@@ -43,6 +43,13 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
         print("Cancelled.")
         return 1
 
+    if install.exists() and not install.is_dir():
+        print(
+            f"FAIL: {install} exists but is not a directory.\n"
+            f"      Pass --path pointing at a directory (or a non-existent path)."
+        )
+        return 1
+
     install.mkdir(parents=True, exist_ok=True)
     if not _is_safe_install_target(install) and not force:
         print(
@@ -63,6 +70,11 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
     print(f"  anneal:     {anneal_path}")
     print()
 
+    # All template reads + `_install_adapter` (which copies the activation
+    # tree) must stay inside this `with` block. Under zipped distributions
+    # (zipapp / PyInstaller / pip --target into zip), `as_file()` materializes
+    # templates to a tempdir that's cleaned up on context exit. Code outside
+    # this block must NOT depend on `templates_root` being live.
     with _templates_root() as templates_root:
         if not (templates_root / "seed" / "world.md").is_file():
             print(
@@ -174,15 +186,22 @@ def _templates_root() -> Iterator[Path]:
     """Yields the package's `templates/` directory as a filesystem Path.
 
     Uses `importlib.resources.as_file` so the path is real and usable with
-    `shutil.copytree`, `shutil.copy2`, `Path.read_text`, etc. across every
-    distribution shape: pip-installed-unpacked, `pip install --target`,
-    zipapp, PyInstaller, and other frozen-importer scenarios. For zipped
-    distributions, files are materialized to a tempdir for the duration of
-    the `with` block; for filesystem distributions, the real package path
-    is yielded with no copy.
+    `shutil.copytree`, `shutil.copy2`, `Path.read_text`, etc. For filesystem
+    distributions (the normal case for `pip install`), yields the real
+    package path with no copy. For zipped distributions (zipapp,
+    PyInstaller, `pip install --target` into a zip), files are materialized
+    to a tempdir for the duration of the `with` block.
 
     Callers MUST consume `templates_root` inside the `with` block — the
     materialized tempdir is cleaned up on exit under zipped distributions.
+
+    Requires Python >=3.12 — directory-resource support for `as_file()`
+    arrived in 3.12 (https://docs.python.org/3/library/importlib.resources.html).
+    The package's `requires-python` floor matches.
+
+    Namespace-package installs (a `levain` package split across multiple
+    directories) will return a `MultiplexedPath` from `files()`, which
+    `as_file()` cannot materialize as a directory. Not supported at v1.
     """
     with as_file(files("levain") / "templates") as path:
         yield Path(path)

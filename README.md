@@ -7,6 +7,14 @@ pip install levain
 levain init
 ```
 
+**Heads-up before you scroll** — Levain v1 boundaries (kept honest):
+
+- **Harnesses:** Claude Code + Codex CLI at v1. One adapter per install (use two installs if you need both).
+- **Python:** 3.12+ required. The package uses `importlib.resources.as_file()` on a directory resource, which gained support in 3.12. v0.1.0 supported 3.11+ but only for filesystem installs; v0.1.1 bumps the floor to 3.12 and adds zipapp / PyInstaller / `pip install --target` into zip support.
+- **Web pane onboarding:** CLI interview at v1.0. Browser-based onboarding lands in v1.1.
+- **Codex hook reliability:** Codex 0.132/0.133 has a known platform-level hook-trust gap that no harness consumer can work around. `levain doctor` + `levain verify-hooks` surface the wiring; whether your Codex install actually fires the hooks is up to Codex itself ([upstream tracking issue](https://github.com/openai/codex/issues/17532)).
+- **Memory substrate:** anneal-memory v0.3.3 is the layer-1 dependency; pinned in `pyproject.toml`.
+
 ---
 
 ## What this is
