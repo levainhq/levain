@@ -26,7 +26,9 @@ import shutil
 import subprocess
 import sys
 import time
-from importlib.resources import files
+from collections.abc import Iterator
+from contextlib import contextmanager
+from importlib.resources import as_file, files
 from pathlib import Path
 
 
@@ -61,54 +63,54 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
     print(f"  anneal:     {anneal_path}")
     print()
 
-    templates_root = _templates_root()
-    if not (templates_root / "seed" / "world.md").is_file():
-        print(
-            f"FAIL: Levain templates not found in installed package at "
-            f"{templates_root}. The wheel may be corrupt; reinstall with "
-            f"`pip install --force-reinstall levain`."
+    with _templates_root() as templates_root:
+        if not (templates_root / "seed" / "world.md").is_file():
+            print(
+                f"FAIL: Levain templates not found in installed package at "
+                f"{templates_root}. The wheel may be corrupt; reinstall with "
+                f"`pip install --force-reinstall levain`."
+            )
+            return 1
+
+        try:
+            from levain.interview import (
+                conduct_interview,
+                parse_template,
+                render_template,
+            )
+        except Exception as e:
+            print(f"FAIL: interview engine unavailable: {e}")
+            return 1
+
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+
+        print("=" * 60)
+        print("Interview — fills the world.md and origin.md templates.")
+        print("=" * 60)
+        print("  Press Ctrl+C to cancel.")
+        try:
+            answers = conduct_interview([spec_world, spec_origin])
+        except (KeyboardInterrupt, EOFError):
+            print("\nInterview interrupted.")
+            _report_partial_state(install)
+            return 1
+
+        install_seed = install / "seed"
+        install_seed.mkdir(parents=True, exist_ok=True)
+        (install_seed / "world.md").write_text(
+            render_template(spec_world, answers), encoding="utf-8"
         )
-        return 1
-
-    try:
-        from levain.interview import (
-            conduct_interview,
-            parse_template,
-            render_template,
+        (install_seed / "origin.md").write_text(
+            render_template(spec_origin, answers), encoding="utf-8"
         )
-    except Exception as e:
-        print(f"FAIL: interview engine unavailable: {e}")
-        return 1
 
-    spec_world = parse_template(templates_root / "seed" / "world.md")
-    spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        for f in ("partnership.md", "memory.md", "continuity.md", "README.md"):
+            src = templates_root / "seed" / f
+            if src.is_file():
+                shutil.copy2(src, install_seed / f)
 
-    print("=" * 60)
-    print("Interview — fills the world.md and origin.md templates.")
-    print("=" * 60)
-    print("  Press Ctrl+C to cancel.")
-    try:
-        answers = conduct_interview([spec_world, spec_origin])
-    except (KeyboardInterrupt, EOFError):
-        print("\nInterview interrupted.")
-        _report_partial_state(install)
-        return 1
-
-    install_seed = install / "seed"
-    install_seed.mkdir(parents=True, exist_ok=True)
-    (install_seed / "world.md").write_text(
-        render_template(spec_world, answers), encoding="utf-8"
-    )
-    (install_seed / "origin.md").write_text(
-        render_template(spec_origin, answers), encoding="utf-8"
-    )
-
-    for f in ("partnership.md", "memory.md", "continuity.md", "README.md"):
-        src = templates_root / "seed" / f
-        if src.is_file():
-            shutil.copy2(src, install_seed / f)
-
-    _install_adapter(chosen, install, templates_root, python_path, anneal_path)
+        _install_adapter(chosen, install, templates_root, python_path, anneal_path)
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -167,15 +169,23 @@ def _is_safe_install_target(path: Path) -> bool:
     return not any(path.iterdir())
 
 
-def _templates_root() -> Path:
-    """Returns the package's `templates/` directory containing `seed/`,
-    `adapters/`, and `activation/`. Templates ship as package_data in the
-    wheel. v1 supports filesystem-installed packages only (`pip install`,
-    `pip install -e`, `pip install --target`) — zipapp / PyInstaller /
-    other zip-imported distribution shapes would need an `as_file()` context
-    manager wrapping the consumers; deferred to v1.1.
+@contextmanager
+def _templates_root() -> Iterator[Path]:
+    """Yields the package's `templates/` directory as a filesystem Path.
+
+    Uses `importlib.resources.as_file` so the path is real and usable with
+    `shutil.copytree`, `shutil.copy2`, `Path.read_text`, etc. across every
+    distribution shape: pip-installed-unpacked, `pip install --target`,
+    zipapp, PyInstaller, and other frozen-importer scenarios. For zipped
+    distributions, files are materialized to a tempdir for the duration of
+    the `with` block; for filesystem distributions, the real package path
+    is yielded with no copy.
+
+    Callers MUST consume `templates_root` inside the `with` block — the
+    materialized tempdir is cleaned up on exit under zipped distributions.
     """
-    return Path(str(files("levain") / "templates"))
+    with as_file(files("levain") / "templates") as path:
+        yield Path(path)
 
 
 def _install_adapter(
