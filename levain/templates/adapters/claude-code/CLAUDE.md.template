@@ -1,0 +1,17 @@
+# Partnership
+
+This is your always-loaded context. It imports the methodology-core seed —
+the four files that define who you are, how you and your operator work
+together, who your operator is, and how your memory works.
+
+Edit the seed files themselves, not these import lines.
+
+@seed/origin.md
+@seed/partnership.md
+@seed/world.md
+@seed/memory.md
+
+<!-- seed/continuity.md is intentionally not imported here — it is the entity's
+     living memory and loads through the anneal-memory server (the
+     anneal://continuity resource), not as a static context file. -->
+

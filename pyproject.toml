@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "levain"
+version = "0.1.0"
+description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Phill Clapham" }]
+keywords = [
+    "agent",
+    "ai",
+    "anneal-memory",
+    "claude-code",
+    "codex",
+    "cognitive-partnership",
+    "memory",
+    "methodology",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "anneal-memory>=0.3.3,<0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+levain = "levain.cli:main"
+
+[project.urls]
+Homepage = "https://levainhq.com"
+Repository = "https://github.com/levainhq/levain"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["levain*"]
+
+[tool.setuptools.package-data]
+levain = ["templates/**/*"]

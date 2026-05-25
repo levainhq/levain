@@ -1,0 +1,132 @@
+"""Levain CLI — `levain init`, `levain doctor`, `levain verify-hooks`.
+
+The entry point declared by `pyproject.toml` ([project.scripts] levain).
+Subcommand handlers live in sibling modules; this file is dispatch only.
+Lazy imports keep `levain --help` fast and isolate import errors per command.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from levain import __version__
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="levain",
+        description=(
+            "A portable cognitive-partnership memory + methodology kit. "
+            "Ship the seed that grows a practice, not the practice."
+        ),
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"levain {__version__}",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command", metavar="<command>", required=True
+    )
+
+    init_p = subparsers.add_parser(
+        "init",
+        help="Scaffold a new install: interview, render templates, init store.",
+        description=(
+            "Scaffold a new Levain install at PATH (default: cwd). Runs a "
+            "scripted interview to fill the seed templates, resolves "
+            "environment-dependent placeholders, lays down the chosen "
+            "adapter(s), initializes the anneal-memory store."
+        ),
+    )
+    init_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    init_p.add_argument(
+        "--adapter",
+        choices=["claude-code", "codex"],
+        help=(
+            "Harness adapter to install. Prompts if omitted. "
+            "v1 installs one adapter per install — to use both harnesses on "
+            "the same machine, create two separate installs."
+        ),
+    )
+    init_p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Allow installing into a non-empty directory. Default refuses "
+            "to avoid clobbering an existing install."
+        ),
+    )
+    init_p.set_defaults(func=_cmd_init)
+
+    doc_p = subparsers.add_parser(
+        "doctor",
+        help="Loud, in-environment health check of an install.",
+        description=(
+            "Check that an install is wired correctly: interpreter resolves, "
+            "MCP server is registered for the detected adapter(s), the store "
+            "is reachable, the hook scripts are present and runnable. Exits "
+            "nonzero on any failure so it composes with shell pipelines."
+        ),
+    )
+    doc_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory to check (default: cwd).",
+    )
+    doc_p.set_defaults(func=_cmd_doctor)
+
+    vh_p = subparsers.add_parser(
+        "verify-hooks",
+        help="Smoke-test the installed activation hooks for each adapter present.",
+        description=(
+            "Invoke each installed hook script with the JSON payload a "
+            "harness would send and check the emitted `hookSpecificOutput` "
+            "is well-formed and non-empty. Validates the script half of the "
+            "hook contract independently of whether the harness actually "
+            "invokes the hooks at runtime (notably useful for the Codex "
+            "platform hook-reliability gap)."
+        ),
+    )
+    vh_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory to verify (default: cwd).",
+    )
+    vh_p.set_defaults(func=_cmd_verify_hooks)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    from levain.install import run_init
+
+    return run_init(path=args.path, adapter=args.adapter, force=args.force)
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from levain.doctor import run_doctor
+
+    return run_doctor(path=args.path)
+
+
+def _cmd_verify_hooks(args: argparse.Namespace) -> int:
+    from levain.verify import run_verify_hooks
+
+    return run_verify_hooks(path=args.path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

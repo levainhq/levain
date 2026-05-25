@@ -1,0 +1,18 @@
+# Partnership
+
+This is your always-loaded context. The seed files in `seed/` define who you
+are, how you and your operator work together, who your operator is, and how
+your memory works.
+
+**Read these files, in order, before doing any work. They are your identity:**
+
+1. `seed/origin.md` — Who You Are
+2. `seed/partnership.md` — How We Work
+3. `seed/world.md` — Who Your Operator Is
+4. `seed/memory.md` — Your Memory
+
+Edit the seed files themselves, not these instructions.
+
+<!-- seed/continuity.md is intentionally not in this list — it is the entity's
+     living memory and loads through the anneal-memory server (the
+     anneal://continuity resource), not as a static context file. -->

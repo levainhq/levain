@@ -1,0 +1,20 @@
+# Python build artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+.eggs/
+
+# Editable install metadata
+*.egg-link
+
+# venv
+.venv/
+venv/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
