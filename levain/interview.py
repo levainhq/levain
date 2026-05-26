@@ -13,6 +13,7 @@ Public surface:
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -121,7 +122,38 @@ def parse_template(path: Path) -> TemplateSpec:
             )
         )
 
-    return TemplateSpec(path=path, sections=sections, raw=text)
+    spec = TemplateSpec(path=path, sections=sections, raw=text)
+    _warn_on_unsplittable_multislot_sections(spec)
+    return spec
+
+
+def _warn_on_unsplittable_multislot_sections(spec: TemplateSpec) -> None:
+    """Surface multi-slot interview sections whose guidance would silently
+    fall back to applying the entire guidance to each slot.
+
+    `_split_guidance` returns `{}` (the fallback signal) when a multi-slot
+    section's guidance has fewer top-level semicolons than slots-1. That's
+    almost always an authoring mistake — the seed-template author wrote
+    multiple slots intending per-slot guidance but forgot the separators.
+    Warn at parse time so template authors catch it before an operator
+    hits the interview. Emits to stderr; never raises.
+    """
+    for section in spec.sections:
+        if len(section.slots) <= 1 or not section.guidance:
+            continue
+        if _split_guidance(section.guidance, section.slots):
+            continue  # split succeeded → no warning
+        title = section.title or "<preamble>"
+        slot_list = ", ".join(section.slots)
+        print(
+            f"WARN: {spec.path.name}: section {title!r} has "
+            f"{len(section.slots)} slots [{slot_list}] but interview "
+            f"guidance is missing the `;` separators needed to split it "
+            f"per-slot. Each slot will receive the full guidance text. "
+            f"Add semicolons between per-slot clauses if that's not "
+            f"intended.",
+            file=sys.stderr,
+        )
 
 
 def _unique_slots(text: str) -> list[str]:
