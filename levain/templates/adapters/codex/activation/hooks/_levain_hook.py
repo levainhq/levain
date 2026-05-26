@@ -133,6 +133,15 @@ def read_blocks(path: Path) -> list[str]:
     return [b for b in blocks if b]
 
 
+# Install-time-resolved anneal-memory binary path. `levain init` substitutes
+# this placeholder after copying the hook scripts into the operator's install
+# dir, so the hooks don't depend on PATH at fire time (Codex sanitizes hook
+# env aggressively). The `"{{" in ...` guard skips this entry when the
+# placeholder wasn't substituted (editable-install workshop state, or a
+# future regression).
+_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"
+
+
 def episodes_since_wrap(timeout: float = 5.0) -> int | None:
     """Episodes recorded since the last wrap, via anneal-memory's public CLI.
 
@@ -140,13 +149,17 @@ def episodes_since_wrap(timeout: float = 5.0) -> int | None:
     `--db` to this install's store (see store_path) — never left to
     anneal-memory's machine-global default. Returns None when anneal-memory
     is not installed, the store does not exist yet, or anything errors —
-    Layer D then stays silent. Tries the console script first, then the
-    module form."""
+    Layer D then stays silent. Tries the install-resolved binary first,
+    then the PATH-lookup console script, then the module form."""
     db = str(store_path())
-    for cmd in (
+    candidates = []
+    if "{{" not in _INSTALL_ANNEAL_BIN:
+        candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, "status", "--json"])
+    candidates.extend([
         ["anneal-memory", "--db", db, "status", "--json"],
         [sys.executable, "-m", "anneal_memory", "--db", db, "status", "--json"],
-    ):
+    ])
+    for cmd in candidates:
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,

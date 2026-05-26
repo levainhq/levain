@@ -234,7 +234,11 @@ def _install_claude_code(
     python_path: str,
     anneal_path: str,
 ) -> None:
-    _copy_activation_tree(templates_root / "activation", install / "activation")
+    _copy_activation_tree(
+        templates_root / "activation",
+        install / "activation",
+        anneal_path=anneal_path,
+    )
 
     shutil.copy2(adapter_root / "CLAUDE.md.template", install / "CLAUDE.md")
 
@@ -258,7 +262,11 @@ def _install_codex(
     python_path: str,
     anneal_path: str,
 ) -> None:
-    _copy_activation_tree(adapter_root / "activation", install / "activation")
+    _copy_activation_tree(
+        adapter_root / "activation",
+        install / "activation",
+        anneal_path=anneal_path,
+    )
     shutil.copy2(adapter_root / "AGENTS.md.template", install / "AGENTS.md")
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
@@ -297,7 +305,7 @@ def _timestamped_backup_path(target: Path) -> Path:
 _OPERATOR_EDITABLE = ("posture.md", "recency_directives.md")
 
 
-def _copy_activation_tree(src: Path, dst: Path) -> None:
+def _copy_activation_tree(src: Path, dst: Path, anneal_path: str | None = None) -> None:
     """Copy `src` -> `dst`, but preserve operator edits to known editable files.
 
     `posture.md` and `recency_directives.md` are documented as operator-editable
@@ -307,6 +315,11 @@ def _copy_activation_tree(src: Path, dst: Path) -> None:
     so the `rmtree(dst)` below doesn't immediately destroy the backup. The
     backups land at `<install>/.levain/backups/activation/<timestamp>/` so the
     operator can find them via the documented backup convention.
+
+    `anneal_path`, when provided, is substituted into the `{{ANNEAL_MEMORY}}`
+    placeholder in any hook .py file under `dst/hooks/`. The hooks use the
+    substituted absolute path as their first CLI candidate so hook firing
+    doesn't depend on PATH (which Claude Code + Codex sanitize aggressively).
     """
     backups: list[tuple[Path, Path]] = []
     if dst.exists():
@@ -342,8 +355,36 @@ def _copy_activation_tree(src: Path, dst: Path) -> None:
         dst,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    if anneal_path is not None:
+        _substitute_hook_placeholders(dst / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
     for current, bak in backups:
         print(f"  ! Operator-edited {current.name} preserved at {bak}")
+
+
+def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:
+    """Replace install-time placeholders in every .py file under `hooks_dir`.
+
+    Hooks ship with `{{ANNEAL_MEMORY}}` (and potentially more keys later) so
+    they can use the install-time-resolved absolute path of anneal-memory
+    without depending on PATH at fire time. The substitution is a simple
+    string replace — placeholder is unique enough that false positives are
+    not a real risk.
+    """
+    if not hooks_dir.is_dir():
+        return
+    for py_file in hooks_dir.glob("*.py"):
+        try:
+            text = py_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        new_text = text
+        for placeholder, value in mapping.items():
+            new_text = new_text.replace(placeholder, value)
+        if new_text != text:
+            try:
+                py_file.write_text(new_text, encoding="utf-8")
+            except OSError:
+                continue
 
 
 # Match the `[mcp_servers.anneal_memory]` table — from its header to the next

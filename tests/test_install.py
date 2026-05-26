@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from levain.install import _is_safe_install_target, _templates_root
+from levain.install import (
+    _is_safe_install_target,
+    _substitute_hook_placeholders,
+    _templates_root,
+)
 
 
 # ---------- _templates_root context manager ----------
@@ -81,3 +85,58 @@ def test_is_safe_install_target_existing_file_returns_false(tmp_path: Path):
     target = tmp_path / "file.txt"
     target.write_text("hello")
     assert _is_safe_install_target(target) is False
+
+
+# ---------- _substitute_hook_placeholders ----------
+
+def test_substitute_hook_placeholders_replaces_in_py_files(tmp_path: Path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    target = hooks_dir / "example.py"
+    target.write_text(
+        "ANNEAL = '{{ANNEAL_MEMORY}}'\nPYTHON = '{{PYTHON}}'\n",
+        encoding="utf-8",
+    )
+    _substitute_hook_placeholders(
+        hooks_dir,
+        {"{{ANNEAL_MEMORY}}": "/usr/local/bin/anneal-memory"},
+    )
+    text = target.read_text(encoding="utf-8")
+    assert "/usr/local/bin/anneal-memory" in text
+    assert "{{ANNEAL_MEMORY}}" not in text
+    # Unmapped placeholders left alone
+    assert "{{PYTHON}}" in text
+
+
+def test_substitute_hook_placeholders_skips_non_py_files(tmp_path: Path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    md = hooks_dir / "README.md"
+    md.write_text("`{{ANNEAL_MEMORY}}` is documentation here\n", encoding="utf-8")
+    _substitute_hook_placeholders(
+        hooks_dir,
+        {"{{ANNEAL_MEMORY}}": "/path/to/anneal-memory"},
+    )
+    # README.md untouched — only *.py files get the substitution
+    assert "{{ANNEAL_MEMORY}}" in md.read_text(encoding="utf-8")
+
+
+def test_substitute_hook_placeholders_missing_dir_is_noop(tmp_path: Path):
+    # Should not raise on a nonexistent directory.
+    _substitute_hook_placeholders(
+        tmp_path / "does-not-exist",
+        {"{{ANNEAL_MEMORY}}": "x"},
+    )
+
+
+def test_substitute_hook_placeholders_handles_no_placeholder(tmp_path: Path):
+    hooks_dir = tmp_path / "hooks"
+    hooks_dir.mkdir()
+    target = hooks_dir / "plain.py"
+    target.write_text("print('no placeholder here')\n", encoding="utf-8")
+    _substitute_hook_placeholders(
+        hooks_dir,
+        {"{{ANNEAL_MEMORY}}": "/anywhere"},
+    )
+    # File should be unchanged (no rewrite when content didn't change)
+    assert target.read_text(encoding="utf-8") == "print('no placeholder here')\n"
