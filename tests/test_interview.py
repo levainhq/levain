@@ -22,6 +22,7 @@ from levain.interview import (
     parse_template,
     render_template,
 )
+from levain.interview import _STYLE_TAG_RE, _VALID_STYLES
 
 
 # ---------- _unique_slots ----------
@@ -248,6 +249,120 @@ def test_conduct_interview_shares_answers_across_specs(tmp_path: Path):
     assert len(operator_prompts) == 1
     assert answers["OPERATOR_NAME"] == "Alex"
     assert answers["NEW_SLOT"] == "value"
+
+
+# ---------- explicit style tag (v2) ----------
+
+def test_parse_template_captures_explicit_style_prose(tmp_path: Path):
+    template = tmp_path / "explicit.md"
+    template.write_text(
+        "# Test\n\n"
+        "## About Them\n\n"
+        "<!-- interview style=prose: synthesize who they are -->\n\n"
+        "Hello {{BIO}}.\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    section = [s for s in spec.sections if "BIO" in s.slots][0]
+    assert section.explicit_style == "prose"
+    # The `style=prose` tag is stripped from the operator-facing guidance.
+    assert "style=" not in section.guidance
+    assert "synthesize who they are" in section.guidance
+
+
+def test_parse_template_captures_explicit_style_bullet(tmp_path: Path):
+    template = tmp_path / "explicit.md"
+    template.write_text(
+        "# Test\n\n## Items\n\n"
+        "<!-- interview style=bullet: list each item -->\n\n"
+        "{{ITEMS}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    section = [s for s in spec.sections if "ITEMS" in s.slots][0]
+    assert section.explicit_style == "bullet"
+
+
+def test_parse_template_missing_style_tag_leaves_explicit_style_none(tmp_path: Path):
+    """Legacy templates without style= must continue to set explicit_style=None
+    so the keyword detection still runs."""
+    template = tmp_path / "legacy.md"
+    template.write_text(
+        "# Test\n\n## S\n\n<!-- interview: synthesize them as a paragraph -->\n\n{{X}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    section = [s for s in spec.sections if "X" in s.slots][0]
+    assert section.explicit_style is None
+
+
+def test_parse_template_invalid_style_tag_treated_as_legacy(tmp_path: Path):
+    """`style=foo` is not in _VALID_STYLES — the regex won't match, the
+    section keeps explicit_style=None and the literal text stays in
+    guidance (so an author's typo is at least visible)."""
+    template = tmp_path / "typo.md"
+    template.write_text(
+        "# Test\n\n## S\n\n<!-- interview style=foo: my question -->\n\n{{X}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    section = [s for s in spec.sections if "X" in s.slots][0]
+    assert section.explicit_style is None
+    # The literal `style=foo` text remains in the guidance — surfaces the typo.
+    assert "style=foo" in section.guidance
+
+
+def test_conduct_interview_respects_explicit_style_over_keywords(tmp_path: Path):
+    """The v2 contract: explicit_style overrides keyword-soup detection.
+    Verify by setting style=line on guidance that would otherwise be
+    detected as prose via the keyword 'paragraph'."""
+    template = tmp_path / "override.md"
+    template.write_text(
+        "# Test\n\n## S\n\n"
+        "<!-- interview style=line: name them in a paragraph or two -->\n\n"
+        "{{X}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    section = [s for s in spec.sections if "X" in s.slots][0]
+    # Without the explicit tag, keyword 'paragraph' would route to prose.
+    # With the explicit tag, line style takes over.
+    assert section.explicit_style == "line"
+
+    captured_prompts: list[str] = []
+
+    def driver(prompt: str) -> str:
+        captured_prompts.append(prompt)
+        return "Alex"
+
+    answers = conduct_interview(
+        [spec],
+        input_fn=driver,
+        output_fn=lambda s: None,
+    )
+    assert answers == {"X": "Alex"}
+    # Prose style uses a multi-line prompt ("...blank line on its own to finish")
+    # Line style uses the simple "X: " prompt. Captured prompts should match
+    # line-style shape.
+    assert any(p.endswith("X: ") for p in captured_prompts), (
+        f"Expected line-style prompt; captured: {captured_prompts}"
+    )
+
+
+def test_style_tag_regex_accepts_all_valid_styles():
+    for style in _VALID_STYLES:
+        m = _STYLE_TAG_RE.match(f"style={style}: rest")
+        assert m is not None
+        assert m.group(1) == style
+
+
+def test_style_tag_regex_rejects_invalid_styles():
+    # `\b` correctly rejects "linebreak" — `e` (word char) → `b` (word char)
+    # is not a word boundary, so the regex doesn't match the "line" prefix.
+    # That's the safer behavior: any unrecognized style is treated as legacy.
+    for invalid in ("foo", "Line", "PROSE", "", "linebreak", "lineish"):
+        m = _STYLE_TAG_RE.match(f"style={invalid}: rest")
+        assert m is None, f"unexpected match for style={invalid}"
 
 
 # ---------- canonical seed templates parse cleanly ----------

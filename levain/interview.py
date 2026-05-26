@@ -26,6 +26,11 @@ INTERVIEW_RE = re.compile(r"<!--\s*interview\b(.*?)-->", re.DOTALL)
 # Strip a leading meta-parenthetical `(...)`: from the captured body so the
 # operator-facing guidance starts at the actual interview questions.
 _LEADING_PAREN_COLON_RE = re.compile(r"^\s*\([^)]*\)\s*:\s*")
+# Recognize an explicit style tag at the very start of the interview body:
+# `<!-- interview style=prose: question? -->`. Strips after capture so the
+# style word doesn't leak into the guidance.
+_STYLE_TAG_RE = re.compile(r"^\s*style\s*=\s*(line|bullet|prose|optional-line)\b\s*")
+_VALID_STYLES = ("line", "bullet", "prose", "optional-line")
 # Also consume the preceding empty `>` blockquote line so the surrounding
 # blockquote stays well-formed after the stripped instruction.
 _ONBOARDING_BLURB_RE = re.compile(
@@ -44,6 +49,8 @@ class Section:
     `guidance` is the operator-facing interview text (sub-questions). `hints`
     is the full comment body including any meta-parenthetical that affects
     style detection (e.g. "synthesize into one coherent picture" → prose).
+    `explicit_style`, when set, overrides keyword-based style detection in
+    `_detect_input_style` — from `<!-- interview style=prose: ... -->`.
     """
 
     title: str
@@ -52,6 +59,7 @@ class Section:
     hints: str
     optional: bool
     optional_reason: str = ""
+    explicit_style: str | None = None
 
 
 @dataclass
@@ -101,8 +109,15 @@ def parse_template(path: Path) -> TemplateSpec:
         interview_match = INTERVIEW_RE.search(section_body)
         hints = ""
         guidance = ""
+        explicit_style: str | None = None
         if interview_match:
             hints = re.sub(r"\s+", " ", interview_match.group(1)).strip()
+            # Strip a leading `style=X` tag before any other processing so
+            # it doesn't leak into the operator-facing guidance.
+            style_match = _STYLE_TAG_RE.match(hints)
+            if style_match:
+                explicit_style = style_match.group(1)
+                hints = hints[style_match.end():].strip()
             # Drop the meta-parenthetical (`(elicit ... synthesize ...)`) +
             # its colon so the operator sees only the question(s).
             guidance = _LEADING_PAREN_COLON_RE.sub("", hints).lstrip(": ").strip()
@@ -119,6 +134,7 @@ def parse_template(path: Path) -> TemplateSpec:
                     if optional_match
                     else ""
                 ),
+                explicit_style=explicit_style,
             )
         )
 
@@ -216,12 +232,16 @@ def conduct_interview(
 
             sub_guidance = _split_guidance(section.guidance, section.slots)
             for slot in unasked:
-                # Style detection uses the FULL comment (parenthetical
-                # included). Single-slot sections inherit section-level hints;
-                # multi-slot sections use their per-slot sub-clause.
-                clause = sub_guidance.get(slot)
-                style_basis = clause if clause is not None else section.hints
-                style = _detect_input_style(slot, style_basis)
+                # Style precedence: explicit `style=X` tag on the section
+                # (interview engine v2) > keyword-soup detection on the
+                # section's per-slot clause (single-slot inherits section
+                # hints; multi-slot uses its per-slot sub-clause).
+                if section.explicit_style is not None:
+                    style = section.explicit_style
+                else:
+                    clause = sub_guidance.get(slot)
+                    style_basis = clause if clause is not None else section.hints
+                    style = _detect_input_style(slot, style_basis)
                 answers[slot] = _prompt_for_slot(slot, style, input_fn, output_fn)
 
             # Persist progress after each completed section — Ctrl+C between

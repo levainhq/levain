@@ -26,15 +26,15 @@ Roles:
 
 {{PERSONAL_HISTORY}}
 
-<!-- interview: the background that still shapes the work today — a prior
+<!-- interview style=prose: the background that still shapes the work today — a prior
      career, a turning point, a constraint that became design material.
-     Prose, a short paragraph. -->
+     A short paragraph. -->
 
 ## How They Think
 
 {{COGNITION}}
 
-<!-- interview (elicit with sub-prompts, then synthesize into one coherent
+<!-- interview style=prose (elicit with sub-prompts, then synthesize into one coherent
      picture — not a concatenated list of answers):
      - cognitive style — how do they actually solve problems?
      - do they run on play and curiosity, or on structured discipline? and
@@ -52,9 +52,9 @@ Roles:
 
 {{HEALTH}}
 
-<!-- interview: anything physical, cognitive, or situational that shapes how
+<!-- interview style=prose: anything physical, cognitive, or situational that shapes how
      much, and when, they can work. Stable facts only — never today's state.
-     Prose. When this section exists, it is load-bearing for the partnership. -->
+     When this section exists, it is load-bearing for the partnership. -->
 
 ## Family & People
 
@@ -62,8 +62,8 @@ Roles:
 
 {{FAMILY}}
 
-<!-- interview: the people in their life an entity should know by name —
-     family, a co-founder, whoever recurs. Prose. -->
+<!-- interview style=prose: the people in their life an entity should know by name —
+     family, a co-founder, whoever recurs. -->
 
 ## Interests & Active Domains
 
@@ -77,27 +77,27 @@ Roles:
 
 {{WORK}}
 
-<!-- interview: the portfolio — what each major thing IS (work and projects
+<!-- interview style=prose: the portfolio — what each major thing IS (work and projects
      belong here, not under Interests). Not its current status: status is
-     transient state, learned by living, never seeded here. Prose. -->
+     transient state, learned by living, never seeded here. -->
 
 ## Communication
 
 {{COMMUNICATION}}
 
-<!-- interview: how they want to be talked to — directness, information
+<!-- interview style=prose: how they want to be talked to — directness, information
      density, formality, profanity, how much challenge they want. This
-     calibrates the entity's voice; be specific. Prose. -->
+     calibrates the entity's voice; be specific. -->
 
 ## Boundaries & Privacy
 
 {{BOUNDARIES}}
 
-<!-- interview: anything to keep separate, off-limits, or out of memory —
+<!-- interview style=prose: anything to keep separate, off-limits, or out of memory —
      work / personal separation, topics not to raise, people or subjects the
      entity should never record. Privacy norms vary enormously between
      operators; this is where the operator states theirs explicitly. Always
-     ask — if they genuinely have none, record that they said so. Prose. -->
+     ask — if they genuinely have none, record that they said so. -->
 
 ## Strategic Direction
 
@@ -105,8 +105,8 @@ Roles:
 
 {{STRATEGIC_DIRECTION}}
 
-<!-- interview: where they are headed; the throughline connecting the work;
-     what winning looks like. Prose. -->
+<!-- interview style=prose: where they are headed; the throughline connecting the work;
+     what winning looks like. -->
 
 ## Context
 
