@@ -95,16 +95,20 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     failed = [r for r in all_results if not r.ok]
 
     # --invoke: layer the dynamic verify-hooks check on top of static checks.
-    # Only run when the static pass succeeded — invoking hooks on a broken
-    # install just doubles the noise.
+    # Run UNCONDITIONALLY when --invoke is set — the failure class --invoke
+    # was built to surface (silent dead hooks) is most common precisely when
+    # static is partial-fail. Gating dynamic on full-static-green defeats the
+    # composition. The operator chose --invoke; trust the choice.
     verify_rc = 0
-    if invoke and not failed:
+    if invoke:
         print("\n  Live-fire (--invoke): running verify-hooks dynamic check...")
         from levain.verify import run_verify_hooks
         verify_rc = run_verify_hooks(install)
 
     print()
-    if failed:
+    if failed and verify_rc != 0:
+        print(f"{len(failed)} static check(s) FAILED + live-fire verify-hooks FAILED.")
+    elif failed:
         print(f"{len(failed)} check(s) FAILED.")
     elif verify_rc != 0:
         print("Static checks passed but live-fire verify-hooks FAILED.")

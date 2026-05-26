@@ -293,8 +293,22 @@ def test_resolve_install_python_falls_back_to_sys_executable_when_no_config(tmp_
     assert _resolve_install_python(tmp_path) == sys.executable
 
 
+def _seed_install_hooks(install: Path) -> Path:
+    """Helper for resolver tests — write a dummy session_start.py inside
+    install/activation/hooks/ so the anti-foreign-hook filter accepts
+    commands pointing at it."""
+    hooks_dir = install / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    target = hooks_dir / "session_start.py"
+    target.write_text("# dummy\n", encoding="utf-8")
+    return target
+
+
 def test_resolve_install_python_reads_claude_settings(tmp_path: Path):
     from levain.verify import _resolve_install_python
+    # Tag file CLAUDE.md must exist for the Claude Code branch to fire.
+    (tmp_path / "CLAUDE.md").write_text("claude", encoding="utf-8")
+    script = _seed_install_hooks(tmp_path)
     settings_dir = tmp_path / ".claude"
     settings_dir.mkdir()
     (settings_dir / "settings.json").write_text(json.dumps({
@@ -302,7 +316,7 @@ def test_resolve_install_python_reads_claude_settings(tmp_path: Path):
             "SessionStart": [{
                 "hooks": [{
                     "type": "command",
-                    "command": "/path/to/venv/bin/python /path/to/script.py",
+                    "command": f"/path/to/venv/bin/python {script}",
                 }],
             }],
         },
@@ -314,10 +328,20 @@ def test_resolve_install_python_reads_codex_hooks(tmp_path: Path):
     from levain.verify import _resolve_install_python
     # AGENTS.md marks this as a Codex install.
     (tmp_path / "AGENTS.md").write_text("agents", encoding="utf-8")
+    script = _seed_install_hooks(tmp_path)
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
+    # Codex hooks.json shape matches Claude Code's settings.json — both use
+    # the nested {"hooks": {<event>: [{"hooks": [{"command": "..."}]}]}} form.
     (codex_home / "hooks.json").write_text(json.dumps({
-        "session_start": [{"command": "/codex-venv/bin/python /script.py"}],
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": f"/codex-venv/bin/python {script}",
+                }],
+            }],
+        },
     }), encoding="utf-8")
     monkey_env = os.environ.copy()
     os.environ["CODEX_HOME"] = str(codex_home)
@@ -328,9 +352,80 @@ def test_resolve_install_python_reads_codex_hooks(tmp_path: Path):
         os.environ.update(monkey_env)
 
 
+def test_resolve_install_python_prefers_claude_over_codex_when_both_present(tmp_path: Path):
+    """Mixed-install regression test — operators with both adapters wired
+    should get Claude Code's python (interactive harness takes precedence)."""
+    from levain.verify import _resolve_install_python
+    (tmp_path / "CLAUDE.md").write_text("claude", encoding="utf-8")
+    (tmp_path / "AGENTS.md").write_text("agents", encoding="utf-8")
+    script = _seed_install_hooks(tmp_path)
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"/claude/python {script}",
+        }]}]},
+    }), encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"/codex/python {script}",
+        }]}]},
+    }), encoding="utf-8")
+    monkey_env = os.environ.copy()
+    os.environ["CODEX_HOME"] = str(codex_home)
+    try:
+        assert _resolve_install_python(tmp_path) == "/claude/python"
+    finally:
+        os.environ.clear()
+        os.environ.update(monkey_env)
+
+
+def test_resolve_install_python_skips_foreign_hooks(tmp_path: Path):
+    """Anti-foreign-hook: a hook command targeting a script OUTSIDE the
+    install's hooks dir must NOT contribute its interpreter to verify-hooks."""
+    from levain.verify import _resolve_install_python
+    (tmp_path / "CLAUDE.md").write_text("claude", encoding="utf-8")
+    script = _seed_install_hooks(tmp_path)
+    foreign = tmp_path / "foreign.py"
+    foreign.write_text("# someone else's hook\n", encoding="utf-8")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [
+                # Foreign hook first — should be SKIPPED.
+                {"hooks": [{
+                    "type": "command",
+                    "command": f"/foreign/python {foreign}",
+                }]},
+                # Then Levain hook — should be PICKED.
+                {"hooks": [{
+                    "type": "command",
+                    "command": f"/levain/python {script}",
+                }]},
+            ],
+        },
+    }), encoding="utf-8")
+    assert _resolve_install_python(tmp_path) == "/levain/python"
+
+
 def test_session_start_sources_constant_covers_all_four():
     from levain.verify import SESSION_START_SOURCES
     assert set(SESSION_START_SOURCES) == {"startup", "resume", "clear", "compact"}
+
+
+def test_session_start_representatives_cover_both_equivalence_classes():
+    """The hook branches on (startup,clear) vs (resume,compact). The actual
+    invocation set should pick one from each class, not iterate all four."""
+    from levain.verify import SESSION_START_REPRESENTATIVES, SESSION_START_SOURCES
+    fresh_class = {"startup", "clear"}
+    continuing_class = {"resume", "compact"}
+    reps = set(SESSION_START_REPRESENTATIVES)
+    assert reps & fresh_class, "missing representative from (startup, clear)"
+    assert reps & continuing_class, "missing representative from (resume, compact)"
+    assert reps <= set(SESSION_START_SOURCES)
 
 
 def test_conduct_interview_checkpoint_fn_failure_does_not_break_interview(tmp_path: Path):

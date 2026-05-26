@@ -66,7 +66,15 @@ def _content_at(repo: Path, sha: str, file_path: str) -> str:
 
 
 def _first_commit_date(repo: Path, file_path: str) -> date:
-    """Date of the commit that first added `file_path` to the repo."""
+    """Date of the commit that first added `file_path` to the repo.
+
+    Uses `--follow` to chase renames, so a file moved from path A to path B
+    reports A's original add date. For a file that was deleted then later
+    re-added at the same path, this returns the OLDEST add date (full
+    lineage), not the most recent re-add — appropriate for an accrual
+    demo whose point is showing the long-lived practice trajectory. If
+    "current incarnation only" semantics are needed instead, use out[0].
+    """
     out = _git(
         [
             "log",
@@ -198,7 +206,19 @@ def _extract_sections(content: str) -> list[tuple[str, str]]:
 
 def collect_snapshot(repo: Path, file_path: str, label: str, anchor_date: str) -> Snapshot:
     sha = _commit_at(repo, file_path, anchor_date)
-    content = _content_at(repo, sha, file_path)
+    try:
+        content = _content_at(repo, sha, file_path)
+    except RuntimeError as e:
+        # The anchor date can land on a commit where the file was DELETED
+        # (later re-added) — `git show <sha>:<path>` then fatals. Don't let
+        # that crash the whole demo; report a friendlier error explaining
+        # what to do.
+        raise RuntimeError(
+            f"Anchor {anchor_date} for {label!r} resolves to commit {sha[:8]} "
+            f"where {file_path} does not exist (likely a deleted-and-re-added "
+            f"gap in the file's history). Pass --snapshots LABEL=YYYY-MM-DD "
+            f"explicitly to skip past the gap."
+        ) from e
     sections = _extract_sections(content)
     return Snapshot(
         label=label,
@@ -229,21 +249,26 @@ def render(snapshots: list[Snapshot], file_path: str) -> str:
         new_count = sum(1 for _, k in snap.sections if k not in prev_keys)
         deltas.append((snap.lines - prev.lines, new_count))
 
+    # Build a data-driven opener describing the actual shape of the trajectory
+    # this run measured — flow's history was one-cliff-bracketed-by-flats, but
+    # other operators' histories will have different shapes (steady accrual,
+    # multiple cliffs, gentle ramp). Generate the prose from the numbers.
+    trajectory_prose = _describe_trajectory(snapshots, deltas)
+
     out.append("# Continuity Accrual — A Growth Timeline")
     out.append("")
     out.append(
-        f"This is one continuity file ({file_path}) at four points in its life. "
-        f"It started at {first.lines} lines and grew to {last.lines} — but the "
-        "growth wasn't steady. Between week 1 and week 4 the architecture barely "
-        "moved. Between week 4 and week 12 it shifted, hard. Between week 12 and "
-        "now it has been stable, with density growing inside the same shape."
+        f"This is one continuity file ({file_path}) at "
+        f"{len(snapshots)} points in its life. "
+        f"It started at {first.lines} lines and grew to {last.lines}. "
+        f"{trajectory_prose}"
     )
     out.append("")
     out.append(
         "**This is the proof under Levain's pitch — ship the seed that grows a "
-        "practice, not the practice.** A new operator's week 1 looks like the first "
-        "snapshot, not the last. The last snapshot isn't a target. It's evidence "
-        "the engine works."
+        "practice, not the practice.** A new operator's first snapshot looks "
+        f"like {first.label}, not {last.label}. The last snapshot isn't a "
+        "target. It's evidence the engine works."
     )
     out.append("")
     out.append("---")
@@ -277,22 +302,85 @@ def render(snapshots: list[Snapshot], file_path: str) -> str:
     growth = last.lines - first.lines
     first_keys = {k for _, k in first.sections}
     new_sections = [d for d, k in last.sections if k not in first_keys]
+    closing_prose = _describe_shape(deltas, len(new_sections))
     out.append("## What this shows")
     out.append("")
     out.append(
-        f"From week 1 to now: **+{growth} lines, +{len(new_sections)} sections**. "
-        "Not steady accrual — one architectural cliff between week 4 and week 12, "
-        "bracketed by two long flat stretches. The growth isn't just volume; the "
-        "architecture is what compounds. The shape locked in around week 12 and "
-        "has held since; what grew inside it was density."
+        f"From {first.label} to {last.label}: "
+        f"**{growth:+d} lines, +{len(new_sections)} sections**. "
+        f"{closing_prose}"
     )
     out.append("")
     out.append(
-        "The seed's job is to get you to week 1 cleanly. Everything after is what "
-        "your partnership grows."
+        "The seed's job is to get you to your first snapshot cleanly. "
+        "Everything after is what your partnership grows."
     )
     out.append("")
     return "\n".join(out)
+
+
+def _describe_trajectory(snapshots: list[Snapshot], deltas: list[tuple[int, int]]) -> str:
+    """Generate the opener prose from the actual per-snapshot deltas.
+
+    Different histories produce different narratives — flow's was
+    flat → cliff → flat. A 5-day-old repo will be near-flat throughout.
+    A startup-phase project will show steady linear ramp. Pick the
+    description that matches the data.
+    """
+    if len(snapshots) < 2:
+        return "Too few snapshots to describe a trajectory."
+    line_deltas = [d for d, _ in deltas[1:]]
+    total = sum(abs(d) for d in line_deltas) or 1
+    biggest = max(line_deltas, key=abs)
+    biggest_idx = line_deltas.index(biggest)
+    biggest_share = abs(biggest) / total
+    if biggest_share >= 0.55 and len(line_deltas) >= 3:
+        # One delta dominates → cliff-shaped trajectory
+        cliff_from = snapshots[biggest_idx].label
+        cliff_to = snapshots[biggest_idx + 1].label
+        return (
+            f"The growth wasn't steady — most of it happened between "
+            f"{cliff_from} and {cliff_to} ({biggest:+d} lines in that one "
+            "interval). The rest of the timeline is flatter."
+        )
+    if biggest_share >= 0.4:
+        return (
+            f"The biggest jump was between {snapshots[biggest_idx].label} and "
+            f"{snapshots[biggest_idx + 1].label} ({biggest:+d} lines), with "
+            "smaller changes across the other intervals."
+        )
+    return (
+        "Growth was distributed roughly evenly across the timeline — no "
+        "single cliff, no long flats."
+    )
+
+
+def _describe_shape(deltas: list[tuple[int, int]], total_new_sections: int) -> str:
+    """Closing prose: what the trajectory shape means for the seed claim."""
+    section_jumps = [s for _, s in deltas[1:] if s > 0]
+    line_deltas = [d for d, _ in deltas[1:]]
+    if total_new_sections == 0:
+        return (
+            "The shape held across the window. Density grew inside the same "
+            "architecture, which is what most of partnership-cognition's "
+            "compounding actually looks like."
+        )
+    if len(section_jumps) == 1:
+        return (
+            "Sections appeared at one architectural moment, then stabilized. "
+            "That's the seed-grows-a-practice claim in one shape: the engine "
+            "produces a structure when the practice needs it."
+        )
+    if any(d < 0 for d in line_deltas):
+        return (
+            "Note the negative deltas — the file actually shrank at points. "
+            "That's wrap-discipline compressing density without losing meaning. "
+            "Growth here isn't volume; it's how much you can keep in scope."
+        )
+    return (
+        "Architecture grew with use — sections appeared when the practice "
+        "needed them. The seed didn't predict the shape; running it produced it."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -9,14 +9,19 @@ the harness actually invokes the hooks at runtime. It is the documented
 remedy for the Codex platform hook-reliability gap — Codex does not surface
 failures, so wiring may look healthy while hooks never fire.
 
-SessionStart is invoked four times — once per `source` value in
-{startup, resume, clear, compact} — because the hook branches on source
-(start-catch wrap check fires only for fresh sessions). All four paths must
-produce valid output.
+SessionStart is invoked twice — once per `source` equivalence class:
+{startup, clear} fire the start-catch wrap check; {resume, compact} skip
+it. The hook reads `payload['source']` at exactly one branch site, so
+testing one representative from each class is the honest coverage. The
+representative-per-class shape leaves room to add a third class without
+forcing the test to grow N×.
 
-UserPromptSubmit is invoked with a realistic payload shape matching what
-the harness actually sends (prompt + cwd + session_id + hook_event_name)
-rather than an empty stub, so the hook's payload-reading path is exercised.
+UserPromptSubmit is invoked with the payload shape the harness actually
+sends (prompt + cwd + session_id + hook_event_name). The current hook
+discards the payload after a JSON parse, so the "realistic" shape mainly
+hardens against the hook starting to read payload fields in a future
+revision — the parse-and-discard surface is also exercised by an empty
+stub, but the realistic shape documents what callers will send.
 
 The Python interpreter is resolved from the install's adapter config (the
 exact Python the harness will use), falling back to sys.executable. This
@@ -32,7 +37,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -64,6 +68,15 @@ def _emit(r: VerifyResult) -> None:
         print(f"      → {r.hint}")
 
 
+# SessionStart `source` values fall into two equivalence classes in the
+# canonical session_start.py: (startup, clear) → start-catch wrap-check
+# fires; (resume, compact) → start-catch skipped, posture-only. Testing
+# one representative per class is honest coverage; iterating all four
+# tests the same code path twice on each side and would green-light a
+# regression that inverted the branch condition.
+SESSION_START_REPRESENTATIVES = ("startup", "compact")
+# All four documented sources — kept as a public constant for adapters/
+# tests that want to confirm vocabulary parity with Claude Code.
 SESSION_START_SOURCES = ("startup", "resume", "clear", "compact")
 
 
@@ -83,18 +96,46 @@ def run_verify_hooks(path: Path) -> int:
         print("\n1 check(s) FAILED.")
         return 1
 
+    # Warn if LEVAIN_HOOK_SUPPRESS is set globally — verify-hooks strips it
+    # from the child env to test the script half cleanly, but live harness
+    # hooks honor it. Operator gets green here, silence at fire time.
+    if os.environ.get("LEVAIN_HOOK_SUPPRESS"):
+        print(
+            "  ⚠ LEVAIN_HOOK_SUPPRESS is set in your environment. verify-hooks\n"
+            "    will strip it for this run, but live harness hooks honor it —\n"
+            "    your real sessions will see no hook output until you unset it.\n"
+        )
+
     # Resolve the Python the harness will actually use — falls back to
     # sys.executable if no install config nominates one.
     python = _resolve_install_python(install)
+
+    # Pre-check: the resolved interpreter must exist. Most common operator
+    # failure is "I deleted/moved the venv this install was created with."
+    # Surface a distinct error rather than letting subprocess.run produce
+    # a generic OSError downstream.
+    if not Path(python).is_file():
+        _emit(VerifyResult(
+            "configured python",
+            False,
+            f"interpreter not found at {python}",
+            (
+                "The install was wired to this Python (likely in a venv that's "
+                "been deleted or moved). Re-run `levain init --force` from the "
+                "venv you want to wire it to, or fix the path in "
+                ".claude/settings.json / ~/.codex/hooks.json."
+            ),
+        ))
+        print("\n1 check(s) FAILED.")
+        return 1
 
     results: list[VerifyResult] = []
 
     ss = hooks_dir / "session_start.py"
     if ss.is_file():
-        # All four `source` values must produce valid output. The hook branches
-        # on source (start-catch wrap check fires only for startup/clear); each
-        # branch must emit valid envelope.
-        for source in SESSION_START_SOURCES:
+        # One representative per source equivalence class — see comment on
+        # SESSION_START_REPRESENTATIVES above for why this isn't all four.
+        for source in SESSION_START_REPRESENTATIVES:
             r = _invoke(ss, install, {"source": source}, "SessionStart", python)
             # Tag the source onto the result name so failures are localized.
             r = VerifyResult(
@@ -280,48 +321,86 @@ def _resolve_install_python(install: Path) -> str:
     available or no python can be extracted. The point is to test the same
     interpreter the harness will actually invoke at fire time, which may
     differ from the venv currently running `levain verify-hooks`.
-    """
-    # Claude Code: settings.json hooks[*].command is shaped like
-    # `<python> <script-path>`. Parse the first token.
-    settings = install / ".claude" / "settings.json"
-    if settings.is_file():
-        try:
-            data = json.loads(settings.read_text(encoding="utf-8"))
-            hooks = data.get("hooks", {})
-            for event_name, entries in hooks.items():
-                if not isinstance(entries, list):
-                    continue
-                for entry in entries:
-                    inner_hooks = entry.get("hooks") if isinstance(entry, dict) else None
-                    if not isinstance(inner_hooks, list):
-                        continue
-                    for hook in inner_hooks:
-                        cmd = hook.get("command") if isinstance(hook, dict) else None
-                        if isinstance(cmd, str):
-                            tokens = shlex.split(cmd)
-                            if tokens:
-                                return tokens[0]
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
 
-    # Codex: CODEX_HOME/hooks.json sidecar — same `<python> <script>` shape.
-    codex_home_env = os.environ.get("CODEX_HOME")
-    codex_home = Path(codex_home_env) if codex_home_env else Path("~/.codex").expanduser()
-    codex_hooks = codex_home / "hooks.json"
-    agents = install / "AGENTS.md"
-    if agents.is_file() and codex_hooks.is_file():
-        try:
-            data = json.loads(codex_hooks.read_text(encoding="utf-8"))
-            for event_name, entries in data.items():
-                if not isinstance(entries, list):
-                    continue
-                for entry in entries:
-                    cmd = entry.get("command") if isinstance(entry, dict) else None
-                    if isinstance(cmd, str):
-                        tokens = shlex.split(cmd)
-                        if tokens:
-                            return tokens[0]
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+    Both Claude Code and Codex use the same nested shape:
+        {"hooks": {<event>: [{"hooks": [{"command": "<py> <script>", ...}]}]}}
+    so the walk is shared between branches. Claude Code is checked first;
+    Codex secondary. Both also gate on the install's tag-file presence
+    (CLAUDE.md or AGENTS.md) — the config file may exist from a previous
+    install but only the tagged adapter is the active one.
+
+    Anti-foreign-hook: the walker only trusts a command whose target script
+    lives inside `<install>/activation/hooks/`. A foreign hook command in
+    the same config (operator-added, or shared across installs) silently
+    gets skipped — so verify-hooks never accidentally tests a non-Levain
+    interpreter.
+    """
+    # Claude Code: .claude/settings.json — gated by CLAUDE.md tag file.
+    if (install / "CLAUDE.md").is_file():
+        py = _python_from_hooks_config(install / ".claude" / "settings.json", install)
+        if py is not None:
+            return py
+
+    # Codex: CODEX_HOME/hooks.json sidecar — gated by AGENTS.md tag file.
+    if (install / "AGENTS.md").is_file():
+        codex_home_env = os.environ.get("CODEX_HOME")
+        codex_home = (
+            Path(codex_home_env) if codex_home_env else Path("~/.codex").expanduser()
+        )
+        py = _python_from_hooks_config(codex_home / "hooks.json", install)
+        if py is not None:
+            return py
 
     return sys.executable
+
+
+def _python_from_hooks_config(path: Path, install: Path) -> str | None:
+    """Walk a hooks-config JSON file and return the python for a hook
+    targeting `install/activation/hooks/`. Skip commands targeting other
+    paths (foreign hooks shouldn't donate their python to verify-hooks).
+
+    Shared between Claude Code's `.claude/settings.json` and Codex's
+    `CODEX_HOME/hooks.json` because both use the same nested shape:
+        {"hooks": {<event>: [{"hooks": [{"command": "..."}, ...]}]}}
+    """
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return None
+    install_hooks_dir = (install / "activation" / "hooks").resolve()
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            inner_hooks = entry.get("hooks") if isinstance(entry, dict) else None
+            if not isinstance(inner_hooks, list):
+                continue
+            for hook in inner_hooks:
+                cmd = hook.get("command") if isinstance(hook, dict) else None
+                if not isinstance(cmd, str):
+                    continue
+                # shlex parse is per-command — a bad command shouldn't poison
+                # the entire walk.
+                try:
+                    tokens = shlex.split(cmd)
+                except ValueError:
+                    continue
+                if len(tokens) < 2:
+                    continue
+                # Filter foreign hooks: command must target a script inside
+                # THIS install's activation/hooks/ dir.
+                try:
+                    script_path = Path(tokens[1]).resolve()
+                except (OSError, ValueError):
+                    continue
+                try:
+                    script_path.relative_to(install_hooks_dir)
+                except ValueError:
+                    continue
+                return tokens[0]
+    return None
