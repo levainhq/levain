@@ -5,6 +5,9 @@ separate because it requires the full interview-driver dance.
 
 from __future__ import annotations
 
+import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -280,6 +283,54 @@ def test_conduct_interview_with_initial_answers_skips_answered_slots(tmp_path: P
     # NAME prompt should not appear in the captured prompts.
     assert not any("NAME" in p for p in prompts)
     assert any("CITY" in p for p in prompts)
+
+
+# ---------- doctor --invoke + verify-hooks improvements ----------
+
+def test_resolve_install_python_falls_back_to_sys_executable_when_no_config(tmp_path: Path):
+    from levain.verify import _resolve_install_python
+    # An empty dir has no .claude/settings.json or AGENTS.md — fallback.
+    assert _resolve_install_python(tmp_path) == sys.executable
+
+
+def test_resolve_install_python_reads_claude_settings(tmp_path: Path):
+    from levain.verify import _resolve_install_python
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/path/to/venv/bin/python /path/to/script.py",
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    assert _resolve_install_python(tmp_path) == "/path/to/venv/bin/python"
+
+
+def test_resolve_install_python_reads_codex_hooks(tmp_path: Path):
+    from levain.verify import _resolve_install_python
+    # AGENTS.md marks this as a Codex install.
+    (tmp_path / "AGENTS.md").write_text("agents", encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text(json.dumps({
+        "session_start": [{"command": "/codex-venv/bin/python /script.py"}],
+    }), encoding="utf-8")
+    monkey_env = os.environ.copy()
+    os.environ["CODEX_HOME"] = str(codex_home)
+    try:
+        assert _resolve_install_python(tmp_path) == "/codex-venv/bin/python"
+    finally:
+        os.environ.clear()
+        os.environ.update(monkey_env)
+
+
+def test_session_start_sources_constant_covers_all_four():
+    from levain.verify import SESSION_START_SOURCES
+    assert set(SESSION_START_SOURCES) == {"startup", "resume", "clear", "compact"}
 
 
 def test_conduct_interview_checkpoint_fn_failure_does_not_break_interview(tmp_path: Path):

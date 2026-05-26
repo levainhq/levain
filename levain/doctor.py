@@ -55,7 +55,7 @@ def _emit(r: CheckResult) -> None:
         print(f"      → {r.hint}")
 
 
-def run_doctor(path: Path) -> int:
+def run_doctor(path: Path, invoke: bool = False) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain doctor — checking {install}\n")
 
@@ -93,17 +93,31 @@ def run_doctor(path: Path) -> int:
 
     all_results = core + [r for rs in adapter_results.values() for r in rs]
     failed = [r for r in all_results if not r.ok]
+
+    # --invoke: layer the dynamic verify-hooks check on top of static checks.
+    # Only run when the static pass succeeded — invoking hooks on a broken
+    # install just doubles the noise.
+    verify_rc = 0
+    if invoke and not failed:
+        print("\n  Live-fire (--invoke): running verify-hooks dynamic check...")
+        from levain.verify import run_verify_hooks
+        verify_rc = run_verify_hooks(install)
+
     print()
     if failed:
         print(f"{len(failed)} check(s) FAILED.")
+    elif verify_rc != 0:
+        print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
         print("All checks passed.")
-    print(
-        "  Note: doctor is static — it does NOT invoke the activation hooks.\n"
-        "        For the actual firing test, run `levain verify-hooks`.\n"
-        "        Also: hooks no-op when LEVAIN_HOOK_SUPPRESS=1 is in the env."
-    )
-    return 1 if failed else 0
+    if not invoke:
+        print(
+            "  Note: doctor is static — it does NOT invoke the activation hooks.\n"
+            "        For the actual firing test, run `levain verify-hooks`\n"
+            "        or `levain doctor --invoke`.\n"
+            "        Also: hooks no-op when LEVAIN_HOOK_SUPPRESS=1 is in the env."
+        )
+    return 1 if failed or verify_rc != 0 else 0
 
 
 _SEED_REQUIRED = ("origin.md", "partnership.md", "world.md", "memory.md")

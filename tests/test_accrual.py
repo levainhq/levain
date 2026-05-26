@@ -12,6 +12,7 @@ proof artifact's correctness.
 from __future__ import annotations
 
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,41 @@ def test_section_key_unknown_section_passes_through():
     """Unrecognized section names should round-trip through the display
     normalizer but not be coerced to anything else."""
     assert accrual._section_key("Some Future Section") == "Some Future Section"
+
+
+# ---------- _auto_snapshots ----------
+
+def test_auto_snapshots_returns_four_label_date_pairs(tmp_path: Path):
+    """Init a tiny git repo with a file and verify _auto_snapshots returns
+    well-formed LABEL=YYYY-MM-DD strings."""
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+    target = tmp_path / "log.md"
+    target.write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "log.md"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "-m", "add"], check=True)
+
+    specs = accrual._auto_snapshots(tmp_path, "log.md")
+    # 2-anchor minimum (Birth + Now) when span is small; 4 otherwise.
+    assert len(specs) in (2, 4)
+    for spec in specs:
+        assert "=" in spec
+        label, date_str = spec.split("=", 1)
+        # Both halves should be non-empty and the date should parse.
+        from datetime import date
+        assert label and date.fromisoformat(date_str)
+
+
+def test_first_commit_date_raises_for_missing_file(tmp_path: Path):
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "T"], check=True)
+    # Empty repo, no commits — _first_commit_date should raise.
+    with pytest.raises((RuntimeError, Exception)):
+        accrual._first_commit_date(tmp_path, "nonexistent.md")
 
 
 def test_section_key_canonicalizes_case_insensitively():

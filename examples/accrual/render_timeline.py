@@ -65,6 +65,55 @@ def _content_at(repo: Path, sha: str, file_path: str) -> str:
     return _git(["show", f"{sha}:{file_path}"], cwd=repo)
 
 
+def _first_commit_date(repo: Path, file_path: str) -> date:
+    """Date of the commit that first added `file_path` to the repo."""
+    out = _git(
+        [
+            "log",
+            "--diff-filter=A",
+            "--follow",
+            "--format=%ad",
+            "--date=short",
+            "--",
+            file_path,
+        ],
+        cwd=repo,
+    ).strip().splitlines()
+    if not out:
+        raise RuntimeError(
+            f"git log found no add-commit for {file_path} — does it exist in this repo?"
+        )
+    # `--follow` may list multiple add events across renames; take the OLDEST,
+    # which is the bottom-most line in default reverse-chronological order.
+    return date.fromisoformat(out[-1])
+
+
+def _auto_snapshots(repo: Path, file_path: str) -> list[str]:
+    """Derive sensible default snapshot anchors from the file's git history.
+
+    Returns four `LABEL=YYYY-MM-DD` strings: birth, ~25% in, ~75% in, today.
+    For repos with only a few days of history, the intermediate anchors may
+    collapse to the same date — _commit_at handles that fine (returns the
+    same commit at each).
+    """
+    first = _first_commit_date(repo, file_path)
+    now = date.today()
+    span = (now - first).days
+    if span <= 0:
+        return [
+            f"Birth={first.isoformat()}",
+            f"Now={now.isoformat()}",
+        ]
+    early = first + (now - first) / 4
+    late = first + ((now - first) * 3) / 4
+    return [
+        f"Birth={first.isoformat()}",
+        f"Early={early.isoformat()}",
+        f"Late={late.isoformat()}",
+        f"Now={now.isoformat()}",
+    ]
+
+
 _SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 
 # Renames over the 5-month history. Maps display-heading prefix → canonical
@@ -254,8 +303,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--snapshots",
         nargs="+",
-        default=["Week 1=2026-01-12", "Week 4=2026-01-26", "Week 12=2026-03-23", "Now=2026-05-25"],
-        help="LABEL=YYYY-MM-DD pairs",
+        default=None,
+        help=(
+            "LABEL=YYYY-MM-DD pairs. When omitted, defaults derive from the "
+            "file's own git history: Birth (first-add date) / Early (~25%% in) / "
+            "Late (~75%% in) / Now. Override with explicit dates if you want "
+            "specific anchors."
+        ),
     )
     args = p.parse_args(argv)
 
@@ -263,8 +317,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: {args.repo} is not a git repo.")
         return 1
 
+    snapshot_specs = args.snapshots
+    if snapshot_specs is None:
+        try:
+            snapshot_specs = _auto_snapshots(args.repo, args.file)
+        except RuntimeError as e:
+            print(f"FAIL: could not derive default snapshots: {e}")
+            print(f"      Pass --snapshots LABEL=YYYY-MM-DD ... explicitly.")
+            return 1
+        print(f"  Auto-detected snapshots: {' | '.join(snapshot_specs)}\n")
+
     snapshots: list[Snapshot] = []
-    for spec in args.snapshots:
+    for spec in snapshot_specs:
         if "=" not in spec:
             print(f"FAIL: snapshot spec '{spec}' must be LABEL=YYYY-MM-DD")
             return 1

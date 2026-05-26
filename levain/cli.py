@@ -84,6 +84,17 @@ def main(argv: list[str] | None = None) -> int:
         default=Path.cwd(),
         help="Install directory to check (default: cwd).",
     )
+    doc_p.add_argument(
+        "--invoke",
+        action="store_true",
+        help=(
+            "After static checks, also invoke each hook script live (the "
+            "verify-hooks dynamic check) to confirm hooks actually fire and "
+            "emit valid output. Closes the 'doctor green but harness not "
+            "invoking hooks' silent-skip class — particularly useful under "
+            "Codex 0.132/0.133 where hook trust is per-content-hash."
+        ),
+    )
     doc_p.set_defaults(func=_cmd_doctor)
 
     vh_p = subparsers.add_parser(
@@ -119,7 +130,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from levain.doctor import run_doctor
 
-    return run_doctor(path=args.path)
+    return run_doctor(path=args.path, invoke=args.invoke)
 
 
 def _cmd_verify_hooks(args: argparse.Namespace) -> int:
