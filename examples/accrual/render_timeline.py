@@ -69,25 +69,28 @@ _SECTION_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 
 # Renames over the 5-month history. Maps display-heading prefix → canonical
 # architectural name. Lets the new-marker fire only on genuine architectural
-# additions (Proven, Foundation, Cross-Domain), not on renames.
+# additions (Proven, Foundation, Cross-Domain), not on renames. Lookups are
+# case-insensitive — operators have used both `## Partnership Context` and
+# the rare lowercase `## partnership context` in git history; both must
+# canonicalize the same way.
 _RENAME_KEY = {
-    "Partnership Context": "Partnership",
-    "Partnership": "Partnership",
-    "Current State": "State",
-    "State": "State",
-    "Recent Context": "Recent",
-    "Recent": "Recent",
-    "Top of Mind": "Top of Mind",
-    "Action Items": "Actions",
-    "Actions": "Actions",
-    "Emerging Patterns": "Developing",
-    "Developing Knowledge": "Developing",
-    "Developing": "Developing",
-    "Graduated Recently": "Proven",
-    "Proven Knowledge": "Proven",
-    "Proven": "Proven",
-    "Foundation": "Foundation",
-    "Cross-Domain Discoveries": "Cross-Domain",
+    "partnership context": "Partnership",
+    "partnership": "Partnership",
+    "current state": "State",
+    "state": "State",
+    "recent context": "Recent",
+    "recent": "Recent",
+    "top of mind": "Top of Mind",
+    "action items": "Actions",
+    "actions": "Actions",
+    "emerging patterns": "Developing",
+    "developing knowledge": "Developing",
+    "developing": "Developing",
+    "graduated recently": "Proven",
+    "proven knowledge": "Proven",
+    "proven": "Proven",
+    "foundation": "Foundation",
+    "cross-domain discoveries": "Cross-Domain",
 }
 
 
@@ -108,9 +111,13 @@ def _section_display(raw: str) -> str:
 
 
 def _section_key(raw: str) -> str:
-    """Canonical name for architectural-identity comparisons across renames."""
+    """Canonical name for architectural-identity comparisons across renames.
+
+    Lookup is case-insensitive (keys are lowercased); unrecognized headings
+    pass through preserving their original case for display use.
+    """
     display = _section_display(raw)
-    return _RENAME_KEY.get(display, display)
+    return _RENAME_KEY.get(display.lower(), display)
 
 
 def _strip_fenced_blocks(content: str) -> str:
@@ -273,6 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as e:
             print(f"FAIL: {e}")
             return 1
+        except (OSError, UnicodeDecodeError) as e:
+            # Broader filesystem / decode failures: bad --repo path, missing
+            # --file, non-UTF-8 content at the checked-out blob. Surface a
+            # clean error instead of a raw traceback.
+            print(f"FAIL: could not read snapshot for {label.strip()!r}: {e}")
+            return 1
         snapshots.append(snap)
         print(
             f"  {snap.label:8s}  {snap.anchor_date}  commit={snap.commit}  "
@@ -280,7 +293,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     rendered = render(snapshots, args.file)
-    args.out.write_text(rendered, encoding="utf-8")
+    try:
+        args.out.write_text(rendered, encoding="utf-8")
+    except OSError as e:
+        print(f"FAIL: could not write output to {args.out}: {e}")
+        return 1
     print(f"\nWrote {args.out} ({rendered.count(chr(10))+1} lines)")
     return 0
 

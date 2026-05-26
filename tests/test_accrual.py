@@ -77,6 +77,18 @@ def test_section_key_unknown_section_passes_through():
     assert accrual._section_key("Some Future Section") == "Some Future Section"
 
 
+def test_section_key_canonicalizes_case_insensitively():
+    """Lowercase / mixed-case headings still canonicalize to the same key
+    as their canonical-case counterpart."""
+    assert accrual._section_key("partnership context") == "Partnership"
+    assert accrual._section_key("PARTNERSHIP CONTEXT") == "Partnership"
+    assert accrual._section_key("Partnership Context") == "Partnership"
+    assert accrual._section_key("DEVELOPING knowledge") == "Developing"
+    assert accrual._section_key("cross-domain discoveries") == "Cross-Domain"
+    # Unknown sections preserve their original case.
+    assert accrual._section_key("some Custom Section") == "some Custom Section"
+
+
 # ---------- _strip_fenced_blocks ----------
 
 def test_strip_fenced_blocks_removes_inner_headings():
