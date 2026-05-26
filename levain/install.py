@@ -20,6 +20,7 @@ the Codex global `~/.codex/hooks.json` is backed up before being overwritten.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -100,9 +101,35 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
         print("=" * 60)
         print("Interview — fills the world.md and origin.md templates.")
         print("=" * 60)
-        print("  Press Ctrl+C to cancel.")
+
+        # Resume from prior Ctrl+C if a checkpoint exists.
+        initial_answers: dict[str, str] = {}
+        checkpoint = _load_checkpoint(install)
+        if checkpoint:
+            n = len(checkpoint)
+            try:
+                response = input(
+                    f"  Found interview checkpoint with {n} answer(s) from "
+                    f"a prior interrupted run.\n"
+                    f"  Resume from checkpoint? [Y/n] "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled before resume decision.")
+                return 1
+            if response in ("", "y", "yes"):
+                initial_answers = checkpoint
+                print(f"  Resuming — {n} answer(s) restored. Continuing where you left off.")
+            else:
+                _clear_checkpoint(install)
+                print("  Discarded checkpoint. Starting fresh.")
+
+        print("  Press Ctrl+C to interrupt — answers so far will be saved for resume.")
         try:
-            answers = conduct_interview([spec_world, spec_origin])
+            answers = conduct_interview(
+                [spec_world, spec_origin],
+                answers=initial_answers,
+                checkpoint_fn=lambda a: _save_checkpoint(install, a),
+            )
         except (KeyboardInterrupt, EOFError):
             print("\nInterview interrupted.")
             _report_partial_state(install)
@@ -128,8 +155,65 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
     store.parent.mkdir(parents=True, exist_ok=True)
     store_ok = _init_store(store, anneal_path)
 
+    # Interview completed successfully — clear the checkpoint so the next
+    # `levain init --force` doesn't offer to resume stale answers.
+    _clear_checkpoint(install)
+
     _print_next_steps(install, chosen, store_ok=store_ok)
     return 0 if store_ok else 1
+
+
+# ---------- interview checkpoint persistence ----------
+
+def _checkpoint_path(install: Path) -> Path:
+    """Where the interview-resume checkpoint lives. Co-located with the
+    memory store so the whole `.levain/` dir is the operator-state surface."""
+    return install / ".levain" / "interview-checkpoint.json"
+
+
+def _save_checkpoint(install: Path, answers: dict[str, str]) -> None:
+    """Write `answers` atomically to the checkpoint file. Best-effort —
+    silent on filesystem errors (the interview must not fail because the
+    checkpoint can't be written)."""
+    target = _checkpoint_path(install)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic-ish write: temp file + rename so a Ctrl+C mid-write
+        # doesn't leave a half-truncated checkpoint.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(answers, indent=2), encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        pass
+
+
+def _load_checkpoint(install: Path) -> dict[str, str] | None:
+    """Return checkpoint answers if a valid checkpoint exists, else None.
+    Silently treats corrupt/unreadable checkpoints as no-checkpoint."""
+    target = _checkpoint_path(install)
+    if not target.is_file():
+        return None
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Defend against non-string entries (corrupted or hand-edited).
+    return {
+        str(k): str(v)
+        for k, v in data.items()
+        if isinstance(k, str) and isinstance(v, str)
+    }
+
+
+def _clear_checkpoint(install: Path) -> None:
+    """Delete the checkpoint file. No-op if absent."""
+    target = _checkpoint_path(install)
+    try:
+        target.unlink()
+    except (FileNotFoundError, OSError):
+        pass
 
 
 def _report_partial_state(install: Path) -> None:
@@ -137,11 +221,18 @@ def _report_partial_state(install: Path) -> None:
     if not install.is_dir():
         return
     contents = sorted(p.name for p in install.iterdir())
+    checkpoint = _load_checkpoint(install)
+    if checkpoint:
+        print(
+            f"  Interview checkpoint saved with {len(checkpoint)} answer(s). "
+            f"Re-run `levain init --path {install} --force` to resume."
+        )
     if not contents:
         print(f"  Install dir {install} is empty — safe to re-run.")
         return
     print(f"  Install dir {install} contains: {', '.join(contents)}")
-    print(f"  Re-run `levain init` with --force to overwrite, or delete the dir first.")
+    if not checkpoint:
+        print(f"  Re-run `levain init` with --force to overwrite, or delete the dir first.")
 
 
 class _UserCancelled(Exception):

@@ -169,6 +169,7 @@ def conduct_interview(
     answers: dict[str, str] | None = None,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    checkpoint_fn: Callable[[dict[str, str]], None] | None = None,
 ) -> dict[str, str]:
     """Walk every spec, prompt for each slot, return slot -> answer dict.
 
@@ -178,6 +179,11 @@ def conduct_interview(
 
     `input_fn` and `output_fn` are dependency-injected so the engine is
     testable without a real terminal.
+
+    `checkpoint_fn`, when provided, is called with the running `answers`
+    dict after each section completes. install.py uses this to persist
+    progress so a Ctrl+C mid-interview can be resumed on the next
+    `levain init` against the same path.
     """
     answers = dict(answers or {})
 
@@ -217,6 +223,16 @@ def conduct_interview(
                 style_basis = clause if clause is not None else section.hints
                 style = _detect_input_style(slot, style_basis)
                 answers[slot] = _prompt_for_slot(slot, style, input_fn, output_fn)
+
+            # Persist progress after each completed section — Ctrl+C between
+            # sections then resumes from this point on next levain init.
+            if checkpoint_fn is not None:
+                try:
+                    checkpoint_fn(answers)
+                except Exception:
+                    # Checkpoint persistence is best-effort; never fail the
+                    # interview on a filesystem hiccup.
+                    pass
 
     return answers
 

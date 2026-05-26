@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from levain.install import (
+    _checkpoint_path,
+    _clear_checkpoint,
     _is_safe_install_target,
+    _load_checkpoint,
+    _save_checkpoint,
     _substitute_hook_placeholders,
     _templates_root,
 )
@@ -140,3 +144,164 @@ def test_substitute_hook_placeholders_handles_no_placeholder(tmp_path: Path):
     )
     # File should be unchanged (no rewrite when content didn't change)
     assert target.read_text(encoding="utf-8") == "print('no placeholder here')\n"
+
+
+# ---------- interview checkpoint persistence ----------
+
+def test_checkpoint_path_is_inside_dot_levain(tmp_path: Path):
+    p = _checkpoint_path(tmp_path)
+    assert p == tmp_path / ".levain" / "interview-checkpoint.json"
+
+
+def test_save_and_load_checkpoint_round_trip(tmp_path: Path):
+    answers = {"NAME": "Alex", "CITY": "Columbus"}
+    _save_checkpoint(tmp_path, answers)
+    loaded = _load_checkpoint(tmp_path)
+    assert loaded == answers
+
+
+def test_load_checkpoint_returns_none_when_absent(tmp_path: Path):
+    assert _load_checkpoint(tmp_path) is None
+
+
+def test_load_checkpoint_returns_none_on_corrupt_json(tmp_path: Path):
+    target = _checkpoint_path(tmp_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("not valid json {{{", encoding="utf-8")
+    assert _load_checkpoint(tmp_path) is None
+
+
+def test_load_checkpoint_returns_none_when_not_a_dict(tmp_path: Path):
+    target = _checkpoint_path(tmp_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('["a", "list", "not a dict"]', encoding="utf-8")
+    assert _load_checkpoint(tmp_path) is None
+
+
+def test_load_checkpoint_filters_non_string_entries(tmp_path: Path):
+    """A corrupted checkpoint with non-string values should be sanitized,
+    not propagate type weirdness into the interview."""
+    target = _checkpoint_path(tmp_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        '{"NAME": "Alex", "NUMBER": 42, "NULL_VAL": null, "CITY": "Columbus"}',
+        encoding="utf-8",
+    )
+    loaded = _load_checkpoint(tmp_path)
+    assert loaded == {"NAME": "Alex", "CITY": "Columbus"}
+
+
+def test_save_checkpoint_creates_parent_dir(tmp_path: Path):
+    """`.levain/` doesn't exist yet at first checkpoint write."""
+    install = tmp_path / "new-install"
+    install.mkdir()
+    _save_checkpoint(install, {"X": "y"})
+    assert (install / ".levain" / "interview-checkpoint.json").is_file()
+
+
+def test_save_checkpoint_atomic_via_temp_file(tmp_path: Path):
+    """A second save should replace the first cleanly. No .tmp left behind."""
+    _save_checkpoint(tmp_path, {"A": "1"})
+    _save_checkpoint(tmp_path, {"A": "2", "B": "3"})
+    loaded = _load_checkpoint(tmp_path)
+    assert loaded == {"A": "2", "B": "3"}
+    # No leftover .tmp
+    tmps = list((tmp_path / ".levain").glob("*.tmp"))
+    assert tmps == []
+
+
+def test_clear_checkpoint_removes_existing(tmp_path: Path):
+    _save_checkpoint(tmp_path, {"X": "y"})
+    assert _load_checkpoint(tmp_path) is not None
+    _clear_checkpoint(tmp_path)
+    assert _load_checkpoint(tmp_path) is None
+
+
+def test_clear_checkpoint_is_noop_when_absent(tmp_path: Path):
+    # Should not raise on a missing checkpoint.
+    _clear_checkpoint(tmp_path)
+
+
+# ---------- conduct_interview + checkpoint integration ----------
+
+def test_conduct_interview_calls_checkpoint_fn_after_each_section(tmp_path: Path):
+    from levain.interview import conduct_interview, parse_template
+
+    template = tmp_path / "test.md"
+    template.write_text(
+        "# Test\n\n"
+        "## First\n\n<!-- interview: their name -->\n\n{{NAME}}\n\n"
+        "## Second\n\n<!-- interview: their city -->\n\n{{CITY}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+
+    checkpoints: list[dict[str, str]] = []
+    answers = conduct_interview(
+        [spec],
+        input_fn=lambda prompt: "Alex" if "NAME" in prompt else "Columbus",
+        output_fn=lambda s: None,
+        checkpoint_fn=lambda a: checkpoints.append(dict(a)),
+    )
+    # Two sections → two checkpoint snapshots, cumulative.
+    assert len(checkpoints) == 2
+    assert checkpoints[0] == {"NAME": "Alex"}
+    assert checkpoints[1] == {"NAME": "Alex", "CITY": "Columbus"}
+    assert answers == {"NAME": "Alex", "CITY": "Columbus"}
+
+
+def test_conduct_interview_with_initial_answers_skips_answered_slots(tmp_path: Path):
+    """The resume contract: pre-load answers from checkpoint, only
+    unasked slots should be prompted."""
+    from levain.interview import conduct_interview, parse_template
+
+    template = tmp_path / "resume.md"
+    template.write_text(
+        "# Resume\n\n"
+        "## Identity\n\n<!-- interview: name; city -->\n\n{{NAME}} {{CITY}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+
+    prompts: list[str] = []
+
+    def driver(prompt: str) -> str:
+        prompts.append(prompt)
+        return "Columbus"
+
+    answers = conduct_interview(
+        [spec],
+        answers={"NAME": "Alex"},  # already answered from "checkpoint"
+        input_fn=driver,
+        output_fn=lambda s: None,
+    )
+    # Should have prompted only for CITY (NAME was pre-loaded).
+    assert answers == {"NAME": "Alex", "CITY": "Columbus"}
+    # NAME prompt should not appear in the captured prompts.
+    assert not any("NAME" in p for p in prompts)
+    assert any("CITY" in p for p in prompts)
+
+
+def test_conduct_interview_checkpoint_fn_failure_does_not_break_interview(tmp_path: Path):
+    """If the checkpoint write fails (full disk, permission, etc.) the
+    interview must complete normally — best-effort persistence."""
+    from levain.interview import conduct_interview, parse_template
+
+    template = tmp_path / "robust.md"
+    template.write_text(
+        "# Robust\n\n## S\n\n<!-- interview: name -->\n\n{{NAME}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+
+    def broken_checkpoint(_a):
+        raise OSError("simulated disk full")
+
+    answers = conduct_interview(
+        [spec],
+        input_fn=lambda prompt: "Alex",
+        output_fn=lambda s: None,
+        checkpoint_fn=broken_checkpoint,
+    )
+    # Interview completed cleanly despite checkpoint failures.
+    assert answers == {"NAME": "Alex"}
