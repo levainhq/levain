@@ -52,3 +52,7 @@ include = ["levain*"]
 
 [tool.setuptools.package-data]
 levain = ["templates/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
