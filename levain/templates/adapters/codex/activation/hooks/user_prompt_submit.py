@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Levain activation — UserPromptSubmit hook (Codex adapter).
 
-Layer B (recency) + Layer D (the ambient-nudge half).
+Layer B (recency) + the event-based prospective surface + Layer D (the
+ambient-nudge half).
 
 Wired to Codex's UserPromptSubmit event. Injects, at recency position
 (immediately before each user prompt is processed):
@@ -9,11 +10,26 @@ Wired to Codex's UserPromptSubmit event. Injects, at recency position
   1. One directive selected at random from activation/recency_directives.md —
      the within-session-durability layer. Selecting across differently-framed
      directives fights attention habituation.
-  2. When episodes recorded since the last wrap reach WRAP_NUDGE_THRESHOLD, a
+  2. Open spores (prospective layer) whose content COLLIDES with this prompt —
+     the event-based germination surface: an open loop surfaces when the current
+     work touches it. Precision-biased and capped, so an unrelated prompt
+     injects nothing (the effortful full-list poll stays opt-in, per the seed).
+  3. When episodes recorded since the last wrap reach WRAP_NUDGE_THRESHOLD, a
      one-line wrap nudge — the ambient half of Layer D.
 
-The two are independent: a broken directives file drops (1) but must not also
-drop (2), so `sections` is built additively.
+The three are independent: a broken directives file drops (1) but must not also
+drop (2)/(3), so `sections` is built additively.
+
+Prompt-key: the collision surface reads the user's text from
+`payload["prompt"]`. VERIFIED against codex-cli 0.133.0 source —
+`UserPromptSubmitCommandInput` serializes `prompt: request.prompt.clone()`
+(codex-rs/hooks/src/events/user_prompt_submit.rs) — so the key matches Claude
+Code's UserPromptSubmit shape. If a future Codex re-keys it, the surface
+degrades to silence (the `isinstance(prompt, str)` guard no-ops) — fail-open,
+never a crash. SEPARATE, still-open item: Codex silent-skips lifecycle hooks
+under `codex exec` through 0.133, so whether the hook FIRES at all under
+*interactive* `codex` (distinct from the payload shape, which is confirmed) is
+the Bucket 3 mechanism-canary verification.
 
 Codex note: on the first prompt of a fresh session, Codex may fire
 UserPromptSubmit alongside SessionStart (both inject context simultaneously
@@ -54,16 +70,17 @@ except Exception:
 # substantial session, before the upper bound, without nagging a short one.
 WRAP_NUDGE_THRESHOLD = 12
 
-# Per-attempt timeout for the Layer D wrap-count query. Tight because this
-# hook runs before EVERY prompt — a slow or hung anneal-memory must not stall
-# the turn. (session_start.py uses episodes_since_wrap's 5s default: it fires
-# once per session and is not latency-sensitive.)
+# Per-attempt timeout for the anneal-memory queries (wrap-count + open spores).
+# Tight because this hook runs before EVERY prompt — a slow or hung
+# anneal-memory must not stall the turn. (session_start.py uses the 5s default:
+# it fires once per session and is not latency-sensitive.)
 WRAP_CHECK_TIMEOUT = 2.0
+SPORE_CHECK_TIMEOUT = 2.0
 
 
 def main() -> int:
     try:
-        hook.read_stdin()  # consume stdin; payload not needed for selection
+        payload = hook.read_stdin()
 
         if not hook.should_fire():
             return 0
@@ -76,19 +93,33 @@ def main() -> int:
         )
         # random.choice() raises IndexError on [] — only call it when the
         # directives file parsed to at least one block. A broken directives
-        # file drops Layer B but must NOT drop the Layer D nudge below, so
+        # file drops Layer B but must NOT drop the sections below, so
         # `sections` is additive (cf. session_start.py).
         if directives:
             sections.append(random.choice(directives))
 
-        # Layer D — ambient nudge. Independent of Layer B above.
+        # Event-based spore germination — open loops whose content collides with
+        # this prompt surface on their own (the intelligent prospective surface;
+        # the effortful full-list poll stays opt-in, per the seed). Precision-
+        # biased + capped, so an irrelevant prompt injects nothing. Prompt-key
+        # ("prompt") verified vs codex-cli 0.133.0 source (see module docstring);
+        # fail-open if a future Codex re-keys it.
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            hits = hook.spores_colliding(
+                prompt, hook.open_spores(timeout=SPORE_CHECK_TIMEOUT)
+            )
+            if hits:
+                sections.append(hook.format_spore_collisions(hits))
+
+        # Layer D — ambient nudge. Independent of the sections above.
         n = hook.episodes_since_wrap(timeout=WRAP_CHECK_TIMEOUT)
         if n is not None and n >= WRAP_NUDGE_THRESHOLD:
             sections.append(
                 f"[wrap nudge] {n} episodes recorded since the last wrap. At "
                 f"the next natural pause, run the wrap sequence (prepare_wrap "
-                f"-> contradiction-scan -> compress -> save_continuity) — that "
-                f"is where the partnership compounds across sessions."
+                f"-> compress -> save_continuity) — that is where the "
+                f"partnership compounds across sessions."
             )
 
         if sections:

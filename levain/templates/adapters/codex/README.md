@@ -47,8 +47,8 @@ supported in v1.
     ├── recency_directives.md     <- operator-editable; the recency directive set
     └── hooks/
         ├── _levain_hook.py        <- shared helpers
-        ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch)
-        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + Layer D nudge)
+        ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch + due-spore surface)
+        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + spore-collision surface + Layer D nudge)
 
 ~/.codex/
 ├── hooks.json                    <- from hooks.json.template; wires the hooks globally
@@ -84,13 +84,17 @@ See `../../activation_spec.md` for the full design.
   date/time. Fires on `startup` / `resume` / `clear` / `compact` (the full
   Codex 0.133 source vocabulary). On a genuinely fresh session
   (`source ∈ {"startup", "clear"}`) it also runs the **Layer D start-catch**
-  — if the previous session left episodes unwrapped, it flags it. `resume`
-  and `compact` are treated as ongoing work and skip the wrap-check.
-- **`user_prompt_submit.py`** → `UserPromptSubmit` (Layer B). Injects, at
-  recency position before each prompt: one directive selected at random
-  from `activation/recency_directives.md`. Once episodes-since-last-wrap
-  pass a threshold (default 12) it also appends the **Layer D ambient
-  nudge**.
+  — if the previous session left episodes unwrapped, it flags it — and the
+  **time-based prospective surface**: open spores gone dormant (or whose
+  `next` date has arrived) are surfaced once so nothing rots silently.
+  `resume` and `compact` are treated as ongoing work and skip both.
+- **`user_prompt_submit.py`** → `UserPromptSubmit` (Layer B + the event-based
+  prospective surface). Injects, at recency position before each prompt: one
+  directive selected at random from `activation/recency_directives.md`, plus
+  any open spores whose content **collides** with the prompt — the
+  event-based germination surface (precision-biased and capped; an unrelated
+  prompt injects nothing). Once episodes-since-last-wrap pass a threshold
+  (default 12) it also appends the **Layer D ambient nudge**.
 
 No Stop hook is wired. Codex 0.133's `stop.command.output` schema accepts
 `continue` / `decision` / `reason` / `stopReason` / `suppressOutput` /

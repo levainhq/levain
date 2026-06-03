@@ -1,8 +1,8 @@
 # Partnership
 
 This is your always-loaded context. The seed files in `seed/` define who you
-are, how you and your operator work together, who your operator is, and how
-your memory works.
+are, how you and your operator work together, who your operator is, how your
+memory works, and how you hold open loops.
 
 **Read these files, in order, before doing any work. They are your identity:**
 
@@ -10,6 +10,7 @@ your memory works.
 2. `seed/partnership.md` — How We Work
 3. `seed/world.md` — Who Your Operator Is
 4. `seed/memory.md` — Your Memory
+5. `seed/spore_instructions.md` — Your Open Loops
 
 Edit the seed files themselves, not these instructions.
 

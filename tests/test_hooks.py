@@ -3,6 +3,8 @@ germination matchers: event-based content collision + time-based due/dormant."""
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -13,6 +15,29 @@ _HOOKS = (
 sys.path.insert(0, str(_HOOKS))
 
 import _levain_hook as hook  # noqa: E402
+
+# The Codex adapter ships its OWN copy of _levain_hook.py (the installers copy
+# different activation trees per adapter — shared for Claude Code, the codex
+# subtree for Codex). Load it under a distinct module name so the parity tests
+# can compare the two without import-cache collision.
+_CODEX_HOOK_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "levain" / "templates" / "adapters" / "codex" / "activation" / "hooks"
+    / "_levain_hook.py"
+)
+
+
+def _load_codex_hook():
+    spec = importlib.util.spec_from_file_location(
+        "_levain_hook_codex", _CODEX_HOOK_FILE
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+codex_hook = _load_codex_hook()
 
 
 def _spore(**kw):
@@ -136,3 +161,45 @@ def test_generic_work_tokens_dont_false_collide():
     # Two generic work tokens shared with an unrelated spore are NOT a match.
     s = _spore(text="review the test file for the parser")
     assert hook.spores_colliding("please review the test file i sent", [s]) == []
+
+
+# The substrate-neutral germination surface MUST stay byte-identical between the
+# shared (Claude Code) hooks and the Codex adapter's copy. The two drifted once —
+# Slice 2 wired germination into the shared copy only; the Codex copy was a wrap
+# behind (the gap Slice 3 closed). This is the structural guard against that
+# recurring until the v1.2 single-_levain_hook refactor collapses the two copies.
+_PORTED_FNS = (
+    "_anneal_json", "_is_int_episodes", "episodes_since_wrap",
+    "open_spores", "_tokens", "spores_colliding", "due_dormant_spores",
+    "_format_spore_lines", "format_spore_collisions", "format_due_spores",
+)
+
+
+class TestCodexParity:
+    def test_germination_functions_byte_identical(self):
+        for name in _PORTED_FNS:
+            shared_src = inspect.getsource(getattr(hook, name))
+            codex_src = inspect.getsource(getattr(codex_hook, name))
+            assert codex_src == shared_src, (
+                f"{name} drifted between the shared and Codex _levain_hook.py — "
+                f"re-sync the Codex adapter's germination surface."
+            )
+
+    def test_tokenizer_constants_match(self):
+        assert codex_hook._STOPWORDS == hook._STOPWORDS
+        assert codex_hook._WORD_RE.pattern == hook._WORD_RE.pattern
+        assert codex_hook._MAX_TOKENIZE_CHARS == hook._MAX_TOKENIZE_CHARS
+
+    def test_codex_collision_surface_works(self):
+        # Not just identical text — the Codex module actually imports and runs
+        # (guards a codex-only import/typo that source-identity wouldn't catch).
+        s = _spore(text="restrict the api keys", id="spore-007")
+        hits = codex_hook.spores_colliding("can we restrict the api keys now", [s])
+        assert len(hits) == 1 and hits[0]["id"] == "spore-007"
+
+    def test_codex_due_dormant_surface_works(self):
+        spores = [
+            _spore(id="a", germination="dormant"),
+            _spore(id="b", germination="growing"),
+        ]
+        assert {s["id"] for s in codex_hook.due_dormant_spores(spores)} == {"a"}

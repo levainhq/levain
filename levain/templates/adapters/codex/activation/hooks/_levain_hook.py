@@ -41,8 +41,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -142,22 +144,36 @@ def read_blocks(path: Path) -> list[str]:
 _INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"
 
 
-def episodes_since_wrap(timeout: float = 5.0) -> int | None:
-    """Episodes recorded since the last wrap, via anneal-memory's public CLI.
+def _anneal_json(
+    sub_args: list[str],
+    timeout: float,
+    validator: Callable[[object], bool] | None = None,
+) -> object | None:
+    """Run an anneal-memory subcommand (which must produce JSON on stdout)
+    against THIS install's store and return the parsed JSON, or None on any
+    failure. The store is pinned explicitly with `--db` to this install's store
+    (see store_path) — never anneal-memory's machine-global default, which would
+    silently merge two installs' memories. Tries the install-resolved binary
+    first, then the PATH console script, then the module form.
 
-    This is the signal Layer D runs on. The store is pinned explicitly with
-    `--db` to this install's store (see store_path) — never left to
-    anneal-memory's machine-global default. Returns None when anneal-memory
-    is not installed, the store does not exist yet, or anything errors —
-    Layer D then stays silent. Tries the install-resolved binary first,
-    then the PATH-lookup console script, then the module form."""
+    No-stall (the load-bearing invariant): a ``TimeoutExpired`` ABORTS the
+    candidate loop and returns None. A timeout means this anneal invocation is
+    hanging, and the other candidates invoke the SAME anneal (different entry
+    points) — they would hang too. So each query costs at most ONE `timeout`,
+    not one-per-candidate.
+
+    ``validator``, when given, must accept the parsed JSON; a candidate whose
+    JSON fails it is skipped to try the next (so a stale binary returning the
+    wrong shape does not block a working fallback). Fail-silent: a missing
+    anneal-memory, no store yet, a too-old anneal lacking the subcommand, a parse
+    error, or a wrong-shape result all return None."""
     db = str(store_path())
     candidates = []
     if "{{" not in _INSTALL_ANNEAL_BIN:
-        candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, "status", "--json"])
+        candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, *sub_args])
     candidates.extend([
-        ["anneal-memory", "--db", db, "status", "--json"],
-        [sys.executable, "-m", "anneal_memory", "--db", db, "status", "--json"],
+        ["anneal-memory", "--db", db, *sub_args],
+        [sys.executable, "-m", "anneal_memory", "--db", db, *sub_args],
     ])
     for cmd in candidates:
         try:
@@ -165,20 +181,147 @@ def episodes_since_wrap(timeout: float = 5.0) -> int | None:
                 cmd, capture_output=True, text=True,
                 errors="replace", timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            return None  # anneal is hanging — don't re-invoke the same binary
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
         if result.returncode != 0 or not result.stdout.strip():
             continue
         try:
-            data = json.loads(result.stdout)
+            parsed = json.loads(result.stdout)
         except ValueError:
             continue
-        if not isinstance(data, dict):
-            continue
+        if validator is not None and not validator(parsed):
+            continue  # valid JSON, wrong shape (e.g. a stale binary) — try next
+        return parsed
+    return None
+
+
+def _is_int_episodes(data: object) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("episodes_since_wrap"), int)
+
+
+def episodes_since_wrap(timeout: float = 5.0) -> int | None:
+    """Episodes recorded since the last wrap (the signal Layer D runs on), via
+    anneal-memory's `status --json`. Returns None on any failure — Layer D then
+    stays silent."""
+    data = _anneal_json(["status", "--json"], timeout, validator=_is_int_episodes)
+    if isinstance(data, dict):
         value = data.get("episodes_since_wrap")
         if isinstance(value, int):
             return value
     return None
+
+
+# ---- Prospective layer (spores) — the germination surfaces ----
+
+def open_spores(timeout: float = 2.0) -> list[dict]:
+    """Open spores for this install, via anneal-memory's `spore list --json`.
+    Returns [] on any failure (an anneal too old to have spores, no store yet,
+    an error) — the prospective surfaces then show nothing. Tight default
+    timeout: the collision surface runs before every prompt."""
+    data = _anneal_json(
+        ["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list)
+    )
+    if isinstance(data, list):
+        return [s for s in data if isinstance(s, dict)]
+    return []
+
+
+# Tokens of 3+ word-chars; common words that would create false collisions are
+# dropped so a >=2-token overlap means genuine content kinship, not "the"/"and".
+# The set includes generic *work* words (code/test/file/review/…) because two
+# such shared tokens between a prompt and an unrelated spore would be noise, not
+# kinship (codex L3 LOW — precision).
+_WORD_RE = re.compile(r"[A-Za-z0-9_]{3,}")
+_STOPWORDS = frozenset({
+    "the", "and", "for", "this", "that", "with", "from", "into", "your", "you",
+    "are", "was", "were", "have", "has", "had", "will", "would", "should", "can",
+    "could", "but", "not", "all", "any", "out", "now", "how", "what", "why",
+    "who", "when", "where", "lets", "let", "get", "got", "use", "using", "need",
+    "want", "about", "just", "like", "make", "made", "one", "two", "its", "our",
+    # generic work/dev words — shared, but not evidence of content kinship.
+    "code", "test", "tests", "file", "files", "review", "fix", "fixes", "change",
+    "changes", "update", "updates", "run", "check", "build", "thing", "things",
+    "stuff", "item", "items", "look", "see", "try", "done", "next", "more",
+})
+
+
+# Cap on the characters fed to the regex/set-build, so a pasted huge prompt or
+# a pathological spore text can't burn CPU before the result cap applies
+# (codex L3 MEDIUM). Collision matches on the gist; the first few KB suffice.
+_MAX_TOKENIZE_CHARS = 4000
+
+
+def _tokens(text: str) -> set[str]:
+    return {t.lower() for t in _WORD_RE.findall(text[:_MAX_TOKENIZE_CHARS])} - _STOPWORDS
+
+
+def spores_colliding(
+    prompt: str, spores: list[dict], min_overlap: int = 2, limit: int = 3
+) -> list[dict]:
+    """Open spores whose text collides with `prompt` by >= `min_overlap`
+    distinct, non-trivial shared tokens — the EVENT-based germination surface
+    (an open loop surfaces when the current work touches it). Precision-biased:
+    a 2-token floor and a small result cap keep this "better nothing than
+    noise." Returns the top `limit` by overlap; [] on an empty prompt or no
+    real collisions."""
+    p = _tokens(prompt)
+    if not p:
+        return []
+    scored: list[tuple[int, dict]] = []
+    for s in spores:
+        text = s.get("text")
+        if not isinstance(text, str):
+            continue
+        overlap = len(p & _tokens(text))
+        if overlap >= min_overlap:
+            scored.append((overlap, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:limit]]
+
+
+def due_dormant_spores(spores: list[dict], limit: int = 5) -> list[dict]:
+    """Open spores that have gone DORMANT — quiet too long, or their `next`
+    surface-date has arrived (anneal computes the `germination` tier). This is
+    the TIME-based germination surface, shown once at session start. Growing,
+    resting, and parked spores stay out of the way. Capped at `limit`."""
+    due = [s for s in spores if s.get("germination") == "dormant"]
+    return due[:limit]
+
+
+def _format_spore_lines(spores: list[dict], *, with_next: bool) -> list[str]:
+    lines: list[str] = []
+    for s in spores:
+        stype = s.get("type", "?")
+        text = s.get("text", "")
+        sid = s.get("id", "?")
+        tail = ""
+        if with_next and s.get("next"):
+            tail = f", next {s['next']}"
+        lines.append(f"  - ({stype}) {text}  [{sid}{tail}]")
+    return lines
+
+
+def format_spore_collisions(spores: list[dict]) -> str:
+    """The recency-position injection for the event-based surface."""
+    return "\n".join([
+        "[open loops — relevant to what you're doing]",
+        *_format_spore_lines(spores, with_next=False),
+        "These open loops touch the current work. Advance, resolve "
+        "(spore_descend / spore_ascend), or set aside as fits — don't let a "
+        "relevant one go unattended.",
+    ])
+
+
+def format_due_spores(spores: list[dict]) -> str:
+    """The primacy-position injection for the time-based surface."""
+    return "\n".join([
+        "[open loops — due or gone quiet]",
+        *_format_spore_lines(spores, with_next=True),
+        "These have gone quiet or their time has come. For each: still alive "
+        "(spore_touch to keep it), or ready to compost (spore_descend)?",
+    ])
 
 
 def temporal() -> str:
