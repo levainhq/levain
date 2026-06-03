@@ -33,7 +33,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "anneal-memory>=0.3.3,<0.4",
+    # Partnership seed needs the full 0.4.x stack: spores (0.4.0), schema-aware
+    # budget (0.4.2), and `init --schema partnership` (0.4.4 — AM-INITSCHEMA).
+    "anneal-memory>=0.4.4,<0.5",
 ]
 
 [project.optional-dependencies]

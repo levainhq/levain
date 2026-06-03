@@ -519,20 +519,17 @@ def _merge_codex_config(path: Path, fragment: str) -> None:
     path.write_text(existing, encoding="utf-8")
 
 
-def _init_store(store: Path, anneal_path: str) -> bool:
-    """Initialize the anneal-memory store. Return True on success."""
-    print()
-    if store.is_file() and store.stat().st_size > 0:
-        # An existing store carries the entity's memory + identity; --force
-        # overlays seed/adapter files but never touches the memory store.
-        print(f"anneal-memory store already present at {store} — preserved.")
-        return True
-
-    print(f"Initializing anneal-memory store at {store}...")
-
+def _run_anneal_cmd(
+    store: Path, anneal_path: str, sub_args: list[str]
+) -> tuple[bool, str, list[str]]:
+    """Run an anneal-memory subcommand against ``store``, trying the console
+    script first then ``python -m anneal_memory``. Returns ``(ok, stdout,
+    errors)`` — ``ok`` True on the first candidate that exits 0 (with its
+    stdout), else False with the collected per-candidate error strings.
+    """
     candidates = [
-        [anneal_path, "--db", str(store), "init"],
-        [sys.executable, "-m", "anneal_memory", "--db", str(store), "init"],
+        [anneal_path, "--db", str(store), *sub_args],
+        [sys.executable, "-m", "anneal_memory", "--db", str(store), *sub_args],
     ]
     errors: list[str] = []
     for cmd in candidates:
@@ -545,17 +542,78 @@ def _init_store(store: Path, anneal_path: str) -> bool:
             errors.append(f"{cmd[0]}: timed out")
             continue
         if result.returncode == 0:
-            print("  Store initialized.")
+            return True, result.stdout, errors
+        errors.append(f"{cmd[0]}: {(result.stderr or result.stdout).strip()[:500]}")
+    return False, "", errors
+
+
+def _store_schema_name(store: Path, anneal_path: str) -> str | None:
+    """Best-effort read of the store's persisted schema name via `status --json`.
+    Returns the name (e.g. ``"partnership"`` / ``"default"``), or ``None`` if it
+    can't be determined (anneal too old to report it, or a parse/read failure)."""
+    ok, out, _errors = _run_anneal_cmd(store, anneal_path, ["status", "--json"])
+    if not ok:
+        return None
+    try:
+        name = json.loads(out).get("schema")
+    except (ValueError, TypeError):
+        return None
+    return name if isinstance(name, str) else None
+
+
+def _init_store(store: Path, anneal_path: str) -> bool:
+    """Initialize (or schema-migrate) the anneal-memory store. Return True on success."""
+    print()
+    if store.is_file() and store.stat().st_size > 0:
+        # An existing store carries the entity's memory + identity; --force
+        # overlays seed/adapter files but never touches the memory CONTENT. We DO
+        # ensure its section schema is partnership: a store created on the old ops
+        # schema, re-installed under a partnership seed, would otherwise be a
+        # silently-ops partnership entity — the exact invariant this kit protects.
+        # Preflight the schema first and migrate ONLY when needed: skipping a
+        # redundant `set-schema` on an already-partnership store avoids its audit
+        # entry AND the wrap-guard edge (set-schema refuses mid-wrap, before any
+        # same-schema short-circuit — so a no-op migrate could spuriously fail).
+        # The migration itself (`set-schema`) preserves memory content (episodes,
+        # wraps, continuity text); it rewrites the schema metadata row and records
+        # a `section_schema_set` audit event.
+        print(f"anneal-memory store already present at {store} — memory preserved.")
+        if _store_schema_name(store, anneal_path) == "partnership":
+            print("  Section schema already partnership — nothing to migrate.")
             return True
-        err = (result.stderr or result.stdout).strip()[:500]
-        errors.append(f"{cmd[0]}: {err}")
+        ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["set-schema", "partnership"])
+        if ok:
+            print("  Section schema migrated to partnership (memory content preserved).")
+            return True
+        print("  ! Could not ensure the partnership schema on the existing store:")
+        for e in errors:
+            print(f"    - {e}")
+        print(f"    The memory is preserved, but the schema may still be the ops")
+        print(f"    default — a partnership entity needs the 6-section schema.")
+        print(f"    Fix: pip install -U anneal-memory")
+        print(f"    Then: anneal-memory --db {store} set-schema partnership")
+        return False
+
+    print(f"Initializing anneal-memory store at {store}...")
+
+    # Persist the 6-section partnership schema at creation (anneal AM-INITSCHEMA).
+    # This is the only point the felt-layer proportion-gate + schema-aware budget
+    # get switched on — a store left on the default silently runs the 4-section
+    # ops schema. We fail loud (below) rather than fall back to a default init,
+    # because a silently-ops partnership entity is exactly the failure to prevent.
+    ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["init", "--schema", "partnership"])
+    if ok:
+        print("  Store initialized (partnership schema).")
+        return True
 
     print("  ! Could not initialize store:")
     for e in errors:
         print(f"    - {e}")
-    print(f"    Most likely cause: anneal-memory is not installed in this Python.")
-    print(f"    Fix: pip install anneal-memory  (or `pip install --user anneal-memory`)")
-    print(f"    Then: anneal-memory --db {store} init")
+    print(f"    Most likely cause: anneal-memory is not installed in this Python,")
+    print(f"    or is older than the release that supports `init --schema` /")
+    print(f"    `set-schema` (the 6-section partnership schema).")
+    print(f"    Fix: pip install -U anneal-memory")
+    print(f"    Then: anneal-memory --db {store} init --schema partnership")
     return False
 
 

@@ -15,6 +15,7 @@ import pytest
 from levain.install import (
     _checkpoint_path,
     _clear_checkpoint,
+    _init_store,
     _is_safe_install_target,
     _load_checkpoint,
     _save_checkpoint,
@@ -451,3 +452,187 @@ def test_conduct_interview_checkpoint_fn_failure_does_not_break_interview(tmp_pa
     )
     # Interview completed cleanly despite checkpoint failures.
     assert answers == {"NAME": "Alex"}
+
+
+# ---------- _init_store: Bucket-2 partnership schema wiring ----------
+
+
+def test_init_store_requests_partnership_schema(tmp_path: Path, monkeypatch):
+    """The install MUST persist the 6-section partnership schema (anneal
+    `init --schema partnership`), not the default ops schema — otherwise the
+    felt-layer proportion-gate and schema-aware budget silently never fire."""
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _Result()
+
+    monkeypatch.setattr("levain.install.subprocess.run", fake_run)
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+
+    ok = _init_store(store, "anneal-memory")
+
+    assert ok is True
+    cmd = captured["cmd"]
+    i = cmd.index("init")
+    assert cmd[i:i + 3] == ["init", "--schema", "partnership"]
+
+
+def test_init_store_existing_ops_store_migrates_via_set_schema(tmp_path: Path, monkeypatch):
+    """An existing NON-partnership store is NOT re-init'd (memory preserved) but
+    its schema IS migrated via `set-schema` (auto-migrate — no silently-ops
+    entity under a partnership seed on the upgrade path). The preflight `status
+    --json` reports a non-partnership schema, so the migration runs."""
+    cmds = []
+
+    def fake_run(cmd, **kwargs):
+        cmds.append(cmd)
+
+        class _R:
+            returncode = 0
+            # status --json preflight: report the existing store as ops/default.
+            stdout = '{"schema": "default"}' if "status" in cmd else ""
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr("levain.install.subprocess.run", fake_run)
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"existing store bytes")
+
+    ok = _init_store(store, "anneal-memory")
+
+    assert ok is True
+    assert any("set-schema" in cmd and "partnership" in cmd for cmd in cmds)
+    assert all("init" not in cmd for cmd in cmds)  # never re-init'd
+
+
+def test_init_store_existing_partnership_store_skips_migration(tmp_path: Path, monkeypatch):
+    """An already-partnership store: the preflight detects it and runs NO
+    `set-schema` (codex L3 LOW-1 — avoids the redundant audit entry + the
+    wrap-guard edge where a no-op migrate could spuriously fail)."""
+    cmds = []
+
+    def fake_run(cmd, **kwargs):
+        cmds.append(cmd)
+
+        class _R:
+            returncode = 0
+            stdout = '{"schema": "partnership"}' if "status" in cmd else ""
+            stderr = ""
+
+        return _R()
+
+    monkeypatch.setattr("levain.install.subprocess.run", fake_run)
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"existing store bytes")
+
+    ok = _init_store(store, "anneal-memory")
+
+    assert ok is True
+    assert all("set-schema" not in cmd for cmd in cmds)  # no redundant migration
+    assert all("init" not in cmd for cmd in cmds)
+
+
+def test_init_store_existing_store_migration_fails_loud(tmp_path: Path, monkeypatch):
+    """If `set-schema` is unsupported (old anneal), the existing-store path
+    fails loud (returns False) rather than leaving a silently-ops store."""
+    class _R:
+        returncode = 2
+        stdout = ""
+        stderr = "error: argument command: invalid choice: 'set-schema'"
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda *a, **k: _R())
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"existing store bytes")
+
+    assert _init_store(store, "anneal-memory") is False
+
+
+def test_init_store_both_candidates_carry_schema(tmp_path: Path, monkeypatch):
+    """Candidate 1 fails (e.g. `anneal-memory` not on PATH) -> fall through to
+    candidate 2 (`python -m anneal_memory`). BOTH must carry `--schema
+    partnership`, so a future edit can't silently drop it from the fallback."""
+    cmds = []
+
+    class _R:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = ""
+            self.stderr = "boom" if rc else ""
+
+    def fake_run(cmd, **kwargs):
+        cmds.append(cmd)
+        return _R(1 if len(cmds) == 1 else 0)  # first fails, second succeeds
+
+    monkeypatch.setattr("levain.install.subprocess.run", fake_run)
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+
+    ok = _init_store(store, "anneal-memory")
+
+    assert ok is True
+    assert len(cmds) == 2  # fell through to the second candidate
+    for cmd in cmds:
+        i = cmd.index("init")
+        assert cmd[i:i + 3] == ["init", "--schema", "partnership"]
+
+
+def test_init_store_fails_loud_no_bare_init_fallback(tmp_path: Path, monkeypatch):
+    """Fail-loud contract (codex L3): if BOTH candidates reject (e.g. an anneal
+    too old to know `--schema`), `_init_store` returns False and NEVER falls back
+    to a bare `init` that would create a silently-ops store."""
+    cmds = []
+
+    class _R:
+        returncode = 2
+        stdout = ""
+        stderr = "error: unrecognized arguments: --schema"
+
+    def fake_run(cmd, **kwargs):
+        cmds.append(cmd)
+        return _R()
+
+    monkeypatch.setattr("levain.install.subprocess.run", fake_run)
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+
+    ok = _init_store(store, "anneal-memory")
+
+    assert ok is False
+    assert len(cmds) == 2  # both candidates tried
+    for cmd in cmds:
+        assert "--schema" in cmd  # never a bare `init` fallback
+
+
+def test_init_store_migrates_real_ops_store_preserving_content(tmp_path: Path):
+    """Integration (needs anneal-memory on path): a real ops-schema store with an
+    episode gets migrated to partnership by `_init_store`, and the memory CONTENT
+    survives — only the schema metadata changes."""
+    pytest.importorskip("anneal_memory")
+    import shutil
+    from anneal_memory import Store, name_for_schema, DEFAULT_SCHEMA
+
+    store_path = tmp_path / ".levain" / "memory.db"
+    store_path.parent.mkdir(parents=True)
+    s = Store(str(store_path), section_schema=DEFAULT_SCHEMA)
+    s.record("an existing memory worth preserving", "observation")
+    s.close()
+    assert name_for_schema(Store(str(store_path)).section_schema) == "default"
+
+    ok = _init_store(store_path, shutil.which("anneal-memory") or "anneal-memory")
+
+    assert ok is True
+    s2 = Store(str(store_path))
+    assert name_for_schema(s2.section_schema) == "partnership"   # migrated
+    assert s2.status().total_episodes == 1                       # content preserved
+    s2.close()
