@@ -5,8 +5,8 @@ Walks a stranger through standing up a new Levain install:
   2. Resolve environment-dependent placeholders.
   3. Run the scripted interview to fill `world.md` + `origin.md`.
   4. Render the templates into the install's `seed/` directory.
-  5. Copy the verbatim seed files (`partnership.md`, `memory.md`, the
-     continuity scaffold, README).
+  5. Copy the verbatim seed files (`partnership.md`, `memory.md`,
+     `spore_instructions.md`, the continuity scaffold, README).
   6. Lay down the adapter's wiring (settings, MCP registration, hooks).
   7. Initialize the install-pinned anneal-memory store.
   8. Print next-steps banner.
@@ -144,7 +144,13 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             render_template(spec_origin, answers), encoding="utf-8"
         )
 
-        for f in ("partnership.md", "memory.md", "continuity.md", "README.md"):
+        for f in (
+            "partnership.md",
+            "memory.md",
+            "spore_instructions.md",
+            "continuity.md",
+            "README.md",
+        ):
             src = templates_root / "seed" / f
             if src.is_file():
                 shutil.copy2(src, install_seed / f)

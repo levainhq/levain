@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Levain activation — UserPromptSubmit hook.
 
-Layer B (recency) + Layer D (the ambient-nudge half).
+Layer B (recency) + the event-based prospective surface + Layer D (the
+ambient-nudge half).
 
 Wired to Claude Code's UserPromptSubmit event. Injects, at recency position
 (immediately before each user prompt is processed):
@@ -9,11 +10,15 @@ Wired to Claude Code's UserPromptSubmit event. Injects, at recency position
   1. One directive selected at random from activation/recency_directives.md —
      the within-session-durability layer. Selecting across differently-framed
      directives fights attention habituation.
-  2. When episodes recorded since the last wrap reach WRAP_NUDGE_THRESHOLD, a
+  2. Open spores (prospective layer) whose content COLLIDES with this prompt —
+     the event-based germination surface: an open loop surfaces when the current
+     work touches it. Precision-biased and capped, so an unrelated prompt
+     injects nothing (the effortful full-list poll stays opt-in, per the seed).
+  3. When episodes recorded since the last wrap reach WRAP_NUDGE_THRESHOLD, a
      one-line wrap nudge — the ambient half of Layer D.
 
-The two are independent: a broken directives file drops (1) but must not also
-drop (2), so `sections` is built additively.
+The three are independent: a broken directives file drops (1) but must not also
+drop (2)/(3), so `sections` is built additively.
 
 FAIL-OPEN — structural: main()'s entire body is wrapped in a catch-all and the
 process always exits 0. A hook must never crash or write stderr noise into the
@@ -40,16 +45,17 @@ except Exception:
 # substantial session, before the upper bound, without nagging a short one.
 WRAP_NUDGE_THRESHOLD = 12
 
-# Per-attempt timeout for the Layer D wrap-count query. Tight because this
-# hook runs before EVERY prompt — a slow or hung anneal-memory must not stall
-# the turn. (session_start.py uses episodes_since_wrap's 5s default: it fires
-# once per session and is not latency-sensitive.)
+# Per-attempt timeout for the anneal-memory queries (wrap-count + open spores).
+# Tight because this hook runs before EVERY prompt — a slow or hung
+# anneal-memory must not stall the turn. (session_start.py uses the 5s default:
+# it fires once per session and is not latency-sensitive.)
 WRAP_CHECK_TIMEOUT = 2.0
+SPORE_CHECK_TIMEOUT = 2.0
 
 
 def main() -> int:
     try:
-        hook.read_stdin()  # consume stdin; payload not needed for selection
+        payload = hook.read_stdin()
 
         if not hook.should_fire():
             return 0
@@ -62,12 +68,24 @@ def main() -> int:
         )
         # random.choice() raises IndexError on [] — only call it when the
         # directives file parsed to at least one block. A broken directives
-        # file drops Layer B but must NOT drop the Layer D nudge below, so
+        # file drops Layer B but must NOT drop the sections below, so
         # `sections` is additive (cf. session_start.py).
         if directives:
             sections.append(random.choice(directives))
 
-        # Layer D — ambient nudge. Independent of Layer B above.
+        # Event-based spore germination — open loops whose content collides with
+        # this prompt surface on their own (the intelligent prospective surface;
+        # the effortful full-list poll stays opt-in, per the seed). Precision-
+        # biased + capped, so an irrelevant prompt injects nothing.
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            hits = hook.spores_colliding(
+                prompt, hook.open_spores(timeout=SPORE_CHECK_TIMEOUT)
+            )
+            if hits:
+                sections.append(hook.format_spore_collisions(hits))
+
+        # Layer D — ambient nudge. Independent of the sections above.
         n = hook.episodes_since_wrap(timeout=WRAP_CHECK_TIMEOUT)
         if n is not None and n >= WRAP_NUDGE_THRESHOLD:
             sections.append(

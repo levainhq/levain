@@ -10,11 +10,13 @@ Injects, at primacy position:
      that stands in for a hand-typed session opener.
   2. Operator-local date and time — models have no clock.
   3. On a genuinely fresh session (startup | clear) only: a wrap-check flag if
-     the previous session left episodes unwrapped. `resume` and `compact` both
-     carry unwrapped episodes that are ongoing work, not a missed wrap — they
-     get posture re-injection but skip the wrap-check. (`compact` is the most
-     important re-injection case: compaction rebuilds the context window and
-     the primacy posture goes with it.)
+     the previous session left episodes unwrapped, AND the time-based
+     prospective surface — open spores that have gone dormant or whose `next`
+     date has arrived, surfaced once so nothing rots silently. `resume` and
+     `compact` both carry ongoing work, not a fresh start — they get posture
+     re-injection but skip the wrap-check and the due-spore surface. (`compact`
+     is the most important re-injection case: compaction rebuilds the context
+     window and the primacy posture goes with it.)
 
 FAIL-OPEN — structural: main()'s entire body is wrapped in a catch-all and the
 process always exits 0. A hook must never crash or write stderr noise into the
@@ -71,6 +73,15 @@ def main() -> int:
                     f"into continuity. They are not lost: prepare_wrap still "
                     f"sees them."
                 )
+
+            # Time-based spore germination — open loops that have gone dormant
+            # or whose `next` date has arrived, surfaced once on a fresh session
+            # so nothing rots silently. Growing/resting/parked stay out of the
+            # way. Fires only on a fresh session (with the wrap-check), not on
+            # resume/compact mid-flow.
+            due = hook.due_dormant_spores(hook.open_spores())
+            if due:
+                sections.append(hook.format_due_spores(due))
 
         if sections:
             hook.emit("\n\n".join(sections), "SessionStart")
