@@ -13,7 +13,7 @@ levain init
 - **Python:** 3.12+ required. The package uses `importlib.resources.as_file()` on a directory resource, which gained support in 3.12. v0.1.0 supported 3.11+ but only for filesystem installs; v0.1.1 bumps the floor to 3.12 and adds zipapp / PyInstaller / `pip install --target` into zip support.
 - **Web pane onboarding:** CLI interview at v1.0. Browser-based onboarding lands in v1.1.
 - **Codex hook reliability:** Codex 0.132/0.133 has a known platform-level hook-trust gap that no harness consumer can work around. `levain doctor` + `levain verify-hooks` surface the wiring; whether your Codex install actually fires the hooks is up to Codex itself ([upstream tracking issue](https://github.com/openai/codex/issues/17532)).
-- **Memory substrate:** anneal-memory v0.3.3 is the layer-1 dependency; pinned in `pyproject.toml`.
+- **Memory substrate:** anneal-memory (0.7.x) is the layer-1 dependency; pinned in `pyproject.toml`. It now carries the **crystallized-pattern tier** (on-demand graduated memory) — see *Dependencies* below.
 
 ---
 
@@ -23,7 +23,7 @@ If you've been working with an AI partner long enough to feel the session-amnesi
 
 It packages four things that work together:
 
-1. **A four-layer memory substrate** (episodic + continuity + Hebbian associations + limbic) via the `anneal-memory` library — your partner's hippocampus, neocortex, and lateral connections.
+1. **A Complementary Learning Systems memory substrate** via the `anneal-memory` library — four layers (episodic + continuity + Hebbian associations + limbic) plus two sibling stores: prospective **spores** (open loops that self-clean) and an on-demand **crystallized** pattern tier (proven, stable wisdom held *out* of always-loaded context and recalled on cue, so the working set stays bounded while earned wisdom keeps growing). Your partner's hippocampus, working memory, lateral connections, and long-term semantic store.
 2. **A methodology-core seed** — a small set of files defining who the entity is, how partnership works, how memory accrues, who its operator is.
 3. **An activation mechanism** — primacy-position posture + recency directives + session-boundary wrap discipline, wired through harness hooks.
 4. **A scripted onboarding interview** — `levain init` walks you through filling the seed templates so the entity is uniquely yours from session one.
@@ -87,7 +87,9 @@ If you've already built your own substrate-management scripts, you'll recognize 
 
 ## Dependencies
 
-Levain layers on [`anneal-memory`](https://github.com/phillipclapham/anneal-memory) — the four-layer memory library. Both ship to PyPI. Clean dependency direction: Levain depends on anneal-memory, never the reverse.
+Levain layers on [`anneal-memory`](https://github.com/phillipclapham/anneal-memory) — the memory library. Both ship to PyPI. Clean dependency direction: Levain depends on anneal-memory, never the reverse.
+
+The division of labor is the point: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session — a memory library that hooked every prompt would forfeit the framework-neutrality that lets it work everywhere. So raw anneal gives you the stores and *manual* recall (you query if you remember to — the dead-store failure mode discipline rots into). Levain wires the hooks that surface the right memory at the right moment automatically — discipline becomes an invariant. Today that fires for the **prospective** layer: an open loop (spore) germinates into context the moment your prompt collides with it. The same hook **will extend** to the **crystallized** pattern tier in v2 — per-turn recall of proven, stable wisdom so it stays effective without clogging always-loaded context. That extension is proven in the flow reference workspace and is Levain v2's opening slice; it is **not** wired into the v1 adapter yet (v1 fires spores, not crystals). This is why "anneal only *fully* works inside a complementary harness" is a feature line, not a caveat: the store is universal, the firing is the harness's job.
 
 ## License
 
@@ -97,4 +99,4 @@ The patent grant matters: as the kit accrues operator-class contributions, downs
 
 ---
 
-*Built inside the [flow](https://github.com/phillipclapham) workspace; lives at levainhq.com.*
+*Built inside the flow reference workspace; lives at levainhq.com.*

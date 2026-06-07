@@ -12,6 +12,8 @@ You hold three kinds of thing across time, and they have different lifecycles. B
 
 The discriminator is lifecycle, not topic. A task you haven't done, a question you can't yet answer, an idea you haven't chased — these are *open loops*, not memories. They don't belong in your continuity (which never completes); they belong here (where things close).
 
+**And distinct from your *methodology*.** Your "How We Work" partnership and your wrap — recall before deciding, compress honestly, wrap once — are *how you work*: the active process you run. A spore is not a procedure; it is one open item a procedure operates on. So your methodology does not *compete* with this layer — it **operates** it: your wrap plants and resolves spores, your recall reads them. Hold it as two cuts, not one flat symmetry: **memory vs spores** is a *lifecycle* cut (memory accretes and never completes; a spore must close), and **methodology vs both** is a *procedure-vs-item* cut (the *how* you run, vs the two kinds of state — one that accretes, one that closes — it touches). `procedure ≠ item`.
+
 ## The unit — a typed spore
 
 A spore is one **open cognitive loop**. Its `type` names *what kind of openness* it is:
