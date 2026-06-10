@@ -18,6 +18,7 @@ from levain.install import (
     _init_store,
     _is_safe_install_target,
     _load_checkpoint,
+    _print_manifest,
     _save_checkpoint,
     _substitute_hook_placeholders,
     _templates_root,
@@ -636,3 +637,86 @@ def test_init_store_migrates_real_ops_store_preserving_content(tmp_path: Path):
     assert name_for_schema(s2.section_schema) == "partnership"   # migrated
     assert s2.status().total_episodes == 1                       # content preserved
     s2.close()
+
+
+# ---------- _print_manifest (item 3 — end-of-init file manifest) ----------
+
+
+def test_print_manifest_lists_created_files_and_says_hand_editable(tmp_path: Path, capsys):
+    install = tmp_path / "inst"
+    (install / "seed").mkdir(parents=True)
+    (install / "seed" / "world.md").write_text("x", encoding="utf-8")
+    (install / "seed" / "origin.md").write_text("x", encoding="utf-8")
+    (install / "CLAUDE.md").write_text("x", encoding="utf-8")
+    (install / ".claude").mkdir()
+    (install / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    (install / ".mcp.json").write_text("{}", encoding="utf-8")
+    (install / "activation").mkdir()
+    store = install / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"x")
+
+    _print_manifest(install, "claude-code", store, store_ok=True)
+    out = capsys.readouterr().out
+
+    assert "hand-edit" in out.lower()
+    assert "world.md" in out
+    assert "CLAUDE.md" in out
+    assert "settings.json" in out
+    assert "memory.db" in out
+
+
+def test_print_manifest_omits_a_failed_store(tmp_path: Path, capsys):
+    install = tmp_path / "inst"
+    (install / "seed").mkdir(parents=True)
+    (install / "seed" / "world.md").write_text("x", encoding="utf-8")
+    store = install / ".levain" / "memory.db"  # never created (init failed)
+
+    _print_manifest(install, "claude-code", store, store_ok=False)
+    out = capsys.readouterr().out
+
+    assert "world.md" in out
+    assert "memory.db" not in out
+
+
+def test_print_manifest_codex_includes_global_files(tmp_path: Path, capsys, monkeypatch):
+    install = tmp_path / "inst"
+    (install / "seed").mkdir(parents=True)
+    (install / "seed" / "world.md").write_text("x", encoding="utf-8")
+    (install / "AGENTS.md").write_text("x", encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text("{}", encoding="utf-8")
+    (codex_home / "config.toml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    store = install / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"x")
+
+    _print_manifest(install, "codex", store, store_ok=True)
+    out = capsys.readouterr().out
+
+    assert "AGENTS.md" in out
+    assert "hooks.json" in out
+    assert "config.toml" in out
+
+
+def test_print_manifest_expands_activation_files(tmp_path: Path, capsys):
+    # Apparatus catch (L3/codex LOW): the manifest should list the actual files
+    # under activation/, not just the directory ("every file" must be true).
+    install = tmp_path / "inst"
+    (install / "seed").mkdir(parents=True)
+    (install / "seed" / "world.md").write_text("x", encoding="utf-8")
+    hooks = install / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "session_start.py").write_text("x", encoding="utf-8")
+    (install / "activation" / "posture.md").write_text("x", encoding="utf-8")
+    store = install / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"x")
+
+    _print_manifest(install, "claude-code", store, store_ok=True)
+    out = capsys.readouterr().out
+
+    assert "session_start.py" in out
+    assert "posture.md" in out

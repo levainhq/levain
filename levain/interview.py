@@ -38,6 +38,20 @@ _ONBOARDING_BLURB_RE = re.compile(
     flags=re.MULTILINE | re.DOTALL,
 )
 
+# Operator commands recognized at any interview prompt. `:back` re-opens the
+# previous answer for editing (composable — repeat to step further back).
+# These exact strings are reserved — an operator cannot enter ":back"/":b" as a
+# literal field value (acceptable: seed slots are names/bios/roles, not commands).
+_BACK_COMMANDS = (":back", ":b")
+
+
+class _Back:
+    """Sentinel returned by `_prompt_for_slot` when the operator typed a
+    back-navigation command instead of an answer."""
+
+
+_BACK = _Back()
+
 
 @dataclass
 class Section:
@@ -67,6 +81,17 @@ class TemplateSpec:
     path: Path
     sections: list[Section]
     raw: str
+
+
+@dataclass
+class _Field:
+    """One slot to prompt, tagged with its spec + section. The flat list of
+    these is what `conduct_interview` walks by index so back-navigation can
+    cross section and spec boundaries."""
+
+    spec: TemplateSpec
+    section: Section
+    slot: str
 
 
 def parse_template(path: Path) -> TemplateSpec:
@@ -203,14 +228,56 @@ def conduct_interview(
     """
     answers = dict(answers or {})
 
+    # Build the flat, ordered field plan. Cross-spec/-section dedup is
+    # simulated here (a slot already answered, or already planned by an
+    # earlier section/spec, is not re-asked) — reproducing the cumulative
+    # contract the old nested loop got from checking `answers`. Optional-
+    # section skip is resolved interactively in the walk below.
+    plan: list[_Field] = []
+    planned: set[str] = set(answers.keys())
     for spec in specs:
-        output_fn("")
-        output_fn(f"=== {spec.path.name} ===")
         for section in spec.sections:
-            unasked = [s for s in section.slots if s not in answers]
-            if not unasked:
-                continue
+            for slot in section.slots:
+                if slot in planned:
+                    continue
+                planned.add(slot)
+                plan.append(_Field(spec=spec, section=section, slot=slot))
 
+    if not plan:
+        return answers
+
+    output_fn("")
+    output_fn("  (Tip: type :back at any prompt to revise your previous answer.)")
+
+    seen_specs: set[int] = set()         # id(spec) — spec header shown
+    entered_sections: set[int] = set()   # id(section) — section header shown
+    skipped_sections: set[int] = set()   # id(section) — optional skip chosen
+    visited_fields: set[int] = set()     # plan index — field already prompted
+    #   nav-state (visited) is deliberately separate from value-state (answers):
+    #   a field bailed out of with `:back` before answering is still "visited".
+
+    i = 0
+    total = len(plan)
+    while i < total:
+        field = plan[i]
+        section = field.section
+        sid = id(section)
+
+        if id(field.spec) not in seen_specs:
+            seen_specs.add(id(field.spec))
+            output_fn("")
+            output_fn(f"=== {field.spec.path.name} ===")
+
+        # A section decided-skipped earlier (its slots already set ""): fill
+        # transparently and advance — keeps skipped sections invisible to the
+        # walk in the forward direction.
+        if sid in skipped_sections:
+            answers.setdefault(field.slot, "")
+            i += 1
+            continue
+
+        if sid not in entered_sections:
+            entered_sections.add(sid)
             output_fn("")
             output_fn(f"## {section.title}" if section.title else "[preamble]")
 
@@ -220,39 +287,88 @@ def conduct_interview(
                 else:
                     output_fn("  (optional)")
                 response = input_fn("  Skip this section? [y/N] ").strip().lower()
+                if response in _BACK_COMMANDS:
+                    # `:back` at the skip prompt — the tip promises "any
+                    # prompt". Un-commit this section's entry (so re-arrival
+                    # re-asks the skip) and step back to the previous prompted
+                    # field. Never land INSIDE the section, which would let the
+                    # forward auto-skip bounce straight back here.
+                    entered_sections.discard(sid)
+                    j = i - 1
+                    while j >= 0 and id(plan[j].section) in skipped_sections:
+                        j -= 1
+                    if j >= 0:
+                        i = j
+                    else:
+                        output_fn(
+                            "  (Already at the first question — nothing to go back to.)"
+                        )
+                    continue
                 if response in ("y", "yes"):
-                    for slot in unasked:
-                        answers[slot] = ""
+                    skipped_sections.add(sid)
+                    while i < total and id(plan[i].section) == sid:
+                        answers[plan[i].slot] = ""
+                        i += 1
                     continue
 
             if section.guidance:
                 output_fn("")
                 output_fn(f"  Guidance: {section.guidance}")
                 output_fn("")
+        elif i in visited_fields:
+            # Re-arrived at a field we already prompted (back-navigation):
+            # re-orient with a "(revising)" header. Using visited-state (not
+            # `answers`) means a field bailed out of with `:back` before being
+            # answered still restores its section context on return. A forward
+            # walk through slots 2..N of a multi-slot section is NOT yet visited
+            # → falls through here with no header (shown once on the first slot).
+            output_fn("")
+            output_fn(f"## {section.title or '[preamble]'}  (revising)")
 
-            sub_guidance = _split_guidance(section.guidance, section.slots)
-            for slot in unasked:
-                # Style precedence: explicit `style=X` tag on the section
-                # (interview engine v2) > keyword-soup detection on the
-                # section's per-slot clause (single-slot inherits section
-                # hints; multi-slot uses its per-slot sub-clause).
-                if section.explicit_style is not None:
-                    style = section.explicit_style
-                else:
-                    clause = sub_guidance.get(slot)
-                    style_basis = clause if clause is not None else section.hints
-                    style = _detect_input_style(slot, style_basis)
-                answers[slot] = _prompt_for_slot(slot, style, input_fn, output_fn)
+        visited_fields.add(i)
 
-            # Persist progress after each completed section — Ctrl+C between
-            # sections then resumes from this point on next levain init.
-            if checkpoint_fn is not None:
-                try:
-                    checkpoint_fn(answers)
-                except Exception:
-                    # Checkpoint persistence is best-effort; never fail the
-                    # interview on a filesystem hiccup.
-                    pass
+        # Style precedence: explicit `style=X` tag on the section (interview
+        # engine v2) > keyword-soup detection on the section's per-slot clause
+        # (single-slot inherits section hints; multi-slot uses its sub-clause).
+        sub_guidance = _split_guidance(section.guidance, section.slots)
+        if section.explicit_style is not None:
+            style = section.explicit_style
+        else:
+            clause = sub_guidance.get(field.slot)
+            style_basis = clause if clause is not None else section.hints
+            style = _detect_input_style(field.slot, style_basis)
+
+        result = _prompt_for_slot(
+            field.slot, style, input_fn, output_fn,
+            current=answers.get(field.slot, ""),
+        )
+
+        if isinstance(result, _Back):
+            # Step back to the previous prompted field, hopping over any
+            # skipped optional section so back-navigation is symmetric.
+            j = i - 1
+            while j >= 0 and id(plan[j].section) in skipped_sections:
+                j -= 1
+            if j < 0:
+                output_fn("  (Already at the first question — nothing to go back to.)")
+                continue
+            i = j
+            continue
+
+        answers[field.slot] = result
+
+        # Persist progress after each completed section (matches the old
+        # per-section cadence) — Ctrl+C then resumes from here on next init.
+        last_in_section = (i + 1 >= total) or (id(plan[i + 1].section) != sid)
+        if last_in_section and checkpoint_fn is not None:
+            try:
+                checkpoint_fn(answers)
+            except Exception:
+                # Checkpoint persistence is best-effort; never fail the
+                # interview on a filesystem hiccup.
+                pass
+
+        i += 1
 
     return answers
 
@@ -319,39 +435,79 @@ def _prompt_for_slot(
     style: str,
     input_fn: Callable[[str], str],
     output_fn: Callable[[str], None],
-) -> str:
+    current: str = "",
+) -> str | _Back:
+    """Prompt for one slot's value.
+
+    Returns the entered value, the `_BACK` sentinel if the operator typed a
+    back-navigation command (`:back`/`:b`), or `current` if they submitted an
+    immediate blank. That one rule — *blank = leave as-is* — covers both
+    skip-and-scaffold-empty on a first visit (`current == ""`) and keep-the-
+    prior-answer on a back-navigation revisit (`current` is the old value).
+    """
+    if current:
+        output_fn(f"  {slot} — current value:")
+        for line in current.splitlines():
+            output_fn(f"      | {line}")
+        output_fn("      (blank = keep, retype = replace, :back = previous)")
+
+    blank_action = "keep" if current else "skip"
+
     if style == "bullet":
-        output_fn(f"  {slot} (one per line, blank line to finish):")
+        output_fn(
+            f"  {slot} (one per line; blank line = {blank_action}, "
+            f":back = previous):"
+        )
         items: list[str] = []
         while True:
             try:
                 line = input_fn("    - ").strip()
             except EOFError:
+                if not items:
+                    return current  # EOF on an empty field = leave as-is
                 break
+            if not items and line in _BACK_COMMANDS:
+                return _BACK
             if not line:
-                break
+                if items:
+                    break
+                return current  # immediate blank = leave as-is
             items.append(f"- {line}")
         return "\n".join(items)
 
     if style == "prose":
-        output_fn(f"  {slot} (multi-line prose, blank line on its own to finish):")
+        output_fn(
+            f"  {slot} (multi-line; blank line = {blank_action}, write then "
+            f"blank line to finish, :back = previous):"
+        )
         lines: list[str] = []
         while True:
             try:
                 line = input_fn("    ")
             except EOFError:
+                if not lines:
+                    return current  # EOF on an empty field = leave as-is
                 break
-            if line.strip() == "" and lines:
-                break
-            if line.strip() == "" and not lines:
-                continue
+            stripped = line.strip()
+            if not lines and stripped in _BACK_COMMANDS:
+                return _BACK
+            if stripped == "":
+                if lines:
+                    break  # blank after content = finish
+                return current  # immediate blank = leave as-is
             lines.append(line.rstrip())
         return "\n".join(lines).strip()
 
     if style == "optional-line":
-        return input_fn(f"  {slot} (optional, blank to skip): ").strip()
+        raw = input_fn(f"  {slot} (optional, blank to skip, :back = previous): ").strip()
+        if raw in _BACK_COMMANDS:
+            return _BACK
+        return current if raw == "" else raw
 
-    return input_fn(f"  {slot}: ").strip()
+    raw = input_fn(f"  {slot}: ").strip()
+    if raw in _BACK_COMMANDS:
+        return _BACK
+    return current if raw == "" else raw
 
 
 # --- Rendering --------------------------------------------------------------

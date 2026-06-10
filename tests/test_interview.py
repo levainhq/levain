@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 
 from levain.interview import (
+    _BACK,
     _detect_input_style,
+    _prompt_for_slot,
     _split_guidance,
     _unique_slots,
     conduct_interview,
@@ -379,3 +381,228 @@ def test_shipped_seed_templates_parse_without_warnings(capsys):
     assert "WARN" not in captured.err, (
         f"Shipped seed templates triggered parse-time warning:\n{captured.err}"
     )
+
+
+# ---------- _prompt_for_slot: skip (item 1) + keep / back-nav (item 2) ----------
+
+def test_prompt_for_slot_line_blank_first_visit_returns_empty():
+    # First visit (current=""): an immediate blank scaffolds empty.
+    result = _prompt_for_slot(
+        "NAME", "line", input_fn=lambda p: "", output_fn=lambda s: None, current=""
+    )
+    assert result == ""
+
+
+def test_prompt_for_slot_prose_immediate_blank_skips_no_infinite_loop():
+    # The item-1 fix: prose used to `continue`-loop forever on an immediate
+    # blank with no content. Now it returns `current` (= "" here). If the fix
+    # regressed, this test would hang rather than fail — that's the signal.
+    result = _prompt_for_slot(
+        "BIO", "prose", input_fn=lambda p: "", output_fn=lambda s: None, current=""
+    )
+    assert result == ""
+
+
+def test_prompt_for_slot_prose_collects_lines_then_blank_finishes():
+    feed = iter(["first line", "second line", ""])
+    result = _prompt_for_slot(
+        "BIO", "prose", input_fn=lambda p: next(feed), output_fn=lambda s: None, current=""
+    )
+    assert result == "first line\nsecond line"
+
+
+def test_prompt_for_slot_bullet_immediate_blank_returns_empty():
+    result = _prompt_for_slot(
+        "ITEMS", "bullet", input_fn=lambda p: "", output_fn=lambda s: None, current=""
+    )
+    assert result == ""
+
+
+def test_prompt_for_slot_bullet_collects_then_blank_finishes():
+    feed = iter(["alpha", "beta", ""])
+    result = _prompt_for_slot(
+        "ITEMS", "bullet", input_fn=lambda p: next(feed), output_fn=lambda s: None, current=""
+    )
+    assert result == "- alpha\n- beta"
+
+
+def test_prompt_for_slot_line_blank_on_revisit_keeps_current():
+    # Item 2: blank on a revisit (current set) keeps the prior answer.
+    result = _prompt_for_slot(
+        "NAME", "line", input_fn=lambda p: "", output_fn=lambda s: None, current="Alex"
+    )
+    assert result == "Alex"
+
+
+def test_prompt_for_slot_prose_blank_on_revisit_keeps_current():
+    result = _prompt_for_slot(
+        "BIO", "prose", input_fn=lambda p: "", output_fn=lambda s: None, current="prior bio"
+    )
+    assert result == "prior bio"
+
+
+def test_prompt_for_slot_line_retype_on_revisit_replaces():
+    result = _prompt_for_slot(
+        "NAME", "line", input_fn=lambda p: "Beta", output_fn=lambda s: None, current="Alpha"
+    )
+    assert result == "Beta"
+
+
+@pytest.mark.parametrize("style", ["line", "prose", "bullet", "optional-line"])
+@pytest.mark.parametrize("cmd", [":back", ":b"])
+def test_prompt_for_slot_back_command_returns_back_sentinel(style, cmd):
+    result = _prompt_for_slot(
+        "X", style, input_fn=lambda p: cmd, output_fn=lambda s: None, current=""
+    )
+    assert result is _BACK
+
+
+def test_prompt_for_slot_line_prompt_string_unchanged_for_back_compat():
+    # The line-style prompt must stay exactly "  {slot}: " — the :back/keep
+    # affordance is surfaced via the one-time tip + the current-value block,
+    # NOT the prompt string (test_conduct_interview_respects_explicit_style_
+    # over_keywords asserts on this).
+    captured: list[str] = []
+
+    def driver(prompt: str) -> str:
+        captured.append(prompt)
+        return "v"
+
+    _prompt_for_slot("X", "line", input_fn=driver, output_fn=lambda s: None, current="")
+    assert captured == ["  X: "]
+
+
+# ---------- conduct_interview: back-navigation (item 2) ----------
+
+def _two_section_spec(tmp_path: Path):
+    template = tmp_path / "twosec.md"
+    template.write_text(
+        "# Test\n\n"
+        "## First\n\n<!-- interview: their name -->\n\n{{NAME}}\n\n"
+        "## Second\n\n<!-- interview: their city -->\n\n{{CITY}}\n",
+        encoding="utf-8",
+    )
+    return parse_template(template)
+
+
+def test_conduct_interview_back_revises_prior_answer(tmp_path: Path):
+    spec = _two_section_spec(tmp_path)
+    # NAME="Alpha"; at CITY type :back; re-answer NAME="Beta"; CITY="Columbus".
+    feed = iter(["Alpha", ":back", "Beta", "Columbus"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
+    )
+    assert answers == {"NAME": "Beta", "CITY": "Columbus"}
+
+
+def test_conduct_interview_back_at_first_question_is_noop(tmp_path: Path):
+    spec = _two_section_spec(tmp_path)
+    # :back at the very first prompt does nothing; then answer through.
+    feed = iter([":back", "Alpha", "Columbus"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
+    )
+    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+
+
+def test_conduct_interview_back_then_blank_keeps_prior_answer(tmp_path: Path):
+    spec = _two_section_spec(tmp_path)
+    # NAME="Alpha"; at CITY :back; at NAME revisit a blank keeps Alpha; CITY.
+    feed = iter(["Alpha", ":back", "", "Columbus"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
+    )
+    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+
+
+def _multislot_spec(tmp_path: Path):
+    template = tmp_path / "multislot.md"
+    template.write_text(
+        "# T\n\n## Identity\n\n<!-- interview: name; city -->\n\n{{NAME}} {{CITY}}\n",
+        encoding="utf-8",
+    )
+    return parse_template(template)
+
+
+def test_conduct_interview_forward_multislot_prints_no_revising_header(tmp_path: Path):
+    # Apparatus catch (L2 MED-1): walking FORWARD through slots 2..N of a
+    # multi-slot section must NOT print "(revising)" — that header is for
+    # genuine back-navigation re-entry only.
+    spec = _multislot_spec(tmp_path)
+    out: list[str] = []
+    feed = iter(["Alpha", "Columbus"])
+    answers = conduct_interview([spec], input_fn=lambda p: next(feed), output_fn=out.append)
+    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+    assert not any("revising" in line for line in out)
+    # The section header prints exactly once, on the first slot.
+    assert sum(1 for line in out if line.strip() == "## Identity") == 1
+
+
+def test_conduct_interview_back_into_multislot_prints_revising_header(tmp_path: Path):
+    # The flip side: a real back-nav revisit DOES re-orient with "(revising)".
+    spec = _multislot_spec(tmp_path)
+    out: list[str] = []
+    feed = iter(["Alpha", ":back", "Beta", "Columbus"])
+    answers = conduct_interview([spec], input_fn=lambda p: next(feed), output_fn=out.append)
+    assert answers == {"NAME": "Beta", "CITY": "Columbus"}
+    assert any("revising" in line for line in out)
+
+
+def test_prompt_for_slot_prose_eof_on_empty_revisit_keeps_current():
+    # Apparatus catch (L1 MED-1): EOF (Ctrl-D) on an empty field must keep the
+    # prior answer on a revisit, consistent with the blank=leave-as-is rule.
+    def boom(_p: str) -> str:
+        raise EOFError
+
+    result = _prompt_for_slot(
+        "BIO", "prose", input_fn=boom, output_fn=lambda s: None, current="prior bio"
+    )
+    assert result == "prior bio"
+
+
+def test_prompt_for_slot_bullet_eof_on_empty_revisit_keeps_current():
+    def boom(_p: str) -> str:
+        raise EOFError
+
+    result = _prompt_for_slot(
+        "ITEMS", "bullet", input_fn=boom, output_fn=lambda s: None, current="- a\n- b"
+    )
+    assert result == "- a\n- b"
+
+
+def test_conduct_interview_back_at_optional_skip_prompt(tmp_path: Path):
+    # Apparatus catch (L3/codex MED): `:back` must work AT the optional
+    # "Skip this section?" prompt, not corrupt the following answers. This is
+    # codex's exact failing sequence; without the fix the answers misalign to
+    # {A:Alpha, B:Beta, C:"y"}.
+    template = tmp_path / "opt.md"
+    template.write_text(
+        "# T\n\n"
+        "## First\n\n<!-- interview: a -->\n\n{{A}}\n\n"
+        "## Maybe\n\n<!-- optional -->\n<!-- interview: b -->\n\n{{B}}\n\n"
+        "## Third\n\n<!-- interview: c -->\n\n{{C}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    # A="Alpha"; at the Maybe skip-prompt type :back; revise A="Beta";
+    # now skip Maybe ("y"); answer C="Columbus".
+    feed = iter(["Alpha", ":back", "Beta", "y", "Columbus"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
+    )
+    assert answers == {"A": "Beta", "B": "", "C": "Columbus"}
+
+
+def test_conduct_interview_return_to_bailed_field_restores_section_context(tmp_path: Path):
+    # Apparatus catch (L3/codex LOW): a field bailed out of with :back before
+    # answering is "visited"; returning to it (even via forward advance after
+    # revising an earlier field) must restore its section header context.
+    spec = _two_section_spec(tmp_path)  # First {{NAME}}, Second {{CITY}}
+    out: list[str] = []
+    # NAME="a1"; at CITY type :back (bail before answering); revise NAME="a2";
+    # forward to CITY="b1".
+    feed = iter(["a1", ":back", "a2", "b1"])
+    answers = conduct_interview([spec], input_fn=lambda p: next(feed), output_fn=out.append)
+    assert answers == {"NAME": "a2", "CITY": "b1"}
+    second_headers = [line for line in out if line.strip().startswith("## Second")]
+    assert len(second_headers) >= 2  # first arrival + the re-orient on return

@@ -165,6 +165,7 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
     # `levain init --force` doesn't offer to resume stale answers.
     _clear_checkpoint(install)
 
+    _print_manifest(install, chosen, store, store_ok=store_ok)
     _print_next_steps(install, chosen, store_ok=store_ok)
     return 0 if store_ok else 1
 
@@ -422,9 +423,11 @@ def _copy_activation_tree(src: Path, dst: Path, anneal_path: str | None = None) 
     if dst.exists():
         # `dst` is `<install>/activation/`; parent is the install root.
         # Stage backups outside `dst` so `rmtree(dst)` doesn't consume them.
-        backup_dir = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
+        staging = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
+        backup_dir: Path | None
         try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
+            staging.mkdir(parents=True, exist_ok=True)
+            backup_dir = staging
         except OSError:
             backup_dir = None  # backups disabled if we can't stage
 
@@ -621,6 +624,67 @@ def _init_store(store: Path, anneal_path: str) -> bool:
     print(f"    Fix: pip install -U anneal-memory")
     print(f"    Then: anneal-memory --db {store} init --schema partnership")
     return False
+
+
+def _print_manifest(
+    install: Path, adapter: str, store: Path, store_ok: bool = True
+) -> None:
+    """List every file the install laid down — so the operator knows what
+    landed, that they can hand-edit it, and where to look before first launch.
+
+    Built from the known install layout (the orchestrator controls exactly
+    what gets written), filtered to paths that actually exist so the
+    conditional seed copies and a failed store init drop out cleanly. Includes
+    the Codex global files (`hooks.json` / `config.toml`) since they live
+    outside the install dir but ARE created/modified by a codex install.
+    """
+    print()
+    print("Files created (you can hand-edit any of these):")
+
+    rows: list[tuple[str, Path]] = []
+
+    seed = install / "seed"
+    for name in (
+        "world.md",
+        "origin.md",
+        "partnership.md",
+        "memory.md",
+        "spore_instructions.md",
+        "continuity.md",
+        "README.md",
+    ):
+        rows.append(("seed", seed / name))
+
+    if adapter == "claude-code":
+        rows.append(("adapter", install / "CLAUDE.md"))
+        rows.append(("adapter", install / ".claude" / "settings.json"))
+        rows.append(("adapter", install / ".mcp.json"))
+    elif adapter == "codex":
+        rows.append(("adapter", install / "AGENTS.md"))
+        codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+        rows.append(("codex (global)", codex_home / "hooks.json"))
+        rows.append(("codex (global)", codex_home / "config.toml"))
+
+    activation = install / "activation"
+    if activation.is_dir():
+        for f in sorted(activation.rglob("*")):
+            if f.is_file() and "__pycache__" not in f.parts:
+                rows.append(("activation", f))
+
+    if store_ok and store.exists():
+        rows.append(("store", store))
+
+    present = [(label, path) for label, path in rows if path.exists()]
+    width = max((len(label) for label, _ in present), default=0)
+    for label, path in present:
+        print(f"  {label:<{width}}  {path}")
+
+    if activation.is_dir():
+        print()
+        print(
+            "  (activation/posture.md + activation/recency_directives.md are yours "
+            "to tune as you find your own RLHF-leakage patterns.)"
+        )
 
 
 def _print_next_steps(install: Path, adapter: str, store_ok: bool = True) -> None:
