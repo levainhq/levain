@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.3.1"
+version = "0.3.2"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,13 +33,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    # Partnership seed needs the 0.7.x stack: spores (0.4.0), schema-aware
-    # budget (0.4.2), `init --schema partnership` (0.4.4 — AM-INITSCHEMA), and
-    # the crystallized-pattern tier (0.6.0 store + 0.7.0 opt-in / `crystal
-    # index`+`recall` / `retrieve_patterns`). The prior `<0.5` floor predated
-    # crystals and silently capped adopters out of the on-demand graduated-
-    # memory tier.
-    "anneal-memory>=0.7.0,<0.8",
+    # Partnership seed needs the 0.8.x stack: spores (0.4.0), schema-aware
+    # budget (0.4.2), `init --schema partnership` (0.4.4 — AM-INITSCHEMA), the
+    # crystallized-pattern tier (0.6.0 store + 0.7.0 opt-in / `crystal index`+
+    # `recall` / `retrieve_patterns`), AND the AM-CRYSTAL-RECALL associative
+    # (Hebbian) backend (0.8.0) that makes crystallized recall fire by meaning.
+    # The prior `<0.8` ceiling capped adopters out of the entire 0.8.x crystal-
+    # recall tier (spore-060); `<0.5` before that predated crystals entirely.
+    "anneal-memory>=0.8.0,<0.9",
 ]
 
 [project.optional-dependencies]
