@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Levain substrate</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #232a33; --ink: #d7dde5;
+    --dim: #8b96a5; --accent: #7ee0c0; --warn: #f0a868; --bad: #f07a7a;
+    --good: #7ee0c0; --node: #5aa9e6; --edge: #3a4654;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  body { padding: 16px; overflow-x: hidden; max-width: 100%; }
+  .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px;
+    justify-content: space-between; margin: 0 0 2px; }
+  h1 { font-size: 14px; margin: 0; letter-spacing: .04em; }
+  .sub { color: var(--dim); font-size: 11px; margin: 0 0 14px; word-break: break-all; }
+  .ctl { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+  .ctl .stamp { color: var(--dim); font-size: 11px; }
+  button#refresh { font: inherit; font-size: 11px; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 3px 10px; cursor: pointer; }
+  button#refresh:hover { border-color: var(--accent); color: var(--accent); }
+  button#refresh:disabled { opacity: .5; cursor: default; }
+  /* minmax(0,1fr) lets grid tracks shrink below their content (default is auto,
+     which is what lets a long unbreakable crystal name overflow the page) */
+  .grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 720px) { .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px 14px; min-width: 0; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .span2 { grid-column: 1 / -1; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .kv .k { color: var(--dim); flex: 0 0 auto; }
+  .kv .v { text-align: right; min-width: 0; overflow-wrap: anywhere; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; }
+  .badge.live { background: rgba(126,224,192,.14); color: var(--good); }
+  .badge.dark { background: rgba(240,122,122,.14); color: var(--bad); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 3px 0;
+    border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .lvl { color: var(--accent); font-weight: 600; flex: 0 0 auto; }
+  .name { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .clause { color: var(--dim); font-size: 12px; flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
+  .tier { color: var(--warn); flex: 0 0 auto; }
+  .muted { color: var(--dim); }
+  pre.section { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    margin: 0; color: var(--ink); font-size: 12px; max-height: 280px; overflow: auto; }
+  .err { color: var(--bad); font-size: 12px; padding: 2px 0; }
+  svg { width: 100%; height: 300px; display: block; }
+  .empty { color: var(--dim); font-style: italic; }
+  .note { color: var(--dim); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <div class="head">
+    <h1>Levain substrate</h1>
+    <div class="ctl">
+      <span class="stamp" id="stamp"></span>
+      <button id="refresh" type="button">refresh</button>
+    </div>
+  </div>
+  <p class="sub" id="store">connecting…</p>
+  <div class="grid" id="board"></div>
+
+<!-- The canonical render core (shared, transport-agnostic) + this surface's thin
+     fetch lifecycle shim. Both served by `levain serve` from package data — no
+     CDN, no framework, runs offline. -->
+<script src="/dashboard_core.js"></script>
+<script src="/dashboard_boot.js"></script>
+</body>
+</html>

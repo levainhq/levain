@@ -65,6 +65,24 @@ levain verify-hooks --path /path/to/install
 
 `levain verify-hooks` actually invokes the activation hooks via stdin JSON and verifies they emit valid output. Closes the silent-skip class — particularly the Codex platform hook-reliability gap where the harness itself doesn't surface failures.
 
+## Inspect your substrate
+
+Your partner's memory normally only exists *inside* a session. These read-only commands let you look at it from outside — memory health (is the Hebbian write-path live or silently dark?), the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. All read-only: they inspect, they never change anything.
+
+```
+levain dashboard          # a terminal glance (add --json for the raw view)
+levain serve              # a local web-app in your browser — localhost only
+```
+
+`levain serve` runs a tiny localhost web server (default `http://127.0.0.1:7420`) and opens your browser to a live dashboard of your own substrate. It binds loopback only, refuses non-loopback Hosts, ships its UI from the package (no CDN, no account, renders offline) — your memory stays on your machine. `Ctrl+C` to stop; `--port` / `--no-open` to adjust.
+
+```
+pip install 'levain[app]'   # optional: the in-host render
+levain serve-app            # serve the same dashboard as an MCP App, inside the host
+```
+
+`levain serve-app` is the alternate surface for hosts that render MCP Apps (Claude desktop/web, etc.). It needs the optional `mcp` extra; `levain serve` needs nothing beyond the base install.
+
 ## Audience
 
 Operator-class developers — the ~5% who already sense session-amnesia is a real problem and would build their own fix. The ceiling isn't a crack; it's the shape of the correct audience.

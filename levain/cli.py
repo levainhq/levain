@@ -143,6 +143,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     dash_p.set_defaults(func=_cmd_dashboard)
 
+    web_p = subparsers.add_parser(
+        "serve",
+        help="Serve the substrate dashboard as a local web-app (localhost).",
+        description=(
+            "Run the read-only substrate dashboard as a local web-app — your "
+            "browser, your machine, no vendor host, no CDN, no account. Binds "
+            "127.0.0.1 only and serves a fresh read-only SubstrateView snapshot "
+            "on every request: acts on nothing. This is the sovereign v2 control "
+            "surface; the in-host `serve-app` MCP App is the parked alternative."
+        ),
+    )
+    web_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    web_p.add_argument(
+        "--port",
+        type=int,
+        default=7420,
+        help="Port to bind on localhost (default: 7420).",
+    )
+    web_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Loopback address to bind (default: 127.0.0.1). Slice-1 serve is "
+            "loopback-only by construction — a non-loopback address is refused, "
+            "because the surface is read-only and unauthenticated until the "
+            "Slice-2 write/auth boundary lands."
+        ),
+    )
+    web_p.add_argument(
+        "--no-open",
+        action="store_true",
+        dest="no_open",
+        help="Do not open a browser tab on startup.",
+    )
+    web_p.set_defaults(func=_cmd_serve)
+
     serve_p = subparsers.add_parser(
         "serve-app",
         help="Serve the substrate dashboard as an in-host MCP App (stdio).",
@@ -188,6 +229,17 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     from levain.dashboard import run_dashboard
 
     return run_dashboard(path=args.path, as_json=args.as_json)
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from levain.web_server import run_web_server
+
+    return run_web_server(
+        path=args.path,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+    )
 
 
 def _cmd_serve_app(args: argparse.Namespace) -> int:
