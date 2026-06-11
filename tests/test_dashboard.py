@@ -1,0 +1,347 @@
+"""Tests for levain.dashboard — the Slice-1 read-only substrate assembly.
+
+Pure helpers are unit-tested directly; ``build_substrate_view`` is exercised
+against real (temp) anneal stores so the in-process call contract is verified,
+not mocked. The populated crystal tier is covered end-to-end by the live-store
+smoke (documented in next.md) + the corrupt-file fail-soft test here.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from levain.dashboard import (
+    AnnealPaths,
+    _one_clause,
+    _parse_sections,
+    _truncate,
+    build_substrate_view,
+)
+
+
+# --- pure helpers ----------------------------------------------------------
+
+class TestOneClause:
+    def test_em_dash_split(self) -> None:
+        assert _one_clause("lead clause — felt prose tail") == "lead clause"
+
+    def test_double_dash_split(self) -> None:
+        assert _one_clause("lead -- tail") == "lead"
+
+    def test_sentence_split_when_no_dash(self) -> None:
+        assert _one_clause("First sentence. Second sentence.") == "First sentence"
+
+    def test_semicolon_split(self) -> None:
+        assert _one_clause("clause a; clause b") == "clause a"
+
+    def test_truncates_long(self) -> None:
+        out = _one_clause("word " * 100)
+        assert len(out) <= 160
+        assert out.endswith("…")
+
+    def test_collapses_whitespace(self) -> None:
+        assert _one_clause("a   b\n\nc — tail") == "a b c"
+
+
+class TestTruncate:
+    def test_short_untouched(self) -> None:
+        assert _truncate("hi", 10) == "hi"
+
+    def test_long_ellipsis(self) -> None:
+        assert _truncate("abcdefghij", 5) == "abcd…"
+
+    def test_collapses_whitespace(self) -> None:
+        assert _truncate("a\n  b", 10) == "a b"
+
+
+class TestParseSections:
+    MD = (
+        "# Title\n\n## State\nfocus line\nmore\n\n"
+        "## Active Threads\n- t1\n- t2\n\n## Patterns\nx\n"
+    )
+
+    def test_returns_wanted_in_order(self) -> None:
+        secs = _parse_sections(self.MD, ("State", "Active Threads"))
+        assert [s.heading for s in secs] == ["State", "Active Threads"]
+        assert "focus line" in secs[0].body
+        assert "t1" in secs[1].body
+
+    def test_missing_section_skipped(self) -> None:
+        secs = _parse_sections(self.MD, ("State", "Nonexistent"))
+        assert [s.heading for s in secs] == ["State"]
+
+    def test_order_follows_request_not_doc(self) -> None:
+        secs = _parse_sections(self.MD, ("Active Threads", "State"))
+        assert [s.heading for s in secs] == ["Active Threads", "State"]
+
+    def test_empty_markdown(self) -> None:
+        assert _parse_sections("", ("State",)) == []
+
+
+# --- AnnealPaths -----------------------------------------------------------
+
+class TestAnnealPaths:
+    def test_derives_siblings_by_stem(self) -> None:
+        p = AnnealPaths.from_db("/x/y/memory.db")
+        assert p.continuity_md == Path("/x/y/memory.continuity.md")
+        assert p.crystal_json == Path("/x/y/memory.crystal.json")
+        assert p.spores_json == Path("/x/y/memory.spores.json")
+
+    def test_expanduser(self) -> None:
+        p = AnnealPaths.from_db("~/foo/bar.db")
+        assert "~" not in str(p.episodic_db)
+
+    def test_nondefault_stem(self) -> None:
+        p = AnnealPaths.from_db("/x/entity.db")
+        assert p.continuity_md.name == "entity.continuity.md"
+        assert p.spores_json.name == "entity.spores.json"
+
+
+# --- build_substrate_view --------------------------------------------------
+
+class TestBuildView:
+    def test_missing_store_reports_not_fabricates(self, tmp_path: Path) -> None:
+        """PURE READ: a missing store is REPORTED, never created. The dashboard
+        must not fabricate the infrastructure it exists to inspect (no db file,
+        no parent dirs)."""
+        target = tmp_path / "nested" / "memory.db"
+        v = build_substrate_view(AnnealPaths.from_db(target))
+        assert not target.exists()
+        assert not target.parent.exists()
+        assert "store" in v.errors
+        assert v.health is None
+        assert v.graph is None
+
+    def test_empty_existing_store_builds_clean(self, tmp_path: Path) -> None:
+        """An existing-but-empty store produces a coherent empty view, no errors."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):  # create an empty store
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.errors == {}
+        assert v.health is not None
+        assert v.health.write_path_live is False
+        assert v.health.total_episodes == 0
+        assert v.crystal_index == []
+        assert v.open_spores == []
+        assert v.sections == []
+        assert v.graph is not None
+        assert v.graph.nodes == []
+        assert v.graph.edges == []
+
+    def test_graph_no_dangling_edges(self, tmp_path: Path) -> None:
+        """Every emitted edge must have BOTH endpoints present as nodes."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            a = store.record("episode A", "decision")
+            b = store.record("episode B", "observation")
+            store.record_associations({(a.id, b.id)})
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.errors == {}
+        assert v.graph is not None
+        assert len(v.graph.edges) >= 1
+        node_ids = {n.id for n in v.graph.nodes}
+        for e in v.graph.edges:
+            assert e.source in node_ids
+            assert e.target in node_ids
+
+    def test_health_exposes_local_density(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.health is not None
+        assert hasattr(v.health, "local_density")
+        assert "local_density" in v.health.to_dict()
+        assert "wrap_in_progress" in v.health.to_dict()
+        assert v.health.wrap_in_progress is False
+
+    def test_health_continuity_chars_from_paths(self, tmp_path: Path) -> None:
+        """continuity_chars must read the (overridable) AnnealPaths location, so
+        it can't disagree with the sections (which read the same file)."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        md = tmp_path / "memory.continuity.md"
+        md.write_text("## State\nhello world\n", encoding="utf-8")
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.health is not None
+        assert v.health.continuity_chars == len(md.read_text(encoding="utf-8"))
+
+    def test_graph_edge_cap_marks_truncated(self, tmp_path: Path) -> None:
+        """The edge budget bounds materialization AND honestly marks truncated;
+        no dangling edges even under the cap; affective_intensity is a float."""
+        from anneal_memory import Store
+
+        from levain.dashboard import _build_graph
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            ids = [store.record(f"ep{i}", "observation").id for i in range(4)]
+            store.record_associations(
+                {(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[3])}
+            )
+        with Store(db, read_only=True) as store:
+            g = _build_graph(store, min_strength=0.0, max_nodes=300, max_edges=2)
+        assert g.truncated is True
+        assert len(g.edges) <= 2
+        node_ids = {n.id for n in g.nodes}
+        for e in g.edges:
+            assert e.source in node_ids
+            assert e.target in node_ids
+            assert isinstance(e.affective_intensity, float)
+
+    def test_populated_episodes_and_sections(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            store.record("decided X because Y", "decision")
+            store.record("noticed Z", "observation")
+        (tmp_path / "memory.continuity.md").write_text(
+            "## State\ncurrent focus\n\n## Active Threads\n- thread one\n",
+            encoding="utf-8",
+        )
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.errors == {}
+        assert v.health is not None
+        assert v.health.total_episodes == 2
+        assert [s.heading for s in v.sections] == ["State", "Active Threads"]
+        assert "current focus" in v.sections[0].body
+
+    def test_open_spores_surfaced(self, tmp_path: Path) -> None:
+        from anneal_memory.spores import SporeStore
+
+        db = tmp_path / "memory.db"
+        SporeStore(tmp_path / "memory.spores.json").add(
+            type="task", text="an open loop", tier="hot", salience=2
+        )
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert len(v.open_spores) == 1
+        assert v.open_spores[0].text == "an open loop"
+        assert v.open_spores[0].tier == "hot"
+
+    def test_max_spores_cap(self, tmp_path: Path) -> None:
+        from anneal_memory.spores import SporeStore
+
+        db = tmp_path / "memory.db"
+        store = SporeStore(tmp_path / "memory.spores.json")
+        for i in range(5):
+            store.add(type="task", text=f"loop {i}", tier="warm")
+        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=3)
+        assert len(v.open_spores) == 3
+
+    def test_corrupt_crystal_is_failsoft(self, tmp_path: Path) -> None:
+        """A corrupt crystal store degrades VISIBLY (errors) without blanking the
+        rest of the board — the invisible_infrastructure_failure guard."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        (tmp_path / "memory.crystal.json").write_text("{not valid json", encoding="utf-8")
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert "crystal_index" in v.errors
+        assert v.crystal_index == []
+        assert v.health is not None  # health tier unaffected by the crystal fault
+
+    def test_to_dict_is_json_serializable(self, tmp_path: Path) -> None:
+        import json
+
+        v = build_substrate_view(AnnealPaths.from_db(tmp_path / "memory.db"))
+        # must round-trip without raising
+        json.dumps(v.to_dict())
+
+
+# --- CLI surface: run_dashboard / render_text ------------------------------
+
+class TestCLISurface:
+    @staticmethod
+    def _make_install(tmp_path: Path) -> Path:
+        from anneal_memory import Store
+
+        levain_dir = tmp_path / ".levain"
+        levain_dir.mkdir()
+        with Store(levain_dir / "memory.db") as store:
+            store.record("decided X because Y", "decision")
+        (levain_dir / "memory.continuity.md").write_text(
+            "## State\nfocus\n\n## Active Threads\n- t1\n", encoding="utf-8"
+        )
+        return tmp_path
+
+    def test_no_store_returns_1(self, tmp_path: Path, capsys) -> None:
+        from levain.dashboard import run_dashboard
+
+        rc = run_dashboard(tmp_path)
+        assert rc == 1
+        assert "No anneal store" in capsys.readouterr().err
+
+    def test_text_render_returns_0(self, tmp_path: Path, capsys) -> None:
+        from levain.dashboard import run_dashboard
+
+        rc = run_dashboard(self._make_install(tmp_path))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Levain substrate" in out
+        assert "Health" in out
+        assert "State" in out
+
+    def test_json_render(self, tmp_path: Path, capsys) -> None:
+        import json
+
+        from levain.dashboard import run_dashboard
+
+        rc = run_dashboard(self._make_install(tmp_path), as_json=True)
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["health"]["total_episodes"] == 1
+        assert "graph" in payload
+
+    def test_via_cli_main(self, tmp_path: Path, capsys) -> None:
+        import json
+
+        from levain.cli import main
+
+        rc = main(["dashboard", "--path", str(self._make_install(tmp_path)), "--json"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["health"]["total_episodes"] == 1
+
+    def test_render_text_handles_dark_write_path(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        from levain.dashboard import AnnealPaths, build_substrate_view, render_text
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        text = render_text(v)
+        assert "DARK" in text  # an existing empty store has no associations
+
+    def test_render_text_with_content(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+        from anneal_memory.spores import SporeStore
+
+        from levain.dashboard import AnnealPaths, build_substrate_view, render_text
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            a = store.record("episode A", "decision")
+            b = store.record("episode B", "observation")
+            store.record_associations({(a.id, b.id)})
+        SporeStore(tmp_path / "memory.spores.json").add(
+            type="task", text="loop", tier="hot"
+        )
+        (tmp_path / "memory.continuity.md").write_text("## State\nfoc\n", encoding="utf-8")
+        text = render_text(build_substrate_view(AnnealPaths.from_db(db)))
+        assert "LIVE" in text  # has associations
+        assert "Open loops" in text
+        assert "State" in text

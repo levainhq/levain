@@ -117,6 +117,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     vh_p.set_defaults(func=_cmd_verify_hooks)
 
+    dash_p = subparsers.add_parser(
+        "dashboard",
+        help="Read-only glance at the substrate from outside a session.",
+        description=(
+            "Render the install's anneal substrate — memory health, the "
+            "association graph, crystallized patterns, open loops, and the "
+            "State / Active Threads narrative — without opening a Claude Code "
+            "or Codex session. Read-only: acts on nothing. --json emits the "
+            "machine-readable SubstrateView (the shape the v2 MCP-App control-"
+            "pane serves)."
+        ),
+    )
+    dash_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    dash_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the SubstrateView as JSON instead of a terminal render.",
+    )
+    dash_p.set_defaults(func=_cmd_dashboard)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
@@ -137,6 +163,12 @@ def _cmd_verify_hooks(args: argparse.Namespace) -> int:
     from levain.verify import run_verify_hooks
 
     return run_verify_hooks(path=args.path)
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> int:
+    from levain.dashboard import run_dashboard
+
+    return run_dashboard(path=args.path, as_json=args.as_json)
 
 
 if __name__ == "__main__":
