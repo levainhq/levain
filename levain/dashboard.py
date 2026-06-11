@@ -51,6 +51,7 @@ __all__ = [
     "SubstrateView",
     "build_substrate_view",
     "render_text",
+    "render_summary",
     "run_dashboard",
 ]
 
@@ -642,6 +643,57 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  - {tier}: {msg}")
 
     return "\n".join(out).rstrip() + "\n"
+
+
+def render_summary(view: SubstrateView) -> str:
+    """The MODEL-visible summary — the ``content`` half of the MCP-App split.
+
+    The full ``SubstrateView`` rides in ``structuredContent`` (the UI's render
+    prop, hidden from the model). This is the compact, reason-over-able digest
+    the model actually sees: write-path health, the load-bearing counts, and the
+    State / Active-Threads headlines — NOT the whole graph + spore + crystal dump
+    (that would bloat model context, which is the exact inversion the
+    content/structuredContent split exists to prevent). Also the text-only
+    fallback for hosts without MCP-Apps support."""
+    lines: list[str] = [f"Levain substrate — {view.paths.episodic_db.stem}"]
+
+    h = view.health
+    if h is not None:
+        if h.write_path_live:
+            lines.append(
+                f"Health: write-path LIVE — {h.total_links} Hebbian links "
+                f"(avg {h.avg_strength:.2f})"
+            )
+        else:
+            lines.append(
+                "Health: write-path DARK — 0 associations "
+                "(a graduated wrap should form links; 0 = the silent-0-links death)"
+            )
+        last = h.last_wrap_at.split("T")[0] if h.last_wrap_at else "never"
+        lines.append(
+            f"  {h.total_episodes:,} episodes ({h.episodes_since_wrap} since wrap) · "
+            f"{h.graduations_validated_total} graduations validated / "
+            f"{h.graduations_demoted_total} demoted · "
+            f"{h.total_wraps} wraps (last {last})"
+        )
+        if h.wrap_in_progress:
+            lines.append("  ⚠ wrap in progress — snapshot may be momentarily inconsistent")
+    elif "store" in view.errors:
+        lines.append(f"Health: unavailable — {view.errors['store']}")
+
+    lines.append(f"Crystallized patterns: {len(view.crystal_index)}")
+    lines.append(f"Open loops: {len(view.open_spores)}")
+
+    for sec in view.sections:
+        # the entity's own words — first non-empty line of each, as a headline
+        head = next((ln.strip() for ln in sec.body.splitlines() if ln.strip()), "")
+        if head:
+            lines.append(f"{sec.heading}: {_truncate(head, 200)}")
+
+    if view.errors:
+        lines.append("Degraded tiers (rendered empty in the app): " + ", ".join(view.errors))
+
+    return "\n".join(lines)
 
 
 def run_dashboard(path: Path, as_json: bool = False) -> int:

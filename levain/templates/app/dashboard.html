@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Levain substrate</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #232a33; --ink: #d7dde5;
+    --dim: #8b96a5; --accent: #7ee0c0; --warn: #f0a868; --bad: #f07a7a;
+    --good: #7ee0c0; --node: #5aa9e6; --edge: #3a4654;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  body { padding: 16px; }
+  h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: .04em; }
+  .sub { color: var(--dim); font-size: 11px; margin: 0 0 14px; word-break: break-all; }
+  .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px 14px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .span2 { grid-column: 1 / -1; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .kv .k { color: var(--dim); } .kv .v { text-align: right; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; }
+  .badge.live { background: rgba(126,224,192,.14); color: var(--good); }
+  .badge.dark { background: rgba(240,122,122,.14); color: var(--bad); }
+  .row { display: flex; gap: 8px; align-items: baseline; padding: 3px 0;
+    border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .lvl { color: var(--accent); font-weight: 600; flex: 0 0 auto; }
+  .name { color: var(--ink); flex: 0 0 auto; }
+  .clause { color: var(--dim); font-size: 12px; }
+  .tier { color: var(--warn); flex: 0 0 auto; }
+  .muted { color: var(--dim); }
+  pre.section { white-space: pre-wrap; word-break: break-word; margin: 0;
+    color: var(--ink); font-size: 12px; max-height: 280px; overflow: auto; }
+  .err { color: var(--bad); font-size: 12px; padding: 2px 0; }
+  svg { width: 100%; height: 300px; display: block; }
+  .empty { color: var(--dim); font-style: italic; }
+  .note { color: var(--dim); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>Levain substrate</h1>
+  <p class="sub" id="store">connecting…</p>
+  <div class="grid" id="board"></div>
+
+<script type="module">
+  import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@0.4.0/app-with-deps";
+
+  const board = document.getElementById("board");
+  const storeEl = document.getElementById("store");
+
+  // ---- tiny DOM helpers (textContent only — never innerHTML on store data) ----
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const panel = (title, span2) => {
+    const p = el("div", "panel" + (span2 ? " span2" : ""));
+    p.appendChild(el("h2", null, title));
+    return p;
+  };
+  const kv = (parent, k, v) => {
+    const row = el("div", "kv");
+    row.appendChild(el("span", "k", k));
+    row.appendChild(el("span", "v", v));
+    parent.appendChild(row);
+  };
+  const fmt = (n) => (typeof n === "number" ? n.toLocaleString("en-US") : n);
+  // coerce a render value to a finite number (a malformed/injected structuredContent
+  // must degrade to 0, never paint the literal "NaN" across the health panel)
+  const num = (x) => { const n = +x; return Number.isFinite(n) ? n : 0; };
+
+  // ---------------------------------------------------------------- render ----
+  function render(view) {
+    board.replaceChildren();
+    if (!view || typeof view !== "object") {
+      board.appendChild(el("p", "empty", "No substrate data delivered."));
+      return;
+    }
+    const paths = view.paths || {};
+    storeEl.textContent = paths.episodic_db || "(store path unknown)";
+
+    renderHealth(view);
+    renderGraph(view);
+    renderCrystals(view);
+    renderSpores(view);
+    renderSections(view);
+    renderErrors(view);
+  }
+
+  function renderHealth(view) {
+    const p = panel("Health");
+    const h = view.health;
+    if (!h) {
+      p.appendChild(el("p", "empty",
+        (view.errors && view.errors.store) ? ("store unavailable — " + view.errors.store)
+                                           : "no health data"));
+      board.appendChild(p);
+      return;
+    }
+    const head = el("div", "kv");
+    head.appendChild(el("span", "k", "write-path"));
+    const b = el("span", "badge " + (h.write_path_live ? "live" : "dark"),
+      h.write_path_live ? "LIVE" : "DARK · 0 links");
+    const vWrap = el("span", "v"); vWrap.appendChild(b);
+    head.appendChild(vWrap);
+    p.appendChild(head);
+
+    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}, max ${num(h.max_strength).toFixed(2)})`);
+    kv(p, "density", `${num(h.density).toFixed(3)} · local ${num(h.local_density).toFixed(3)}`);
+    kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
+    kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
+    const last = h.last_wrap_at ? String(h.last_wrap_at).split("T")[0] : "never";
+    kv(p, "continuity", `${h.continuity_chars != null ? fmt(h.continuity_chars) + " chars" : "not yet created"} · ${fmt(h.total_wraps)} wraps · last ${last}`);
+    if (h.tombstones) kv(p, "tombstones", fmt(h.tombstones));
+    if (h.wrap_in_progress) p.appendChild(el("p", "note", "⚠ wrap in progress — snapshot may be momentarily inconsistent"));
+    board.appendChild(p);
+  }
+
+  function renderGraph(view) {
+    const p = panel("Association graph", true);
+    const g = view.graph;
+    if (!g || !g.nodes || g.nodes.length === 0) {
+      p.appendChild(el("p", "empty",
+        (view.errors && view.errors.graph) ? ("graph unavailable — " + view.errors.graph)
+                                           : "no associations yet (a graduated wrap forms links)"));
+      board.appendChild(p);
+      return;
+    }
+    const W = 640, H = 300;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    layoutAndDraw(svg, g.nodes, g.edges || [], W, H);
+    p.appendChild(svg);
+    const cap = g.truncated ? " (capped for display)" : "";
+    p.appendChild(el("p", "note", `${g.nodes.length} nodes · ${(g.edges || []).length} edges${cap}`));
+    board.appendChild(p);
+  }
+
+  // Deterministic force-ish layout (seeded on a circle, fixed iterations) — no
+  // RNG, no deps, snappy at the builder's 300-node / 2000-edge caps.
+  function layoutAndDraw(svg, nodes, edges, W, H) {
+    const N = nodes.length;
+    const idx = new Map(nodes.map((n, i) => [n.id, i]));
+    const R = Math.min(W, H) * 0.42;
+    const pos = nodes.map((n, i) => ({
+      x: W / 2 + R * Math.cos((2 * Math.PI * i) / N),
+      y: H / 2 + R * Math.sin((2 * Math.PI * i) / N),
+    }));
+    const E = edges
+      .map((e) => [idx.get(e.source), idx.get(e.target), num(e.strength)])
+      // drop dangling endpoints AND self-loops (a self-edge would draw a
+      // zero-length line and double-count one node's degree)
+      .filter((e) => e[0] != null && e[1] != null && e[0] !== e[1]);
+    const deg = new Array(N).fill(0);
+    for (const [a, b] of E) { deg[a]++; deg[b]++; }
+
+    const iters = N > 160 ? 90 : 200;
+    for (let t = 0; t < iters; t++) {
+      const fx = new Array(N).fill(0), fy = new Array(N).fill(0);
+      for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+        const dx = pos[i].x - pos[j].x, dy = pos[i].y - pos[j].y;
+        const d2 = dx * dx + dy * dy + 0.01, f = 900 / d2;
+        fx[i] += dx * f; fy[i] += dy * f; fx[j] -= dx * f; fy[j] -= dy * f;
+      }
+      for (const [a, b, s] of E) {
+        const dx = pos[b].x - pos[a].x, dy = pos[b].y - pos[a].y;
+        const d = Math.sqrt(dx * dx + dy * dy) + 0.01;
+        const f = (d - 58) * 0.02 * (0.3 + s);
+        fx[a] += (dx / d) * f; fy[a] += (dy / d) * f;
+        fx[b] -= (dx / d) * f; fy[b] -= (dy / d) * f;
+      }
+      for (let i = 0; i < N; i++) {
+        pos[i].x += Math.max(-14, Math.min(14, fx[i]));
+        pos[i].y += Math.max(-14, Math.min(14, fy[i]));
+      }
+    }
+    // fit into viewport with padding
+    const pad = 16;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of pos) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y); }
+    const sx = (W - 2 * pad) / Math.max(1, maxX - minX);
+    const sy = (H - 2 * pad) / Math.max(1, maxY - minY);
+    const s = Math.min(sx, sy);
+    for (const p of pos) { p.x = pad + (p.x - minX) * s; p.y = pad + (p.y - minY) * s; }
+
+    const NS = "http://www.w3.org/2000/svg";
+    let maxS = 0; for (const [, , st] of E) maxS = Math.max(maxS, st);
+    for (const [a, b, st] of E) {
+      const ln = document.createElementNS(NS, "line");
+      ln.setAttribute("x1", pos[a].x); ln.setAttribute("y1", pos[a].y);
+      ln.setAttribute("x2", pos[b].x); ln.setAttribute("y2", pos[b].y);
+      ln.setAttribute("stroke", "var(--edge)");
+      ln.setAttribute("stroke-opacity", (0.25 + 0.6 * (maxS ? st / maxS : 0)).toFixed(2));
+      ln.setAttribute("stroke-width", (0.5 + 1.5 * (maxS ? st / maxS : 0)).toFixed(2));
+      svg.appendChild(ln);
+    }
+    for (let i = 0; i < N; i++) {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("cx", pos[i].x); c.setAttribute("cy", pos[i].y);
+      c.setAttribute("r", (2.5 + Math.min(5, deg[i] * 0.6)).toFixed(1));
+      c.setAttribute("fill", "var(--node)");
+      const title = document.createElementNS(NS, "title");
+      title.textContent = nodes[i].label || nodes[i].id || "";
+      c.appendChild(title);
+      svg.appendChild(c);
+    }
+  }
+
+  function renderCrystals(view) {
+    const list = view.crystal_index || [];
+    const p = panel(`Crystallized patterns (${list.length})`);
+    if (list.length === 0) { p.appendChild(el("p", "empty", "none crystallized yet")); board.appendChild(p); return; }
+    for (const c of list) {
+      const row = el("div", "row");
+      row.appendChild(el("span", "lvl", `${c.level}x`));
+      row.appendChild(el("span", "name", c.name));
+      if (c.one_clause) row.appendChild(el("span", "clause", "— " + c.one_clause));
+      p.appendChild(row);
+    }
+    board.appendChild(p);
+  }
+
+  function renderSpores(view) {
+    const list = view.open_spores || [];
+    const p = panel(`Open loops (${list.length})`);
+    if (list.length === 0) { p.appendChild(el("p", "empty", "no open prospective loops")); board.appendChild(p); return; }
+    for (const s of list) {
+      const row = el("div", "row");
+      if (s.tier) row.appendChild(el("span", "tier", `[${s.tier}]`));
+      row.appendChild(el("span", "clause", s.text));
+      if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+      p.appendChild(row);
+    }
+    board.appendChild(p);
+  }
+
+  function renderSections(view) {
+    for (const sec of view.sections || []) {
+      const p = panel(sec.heading, true);
+      const pre = el("pre", "section", sec.body || "");
+      p.appendChild(pre);
+      board.appendChild(p);
+    }
+  }
+
+  function renderErrors(view) {
+    const errs = view.errors || {};
+    const keys = Object.keys(errs);
+    if (keys.length === 0) return;
+    const p = panel("Degraded tiers (rendered empty above)", true);
+    for (const k of keys) p.appendChild(el("p", "err", `${k}: ${errs[k]}`));
+    board.appendChild(p);
+  }
+
+  // ------------------------------------------------------------- lifecycle ----
+  const app = new App({ name: "Levain substrate", version: "1.0.0" });
+
+  // The tool result delivers the read-only snapshot. We render structuredContent
+  // (the UI prop); content is the model-facing summary, not for the UI.
+  app.ontoolresult = (result) => {
+    const sc = result && result.structuredContent;
+    if (sc) render(sc);
+  };
+
+  app.onhostcontextchanged = (ctx) => {
+    if (ctx && ctx.safeAreaInsets) {
+      const i = ctx.safeAreaInsets;
+      document.body.style.padding =
+        `${16 + (i.top || 0)}px ${16 + (i.right || 0)}px ${16 + (i.bottom || 0)}px ${16 + (i.left || 0)}px`;
+    }
+  };
+
+  try {
+    await app.connect();
+    const ctx = app.getHostContext && app.getHostContext();
+    if (ctx) app.onhostcontextchanged(ctx);
+  } catch (e) {
+    storeEl.textContent = "failed to connect to host: " + (e && e.message ? e.message : e);
+  }
+</script>
+</body>
+</html>

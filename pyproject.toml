@@ -44,7 +44,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+# The MCP-App in-host dashboard server (`levain serve-app`). Optional so the
+# core install + `levain dashboard` CLI stay lean; only pulled when an operator
+# wants the in-host render. The UI loads its client lib from a CDN — no Node.
+app = ["mcp>=1.27,<2"]
+dev = ["pytest>=7.4", "mcp>=1.27,<2"]
 
 [project.scripts]
 levain = "levain.cli:main"

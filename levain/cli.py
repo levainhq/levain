@@ -143,6 +143,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     dash_p.set_defaults(func=_cmd_dashboard)
 
+    serve_p = subparsers.add_parser(
+        "serve-app",
+        help="Serve the substrate dashboard as an in-host MCP App (stdio).",
+        description=(
+            "Run the read-only substrate dashboard as an MCP-Apps server over "
+            "stdio, so a host (Claude desktop/web, ChatGPT, VS Code, Goose) can "
+            "render it inside the chat. Read-only by construction: the server "
+            "declares only read tools, so nothing it exposes can mutate the "
+            "store. Needs the optional MCP SDK: pip install 'levain[app]'."
+        ),
+    )
+    serve_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    serve_p.set_defaults(func=_cmd_serve_app)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
@@ -169,6 +188,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     from levain.dashboard import run_dashboard
 
     return run_dashboard(path=args.path, as_json=args.as_json)
+
+
+def _cmd_serve_app(args: argparse.Namespace) -> int:
+    from levain.app_server import run_app_server
+
+    return run_app_server(path=args.path)
 
 
 if __name__ == "__main__":
