@@ -13,32 +13,35 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--ink);
     font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  body { padding: 16px; }
+  body { padding: 16px; overflow-x: hidden; max-width: 100%; }
   h1 { font-size: 14px; margin: 0 0 2px; letter-spacing: .04em; }
   .sub { color: var(--dim); font-size: 11px; margin: 0 0 14px; word-break: break-all; }
-  .grid { display: grid; gap: 12px; grid-template-columns: 1fr; }
-  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  /* minmax(0,1fr) lets grid tracks shrink below their content (default is auto,
+     which is what lets a long unbreakable crystal name overflow the page) */
+  .grid { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 720px) { .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
   .panel { background: var(--panel); border: 1px solid var(--line);
-    border-radius: 8px; padding: 12px 14px; }
+    border-radius: 8px; padding: 12px 14px; min-width: 0; }
   .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
     color: var(--dim); margin: 0 0 10px; font-weight: 600; }
   .span2 { grid-column: 1 / -1; }
   .kv { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
-  .kv .k { color: var(--dim); } .kv .v { text-align: right; }
+  .kv .k { color: var(--dim); flex: 0 0 auto; }
+  .kv .v { text-align: right; min-width: 0; overflow-wrap: anywhere; }
   .badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
     font-size: 11px; font-weight: 600; }
   .badge.live { background: rgba(126,224,192,.14); color: var(--good); }
   .badge.dark { background: rgba(240,122,122,.14); color: var(--bad); }
-  .row { display: flex; gap: 8px; align-items: baseline; padding: 3px 0;
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 3px 0;
     border-top: 1px solid var(--line); }
   .row:first-child { border-top: 0; }
   .lvl { color: var(--accent); font-weight: 600; flex: 0 0 auto; }
-  .name { color: var(--ink); flex: 0 0 auto; }
-  .clause { color: var(--dim); font-size: 12px; }
+  .name { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  .clause { color: var(--dim); font-size: 12px; flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
   .tier { color: var(--warn); flex: 0 0 auto; }
   .muted { color: var(--dim); }
-  pre.section { white-space: pre-wrap; word-break: break-word; margin: 0;
-    color: var(--ink); font-size: 12px; max-height: 280px; overflow: auto; }
+  pre.section { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    margin: 0; color: var(--ink); font-size: 12px; max-height: 280px; overflow: auto; }
   .err { color: var(--bad); font-size: 12px; padding: 2px 0; }
   svg { width: 100%; height: 300px; display: block; }
   .empty { color: var(--dim); font-style: italic; }
