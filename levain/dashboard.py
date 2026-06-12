@@ -1,11 +1,22 @@
-"""levain.dashboard — Levain v2, Slice 1: the read-only substrate dashboard.
+"""levain.dashboard — Levain v2: the read-only substrate view (Slices 1 + 1.5).
 
 The v2 spine is *the substrate escapes the session*. Today a Levain partnership
 entity only exists INSIDE a live Claude Code / Codex session — to see your memory,
-your open loops, the health of your Hebbian graph, you have to be mid-conversation.
-Slice 1 is the first move out: assemble the entity's whole anneal substrate into a
-single ``SubstrateView`` that can be rendered from outside (an MCP-App inside the
-host, a CLI, a future control-pane).
+your open loops, the health of your Hebbian graph, who the entity is and how it
+thinks, you have to be mid-conversation. This module is the first move out:
+assemble the entity's WHOLE substrate — the anneal stores AND the install's
+seed/config surface — into a single ``SubstrateView`` that renders from outside
+(the local sovereign web-app, a CLI, the parked in-host MCP-App).
+
+Slice 1 served State + health + graph + crystals + spores. **Slice 1.5 shows
+EVERYTHING, read-only:** all six neocortex sections, the seed/config surface
+(origin / operator / posture / constitution), recent episodes, the wrap-history
+timeline — organized by the ``Identity · Operate · Mind`` IA. Every emitted
+surface carries its **edit-class** (A = operator config / B = lifecycle verb /
+C = consolidated cognition, read-only) and **zone**; the ``layout()`` manifest
+declares the render program in Python, so the frontend renders affordances FROM
+the substrate schema and Slice 2 turns on per-class editing without a data-layer
+rewrite (``structural_invariants_beat_discipline`` at the UI layer).
 
 This module is the host-agnostic DATA half. It imports ``anneal_memory`` in-process
 (no IPC wall, no CLI shell, no MCP round-trip — Levain and anneal are both Python and
@@ -19,10 +30,11 @@ Three properties make this the correct first slice:
 
 Failure discipline mirrors the recall hook: each sub-read is independently
 fail-soft. A corrupt crystal file, an absent spore store, an unwrapped entity with
-no continuity yet — none of these blank the whole board. Every degradation lands in
-``SubstrateView.errors`` so the surface can SHOW that a tier is unavailable rather
-than silently rendering it empty (a silent-empty health panel is exactly the
-``invisible_infrastructure_failure`` the dashboard exists to make visible).
+no continuity yet, a missing ``seed/`` dir — none of these blank the whole board.
+Every degradation lands in ``SubstrateView.errors`` so the surface can SHOW that a
+tier is unavailable rather than silently rendering it empty (a silent-empty health
+panel is exactly the ``invisible_infrastructure_failure`` the dashboard exists to
+make visible).
 """
 
 from __future__ import annotations
@@ -41,12 +53,16 @@ from typing import Any
 
 __all__ = [
     "AnnealPaths",
+    "SubstrateSource",
     "Health",
     "GraphNode",
     "GraphEdge",
     "AssociationGraph",
     "CrystalEntry",
     "OpenSpore",
+    "EpisodeRow",
+    "WrapRow",
+    "ConfigDoc",
     "Section",
     "SubstrateView",
     "build_substrate_view",
@@ -54,6 +70,21 @@ __all__ = [
     "render_summary",
     "run_dashboard",
 ]
+
+
+# --- the IA: zones (Identity · Operate · Mind) + edit-classes (A/B/C) -------
+# The three zones encode the governance model — the IA IS the edit-class
+# structure. Edit-classes: A = operator config (direct edit, human-is-fan-in,
+# safe); B = lifecycle data (anneal's validated verbs, never raw writes); C =
+# consolidated cognition (the consolidate single-writer owns it — READ-ONLY, the
+# human influences it only via inputs). 1.5 renders every class read-only; the
+# tags are present so Slice 2 turns on affordances per class with no rewrite.
+ZONE_IDENTITY = "identity"
+ZONE_OPERATE = "operate"
+ZONE_MIND = "mind"
+CLASS_A = "A"
+CLASS_B = "B"
+CLASS_C = "C"
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +121,54 @@ class AnnealPaths:
         )
 
 
+@dataclass(frozen=True)
+class SubstrateSource:
+    """WHERE a substrate view is assembled from — the data-source seam.
+
+    Slice 1.5 has exactly one source: a local Levain install (its anneal store +
+    its install-root seed/config files). The seam exists so a *team commons*
+    source (``scope="team"``, a different paths bundle) is a SWAP, not a rewrite —
+    ``build_substrate_view`` + ``SubstrateView`` + the render core all stay
+    source-agnostic (they don't care where the bytes came from). This is
+    ``canonical_object_model_plus_replaceable_surfaces`` at the data layer.
+
+    ``anneal`` locates the four anneal stores; ``install_root`` (optional) locates
+    the seed/config surface (``<root>/seed/*``, ``<root>/activation/*``) which does
+    NOT live next to the db. ``scope`` is carried through to the view (the IA's
+    personal|team axis; 1.5 only ever emits ``personal``)."""
+
+    anneal: AnnealPaths
+    install_root: Path | None = None
+    scope: str = "personal"
+
+    @classmethod
+    def local(cls, install_root: str | Path) -> "SubstrateSource":
+        """A Levain install keeps its anneal store at ``<install>/.levain/memory.db``
+        (the convention ``doctor._match_store`` enforces) and its seed/config files
+        at the install root. Resolve both from the install directory."""
+        root = Path(str(install_root)).expanduser().resolve()
+        return cls(
+            anneal=AnnealPaths.from_db(root / ".levain" / "memory.db"),
+            install_root=root,
+            scope="personal",
+        )
+
+    def build(self, **kwargs: Any) -> "SubstrateView":
+        """Assemble the view from this source. The single call entry points use,
+        so a team-commons source flows through unchanged."""
+        return build_substrate_view(
+            self.anneal,
+            install_root=self.install_root,
+            scope=self.scope,
+            **kwargs,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Result shapes — plain dataclasses, JSON-serializable via to_dict(). These are
-# the dashboard's vocabulary; the MCP-App server serializes them, the host
-# renders them. Kept faithful to the underlying anneal reads (no speculative
-# fields) — sourdough_scoping, not a designed-ahead schema.
+# the dashboard's vocabulary; the web-app + MCP-App serialize them, the browser
+# renders them. Kept faithful to the underlying reads (no speculative fields) —
+# sourdough_scoping, not a designed-ahead schema.
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -206,12 +280,78 @@ class OpenSpore:
 
 
 @dataclass
+class EpisodeRow:
+    """One recent episode — the raw input layer the consolidate compresses from.
+    The PANEL is Class B (read-only here): per scope §4's edit-class taxonomy the
+    chip encodes the EDIT MODEL, and the only episode mutation is a verb-mediated
+    tombstone (never a raw write), exactly like spores — so the Operate zone is
+    coherently verb-mediated. (§6's build-note loosely said "Class A"; §4, the
+    canonical table, governs — and seam #2 keys Slice-2 affordances off this chip,
+    so it must signal verb-mediated, not direct-edit.) The dashboard surfaces the
+    entity's own facts, truncated for the list."""
+
+    id: str
+    timestamp: str
+    type: str
+    source: str
+    content: str
+    tags: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+@dataclass
+class WrapRow:
+    """One historical wrap — the consolidate's audit trail surfaced as a timeline.
+    The read foundation for Slice-2 time-travel/restore (anneal's hash-chain audit
+    already holds the data). Class C — read-only consolidated history."""
+
+    wrapped_at: str
+    episodes_compressed: int
+    continuity_chars: int
+    graduations_validated: int
+    graduations_demoted: int
+    associations_formed: int
+    associations_strengthened: int
+    associations_decayed: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+@dataclass
+class ConfigDoc:
+    """A seed/config document from the install root (NOT the anneal store): who the
+    operator is (``world.md`` sections), who the entity is (``origin.md``), how it
+    thinks (``posture.md`` / ``recency_directives.md``) — all Class A — and the
+    constitution (``partnership.md`` / ``memory.md`` / ``spore_instructions.md``),
+    Class C-view (viewable; the advanced "fork my methodology" edit is Slice 2+).
+    All live in the Identity zone."""
+
+    key: str
+    title: str
+    body: str
+    edit_class: str
+    zone: str
+    source: str  # the file it came from, relative to the install root
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+@dataclass
 class Section:
-    """A continuity narrative section (State / Active Threads), rendered as-is.
-    The dashboard does not re-derive these — it surfaces the entity's own words."""
+    """A neocortex narrative section (State / Active Threads / Patterns / Decisions
+    / Context / Understanding), rendered as-is. The dashboard does not re-derive
+    these — it surfaces the entity's own words. ``State`` is Class A (free-text,
+    last-writer-wins — directly editable in Slice 2); the rest are Class C (the
+    consolidate owns them, read-only). All live in the Mind zone."""
 
     heading: str
     body: str
+    edit_class: str = CLASS_C
+    zone: str = ZONE_MIND
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -219,16 +359,86 @@ class Section:
 
 @dataclass
 class SubstrateView:
-    """The whole substrate, assembled. Any tier may be ``None`` with a matching
-    entry in ``errors`` — degrade visibly, never silently."""
+    """The whole substrate, assembled. Any tier may be ``None`` / empty with a
+    matching entry in ``errors`` — degrade visibly, never silently. ``layout()``
+    declares the ordered, zoned, edit-classed render program the frontend renders
+    from."""
 
     paths: AnnealPaths
+    scope: str = "personal"
+    entity_name: str | None = None
     health: Health | None = None
     graph: AssociationGraph | None = None
     crystal_index: list[CrystalEntry] = field(default_factory=list)
     open_spores: list[OpenSpore] = field(default_factory=list)
+    episodes: list[EpisodeRow] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
+    config_docs: list[ConfigDoc] = field(default_factory=list)
+    wraps: list[WrapRow] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
+
+    def layout(self) -> list[dict[str, Any]]:
+        """The declared render program: an ordered list of panels, each with its
+        ``zone`` (identity/operate/mind), ``edit_class`` (A/B/C), ``title``, and a
+        ``ref`` index into the relevant collection for multi-item kinds. The
+        frontend renders FROM this — the IA + governance model live HERE in Python,
+        not hardcoded in JS, so the app cannot drift from what it edits. Slice 2
+        reads ``edit_class`` to enable affordances; 1.5 renders read-only.
+
+        Panels are emitted Identity → Operate → Mind (tab/scroll order). Singleton
+        kinds (health/graph/crystals/spores/episodes/wraps) read their data from the
+        matching view field; indexed kinds (config/section) carry ``ref``."""
+        panels: list[dict[str, Any]] = []
+
+        # --- Identity: the seed/config surface (who + how it thinks) ---------
+        for i, d in enumerate(self.config_docs):
+            panels.append(
+                {
+                    "kind": "config",
+                    "zone": d.zone,
+                    "edit_class": d.edit_class,
+                    "title": d.title,
+                    "ref": i,
+                    "source": d.source,  # render which seed/config file this is [codex L3]
+                }
+            )
+
+        # --- Operate: the inputs/loops you steer -----------------------------
+        panels.append(
+            {"kind": "spores", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
+             "title": f"Open loops ({len(self.open_spores)})"}
+        )
+        panels.append(
+            {"kind": "episodes", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
+             "title": f"Recent episodes ({len(self.episodes)})"}
+        )
+
+        # --- Mind: the cognition you observe (don't puppet) ------------------
+        panels.append(
+            {"kind": "health", "zone": ZONE_MIND, "edit_class": CLASS_C, "title": "Health"}
+        )
+        panels.append(
+            # kind stays "graph" (wire contract; the association-graph payload
+            # still rides view.graph for its stats + Slice-2 topology). The
+            # renderer draws the cognition-trace oscilloscope from view.wraps —
+            # real per-wrap vitals, per the no-theater design rule.
+            {"kind": "graph", "zone": ZONE_MIND, "edit_class": CLASS_C,
+             "title": "Cognition trace"}
+        )
+        panels.append(
+            {"kind": "crystals", "zone": ZONE_MIND, "edit_class": CLASS_C,
+             "title": f"Crystallized patterns ({len(self.crystal_index)})"}
+        )
+        for i, s in enumerate(self.sections):
+            panels.append(
+                {"kind": "section", "zone": s.zone, "edit_class": s.edit_class,
+                 "title": s.heading, "ref": i}
+            )
+        panels.append(
+            {"kind": "wraps", "zone": ZONE_MIND, "edit_class": CLASS_C,
+             "title": f"Wrap history ({len(self.wraps)})"}
+        )
+        return panels
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,11 +448,17 @@ class SubstrateView:
                 "crystal_json": str(self.paths.crystal_json),
                 "spores_json": str(self.paths.spores_json),
             },
+            "scope": self.scope,
+            "entity_name": self.entity_name,
             "health": self.health.to_dict() if self.health else None,
             "graph": self.graph.to_dict() if self.graph else None,
             "crystal_index": [c.to_dict() for c in self.crystal_index],
             "open_spores": [s.to_dict() for s in self.open_spores],
+            "episodes": [e.to_dict() for e in self.episodes],
             "sections": [s.to_dict() for s in self.sections],
+            "config_docs": [d.to_dict() for d in self.config_docs],
+            "wraps": [w.to_dict() for w in self.wraps],
+            "layout": self.layout(),
             "errors": self.errors,
         }
 
@@ -279,28 +495,140 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def _parse_sections(markdown: str, wanted: tuple[str, ...]) -> list[Section]:
-    """Split a continuity file on ``## `` headings and return the wanted ones in
-    requested order. Tolerant of the FLOW_SCHEMA shape (## State / ## Active
-    Threads / ## Patterns / …) without depending on a specific schema."""
-    blocks: dict[str, str] = {}
+def _split_sections(markdown: str) -> list[tuple[str, str]]:
+    """All ``## `` sections of a markdown doc, in document order, as
+    ``(heading, body)``. Used for both the neocortex (filtered) and the operator
+    seed file (every section becomes its own config panel)."""
+    out: list[tuple[str, str]] = []
     current: str | None = None
     buf: list[str] = []
     for line in markdown.splitlines():
         if line.startswith("## "):
             if current is not None:
-                blocks[current] = "\n".join(buf).strip()
+                out.append((current, "\n".join(buf).strip()))
             current = line[3:].strip()
             buf = []
         elif current is not None:
             buf.append(line)
     if current is not None:
-        blocks[current] = "\n".join(buf).strip()
+        out.append((current, "\n".join(buf).strip()))
+    return out
+
+
+def _parse_sections(markdown: str, wanted: tuple[str, ...]) -> list[Section]:
+    """Split a continuity file on ``## `` headings and return the wanted ones in
+    requested order. Tolerant of the FLOW_SCHEMA shape (## State / ## Active
+    Threads / ## Patterns / …) without depending on a specific schema. ``State``
+    is tagged Class A (free-text, directly editable in Slice 2); every other
+    section is Class C (the consolidate owns it)."""
+    blocks = dict(_split_sections(markdown))
     out: list[Section] = []
     for name in wanted:
         if name in blocks:
-            out.append(Section(heading=name, body=blocks[name]))
+            edit_class = CLASS_A if name == "State" else CLASS_C
+            out.append(Section(heading=name, body=blocks[name], edit_class=edit_class))
     return out
+
+
+def _h1_name_suffix(markdown: str) -> str | None:
+    """The operator-set entity name baked into a seed file's H1 at install
+    (``# Who You Are — <name>`` / ``# Continuity — <name>``). Returns the suffix
+    after the dash, or None if the H1 carries no ``— <name>`` form. The seed
+    "names nothing" by design, so this is the operator's post-formation name —
+    a real first-class name field is a Slice-2 concern (§9 of the scope)."""
+    for line in markdown.splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            head = s[2:].strip()
+            for sep in (" — ", " -- ", " - "):
+                if sep in head:
+                    name = head.split(sep, 1)[1].strip()
+                    return name or None
+            return None  # an H1 without a "— name" suffix carries no name
+    return None
+
+
+# The constitution files an entity carries (read-only view), with display names.
+# The seed ``continuity.md`` is intentionally NOT here: it is the near-empty SCHEMA
+# template (just the six section headings), and the operator's LIVE neocortex
+# already renders in the Mind zone — showing the empty schema as "constitution"
+# would only confuse. (Scope §4 lists it; this is a deliberate deviation.)
+_CONSTITUTION = (
+    ("partnership.md", "Constitution · how we work"),
+    ("memory.md", "Constitution · your memory"),
+    ("spore_instructions.md", "Constitution · open loops"),
+)
+
+# Bound the one operator-unbounded config tier: every other tier is capped
+# (max_spores/max_episodes/max_wraps/max_graph_nodes), but world.md splits into
+# one panel per ``##`` section, so a pathological world.md could emit arbitrarily
+# many. Cap the world-section split (the shipped template has 11; 40 is generous
+# headroom) so the Identity zone can't become an unbounded document dump.
+_MAX_WORLD_SECTIONS = 40
+
+
+def _read_config_docs(install_root: Path) -> list[ConfigDoc]:
+    """Read the seed/config surface from a Levain install root. Each file is
+    independently fail-soft — a missing file is simply skipped (an entity may not
+    carry every optional doc); only a fault that makes the whole tier unreadable
+    propagates to the caller's error handler. Returns Identity-zone docs in
+    render order: entity self → operator (per section) → thinking style →
+    constitution."""
+    docs: list[ConfigDoc] = []
+    seed = install_root / "seed"
+    activation = install_root / "activation"
+
+    def _read(p: Path) -> str | None:
+        try:
+            return p.read_text(encoding="utf-8") if p.is_file() else None
+        except (OSError, ValueError):
+            # ValueError covers UnicodeDecodeError: a single non-UTF8 seed file is
+            # SKIPPED exactly like a missing one — one corrupt file must never blank
+            # the whole config tier (the per-file fail-soft promise above).
+            return None
+
+    # entity self
+    origin = _read(seed / "origin.md")
+    if origin:
+        docs.append(ConfigDoc(
+            key="origin", title="Origin · who the entity is", body=origin,
+            edit_class=CLASS_A, zone=ZONE_IDENTITY, source="seed/origin.md",
+        ))
+
+    # operator — one panel per world.md section (Identity / How They Think / …),
+    # bounded so an over-long world.md can't flood the Identity zone.
+    world = _read(seed / "world.md")
+    if world:
+        for heading, section_body in _split_sections(world)[:_MAX_WORLD_SECTIONS]:
+            if not section_body:
+                continue
+            slug = heading.lower().replace(" ", "-").replace("&", "and")
+            docs.append(ConfigDoc(
+                key=f"world:{slug}", title=f"Operator · {heading}", body=section_body,
+                edit_class=CLASS_A, zone=ZONE_IDENTITY, source="seed/world.md",
+            ))
+
+    # thinking style
+    for fname, title in (("posture.md", "Posture · how it thinks"),
+                         ("recency_directives.md", "Recency directives")):
+        body = _read(activation / fname)
+        if body:
+            docs.append(ConfigDoc(
+                key=fname.replace(".md", ""), title=title, body=body,
+                edit_class=CLASS_A, zone=ZONE_IDENTITY,
+                source=f"activation/{fname}",
+            ))
+
+    # constitution (read-only view)
+    for fname, title in _CONSTITUTION:
+        body = _read(seed / fname)
+        if body:
+            docs.append(ConfigDoc(
+                key=fname.replace(".md", ""), title=title, body=body,
+                edit_class=CLASS_C, zone=ZONE_IDENTITY, source=f"seed/{fname}",
+            ))
+
+    return docs
 
 
 # ``get_associations`` binds the id list TWICE (``episode_a IN (...) OR
@@ -328,7 +656,10 @@ def _build_graph(
 
     seen: set[frozenset[str]] = set()
     pairs = []
-    truncated = False
+    # honest from the start: if the recall window itself dropped episodes (a store
+    # with >100k episodes), edges to those nodes can't be seen → already truncated.
+    # [codex L3 LOW]
+    truncated = result.total_matching > len(result.episodes)
     for i in range(0, len(all_ids), _ASSOC_ID_CHUNK):
         chunk = all_ids[i : i + _ASSOC_ID_CHUNK]
         got = store.get_associations(chunk, min_strength=min_strength, limit=max_edges)
@@ -391,6 +722,27 @@ def _build_graph(
     return AssociationGraph(nodes=nodes, edges=edges, truncated=truncated)
 
 
+def _episode_tags(ep: Any) -> list[str]:
+    """Tags ride in an episode's ``metadata`` dict (the episodic writer stores
+    ``--tags`` there). Defensive: any non-list / absent value → empty."""
+    meta = getattr(ep, "metadata", None)
+    if isinstance(meta, dict):
+        tags = meta.get("tags")
+        if isinstance(tags, list):
+            return [str(t) for t in tags]
+    return []
+
+
+# The six neocortex sections of the FLOW_SCHEMA, in canonical order. Slice 1
+# showed only the first two; 1.5 shows them all.
+_ALL_SECTIONS = ("State", "Active Threads", "Patterns", "Decisions", "Context", "Understanding")
+
+# The sections that ride the MODEL-visible render_summary (the MCP-App content
+# half) — kept to the two headlines so the all-six expansion never bloats model
+# context. The full six always ride structuredContent for the UI.
+_SUMMARY_SECTIONS = frozenset({"State", "Active Threads"})
+
+
 # ---------------------------------------------------------------------------
 # The builder
 # ---------------------------------------------------------------------------
@@ -399,21 +751,30 @@ def build_substrate_view(
     paths: AnnealPaths,
     *,
     today: date | None = None,
+    install_root: Path | None = None,
+    scope: str = "personal",
     graph_min_strength: float = 0.0,
     max_graph_nodes: int = 300,
     max_graph_edges: int = 2000,
     max_spores: int = 50,
-    sections: tuple[str, ...] = ("State", "Active Threads"),
+    max_episodes: int = 50,
+    max_wraps: int = 50,
+    sections: tuple[str, ...] = _ALL_SECTIONS,
 ) -> SubstrateView:
     """Assemble the full read-only substrate view from the operator's stores.
 
     PURE READ — the episodic Store is opened ``read_only=True`` and a missing
     store is REPORTED, never fabricated (no db/dir creation, no wrap contention).
     Each tier is independently fail-soft on DATA/IO faults (a corrupt crystal
-    file, an unreadable continuity) → recorded to ``view.errors`` and rendered
-    visibly empty. Programming-error classes are NOT caught — they surface loud.
-    """
-    view = SubstrateView(paths=paths)
+    file, an unreadable continuity, a missing ``seed/`` dir) → recorded to
+    ``view.errors`` and rendered visibly empty. Programming-error classes are NOT
+    caught — they surface loud.
+
+    ``install_root`` (when given) locates the seed/config surface — the
+    operator/origin/posture/constitution docs that live at the install root, not
+    next to the db. Without it (a bare store with no install context) the config
+    tier is simply absent (no error — there is nothing to read there)."""
+    view = SubstrateView(paths=paths, scope=scope)
 
     # Data/IO fault classes we degrade on; programming bugs propagate (loud).
     # anneal wraps store faults in AnnealMemoryError, imported lazily so this
@@ -431,29 +792,63 @@ def build_substrate_view(
         data_faults = (OSError, ValueError, json.JSONDecodeError)
     store_faults: tuple[type[BaseException], ...] = (*data_faults, ImportError)
 
-    # --- health + graph (episodic Store, READ-ONLY — never creates it) -----
+    # --- health + graph + episodes + wraps (episodic Store, READ-ONLY) ------
     try:
         if not paths.episodic_db.exists():
             raise FileNotFoundError(f"no anneal store at {paths.episodic_db}")
         from anneal_memory import Store
 
         with Store(paths.episodic_db, read_only=True) as store:
-            # health
+            # wrap history — fetched ONCE, used by both the timeline AND health's
+            # totals, in its OWN try. It does not read the continuity file, so a
+            # non-UTF8 continuity (which anneal's status() reads + faults on) must
+            # not blank the timeline as collateral of a health failure.
+            wraps: list[Any] = []
+            try:
+                wraps = store.get_wrap_history()
+                # `or ""` defends the sort against a legacy row with a null
+                # wrapped_at (TypeError isn't a data_fault, so an un-guarded compare
+                # would escape the tier). [kimi L3]
+                ordered = sorted(wraps, key=lambda w: w.wrapped_at or "", reverse=True)
+                view.wraps = [
+                    WrapRow(
+                        wrapped_at=w.wrapped_at,
+                        episodes_compressed=w.episodes_compressed,
+                        continuity_chars=w.continuity_chars,
+                        graduations_validated=w.graduations_validated,
+                        graduations_demoted=w.graduations_demoted,
+                        associations_formed=w.associations_formed,
+                        associations_strengthened=w.associations_strengthened,
+                        associations_decayed=w.associations_decayed,
+                    )
+                    for w in ordered[:max_wraps]
+                ]
+            except data_faults as exc:
+                view.errors["wraps"] = f"{type(exc).__name__}: {exc}"
+
+            # health — NB anneal's status() reads the continuity file (store.py),
+            # so a non-UTF8 continuity faults status() and health degrades VISIBLY
+            # here (errors["health"]); wraps above + graph/episodes below stay
+            # independent. The inner cont_chars guard is forward defense for the day
+            # anneal hardens that read (then this would otherwise be the next escape).
             try:
                 status = store.status()
-                wraps = store.get_wrap_history()
                 a = status.association_stats
-                # read continuity size from the (overridable) AnnealPaths
-                # location — consistent with how sections are read — rather than
-                # status()'s stem-derived path, so the two never disagree.
+                # NB the links_*/graduations_* totals below sum the `wraps` list
+                # fetched in the (independent) wraps tier above; if that tier faulted
+                # (errors["wraps"]), `wraps` is [] and these read 0 — do not treat a 0
+                # here as authoritative when "wraps" is in errors. [complement L3 LOW-2]
+                # read continuity size from the (overridable) AnnealPaths location —
+                # consistent with how sections are read — not status()'s stem-derived
+                # path, so the two never disagree.
                 try:
                     cont_chars = (
                         len(paths.continuity_md.read_text(encoding="utf-8"))
                         if paths.continuity_md.exists()
                         else None
                     )
-                except OSError:
-                    cont_chars = None
+                except (OSError, ValueError):
+                    cont_chars = None  # ValueError covers UnicodeDecodeError
                 view.health = Health(
                     write_path_live=bool(a and a.total_links > 0),
                     total_links=a.total_links if a else 0,
@@ -488,6 +883,22 @@ def build_substrate_view(
                 )
             except data_faults as exc:
                 view.errors["graph"] = f"{type(exc).__name__}: {exc}"
+
+            # recent episodes (the raw input layer; newest first via recall)
+            try:
+                for ep in store.recall(limit=max_episodes).episodes:
+                    view.episodes.append(
+                        EpisodeRow(
+                            id=ep.id,
+                            timestamp=ep.timestamp,
+                            type=ep.type.value,
+                            source=ep.source,
+                            content=_truncate(ep.content, 280),
+                            tags=_episode_tags(ep),
+                        )
+                    )
+            except data_faults as exc:
+                view.errors["episodes"] = f"{type(exc).__name__}: {exc}"
     except store_faults as exc:  # Store unopenable / missing / anneal import fault
         view.errors["store"] = f"{type(exc).__name__}: {exc}"
 
@@ -542,13 +953,32 @@ def build_substrate_view(
     except store_faults as exc:
         view.errors["open_spores"] = f"{type(exc).__name__}: {exc}"
 
-    # --- continuity narrative sections (State / Active Threads) -------------
+    # --- continuity narrative sections (all six neocortex sections) ---------
     try:
         if paths.continuity_md.exists():
             md = paths.continuity_md.read_text(encoding="utf-8")
             view.sections = _parse_sections(md, sections)
     except (OSError, ValueError) as exc:
         view.errors["sections"] = f"{type(exc).__name__}: {exc}"
+
+    # --- seed/config surface (install root — operator/origin/posture/constitution)
+    #     Only when an install root is known; a bare store has no config context.
+    if install_root is not None:
+        try:
+            if not install_root.exists():
+                raise FileNotFoundError(f"no install root at {install_root}")
+            view.config_docs = _read_config_docs(install_root)
+            # entity name from the origin.md body ALREADY loaded into config_docs —
+            # NOT a second filesystem read: a re-read could fail (file deleted/renamed
+            # between the two reads) and set errors["config"] while config_docs is
+            # already populated, making the error a lie. [complement L3 MEDIUM-1]
+            origin_doc = next((d for d in view.config_docs if d.key == "origin"), None)
+            if origin_doc:
+                name = _h1_name_suffix(origin_doc.body)
+                if name:
+                    view.entity_name = name
+        except (OSError, ValueError) as exc:
+            view.errors["config"] = f"{type(exc).__name__}: {exc}"
 
     return view
 
@@ -559,23 +989,30 @@ def build_substrate_view(
 # The smallest real "escapes the session" affordance: an operator runs this
 # OUTSIDE any Claude Code / Codex session and sees their substrate. Read-only,
 # so it acts on nothing — the human-is-fan-in invariant holds trivially. The
-# JSON form is the shape the future MCP-App control-pane serves; the text form
-# is the terminal glance.
+# JSON form is the shape the web-app + control-pane serve; the text form is the
+# terminal glance.
 # ---------------------------------------------------------------------------
 
+def _resolve_source(path: Path) -> SubstrateSource:
+    """Resolve a Levain install directory into a ``SubstrateSource`` — the anneal
+    store (``<install>/.levain/memory.db``) plus the install root for the
+    seed/config surface."""
+    return SubstrateSource.local(path)
+
+
 def _resolve_store(path: Path) -> AnnealPaths:
-    """A Levain install keeps its anneal store at ``<install>/.levain/memory.db``
-    (the convention ``doctor._match_store`` enforces). Derive the four sibling
-    stores from there."""
-    install = Path(str(path)).expanduser().resolve()
-    return AnnealPaths.from_db(install / ".levain" / "memory.db")
+    """Back-compat: the anneal paths alone (no install-root config context). Kept
+    for callers that only need the store tiers; new code uses ``_resolve_source``."""
+    return _resolve_source(path).anneal
 
 
 def render_text(view: SubstrateView) -> str:
     """A terminal glance: the operator's memory health, association graph,
-    crystallized wisdom, open loops, and State / Active Threads — from outside a
-    session. Degraded tiers are named at the bottom, never silently dropped."""
-    out: list[str] = ["Levain substrate", f"  store: {view.paths.episodic_db}", ""]
+    crystallized wisdom, open loops, recent episodes, the neocortex sections, and
+    the seed/config surface — from outside a session. Degraded tiers are named at
+    the bottom, never silently dropped."""
+    title = view.entity_name or view.paths.episodic_db.stem
+    out: list[str] = [f"Levain substrate — {title}", f"  store: {view.paths.episodic_db}", ""]
 
     h = view.health
     if h is not None:
@@ -631,10 +1068,33 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  - [{s.tier}] {s.text}{nxt}")
         out.append("")
 
+    if view.episodes:
+        out.append(f"Recent episodes ({len(view.episodes)})")
+        for e in view.episodes[:12]:
+            stamp = e.timestamp.split("T")[0] if e.timestamp else ""
+            out.append(f"  - [{e.type}] {e.content}  ({stamp})")
+        out.append("")
+
     for sec in view.sections:
-        out.append(sec.heading)
+        out.append(f"{sec.heading}  [{sec.edit_class}]")
         for line in sec.body.splitlines():
             out.append(f"  {line}")
+        out.append("")
+
+    if view.config_docs:
+        out.append(f"Seed / config ({len(view.config_docs)})")
+        for d in view.config_docs:
+            out.append(f"  - {d.title}  [{d.edit_class}] ({d.source})")
+        out.append("")
+
+    if view.wraps:
+        out.append(f"Wrap history ({len(view.wraps)})")
+        for w in view.wraps[:10]:
+            stamp = w.wrapped_at.split("T")[0] if w.wrapped_at else ""
+            out.append(
+                f"  - {stamp}: {w.graduations_validated}↑/{w.graduations_demoted}↓ grad · "
+                f"+{w.associations_formed} links · {w.continuity_chars:,} chars"
+            )
         out.append("")
 
     if view.errors:
@@ -655,7 +1115,8 @@ def render_summary(view: SubstrateView) -> str:
     (that would bloat model context, which is the exact inversion the
     content/structuredContent split exists to prevent). Also the text-only
     fallback for hosts without MCP-Apps support."""
-    lines: list[str] = [f"Levain substrate — {view.paths.episodic_db.stem}"]
+    title = view.entity_name or view.paths.episodic_db.stem
+    lines: list[str] = [f"Levain substrate — {title}"]
 
     h = view.health
     if h is not None:
@@ -683,9 +1144,17 @@ def render_summary(view: SubstrateView) -> str:
 
     lines.append(f"Crystallized patterns: {len(view.crystal_index)}")
     lines.append(f"Open loops: {len(view.open_spores)}")
+    lines.append(f"Recent episodes: {len(view.episodes)}")
+    if view.config_docs:
+        lines.append(f"Seed/config docs: {len(view.config_docs)}")
 
+    # Only the two headline sections ride the MODEL-visible summary — the full six
+    # ride in structuredContent for the UI. Folding all six here would bloat model
+    # context, the exact inversion the content/structuredContent split exists to
+    # prevent (the 1.5 expansion to all-six sections must NOT leak into this digest).
     for sec in view.sections:
-        # the entity's own words — first non-empty line of each, as a headline
+        if sec.heading not in _SUMMARY_SECTIONS:
+            continue
         head = next((ln.strip() for ln in sec.body.splitlines() if ln.strip()), "")
         if head:
             lines.append(f"{sec.heading}: {_truncate(head, 200)}")
@@ -700,15 +1169,15 @@ def run_dashboard(path: Path, as_json: bool = False) -> int:
     """``levain dashboard`` entry point. Nonzero only if the store itself is
     unreachable — a degraded sub-tier (e.g. a corrupt crystal file) renders
     visibly and is not a dashboard failure."""
-    paths = _resolve_store(path)
-    if not paths.episodic_db.exists():
+    source = _resolve_source(path)
+    if not source.anneal.episodic_db.exists():
         print(
-            f"No anneal store at {paths.episodic_db}.\n"
+            f"No anneal store at {source.anneal.episodic_db}.\n"
             "Run `levain init` in this directory, or pass --path to an install.",
             file=sys.stderr,
         )
         return 1
-    view = build_substrate_view(paths)
+    view = source.build()
     if as_json:
         print(json.dumps(view.to_dict(), indent=2))
     else:

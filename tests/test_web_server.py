@@ -20,7 +20,7 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.dashboard import AnnealPaths
+from levain.dashboard import AnnealPaths, SubstrateSource
 from levain.web_server import (
     build_substrate_json,
     load_web_asset,
@@ -29,10 +29,12 @@ from levain.web_server import (
 )
 
 
-def _store_with_data(tmp_path: Path) -> AnnealPaths:
+def _store_with_data(tmp_path: Path) -> SubstrateSource:
     """A populated substrate: a graduated association (live write-path), one open
     spore, and a two-section continuity. Mirrors the app_server fixture so the two
-    surfaces are tested against the same shape."""
+    surfaces are tested against the same shape. Returned as a ``SubstrateSource``
+    (no install root — these temp stores aren't a full ``.levain`` install, so the
+    seed/config tier is simply absent)."""
     from anneal_memory import Store
     from anneal_memory.spores import SporeStore
 
@@ -48,14 +50,14 @@ def _store_with_data(tmp_path: Path) -> AnnealPaths:
         "## State\ncurrent focus line\n\n## Active Threads\n- thread one\n",
         encoding="utf-8",
     )
-    return AnnealPaths.from_db(db)
+    return SubstrateSource(anneal=AnnealPaths.from_db(db))
 
 
 @contextmanager
-def _serving(paths: AnnealPaths):
+def _serving(source: SubstrateSource):
     """Bring up a real server on an ephemeral loopback port, yield its base URL,
     and tear it down cleanly — the live integration harness for the route tests."""
-    httpd = make_server(paths, host="127.0.0.1", port=0)
+    httpd = make_server(source, host="127.0.0.1", port=0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address[0], httpd.server_address[1]
@@ -107,10 +109,10 @@ class TestSubstrateJson:
         assert json.loads(body)["health"]["total_episodes"] == 2
 
     def test_missing_store_degrades_not_crashes(self, tmp_path: Path) -> None:
-        """A bare AnnealPaths with no db yields a renderable, degraded view — the
+        """A bare source with no db yields a renderable, degraded view — the
         endpoint must 200 with an errors entry, never 500 / dead-connection."""
-        paths = AnnealPaths.from_db(tmp_path / "nope" / "memory.db")
-        with _serving(paths) as (base, _):
+        source = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "nope" / "memory.db"))
+        with _serving(source) as (base, _):
             status, _h, body = _get(base + "/substrate.json")
         assert status == 200
         assert "store" in json.loads(body)["errors"]
@@ -141,7 +143,9 @@ class TestAssets:
             status, headers, body = _get(base + "/")
         assert status == 200
         assert headers["Content-Type"] == "text/html; charset=utf-8"
-        assert b"Levain substrate" in body
+        # the page identifies as Levain AND serves the Identity·Operate·Mind tab bar
+        assert b"Levain" in body
+        assert b'class="tabs"' in body and b'data-zone="mind"' in body
 
     def test_script_routes(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
@@ -370,13 +374,14 @@ class TestHandlerFaultPath:
 
 class TestReadOnly:
     def test_requests_do_not_mutate_store(self, tmp_path: Path) -> None:
-        paths = _store_with_data(tmp_path)
-        before = paths.episodic_db.stat().st_mtime_ns
-        with _serving(paths) as (base, _):
+        source = _store_with_data(tmp_path)
+        db = source.anneal.episodic_db
+        before = db.stat().st_mtime_ns
+        with _serving(source) as (base, _):
             _get(base + "/substrate.json")
             _get(base + "/substrate.json")
             _get(base + "/")
-        assert paths.episodic_db.stat().st_mtime_ns == before
+        assert db.stat().st_mtime_ns == before
 
 
 # --- the startup contract (run_web_server / CLI) ---------------------------
@@ -406,7 +411,9 @@ class TestStartupContract:
             pass
 
         # occupy a port, then ask the server to bind the same one
-        blocker = make_server(AnnealPaths.from_db(levain_dir / "memory.db"), port=0)
+        blocker = make_server(
+            SubstrateSource(anneal=AnnealPaths.from_db(levain_dir / "memory.db")), port=0
+        )
         busy_port = blocker.server_address[1]
         try:
             rc = run_web_server(

@@ -52,7 +52,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from levain.dashboard import AnnealPaths, _resolve_store, build_substrate_view
+from levain.dashboard import SubstrateSource, _resolve_source
 
 __all__ = [
     "DEFAULT_HOST",
@@ -124,26 +124,28 @@ def load_web_asset(filename: str) -> str:
     )
 
 
-def build_substrate_json(paths: AnnealPaths) -> bytes:
+def build_substrate_json(source: SubstrateSource) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
-    Pure read — ``build_substrate_view`` opens the episodic Store ``read_only=True``
-    and degrades any unavailable tier into ``view.errors`` rather than failing, so
-    this always yields a renderable view (the dashboard shows which tiers are dark
+    Pure read — ``source.build()`` opens the episodic Store ``read_only=True`` and
+    degrades any unavailable tier into ``view.errors`` rather than failing, so this
+    always yields a renderable view (the dashboard shows which tiers are dark
     rather than blanking). Built per request so the browser's refresh reflects the
-    live store, including a wrap that landed since the page opened."""
-    view = build_substrate_view(paths)
+    live store, including a wrap that landed since the page opened. The
+    ``SubstrateSource`` carries the install root, so the served view includes the
+    seed/config surface (1.5), not just the anneal store."""
+    view = source.build()
     return json.dumps(view.to_dict()).encode("utf-8")
 
 
 class _LevainHTTPServer(ThreadingHTTPServer):
-    """A ``ThreadingHTTPServer`` carrying the substrate paths, the cached static
+    """A ``ThreadingHTTPServer`` carrying the substrate source, the cached static
     assets, and the Host-header allowlist. A typed subclass (rather than ad-hoc
     attributes on a plain server) so the handler's access is type-checked and
     can't silently break into an unhandled ``AttributeError`` if construction
     ever moves."""
 
-    levain_paths: AnnealPaths
+    levain_source: SubstrateSource
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
 
@@ -236,7 +238,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path == "/substrate.json":
             try:
-                body = build_substrate_json(self.server.levain_paths)
+                body = build_substrate_json(self.server.levain_source)
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
@@ -272,7 +274,7 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    paths: AnnealPaths, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
+    source: SubstrateSource, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -294,7 +296,7 @@ def make_server(
         )
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
-    httpd.levain_paths = paths
+    httpd.levain_source = source
     httpd.levain_assets = assets
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
@@ -316,17 +318,17 @@ def run_web_server(
     ``serve-app``. A degraded sub-tier renders visibly and is not a startup
     failure. Blocks in ``serve_forever`` until interrupted (Ctrl+C → clean exit 0).
     """
-    paths = _resolve_store(path)
-    if not paths.episodic_db.exists():
+    source = _resolve_source(path)
+    if not source.anneal.episodic_db.exists():
         print(
-            f"No anneal store at {paths.episodic_db}.\n"
+            f"No anneal store at {source.anneal.episodic_db}.\n"
             "Run `levain init` in this directory, or pass --path to an install.",
             file=sys.stderr,
         )
         return 1
 
     try:
-        httpd = make_server(paths, host=host, port=port)
+        httpd = make_server(source, host=host, port=port)
     except ValueError as exc:  # non-loopback bind refused (the Slice-1 boundary)
         print(str(exc), file=sys.stderr)
         return 1
@@ -344,7 +346,7 @@ def run_web_server(
     host_for_url = f"[{bound_host}]" if ":" in str(bound_host) else bound_host
     url = f"http://{host_for_url}:{bound_port}/"
     print(f"Levain substrate → {url}")
-    print(f"  store: {paths.episodic_db}")
+    print(f"  store: {source.anneal.episodic_db}")
     print("  read-only · localhost-only · Ctrl+C to stop")
 
     if open_browser:

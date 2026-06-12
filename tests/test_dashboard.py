@@ -345,3 +345,325 @@ class TestCLISurface:
         assert "LIVE" in text  # has associations
         assert "Open loops" in text
         assert "State" in text
+
+
+# --- Slice 1.5: SHOW EVERYTHING — source seam, config tier, IA manifest -----
+
+
+def _make_levain_install(tmp_path: Path) -> Path:
+    """A realistic Levain install: anneal store under ``.levain/`` + the seed/
+    config surface at the install root. The shape ``SubstrateSource.local`` +
+    the 1.5 config tier read from."""
+    from anneal_memory import Store
+
+    root = tmp_path / "entity"
+    (root / ".levain").mkdir(parents=True)
+    with Store(root / ".levain" / "memory.db") as store:
+        store.record("decided X because Y", "decision", metadata={"tags": ["alpha", "beta"]})
+        store.record("noticed Z", "observation")
+    (root / ".levain" / "memory.continuity.md").write_text(
+        "# Continuity — Sage\n\n## State\nfocus line\n\n## Active Threads\n- t1\n\n"
+        "## Patterns\n- p1\n\n## Decisions\n- d1\n\n## Context\nctx\n\n"
+        "## Understanding\nthe felt layer\n",
+        encoding="utf-8",
+    )
+    seed = root / "seed"
+    seed.mkdir()
+    (seed / "origin.md").write_text("# Who You Are — Sage\n\nYou are Sage.\n", encoding="utf-8")
+    (seed / "world.md").write_text(
+        "# Who Your Operator Is\n\n## Identity\nAda. Engineer.\n\n"
+        "## Communication\nDirect, dense.\n",
+        encoding="utf-8",
+    )
+    (seed / "partnership.md").write_text("# How We Work\n\nPartner, not assistant.\n", encoding="utf-8")
+    (seed / "memory.md").write_text("# Your Memory\n\nanneal.\n", encoding="utf-8")
+    (seed / "spore_instructions.md").write_text("# Open Loops\n\nspores.\n", encoding="utf-8")
+    activation = root / "activation"
+    activation.mkdir()
+    (activation / "posture.md").write_text("# Posture\n\nthink out loud.\n", encoding="utf-8")
+    (activation / "recency_directives.md").write_text("# Recency\n\nverify.\n", encoding="utf-8")
+    return root
+
+
+class TestSubstrateSource:
+    def test_local_derives_store_and_root(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+
+        root = tmp_path / "entity"
+        src = SubstrateSource.local(root)
+        assert src.install_root == root.resolve()
+        assert src.anneal.episodic_db == (root / ".levain" / "memory.db").resolve()
+        assert src.scope == "personal"
+
+    def test_build_threads_install_root(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+
+        root = _make_levain_install(tmp_path)
+        v = SubstrateSource.local(root).build()
+        assert v.errors == {}
+        assert v.config_docs  # the seed tier reached because install_root flowed through
+        assert v.scope == "personal"
+
+
+class TestConfigTier:
+    def test_config_docs_classed_and_zoned(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+
+        root = _make_levain_install(tmp_path)
+        v = SubstrateSource.local(root).build()
+        by_key = {d.key: d for d in v.config_docs}
+        # origin + posture + recency are Class A, Identity zone
+        assert by_key["origin"].edit_class == "A"
+        assert by_key["origin"].zone == "identity"
+        assert by_key["posture"].edit_class == "A"
+        # world.md splits into one Class-A doc per section
+        assert "world:identity" in by_key and "world:communication" in by_key
+        assert by_key["world:identity"].edit_class == "A"
+        assert "Ada. Engineer." in by_key["world:identity"].body
+        # constitution files are Class C-view
+        assert by_key["partnership"].edit_class == "C"
+        assert by_key["memory"].edit_class == "C"
+        # every config doc carries a source path relative to the install root
+        assert by_key["origin"].source == "seed/origin.md"
+        assert by_key["posture"].source == "activation/posture.md"
+
+    def test_entity_name_from_origin_h1(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+
+        root = _make_levain_install(tmp_path)
+        v = SubstrateSource.local(root).build()
+        assert v.entity_name == "Sage"
+
+    def test_no_install_root_means_no_config_no_error(self, tmp_path: Path) -> None:
+        """A bare store (no install context) simply has no config tier — NOT an
+        error (there is nothing to read there)."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.config_docs == []
+        assert "config" not in v.errors
+        assert v.entity_name is None
+
+    def test_missing_install_root_is_failsoft(self, tmp_path: Path) -> None:
+        """install_root given but absent → degrades VISIBLY (config error), never
+        blanks the store tiers."""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(
+            AnnealPaths.from_db(db), install_root=tmp_path / "nope"
+        )
+        assert "config" in v.errors
+        assert v.health is not None  # store tiers unaffected
+
+
+class TestSlice15Surfaces:
+    def test_all_six_sections_with_edit_class(self, tmp_path: Path) -> None:
+        root = _make_levain_install(tmp_path)
+        from levain.dashboard import SubstrateSource
+
+        v = SubstrateSource.local(root).build()
+        headings = [s.heading for s in v.sections]
+        assert headings == ["State", "Active Threads", "Patterns", "Decisions",
+                            "Context", "Understanding"]
+        classes = {s.heading: s.edit_class for s in v.sections}
+        assert classes["State"] == "A"  # free-text, last-writer-wins
+        assert classes["Patterns"] == "C"  # the consolidate owns it
+        assert all(s.zone == "mind" for s in v.sections)
+
+    def test_recent_episodes_surfaced(self, tmp_path: Path) -> None:
+        root = _make_levain_install(tmp_path)
+        from levain.dashboard import SubstrateSource
+
+        v = SubstrateSource.local(root).build()
+        assert len(v.episodes) == 2
+        # newest first (recall is ORDER BY timestamp DESC)
+        types = {e.type for e in v.episodes}
+        assert "decision" in types and "observation" in types
+        decision = next(e for e in v.episodes if e.type == "decision")
+        assert decision.tags == ["alpha", "beta"]
+
+    def test_max_episodes_cap(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            for i in range(6):
+                store.record(f"ep {i}", "observation")
+        v = build_substrate_view(AnnealPaths.from_db(db), max_episodes=3)
+        assert len(v.episodes) == 3
+
+    def test_wraps_empty_on_unwrapped_store(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.wraps == []
+
+    def test_layout_manifest_is_ordered_zoned_classed(self, tmp_path: Path) -> None:
+        root = _make_levain_install(tmp_path)
+        from levain.dashboard import SubstrateSource
+
+        v = SubstrateSource.local(root).build()
+        layout = v.layout()
+        kinds = [e["kind"] for e in layout]
+        # every panel kind is represented
+        for k in ("config", "spores", "episodes", "health", "graph", "crystals",
+                  "section", "wraps"):
+            assert k in kinds
+        # zones appear in IA order: identity → operate → mind (no interleaving)
+        zones = [e["zone"] for e in layout]
+        first_idx = {z: zones.index(z) for z in ("identity", "operate", "mind")}
+        assert first_idx["identity"] < first_idx["operate"] < first_idx["mind"]
+        last_identity = max(i for i, z in enumerate(zones) if z == "identity")
+        assert last_identity < first_idx["operate"]
+        # every entry carries an edit_class in {A,B,C}
+        assert all(e["edit_class"] in ("A", "B", "C") for e in layout)
+        # the edit-class chip encodes the EDIT MODEL (§4): the Operate zone is
+        # verb-mediated lifecycle data — spores AND episodes are Class B (episode
+        # mutation = tombstone verb), NOT direct-edit. [L4 HIGH]
+        by_kind = {e["kind"]: e for e in layout}
+        assert by_kind["spores"]["edit_class"] == "B"
+        assert by_kind["episodes"]["edit_class"] == "B"
+        # consolidated cognition is read-only Class C
+        assert by_kind["health"]["edit_class"] == "C"
+        assert by_kind["crystals"]["edit_class"] == "C"
+        # indexed kinds (config/section) carry a ref into their collection
+        for e in layout:
+            if e["kind"] in ("config", "section"):
+                assert "ref" in e
+
+    def test_to_dict_has_15_surfaces_and_is_serializable(self, tmp_path: Path) -> None:
+        import json
+
+        root = _make_levain_install(tmp_path)
+        from levain.dashboard import SubstrateSource
+
+        d = SubstrateSource.local(root).build().to_dict()
+        for key in ("scope", "entity_name", "episodes", "config_docs", "wraps", "layout"):
+            assert key in d
+        json.dumps(d)  # round-trips without raising
+
+    def test_render_text_includes_new_surfaces(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource, render_text
+
+        root = _make_levain_install(tmp_path)
+        text = render_text(SubstrateSource.local(root).build())
+        assert "Sage" in text  # entity name in the header
+        assert "Recent episodes" in text
+        assert "Seed / config" in text
+        assert "Understanding" in text  # all six sections rendered
+
+
+class TestFailSoftBoundaries:
+    """Apparatus L1/L2 catches: a non-UTF8 file must degrade ONLY its own read,
+    never escape to blank a store-derived or sibling tier."""
+
+    def test_non_utf8_continuity_contains_blast_radius(self, tmp_path: Path) -> None:
+        """A non-UTF8 continuity.md faults anneal's status() (which reads the file),
+        so health degrades VISIBLY — but the wraps, graph, and episode tiers (which
+        do NOT read continuity) must survive as INDEPENDENT tries, no collateral.
+        [L1-H1 — root cause: anneal status() reads continuity; fix decouples wraps]"""
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db):
+            pass
+        (tmp_path / "memory.continuity.md").write_bytes(b"## State\n\xff\xfe not utf8\n")
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        # health degrades VISIBLY (not a silent blank) — the fail-soft contract
+        assert v.health is None
+        assert "health" in v.errors
+        # but the tiers that do NOT depend on the continuity file survive cleanly
+        assert "wraps" not in v.errors and v.wraps == []
+        assert "graph" not in v.errors and v.graph is not None
+        assert "episodes" not in v.errors
+        assert "sections" in v.errors  # the section read correctly degrades too
+
+    def test_one_non_utf8_seed_file_keeps_config_tier(self, tmp_path: Path) -> None:
+        """A single corrupt seed file is skipped like a missing one — the rest of
+        the config tier (and entity_name) survive. [L1-M1]"""
+        root = _make_levain_install(tmp_path)
+        # corrupt ONE seed file
+        (root / "seed" / "world.md").write_bytes(b"## Identity\n\xff\xfe broken\n")
+        from levain.dashboard import SubstrateSource
+
+        v = SubstrateSource.local(root).build()
+        keys = {d.key for d in v.config_docs}
+        assert "origin" in keys  # the other config docs survive
+        assert "posture" in keys
+        assert not any(k.startswith("world:") for k in keys)  # the corrupt file skipped
+        assert v.entity_name == "Sage"  # name read (origin.md) unaffected
+        assert "config" not in v.errors  # NOT a whole-tier failure
+
+
+class TestRenderSummaryContract:
+    def test_summary_omits_non_headline_sections(self, tmp_path: Path) -> None:
+        """The MODEL-visible summary must stay to State + Active Threads even though
+        the view now carries all six sections — the all-six expansion must not bloat
+        model context. [L2-M2]"""
+        from levain.dashboard import SubstrateSource, render_summary
+
+        root = _make_levain_install(tmp_path)
+        summary = render_summary(SubstrateSource.local(root).build())
+        assert "State:" in summary
+        assert "Active Threads:" in summary
+        assert "Patterns:" not in summary
+        assert "Understanding:" not in summary
+        assert "Decisions:" not in summary
+
+
+class TestL3Fixes:
+    def test_config_layout_entries_carry_source(self, tmp_path: Path) -> None:
+        """The manifest must thread ConfigDoc.source so the UI can show which
+        seed/config file a panel came from. [codex L3 LOW]"""
+        from levain.dashboard import SubstrateSource
+
+        root = _make_levain_install(tmp_path)
+        layout = SubstrateSource.local(root).build().layout()
+        config_entries = [e for e in layout if e["kind"] == "config"]
+        assert config_entries
+        assert all("source" in e and e["source"] for e in config_entries)
+        origin = next(e for e in config_entries if "origin" in e["source"])
+        assert origin["source"] == "seed/origin.md"
+
+    def test_graph_truncated_when_recall_window_drops_episodes(self) -> None:
+        """If the 100k recall window itself dropped episodes (total_matching >
+        returned), the graph is already truncated — honest from the start. [codex L3]"""
+        from types import SimpleNamespace
+
+        from levain.dashboard import _build_graph
+
+        # a stub store: recall returns 1 episode but reports 5 total matching
+        ep = SimpleNamespace(id="e1", type=SimpleNamespace(value="observation"), content="x")
+        stub = SimpleNamespace(
+            recall=lambda limit: SimpleNamespace(episodes=[ep], total_matching=5),
+            get_associations=lambda chunk, min_strength, limit: [],
+        )
+        g = _build_graph(stub, min_strength=0.0, max_nodes=300, max_edges=2000)
+        assert g.truncated is True
+
+
+class TestEntityNameExtraction:
+    def test_h1_suffix_forms(self) -> None:
+        from levain.dashboard import _h1_name_suffix
+
+        assert _h1_name_suffix("# Who You Are — Sage\n") == "Sage"
+        assert _h1_name_suffix("# Continuity — Atlas\nbody") == "Atlas"
+        assert _h1_name_suffix("# Who You Are - Hyphen\n") == "Hyphen"
+
+    def test_h1_without_suffix_is_none(self) -> None:
+        """The flow-store shape ``# flow — Memory (v1)`` would mis-extract a name;
+        the suffix form is only trusted from origin.md, and a plain H1 yields None
+        (no fabricated name)."""
+        from levain.dashboard import _h1_name_suffix
+
+        assert _h1_name_suffix("# Just A Title\nbody") is None
+        assert _h1_name_suffix("no heading here") is None
