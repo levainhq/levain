@@ -66,6 +66,13 @@
   // visibility re-read) — the operator's chosen tab must not reset on every poll.
   let activeZone = "all";
 
+  // The write transport, injected by the surface shim each render (Slice 2a). A
+  // surface that provides none (the parked in-host MCP-App port) renders strictly
+  // read-only — every edit affordance below is gated on `commit` being a function,
+  // so the governance model stays in the schema and the read-only port needs zero
+  // change. `commit(request) → Promise<{ok} | {ok:false, error, message}>`.
+  let commit = null;
+
   // Friendly zone labels, in IA order — used for the "All" view separators.
   const ZONE_LABELS = [
     ["identity", "Identity"],
@@ -74,7 +81,11 @@
   ];
 
   // ---------------------------------------------------------------- render ----
-  function render(view) {
+  function render(view, opts) {
+    // The surface injects its write transport here; a port that provides none (the
+    // parked MCP-App) renders read-only — no edit affordances, zero other change.
+    commit = opts && typeof opts.commit === "function" ? opts.commit : null;
+
     const board = document.getElementById("board");
     if (!board) return;
     board.replaceChildren();
@@ -90,6 +101,7 @@
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
       entityEl.textContent = view.entity_name || stem.replace(/\.db$/, "");
+      wireEntityName(entityEl, view);  // Class-A rename affordance (Slice 2a; commit-gated)
     }
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
@@ -151,6 +163,11 @@
         });
         p.appendChild(btn);
       }
+      // editable Class-A config panels get their edit affordance on its own right-
+      // aligned row at the panel BOTTOM (after the pbody + any expander).
+      if (p.dataset.editable === "1" && p._levainEdit) {
+        p.appendChild(buildEditRow(p, p._levainEdit.entry, p._levainEdit.doc));
+      }
     }
   }
 
@@ -166,6 +183,7 @@
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
       case "config": return renderConfig(entry, (view.config_docs || [])[entry.ref]);
+      case "edits": return renderEdits(entry, view);
       default: return null;
     }
   }
@@ -403,7 +421,172 @@
     const p = panel(entry);
     if (!doc) { p.appendChild(el("p", "empty", "—")); return p; }
     p.appendChild(el("pre", "section", doc.body || ""));
+    if (isEditableConfig(entry)) {
+      // Mark + stash; the edit bar is appended at the panel BOTTOM in finalizePanels
+      // (a consistent position, after the pbody/expander — never wraps in the header).
+      p.dataset.editable = "1";
+      p._levainEdit = { entry, doc };
+    }
     return p;
+  }
+
+  // Slice 2a: the only writable surface turned on here is a Class-A CONFIG panel
+  // (world.md section / posture / recency). State is Class-A too but kind="section"
+  // — its write path is Slice 2b — so the gate is kind==="config", and only when a
+  // `commit` transport exists (read-only port → no affordance). origin.md +
+  // constitution are Class C → no match → stay glass.
+  function isEditableConfig(entry) {
+    return !!commit && entry.kind === "config" && entry.edit_class === "A" && !!entry.source;
+  }
+
+  // The edit affordance is a small METAL button on its own row under the header;
+  // clicking flips the panel body from its glass <pre> display into a recessed editor.
+  function buildEditRow(p, entry, doc) {
+    const row = el("div", "edit-trigger-row");
+    const btn = el("button", "edit-btn", "edit");
+    btn.type = "button";
+    btn.addEventListener("click", () => enterEditMode(p, entry, doc, row));
+    row.appendChild(btn);
+    return row;
+  }
+
+  function enterEditMode(p, entry, doc, row) {
+    const body = p.querySelector(".pbody");  // created by finalizePanels (post-render)
+    if (!body || body.dataset.editing === "1") return;
+    body.dataset.editing = "1";
+    const pre = body.querySelector("pre.section");
+    const expander = p.querySelector(".expander");
+    if (pre) pre.style.display = "none";
+    if (expander) expander.style.display = "none";
+    row.style.display = "none";  // the row is the trigger; hide it while editing
+    body.classList.remove("clamped");  // show full text while editing
+
+    const editor = el("div", "editor");
+    const ta = el("textarea", "edit-ta");
+    ta.value = doc.body || "";  // .value (not innerHTML) — store text never becomes markup
+    const controls = el("div", "edit-controls");
+    const save = el("button", "edit-save", "save");
+    const cancel = el("button", "edit-cancel", "cancel");
+    save.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    controls.append(save, cancel, msg);
+    editor.append(ta, controls);
+    body.appendChild(editor);
+    ta.focus();
+
+    const restore = () => {
+      editor.remove();
+      if (pre) pre.style.display = "";
+      if (expander) expander.style.display = "";
+      row.style.display = "";
+      body.dataset.editing = "";
+    };
+    cancel.addEventListener("click", restore);
+    save.addEventListener("click", async () => {
+      save.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "saving…";
+      // expected_body is exactly the body the operator saw → the server's per-section
+      // stale-check rejects (409) if the file changed underneath; new_body is verbatim.
+      const res = await commit({
+        kind: "config",
+        source: entry.source,
+        heading: entry.heading != null ? entry.heading : null,
+        expected_body: doc.body || "",
+        new_body: ta.value,
+      });
+      if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
+      msg.className = "edit-msg err";
+      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      save.disabled = false; cancel.disabled = false;
+    });
+  }
+
+  // The edit log + undo surface (Operate zone). Offers undo only on the most-recent
+  // non-undo edit PER SOURCE (a safe stack-pop — undoing an older edit would discard
+  // newer ones; that's a Slice-2b time-travel concern). Undo restores that edit's
+  // backup via the same governed commit transport.
+  function renderEdits(entry, view) {
+    const list = view.recent_edits || [];
+    const p = panel(entry);
+    if (list.length === 0) { p.appendChild(el("p", "empty", "no edits yet")); return p; }
+    const claimed = new Set();
+    for (const e of list) {
+      const row = el("div", "edit-row");
+      row.appendChild(el("span", "tier", datePart(e.ts)));
+      const isUndo = e.action === "undo";
+      row.appendChild(el("span", "edit-act" + (isUndo ? " undo" : ""), isUndo ? "undo" : (e.action || "edit")));
+      const label = String(e.source || "") + (e.heading ? " · " + e.heading : "");
+      row.appendChild(el("span", "clause", label));
+      if (commit && !isUndo && e.id && !claimed.has(e.source)) {
+        const u = el("button", "undo-btn", "undo");
+        u.type = "button";
+        u.addEventListener("click", async () => {
+          u.disabled = true;
+          const res = await commit({ kind: "undo", edit_id: e.id });
+          if (res && res.ok) return;  // reloaded
+          u.disabled = false;
+          row.appendChild(el("span", "edit-msg err",
+            (res && (res.message || res.error)) || "undo failed"));
+        });
+        row.appendChild(u);
+      }
+      claimed.add(e.source);  // any record claims its source's latest-action slot
+      p.appendChild(row);
+    }
+    return p;
+  }
+
+  // The masthead "Unit" name is a Class-A input too — a commit-gated rename.
+  function wireEntityName(entityEl, view) {
+    if (!commit) return;
+    const unit = entityEl.parentElement;
+    if (!unit || unit.querySelector(".name-edit") || unit.querySelector(".name-editor")) return;
+    const btn = el("button", "name-edit", "rename");
+    btn.type = "button";
+    btn.title = "rename this entity";
+    btn.setAttribute("aria-label", "rename entity");
+    btn.addEventListener("click", () => enterNameEdit(unit, entityEl, view, btn));
+    unit.appendChild(btn);
+  }
+
+  function enterNameEdit(unit, entityEl, view, btn) {
+    const current = view.entity_name || "";
+    const editor = el("div", "name-editor");
+    const input = el("input", "name-input");
+    input.type = "text"; input.value = current; input.maxLength = 120;
+    const save = el("button", "edit-save", "save");
+    const cancel = el("button", "edit-cancel", "cancel");
+    save.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    editor.append(input, save, cancel, msg);
+    entityEl.style.display = "none";
+    btn.style.display = "none";
+    unit.appendChild(editor);
+    input.focus(); input.select();
+
+    const restore = () => {
+      editor.remove();
+      entityEl.style.display = "";
+      btn.style.display = "";
+    };
+    const doSave = async () => {
+      save.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "saving…";
+      // no `expected` sent: the displayed name may come from the origin.md H1 fallback
+      // (≠ the config field the server stale-checks), so an optimistic lock here would
+      // false-409 the first rename. The name is a single trivial field — last-writer-wins.
+      const res = await commit({ kind: "entity_name", value: input.value });
+      if (res && res.ok) return;  // reloaded
+      msg.className = "edit-msg err";
+      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      save.disabled = false; cancel.disabled = false;
+    };
+    cancel.addEventListener("click", restore);
+    save.addEventListener("click", doSave);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); doSave(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); restore(); }
+    });
   }
 
   function renderErrors(view) {

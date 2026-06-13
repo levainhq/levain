@@ -21,6 +21,31 @@
 
   let inflight = false;
 
+  // The write transport for Slice-2a governed edits. POSTs the edit to /edit with a
+  // same-origin fetch (browser sends Sec-Fetch-Site: same-origin + we set
+  // application/json — exactly what the server's write/auth boundary requires). On
+  // success it reloads so the dashboard reflects the saved state; on refusal it
+  // returns {ok:false, error, message} so the render core can surface it inline.
+  async function commit(request) {
+    try {
+      const res = await fetch("/edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      let data = {};
+      try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
+      if (res.ok) { await load(); return { ok: true }; }
+      return {
+        ok: false,
+        error: data.error || "HTTP " + res.status,
+        message: data.message || "HTTP " + res.status,
+      };
+    } catch (e) {
+      return { ok: false, error: "network", message: e && e.message ? e.message : String(e) };
+    }
+  }
+
   async function load() {
     if (inflight) return; // a focus event mid-refresh must not stack a 2nd fetch
     // If the render core didn't load (reorder / serve failure), say so plainly
@@ -35,7 +60,7 @@
       const res = await fetch("/substrate.json", { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
-      window.LevainDashboard.render(view);
+      window.LevainDashboard.render(view, { commit });
       status("read " + new Date().toLocaleTimeString());
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));

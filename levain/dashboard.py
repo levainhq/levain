@@ -322,12 +322,26 @@ class WrapRow:
 
 @dataclass
 class ConfigDoc:
-    """A seed/config document from the install root (NOT the anneal store): who the
-    operator is (``world.md`` sections), who the entity is (``origin.md``), how it
-    thinks (``posture.md`` / ``recency_directives.md``) — all Class A — and the
-    constitution (``partnership.md`` / ``memory.md`` / ``spore_instructions.md``),
-    Class C-view (viewable; the advanced "fork my methodology" edit is Slice 2+).
-    All live in the Identity zone."""
+    """A seed/config document from the install root (NOT the anneal store).
+
+    Edit-classes (Slice-2 sharpening of scope §4):
+    - ``world.md`` sections (who the **operator** is) + ``posture.md`` /
+      ``recency_directives.md`` (how it thinks) → **Class A** (operator inputs,
+      directly editable: you fix facts about yourself / tune the thinking style).
+    - ``origin.md`` (who the **entity** is — its own birth self-statement) →
+      **Class C-view** (read-only). Per scope §1 the operator governs *inputs* and
+      never overwrites the entity's cognition; the origin self-statement is the
+      entity's, not the operator's, so it is NOT directly editable (the prior §4
+      draft lumped it with the operator's ``world.md`` as Class A — corrected). The
+      operator's legitimate influence on the entity's self is the future
+      correction-as-input channel (§9), not a file rewrite; until then it reads.
+    - the constitution (``partnership.md`` / ``memory.md`` / ``spore_instructions.md``)
+      → **Class C-view** (the advanced "fork my methodology" edit is Slice 2+).
+
+    All live in the Identity zone. ``heading`` is the exact ``## `` section heading
+    for a per-section doc (``world.md`` splits one doc per section), else ``None``
+    for a whole-file doc — it is the write address the Slice-2 edit path round-trips
+    to locate the section unambiguously (the slug in ``key`` is lossy)."""
 
     key: str
     title: str
@@ -335,6 +349,7 @@ class ConfigDoc:
     edit_class: str
     zone: str
     source: str  # the file it came from, relative to the install root
+    heading: str | None = None  # exact ## heading for a per-section doc, else None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -375,6 +390,7 @@ class SubstrateView:
     sections: list[Section] = field(default_factory=list)
     config_docs: list[ConfigDoc] = field(default_factory=list)
     wraps: list[WrapRow] = field(default_factory=list)
+    recent_edits: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
 
     def layout(self) -> list[dict[str, Any]]:
@@ -400,6 +416,7 @@ class SubstrateView:
                     "title": d.title,
                     "ref": i,
                     "source": d.source,  # render which seed/config file this is [codex L3]
+                    "heading": d.heading,  # exact ## section (world.md) write-address; None for whole-file
                 }
             )
 
@@ -411,6 +428,12 @@ class SubstrateView:
         panels.append(
             {"kind": "episodes", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Recent episodes ({len(self.episodes)})"}
+        )
+        # the operator's own Class-A edit log (Slice 2a) — the audit/undo surface;
+        # no edit-class chip (it's the record OF edits, not an editable tier).
+        panels.append(
+            {"kind": "edits", "zone": ZONE_OPERATE, "edit_class": "",
+             "title": f"Recent edits ({len(self.recent_edits)})"}
         )
 
         # --- Mind: the cognition you observe (don't puppet) ------------------
@@ -458,6 +481,7 @@ class SubstrateView:
             "sections": [s.to_dict() for s in self.sections],
             "config_docs": [d.to_dict() for d in self.config_docs],
             "wraps": [w.to_dict() for w in self.wraps],
+            "recent_edits": self.recent_edits,
             "layout": self.layout(),
             "errors": self.errors,
         }
@@ -548,6 +572,30 @@ def _h1_name_suffix(markdown: str) -> str | None:
     return None
 
 
+# The operator-set config lives in one small JSON file under the install's
+# ``.levain/`` dir (alongside the anneal stores) — the first-class home for Class-A
+# settings (entity name today; future operator toggles). Slice-2 §9: the name is the
+# operator's, post-formation and sovereign, so it is a real config field, NOT the
+# seed (which "names nothing"). The legacy H1-suffix read stays as a FALLBACK so an
+# install that named its entity via the old H1 form still surfaces it.
+LEVAIN_CONFIG_REL = (".levain", "config.json")
+
+
+def _read_levain_config(install_root: Path) -> dict[str, Any]:
+    """Fail-soft read of ``<install>/.levain/config.json`` → a dict (``{}`` if the
+    file is absent, unreadable, non-UTF8, or not a JSON object). Never raises: a
+    bad config must not blank the config tier (same fail-soft promise as the seed
+    files)."""
+    p = install_root.joinpath(*LEVAIN_CONFIG_REL)
+    try:
+        if not p.is_file():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 # The constitution files an entity carries (read-only view), with display names.
 # The seed ``continuity.md`` is intentionally NOT here: it is the near-empty SCHEMA
 # template (just the six section headings), and the operator's LIVE neocortex
@@ -587,12 +635,16 @@ def _read_config_docs(install_root: Path) -> list[ConfigDoc]:
             # the whole config tier (the per-file fail-soft promise above).
             return None
 
-    # entity self
+    # entity self — Class C-view (read-only): the entity's own birth self-statement,
+    # not an operator input. The operator governs inputs, never overwrites the
+    # entity's cognition (scope §1); influence on the felt self is the future
+    # correction-as-input channel (§9), not a rewrite. (Sharpens §4, which had
+    # drafted origin.md as Class A alongside the operator's world.md.)
     origin = _read(seed / "origin.md")
     if origin:
         docs.append(ConfigDoc(
             key="origin", title="Origin · who the entity is", body=origin,
-            edit_class=CLASS_A, zone=ZONE_IDENTITY, source="seed/origin.md",
+            edit_class=CLASS_C, zone=ZONE_IDENTITY, source="seed/origin.md",
         ))
 
     # operator — one panel per world.md section (Identity / How They Think / …),
@@ -606,6 +658,7 @@ def _read_config_docs(install_root: Path) -> list[ConfigDoc]:
             docs.append(ConfigDoc(
                 key=f"world:{slug}", title=f"Operator · {heading}", body=section_body,
                 edit_class=CLASS_A, zone=ZONE_IDENTITY, source="seed/world.md",
+                heading=heading,
             ))
 
     # thinking style
@@ -978,15 +1031,27 @@ def build_substrate_view(
             if not install_root.exists():
                 raise FileNotFoundError(f"no install root at {install_root}")
             view.config_docs = _read_config_docs(install_root)
-            # entity name from the origin.md body ALREADY loaded into config_docs —
-            # NOT a second filesystem read: a re-read could fail (file deleted/renamed
-            # between the two reads) and set errors["config"] while config_docs is
-            # already populated, making the error a lie. [complement L3 MEDIUM-1]
-            origin_doc = next((d for d in view.config_docs if d.key == "origin"), None)
-            if origin_doc:
-                name = _h1_name_suffix(origin_doc.body)
-                if name:
-                    view.entity_name = name
+            # entity name — prefer the first-class .levain/config.json (Slice-2 §9:
+            # the name is operator-set + sovereign), fall back to the legacy
+            # origin.md H1 suffix. The config read is fail-soft (never raises), so it
+            # can't turn a populated config_docs into a lying errors["config"]. The
+            # origin body comes from the ALREADY-loaded config_docs, not a 2nd
+            # filesystem read that could race a delete/rename and falsely error.
+            # [complement L3 MEDIUM-1]
+            config = _read_levain_config(install_root)
+            name = config.get("entity_name")
+            if not isinstance(name, str) or not name.strip():
+                origin_doc = next(
+                    (d for d in view.config_docs if d.key == "origin"), None
+                )
+                name = _h1_name_suffix(origin_doc.body) if origin_doc else None
+            if name:
+                view.entity_name = name.strip()
+            # the operator's Class-A edit log (Slice 2a). recent_edits is fail-soft
+            # (returns [] on any read fault) so it never propagates an error here.
+            from levain.writes import recent_edits  # lazy: writes↔dashboard cycle
+
+            view.recent_edits = recent_edits(install_root)
         except (OSError, ValueError) as exc:
             view.errors["config"] = f"{type(exc).__name__}: {exc}"
 

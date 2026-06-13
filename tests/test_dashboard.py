@@ -414,13 +414,17 @@ class TestConfigTier:
         root = _make_levain_install(tmp_path)
         v = SubstrateSource.local(root).build()
         by_key = {d.key: d for d in v.config_docs}
-        # origin + posture + recency are Class A, Identity zone
-        assert by_key["origin"].edit_class == "A"
+        # origin.md is Class C-view (read-only — the entity's own self-statement, not
+        # an operator input; Slice-2 sharpening of §4). posture/recency stay Class A.
+        assert by_key["origin"].edit_class == "C"
         assert by_key["origin"].zone == "identity"
+        assert by_key["origin"].heading is None  # whole-file doc, no section address
         assert by_key["posture"].edit_class == "A"
-        # world.md splits into one Class-A doc per section
+        # world.md splits into one Class-A doc per section, each carrying its exact
+        # ## heading as the Slice-2 write address.
         assert "world:identity" in by_key and "world:communication" in by_key
         assert by_key["world:identity"].edit_class == "A"
+        assert by_key["world:identity"].heading == "Identity"
         assert "Ada. Engineer." in by_key["world:identity"].body
         # constitution files are Class C-view
         assert by_key["partnership"].edit_class == "C"
@@ -517,8 +521,8 @@ class TestSlice15Surfaces:
         layout = v.layout()
         kinds = [e["kind"] for e in layout]
         # every panel kind is represented
-        for k in ("config", "spores", "episodes", "health", "graph", "crystals",
-                  "section", "wraps"):
+        for k in ("config", "spores", "episodes", "edits", "health", "graph",
+                  "crystals", "section", "wraps"):
             assert k in kinds
         # zones appear in IA order: identity → operate → mind (no interleaving)
         zones = [e["zone"] for e in layout]
@@ -526,8 +530,14 @@ class TestSlice15Surfaces:
         assert first_idx["identity"] < first_idx["operate"] < first_idx["mind"]
         last_identity = max(i for i, z in enumerate(zones) if z == "identity")
         assert last_identity < first_idx["operate"]
-        # every entry carries an edit_class in {A,B,C}
-        assert all(e["edit_class"] in ("A", "B", "C") for e in layout)
+        # every edit-classed tier carries A/B/C; the "edits" meta-panel (the audit
+        # log, not an editable tier) legitimately carries no class (Slice 2a).
+        assert all(
+            e["edit_class"] in ("A", "B", "C")
+            for e in layout if e["kind"] != "edits"
+        )
+        edits_panel = next(e for e in layout if e["kind"] == "edits")
+        assert edits_panel["edit_class"] == "" and edits_panel["zone"] == "operate"
         # the edit-class chip encodes the EDIT MODEL (§4): the Operate zone is
         # verb-mediated lifecycle data — spores AND episodes are Class B (episode
         # mutation = tombstone verb), NOT direct-edit. [L4 HIGH]

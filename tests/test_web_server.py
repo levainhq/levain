@@ -125,10 +125,15 @@ class TestAssets:
         html = load_web_asset("dashboard.html")
         core = load_web_asset("dashboard_core.js")
         boot = load_web_asset("dashboard_boot.js")
+        css = load_web_asset("dashboard.css")
         assert "<!DOCTYPE html>" in html
-        # the page wires both served scripts and NO external/CDN import
+        # the page wires both served scripts + the served stylesheet, NO external/CDN
+        # import and NO inline <style> (Slice 2a moved CSS out → style-src 'self').
         assert '/dashboard_core.js' in html
         assert '/dashboard_boot.js' in html
+        assert '/dashboard.css' in html
+        assert "<style>" not in html
+        assert ".panel" in css and ".edit-btn" in css  # the moved sheet + the 2a affordances
         assert "unpkg.com" not in html and "modelcontextprotocol" not in html
         # the core exposes the one render entry point the boot shim calls
         assert "window.LevainDashboard" in core
@@ -154,6 +159,13 @@ class TestAssets:
                 assert status == 200, route
                 assert headers["Content-Type"] == "text/javascript; charset=utf-8"
                 assert body, route
+
+    def test_stylesheet_route(self, tmp_path: Path) -> None:
+        with _serving(_store_with_data(tmp_path)) as (base, _):
+            status, headers, body = _get(base + "/dashboard.css")
+        assert status == 200
+        assert headers["Content-Type"] == "text/css; charset=utf-8"
+        assert b".panel" in body
 
 
 # --- security boundary: closed allowlist, headers, loopback ----------------
@@ -188,6 +200,9 @@ class TestSecurityBoundary:
                 csp = headers["Content-Security-Policy"]
                 assert "default-src 'none'" in csp, route
                 assert "script-src 'self'" in csp, route
+                # Slice 2a: CSS is a served sheet now → style-src 'self', no inline.
+                assert "style-src 'self'" in csp, route
+                assert "unsafe-inline" not in csp, route
                 assert "frame-ancestors 'none'" in csp, route
                 assert headers["X-Content-Type-Options"] == "nosniff", route
                 assert headers["X-Frame-Options"] == "DENY", route
@@ -424,3 +439,185 @@ class TestStartupContract:
         assert rc == 1
         err = capsys.readouterr().err
         assert "Could not bind" in err and "--port" in err
+
+
+# --- Slice 2a: the governed write boundary (POST /edit) ---------------------
+
+_W_WORLD = (
+    "# Who Your Operator Is\n\n> Seed material — operator template.\n\n"
+    "## Identity\n\nPhill. 46. Columbus, OH.\n\n"
+    "## Communication\n\nDirect, profanity welcome.\n"
+)
+_W_ORIGIN = "# Who You Are — Aria\n\nA new entity.\n"
+_W_CONST = "# Constitution\n\nUniversal core.\n"
+
+
+def _make_full_install(tmp_path: Path) -> SubstrateSource:
+    """A full Levain install (seed + activation + .levain) so the write route has a
+    real install_root + Class-A files to edit. No anneal store is needed for
+    Class-A FILE edits (make_server doesn't require the db to exist)."""
+    root = tmp_path / "install"
+    (root / "seed").mkdir(parents=True)
+    (root / "activation").mkdir(parents=True)
+    (root / ".levain").mkdir()
+    (root / "seed" / "world.md").write_text(_W_WORLD, encoding="utf-8")
+    (root / "seed" / "origin.md").write_text(_W_ORIGIN, encoding="utf-8")
+    (root / "seed" / "partnership.md").write_text(_W_CONST, encoding="utf-8")
+    (root / "seed" / "memory.md").write_text(_W_CONST, encoding="utf-8")
+    (root / "seed" / "spore_instructions.md").write_text(_W_CONST, encoding="utf-8")
+    (root / "activation" / "posture.md").write_text("Slow is fast.\n", encoding="utf-8")
+    (root / "activation" / "recency_directives.md").write_text("No gatekeeping.\n", encoding="utf-8")
+    return SubstrateSource.local(root)
+
+
+def _post(url: str, payload, *, headers: dict | None = None, content_type: str = "application/json"):
+    data = json.dumps(payload).encode("utf-8")
+    h = {} if content_type is None else {"Content-Type": content_type}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, method="POST", headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+class TestWriteBoundary:
+    def test_world_section_edit_happy_path(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "config", "source": "seed/world.md", "heading": "Identity",
+                "expected_body": "Phill. 46. Columbus, OH.", "new_body": "Topological mind.",
+            })
+        assert status == 200 and body["ok"] is True
+        out = (src.install_root / "seed" / "world.md").read_text(encoding="utf-8")
+        assert "Topological mind." in out
+        assert "Direct, profanity welcome." in out  # sibling preserved
+
+    def test_entity_name_edit(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {"kind": "entity_name", "value": "Sol"})
+        assert status == 200
+        cfg = json.loads((src.install_root / ".levain" / "config.json").read_text("utf-8"))
+        assert cfg["entity_name"] == "Sol"
+
+    def test_cross_site_refused(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "config", "source": "seed/world.md", "heading": "Identity",
+                "expected_body": "Phill. 46. Columbus, OH.", "new_body": "x",
+            }, headers={"Sec-Fetch-Site": "cross-site"})
+        assert status == 403 and body["error"] == "forbidden"
+        # the file is untouched
+        assert "Phill. 46." in (src.install_root / "seed" / "world.md").read_text("utf-8")
+
+    def test_same_site_refused(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                              headers={"Sec-Fetch-Site": "same-site"})
+        assert status == 403
+
+    def test_same_origin_allowed(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "Ok"},
+                              headers={"Sec-Fetch-Site": "same-origin"})
+        assert status == 200
+
+    def test_wrong_content_type_415(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                                 content_type="text/plain")
+        assert status == 415 and body["error"] == "unsupported_media_type"
+
+    def test_class_c_origin_refused(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "config", "source": "seed/origin.md", "heading": None,
+                "expected_body": _W_ORIGIN, "new_body": "hacked",
+            })
+        assert status == 403 and body["error"] == "not_editable"
+        assert (src.install_root / "seed" / "origin.md").read_text("utf-8") == _W_ORIGIN
+
+    def test_stale_409(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "config", "source": "seed/world.md", "heading": "Identity",
+                "expected_body": "WRONG", "new_body": "x",
+            })
+        assert status == 409 and body["error"] == "stale"
+
+    def test_bad_host_refused(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                              headers={"Host": "evil.com"})
+        assert status == 403
+
+    def test_unknown_route_404(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, _ = _post(base + "/wat", {"kind": "entity_name", "value": "x"})
+        assert status == 404
+
+    def test_bad_json_400(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            data = b"{not json"
+            req = urllib.request.Request(
+                base + "/edit", data=data, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
+                    status = r.status
+            except urllib.error.HTTPError as e:
+                status = e.code
+        assert status == 400
+
+    def test_oversize_413(self, tmp_path: Path) -> None:
+        from levain.web_server import _MAX_POST_BYTES
+
+        src = _make_full_install(tmp_path)
+        big = "z" * (_MAX_POST_BYTES + 1024)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {
+                "kind": "config", "source": "seed/world.md", "heading": "Identity",
+                "expected_body": "Phill. 46. Columbus, OH.", "new_body": big,
+            })
+        assert status == 413
+
+    def test_get_to_edit_is_404(self, tmp_path: Path) -> None:
+        # /edit is POST-only; a GET falls through the read allowlist to 404.
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            try:
+                status, _, _ = _request(base + "/edit", method="GET")
+            except urllib.error.HTTPError as e:
+                status = e.code
+        assert status == 404
+
+    def test_rate_gate_503(self, tmp_path: Path) -> None:
+        # Saturate the bounded gate, then a store read returns a clean 503.
+        from levain.web_server import _MAX_INFLIGHT
+
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, httpd):
+            held = [httpd.request_gate.acquire(blocking=False) for _ in range(_MAX_INFLIGHT)]
+            assert all(held)
+            try:
+                status, _, _ = _request(base + "/substrate.json", method="GET")
+            except urllib.error.HTTPError as e:
+                status = e.code
+            finally:
+                for _ in range(_MAX_INFLIGHT):
+                    httpd.request_gate.release()
+        assert status == 503
