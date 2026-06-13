@@ -803,26 +803,36 @@ def build_substrate_view(
             # totals, in its OWN try. It does not read the continuity file, so a
             # non-UTF8 continuity (which anneal's status() reads + faults on) must
             # not blank the timeline as collateral of a health failure.
-            wraps: list[Any] = []
+            wraps: list[WrapRow] = []
             try:
-                wraps = store.get_wrap_history()
-                # `or ""` defends the sort against a legacy row with a null
-                # wrapped_at (TypeError isn't a data_fault, so an un-guarded compare
-                # would escape the tier). [kimi L3]
-                ordered = sorted(wraps, key=lambda w: w.wrapped_at or "", reverse=True)
-                view.wraps = [
+                # Coerce raw wrap rows to typed WrapRows AT THE BOUNDARY. SQLite's
+                # loose INTEGER affinity can return TEXT/NULL in counter columns; an
+                # un-coerced 'bad'/None would escape this tier as a TypeError (NOT a
+                # data_fault) — through either the sort key OR health's sum() below —
+                # and blank the WHOLE view. `int(x or 0)` maps NULL→0 and turns
+                # malformed text into a ValueError (∈ data_faults) so the wraps tier
+                # degrades VISIBLY in isolation; wrapped_at is str-coerced so the sort
+                # never compares mixed types. [codex L3 HIGH] (supersedes the kimi-L3
+                # `wrapped_at or ""` guard, which covered only the null-sort sub-case.)
+                def _int(x: Any) -> int:
+                    return int(x or 0)
+
+                wraps = [
                     WrapRow(
-                        wrapped_at=w.wrapped_at,
-                        episodes_compressed=w.episodes_compressed,
-                        continuity_chars=w.continuity_chars,
-                        graduations_validated=w.graduations_validated,
-                        graduations_demoted=w.graduations_demoted,
-                        associations_formed=w.associations_formed,
-                        associations_strengthened=w.associations_strengthened,
-                        associations_decayed=w.associations_decayed,
+                        wrapped_at=str(w.wrapped_at) if w.wrapped_at is not None else "",
+                        episodes_compressed=_int(w.episodes_compressed),
+                        continuity_chars=_int(w.continuity_chars),
+                        graduations_validated=_int(w.graduations_validated),
+                        graduations_demoted=_int(w.graduations_demoted),
+                        associations_formed=_int(w.associations_formed),
+                        associations_strengthened=_int(w.associations_strengthened),
+                        associations_decayed=_int(w.associations_decayed),
                     )
-                    for w in ordered[:max_wraps]
+                    for w in store.get_wrap_history()
                 ]
+                view.wraps = sorted(
+                    wraps, key=lambda w: w.wrapped_at or "", reverse=True
+                )[:max_wraps]
             except data_faults as exc:
                 view.errors["wraps"] = f"{type(exc).__name__}: {exc}"
 

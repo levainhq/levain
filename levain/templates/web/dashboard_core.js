@@ -255,13 +255,19 @@
       svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
       for (let i = 0; i <= 8; i++) svg.appendChild(gratLine(NS, (i * W) / 8, 0, (i * W) / 8, H));
       for (let i = 0; i <= 4; i++) svg.appendChild(gratLine(NS, 0, (i * H) / 4, W, (i * H) / 4));
-      const X = (i) => PAD + (i * (W - 2 * PAD)) / (wraps.length - 1);
+      // Math.max floors the divisor at 1 — forward-defense for a future 1-sample
+      // timebase (today span ≥ 12, so wraps.length ≥ 2 and this is a no-op). [L1/codex MED]
+      const X = (i) => PAD + (i * (W - 2 * PAD)) / Math.max(1, wraps.length - 1);
       const chips = [];
       for (const ch of CHANNELS) {
-        const vals = wraps.map(ch.val);
-        const max = Math.max(1, ...vals);
+        // counters are non-negative; clamp a malformed negative so it can't plot
+        // off-grid (num() lets negatives through). gain floors at 1 to avoid /0, but
+        // the legend reports the TRUE max so the calibration stays honest. [codex MED]
+        const vals = wraps.map((w) => Math.max(0, ch.val(w)));
+        const actualMax = Math.max(0, ...vals);
+        const gain = Math.max(1, actualMax);
         const pts = vals
-          .map((v, i) => `${X(i).toFixed(1)},${(H - PAD - (v / max) * (H - 2 * PAD)).toFixed(1)}`)
+          .map((v, i) => `${X(i).toFixed(1)},${(H - PAD - (v / gain) * (H - 2 * PAD)).toFixed(1)}`)
           .join(" ");
         for (const layer of ["trace-glow", "trace-core"]) {
           const pl = document.createElementNS(NS, "polyline");
@@ -272,14 +278,14 @@
           svg.appendChild(pl);
         }
         const chip = el("button", `scope-ch ${ch.cls}`,
-          `${ch.label} ${fmt(vals[vals.length - 1])} · max ${fmt(max)}`);
+          `${ch.label} ${fmt(vals[vals.length - 1])} · max ${fmt(actualMax)}`);
         chip.type = "button";
         chip.title = "solo this channel (click again for all)";
         chip.setAttribute("aria-pressed", solo === ch.cls ? "true" : "false");
         chip.addEventListener("click", () => {
           solo = solo === ch.cls ? null : ch.cls;
           wrap.dataset.solo = solo || "";
-          for (const c of chips) c.setAttribute("aria-pressed", c.classList.contains(solo) ? "true" : "false");
+          for (const c of chips) c.setAttribute("aria-pressed", solo != null && c.classList.contains(solo) ? "true" : "false");
         });
         chips.push(chip);
         legend.appendChild(chip);
@@ -356,7 +362,6 @@
     const err = tierErr(view, "episodes");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "no episodes yet")); return p; }
-    const scroll = el("div", "scroll");
     for (const e of list) {
       const row = el("div", "row");
       if (e.type) row.appendChild(el("span", "etype", e.type));
@@ -365,9 +370,8 @@
         row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
       }
       row.appendChild(el("span", "muted", datePart(e.timestamp)));
-      scroll.appendChild(row);
+      p.appendChild(row);
     }
-    p.appendChild(scroll);
     return p;
   }
 
@@ -377,16 +381,14 @@
     const err = tierErr(view, "wraps");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "no wraps yet")); return p; }
-    const scroll = el("div", "scroll");
     for (const w of list) {
       const row = el("div", "row");
       row.appendChild(el("span", "tier", datePart(w.wrapped_at)));
       row.appendChild(el("span", "clause",
-        `${fmt(w.graduations_validated)}↑ / ${fmt(w.graduations_demoted)}↓ grad · ` +
-        `+${fmt(w.associations_formed)} links · ${fmt(w.continuity_chars)} chars`));
-      scroll.appendChild(row);
+        `${fmt(num(w.graduations_validated))}↑ / ${fmt(num(w.graduations_demoted))}↓ grad · ` +
+        `+${fmt(num(w.associations_formed))} links · ${fmt(num(w.continuity_chars))} chars`));
+      p.appendChild(row);
     }
-    p.appendChild(scroll);
     return p;
   }
 

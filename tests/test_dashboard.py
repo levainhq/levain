@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from levain.dashboard import (
     AnnealPaths,
     _one_clause,
@@ -602,6 +604,39 @@ class TestFailSoftBoundaries:
         assert not any(k.startswith("world:") for k in keys)  # the corrupt file skipped
         assert v.entity_name == "Sage"  # name read (origin.md) unaffected
         assert "config" not in v.errors  # NOT a whole-tier failure
+
+    def test_malformed_wrap_counter_contains_blast_radius(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wrap row with a non-int counter (SQLite's loose INTEGER affinity, or a
+        legacy/buggy writer) must degrade ONLY the wraps tier — it must NOT escape as
+        a TypeError through the sort key or health's sum() and blank the whole view.
+        [codex L3 HIGH — the wraps/health analogue of the non-utf8 blast-radius]"""
+        import anneal_memory
+
+        db = tmp_path / "memory.db"
+        with anneal_memory.Store(db):
+            pass
+
+        class _BadRec:  # a wrap record with TEXT where an INTEGER counter belongs
+            wrapped_at = "2026-06-12T10:00:00"
+            episodes_compressed = 5
+            continuity_chars = 100
+            graduations_validated = 1
+            graduations_demoted = 0
+            associations_formed = "bad"  # ← the affinity-loose poison value
+            associations_strengthened = 2
+            associations_decayed = 0
+
+        monkeypatch.setattr(
+            anneal_memory.Store, "get_wrap_history", lambda self: [_BadRec()]
+        )
+        v = build_substrate_view(AnnealPaths.from_db(db))  # must NOT raise
+
+        assert "wraps" in v.errors  # the wraps tier degrades VISIBLY, in isolation
+        assert v.wraps == []
+        assert v.health is not None  # health survives (sums over the empty wraps → 0)
+        assert "episodes" not in v.errors  # sibling tiers untouched
 
 
 class TestRenderSummaryContract:
