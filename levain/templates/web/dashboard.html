@@ -86,6 +86,17 @@
     content: ""; position: absolute; inset: 0; z-index: 1;
     background: radial-gradient(closest-side at 50% 45%, transparent 10%, rgba(8,11,11,.62) 42%, rgba(8,11,11,.97) 72%);
   }
+  /* CRT phosphor raster — a denser vintage-monitor scanline scoped to the ORGANISM
+     (the chassis panels stay clean metal: the substrate lives behind the tube). Flat
+     alpha + NO blend mode — a multiply over the animating rings would re-blend every
+     frame (the killed flicker class); flat alpha is a static, compositor-free layer. */
+  .rings::before {
+    content: ""; position: absolute; inset: 0; z-index: 2; pointer-events: none;
+    background:
+      repeating-linear-gradient(0deg, rgba(26,10,0,.46) 0 1px, transparent 1px 3px),
+      radial-gradient(125% 95% at 50% 45%, rgba(245,177,78,.07), transparent 62%);
+    opacity: .85;
+  }
   body[data-vital="dark"] .rings { opacity: .2; filter: grayscale(.62) brightness(.5); }
   .ring {
     position: absolute; inset: 0; margin: auto; border-radius: 50%;
@@ -174,18 +185,32 @@
      Two layers so the BREATH reads: the halo stays atmospheric under heavy blur;
      the nucleus (a SIBLING — a child would inherit the parent's blur filter)
      carries a light blur + a pronounced scale/opacity swing = the visible pulse. */
+  /* The PULSE rides the parent (transform+opacity = compositor-only); the COLOR
+     cycle rides 6 pre-blurred sibling .hue layers that cross-fade opacity. Each .hue
+     has a STATIC gradient, so its blur rasterizes ONCE and is cached — animating its
+     opacity never re-runs the 32px blur. (The old `coreCycle` animated `background`
+     UNDER the blur = a per-frame repaint+reblur loop.) Same exact atomic spectrum,
+     compositor-cheap. [L2/codex HIGH — fix, exact colors preserved] */
   .core {
     position: absolute; inset: 0; margin: auto; width: 420px; height: 420px; border-radius: 50%;
-    filter: blur(32px); mix-blend-mode: screen; opacity: .55;
-    background: radial-gradient(circle, var(--r-green) 0%, transparent 70%);
-    animation: coreCycle 30s linear infinite, corePulse 10s infinite;
+    mix-blend-mode: screen; opacity: .55; animation: corePulse 10s infinite;
   }
   .nucleus {
     position: absolute; inset: 0; margin: auto; width: 180px; height: 180px; border-radius: 50%;
-    filter: blur(9px); mix-blend-mode: screen; opacity: .6;
-    background: radial-gradient(circle, var(--r-green) 0%, transparent 72%);
-    animation: coreCycle 30s linear infinite, nucleusPulse 10s infinite;
+    mix-blend-mode: screen; opacity: .6; animation: nucleusPulse 10s infinite;
   }
+  .core .hue, .nucleus .hue {
+    position: absolute; inset: 0; border-radius: 50%; opacity: 0;
+    animation: hueCycle 30s linear infinite;
+  }
+  .core .hue { filter: blur(32px); }
+  .nucleus .hue { filter: blur(9px); }
+  .hue.h1 { background: radial-gradient(circle, var(--r-green) 0%, transparent 70%); animation-delay: 0s; }
+  .hue.h2 { background: radial-gradient(circle, var(--r-teal)  0%, transparent 70%); animation-delay: -5s; }
+  .hue.h3 { background: radial-gradient(circle, var(--r-cyan)  0%, transparent 70%); animation-delay: -10s; }
+  .hue.h4 { background: radial-gradient(circle, var(--r-sky)   0%, transparent 70%); animation-delay: -15s; }
+  .hue.h5 { background: radial-gradient(circle, var(--r-gold)  0%, transparent 70%); animation-delay: -20s; }
+  .hue.h6 { background: radial-gradient(circle, var(--r-coral) 0%, transparent 70%); animation-delay: -25s; }
 
   .deck { max-width: 1320px; margin: 0 auto; position: relative; z-index: 1; }
 
@@ -269,14 +294,14 @@
   .zone-head[data-zone="mind"]     { --accent: var(--mind);     color: color-mix(in srgb, var(--mind) 55%, var(--dim)); }
 
   /* ── panel — a glass display module, seated in the chassis. MATERIALITY RULE:
-     displays are GLASS (frosted — the organism shows through), controls are
-     METAL (tabs/buttons stay solid — you grip them). backdrop-filter re-samples
-     the animating rings behind each panel per frame; blur radius kept modest. */
+     displays are GLASS (translucent — the organism shows through), controls are
+     METAL (tabs/buttons stay solid — you grip them). A per-panel backdrop-filter
+     re-sampled the animating rings every frame AND its cost scaled with panel
+     count (worse as the store grows); the vignette already occludes the rings in
+     the panel band, so translucency carries the glass read without the blur. */
   .panel {
     --accent: var(--line-hot);
     background: linear-gradient(180deg, rgba(19,29,27,.62), rgba(14,21,20,.56));
-    -webkit-backdrop-filter: blur(10px) saturate(1.25);
-    backdrop-filter: blur(10px) saturate(1.25);
     border: 1px solid var(--line); border-left: 2px solid color-mix(in srgb, var(--accent) 60%, var(--line));
     border-radius: 5px; padding: 0; min-width: 0; position: relative;
     box-shadow: inset 0 1px 0 rgba(255,255,255,.045), inset 0 -1px 0 rgba(0,0,0,.35), 0 8px 22px -16px #000;
@@ -465,18 +490,21 @@
     0%, 88%, 100% { opacity: .16; }
     40% { opacity: .34; }
   }
-  @keyframes coreCycle {
-    0%   { background: radial-gradient(circle, var(--r-green) 0%, transparent 70%); }
-    17%  { background: radial-gradient(circle, var(--r-teal)  0%, transparent 70%); }
-    34%  { background: radial-gradient(circle, var(--r-cyan)  0%, transparent 70%); }
-    50%  { background: radial-gradient(circle, var(--r-sky)   0%, transparent 70%); }
-    67%  { background: radial-gradient(circle, var(--r-gold)  0%, transparent 70%); }
-    84%  { background: radial-gradient(circle, var(--r-coral) 0%, transparent 70%); }
-    100% { background: radial-gradient(circle, var(--r-green) 0%, transparent 70%); }
+  /* one shared crossfade — 6 layers staggered -5s apart (16.6% of the 30s cycle)
+     each hold their color full for a window, then hand off; the plateau + soft
+     fades keep the screen-blended sum ~constant so the breath stays smooth. */
+  @keyframes hueCycle {
+    0%, 100% { opacity: 0; }
+    5%       { opacity: 1; }
+    17%      { opacity: 1; }
+    23%      { opacity: 0; }
   }
   @media (prefers-reduced-motion: no-preference) { .masthead::after { animation: sweep 1.1s ease-out .15s 1 both; } }
   @media (prefers-reduced-motion: reduce) {
-    .panel, .badge.live, .entity::after, .wordmark, .core, .nucleus { animation: none; }
+    .panel, .badge.live, .entity::after, .wordmark, .core, .nucleus, .hue { animation: none; }
+    /* specificity (0,3,0) so it beats the base `.core .hue` (0,2,0) by a margin, not
+       by source order — a future block reorder can't silently kill the core here. */
+    .core .hue.h1, .nucleus .hue.h1 { opacity: 1; }  /* hold one static hue so the core stays lit */
     .ring { animation: none; }  /* per-ring opacity ramp stays — it carries the depth */
     svg.scope .trace-core, svg.scope .trace-glow { animation: none; stroke-dashoffset: 0; }
   }
@@ -491,7 +519,14 @@
     <div class="ring ring-6"></div><div class="ring ring-7"></div><div class="ring ring-8"></div>
     <div class="ring ring-9"></div><div class="ring ring-10"></div><div class="ring ring-11"></div>
     <div class="ring ring-12"></div>
-    <div class="core"></div><div class="nucleus"></div>
+    <div class="core">
+      <span class="hue h1"></span><span class="hue h2"></span><span class="hue h3"></span>
+      <span class="hue h4"></span><span class="hue h5"></span><span class="hue h6"></span>
+    </div>
+    <div class="nucleus">
+      <span class="hue h1"></span><span class="hue h2"></span><span class="hue h3"></span>
+      <span class="hue h4"></span><span class="hue h5"></span><span class="hue h6"></span>
+    </div>
   </div>
 
   <div class="deck">
