@@ -672,3 +672,57 @@ class TestStateEdit:
         assert "re-consolidated." in cont.read_text(encoding="utf-8")
         # a refused edit leaves no spurious audit/backup record (CAS is pre-audit)
         assert recent_edits(install) == []
+
+
+class TestContinuityLockWiring:
+    """AM-CONTLOCK: the continuity-targeting writes (State edit + undo-of-State) take
+    anneal's SHARED `continuity_lock` across their read→write so a cross-process wrap
+    can't interleave; the Levain-only targets (world.md config, entity_name,
+    undo-of-config) do NOT — their only writer is Levain, `_WRITE_LOCK` suffices, and
+    a needless cross-process lock there would be misleading."""
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[str]:
+        import contextlib
+        import levain.writes as W
+
+        calls: list[str] = []
+        real = W.continuity_lock
+
+        @contextlib.contextmanager
+        def spy(path):
+            calls.append(str(path))
+            with real(path):  # delegate to the real lock — behaves exactly as prod
+                yield
+
+        monkeypatch.setattr(W, "continuity_lock", spy)
+        return calls
+
+    def test_state_edit_takes_the_lock(self, install: Path, monkeypatch) -> None:
+        _add_continuity(install)
+        calls = self._spy(monkeypatch)
+        apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+        assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
+
+    def test_config_edit_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
+        calls = self._spy(monkeypatch)
+        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        assert calls == []
+
+    def test_entity_name_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
+        calls = self._spy(monkeypatch)
+        apply_edit(install, {"kind": "entity_name", "value": "Aria"})
+        assert calls == []
+
+    def test_undo_of_state_takes_the_lock(self, install: Path, monkeypatch) -> None:
+        _add_continuity(install)
+        res = apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+        calls = self._spy(monkeypatch)  # spy only the undo
+        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
+
+    def test_undo_of_config_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
+        res = apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        calls = self._spy(monkeypatch)  # spy only the undo
+        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        assert calls == []

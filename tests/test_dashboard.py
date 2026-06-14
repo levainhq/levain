@@ -598,10 +598,14 @@ class TestFailSoftBoundaries:
     never escape to blank a store-derived or sibling tier."""
 
     def test_non_utf8_continuity_contains_blast_radius(self, tmp_path: Path) -> None:
-        """A non-UTF8 continuity.md faults anneal's status() (which reads the file),
-        so health degrades VISIBLY — but the wraps, graph, and episode tiers (which
-        do NOT read continuity) must survive as INDEPENDENT tries, no collateral.
-        [L1-H1 — root cause: anneal status() reads continuity; fix decouples wraps]"""
+        """A non-UTF8 continuity.md degrades ONLY its own read. With AM-STATUS-HARDEN
+        (anneal 0.9.0) anneal's status() no longer faults on a corrupt continuity — it
+        returns valid health with continuity_chars=None — so the blast radius is now
+        even tighter than the original L1-H1 fix targeted: the health CARD survives,
+        only the continuity-size field (and the felt-layer section read) degrade. The
+        wraps, graph, and episode tiers (which never touch continuity) stay clean.
+        [L1-H1 lineage; the dashboard's own cont_chars guard was forward-defense for
+        exactly this hardening — now the live path.]"""
         from anneal_memory import Store
 
         db = tmp_path / "memory.db"
@@ -609,14 +613,16 @@ class TestFailSoftBoundaries:
             pass
         (tmp_path / "memory.continuity.md").write_bytes(b"## State\n\xff\xfe not utf8\n")
         v = build_substrate_view(AnnealPaths.from_db(db))
-        # health degrades VISIBLY (not a silent blank) — the fail-soft contract
-        assert v.health is None
-        assert "health" in v.errors
-        # but the tiers that do NOT depend on the continuity file survive cleanly
+        # health SURVIVES (anneal 0.9.0 hardened status()); only the one field that
+        # actually needs to read the continuity file degrades — visibly, in isolation.
+        assert v.health is not None
+        assert "health" not in v.errors
+        assert v.health.continuity_chars is None
+        # the tiers that do NOT depend on the continuity file survive cleanly
         assert "wraps" not in v.errors and v.wraps == []
         assert "graph" not in v.errors and v.graph is not None
         assert "episodes" not in v.errors
-        assert "sections" in v.errors  # the section read correctly degrades too
+        assert "sections" in v.errors  # the felt-layer section read correctly degrades too
 
     def test_one_non_utf8_seed_file_keeps_config_tier(self, tmp_path: Path) -> None:
         """A single corrupt seed file is skipped like a missing one — the rest of
