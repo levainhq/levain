@@ -57,9 +57,12 @@ import json
 import os
 import threading
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from anneal_memory import continuity_lock  # the SHARED cross-process continuity lock
 
 __all__ = [
     "EditError",
@@ -526,16 +529,26 @@ def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) 
             "no neocortex continuity file yet — the entity hasn't wrapped a session, "
             f"so there is no {heading!r} to edit",
         )
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:  # ValueError covers UnicodeDecodeError
-        raise EditError("unreadable", 422, f"cannot read the continuity file: {exc}") from exc
+    # AM-CONTLOCK: hold anneal's SHARED cross-process continuity lock across the
+    # ENTIRE read→edit→CAS→os.replace. The continuity file is also written by the
+    # anneal CONSOLIDATE in another process; `_WRITE_LOCK` (threading) only
+    # serializes Levain's own request threads, so without this a wrap landing
+    # between our read and our write is the lost-update codex L3 flagged in 2b-i.
+    # `_commit`'s CAS still runs inside the lock as the no-op-degradation fallback
+    # (and to catch a wrap that landed between the operator loading the page and
+    # this read). Lock is INNER to `_WRITE_LOCK`; it is the only cross-process
+    # lock, so the order can't deadlock.
+    with continuity_lock(path):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:  # ValueError covers UnicodeDecodeError
+            raise EditError("unreadable", 422, f"cannot read the continuity file: {exc}") from exc
 
-    new_text = _edit_one_section(raw, heading, _to_lf(expected), _to_lf(new_body))
-    return _commit(
-        install_root, source=source, heading=heading, path=path,
-        prior_text=raw, new_text=new_text, action="edit", kind="state", now=now,
-    )
+        new_text = _edit_one_section(raw, heading, _to_lf(expected), _to_lf(new_body))
+        return _commit(
+            install_root, source=source, heading=heading, path=path,
+            prior_text=raw, new_text=new_text, action="edit", kind="state", now=now,
+        )
 
 
 def _apply_entity_name(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
@@ -596,55 +609,71 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
         raise EditError("corrupt_record", 422, "audit record has no source")
     path = _resolve_inside(install_root, source)
 
-    # [L3 HIGH] Only the edit whose result is STILL the file's current content can be
-    # undone — i.e. the most-recent edit to that file. Otherwise a stale id would
-    # restore an old backup and silently discard every newer edit to the same file.
-    # Compare the live file's hash to the edit's recorded result; a mismatch (a newer
-    # edit landed, or the file changed) is a clean 409. This also blocks a second undo
-    # of the same edit (post-undo the file no longer matches the edit's result).
-    current_bytes = path.read_bytes() if path.is_file() else None
-    current_sha = hashlib.sha256(current_bytes).hexdigest() if current_bytes is not None else None
-    if current_sha != record.get("new_sha256"):
-        raise EditError(
-            "stale", 409,
-            "only the most-recent edit to a file can be undone — it has changed since "
-            "(a newer edit or a consolidation/wrap landed, or it was already undone)",
-        )
-    prior_text = current_bytes.decode("utf-8") if current_bytes is not None else None
+    # AM-CONTLOCK: if this undo targets the continuity file it has the SAME
+    # cross-process writer (the anneal consolidate) as a State edit, so hold the
+    # shared lock across the whole read→CAS→restore — a wrap landing between
+    # read_bytes and _atomic_write is the lost-update codex flagged in 2b-i.
+    # (`_commit`'s CAS+lock close the same window on the forward State-edit path.)
+    # NB on a lock-less FS the lock degrades to a no-op and the SHA CAS below is the
+    # only guard — and undo's CAS→write window (read_bytes → backup → audit →
+    # _atomic_write) is WIDER than _commit's, so that degradation is genuinely
+    # best-effort here, not airtight. Other Class-A targets (world.md / posture /
+    # config.json) are Levain-only — `_WRITE_LOCK` already serializes them — so they
+    # take a nullcontext (no needless cross-process lock).
+    from levain.dashboard import LEVAIN_CONTINUITY_REL  # lazy: avoid import cycle
+    _is_continuity = path == _resolve_inside(install_root, str(Path(*LEVAIN_CONTINUITY_REL)))
+    undo_lock = continuity_lock(path) if _is_continuity else nullcontext()
 
-    # Resolve the restore target BEFORE mutating, so a missing backup fails clean.
-    backup_rel = record.get("backup")
-    if backup_rel is None:
-        restored = None  # the edit created the file → undo removes it
-    else:
-        backup_path = _resolve_inside(install_root, str(backup_rel))
-        if not backup_path.is_file():
-            raise EditError("backup_missing", 422, f"backup {backup_rel!r} is gone")
-        restored = backup_path.read_bytes().decode("utf-8")
+    with undo_lock:
+        # [L3 HIGH] Only the edit whose result is STILL the file's current content can be
+        # undone — i.e. the most-recent edit to that file. Otherwise a stale id would
+        # restore an old backup and silently discard every newer edit to the same file.
+        # Compare the live file's hash to the edit's recorded result; a mismatch (a newer
+        # edit landed, or the file changed) is a clean 409. This also blocks a second undo
+        # of the same edit (post-undo the file no longer matches the edit's result).
+        current_bytes = path.read_bytes() if path.is_file() else None
+        current_sha = hashlib.sha256(current_bytes).hexdigest() if current_bytes is not None else None
+        if current_sha != record.get("new_sha256"):
+            raise EditError(
+                "stale", 409,
+                "only the most-recent edit to a file can be undone — it has changed since "
+                "(a newer edit or a consolidation/wrap landed, or it was already undone)",
+            )
+        prior_text = current_bytes.decode("utf-8") if current_bytes is not None else None
 
-    # [L3 HIGH] Back up the current content + append the undo audit BEFORE mutating —
-    # same ordering as _commit, so a crash mid-restore leaves a backup + a record, not
-    # a changed file with no way back.
-    edit_id_new = uuid.uuid4().hex[:12]
-    audit = {
-        "id": edit_id_new,
-        "ts": _now_iso(now),
-        "kind": "undo",
-        "action": "undo",
-        "source": source,
-        "heading": record.get("heading"),
-        "undid": edit_id,
-        "backup": _backup(install_root, source, prior_text, edit_id_new),
-        "restored_to": backup_rel if backup_rel is not None else "<absent>",
-    }
-    _append_audit(install_root, audit)
+        # Resolve the restore target BEFORE mutating, so a missing backup fails clean.
+        backup_rel = record.get("backup")
+        if backup_rel is None:
+            restored = None  # the edit created the file → undo removes it
+        else:
+            backup_path = _resolve_inside(install_root, str(backup_rel))
+            if not backup_path.is_file():
+                raise EditError("backup_missing", 422, f"backup {backup_rel!r} is gone")
+            restored = backup_path.read_bytes().decode("utf-8")
 
-    if restored is None:
-        if path.is_file():
-            path.unlink()
-    else:
-        _atomic_write(path, restored)
-    return {"ok": True, "id": edit_id_new, "undid": edit_id, "source": source}
+        # [L3 HIGH] Back up the current content + append the undo audit BEFORE mutating —
+        # same ordering as _commit, so a crash mid-restore leaves a backup + a record, not
+        # a changed file with no way back.
+        edit_id_new = uuid.uuid4().hex[:12]
+        audit = {
+            "id": edit_id_new,
+            "ts": _now_iso(now),
+            "kind": "undo",
+            "action": "undo",
+            "source": source,
+            "heading": record.get("heading"),
+            "undid": edit_id,
+            "backup": _backup(install_root, source, prior_text, edit_id_new),
+            "restored_to": backup_rel if backup_rel is not None else "<absent>",
+        }
+        _append_audit(install_root, audit)
+
+        if restored is None:
+            if path.is_file():
+                path.unlink()
+        else:
+            _atomic_write(path, restored)
+        return {"ok": True, "id": edit_id_new, "undid": edit_id, "source": source}
 
 
 def _commit(
@@ -672,10 +701,17 @@ def _commit(
     # any backup/audit so a refusal leaves no trace) and the refusal happens here, just
     # before the mutation, shrinking the window to the atomic os.replace. For the seed
     # files (no external writer) the live content always equals `prior_text` under the
-    # lock, so this never false-fires there. RESIDUAL: a sub-replace race remains — an
-    # airtight guarantee needs a continuity lock SHARED with anneal's save path (an
-    # anneal-coordination follow-up, deferred with the snapshot/restore slice);
-    # reversibility (backup + audit) is the net until then.
+    # lock, so this never false-fires there.
+    #
+    # AM-CONTLOCK (the 2b-i residual, now CLOSED for the continuity path): the
+    # continuity-targeting callers (`_apply_state_edit`, undo-of-State) hold anneal's
+    # SHARED `continuity_lock` across their whole read→here→os.replace, so the
+    # sub-replace race against the anneal save path is gone — anneal takes the same
+    # lock around its Phase-3 rename. This CAS now stays as (a) the no-op-degradation
+    # fallback on non-POSIX / lock-less filesystems where the flock can't serialize,
+    # and (b) the catch for a wrap that landed before the caller acquired the lock
+    # (the operator-loaded-then-wrapped window). The seed-file callers take no
+    # continuity lock (Levain is their only writer); `_WRITE_LOCK` + this CAS suffice.
     try:
         live = path.read_text(encoding="utf-8") if path.is_file() else None
     except (OSError, ValueError):

@@ -925,11 +925,13 @@ def build_substrate_view(
             except data_faults as exc:
                 view.errors["wraps"] = f"{type(exc).__name__}: {exc}"
 
-            # health — NB anneal's status() reads the continuity file (store.py),
-            # so a non-UTF8 continuity faults status() and health degrades VISIBLY
-            # here (errors["health"]); wraps above + graph/episodes below stay
-            # independent. The inner cont_chars guard is forward defense for the day
-            # anneal hardens that read (then this would otherwise be the next escape).
+            # health — anneal's status() USED to read the continuity file and fault on
+            # a non-UTF8 one; AM-STATUS-HARDEN (anneal 0.9.0) hardened that read, so
+            # status() now returns valid health with continuity_chars=None instead of
+            # raising. We still read the continuity size OURSELVES below (its own
+            # guard) — so the health card survives a corrupt continuity and only that
+            # one field degrades. wraps above + graph/episodes below stay independent
+            # regardless. (errors["health"] now fires only on a genuine status() fault.)
             try:
                 status = store.status()
                 a = status.association_stats

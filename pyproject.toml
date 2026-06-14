@@ -36,11 +36,15 @@ dependencies = [
     # Partnership seed needs the 0.8.x stack: spores (0.4.0), schema-aware
     # budget (0.4.2), `init --schema partnership` (0.4.4 — AM-INITSCHEMA), the
     # crystallized-pattern tier (0.6.0 store + 0.7.0 opt-in / `crystal index`+
-    # `recall` / `retrieve_patterns`), AND the AM-CRYSTAL-RECALL associative
-    # (Hebbian) backend (0.8.0) that makes crystallized recall fire by meaning.
-    # The prior `<0.8` ceiling capped adopters out of the entire 0.8.x crystal-
-    # recall tier (spore-060); `<0.5` before that predated crystals entirely.
-    "anneal-memory>=0.8.0,<0.9",
+    # `recall` / `retrieve_patterns`), the AM-CRYSTAL-RECALL associative
+    # (Hebbian) backend (0.8.0) that makes crystallized recall fire by meaning,
+    # AND the AM-CONTLOCK shared `continuity_lock` (0.9.0) the governed State /
+    # undo writes take to serialize against the anneal consolidate cross-process.
+    # The prior `<0.8` ceiling capped adopters out of the 0.8.x crystal-recall
+    # tier (spore-060); `<0.5` before that predated crystals entirely. (0.9.0
+    # ships with anneal Slice C — main carries this pin ahead of the PyPI publish,
+    # per the coordinated shadow-ship plan.)
+    "anneal-memory>=0.9.0,<0.10",
 ]
 
 [project.optional-dependencies]
