@@ -504,6 +504,29 @@ class TestWriteBoundary:
         cfg = json.loads((src.install_root / ".levain" / "config.json").read_text("utf-8"))
         assert cfg["entity_name"] == "Sol"
 
+    def test_state_section_edit_end_to_end(self, tmp_path: Path) -> None:
+        # Slice 2b: the neocortex State section edits through the same governed route;
+        # the felt layer is preserved, and a non-State section is refused 403.
+        src = _make_full_install(tmp_path)
+        cont = src.install_root / ".levain" / "memory.continuity.md"
+        cont.write_text(
+            "# Memory\n\n## State\n\nFocus: A.\n\n## Patterns\n\nfelt layer.\n",
+            encoding="utf-8",
+        )
+        with _serving(src) as (base, _httpd):
+            ok_status, ok_body = _post(base + "/edit", {
+                "kind": "state", "heading": "State",
+                "expected_body": "Focus: A.", "new_body": "Focus: B.",
+            })
+            bad_status, bad_body = _post(base + "/edit", {
+                "kind": "state", "heading": "Patterns",
+                "expected_body": "felt layer.", "new_body": "hacked",
+            })
+        assert ok_status == 200 and ok_body["ok"] is True
+        out = cont.read_text(encoding="utf-8")
+        assert "Focus: B." in out and "felt layer." in out  # State changed, felt kept
+        assert bad_status == 403 and bad_body["error"] == "not_editable"
+
     def test_cross_site_refused(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):

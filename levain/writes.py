@@ -1,11 +1,15 @@
-"""levain.writes — Levain v2 Slice 2a: the governed Class-A write layer.
+"""levain.writes — Levain v2 Slice 2: the governed Class-A write layer.
 
-The inverse of ``dashboard.py``'s read path, for the ONE edit class Slice 2a turns
-on: **Class A — operator config** (direct, declarative, human-is-fan-in, safe). That
-is the operator's profile (``seed/world.md`` sections), the entity's thinking style
+The inverse of ``dashboard.py``'s read path, for the **Class A — operator-input** edit
+class (direct, declarative, human-is-fan-in, safe). Slice 2a turned on the operator's
+profile (``seed/world.md`` sections), the entity's thinking style
 (``activation/posture.md`` / ``recency_directives.md``), and the operator-set entity
-name (``.levain/config.json``). Class B (anneal lifecycle verbs) and Class C
-(consolidated cognition — read-only) are NOT writable here; that is the whole point.
+name (``.levain/config.json``). **Slice 2b adds the neocortex ``State`` section** —
+the one Class-A section of the consolidated-cognition file (live-state, an INPUT to
+cognition, last-writer-wins), confined to ``State`` alone (``_apply_state_edit``). The
+other five neocortex sections (Class C — the consolidate's own conclusions), Class B
+(anneal lifecycle verbs), and the Class C-view seed docs are NOT writable here; that is
+the whole point — the operator governs inputs, never the entity's cognition.
 
 The governance model (load-bearing — this is the seam the moat is built on):
 
@@ -153,7 +157,13 @@ def _resolve_inside(install_root: Path, source: str) -> Path:
 
 def _locate_section(lines: list[str], heading: str) -> int:
     """Index of the lone ``## <heading>`` line. Raises if absent (404-ish 422) or
-    ambiguous (the same heading twice → refuse rather than guess which one)."""
+    ambiguous (the same heading twice → refuse rather than guess which one).
+
+    NB the read layer (``dashboard._split_sections`` → ``dict(...)``) silently keeps the
+    LAST duplicate; the write deliberately diverges and REFUSES (a write that guessed
+    which of two ``## State`` blocks to replace could clobber the wrong one). Refuse
+    beats guess at a mutation boundary — the divergence is safe (it can only refuse,
+    never escape)."""
     matches = [
         i for i, ln in enumerate(lines)
         if ln.startswith("## ") and ln[3:].strip() == heading
@@ -178,10 +188,26 @@ def _section_end(lines: list[str], heading_idx: int) -> int:
 
 
 def _current_section_body(raw: str, heading: str) -> str:
-    """The section's current body, extracted the SAME way the read layer renders it
-    (``dashboard._split_sections`` joins the lines between headings and strips) — so
-    the stale-check compares like with like against the body the operator saw."""
-    lines = raw.split("\n")
+    """The section's current body, extracted the SAME way the read layer renders it —
+    so the optimistic stale-check compares like-with-like against the body the operator
+    saw and round-tripped as ``expected_body``.
+
+    Uses ``str.splitlines()`` to match ``dashboard._split_sections`` EXACTLY. This is
+    load-bearing, not cosmetic: ``splitlines()`` breaks on Unicode line separators
+    (``\\u2028``/``\\u2029``/``\\x0b``/``\\x0c``/``\\x85``/…) that a plain ``split("\\n")``
+    keeps literal, and ``read_text`` normalizes ``\\r\\n``/``\\r`` but NOT those — so a
+    State body containing one (paste-prone, free-text section) would render one way and
+    compare another, a permanent unclearable 409. Both layers split the same way →
+    symmetry is structural, not disciplinary. [L1+L2 convergent MEDIUM]
+
+    NB ``_replace_section`` deliberately keeps ``split("\\n")`` (byte-preserving span
+    surgery) so an edit never silently normalizes a separator in a SIBLING section (the
+    felt layer must stay byte-identical). The two functions intentionally use different
+    line models for their different jobs: compare-as-rendered here, write-as-bytes
+    there. They agree on heading LOCATION for all normal input; the lone residual is a
+    pathological separator-adjacent-to-heading (``foo\\u2028## State``), where this
+    finds a body but the surgery 422s — a refusal, never an escape."""
+    lines = raw.splitlines()
     idx = _locate_section(lines, heading)
     end = _section_end(lines, idx)
     return "\n".join(lines[idx + 1 : end]).strip()
@@ -201,6 +227,38 @@ def _replace_section(raw: str, heading: str, new_body: str) -> str:
     new_lines = [""] if content == "" else ["", *content.split("\n"), ""]
     rebuilt = lines[: idx + 1] + new_lines + lines[end:]
     return "\n".join(rebuilt)
+
+
+def _edit_one_section(raw: str, heading: str, expected_lf: str, new_lf: str) -> str:
+    """The shared Class-A section-edit core: break-guard → stale-check → span-replace.
+    Used by BOTH a ``world.md`` config section edit and the neocortex ``State`` edit,
+    so the two write paths share exactly one section-surgery implementation. Both
+    arguments are LF-normalized by the caller. Returns ``raw`` with only the section's
+    body span replaced; raises ``EditError`` (section_break 422 / stale 409)."""
+    # A section body must not itself contain a `## ` line — the read layer would
+    # parse it as a NEW section, silently fragmenting the operator's one panel.
+    # Split with splitlines() — the SAME boundary `dashboard._split_sections` re-parses
+    # with — NOT split("\n"): a Unicode line separator ( /\x0c/\x85/…) keeps a
+    # `## State` literal hidden from split("\n") but the read layer breaks on it and
+    # parses a SECOND `## State`, injecting a duplicate section that bricks State
+    # editing forever (section_ambiguous on every future edit). The guard must see what
+    # the parser will. [codex L3 HIGH — confinement break the compare-side fix missed]
+    if any(ln.startswith("## ") for ln in new_lf.splitlines()):
+        raise EditError(
+            "section_break", 422,
+            "a section body can't contain a '## ' heading line — it would split "
+            "the section into two",
+        )
+    # Stale-check the section body against what the operator saw (per-section
+    # optimistic concurrency): if it changed underneath (a hand-edit, or — for the
+    # continuity file — a harness wrap landed since load), refuse rather than clobber.
+    current = _current_section_body(raw, heading)
+    if current != expected_lf:
+        raise EditError(
+            "stale", 409,
+            f"'## {heading}' changed since you loaded it — reload and re-edit",
+        )
+    return _replace_section(raw, heading, new_lf)
 
 
 def _normalize_file_body(new_body: str) -> str:
@@ -332,8 +390,8 @@ def apply_edit(install_root: Path, req: dict[str, Any], *, now: str | None = Non
     result dict on success; raises ``EditError`` (carrying an HTTP status) on refusal.
 
     Kinds: ``config`` (a world.md section or a whole posture/recency file),
-    ``entity_name`` (the .levain/config.json name), ``undo`` (restore an edit's
-    backup)."""
+    ``state`` (the neocortex ``State`` section — Slice 2b), ``entity_name`` (the
+    .levain/config.json name), ``undo`` (restore an edit's backup)."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
@@ -342,6 +400,8 @@ def apply_edit(install_root: Path, req: dict[str, Any], *, now: str | None = Non
     with _WRITE_LOCK:
         if kind == "config":
             return _apply_config_edit(install_root, req, now)
+        if kind == "state":
+            return _apply_state_edit(install_root, req, now)
         if kind == "entity_name":
             return _apply_entity_name(install_root, req, now)
         if kind == "undo":
@@ -392,22 +452,9 @@ def _apply_config_edit(install_root: Path, req: dict[str, Any], now: str | None)
     new_lf = _to_lf(new_body)
 
     if heading is not None:
-        # A section body must not itself contain a `## ` line — the read layer would
-        # parse it as a NEW section, silently fragmenting the operator's one panel.
-        if any(ln.startswith("## ") for ln in new_lf.split("\n")):
-            raise EditError(
-                "section_break", 422,
-                "a section body can't contain a '## ' heading line — it would split "
-                "the section into two",
-            )
-        # Section edit (world.md): stale-check the section body, replace its span.
-        current = _current_section_body(raw, heading)
-        if current != exp:
-            raise EditError(
-                "stale", 409,
-                f"'## {heading}' changed since you loaded it — reload and re-edit",
-            )
-        new_text = _replace_section(raw, heading, new_lf)
+        # Section edit (world.md): the shared Class-A section core (break-guard,
+        # stale-check, span-replace) — the same path the State write uses.
+        new_text = _edit_one_section(raw, heading, exp, new_lf)
     else:
         # Whole-file edit (posture.md / recency_directives.md): stale-check the whole
         # file (both sides LF-normalized).
@@ -421,6 +468,73 @@ def _apply_config_edit(install_root: Path, req: dict[str, Any], now: str | None)
     return _commit(
         install_root, source=source, heading=heading, path=path,
         prior_text=raw, new_text=new_text, action="edit", kind="config", now=now,
+    )
+
+
+def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+    """Apply a Class-A edit to the neocortex **State** section — the ONE operator-
+    editable section of the consolidated-cognition file. State is live-state
+    (last-writer-wins; flow's own "quick update" treats it as a direct targeted edit,
+    no consolidate needed) — an INPUT to cognition, never a conclusion the consolidate
+    produced (scope §1). Confined two ways, by construction:
+
+    1. **Target.** Always the install's continuity file, derived from
+       ``LEVAIN_CONTINUITY_REL`` — NEVER a request-supplied path. A ``state`` edit
+       structurally cannot reach a seed file, and ``_resolve_inside`` re-confines it
+       under the install root regardless.
+    2. **Section.** The heading must be the lone Class-A section per the read layer's
+       OWN rule (``_section_edit_class``). The five felt-layer sections (Patterns /
+       Decisions / Context / Understanding / Active Threads) are Class C → refused 403
+       here, server-side, no matter what the client claims. Re-deriving from the read
+       rule (not a hardcoded name) means the writable set provably matches what the
+       dashboard tags editable.
+
+    **Arrow-of-time (the Slice-2b design frame).** A State write is temporal/causal,
+    not declarative plumbing. Its reversibility net is the SAME hash-guarded undo every
+    Class-A edit gets — and that guard is exactly right here: ``_apply_undo`` undoes a
+    State edit ONLY while it is still the file's latest change, so once the harness
+    wraps (rewrites the continuity file) the undo cleanly 409s instead of FORKING the
+    thread (restoring an old State into a post-wrap file the linear history never held).
+    Whole-consolidation time-travel/restore is a separate anneal-backed slice; this is
+    the per-edit net, and it refuses to reverse across a consolidation boundary."""
+    from levain.dashboard import (  # lazy: avoid the writes↔dashboard import cycle
+        CLASS_A,
+        LEVAIN_CONTINUITY_REL,
+        STATE_HEADING,
+        _section_edit_class,
+    )
+
+    heading = _require_str(req, "heading")
+    if _section_edit_class(heading) != CLASS_A:
+        raise EditError(
+            "not_editable", 403,
+            f"the {heading!r} section is consolidated cognition (Class C) — the "
+            "operator governs inputs, never the entity's conclusions; only the "
+            f"{STATE_HEADING!r} section is operator-editable",
+        )
+    expected = _require_str(req, "expected_body")
+    new_body = _require_str(req, "new_body")
+    if len(new_body.encode("utf-8")) > MAX_BODY_BYTES:
+        raise EditError("too_large", 413, f"body exceeds {MAX_BODY_BYTES} bytes")
+
+    # The target is the continuity file, by construction (never the request).
+    source = str(Path(*LEVAIN_CONTINUITY_REL))
+    path = _resolve_inside(install_root, source)
+    if not path.is_file():
+        raise EditError(
+            "not_found", 404,
+            "no neocortex continuity file yet — the entity hasn't wrapped a session, "
+            f"so there is no {heading!r} to edit",
+        )
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:  # ValueError covers UnicodeDecodeError
+        raise EditError("unreadable", 422, f"cannot read the continuity file: {exc}") from exc
+
+    new_text = _edit_one_section(raw, heading, _to_lf(expected), _to_lf(new_body))
+    return _commit(
+        install_root, source=source, heading=heading, path=path,
+        prior_text=raw, new_text=new_text, action="edit", kind="state", now=now,
     )
 
 
@@ -494,7 +608,7 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
         raise EditError(
             "stale", 409,
             "only the most-recent edit to a file can be undone — it has changed since "
-            "(a newer edit landed, or it was already undone)",
+            "(a newer edit or a consolidation/wrap landed, or it was already undone)",
         )
     prior_text = current_bytes.decode("utf-8") if current_bytes is not None else None
 
@@ -545,10 +659,33 @@ def _commit(
     kind: str,
     now: str | None,
 ) -> dict[str, Any]:
-    """Shared tail for every mutating edit: mint an id, back up the prior content,
-    append the audit record, then atomically write the new content. The backup +
-    audit land BEFORE the write so a crash can't leave a changed file with no record
-    of how to reverse it."""
+    """Shared tail for every mutating edit: CAS-check the live file, mint an id, back
+    up the prior content, append the audit record, then atomically write the new
+    content. The backup + audit land BEFORE the write so a crash can't leave a changed
+    file with no record of how to reverse it."""
+    # Cross-WRITER compare-and-swap: re-read the live file (the SAME way the caller
+    # read `prior_text` — read_text, universal-newline) and refuse if it changed since.
+    # `_WRITE_LOCK` only serializes Levain's own threads; the continuity file is also
+    # written by the harness CONSOLIDATE in ANOTHER process, so a wrap landing between
+    # the caller's read and this write would otherwise be silently CLOBBERED by our
+    # stale snapshot [codex L3 HIGH]. This CAS fails safe (refuse, no clobber, before
+    # any backup/audit so a refusal leaves no trace) and the refusal happens here, just
+    # before the mutation, shrinking the window to the atomic os.replace. For the seed
+    # files (no external writer) the live content always equals `prior_text` under the
+    # lock, so this never false-fires there. RESIDUAL: a sub-replace race remains — an
+    # airtight guarantee needs a continuity lock SHARED with anneal's save path (an
+    # anneal-coordination follow-up, deferred with the snapshot/restore slice);
+    # reversibility (backup + audit) is the net until then.
+    try:
+        live = path.read_text(encoding="utf-8") if path.is_file() else None
+    except (OSError, ValueError):
+        live = None  # unreadable now (e.g. a wrap mid-rename) → treat as drifted
+    if live != prior_text:
+        raise EditError(
+            "stale", 409,
+            f"{source!r} changed on disk since you loaded it (a newer edit or a "
+            "consolidation/wrap landed) — reload and re-edit",
+        )
     edit_id = uuid.uuid4().hex[:12]
     backup_rel = _backup(install_root, source, prior_text, edit_id)
     record = {

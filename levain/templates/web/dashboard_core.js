@@ -414,6 +414,12 @@
     const p = panel(entry);
     if (!sec) { p.appendChild(el("p", "empty", "—")); return p; }
     p.appendChild(el("pre", "section", sec.body || ""));
+    if (isEditablePanel(entry)) {
+      // State (Class-A neocortex section) is editable in Slice 2b via the SAME
+      // affordance config panels use — mark + stash; finalizePanels appends the bar.
+      p.dataset.editable = "1";
+      p._levainEdit = { entry, doc: sec };
+    }
     return p;
   }
 
@@ -421,7 +427,7 @@
     const p = panel(entry);
     if (!doc) { p.appendChild(el("p", "empty", "—")); return p; }
     p.appendChild(el("pre", "section", doc.body || ""));
-    if (isEditableConfig(entry)) {
+    if (isEditablePanel(entry)) {
       // Mark + stash; the edit bar is appended at the panel BOTTOM in finalizePanels
       // (a consistent position, after the pbody/expander — never wraps in the header).
       p.dataset.editable = "1";
@@ -430,13 +436,14 @@
     return p;
   }
 
-  // Slice 2a: the only writable surface turned on here is a Class-A CONFIG panel
-  // (world.md section / posture / recency). State is Class-A too but kind="section"
-  // — its write path is Slice 2b — so the gate is kind==="config", and only when a
-  // `commit` transport exists (read-only port → no affordance). origin.md +
-  // constitution are Class C → no match → stay glass.
-  function isEditableConfig(entry) {
-    return !!commit && entry.kind === "config" && entry.edit_class === "A" && !!entry.source;
+  // The writable surfaces: a Class-A CONFIG panel (world.md section / posture /
+  // recency — Slice 2a) OR a Class-A SECTION panel (the neocortex State section —
+  // Slice 2b). Both need `commit` (read-only port → no affordance), edit_class "A",
+  // and a `source` write-address. origin.md + constitution + the five felt-layer
+  // sections are Class C → no match → stay glass.
+  function isEditablePanel(entry) {
+    return !!commit && entry.edit_class === "A" && !!entry.source &&
+      (entry.kind === "config" || entry.kind === "section");
   }
 
   // The edit affordance is a small METAL button on its own row under the header;
@@ -487,8 +494,11 @@
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
       // expected_body is exactly the body the operator saw → the server's per-section
       // stale-check rejects (409) if the file changed underneath; new_body is verbatim.
+      // A section panel writes the neocortex State section (kind "state"); a config
+      // panel writes a seed/config file (kind "config"). Each kind self-confines to
+      // its own target set server-side.
       const res = await commit({
-        kind: "config",
+        kind: entry.kind === "section" ? "state" : "config",
         source: entry.source,
         heading: entry.heading != null ? entry.heading : null,
         expected_body: doc.body || "",
