@@ -552,6 +552,25 @@ class TestSlice15Surfaces:
             if e["kind"] in ("config", "section"):
                 assert "ref" in e
 
+    def test_section_panels_carry_state_write_address(self, tmp_path: Path) -> None:
+        # Slice 2b: section panels carry source + heading (the write-address) so the
+        # Class-A State section is editable through the governed seam; every section
+        # panel's source is the continuity file, and only State is edit_class A.
+        root = _make_levain_install(tmp_path)
+        from levain.dashboard import SubstrateSource
+
+        v = SubstrateSource.local(root).build()
+        sect_panels = [e for e in v.layout() if e["kind"] == "section"]
+        assert sect_panels, "expected section panels"
+        cont_rel = str(Path(".levain") / "memory.continuity.md")
+        for e in sect_panels:
+            assert e["source"] == cont_rel
+            assert e["heading"] == e["title"]
+        state_panel = next(e for e in sect_panels if e["heading"] == "State")
+        assert state_panel["edit_class"] == "A"
+        felt = [e for e in sect_panels if e["heading"] != "State"]
+        assert felt and all(e["edit_class"] == "C" for e in felt)
+
     def test_to_dict_has_15_surfaces_and_is_serializable(self, tmp_path: Path) -> None:
         import json
 

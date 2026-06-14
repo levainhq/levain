@@ -86,6 +86,26 @@ CLASS_A = "A"
 CLASS_B = "B"
 CLASS_C = "C"
 
+# The ONE neocortex section the operator directly edits (Class A). It is live-state
+# (last-writer-wins; flow's own "quick update" discipline treats it as a direct
+# targeted edit, no consolidate needed) — an INPUT to cognition, not a conclusion the
+# consolidate produced. Every other section (Patterns / Decisions / Context /
+# Understanding / Active Threads) is the felt layer the consolidate single-writer owns
+# → Class C, read-only. This name is the single source of truth for that split; both
+# the read layer (`_parse_sections`) and the write layer (`writes._apply_state_edit`)
+# derive from `_section_edit_class` below, so they can never drift apart.
+STATE_HEADING = "State"
+
+
+def _section_edit_class(name: str) -> str:
+    """The edit-class of a neocortex section, by name. ``State`` is the lone Class-A
+    (operator-editable live-state) section; every other section is Class-C (the
+    consolidate owns it — read-only). The one rule, used by BOTH the read render and
+    the Slice-2b write boundary, so the writable set provably matches what the
+    dashboard tags editable (``structural_invariants_beat_discipline`` at the
+    edit-class layer)."""
+    return CLASS_A if name == STATE_HEADING else CLASS_C
+
 
 # ---------------------------------------------------------------------------
 # Path resolution — derive the four sibling stores from the episodic db stem,
@@ -452,10 +472,18 @@ class SubstrateView:
             {"kind": "crystals", "zone": ZONE_MIND, "edit_class": CLASS_C,
              "title": f"Crystallized patterns ({len(self.crystal_index)})"}
         )
+        # Section panels carry the same write-address pair config panels do
+        # (``source`` + ``heading``) so a Class-A section (State) can be edited
+        # through the governed seam. ``source`` is the continuity file's install-
+        # relative path (the convention constant — matches writes._apply_state_edit's
+        # own target derivation); the read-only Class-C sections carry it too
+        # (harmless — the frontend only opens an affordance on edit_class "A").
+        _cont_src = str(Path(*LEVAIN_CONTINUITY_REL))
         for i, s in enumerate(self.sections):
             panels.append(
                 {"kind": "section", "zone": s.zone, "edit_class": s.edit_class,
-                 "title": s.heading, "ref": i}
+                 "title": s.heading, "ref": i,
+                 "source": _cont_src, "heading": s.heading}
             )
         panels.append(
             {"kind": "wraps", "zone": ZONE_MIND, "edit_class": CLASS_C,
@@ -549,8 +577,8 @@ def _parse_sections(markdown: str, wanted: tuple[str, ...]) -> list[Section]:
     out: list[Section] = []
     for name in wanted:
         if name in blocks:
-            edit_class = CLASS_A if name == "State" else CLASS_C
-            out.append(Section(heading=name, body=blocks[name], edit_class=edit_class))
+            out.append(Section(heading=name, body=blocks[name],
+                               edit_class=_section_edit_class(name)))
     return out
 
 
@@ -579,6 +607,14 @@ def _h1_name_suffix(markdown: str) -> str | None:
 # seed (which "names nothing"). The legacy H1-suffix read stays as a FALLBACK so an
 # install that named its entity via the old H1 form still surfaces it.
 LEVAIN_CONFIG_REL = (".levain", "config.json")
+
+# The neocortex continuity file's path RELATIVE to a Levain install root — the
+# convention ``SubstrateSource.local`` lays down (anneal store at
+# ``<root>/.levain/memory.db`` → continuity at ``<root>/.levain/memory.continuity.md``).
+# The Slice-2b State write derives its target from this same constant (NOT from a
+# request-supplied path), so the write target and the layout-emitted section ``source``
+# can never disagree, and a ``state`` edit is structurally confined to this one file.
+LEVAIN_CONTINUITY_REL = (".levain", "memory.continuity.md")
 
 
 def _read_levain_config(install_root: Path) -> dict[str, Any]:

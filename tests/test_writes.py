@@ -1,9 +1,10 @@
-"""Tests for levain.writes — the Slice-2a governed Class-A write layer.
+"""Tests for levain.writes — the governed Class-A write layer (Slice 2a + 2b).
 
 The enforcement boundary (Class-C / unknown / path-escape refusal), the markdown
 section surgery (preserve everything outside the edited span), the optimistic
 stale-check, reversibility (backup / audit / undo), the entity-name config write,
-and untrusted-input validation — exercised against a real temp install (no mocks).
+the Slice-2b neocortex ``State`` edit (with its arrow-of-time undo-across-wrap
+refusal), and untrusted-input validation — exercised against a real temp install.
 """
 
 from __future__ import annotations
@@ -16,9 +17,12 @@ import pytest
 from levain.dashboard import (
     CLASS_A,
     CLASS_C,
+    STATE_HEADING,
     SubstrateSource,
     _read_config_docs,
     _read_levain_config,
+    _section_edit_class,
+    _split_sections,
 )
 from levain.writes import (
     EditError,
@@ -51,6 +55,56 @@ You are a new entity, not a copy of anything.
 POSTURE = "Partnership brain. Slow is fast.\n"
 RECENCY = "Do not gatekeep.\n"
 CONSTITUTION = "# Constitution\n\nUniversal core.\n"
+
+# A FLOW_SCHEMA neocortex file: State (Class A) + five Class-C felt-layer sections.
+# Distinctive bodies so a State edit's "touched only State" claim is byte-checkable.
+CONTINUITY = """# flow — Memory
+
+## State
+
+**Current focus: Slice 2b.** Taper ~75mg.
+
+## Active Threads
+
+- Levain (primary bet) — Slice 2b.
+
+## Patterns
+
+{{apparatus: cross_substrate_review | 4x — codex non-replaceable.}}
+
+## Decisions
+
+[decided] State is the lone Class-A neocortex section.
+
+## Context
+
+This session built the governed State write.
+
+## Understanding
+
+Phill is a paradox-holding ensemble mind.
+"""
+
+_CONTINUITY_REL = Path(".levain") / "memory.continuity.md"
+
+
+def _add_continuity(install: Path, text: str = CONTINUITY) -> Path:
+    """Drop a neocortex continuity file into the install (the convention path the
+    write layer derives its State target from)."""
+    p = install / _CONTINUITY_REL
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _section_body(text: str, heading: str) -> str:
+    """The body the read layer would render for ``heading`` — i.e. exactly what the
+    operator sees and round-trips as ``expected_body`` (proves read/write symmetry)."""
+    return dict(_split_sections(text))[heading]
+
+
+def _state_req(expected: str, new: str, heading: str = STATE_HEADING) -> dict:
+    return {"kind": "state", "heading": heading,
+            "expected_body": expected, "new_body": new}
 
 
 def _make_install(tmp_path: Path) -> Path:
@@ -442,3 +496,179 @@ class TestApparatusFixes:
         with pytest.raises(EditError) as ei:
             apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
         assert ei.value.code == "stale"
+
+
+# --- Slice 2b: the neocortex State edit -----------------------------------
+
+class TestStateEdit:
+    """Class-A State write: the lone operator-editable section of the consolidated-
+    cognition file. The felt layer (five Class-C sections) is refused + provably
+    untouched; the arrow-of-time net (undo refuses across a wrap) holds."""
+
+    def test_section_edit_class_rule(self) -> None:
+        # The single source of truth both read + write derive from.
+        assert _section_edit_class("State") == CLASS_A
+        for felt in ("Active Threads", "Patterns", "Decisions", "Context", "Understanding"):
+            assert _section_edit_class(felt) == CLASS_C
+
+    def test_edit_state_happy_path_touches_only_state(self, install: Path) -> None:
+        cont = _add_continuity(install)
+        before = dict(_split_sections(CONTINUITY))
+        res = apply_edit(install, _state_req(before["State"], "**New focus.** Taper 73mg."))
+        assert res["ok"] and res["heading"] == "State"
+        after = dict(_split_sections(cont.read_text(encoding="utf-8")))
+        assert after["State"] == "**New focus.** Taper 73mg."
+        # every felt-layer section is byte-identical — the write touched only State.
+        for felt in ("Active Threads", "Patterns", "Decisions", "Context", "Understanding"):
+            assert after[felt] == before[felt], f"{felt} must be untouched"
+        # and the H1/preamble + section ORDER outside State are preserved verbatim:
+        # only the State body span differs from the original file.
+        rebuilt = CONTINUITY.replace(before["State"], "**New focus.** Taper 73mg.")
+        assert cont.read_text(encoding="utf-8") == rebuilt
+
+    def test_audit_records_kind_state(self, install: Path) -> None:
+        _add_continuity(install)
+        apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "X."))
+        rec = recent_edits(install)[0]
+        assert rec["kind"] == "state"
+        assert rec["heading"] == "State"
+        assert rec["source"] == str(_CONTINUITY_REL)
+        assert rec["backup"] is not None  # the prior State is recoverable
+
+    @pytest.mark.parametrize(
+        "felt", ["Active Threads", "Patterns", "Decisions", "Context", "Understanding"]
+    )
+    def test_refuses_felt_layer_sections(self, install: Path, felt: str) -> None:
+        cont = _add_continuity(install)
+        original = cont.read_text(encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(_section_body(CONTINUITY, felt), "hacked", heading=felt))
+        assert ei.value.code == "not_editable" and ei.value.http_status == 403
+        assert cont.read_text(encoding="utf-8") == original  # nothing written
+
+    def test_stale_check_after_wrap(self, install: Path) -> None:
+        cont = _add_continuity(install)
+        stale_expected = _section_body(CONTINUITY, "State")
+        # a harness wrap rewrote State since the operator loaded the page
+        cont.write_text(CONTINUITY.replace(stale_expected, "**Wrapped.** newer."), encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(stale_expected, "operator's edit"))
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+
+    def test_undo_restores_state_and_preserves_felt_layer(self, install: Path) -> None:
+        cont = _add_continuity(install)
+        before = dict(_split_sections(CONTINUITY))
+        r = apply_edit(install, _state_req(before["State"], "edited."))
+        res = apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+        assert res["ok"]
+        after = dict(_split_sections(cont.read_text(encoding="utf-8")))
+        assert after["State"] == before["State"]  # restored
+        assert after["Understanding"] == before["Understanding"]
+
+    def test_undo_refuses_across_wrap_no_thread_fork(self, install: Path) -> None:
+        # The arrow-of-time guard: once the harness wraps (rewrites the continuity
+        # file) AFTER a State edit, undo refuses — it will not restore an old State
+        # into a post-wrap file (a thread the linear history never held).
+        cont = _add_continuity(install)
+        r = apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "edited state."))
+        wrapped = (cont.read_text(encoding="utf-8")
+                   .replace("Phill is a paradox-holding ensemble mind.",
+                            "Phill is a paradox-holding ensemble mind, re-consolidated."))
+        cont.write_text(wrapped, encoding="utf-8")  # the consolidate touched the felt layer
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        # the wrap's consolidation stands — undo did not fork it
+        assert "re-consolidated." in cont.read_text(encoding="utf-8")
+
+    def test_section_break_guard(self, install: Path) -> None:
+        _add_continuity(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"),
+                                           "ok\n## Patterns\ninjected"))
+        assert ei.value.code == "section_break" and ei.value.http_status == 422
+
+    def test_not_found_when_no_continuity(self, install: Path) -> None:
+        # no continuity file yet (entity hasn't wrapped) → 404, not a crash
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req("", "first state"))
+        assert ei.value.code == "not_found" and ei.value.http_status == 404
+
+    def test_state_target_ignores_request_source(self, install: Path) -> None:
+        # a `state` edit derives its target from the convention constant, NOT the
+        # request — a crafted `source` cannot redirect the write to a seed file.
+        cont = _add_continuity(install)
+        seed_before = (install / "seed" / "origin.md").read_text(encoding="utf-8")
+        req = _state_req(_section_body(CONTINUITY, "State"), "edited.")
+        req["source"] = "seed/origin.md"  # attacker-supplied — must be ignored
+        res = apply_edit(install, req)
+        assert res["ok"] and res["source"] == str(_CONTINUITY_REL)
+        # origin.md untouched; the State write landed in the continuity file
+        assert (install / "seed" / "origin.md").read_text(encoding="utf-8") == seed_before
+        assert "edited." in dict(_split_sections(cont.read_text(encoding="utf-8")))["State"]
+
+    def test_unicode_line_separator_round_trips(self, install: Path) -> None:
+        # [L1+L2 convergent MEDIUM] A State body with a Unicode LINE SEPARATOR
+        # ( ) — which the read layer's splitlines() breaks on but read_text does
+        # NOT normalize. The stale-check must accept the operator-visible (rendered)
+        # body, NOT 409 forever; and the edit must not normalize a separator in a
+        # sibling FELT section (byte-preserving surgery).
+        text = (
+            "# M\n\n## State\n\nline A line B\n\n"
+            "## Patterns\n\nfelt layer\n\n## Understanding\n\nmind.\n"
+        )
+        cont = _add_continuity(install, text)
+        # what the operator sees == what the write compares (both splitlines now)
+        seen = _section_body(text, "State")
+        assert seen == "line A\nline B"  # the rendered body, separator folded
+        res = apply_edit(install, _state_req(seen, "edited."))
+        assert res["ok"]  # would have been a permanent 409 before the fix
+        on_disk = cont.read_text(encoding="utf-8")
+        assert dict(_split_sections(on_disk))["State"] == "edited."
+        # the sibling felt section's   survives byte-for-byte (surgery = split"\n")
+        assert "felt layer" in on_disk
+
+    @pytest.mark.parametrize("sep", [" ", " ", "\x0c", "\x85"])
+    def test_section_break_guard_catches_unicode_separator_injection(
+        self, install: Path, sep: str
+    ) -> None:
+        # [codex L3 HIGH] A new_body hiding a `## State` behind a Unicode line
+        # separator the read parser breaks on (but split("\n") doesn't) would inject a
+        # DUPLICATE section and brick State editing. The guard must use splitlines() —
+        # the same boundary the read layer re-parses with — and refuse it.
+        cont = _add_continuity(install)
+        original = cont.read_text(encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"),
+                                           f"ok{sep}## State{sep}shadow"))
+        assert ei.value.code == "section_break" and ei.value.http_status == 422
+        assert cont.read_text(encoding="utf-8") == original  # nothing written
+
+    def test_commit_cas_refuses_external_wrap_no_clobber(
+        self, install: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # [codex L3 HIGH] A harness consolidate (another process) rewrites the
+        # continuity file BETWEEN Levain's read and its write; _WRITE_LOCK (threading)
+        # can't see it. The _commit CAS re-read must refuse, not clobber the wrap with
+        # Levain's stale snapshot.
+        import levain.writes as W
+
+        cont = _add_continuity(install)
+        wrapped = CONTINUITY.replace(
+            "Phill is a paradox-holding ensemble mind.",
+            "Phill is a paradox-holding ensemble mind, re-consolidated.",
+        )
+        real = W._edit_one_section
+
+        def _inject_wrap(raw: str, heading: str, exp: str, new: str) -> str:
+            cont.write_text(wrapped, encoding="utf-8")  # wrap lands after read, before CAS
+            return real(raw, heading, exp, new)
+
+        monkeypatch.setattr(W, "_edit_one_section", _inject_wrap)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "my edit"))
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        # the wrap's consolidation STANDS — Levain refused, did not clobber it
+        assert "re-consolidated." in cont.read_text(encoding="utf-8")
+        # a refused edit leaves no spurious audit/backup record (CAS is pre-audit)
+        assert recent_edits(install) == []
