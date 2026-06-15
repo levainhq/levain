@@ -644,3 +644,46 @@ class TestWriteBoundary:
                 for _ in range(_MAX_INFLIGHT):
                     httpd.request_gate.release()
         assert status == 503
+
+
+# --- Slice 2b-ii: the Class-B verb route (spores + episode tombstone) --------
+
+def _seed_anneal(src: SubstrateSource) -> tuple[str, str]:
+    """Plant an open spore + an episode in the install's `.levain/` anneal store so
+    the Class-B verb route has real lifecycle data to act on."""
+    from anneal_memory import Store
+    from anneal_memory.spores import SporeStore
+
+    root = src.install_root
+    s = SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="ship 2b-ii")
+    with Store(str(root / ".levain" / "memory.db")) as store:
+        ep = store.record("built the writable handle", "observation")
+    return str(s["id"]), ep.id
+
+
+class TestClassBRoute:
+    def test_spore_descend_confirm_flow(self, tmp_path: Path) -> None:
+        # the destructive verb is refused without confirm, then succeeds with it —
+        # the per-write confirm gate enforced end-to-end through the HTTP boundary.
+        src = _make_full_install(tmp_path)
+        sid, _eid = _seed_anneal(src)
+        with _serving(src) as (base, _httpd):
+            s1, b1 = _post(base + "/edit", {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done",
+            })
+            s2, b2 = _post(base + "/edit", {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+            })
+        assert s1 == 409 and b1["error"] == "confirm_required"
+        assert s2 == 200 and b2["ok"] is True
+
+    def test_spore_touch_and_episode_tombstone(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        sid, eid = _seed_anneal(src)
+        with _serving(src) as (base, _httpd):
+            st, bt = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid})
+            se, be = _post(base + "/edit", {
+                "kind": "episode_tombstone", "episode_id": eid, "confirm": True,
+            })
+        assert st == 200 and bt["action"] == "touch"
+        assert se == 200 and be["action"] == "tombstone"

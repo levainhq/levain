@@ -364,11 +364,13 @@
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "no open prospective loops")); return p; }
+    const verbs = isVerbPanel(entry);
     for (const s of list) {
       const row = el("div", "row");
       if (s.tier) row.appendChild(el("span", "tier", `[${s.tier}]`));
       row.appendChild(el("span", "clause", s.text));
       if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+      if (verbs && s.id) row.appendChild(buildSporeVerbs(s));
       p.appendChild(row);
     }
     return p;
@@ -380,6 +382,7 @@
     const err = tierErr(view, "episodes");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "no episodes yet")); return p; }
+    const verbs = isVerbPanel(entry);
     for (const e of list) {
       const row = el("div", "row");
       if (e.type) row.appendChild(el("span", "etype", e.type));
@@ -388,25 +391,46 @@
         row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
       }
       row.appendChild(el("span", "muted", datePart(e.timestamp)));
+      if (verbs && e.id) row.appendChild(buildEpisodeVerbs(e));
       p.appendChild(row);
     }
     return p;
   }
 
+  // Projection history (Slice 2b-ii / spore-093 v0). Each wrap is a RE-PROJECTION of
+  // the continuity from the moving substrate — a regeneration, not a saved version.
+  // The teaching frame + the per-wrap size delta make the projection visibly REGENERATE;
+  // the deliberate ABSENCE of a restore button is the lesson (you can't roll a
+  // projection back over a substrate that has moved on — govern the inputs instead).
+  // aesthetic_encodes_the_relationship_model. (Full content/lineage `as-of` view = v1.)
   function renderWraps(entry, view) {
     const list = view.wraps || [];
     const p = panel(entry);
     const err = tierErr(view, "wraps");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (list.length === 0) { p.appendChild(el("p", "empty", "no wraps yet")); return p; }
-    for (const w of list) {
+    p.appendChild(el("p", "note",
+      "each wrap re-projects this continuity from the substrate — regenerations, not " +
+      "saved versions. no restore: to steer cognition, govern the inputs (Operate)."));
+    list.forEach((w, i) => {
       const row = el("div", "row");
       row.appendChild(el("span", "tier", datePart(w.wrapped_at)));
       row.appendChild(el("span", "clause",
         `${fmt(num(w.graduations_validated))}↑ / ${fmt(num(w.graduations_demoted))}↓ grad · ` +
         `+${fmt(num(w.associations_formed))} links · ${fmt(num(w.continuity_chars))} chars`));
+      // digest-delta: how much the projection grew/shrank vs the previous (older)
+      // regeneration — list is newest-first, so the older wrap is the next index.
+      const older = list[i + 1];
+      if (older) {
+        const d = num(w.continuity_chars) - num(older.continuity_chars);
+        const sign = d > 0 ? "+" : d < 0 ? "−" : "±";
+        row.appendChild(el("span", "delta" + (d > 0 ? " up" : d < 0 ? " down" : ""),
+          `Δ ${sign}${fmt(Math.abs(d))}`));
+      } else {
+        row.appendChild(el("span", "muted", "first projection"));
+      }
       p.appendChild(row);
-    }
+    });
     return p;
   }
 
@@ -444,6 +468,15 @@
   function isEditablePanel(entry) {
     return !!commit && entry.edit_class === "A" && !!entry.source &&
       (entry.kind === "config" || entry.kind === "section");
+  }
+
+  // A Class-B panel (spores / episodes — the operator's INPUT layer) gets
+  // verb affordances when a write transport is present (read-only port → none).
+  // The verbs are anneal-validated lifecycle ops, never raw edits; a DESTRUCTIVE
+  // one (resolving a spore / tombstoning an episode) sends confirm:true — and the
+  // server enforces that too, so the UI confirm is the affordance, not the gate.
+  function isVerbPanel(entry) {
+    return !!commit && entry.edit_class === "B";
   }
 
   // The edit affordance is a small METAL button on its own row under the header;
@@ -511,10 +544,129 @@
     });
   }
 
+  // ---- Class-B verb affordances (Slice 2b-ii) ----
+  // Spores + episodes are the operator's INPUTS, mutated through anneal's validated
+  // verbs (never raw writes). A metal button per row; destructive verbs open a small
+  // confirm/kind form that sends confirm:true (the server requires it regardless).
+
+  function verbBtn(label, title, onClick) {
+    const b = el("button", "verb-btn", label);
+    b.type = "button";
+    if (title) b.title = title;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function verbErr(wrap, res) {
+    let m = wrap.querySelector(".edit-msg");
+    if (!m) { m = el("span", "edit-msg", ""); wrap.appendChild(m); }
+    m.className = "edit-msg err";
+    m.textContent = (res && (res.message || res.error)) || "failed";
+  }
+
+  function buildSporeVerbs(s) {
+    const wrap = el("span", "verb-actions");
+    // touch — non-destructive (engage: seen=today, clears an elapsed alarm)
+    wrap.appendChild(verbBtn("touch", "mark seen — reset its clock", async (ev) => {
+      const b = ev.currentTarget; b.disabled = true;
+      const res = await commit({ kind: "spore_touch", spore_id: s.id });
+      if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
+      b.disabled = false;
+      verbErr(wrap, res);
+    }));
+    // compost (descend) / promote (ascend) — destructive; kind comes from the
+    // spore's own type taxonomy (server-emitted, so the UI can't offer an invalid kind).
+    if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
+      wrap.appendChild(verbBtn("compost", "resolve this loop downward", () =>
+        openResolveForm(wrap, "spore_descend", "compost", s, s.descend_kinds, false)));
+    }
+    if (Array.isArray(s.ascend_kinds) && s.ascend_kinds.length) {
+      wrap.appendChild(verbBtn("promote", "transmute into memory / project", () =>
+        openResolveForm(wrap, "spore_ascend", "promote", s, s.ascend_kinds, true)));
+    }
+    return wrap;
+  }
+
+  // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a
+  // confirm/cancel pair. The trigger buttons hide while it's open; confirm sends
+  // confirm:true. One form per row at a time.
+  function openResolveForm(host, kind, label, s, kinds, needsRef) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();  // a prior touch error
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form");
+    const sel = el("select", "verb-kind");
+    for (const k of kinds) { const o = el("option", null, k); o.value = k; sel.appendChild(o); }
+    form.appendChild(sel);
+    let refInput = null;
+    if (needsRef) {
+      refInput = el("input", "verb-ref");
+      refInput.type = "text"; refInput.placeholder = "what it became (ref)"; refInput.maxLength = 200;
+      form.appendChild(refInput);
+    }
+    const go = el("button", "verb-confirm", label);
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    form.append(go, cancel, msg);
+    host.appendChild(form);
+    (needsRef ? refInput : sel).focus();
+
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    go.addEventListener("click", async () => {
+      const req = { kind: kind, spore_id: s.id, spore_kind: sel.value, confirm: true };
+      if (needsRef) {
+        const ref = refInput.value.trim();
+        if (!ref) { msg.className = "edit-msg err"; msg.textContent = "a ref is required"; return; }
+        req.ref = ref;
+      }
+      go.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit(req);
+      if (res && res.ok) return;  // re-rendered
+      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      go.disabled = false; cancel.disabled = false;
+    });
+  }
+
+  function buildEpisodeVerbs(e) {
+    const wrap = el("span", "verb-actions");
+    wrap.appendChild(verbBtn("tombstone", "delete this input — the consolidate re-derives without it", () =>
+      openTombstoneConfirm(wrap, e)));
+    return wrap;
+  }
+
+  function openTombstoneConfirm(host, e) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();  // a prior touch error
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form");
+    const go = el("button", "verb-confirm danger", "confirm tombstone");
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    form.append(go, cancel, msg);
+    host.appendChild(form);
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    go.addEventListener("click", async () => {
+      go.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit({ kind: "episode_tombstone", episode_id: e.id, confirm: true });
+      if (res && res.ok) return;  // re-rendered
+      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      go.disabled = false; cancel.disabled = false;
+    });
+  }
+
   // The edit log + undo surface (Operate zone). Offers undo only on the most-recent
-  // non-undo edit PER SOURCE (a safe stack-pop — undoing an older edit would discard
-  // newer ones; that's a Slice-2b time-travel concern). Undo restores that edit's
-  // backup via the same governed commit transport.
+  // non-undo, file-undoable edit PER SOURCE (a safe stack-pop — undoing an older edit
+  // would discard newer ones; that's a Slice-2b time-travel concern). Verb-mediated
+  // records (undoable === false) show in the log but get no undo (anneal owns their
+  // reversibility). Undo restores that edit's backup via the same commit transport.
   function renderEdits(entry, view) {
     const list = view.recent_edits || [];
     const p = panel(entry);
@@ -527,7 +679,7 @@
       row.appendChild(el("span", "edit-act" + (isUndo ? " undo" : ""), isUndo ? "undo" : (e.action || "edit")));
       const label = String(e.source || "") + (e.heading ? " · " + e.heading : "");
       row.appendChild(el("span", "clause", label));
-      if (commit && !isUndo && e.id && !claimed.has(e.source)) {
+      if (commit && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
         const u = el("button", "undo-btn", "undo");
         u.type = "button";
         u.addEventListener("click", async () => {

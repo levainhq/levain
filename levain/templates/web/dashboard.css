@@ -387,6 +387,10 @@
   .err::before { content: "▲ "; }
   .empty { color: var(--faint); font-style: italic; font-size: 12px; }
   .note { color: var(--dim); font-size: 10.5px; margin-top: 9px; letter-spacing: .03em; }
+  /* projection-history size delta (spore-093 v0): the projection regenerating */
+  .delta { flex: 0 0 auto; font: 700 10px/1.4 var(--mono); letter-spacing: .02em; color: var(--faint); }
+  .delta.up { color: var(--accent); }
+  .delta.down { color: var(--hot); }
 
   /* ── the cognition trace — phosphor oscilloscope over real wrap vitals ──── */
   svg.scope {
@@ -598,3 +602,49 @@
   .undo-btn:hover { color: #06120c; background: var(--hot); }
   .undo-btn:active { transform: translateY(1px); }
   .undo-btn:disabled { opacity: .4; cursor: default; }
+
+  /* Class-B verb affordances (Slice 2b-ii) — spores/episodes are Operate-zone
+     INPUTS the operator resolves through anneal's validated verbs. Metal controls,
+     Operate accent; the destructive ones open a confirm form (kind select + optional
+     ref), and `confirm tombstone` reads hot (.danger). Aligned to the row's right. */
+  .verb-actions { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-left: auto; }
+  .verb-btn {
+    font: 700 8.5px/1 var(--label); letter-spacing: .1em; text-transform: uppercase;
+    color: color-mix(in srgb, var(--operate) 80%, var(--ink));
+    background: linear-gradient(180deg, #18241f, #0e1714);
+    border: 1px solid color-mix(in srgb, var(--operate) 30%, var(--line)); border-bottom-width: 2px;
+    border-radius: 3px; padding: 3px 8px; cursor: pointer; transition: all .13s ease;
+  }
+  .verb-btn:hover { color: #06120c; background: var(--operate); box-shadow: 0 0 12px -4px var(--operate); }
+  .verb-btn:active { transform: translateY(1px); }
+  .verb-btn:disabled { opacity: .4; cursor: default; box-shadow: none; }
+  .verb-form { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+  .verb-kind, .verb-ref {
+    font: 11px/1.4 var(--mono); color: var(--ink); background: #0a0f0e;
+    border: 1px solid var(--line-hot); border-radius: 3px; padding: 3px 7px; outline: none;
+  }
+  .verb-ref { min-width: 140px; }
+  .verb-kind:focus, .verb-ref:focus {
+    border-color: color-mix(in srgb, var(--operate) 55%, var(--line-hot));
+    box-shadow: 0 0 10px -4px var(--operate);
+  }
+  .verb-confirm, .verb-cancel {
+    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase;
+    border-radius: 3px; padding: 4px 10px; cursor: pointer; transition: all .13s ease;
+    border: 1px solid var(--line); border-bottom-width: 2px;
+  }
+  .verb-confirm {
+    color: #06120c; border-color: var(--operate);
+    background: linear-gradient(180deg, var(--operate), color-mix(in srgb, var(--operate) 70%, #000));
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.2), 0 0 12px -5px var(--operate);
+  }
+  .verb-confirm:hover { box-shadow: 0 0 18px -3px var(--operate); }
+  .verb-confirm.danger {
+    border-color: var(--hot);
+    background: linear-gradient(180deg, var(--hot), color-mix(in srgb, var(--hot) 70%, #000));
+  }
+  .verb-confirm.danger:hover { box-shadow: 0 0 18px -3px var(--hot); }
+  .verb-cancel { color: var(--dim); background: linear-gradient(180deg, #131e1c, #0c1513); }
+  .verb-cancel:hover { color: var(--ink); border-color: var(--line-hot); }
+  .verb-confirm:active, .verb-cancel:active { transform: translateY(1px); }
+  .verb-confirm:disabled, .verb-cancel:disabled { opacity: .45; cursor: default; box-shadow: none; }

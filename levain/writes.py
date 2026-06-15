@@ -1,15 +1,35 @@
-"""levain.writes — Levain v2 Slice 2: the governed Class-A write layer.
+"""levain.writes — Levain v2 Slice 2: the governed write layer (Class A + Class B).
 
-The inverse of ``dashboard.py``'s read path, for the **Class A — operator-input** edit
-class (direct, declarative, human-is-fan-in, safe). Slice 2a turned on the operator's
-profile (``seed/world.md`` sections), the entity's thinking style
-(``activation/posture.md`` / ``recency_directives.md``), and the operator-set entity
-name (``.levain/config.json``). **Slice 2b adds the neocortex ``State`` section** —
-the one Class-A section of the consolidated-cognition file (live-state, an INPUT to
-cognition, last-writer-wins), confined to ``State`` alone (``_apply_state_edit``). The
-other five neocortex sections (Class C — the consolidate's own conclusions), Class B
-(anneal lifecycle verbs), and the Class C-view seed docs are NOT writable here; that is
-the whole point — the operator governs inputs, never the entity's cognition.
+The inverse of ``dashboard.py``'s read path. Two governed edit classes, both
+*inputs* to the entity's cognition — never its consolidated conclusions:
+
+**Class A — operator-input (direct file edit).** Declarative, human-is-fan-in,
+safe; written straight to the file/field with backup + audit + atomic write +
+undo. Slice 2a: the operator's profile (``seed/world.md`` sections), thinking
+style (``activation/posture.md`` / ``recency_directives.md``), the operator-set
+entity name (``.levain/config.json``). Slice 2b-i: the neocortex ``State``
+section — the one Class-A section of the consolidated-cognition file (live-state,
+last-writer-wins), confined to ``State`` alone (``_apply_state_edit``).
+
+**Class B — lifecycle data (verb-mediated).** Slice 2b-ii: the operator's open
+loops (**spores** — ``touch`` / ``descend`` / ``ascend``) and raw inputs
+(**episodes** — ``tombstone``), mutated ONLY through anneal's own *validated*
+verbs against a WRITABLE anneal handle (the dashboard read path opens everything
+``read_only=True``; this is the one governed writable path). The lifecycle
+invariants — kind-validation, tombstones, id integrity — live in anneal, not
+here (``thinness_is_the_architecture``); this layer locates the store, calls the
+verb, and records the change. A *destructive* verb (resolving a spore /
+tombstoning an episode) requires an explicit ``confirm: true`` — the per-write
+confirm gate, enforced server-side (a raw client without it is refused too).
+
+What is NOT writable here, by construction: the five felt-layer neocortex
+sections + the Hebbian/limbic/crystal layers (Class C — the consolidate's own
+conclusions), and the Class C-view seed docs. **Crystals (graduated patterns)
+are deliberately Class-B-EXCLUDED**: a crystal is the entity's own consolidated
+wisdom, not an operator input — retiring one would overwrite the entity's
+cognition, so it routes through anneal's crystal *decision channel* at
+consolidate time, never an operator button (scope §1, Fork 1 = A). That is the
+whole point — the operator governs inputs, never the entity's cognition.
 
 The governance model (load-bearing — this is the seam the moat is built on):
 
@@ -57,12 +77,16 @@ import json
 import os
 import threading
 import uuid
-from contextlib import nullcontext
+import warnings
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from anneal_memory import continuity_lock  # the SHARED cross-process continuity lock
+from anneal_memory import (  # the SHARED cross-process continuity lock
+    ContinuityLockUnavailable,
+    continuity_lock,
+)
 
 __all__ = [
     "EditError",
@@ -99,6 +123,28 @@ class EditError(Exception):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+
+
+@contextmanager
+def _governed_continuity_lock(path: Path) -> Iterator[bool]:
+    """Take anneal's shared cross-process continuity lock with ``require=True`` —
+    Levain's governed continuity writes FAIL CLOSED (spore-091 #2). On a lock-less
+    filesystem / non-POSIX volume the lock can't serialize against the anneal
+    consolidate; Levain has no 2PC / recovery oracle of its own (anneal's save
+    does, so anneal stays best-effort), so editing State unserialized risks a
+    silent lost update. We refuse with a clean 503 instead of degrading to the
+    best-effort CAS. Maps :class:`ContinuityLockUnavailable` → ``EditError`` so the
+    call sites stay simple."""
+    try:
+        with continuity_lock(path, require=True) as held:
+            yield held
+    except ContinuityLockUnavailable as exc:
+        raise EditError(
+            "lock_unavailable", 503,
+            "the continuity file's cross-process lock is unavailable (a lock-less "
+            "filesystem / non-POSIX volume) — refusing to edit consolidated-cognition "
+            "State unserialized; edit by hand or retry on a POSIX-locking volume",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +453,14 @@ def apply_edit(install_root: Path, req: dict[str, Any], *, now: str | None = Non
             return _apply_state_edit(install_root, req, now)
         if kind == "entity_name":
             return _apply_entity_name(install_root, req, now)
+        if kind == "spore_touch":
+            return _apply_spore_verb(install_root, req, now, "touch")
+        if kind == "spore_descend":
+            return _apply_spore_verb(install_root, req, now, "descend")
+        if kind == "spore_ascend":
+            return _apply_spore_verb(install_root, req, now, "ascend")
+        if kind == "episode_tombstone":
+            return _apply_episode_tombstone(install_root, req, now)
         if kind == "undo":
             return _apply_undo(install_root, req, now)
     raise EditError("bad_kind", 400, f"unknown edit kind {kind!r}")
@@ -537,8 +591,10 @@ def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) 
     # `_commit`'s CAS still runs inside the lock as the no-op-degradation fallback
     # (and to catch a wrap that landed between the operator loading the page and
     # this read). Lock is INNER to `_WRITE_LOCK`; it is the only cross-process
-    # lock, so the order can't deadlock.
-    with continuity_lock(path):
+    # lock, so the order can't deadlock. require=True (via _governed_continuity_lock)
+    # → fail CLOSED (503) on a lock-less FS rather than edit cognition unserialized
+    # [spore-091 #2].
+    with _governed_continuity_lock(path):
         try:
             raw = path.read_text(encoding="utf-8")
         except (OSError, ValueError) as exc:  # ValueError covers UnicodeDecodeError
@@ -593,6 +649,201 @@ def _apply_entity_name(install_root: Path, req: dict[str, Any], now: str | None)
     )
 
 
+# ---------------------------------------------------------------------------
+# Class B — lifecycle data (verb-mediated). The operator's INPUTS (open loops,
+# raw episodes), mutated ONLY through anneal's validated verbs against a WRITABLE
+# handle. No file backup is taken: a Class-B verb is not a file edit, and its
+# reversibility is anneal's (a composted spore stays in the `resolved` set; a
+# tombstoned episode keeps a tombstone row) — so `_apply_undo` REFUSES these.
+# ---------------------------------------------------------------------------
+
+# Verb-mediated kinds: recorded in the audit trail but NOT file-undoable.
+_VERB_KINDS = frozenset(
+    {"spore_touch", "spore_descend", "spore_ascend", "episode_tombstone"}
+)
+
+
+def _anneal_paths(install_root: Path) -> Any:
+    """The install's anneal stores, derived the SAME way the read layer derives
+    them (the ``.levain/memory.db`` stem) so a Class-B write targets exactly the
+    store the dashboard shows. Matches ``_apply_state_edit``'s ``.levain``
+    convention (``LEVAIN_CONTINUITY_REL``). A non-default {{ANNEAL_MEMORY}}
+    location is a pre-existing write-path limitation shared with State."""
+    from levain.dashboard import AnnealPaths  # lazy: avoid the dashboard import cycle
+
+    return AnnealPaths.from_db(install_root / ".levain" / "memory.db")
+
+
+def _require_confirm(req: dict[str, Any], what: str) -> None:
+    """A destructive verb must carry ``confirm: true``. The frontend renders the
+    confirmation UI; THIS refusal is the enforcement — a client that omits it
+    (curl, a script) is refused too (``structural_invariants_beat_discipline``)."""
+    if req.get("confirm") is not True:
+        raise EditError("confirm_required", 409, what)
+
+
+def _audit_verb(
+    install_root: Path,
+    *,
+    kind: str,
+    action: str,
+    target: str,
+    now: str | None,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    """Append a verb-mediated audit record AFTER the (anneal-atomic, canonical) verb
+    has committed. ``source`` is a ``spore:<id>`` / ``episode:<id>`` label (the edit-log
+    renders it); ``undoable: False`` marks it not-file-undoable (the frontend gates the
+    undo button on this, and ``_apply_undo`` refuses it server-side regardless).
+
+    **BEST-EFFORT by design [codex L3 HIGH].** Unlike the Class-A ``_commit`` path —
+    which audits BEFORE the (reversible) file write so a crash can't leave a changed
+    file with no record — a Class-B verb commits in anneal FIRST (its own atomic
+    ``_transaction`` / ``_db_boundary``), and that committed state IS the canonical
+    record (the resolved-spore set / the tombstone row). So a failure to append the
+    SECONDARY Levain edit-log line must NOT collapse a committed, possibly destructive,
+    op into a reported failure that makes the operator retry an already-done action. On
+    an append failure we ``warn`` (surfaces in the server log) and return ``""`` — the
+    op still succeeded, and the dashboard re-reads anneal's canonical state."""
+    edit_id = uuid.uuid4().hex[:12]
+    record: dict[str, Any] = {
+        "id": edit_id,
+        "ts": _now_iso(now),
+        "kind": kind,
+        "action": action,
+        "source": target,
+        "heading": None,
+        "undoable": False,
+    }
+    if extra:
+        record.update(extra)
+    try:
+        _append_audit(install_root, record)
+    except OSError as exc:
+        warnings.warn(
+            f"verb {kind} on {target} committed in anneal but its edit-log audit "
+            f"append failed ({exc}); the mutation is canonical in anneal (resolved "
+            f"set / tombstone row) — reporting success, edit-log line skipped",
+            RuntimeWarning, stacklevel=2,
+        )
+        return ""
+    return edit_id
+
+
+def _apply_spore_verb(
+    install_root: Path, req: dict[str, Any], now: str | None, verb: str
+) -> dict[str, Any]:
+    """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
+    ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
+    resolving verbs are destructive (the loop leaves the open set) → confirm-gated
+    and carry a ``kind`` anneal validates against the spore's type; ``ascend`` also
+    requires a ``ref`` (what the loop became). anneal owns the validation + the
+    atomic write (its own ``_transaction`` flock); this records the audit entry."""
+    from anneal_memory.spores import SporeError, SporeStore  # lazy
+
+    spore_id = _require_str(req, "spore_id")
+    spore_kind: str | None = None
+    ref: str | None = None
+    if verb == "descend":
+        spore_kind = _require_str(req, "spore_kind")
+        _require_confirm(
+            req,
+            f"compost spore {spore_id} as '{spore_kind}'? this resolves the loop "
+            "(it stays recoverable in anneal's resolved set)",
+        )
+    elif verb == "ascend":
+        spore_kind = _require_str(req, "spore_kind")
+        ref = _require_str(req, "ref").strip()
+        if not ref:
+            raise EditError("bad_verb_arg", 422, "ascend requires a non-empty ref")
+        _require_confirm(
+            req,
+            f"promote spore {spore_id} → '{ref}' as '{spore_kind}'? this resolves "
+            "the loop",
+        )
+
+    paths = _anneal_paths(install_root)
+    if not paths.spores_json.is_file():
+        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
+    store = SporeStore(paths.spores_json)
+    try:
+        if verb == "touch":
+            store.touch(spore_id)
+        elif verb == "descend":
+            store.descend(spore_id, kind=spore_kind)
+        else:  # ascend
+            store.ascend(spore_id, kind=spore_kind, ref=ref)
+    except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except SporeError as exc:  # unknown id / already resolved / store drift
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:  # raw IO from SporeStore._transaction (ENOLCK on a lock-less
+        # FS, permission, fsync/replace) — not wrapped by anneal; map to a clean
+        # retryable 503 instead of leaking a generic internal 500 [codex L3 MED].
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+
+    extra: dict[str, Any] = {}
+    if spore_kind is not None:
+        extra["verb_kind"] = spore_kind
+    if ref is not None:
+        extra["ref"] = ref
+    edit_id = _audit_verb(
+        install_root, kind=f"spore_{verb}", action=verb,
+        target=f"spore:{spore_id}", now=now, extra=extra,
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
+
+
+def _apply_episode_tombstone(
+    install_root: Path, req: dict[str, Any], now: str | None
+) -> dict[str, Any]:
+    """Tombstone (delete) a raw episode — a Class-B verb on the operator's own
+    INPUT layer (principle #2: deleting data you fed in is not rewriting a
+    conclusion; the consolidate re-derives without it, and anneal keeps a tombstone
+    row). Destructive → confirm-gated. Opens the episodic Store WRITABLE (the
+    governed writable handle; the dashboard read path opens it read_only)."""
+    from anneal_memory import AnnealMemoryError, Store  # lazy
+
+    episode_id = _require_str(req, "episode_id")
+    _require_confirm(
+        req,
+        f"tombstone episode {episode_id}? its content is PERMANENTLY erased (only an "
+        "audit tombstone row — id/timestamp/type/hash — remains); the consolidate "
+        "re-derives without it",
+    )
+
+    paths = _anneal_paths(install_root)
+    if not paths.episodic_db.is_file():
+        raise EditError("not_found", 404, "no episodic store yet")
+    # Cross-process safety [L1 H1 — intentional, documented]: a tombstone touches the
+    # EPISODIC DB, NOT the continuity file — a DIFFERENT resource than spore-091's
+    # `continuity_lock` guards, so it deliberately takes NO continuity lock (that would
+    # serialize the wrong thing). The episodic Store is WAL-mode and every mutation runs
+    # inside anneal's `_db_boundary`, which makes the DELETE + tombstone-insert
+    # row-atomic AND wraps a concurrent-writer SQLite busy/locked error as
+    # StoreDatabaseError (→ AnnealMemoryError → the clean 422 below) — never a torn
+    # write. A wrap consolidating at the same instant reads a FROZEN episode snapshot
+    # (anneal's wrap-token TOCTOU guard) and tolerates a vanished source row as a soft
+    # citation-miss (a warning), not corruption. So this is correctly lock-free; the
+    # asymmetry with the fail-CLOSED State write is intentional — different resource,
+    # different serialization.
+    try:
+        with Store(str(paths.episodic_db), read_only=False) as store:
+            existed = store.delete(episode_id)
+    except AnnealMemoryError as exc:  # incl. StoreDatabaseError (busy/locked, wrapped)
+        raise EditError("verb_failed", 422, f"tombstone failed: {exc}") from exc
+    except OSError as exc:  # raw IO opening the db (permission, etc.) — not wrapped;
+        # clean retryable 503 over a generic internal 500 [codex L3 MED].
+        raise EditError("store_unavailable", 503, f"episodic store unavailable: {exc}") from exc
+    if not existed:
+        raise EditError("not_found", 404, f"no episode {episode_id!r} to tombstone")
+    edit_id = _audit_verb(
+        install_root, kind="episode_tombstone", action="tombstone",
+        target=f"episode:{episode_id}", now=now,
+    )
+    return {"ok": True, "id": edit_id, "source": f"episode:{episode_id}", "action": "tombstone"}
+
+
 def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     edit_id = _require_str(req, "edit_id")
     record = next(
@@ -603,6 +854,19 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
         raise EditError("not_found", 404, f"no edit {edit_id!r} in the audit log")
     if record.get("action") == "undo":
         raise EditError("bad_request", 400, "cannot undo an undo")
+    # Class-B verbs are verb-mediated, not file edits — they carry no backup and
+    # their reversibility is anneal's, not this layer's. Refuse server-side
+    # (the frontend also hides the undo button via `undoable: False`, but this is
+    # the enforcement — a stale/hand-built undo request can't no-op its way through
+    # the file-restore path against a `spore:`/`episode:` pseudo-source).
+    if record.get("kind") in _VERB_KINDS or record.get("undoable") is False:
+        raise EditError(
+            "not_undoable", 400,
+            "verb-mediated edits aren't file-undoable from the plane: a composted / "
+            "promoted spore is recoverable from anneal's resolved set, but a tombstoned "
+            "episode's content is PERMANENTLY erased (only an audit tombstone row "
+            "remains) — there is nothing to restore",
+        )
 
     source = record.get("source")
     if not isinstance(source, str):
@@ -614,15 +878,16 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
     # shared lock across the whole read→CAS→restore — a wrap landing between
     # read_bytes and _atomic_write is the lost-update codex flagged in 2b-i.
     # (`_commit`'s CAS+lock close the same window on the forward State-edit path.)
-    # NB on a lock-less FS the lock degrades to a no-op and the SHA CAS below is the
-    # only guard — and undo's CAS→write window (read_bytes → backup → audit →
-    # _atomic_write) is WIDER than _commit's, so that degradation is genuinely
-    # best-effort here, not airtight. Other Class-A targets (world.md / posture /
-    # config.json) are Levain-only — `_WRITE_LOCK` already serializes them — so they
-    # take a nullcontext (no needless cross-process lock).
+    # spore-091 #2: the continuity case uses _governed_continuity_lock (require=True)
+    # so undo of State FAILS CLOSED (503) on a lock-less FS too — undo's CAS→write
+    # window (read_bytes → backup → audit → _atomic_write) is WIDER than _commit's,
+    # so a degraded best-effort lock here would be the least airtight path of all;
+    # refusing is correct. Other Class-A targets (world.md / posture / config.json)
+    # are Levain-only — `_WRITE_LOCK` already serializes them — so they take a
+    # nullcontext (no needless cross-process lock).
     from levain.dashboard import LEVAIN_CONTINUITY_REL  # lazy: avoid import cycle
     _is_continuity = path == _resolve_inside(install_root, str(Path(*LEVAIN_CONTINUITY_REL)))
-    undo_lock = continuity_lock(path) if _is_continuity else nullcontext()
+    undo_lock = _governed_continuity_lock(path) if _is_continuity else nullcontext()
 
     with undo_lock:
         # [L3 HIGH] Only the edit whose result is STILL the file's current content can be

@@ -690,10 +690,10 @@ class TestContinuityLockWiring:
         real = W.continuity_lock
 
         @contextlib.contextmanager
-        def spy(path):
+        def spy(path, **kw):  # **kw: the governed lock passes require=True
             calls.append(str(path))
-            with real(path):  # delegate to the real lock — behaves exactly as prod
-                yield
+            with real(path, **kw) as held:  # delegate to the real lock — exactly as prod
+                yield held
 
         monkeypatch.setattr(W, "continuity_lock", spy)
         return calls
@@ -703,6 +703,20 @@ class TestContinuityLockWiring:
         calls = self._spy(monkeypatch)
         apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
         assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
+
+    def test_state_edit_fails_closed_on_lockless_fs(self, install: Path, monkeypatch) -> None:
+        # spore-091 #2: require=True → 503 (not a silent best-effort write) when the
+        # cross-process lock can't be acquired (fcntl None simulates non-POSIX / lock-less).
+        import anneal_memory.store as store_module
+
+        monkeypatch.setattr(store_module, "fcntl", None)
+        _add_continuity(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+        assert ei.value.code == "lock_unavailable" and ei.value.http_status == 503
+        # the file must be UNTOUCHED — fail closed means no write happened
+        cont = (install / _CONTINUITY_REL).read_text(encoding="utf-8")
+        assert _section_body(cont, STATE_HEADING) == _section_body(CONTINUITY, STATE_HEADING)
 
     def test_config_edit_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
         calls = self._spy(monkeypatch)
@@ -726,3 +740,192 @@ class TestContinuityLockWiring:
         calls = self._spy(monkeypatch)  # spy only the undo
         apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
         assert calls == []
+
+
+# --- Class-B lifecycle verbs (Slice 2b-ii): spores + episode tombstone -------
+
+def _add_spore(install: Path, *, stype: str = "task", text: str = "ship 2b-ii", **kw) -> str:
+    from anneal_memory.spores import SporeStore
+
+    s = SporeStore(install / ".levain" / "memory.spores.json").add(type=stype, text=text, **kw)
+    return str(s["id"])
+
+
+def _spore_store(install: Path):
+    from anneal_memory.spores import SporeStore
+
+    return SporeStore(install / ".levain" / "memory.spores.json")
+
+
+def _add_episode(install: Path, *, content: str = "built the writable handle") -> str:
+    from anneal_memory import Store
+
+    with Store(str(install / ".levain" / "memory.db")) as store:
+        ep = store.record(content, "observation")
+    return ep.id
+
+
+class TestSporeVerbs:
+    def test_touch_is_non_destructive_and_updates_seen(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+        assert res["ok"] and res["action"] == "touch"
+        # still open (touch never resolves) and recorded in the audit trail
+        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+        rec = recent_edits(install)[0]
+        assert rec["kind"] == "spore_touch" and rec["source"] == f"spore:{sid}"
+        assert rec["undoable"] is False
+
+    def test_descend_requires_confirm(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "spore_descend", "spore_id": sid, "spore_kind": "done"})
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+        # refused → the spore is untouched (still open)
+        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+
+    def test_descend_with_confirm_composts(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(install, {
+            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+        })
+        assert res["ok"]
+        store = _spore_store(install)
+        assert not any(s["id"] == sid for s in store.list_open()), "composted → gone from open"
+        rec = recent_edits(install)[0]
+        assert rec["kind"] == "spore_descend" and rec["verb_kind"] == "done"
+
+    def test_descend_bad_kind_for_type(self, install: Path) -> None:
+        sid = _add_spore(install, stype="task")  # task descend kinds = done/dropped/composted
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "answered",  # question-only
+                "confirm": True,
+            })
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+        assert any(s["id"] == sid for s in _spore_store(install).list_open()), "rejected → still open"
+
+    def test_ascend_requires_ref(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project", "confirm": True,
+            })
+        assert ei.value.http_status == 400  # _require_str("ref") missing
+
+    def test_ascend_with_ref_and_confirm(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(install, {
+            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "ref": "projects/levain", "confirm": True,
+        })
+        assert res["ok"]
+        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+        rec = recent_edits(install)[0]
+        assert rec["kind"] == "spore_ascend" and rec["ref"] == "projects/levain"
+
+    def test_unknown_spore_id(self, install: Path) -> None:
+        _add_spore(install)  # store exists, id doesn't
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {
+                "kind": "spore_descend", "spore_id": "spore-999", "spore_kind": "done", "confirm": True,
+            })
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+
+    def test_no_spore_store_yet(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "spore_touch", "spore_id": "spore-001"})
+        assert ei.value.code == "not_found" and ei.value.http_status == 404
+
+
+class TestEpisodeTombstone:
+    def test_requires_confirm(self, install: Path) -> None:
+        eid = _add_episode(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid})
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+
+    def test_with_confirm_deletes_and_keeps_tombstone(self, install: Path) -> None:
+        from anneal_memory import Store
+
+        eid = _add_episode(install)
+        res = apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
+        assert res["ok"] and res["action"] == "tombstone"
+        with Store(str(install / ".levain" / "memory.db"), read_only=True) as store:
+            assert store.status().tombstone_count >= 1
+        rec = recent_edits(install)[0]
+        assert rec["kind"] == "episode_tombstone" and rec["undoable"] is False
+
+    def test_unknown_episode_id(self, install: Path) -> None:
+        _add_episode(install)  # db exists, id doesn't
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "episode_tombstone", "episode_id": "nope", "confirm": True})
+        assert ei.value.code == "not_found" and ei.value.http_status == 404
+
+
+class TestClassBGovernance:
+    def test_undo_refuses_a_verb_record(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        assert ei.value.code == "not_undoable" and ei.value.http_status == 400
+
+    def test_no_crystal_retire_verb_exists(self, install: Path) -> None:
+        # Fork 1 = A: a crystal is the entity's own consolidated wisdom (Class C),
+        # never an operator button — there is no retire kind to dispatch.
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "crystal_retire", "name": "some_pattern", "confirm": True})
+        assert ei.value.code == "bad_kind" and ei.value.http_status == 400
+
+
+class TestClassBRobustness:
+    """codex L3 findings: a committed verb must not be reported as failure when only the
+    secondary edit-log append fails (HIGH), and raw store OSErrors map to a clean 503 (MED)."""
+
+    def test_committed_verb_survives_audit_append_failure(self, install: Path, monkeypatch) -> None:
+        import warnings
+
+        import levain.writes as W
+
+        sid = _add_spore(install)
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(W, "_append_audit", boom)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = apply_edit(install, {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+            })
+        # committed op reports SUCCESS (not a 500) even though the edit-log line failed;
+        # no audit id is returned, and the spore is genuinely composted (canonical in anneal).
+        assert res["ok"] is True and res["id"] == ""
+        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+
+    def test_spore_verb_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
+        from anneal_memory.spores import SporeStore
+
+        sid = _add_spore(install)
+
+        def boom(*a, **k):
+            raise OSError("no locks available")
+
+        monkeypatch.setattr(SporeStore, "touch", boom)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+        assert ei.value.code == "store_unavailable" and ei.value.http_status == 503
+
+    def test_tombstone_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
+        from anneal_memory import Store
+
+        eid = _add_episode(install)
+
+        def boom(*a, **k):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Store, "delete", boom)
+        with pytest.raises(EditError) as ei:
+            apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
+        assert ei.value.code == "store_unavailable" and ei.value.http_status == 503

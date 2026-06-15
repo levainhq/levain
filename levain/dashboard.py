@@ -294,6 +294,12 @@ class OpenSpore:
     seen: str
     next: str | None
     pointer: str | None
+    # The valid Class-B resolve kinds for THIS spore's type, derived from anneal's
+    # own DESCEND_BY_TYPE / ASCEND_BY_TYPE (Slice 2b-ii). Schema-driven from the
+    # substrate so the plane's verb affordances can't drift from anneal's taxonomy
+    # (principle #4). Empty for an unknown type → the plane offers no resolve verb.
+    descend_kinds: list[str] = field(default_factory=list)
+    ascend_kinds: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -324,8 +330,13 @@ class EpisodeRow:
 @dataclass
 class WrapRow:
     """One historical wrap — the consolidate's audit trail surfaced as a timeline.
-    The read foundation for Slice-2 time-travel/restore (anneal's hash-chain audit
-    already holds the data). Class C — read-only consolidated history."""
+    The read foundation for the **projection-history viewer** (Slice 2b-ii / spore-093
+    v0): each wrap is a RE-PROJECTION of the continuity from the moving substrate, not
+    a saved version — so the timeline teaches *view-as-of + re-project, never restore*
+    (the Slice-2 RESTORE half was killed 2026-06-14 as incoherent over a projection of
+    a live multi-layer substrate). v0 shows the per-wrap size delta; the full
+    content/lineage `as-of` viewer is v1 (an anneal-side content-store dep). Class C —
+    read-only consolidated history."""
 
     wrapped_at: str
     episodes_compressed: int
@@ -487,7 +498,7 @@ class SubstrateView:
             )
         panels.append(
             {"kind": "wraps", "zone": ZONE_MIND, "edit_class": CLASS_C,
-             "title": f"Wrap history ({len(self.wraps)})"}
+             "title": f"Projection history ({len(self.wraps)} wraps)"}
         )
         return panels
 
@@ -1030,16 +1041,21 @@ def build_substrate_view(
 
     # --- open spores (prospective loops; defensive per-row) ----------------
     try:
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import (
+            ASCEND_BY_TYPE,
+            DESCEND_BY_TYPE,
+            SporeStore,
+        )
 
         if paths.spores_json.exists():
             items = SporeStore(paths.spores_json).list_open(today=today)[:max_spores]
             for s in items:
                 try:
+                    stype = str(s.get("type", ""))
                     view.open_spores.append(
                         OpenSpore(
                             id=str(s.get("id", "")),
-                            type=str(s.get("type", "")),
+                            type=stype,
                             tier=str(s.get("tier", "")),
                             salience=int(s.get("salience", 0) or 0),
                             domain=str(s.get("domain", "")),
@@ -1047,6 +1063,8 @@ def build_substrate_view(
                             seen=str(s.get("seen", "")),
                             next=s.get("next"),
                             pointer=s.get("pointer"),
+                            descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
+                            ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
                         )
                     )
                 except (ValueError, TypeError):
@@ -1201,7 +1219,7 @@ def render_text(view: SubstrateView) -> str:
         out.append("")
 
     if view.wraps:
-        out.append(f"Wrap history ({len(view.wraps)})")
+        out.append(f"Projection history ({len(view.wraps)} wraps)")
         for w in view.wraps[:10]:
             stamp = w.wrapped_at.split("T")[0] if w.wrapped_at else ""
             out.append(
