@@ -143,6 +143,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     dash_p.set_defaults(func=_cmd_dashboard)
 
+    tui_p = subparsers.add_parser(
+        "tui",
+        help="Interactive terminal control plane over the substrate.",
+        description=(
+            "Inspect and steer the install's substrate from a full-screen "
+            "terminal UI — the Unix-terminal-native peer of `levain serve` (the "
+            "browser surface). Navigate the Identity · Operate · Mind zones, read "
+            "every panel, and (with the write verbs) edit Class-A operator inputs "
+            "and run Class-B lifecycle verbs, through the same governed write seam "
+            "the web-app uses. No server, no port, no browser; needs an "
+            "interactive terminal (use `levain dashboard` for a non-interactive "
+            "glance)."
+        ),
+    )
+    tui_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    tui_p.set_defaults(func=_cmd_tui)
+
     web_p = subparsers.add_parser(
         "serve",
         help="Serve the substrate dashboard as a local web-app (localhost).",
@@ -229,6 +251,12 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
     from levain.dashboard import run_dashboard
 
     return run_dashboard(path=args.path, as_json=args.as_json)
+
+
+def _cmd_tui(args: argparse.Namespace) -> int:
+    from levain.tui import run_tui
+
+    return run_tui(path=args.path)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
