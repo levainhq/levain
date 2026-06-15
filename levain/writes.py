@@ -81,7 +81,7 @@ import warnings
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 from anneal_memory import (  # the SHARED cross-process continuity lock
     ContinuityLockUnavailable,
@@ -731,7 +731,8 @@ def _audit_verb(
 
 
 def _apply_spore_verb(
-    install_root: Path, req: dict[str, Any], now: str | None, verb: str
+    install_root: Path, req: dict[str, Any], now: str | None,
+    verb: Literal["touch", "descend", "ascend"],
 ) -> dict[str, Any]:
     """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
     ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
@@ -770,8 +771,10 @@ def _apply_spore_verb(
         if verb == "touch":
             store.touch(spore_id)
         elif verb == "descend":
+            assert spore_kind is not None  # set in the descend validation branch above
             store.descend(spore_id, kind=spore_kind)
         else:  # ascend
+            assert spore_kind is not None and ref is not None  # set in the ascend branch
             store.ascend(spore_id, kind=spore_kind, ref=ref)
     except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
