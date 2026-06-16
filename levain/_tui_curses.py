@@ -67,19 +67,31 @@ _MIN_W = 50
 _LEFT_W = 30  # panel-list column width (clamped to a third of the screen)
 
 
-def main_loop(source: SubstrateSource, install_root: Path, view: SubstrateView) -> int:
+def main_loop(
+    source: SubstrateSource,
+    install_root: Path,
+    view: SubstrateView,
+    *,
+    read_only: bool = False,
+) -> int:
     """Run the curses event loop under ``curses.wrapper`` (which guarantees the
     terminal is restored on any exit). The first view is built by the caller,
-    pre-curses, so a startup fault never tears down the screen mid-frame."""
-    return curses.wrapper(_loop, source, install_root, view)
+    pre-curses, so a startup fault never tears down the screen mid-frame.
+
+    ``read_only`` runs the inspect-only variant: ``_active_verbs`` advertises +
+    dispatches nothing and ``_apply`` refuses (the un-bypassable chokepoint) — a
+    pure inspection surface over a substrate with no governed write target."""
+    return curses.wrapper(_loop, source, install_root, view, read_only)
 
 
 def _loop(
-    stdscr: "curses.window", source: SubstrateSource, install_root: Path, view: SubstrateView,
+    stdscr: "curses.window", source: SubstrateSource, install_root: Path,
+    view: SubstrateView, read_only: bool = False,
 ) -> int:
     curses.curs_set(0)
     stdscr.keypad(True)
-    model = TuiModel(view=view, status="press ? for help")
+    hint = "read-only cockpit · press ? for help" if read_only else "press ? for help"
+    model = TuiModel(view=view, status=hint, read_only=read_only)
     show_help = False
 
     while True:
@@ -142,9 +154,11 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
     """The verbs the SELECTED panel+row actually affords. Row-aware for the edits
     panel — ``[u]ndo`` is offered only on a file-undoable record (mirroring the
     server's refusal), so the footer never advertises a key the server would 400.
-    Every other panel's verbs are a function of the panel alone."""
+    Every other panel's verbs are a function of the panel alone. A read-only model
+    suppresses them all (``panel_verbs(read_only=True)`` → ``[]``) so the footer
+    advertises navigation only and no verb key dispatches (NO THEATER)."""
     sel = model.current_panel()
-    verbs = panel_verbs(sel)
+    verbs = panel_verbs(sel, read_only=model.read_only)
     if sel is not None and is_item_list(sel):
         if panel_item_count(model.view, sel) == 0:
             return []  # empty list → no row to act on, so advertise nothing
@@ -299,6 +313,12 @@ def _apply(
     """Run one ``apply_edit`` and re-seat the model. Success → rebuild + ok status;
     a ``stale`` 409 → rebuild (the substrate moved) + the reload status; any other
     refusal → keep the view, show the mapped status."""
+    if model.read_only:
+        # Structural backstop (structural_invariants_beat_discipline): in a read-only
+        # view no write can reach apply_edit, regardless of how dispatch was reached.
+        # _active_verbs already advertises + dispatches nothing; this is the single
+        # un-bypassable chokepoint every write funnels through.
+        return replace(model, status="read-only view — write verbs are suppressed")
     try:
         apply_edit(install_root, req)
     except EditError as exc:
@@ -487,8 +507,11 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         row = f"{chip} {label}"
         if pidx == model.panel_idx:
             attr = curses.A_REVERSE
-        elif cls == CLASS_C or cls == "":
-            attr = curses.A_DIM  # glass — read-only cognition / record
+        elif model.read_only or cls == CLASS_C or cls == "":
+            # glass — Class-C cognition/record, OR (read_only) the WHOLE surface:
+            # nothing is steerable here, so nothing reads as metal. Keeps the
+            # materiality doctrine honest with the footer (which advertises no verbs).
+            attr = curses.A_DIM
         else:
             attr = curses.A_BOLD  # metal — Class A/B, operator-steerable
         _safe_addstr(stdscr, body_top + row_i, 0, row.ljust(left_w)[:left_w], attr)

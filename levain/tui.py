@@ -137,6 +137,7 @@ class TuiModel:
     item_idx: int = 0
     scroll: int = 0
     status: str = ""
+    read_only: bool = False  # inspect-only: suppress ALL write affordances (NO THEATER)
 
     @property
     def zone(self) -> str:
@@ -217,13 +218,20 @@ class Verb:
     needs_kind: bool = False
 
 
-def panel_verbs(panel: dict[str, Any] | None) -> list[Verb]:
+def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> list[Verb]:
     """The verbs available on a panel, by edit-class + kind. A Class-C panel offers
     none (glass). Class-A config/section panels offer ``[e]dit``. Class-B spores
     offer touch/descend/ascend; episodes offer tombstone. The edits panel offers
     ``[u]ndo`` of the selected (file-undoable) record. Returns ``[]`` for a panel
-    that affords nothing — the footer then shows navigation only."""
-    if panel is None:
+    that affords nothing — the footer then shows navigation only.
+
+    ``read_only`` is the inspect-only view mode (``levain tui --read-only``, and the
+    flow self-ops cockpit that points this kernel at a substrate with no ``.levain``
+    install): it suppresses EVERY affordance so the footer advertises navigation
+    only (NO THEATER — a write verb is never shown when there is no governed write
+    target behind it). The data layer is always read-only; this is the UI mode that
+    matches it for an inspection surface."""
+    if panel is None or read_only:
         return []
     kind = panel.get("kind")
     edit_class = panel.get("edit_class")
@@ -581,8 +589,12 @@ def current_edit_record(model: TuiModel) -> dict[str, Any] | None:
 # never requires curses, and the pure layer stays importable for the test suite).
 # ---------------------------------------------------------------------------
 
-def run_tui(path: Path) -> int:
+def run_tui(path: Path, *, read_only: bool = False) -> int:
     """``levain tui`` entry point. Read+write control plane in the terminal.
+
+    ``read_only`` runs the inspect-only variant (``--read-only``): every write verb
+    is suppressed, so it is a pure inspection surface over the substrate — the mode
+    the flow self-ops cockpit (a substrate with no ``.levain`` write target) needs.
 
     Nonzero only when it cannot start (no store, not a tty); a degraded sub-tier
     renders visibly inside, exactly like ``levain dashboard``."""
@@ -617,4 +629,4 @@ def run_tui(path: Path) -> int:
     install_root = source.install_root or path
     from levain import _tui_curses  # lazy: curses + the screen driver
 
-    return _tui_curses.main_loop(source, install_root, view)
+    return _tui_curses.main_loop(source, install_root, view, read_only=read_only)
