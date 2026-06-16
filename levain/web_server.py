@@ -147,6 +147,49 @@ def _is_loopback_host(host: str) -> bool:
         return False
     return ip.is_loopback and ip.version == 4
 
+
+def _canonical_bind_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The canonical IP for a bind host, or None if it isn't one we accept.
+
+    SECURITY-CRITICAL canonicalization: the socket layer (libc getaddrinfo) accepts
+    legacy numeric IPv4 forms that Python's strict ``ipaddress`` REJECTS — ``0``,
+    ``134744072``, ``0x08080808``, ``010.010.010.010`` all bind as 0.0.0.0 / 8.8.8.8
+    / 10.10.10.10. Validating with ``ipaddress`` but BINDING the raw string would let
+    those slip past the wildcard/public guard (codex L3). So we accept ONLY
+    ``localhost`` or a canonical IP literal; a hostname or legacy-numeric form is
+    refused. IPv4-mapped IPv6 (``::ffff:x.x.x.x``) is unwrapped so the EMBEDDED
+    address is classified, not the mapping wrapper (complement L3)."""
+    h = host.strip().rstrip(".").lower()
+    if h == "localhost":
+        return ipaddress.ip_address("127.0.0.1")
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return None  # a hostname or legacy-numeric form, not a canonical literal
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _rejected_bind_host(host: str) -> str | None:
+    """Reason a host must NEVER be bound (for ANY source), or None if acceptable.
+
+    A non-loopback bind is meant for ONE specific, non-public interface — a LAN IP
+    or a Tailscale CGNAT address (RFC 6598, 100.64/10). Refused for ANY source:
+    - a non-canonical / hostname bind host (see ``_canonical_bind_ip`` — closes the
+      libc-vs-``ipaddress`` parser-differential bypass);
+    - a WILDCARD (``0.0.0.0`` / ``::``) — binds EVERY interface, not just the mesh;
+    - a GLOBAL/public IP — would expose the substrate to the internet."""
+    ip = _canonical_bind_ip(host)
+    if ip is None:
+        return ("a hostname or non-canonical numeric address is not allowed; pass a "
+                "canonical IP literal (e.g. your Tailscale IP) or 'localhost'")
+    if ip.is_unspecified:
+        return "a wildcard address (0.0.0.0 / ::) exposes EVERY interface, not just the private mesh"
+    if ip.is_global:
+        return "a public/global IP would expose the substrate to the internet"
+    return None
+
 # The static assets, by request path → (package-data filename, content-type).
 # An explicit allowlist: there is no path → filesystem mapping anywhere, so a
 # crafted path cannot escape this set.
@@ -475,15 +518,29 @@ def make_server(
     how to report it. Separated from ``run_web_server`` so tests can drive a real
     bound server without the resolve/existence/print/browser/serve_forever wrapper.
 
-    Raises ``ValueError`` (before binding) if ``host`` is not a loopback address —
-    Slice-1 ``serve`` is unauthenticated + read-only and must not be remotely
-    reachable."""
-    if not _is_loopback_host(host):
+    Non-loopback binding (a LAN / Tailscale IP) is allowed ONLY for a READ-ONLY
+    source (``install_root is None``): the write route 422s and the frontend renders
+    read-only, so there is no unauthenticated WRITE surface to expose, and the
+    private mesh (e.g. Tailscale's WireGuard) is the access boundary. A WRITABLE
+    source stays loopback-only — its no-token localhost-sovereign write auth assumes
+    loopback, so off-loopback exposure waits for the Slice-2 write/auth boundary.
+    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind."""
+    # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
+    # ONE specific private/mesh interface, never every interface or the internet.
+    reason = _rejected_bind_host(host)
+    if reason:
         raise ValueError(
-            f"refusing to bind {host!r}: Slice-1 `levain serve` is loopback-only "
-            "(127.0.0.1 / localhost). Off-loopback exposure waits for the Slice-2 "
-            "write/auth boundary — an unauthenticated read surface must not be "
-            "remotely reachable."
+            f"refusing to bind {host!r}: {reason}. Pass a SPECIFIC private interface "
+            "IP (e.g. your Tailscale IP), not a wildcard or a public address."
+        )
+    if not _is_loopback_host(host) and source.install_root is not None:
+        raise ValueError(
+            f"refusing to bind {host!r}: a WRITABLE substrate is loopback-only "
+            "(127.0.0.1 / localhost). The no-token localhost-sovereign write boundary "
+            "(POST /edit) assumes loopback; off-loopback exposure of a writable install "
+            "waits for the Slice-2 write/auth boundary. A READ-ONLY source (no install "
+            "root) MAY bind a non-loopback address — e.g. a Tailscale IP — for "
+            "private-mesh access."
         )
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)

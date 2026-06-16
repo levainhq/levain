@@ -116,6 +116,42 @@ class TestSubstrateJson:
         assert status == 422
         assert resp["error"] == "no_install"
 
+    def test_nonloopback_bind_gated_on_read_only(self, tmp_path: Path) -> None:
+        # Non-loopback binding (a Tailscale/LAN IP) is allowed for a READ-ONLY source
+        # (no write surface to expose; the private mesh is the boundary) but REFUSED
+        # for a writable one (localhost-sovereign write auth assumes loopback).
+        # 192.0.2.1 = TEST-NET-1 (RFC 5737): non-loopback, never a real interface.
+        import pytest
+
+        ro = _store_with_data(tmp_path)  # install_root=None → read-only
+        writable = SubstrateSource(anneal=ro.anneal, install_root=tmp_path)
+        with pytest.raises(ValueError, match="loopback"):
+            make_server(writable, host="192.0.2.1", port=0)  # guard fires BEFORE bind
+        # the read-only source clears the guard, then fails to BIND the unroutable
+        # address (OSError, not ValueError) — proving the guard was bypassed for it.
+        with pytest.raises(OSError):
+            make_server(ro, host="192.0.2.1", port=0)
+
+    def test_wildcard_and_public_bind_refused_for_any_source(self, tmp_path: Path) -> None:
+        # A wildcard / public bind is refused for ANY source (read-only included) —
+        # exposure is ONE specific private/mesh interface, never every interface or
+        # the internet (L1/L2 HIGH). Includes the libc-vs-ipaddress parser-differential
+        # bypasses (L3): legacy-numeric IPv4 (0 / 134744072 / 0x.. / octal) and
+        # IPv4-mapped IPv6 (::ffff:x) that bind dangerously but ipaddress mis-classifies,
+        # plus a hostname — all must raise ValueError, never reach a bind.
+        import pytest
+
+        ro = _store_with_data(tmp_path)  # install_root=None → read-only
+        bad = (
+            "0.0.0.0", "::", "8.8.8.8",               # canonical wildcard / public
+            "::ffff:0.0.0.0", "::ffff:8.8.8.8",       # IPv4-mapped (complement L3)
+            "0", "000.000.000.000", "134744072", "0x08080808", "010.010.010.010",  # legacy (codex L3)
+            "example.com",                            # hostname
+        )
+        for h in bad:
+            with pytest.raises(ValueError, match="refusing to bind"):
+                make_server(ro, host=h, port=0)
+
     def test_endpoint_serves_the_view(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
             status, headers, body = _get(base + "/substrate.json")
@@ -350,9 +386,16 @@ class TestLoopbackBindBoundary:
 
         from levain.web_server import make_server
 
-        for bad in ("0.0.0.0", "192.168.1.5", "::1"):  # ::1 = IPv6, Slice-2+ nicety
+        # A WRITABLE source (install_root set) refuses non-loopback binds — its
+        # no-token localhost-sovereign write auth assumes loopback. (A READ-ONLY
+        # source MAY bind non-loopback — TestSubstrateJson covers that half.)
+        src = _store_with_data(tmp_path)
+        writable = SubstrateSource(anneal=src.anneal, install_root=tmp_path)
+        # non-wildcard, non-public, non-loopback → hits the writable loopback-only
+        # guard (wildcard/public are refused for any source — separate test).
+        for bad in ("192.168.1.5", "10.0.0.1", "::1"):  # ::1 = IPv6, Slice-2+ nicety
             with pytest.raises(ValueError, match="loopback"):
-                make_server(_store_with_data(tmp_path), host=bad)
+                make_server(writable, host=bad)
 
     def test_make_server_allows_loopback(self, tmp_path: Path) -> None:
         from levain.web_server import make_server
@@ -382,7 +425,7 @@ class TestLoopbackBindBoundary:
         levain_dir.mkdir()
         with Store(levain_dir / "memory.db"):
             pass
-        rc = run_web_server(tmp_path, host="0.0.0.0", open_browser=False)
+        rc = run_web_server(tmp_path, host="192.168.1.5", open_browser=False)
         assert rc == 1
         assert "loopback-only" in capsys.readouterr().err
 
