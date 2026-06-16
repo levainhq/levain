@@ -180,9 +180,22 @@ def build_substrate_json(source: SubstrateSource) -> bytes:
     rather than blanking). Built per request so the browser's refresh reflects the
     live store, including a wrap that landed since the page opened. The
     ``SubstrateSource`` carries the install root, so the served view includes the
-    seed/config surface (1.5), not just the anneal store."""
+    seed/config surface (1.5), not just the anneal store.
+
+    ``writable`` is the transport's write capability — true only when the source has
+    an install root. With no install root (a read-only inspection source, e.g. the
+    flow self-ops cockpit over a store with no ``.levain`` install) the write route
+    ``POST /edit`` 422s server-side; this flag carries that SAME signal to the
+    frontend so it wires no ``commit`` and renders no edit affordances at all (NO
+    THEATER — one signal drives both the server refusal and the UI suppression)."""
     view = source.build()
-    return json.dumps(view.to_dict()).encode("utf-8")
+    payload = view.to_dict()
+    # `writable` is a transport capability, deliberately NOT a SubstrateView field;
+    # guard the namespace so a future to_dict() field of the same name can't be
+    # silently clobbered (caught in tests, never in prod — complement L3).
+    assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
+    payload["writable"] = source.install_root is not None
+    return json.dumps(payload).encode("utf-8")
 
 
 class _LevainHTTPServer(ThreadingHTTPServer):
@@ -307,9 +320,15 @@ class _Handler(BaseHTTPRequestHandler):
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
                 # UI can show, not a dead connection.
-                body = json.dumps(
-                    {"paths": {}, "errors": {"server": f"{type(exc).__name__}: {exc}"}}
-                ).encode("utf-8")
+                # The capability bit belongs on EVERY renderable payload, not just
+                # the happy path: a degraded read that omits `writable` makes the
+                # frontend default to writable and render edit affordances a read-only
+                # source can't honor (codex L3). Same predicate as build_substrate_json.
+                body = json.dumps({
+                    "paths": {},
+                    "writable": self.server.levain_source.install_root is not None,
+                    "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
             self._send(body, "application/json; charset=utf-8", head=head)

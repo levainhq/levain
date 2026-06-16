@@ -60,7 +60,11 @@
       const res = await fetch("/substrate.json", { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
-      window.LevainDashboard.render(view, { commit });
+      // Gate the write transport on the substrate being writable (NO THEATER): a
+      // read-only source (no install root → POST /edit 422s) renders with no edit
+      // affordances at all, matching the server. An older payload without
+      // `writable` defaults to writable, so existing installs are unchanged.
+      window.LevainDashboard.render(view, view.writable === false ? {} : { commit });
       status("read " + new Date().toLocaleTimeString());
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));

@@ -93,6 +93,29 @@ class TestSubstrateJson:
         assert len(data["open_spores"]) == 1
         assert data["sections"][0]["heading"] == "State"
 
+    def test_writable_flag_tracks_install_root(self, tmp_path: Path) -> None:
+        # The frontend gates every edit affordance on `writable` (NO THEATER). A
+        # source with no install root (a read-only inspection cockpit, e.g. the flow
+        # self-ops cockpit) is non-writable, matching the server's POST /edit 422; a
+        # source WITH an install root is writable.
+        src = _store_with_data(tmp_path)  # install_root defaults to None
+        assert json.loads(build_substrate_json(src))["writable"] is False
+        with_install = SubstrateSource(anneal=src.anneal, install_root=tmp_path)
+        assert json.loads(build_substrate_json(with_install))["writable"] is True
+
+    def test_no_install_source_flags_readonly_and_refuses_write(self, tmp_path: Path) -> None:
+        # The NO-THEATER coupling end-to-end: a source with no install root BOTH
+        # serves writable:false AND 422s POST /edit. Both read the same
+        # source.install_root, so they can't diverge — this locks that they don't
+        # (catches a future do_POST/flag predicate split with all else green).
+        src = _store_with_data(tmp_path)  # install_root defaults to None
+        with _serving(src) as (base, _):
+            _s, _h, body = _get(base + "/substrate.json")
+            assert json.loads(body)["writable"] is False
+            status, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+        assert status == 422
+        assert resp["error"] == "no_install"
+
     def test_endpoint_serves_the_view(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
             status, headers, body = _get(base + "/substrate.json")
