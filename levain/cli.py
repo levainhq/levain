@@ -163,6 +163,16 @@ def main(argv: list[str] | None = None) -> int:
         default=Path.cwd(),
         help="Install directory (default: cwd).",
     )
+    tui_p.add_argument(
+        "--read-only",
+        action="store_true",
+        dest="read_only",
+        help=(
+            "Inspect-only: suppress every write verb so the footer advertises "
+            "navigation only. A pure read-only control plane over the substrate "
+            "(the mode a cockpit over a store with no governed write target uses)."
+        ),
+    )
     tui_p.set_defaults(func=_cmd_tui)
 
     web_p = subparsers.add_parser(
@@ -256,7 +266,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
-    return run_tui(path=args.path)
+    return run_tui(path=args.path, read_only=args.read_only)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:

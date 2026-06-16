@@ -279,6 +279,70 @@ def test_build_state_and_config_edit_reqs():
     assert c["kind"] == "config" and c["heading"] == "Identity"
 
 
+def test_panel_verbs_read_only_suppresses_all_affordances():
+    # The inspect-only mode (`levain tui --read-only` / the flow self-ops cockpit):
+    # EVERY panel that would otherwise carry a verb offers none, so the footer
+    # advertises navigation only and no verb key dispatches (NO THEATER — never
+    # advertise a write with no governed target behind it).
+    v = _view()
+    for kind in ("config", "section", "spores", "episodes", "edits"):
+        panels = [p for p in v.layout() if p["kind"] == kind]
+        for p in panels:
+            assert tui.panel_verbs(p, read_only=True) == [], (kind, p.get("edit_class"))
+    # and the would-be-metal Class-A/B panels in isolation
+    assert tui.panel_verbs({"kind": "spores", "edit_class": CLASS_B}, read_only=True) == []
+    assert tui.panel_verbs({"kind": "section", "edit_class": CLASS_A}, read_only=True) == []
+
+
+def test_read_only_is_off_by_default():
+    # The default model is read+write — the new flag must not change existing behavior.
+    assert tui.TuiModel(view=_view()).read_only is False
+    world = next(p for p in _view().layout() if p["kind"] == "config" and p["edit_class"] == CLASS_A)
+    assert [x.kind for x in tui.panel_verbs(world)] == ["edit"]  # unchanged default path
+
+
+def _model_on(view: SubstrateView, kind: str, *, read_only: bool) -> tui.TuiModel:
+    """A model seated on the first panel of `kind` (so current_panel() returns it)."""
+    for zi, (zone, _label) in enumerate(tui.ZONES):
+        panels = tui.panels_for_zone(view, zone)
+        for pi, p in enumerate(panels):
+            if p.get("kind") == kind:
+                return tui.TuiModel(view=view, zone_idx=zi, panel_idx=pi, read_only=read_only)
+    raise AssertionError(f"no {kind} panel in any zone")
+
+
+def test_active_verbs_threads_read_only_to_panel_verbs():
+    # The driver's _active_verbs feeds BOTH the footer (advertise) and the dispatch
+    # map (honor). Lock that read_only threads through it → both go dark (codex/
+    # complement L3 — the chokepoint one layer below panel_verbs).
+    from levain import _tui_curses
+
+    v = _view()
+    rw = _model_on(v, "spores", read_only=False)
+    assert [x.kind for x in _tui_curses._active_verbs(rw)] == [
+        "spore_touch", "spore_descend", "spore_ascend",
+    ]
+    ro = _model_on(v, "spores", read_only=True)
+    assert _tui_curses._active_verbs(ro) == []
+
+
+def test_apply_backstop_refuses_write_in_read_only(monkeypatch):
+    # The single un-bypassable chokepoint: in a read_only model _apply must refuse
+    # BEFORE calling apply_edit (no install_root/.levain/ fabrication), regardless
+    # of how dispatch was reached (codex/complement L3).
+    from levain import _tui_curses
+
+    called: list = []
+    monkeypatch.setattr(_tui_curses, "apply_edit", lambda *a, **k: called.append((a, k)))
+    model = tui.TuiModel(view=_view(), read_only=True)
+    result = _tui_curses._apply(
+        model, Path("/x"), None, {"kind": "spore_touch", "spore_id": "s1"}, "ok"
+    )
+    assert called == []  # apply_edit NEVER reached
+    assert result.read_only is True
+    assert "read-only" in result.status
+
+
 def test_panel_verbs_require_class_b_for_lifecycle():
     # The manifest's edit_class owns the affordance: a mistagged Class-C spores/
     # episodes panel must offer NO mutation verb.
