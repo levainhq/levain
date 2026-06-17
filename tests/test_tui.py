@@ -336,7 +336,7 @@ def test_apply_backstop_refuses_write_in_read_only(monkeypatch):
     monkeypatch.setattr(_tui_curses, "apply_edit", lambda *a, **k: called.append((a, k)))
     model = tui.TuiModel(view=_view(), read_only=True)
     result = _tui_curses._apply(
-        model, Path("/x"), None, {"kind": "spore_touch", "spore_id": "s1"}, "ok"
+        model, None, {"kind": "spore_touch", "spore_id": "s1"}, "ok"
     )
     assert called == []  # apply_edit NEVER reached
     assert result.read_only is True

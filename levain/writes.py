@@ -79,17 +79,22 @@ import threading
 import uuid
 import warnings
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal
 
 from anneal_memory import (  # the SHARED cross-process continuity lock
     ContinuityLockUnavailable,
     continuity_lock,
 )
 
+if TYPE_CHECKING:
+    from levain.dashboard import AnnealPaths
+
 __all__ = [
     "EditError",
+    "WriteScope",
     "apply_edit",
     "recent_edits",
     "MAX_BODY_BYTES",
@@ -102,8 +107,16 @@ __all__ = [
 MAX_BODY_BYTES = 256 * 1024
 MAX_NAME_LEN = 120
 
-_AUDIT_LOG_REL = (".levain", "edits.jsonl")
-_BACKUPS_REL = (".levain", "backups")
+# Ledger artifacts live UNDER a WriteScope.ledger_root (a Levain install's `.levain/`,
+# or any explicit dir — e.g. flow's `state/bridge/`). These names are ledger-RELATIVE;
+# the `.levain/` location is just `WriteScope.from_install_root`'s choice of ledger_root.
+_AUDIT_LOG_NAME = "edits.jsonl"
+_BACKUPS_NAME = "backups"
+# The stable, install-INDEPENDENT audit/backup label for a State edit. The target is
+# `scope.anneal.continuity_md` (an explicit trusted path, never a request path), so the
+# label is a logical id, not a filesystem-relative path. Undo recognizes a State edit by
+# `kind == "state"`, not by this label — so the label is display + backup-filename only.
+_CONTINUITY_SOURCE = "continuity"
 
 # Serializes the whole read→stale-check→backup→audit→write critical section across
 # the server's request threads (ThreadingHTTPServer runs writes concurrently). This
@@ -113,6 +126,56 @@ _BACKUPS_REL = (".levain", "backups")
 # are rare + human-driven, so a global lock costs nothing; with it, a second edit to
 # a section just-changed by the first re-reads under the lock and gets a clean 409.
 _WRITE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class WriteScope:
+    """WHERE + WHETHER a substrate is writable — the write-path peer of the read
+    path's :class:`~levain.dashboard.SubstrateSource`. Decouples the governed write
+    surface from the ``.levain/`` install convention so a non-install substrate (e.g.
+    flow's own store — anneal at ``~/.anneal-memory``, spores in its repo, NO
+    ``.levain/``) is governed through the SAME seam a Levain install uses.
+
+    Three explicit fields, each the trusted source for one class of write:
+
+    - ``anneal`` — the explicit store paths (``continuity_md`` for the State edit,
+      ``spores_json`` for the Class-B spore verbs, ``episodic_db`` for the tombstone).
+      These are TRUSTED (never request-supplied) → confined by construction.
+    - ``ledger_root`` — the dir holding the append-only ``edits.jsonl`` audit trail +
+      the ``backups/`` tree (reversibility for Class-A file edits).
+    - ``install_root`` — OPTIONAL. Locates the Class-A *seed/config* surface
+      (``seed/*`` / ``activation/*`` / ``.levain/config.json``) for ``config`` /
+      ``entity_name`` edits, which are request-path-confined UNDER it. ``None`` (a
+      non-install substrate) → those kinds are refused; State + the Class-B verbs do
+      not need it.
+
+    ``from_install_root`` reproduces the pre-WriteScope BEHAVIOR (store paths by the
+    ``.levain/memory.db`` convention, ledger physical location at ``.levain/``, undo
+    correctness), so the existing Levain web + TUI write surfaces are unchanged. One
+    intentional non-identity [codex L3 MED]: a NEW install-scope audit record's ``backup``
+    ref is ledger-relative (``backups/<id>/...``) vs the old install-relative
+    (``.levain/backups/<id>/...``) — same physical file, and the undo shim reads both
+    forms — so it is behavior-preserving, not byte-identical in the audit-log text."""
+
+    anneal: AnnealPaths
+    ledger_root: Path
+    install_root: Path | None = None
+
+    @classmethod
+    def from_install_root(cls, install_root: str | Path) -> "WriteScope":
+        """The Levain-install scope: store paths derived from the
+        ``<root>/.levain/memory.db`` convention, ledger + backups under
+        ``<root>/.levain/``, seed/config edits confined under ``<root>``. Behavior-
+        preserving vs pre-WriteScope (targets, ledger physical location, undo); the audit
+        ``backup``-ref string is now ledger-relative — see the class docstring."""
+        from levain.dashboard import AnnealPaths  # lazy: avoid the writes↔dashboard cycle
+
+        root = Path(install_root)
+        return cls(
+            anneal=AnnealPaths.from_db(root / ".levain" / "memory.db"),
+            ledger_root=root / ".levain",
+            install_root=root,
+        )
 
 
 class EditError(Exception):
@@ -368,22 +431,25 @@ def _atomic_write(path: Path, text: str) -> None:
             pass
 
 
-def _backup(install_root: Path, source: str, prior_text: str | None, edit_id: str) -> str | None:
-    """Copy ``prior_text`` to ``.levain/backups/<edit-id>/<source>`` (subdirs
-    preserved) and return the relative backup path. ``None`` prior (the file did not
-    exist before this edit — e.g. first ``config.json``) backs up nothing and the
-    audit records ``backup: null`` so undo knows to restore-to-absent."""
+def _backup(ledger_root: Path, source: str, prior_text: str | None, edit_id: str) -> str | None:
+    """Copy ``prior_text`` to ``<ledger_root>/backups/<edit-id>/<source>`` (subdirs
+    preserved) and return the backup path RELATIVE TO ``ledger_root``. ``None`` prior
+    (the file did not exist before this edit — e.g. first ``config.json``) backs up
+    nothing and the audit records ``backup: null`` so undo knows to restore-to-absent."""
     if prior_text is None:
         return None
-    rel = Path(*_BACKUPS_REL) / edit_id / source
+    rel = Path(_BACKUPS_NAME) / edit_id / source
     # Self-confine (L2 MED): the backup is the one mutating primitive that folds
     # `source` into its write path. Confine it structurally — physically unable to
-    # escape the backups dir — rather than trusting every caller to pre-validate
-    # source (structural_invariants_beat_discipline).
-    backups_root = (install_root / Path(*_BACKUPS_REL)).resolve()
-    bpath = (install_root / rel).resolve()
-    if backups_root not in bpath.parents:
-        raise EditError("path_escape", 403, f"backup path for {source!r} escapes the backups dir")
+    # escape — rather than trusting every caller to pre-validate source
+    # (structural_invariants_beat_discipline). Confine to THIS edit's subdir, not just
+    # the backups/ root: a `source` containing `..` would otherwise stay inside backups/
+    # yet clobber a SIBLING edit's backup. (source is allowlist-constrained / a fixed
+    # label today, so this is belt-and-suspenders — confine at the write anyway.) [L2 LOW]
+    edit_dir = (ledger_root / _BACKUPS_NAME / edit_id).resolve()
+    bpath = (ledger_root / rel).resolve()
+    if bpath != edit_dir and edit_dir not in bpath.parents:
+        raise EditError("path_escape", 403, f"backup path for {source!r} escapes the edit's backup dir")
     bpath.parent.mkdir(parents=True, exist_ok=True)
     # write_bytes (not write_text) → byte-exact backup; write_text would CRLF-
     # translate on Windows, so the backup wouldn't match the bytes we read.
@@ -391,10 +457,10 @@ def _backup(install_root: Path, source: str, prior_text: str | None, edit_id: st
     return str(rel)
 
 
-def _append_audit(install_root: Path, record: dict[str, Any]) -> None:
-    """Append one JSON record to the append-only ``.levain/edits.jsonl`` trail.
+def _append_audit(ledger_root: Path, record: dict[str, Any]) -> None:
+    """Append one JSON record to the append-only ``<ledger_root>/edits.jsonl`` trail.
     Single-writer (the server serializes writes) so a plain append is sufficient."""
-    p = install_root.joinpath(*_AUDIT_LOG_REL)
+    p = ledger_root / _AUDIT_LOG_NAME
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -404,10 +470,10 @@ def _now_iso(now: str | None) -> str:
     return now if now is not None else datetime.now(timezone.utc).isoformat()
 
 
-def recent_edits(install_root: Path, limit: int = 20) -> list[dict[str, Any]]:
+def recent_edits(ledger_root: Path, limit: int = 20) -> list[dict[str, Any]]:
     """The most-recent audit records, newest first (for the dashboard's edit log /
     undo surface). Fail-soft: a missing log is ``[]``; a malformed line is skipped."""
-    p = install_root.joinpath(*_AUDIT_LOG_REL)
+    p = ledger_root / _AUDIT_LOG_NAME
     try:
         if not p.is_file():
             return []
@@ -434,13 +500,31 @@ def recent_edits(install_root: Path, limit: int = 20) -> list[dict[str, Any]]:
 # The public entry — apply_edit, routed by kind.
 # ---------------------------------------------------------------------------
 
-def apply_edit(install_root: Path, req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
-    """Apply one Class-A edit described by ``req`` (an untrusted JSON dict). Returns a
-    result dict on success; raises ``EditError`` (carrying an HTTP status) on refusal.
+def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
+    """A ``config`` / ``entity_name`` edit targets the install's seed/config surface —
+    which only exists when the scope has an ``install_root``. A non-install substrate
+    (``install_root is None`` — e.g. flow's own store) refuses these cleanly; State +
+    the Class-B verbs never reach here (they run off ``scope.anneal`` + the ledger)."""
+    if scope.install_root is None:
+        raise EditError(
+            "no_install", 422,
+            f"{kind_label} edits need a Levain install (the seed/config surface) — this "
+            "substrate has none (it's governed through explicit store paths only)",
+        )
+    return scope.install_root
 
-    Kinds: ``config`` (a world.md section or a whole posture/recency file),
-    ``state`` (the neocortex ``State`` section — Slice 2b), ``entity_name`` (the
-    .levain/config.json name), ``undo`` (restore an edit's backup)."""
+
+def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+    """Apply one governed edit described by ``req`` (an untrusted JSON dict) against
+    ``scope`` (the explicit write surface). Returns a result dict on success; raises
+    ``EditError`` (carrying an HTTP status) on refusal.
+
+    Kinds: ``config`` (a world.md section or a whole posture/recency file) +
+    ``entity_name`` (the .levain/config.json name) — Class-A seed/config, require a
+    ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
+    ``scope.anneal.continuity_md``); the Class-B verbs (``spore_touch`` /
+    ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off
+    ``scope.anneal``); ``undo`` (restore a Class-A edit's backup)."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
@@ -448,21 +532,21 @@ def apply_edit(install_root: Path, req: dict[str, Any], *, now: str | None = Non
     # server's request threads — this is what makes single-writer true (L1 HIGH).
     with _WRITE_LOCK:
         if kind == "config":
-            return _apply_config_edit(install_root, req, now)
+            return _apply_config_edit(scope, req, now)
         if kind == "state":
-            return _apply_state_edit(install_root, req, now)
+            return _apply_state_edit(scope, req, now)
         if kind == "entity_name":
-            return _apply_entity_name(install_root, req, now)
+            return _apply_entity_name(scope, req, now)
         if kind == "spore_touch":
-            return _apply_spore_verb(install_root, req, now, "touch")
+            return _apply_spore_verb(scope, req, now, "touch")
         if kind == "spore_descend":
-            return _apply_spore_verb(install_root, req, now, "descend")
+            return _apply_spore_verb(scope, req, now, "descend")
         if kind == "spore_ascend":
-            return _apply_spore_verb(install_root, req, now, "ascend")
+            return _apply_spore_verb(scope, req, now, "ascend")
         if kind == "episode_tombstone":
-            return _apply_episode_tombstone(install_root, req, now)
+            return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
-            return _apply_undo(install_root, req, now)
+            return _apply_undo(scope, req, now)
     raise EditError("bad_kind", 400, f"unknown edit kind {kind!r}")
 
 
@@ -473,7 +557,8 @@ def _require_str(req: dict[str, Any], field: str) -> str:
     return val
 
 
-def _apply_config_edit(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+def _apply_config_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+    install_root = _require_install_root(scope, "config")
     source = _require_str(req, "source")
     heading = req.get("heading")
     if heading is not None and not isinstance(heading, str):
@@ -523,22 +608,31 @@ def _apply_config_edit(install_root: Path, req: dict[str, Any], now: str | None)
         new_text = _normalize_file_body(new_lf)
 
     return _commit(
-        install_root, source=source, heading=heading, path=path,
+        scope, source=source, heading=heading, path=path,
         prior_text=raw, new_text=new_text, action="edit", kind="config", now=now,
     )
 
 
-def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     """Apply a Class-A edit to the neocortex **State** section — the ONE operator-
     editable section of the consolidated-cognition file. State is live-state
     (last-writer-wins; flow's own "quick update" treats it as a direct targeted edit,
     no consolidate needed) — an INPUT to cognition, never a conclusion the consolidate
     produced (scope §1). Confined two ways, by construction:
 
-    1. **Target.** Always the install's continuity file, derived from
-       ``LEVAIN_CONTINUITY_REL`` — NEVER a request-supplied path. A ``state`` edit
-       structurally cannot reach a seed file, and ``_resolve_inside`` re-confines it
-       under the install root regardless.
+    1. **Target.** Always ``scope.anneal.continuity_md`` — the explicit, TRUSTED
+       continuity path carried on the scope, NEVER a request-supplied path. A ``state``
+       edit structurally cannot be REDIRECTED by the request: the target is taken from the
+       scope, not parsed from ``req``, so no network ``req`` input can escape to another
+       file — that is the confinement that matters here. NB this deliberately trades away
+       one *incidental* defense the pre-WriteScope install-relative ``_resolve_inside`` had
+       (it would have refused a ``.levain/memory.continuity.md`` symlinked OUTSIDE the
+       install): the target is now an operator/installer-trusted store path — and for a
+       non-install substrate the continuity legitimately lives outside any tree (flow's
+       ``~/.anneal-memory/``) — so a store-owned symlink is the operator's choice, not a
+       request-injection vector. For a Levain install this is
+       ``<root>/.levain/memory.continuity.md``; for a non-install substrate (flow) it is
+       wherever that substrate's anneal store lives.
     2. **Section.** The heading must be the lone Class-A section per the read layer's
        OWN rule (``_section_edit_class``). The five felt-layer sections (Patterns /
        Decisions / Context / Understanding / Active Threads) are Class C → refused 403
@@ -556,7 +650,6 @@ def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) 
     the per-edit net, and it refuses to reverse across a consolidation boundary."""
     from levain.dashboard import (  # lazy: avoid the writes↔dashboard import cycle
         CLASS_A,
-        LEVAIN_CONTINUITY_REL,
         STATE_HEADING,
         _section_edit_class,
     )
@@ -574,9 +667,10 @@ def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) 
     if len(new_body.encode("utf-8")) > MAX_BODY_BYTES:
         raise EditError("too_large", 413, f"body exceeds {MAX_BODY_BYTES} bytes")
 
-    # The target is the continuity file, by construction (never the request).
-    source = str(Path(*LEVAIN_CONTINUITY_REL))
-    path = _resolve_inside(install_root, source)
+    # The target is the explicit continuity path from the scope (never the request);
+    # `source` is a stable logical label (`_CONTINUITY_SOURCE`), not a filesystem path.
+    source = _CONTINUITY_SOURCE
+    path = scope.anneal.continuity_md
     if not path.is_file():
         raise EditError(
             "not_found", 404,
@@ -602,14 +696,15 @@ def _apply_state_edit(install_root: Path, req: dict[str, Any], now: str | None) 
 
         new_text = _edit_one_section(raw, heading, _to_lf(expected), _to_lf(new_body))
         return _commit(
-            install_root, source=source, heading=heading, path=path,
+            scope, source=source, heading=heading, path=path,
             prior_text=raw, new_text=new_text, action="edit", kind="state", now=now,
         )
 
 
-def _apply_entity_name(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     from levain.dashboard import LEVAIN_CONFIG_REL, _read_levain_config  # lazy
 
+    install_root = _require_install_root(scope, "entity_name")
     value = _require_str(req, "value").strip()
     if len(value) > MAX_NAME_LEN:
         raise EditError("too_long", 422, f"name exceeds {MAX_NAME_LEN} chars")
@@ -642,7 +737,7 @@ def _apply_entity_name(install_root: Path, req: dict[str, Any], now: str | None)
     source = str(Path(*LEVAIN_CONFIG_REL))
 
     return _commit(
-        install_root, source=source, heading=None, path=config_path,
+        scope, source=source, heading=None, path=config_path,
         prior_text=prior_text, new_text=new_text,
         action="create" if prior_text is None else "edit",
         kind="entity_name", now=now,
@@ -663,17 +758,6 @@ _VERB_KINDS = frozenset(
 )
 
 
-def _anneal_paths(install_root: Path) -> Any:
-    """The install's anneal stores, derived the SAME way the read layer derives
-    them (the ``.levain/memory.db`` stem) so a Class-B write targets exactly the
-    store the dashboard shows. Matches ``_apply_state_edit``'s ``.levain``
-    convention (``LEVAIN_CONTINUITY_REL``). A non-default {{ANNEAL_MEMORY}}
-    location is a pre-existing write-path limitation shared with State."""
-    from levain.dashboard import AnnealPaths  # lazy: avoid the dashboard import cycle
-
-    return AnnealPaths.from_db(install_root / ".levain" / "memory.db")
-
-
 def _require_confirm(req: dict[str, Any], what: str) -> None:
     """A destructive verb must carry ``confirm: true``. The frontend renders the
     confirmation UI; THIS refusal is the enforcement — a client that omits it
@@ -683,7 +767,7 @@ def _require_confirm(req: dict[str, Any], what: str) -> None:
 
 
 def _audit_verb(
-    install_root: Path,
+    ledger_root: Path,
     *,
     kind: str,
     action: str,
@@ -718,7 +802,7 @@ def _audit_verb(
     if extra:
         record.update(extra)
     try:
-        _append_audit(install_root, record)
+        _append_audit(ledger_root, record)
     except OSError as exc:
         warnings.warn(
             f"verb {kind} on {target} committed in anneal but its edit-log audit "
@@ -731,7 +815,7 @@ def _audit_verb(
 
 
 def _apply_spore_verb(
-    install_root: Path, req: dict[str, Any], now: str | None,
+    scope: WriteScope, req: dict[str, Any], now: str | None,
     verb: Literal["touch", "descend", "ascend"],
 ) -> dict[str, Any]:
     """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
@@ -763,7 +847,7 @@ def _apply_spore_verb(
             "the loop",
         )
 
-    paths = _anneal_paths(install_root)
+    paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
@@ -791,14 +875,14 @@ def _apply_spore_verb(
     if ref is not None:
         extra["ref"] = ref
     edit_id = _audit_verb(
-        install_root, kind=f"spore_{verb}", action=verb,
+        scope.ledger_root, kind=f"spore_{verb}", action=verb,
         target=f"spore:{spore_id}", now=now, extra=extra,
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
 
 
 def _apply_episode_tombstone(
-    install_root: Path, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
     """Tombstone (delete) a raw episode — a Class-B verb on the operator's own
     INPUT layer (principle #2: deleting data you fed in is not rewriting a
@@ -815,7 +899,7 @@ def _apply_episode_tombstone(
         "re-derives without it",
     )
 
-    paths = _anneal_paths(install_root)
+    paths = scope.anneal
     if not paths.episodic_db.is_file():
         raise EditError("not_found", 404, "no episodic store yet")
     # Cross-process safety [L1 H1 — intentional, documented]: a tombstone touches the
@@ -841,16 +925,16 @@ def _apply_episode_tombstone(
     if not existed:
         raise EditError("not_found", 404, f"no episode {episode_id!r} to tombstone")
     edit_id = _audit_verb(
-        install_root, kind="episode_tombstone", action="tombstone",
+        scope.ledger_root, kind="episode_tombstone", action="tombstone",
         target=f"episode:{episode_id}", now=now,
     )
     return {"ok": True, "id": edit_id, "source": f"episode:{episode_id}", "action": "tombstone"}
 
 
-def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+def _apply_undo(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     edit_id = _require_str(req, "edit_id")
     record = next(
-        (r for r in recent_edits(install_root, limit=10_000) if r.get("id") == edit_id),
+        (r for r in recent_edits(scope.ledger_root, limit=10_000) if r.get("id") == edit_id),
         None,
     )
     if record is None:
@@ -874,23 +958,38 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
     source = record.get("source")
     if not isinstance(source, str):
         raise EditError("corrupt_record", 422, "audit record has no source")
-    path = _resolve_inside(install_root, source)
 
-    # AM-CONTLOCK: if this undo targets the continuity file it has the SAME
-    # cross-process writer (the anneal consolidate) as a State edit, so hold the
-    # shared lock across the whole read→CAS→restore — a wrap landing between
-    # read_bytes and _atomic_write is the lost-update codex flagged in 2b-i.
-    # (`_commit`'s CAS+lock close the same window on the forward State-edit path.)
-    # spore-091 #2: the continuity case uses _governed_continuity_lock (require=True)
-    # so undo of State FAILS CLOSED (503) on a lock-less FS too — undo's CAS→write
-    # window (read_bytes → backup → audit → _atomic_write) is WIDER than _commit's,
-    # so a degraded best-effort lock here would be the least airtight path of all;
-    # refusing is correct. Other Class-A targets (world.md / posture / config.json)
-    # are Levain-only — `_WRITE_LOCK` already serializes them — so they take a
-    # nullcontext (no needless cross-process lock).
-    from levain.dashboard import LEVAIN_CONTINUITY_REL  # lazy: avoid import cycle
-    _is_continuity = path == _resolve_inside(install_root, str(Path(*LEVAIN_CONTINUITY_REL)))
-    undo_lock = _governed_continuity_lock(path) if _is_continuity else nullcontext()
+    # Resolve the TARGET file being restored. A State edit targets the explicit
+    # continuity path on the scope (its `source` is the logical `_CONTINUITY_SOURCE`
+    # label, NOT a filesystem path); every other Class-A file edit (config / entity_name)
+    # is request-path-confined under the install root. Recognize a State edit by `kind`
+    # (not the source label) so undo finds the right file on a non-install substrate
+    # (flow), where the continuity lives outside any install root.
+    if record.get("kind") == "state":
+        path = scope.anneal.continuity_md
+        is_continuity = True
+    else:
+        if scope.install_root is None:
+            raise EditError(
+                "no_install", 422,
+                "cannot undo this edit — it targets an install seed/config file, but "
+                "this substrate has no install root",
+            )
+        path = _resolve_inside(scope.install_root, source)
+        is_continuity = False
+
+    # AM-CONTLOCK: a State undo has the SAME cross-process writer (the anneal
+    # consolidate) as a State edit, so hold the shared lock across the whole
+    # read→CAS→restore — a wrap landing between read_bytes and _atomic_write is the
+    # lost-update codex flagged in 2b-i. (`_commit`'s CAS+lock close the same window on
+    # the forward State-edit path.) spore-091 #2: the continuity case uses
+    # _governed_continuity_lock (require=True) so undo of State FAILS CLOSED (503) on a
+    # lock-less FS too — undo's CAS→write window (read_bytes → backup → audit →
+    # _atomic_write) is WIDER than _commit's, so a degraded best-effort lock here would
+    # be the least airtight path of all; refusing is correct. Other Class-A targets
+    # (world.md / posture / config.json) are Levain-only — `_WRITE_LOCK` already
+    # serializes them — so they take a nullcontext (no needless cross-process lock).
+    undo_lock = _governed_continuity_lock(path) if is_continuity else nullcontext()
 
     with undo_lock:
         # [L3 HIGH] Only the edit whose result is STILL the file's current content can be
@@ -914,7 +1013,39 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
         if backup_rel is None:
             restored = None  # the edit created the file → undo removes it
         else:
-            backup_path = _resolve_inside(install_root, str(backup_rel))
+            rel_str = str(backup_rel)
+            # The backup rel MUST name a file under the backups tree: new records store it
+            # relative to `ledger_root` (`backups/<id>/...`); pre-WriteScope records stored
+            # it relative to the install root (`.levain/backups/<id>/...`). Validate the
+            # prefix structurally and reject anything else — a corrupt/forged record naming
+            # e.g. the audit log itself (`edits.jsonl`) must not become a restore source.
+            # `norm` folds a Windows-separator legacy rel for the check. [L1 LOW]
+            norm = rel_str.replace("\\", "/")
+            if norm.startswith(".levain/backups/"):
+                # legacy: relative to the install root (only on a from_install_root scope,
+                # where ledger_root == install_root/.levain). [back-compat shim]
+                legacy_base = scope.install_root or scope.ledger_root.parent
+                backup_path = _resolve_inside(legacy_base, rel_str)
+                backups_root = (legacy_base / ".levain" / _BACKUPS_NAME).resolve()
+            elif norm.startswith("backups/"):
+                backup_path = _resolve_inside(scope.ledger_root, rel_str)
+                backups_root = (scope.ledger_root / _BACKUPS_NAME).resolve()
+            else:
+                raise EditError(
+                    "corrupt_record", 422,
+                    f"backup {backup_rel!r} is not a backups-tree path",
+                )
+            # [codex L3 HIGH] A prefix check alone is BYPASSABLE: `backups/../edits.jsonl`
+            # passes startswith() but `_resolve_inside` only confines to the BASE, not the
+            # backups subdir — a `..` after the prefix escapes to a SIBLING ledger file
+            # (e.g. the audit log itself) and would be restored as content. Confine the
+            # RESOLVED path under the resolved backups root, not the string
+            # (structural_invariants_beat_discipline: check the real location).
+            if backup_path == backups_root or backups_root not in backup_path.parents:
+                raise EditError(
+                    "corrupt_record", 422,
+                    f"backup {backup_rel!r} escapes the backups tree",
+                )
             if not backup_path.is_file():
                 raise EditError("backup_missing", 422, f"backup {backup_rel!r} is gone")
             restored = backup_path.read_bytes().decode("utf-8")
@@ -931,10 +1062,10 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
             "source": source,
             "heading": record.get("heading"),
             "undid": edit_id,
-            "backup": _backup(install_root, source, prior_text, edit_id_new),
+            "backup": _backup(scope.ledger_root, source, prior_text, edit_id_new),
             "restored_to": backup_rel if backup_rel is not None else "<absent>",
         }
-        _append_audit(install_root, audit)
+        _append_audit(scope.ledger_root, audit)
 
         if restored is None:
             if path.is_file():
@@ -945,7 +1076,7 @@ def _apply_undo(install_root: Path, req: dict[str, Any], now: str | None) -> dic
 
 
 def _commit(
-    install_root: Path,
+    scope: WriteScope,
     *,
     source: str,
     heading: str | None,
@@ -991,7 +1122,7 @@ def _commit(
             "consolidation/wrap landed) — reload and re-edit",
         )
     edit_id = uuid.uuid4().hex[:12]
-    backup_rel = _backup(install_root, source, prior_text, edit_id)
+    backup_rel = _backup(scope.ledger_root, source, prior_text, edit_id)
     record = {
         "id": edit_id,
         "ts": _now_iso(now),
@@ -1005,6 +1136,6 @@ def _commit(
         "prev_len": len(prior_text) if prior_text is not None else 0,
         "new_len": len(new_text),
     }
-    _append_audit(install_root, record)
+    _append_audit(scope.ledger_root, record)
     _atomic_write(path, new_text)
     return {"ok": True, "id": edit_id, "source": source, "heading": heading}

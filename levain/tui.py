@@ -10,7 +10,7 @@ the Unix-terminal-native one — no browser, no server, no port, no account.
 ``dashboard.build_substrate_view`` → a ``SubstrateView``, rendered straight off
 ``view.layout()`` (the schema-driven panel manifest — the IA + edit-class model
 live in Python on the substrate, so this surface CANNOT drift from what it
-edits). The write path is ``writes.apply_edit(install_root, req)`` — the SAME
+edits). The write path is ``writes.apply_edit(scope, req)`` — the SAME
 governed dispatcher the ``POST /edit`` handler calls. All the load-bearing
 governance (the Class-A allowlist, the destructive-verb ``confirm`` gate, the
 ``require=True`` continuity lock, the optimistic stale-check) lives INSIDE
@@ -626,7 +626,8 @@ def run_tui(path: Path, *, read_only: bool = False) -> int:
         print(f"Could not assemble the substrate view: {exc}", file=sys.stderr)
         return 1
 
-    install_root = source.install_root or path
     from levain import _tui_curses  # lazy: curses + the screen driver
 
-    return _tui_curses.main_loop(source, install_root, view, read_only=read_only)
+    # The write target is carried on the source (SubstrateSource.local sets write_scope
+    # from the install); main_loop derives read-only from write_scope + the flag.
+    return _tui_curses.main_loop(source, view, read_only=read_only)

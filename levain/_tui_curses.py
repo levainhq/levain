@@ -32,7 +32,6 @@ import shlex
 import subprocess
 import tempfile
 from dataclasses import replace
-from pathlib import Path
 
 from levain.dashboard import CLASS_A, CLASS_C, SubstrateSource, SubstrateView
 from levain.tui import (
@@ -69,7 +68,6 @@ _LEFT_W = 30  # panel-list column width (clamped to a third of the screen)
 
 def main_loop(
     source: SubstrateSource,
-    install_root: Path,
     view: SubstrateView,
     *,
     read_only: bool = False,
@@ -78,20 +76,25 @@ def main_loop(
     terminal is restored on any exit). The first view is built by the caller,
     pre-curses, so a startup fault never tears down the screen mid-frame.
 
-    ``read_only`` runs the inspect-only variant: ``_active_verbs`` advertises +
-    dispatches nothing and ``_apply`` refuses (the un-bypassable chokepoint) — a
-    pure inspection surface over a substrate with no governed write target."""
-    return curses.wrapper(_loop, source, install_root, view, read_only)
+    The write target is ``source.write_scope`` (the explicit governed write surface).
+    ``read_only`` forces the inspect-only variant; a source with ``write_scope is None``
+    is read-only too. Either way ``_active_verbs`` advertises + dispatches nothing and
+    ``_apply`` refuses (the un-bypassable chokepoint) — a pure inspection surface."""
+    return curses.wrapper(_loop, source, view, read_only)
 
 
 def _loop(
-    stdscr: "curses.window", source: SubstrateSource, install_root: Path,
+    stdscr: "curses.window", source: SubstrateSource,
     view: SubstrateView, read_only: bool = False,
 ) -> int:
     curses.curs_set(0)
     stdscr.keypad(True)
-    hint = "read-only cockpit · press ? for help" if read_only else "press ? for help"
-    model = TuiModel(view=view, status=hint, read_only=read_only)
+    # A substrate with no write scope is read-only EVEN IF the caller didn't pass
+    # read_only=True (NO THEATER: never advertise a verb nothing can honor). Fold the
+    # two into the model's read_only so the footer, dispatch, and _apply all agree.
+    effective_read_only = read_only or source.write_scope is None
+    hint = "read-only cockpit · press ? for help" if effective_read_only else "press ? for help"
+    model = TuiModel(view=view, status=hint, read_only=effective_read_only)
     show_help = False
 
     while True:
@@ -142,7 +145,7 @@ def _loop(
             # (the same set the footer advertised). An unbound key does nothing.
             verbs = {v.key: v for v in _active_verbs(model)}
             if 0 <= ch < 256 and chr(ch) in verbs:
-                model = _handle_verb(stdscr, model, install_root, source, verbs[chr(ch)])
+                model = _handle_verb(stdscr, model, source, verbs[chr(ch)])
 
 
 def _body_height(stdscr: "curses.window") -> int:
@@ -187,18 +190,18 @@ def _rebuild(model: TuiModel, source: SubstrateSource, status: str) -> TuiModel:
 # ---------------------------------------------------------------------------
 
 def _handle_verb(
-    stdscr: "curses.window", model: TuiModel, install_root: Path,
+    stdscr: "curses.window", model: TuiModel,
     source: SubstrateSource, verb: Verb,
 ) -> TuiModel:
     kind = verb.kind
     if kind == "edit":
-        return _handle_edit(stdscr, model, install_root, source)
+        return _handle_edit(stdscr, model, source)
 
     if kind == "spore_touch":
         s = current_spore(model)
         if s is None:
             return replace(model, status="no loop selected")
-        return _apply(model, install_root, source, build_touch_req(s.id), f"touched {s.id}")
+        return _apply(model, source, build_touch_req(s.id), f"touched {s.id}")
 
     if kind == "spore_descend":
         s = current_spore(model)
@@ -211,7 +214,7 @@ def _handle_verb(
             return replace(model, status="cancelled")
         if not _confirm(stdscr, f"compost {s.id} as '{chosen}'? (recoverable in anneal's resolved set)"):
             return replace(model, status="cancelled")
-        return _apply(model, install_root, source, build_descend_req(s.id, chosen), f"composted {s.id}")
+        return _apply(model, source, build_descend_req(s.id, chosen), f"composted {s.id}")
 
     if kind == "spore_ascend":
         s = current_spore(model)
@@ -227,7 +230,7 @@ def _handle_verb(
             return replace(model, status="cancelled")
         if not _confirm(stdscr, f"promote {s.id} → '{ref}' as '{chosen}'?"):
             return replace(model, status="cancelled")
-        return _apply(model, install_root, source, build_ascend_req(s.id, chosen, ref), f"promoted {s.id}")
+        return _apply(model, source, build_ascend_req(s.id, chosen, ref), f"promoted {s.id}")
 
     if kind == "episode_tombstone":
         e = current_episode(model)
@@ -235,7 +238,7 @@ def _handle_verb(
             return replace(model, status="no episode selected")
         if not _confirm(stdscr, f"tombstone {e.id}? content PERMANENTLY erased (only an audit row remains)"):
             return replace(model, status="cancelled")
-        return _apply(model, install_root, source, build_tombstone_req(e.id), f"tombstoned {e.id}")
+        return _apply(model, source, build_tombstone_req(e.id), f"tombstoned {e.id}")
 
     if kind == "undo":
         r = current_edit_record(model)
@@ -246,13 +249,13 @@ def _handle_verb(
         eid = r.get("id")
         if not isinstance(eid, str):
             return replace(model, status="⚠ that record has no id to undo")
-        return _apply(model, install_root, source, build_undo_req(eid), f"undid {eid}")
+        return _apply(model, source, build_undo_req(eid), f"undid {eid}")
 
     return model
 
 
 def _handle_edit(
-    stdscr: "curses.window", model: TuiModel, install_root: Path, source: SubstrateSource,
+    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
 ) -> TuiModel:
     """The Class-A ``[e]dit`` flow: load the section's current body, hand it to
     ``$EDITOR``, and apply the result with the original body as ``expected_body``
@@ -303,11 +306,11 @@ def _handle_edit(
     else:
         return replace(model, status="edit not wired for this panel kind")
 
-    return _apply(model, install_root, source, req, f"edited {label}")
+    return _apply(model, source, req, f"edited {label}")
 
 
 def _apply(
-    model: TuiModel, install_root: Path, source: SubstrateSource,
+    model: TuiModel, source: SubstrateSource,
     req: dict, ok_msg: str,
 ) -> TuiModel:
     """Run one ``apply_edit`` and re-seat the model. Success → rebuild + ok status;
@@ -319,8 +322,14 @@ def _apply(
         # _active_verbs already advertises + dispatches nothing; this is the single
         # un-bypassable chokepoint every write funnels through.
         return replace(model, status="read-only view — write verbs are suppressed")
+    scope = source.write_scope
+    if scope is None:
+        # Belt-and-suspenders: model.read_only already folds in `write_scope is None`
+        # (see _loop), so this is unreachable via the loop — but _apply is the
+        # un-bypassable chokepoint, so it refuses on its OWN state, not a caller flag.
+        return replace(model, status="this substrate has no write scope — read-only")
     try:
-        apply_edit(install_root, req)
+        apply_edit(scope, req)
     except EditError as exc:
         status = edit_error_status(exc.code, str(exc))
         if exc.code == "stale":

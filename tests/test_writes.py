@@ -25,7 +25,9 @@ from levain.dashboard import (
     _split_sections,
 )
 from levain.writes import (
+    _CONTINUITY_SOURCE,
     EditError,
+    WriteScope,
     apply_edit,
     recent_edits,
 )
@@ -129,6 +131,14 @@ def install(tmp_path: Path) -> Path:
     return _make_install(tmp_path)
 
 
+def _scope(install: Path) -> WriteScope:
+    """The WriteScope for an install. apply_edit now takes the explicit write surface;
+    ``from_install_root`` reproduces the pre-WriteScope install-convention derivation
+    (store paths by the .levain/memory.db stem, ledger + backups under .levain/), so
+    these tests exercise the same behavior through the new entry point."""
+    return WriteScope.from_install_root(install)
+
+
 def _world_section(req_heading: str, expected: str, new: str) -> dict:
     return {
         "kind": "config",
@@ -155,7 +165,7 @@ class TestClassEnforcement:
 
     def test_refuses_origin_edit(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "seed/origin.md", "heading": None,
                 "expected_body": ORIGIN, "new_body": "hacked",
             })
@@ -164,7 +174,7 @@ class TestClassEnforcement:
 
     def test_refuses_constitution_edit(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "seed/partnership.md", "heading": None,
                 "expected_body": CONSTITUTION, "new_body": "hacked",
             })
@@ -172,7 +182,7 @@ class TestClassEnforcement:
 
     def test_refuses_unknown_source(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "seed/secrets.md", "heading": None,
                 "expected_body": "", "new_body": "x",
             })
@@ -181,7 +191,7 @@ class TestClassEnforcement:
     def test_refuses_path_escape(self, install: Path) -> None:
         # Even if an allowlist match were faked, the path-confinement refuses ../.
         with pytest.raises(EditError):
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "../escape.md", "heading": None,
                 "expected_body": "", "new_body": "x",
             })
@@ -189,7 +199,7 @@ class TestClassEnforcement:
     def test_world_section_with_null_heading_refused(self, install: Path) -> None:
         # world.md has no (source, heading=None) Class-A doc — only per-section docs.
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "seed/world.md", "heading": None,
                 "expected_body": WORLD, "new_body": "x",
             })
@@ -200,7 +210,7 @@ class TestClassEnforcement:
 
 class TestSectionEdit:
     def test_replaces_only_target_section(self, install: Path) -> None:
-        res = apply_edit(install, _world_section(
+        res = apply_edit(_scope(install), _world_section(
             "How They Think", "First principles, ordered effects.", "Topological space."
         ))
         assert res["ok"]
@@ -217,27 +227,27 @@ class TestSectionEdit:
         assert out.index("## Identity") < out.index("## How They Think") < out.index("## Communication")
 
     def test_edit_first_section(self, install: Path) -> None:
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New identity."))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New identity."))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "New identity." in out
         assert "# Who Your Operator Is" in out
         assert "First principles" in out
 
     def test_edit_last_section(self, install: Path) -> None:
-        apply_edit(install, _world_section("Communication", "Direct, profanity welcome.", "Terse."))
+        apply_edit(_scope(install), _world_section("Communication", "Direct, profanity welcome.", "Terse."))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "Terse." in out
         assert "Phill. 46." in out
 
     def test_reparse_round_trips(self, install: Path) -> None:
         # After an edit the read layer re-parses the new body correctly.
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "X.\nY."))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "X.\nY."))
         docs = {d.key: d for d in _read_config_docs(install) if d.source == "seed/world.md"}
         ident = next(d for d in docs.values() if d.heading == "Identity")
         assert ident.body == "X.\nY."
 
     def test_empty_body_clears_section(self, install: Path) -> None:
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", ""))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", ""))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "## Identity" in out
         assert "Phill. 46." not in out
@@ -250,7 +260,7 @@ class TestSectionEdit:
         # section_not_found (422) path stays as defense for the benign TOCTOU where a
         # real section vanishes between the allowlist read and the replacement read.
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _world_section("Nonexistent", "", "x"))
+            apply_edit(_scope(install), _world_section("Nonexistent", "", "x"))
         assert ei.value.code == "not_editable"
         assert ei.value.http_status == 403
 
@@ -259,7 +269,7 @@ class TestSectionEdit:
         dup = WORLD + "\n## Identity\n\nduplicate.\n"
         (root / "seed" / "world.md").write_text(dup, encoding="utf-8")
         with pytest.raises(EditError) as ei:
-            apply_edit(root, _world_section("Identity", "Phill. 46. Columbus, OH.", "x"))
+            apply_edit(_scope(root), _world_section("Identity", "Phill. 46. Columbus, OH.", "x"))
         assert ei.value.code == "section_ambiguous"
 
 
@@ -268,20 +278,20 @@ class TestSectionEdit:
 class TestStaleCheck:
     def test_section_stale_409(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _world_section("Identity", "WRONG expected body", "x"))
+            apply_edit(_scope(install), _world_section("Identity", "WRONG expected body", "x"))
         assert ei.value.code == "stale"
         assert ei.value.http_status == 409
 
     def test_wholefile_stale_409(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "config", "source": "activation/posture.md", "heading": None,
                 "expected_body": "wrong", "new_body": "new posture",
             })
         assert ei.value.code == "stale"
 
     def test_wholefile_edit_ok(self, install: Path) -> None:
-        res = apply_edit(install, {
+        res = apply_edit(_scope(install), {
             "kind": "config", "source": "activation/posture.md", "heading": None,
             "expected_body": POSTURE, "new_body": "New posture prose.",
         })
@@ -293,57 +303,89 @@ class TestStaleCheck:
 
 class TestReversibility:
     def test_backup_and_audit_written(self, install: Path) -> None:
-        res = apply_edit(install, _world_section(
+        res = apply_edit(_scope(install), _world_section(
             "Identity", "Phill. 46. Columbus, OH.", "New."), now="2026-06-13T19:00:00+00:00")
-        edits = recent_edits(install)
+        edits = recent_edits(install / ".levain")
         assert len(edits) == 1
         rec = edits[0]
         assert rec["id"] == res["id"]
         assert rec["source"] == "seed/world.md"
         assert rec["heading"] == "Identity"
         assert rec["ts"] == "2026-06-13T19:00:00+00:00"
-        # the backup holds the prior file content verbatim
-        backup = install / rec["backup"]
+        # the backup holds the prior file content verbatim (rec["backup"] is relative to
+        # the ledger root — .levain/ for a from_install_root scope)
+        backup = install / ".levain" / rec["backup"]
         assert backup.is_file()
         assert backup.read_text(encoding="utf-8") == WORLD
 
     def test_newest_first(self, install: Path) -> None:
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
-        out1 = (install / "seed" / "world.md").read_text(encoding="utf-8")
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
         ident_body = "A."  # the new current body of Identity
-        apply_edit(install, _world_section("Identity", ident_body, "B."))
-        edits = recent_edits(install)
+        apply_edit(_scope(install), _world_section("Identity", ident_body, "B."))
+        edits = recent_edits(install / ".levain")
         assert len(edits) == 2
         # newest first: the second edit ("B.") is index 0
         assert edits[0]["new_sha256"] != edits[1]["new_sha256"]
 
     def test_undo_restores_prior(self, install: Path) -> None:
-        res = apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "Changed."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "Changed."))
         assert "Changed." in (install / "seed" / "world.md").read_text(encoding="utf-8")
-        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         restored = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert restored == WORLD
 
+    def test_undo_refuses_forged_non_backups_rel(self, install: Path) -> None:
+        # [L1 LOW] A forged audit record whose `backup` names a file OUTSIDE the backups
+        # tree (e.g. the audit log itself) must be REFUSED, never used as a restore source.
+        # The CAS gate runs first, so forge a REAL edit's record (new_sha256 stays valid)
+        # and tamper only its `backup` field — this exercises the prefix validation.
+        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        log = install / ".levain" / "edits.jsonl"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        rec = json.loads(lines[-1])
+        rec["backup"] = "edits.jsonl"  # inside the ledger, but NOT a backups-tree path
+        lines[-1] = json.dumps(rec)
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
+        assert ei.value.code == "corrupt_record" and ei.value.http_status == 422
+
+    def test_undo_refuses_backups_traversal(self, install: Path) -> None:
+        # [codex L3 HIGH] A backup rel that PASSES the `backups/` prefix but uses `..` to
+        # escape the subdir (`backups/../edits.jsonl`) must be refused — the prefix string
+        # is not enough; the RESOLVED path must stay under backups/. (CAS runs first, so
+        # forge a real edit's record and tamper only `backup`.)
+        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        log = install / ".levain" / "edits.jsonl"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        rec = json.loads(lines[-1])
+        rec["backup"] = "backups/../edits.jsonl"  # passes the prefix, escapes via ..
+        lines[-1] = json.dumps(rec)
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
+        assert ei.value.code == "corrupt_record" and ei.value.http_status == 422
+
     def test_undo_of_create_removes_file(self, install: Path) -> None:
         # First entity_name on a fresh install creates config.json (no prior).
-        res = apply_edit(install, {"kind": "entity_name", "value": "Aria"})
+        res = apply_edit(_scope(install), {"kind": "entity_name", "value": "Aria"})
         cfg = install / ".levain" / "config.json"
         assert cfg.is_file()
-        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert not cfg.is_file()
 
     def test_undo_unknown_id_404(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "undo", "edit_id": "deadbeef"})
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": "deadbeef"})
         assert ei.value.http_status == 404
 
     def test_no_tmp_files_left(self, install: Path) -> None:
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "X."))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "X."))
         leftovers = list((install / "seed").glob(".*tmp*"))
         assert leftovers == []
 
     def test_view_surfaces_recent_edits(self, install: Path) -> None:
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
         view = SubstrateSource.local(install).build()
         assert len(view.recent_edits) == 1
         assert view.recent_edits[0]["heading"] == "Identity"
@@ -354,14 +396,14 @@ class TestReversibility:
 
 class TestEntityName:
     def test_sets_config_json(self, install: Path) -> None:
-        res = apply_edit(install, {"kind": "entity_name", "value": "Aria"})
+        res = apply_edit(_scope(install), {"kind": "entity_name", "value": "Aria"})
         assert res["ok"]
         cfg = json.loads((install / ".levain" / "config.json").read_text(encoding="utf-8"))
         assert cfg["entity_name"] == "Aria"
 
     def test_dashboard_prefers_config_over_h1(self, install: Path) -> None:
         # origin.md H1 says "Aria"; set config to a different name → config wins.
-        apply_edit(install, {"kind": "entity_name", "value": "Sol"})
+        apply_edit(_scope(install), {"kind": "entity_name", "value": "Sol"})
         view = SubstrateSource.local(install).build()
         assert view.entity_name == "Sol"
 
@@ -370,24 +412,24 @@ class TestEntityName:
         assert view.entity_name == "Aria"  # from origin.md H1, no config yet
 
     def test_stale_409(self, install: Path) -> None:
-        apply_edit(install, {"kind": "entity_name", "value": "Aria"})
+        apply_edit(_scope(install), {"kind": "entity_name", "value": "Aria"})
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "entity_name", "value": "X", "expected": "WrongName"})
+            apply_edit(_scope(install), {"kind": "entity_name", "value": "X", "expected": "WrongName"})
         assert ei.value.code == "stale"
 
     def test_too_long_422(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "entity_name", "value": "z" * 200})
+            apply_edit(_scope(install), {"kind": "entity_name", "value": "z" * 200})
         assert ei.value.http_status == 422
 
     def test_control_chars_422(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "entity_name", "value": "bad\nname"})
+            apply_edit(_scope(install), {"kind": "entity_name", "value": "bad\nname"})
         assert ei.value.code == "bad_value"
 
     def test_empty_clears_name(self, install: Path) -> None:
-        apply_edit(install, {"kind": "entity_name", "value": "Aria"})
-        apply_edit(install, {"kind": "entity_name", "value": "", "expected": "Aria"})
+        apply_edit(_scope(install), {"kind": "entity_name", "value": "Aria"})
+        apply_edit(_scope(install), {"kind": "entity_name", "value": "", "expected": "Aria"})
         cfg = _read_levain_config(install)
         assert "entity_name" not in cfg
 
@@ -397,22 +439,22 @@ class TestEntityName:
 class TestInputValidation:
     def test_non_dict(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, ["not", "a", "dict"])  # type: ignore[arg-type]
+            apply_edit(_scope(install), ["not", "a", "dict"])  # type: ignore[arg-type]
         assert ei.value.http_status == 400
 
     def test_unknown_kind(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "drop_tables"})
+            apply_edit(_scope(install), {"kind": "drop_tables"})
         assert ei.value.code == "bad_kind"
 
     def test_missing_field(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "config", "source": "seed/world.md"})
+            apply_edit(_scope(install), {"kind": "config", "source": "seed/world.md"})
         assert ei.value.http_status == 400
 
     def test_oversize_body_413(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _world_section(
+            apply_edit(_scope(install), _world_section(
                 "Identity", "Phill. 46. Columbus, OH.", "z" * (256 * 1024 + 1)))
         assert ei.value.http_status == 413
 
@@ -427,7 +469,7 @@ class TestApparatusFixes:
         (root / "seed" / "world.md").write_bytes(WORLD.replace("\n", "\r\n").encode("utf-8"))
         ident = next(d for d in _read_config_docs(root) if d.heading == "How They Think")
         assert "\r" not in ident.body  # the read layer presents LF
-        res = apply_edit(root, _world_section("How They Think", ident.body, "Topological.\nSecond."))
+        res = apply_edit(_scope(root), _world_section("How They Think", ident.body, "Topological.\nSecond."))
         assert res["ok"]  # NOT a spurious 409
         out = (root / "seed" / "world.md").read_bytes()
         assert b"\r" not in out  # consistent LF, no stray \r (no mixed endings)
@@ -435,14 +477,14 @@ class TestApparatusFixes:
 
     def test_crlf_in_new_body_normalized(self, install: Path) -> None:
         # An untrusted client (curl) sending \r\n in new_body must not write mixed endings.
-        apply_edit(install, _world_section("Communication", "Direct, profanity welcome.", "Line A.\r\nLine B."))
+        apply_edit(_scope(install), _world_section("Communication", "Direct, profanity welcome.", "Line A.\r\nLine B."))
         out = (install / "seed" / "world.md").read_bytes()
         assert b"\r" not in out
         assert b"Line A.\nLine B." in out
 
     def test_section_break_rejected(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "text\n## Sneaky\nmore"))
+            apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "text\n## Sneaky\nmore"))
         assert ei.value.code == "section_break"
         assert ei.value.http_status == 422
 
@@ -453,7 +495,7 @@ class TestApparatusFixes:
 
         def attempt(i: int) -> str:
             try:
-                apply_edit(install, _world_section("Identity", expected, f"writer-{i}"))
+                apply_edit(_scope(install), _world_section("Identity", expected, f"writer-{i}"))
                 return "ok"
             except EditError as e:
                 return e.code
@@ -464,7 +506,7 @@ class TestApparatusFixes:
         # and get a clean 409 (no lost update, no torn audit).
         assert results.count("ok") == 1
         assert all(r in ("ok", "stale") for r in results)
-        assert len(recent_edits(install)) == 1  # exactly one edit landed
+        assert len(recent_edits(install / ".levain")) == 1  # exactly one edit landed
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert sum(f"writer-{i}" in out for i in range(8)) == 1  # one writer's content, not a mix
 
@@ -478,23 +520,23 @@ class TestApparatusFixes:
     def test_undo_refuses_stale_id_no_discard_of_newer(self, install: Path) -> None:
         # Two edits to the SAME file; undoing the OLDER one is refused (it would
         # silently discard the newer edit). Only the latest edit to a file undoes.
-        r1 = apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
-        r2 = apply_edit(install, _world_section("Communication", "Direct, profanity welcome.", "B."))
+        r1 = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
+        r2 = apply_edit(_scope(install), _world_section("Communication", "Direct, profanity welcome.", "B."))
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "undo", "edit_id": r1["id"]})
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": r1["id"]})
         assert ei.value.code == "stale" and ei.value.http_status == 409
         # the latest edit (r2) undoes cleanly; r1's change to the same file survives
-        res = apply_edit(install, {"kind": "undo", "edit_id": r2["id"]})
+        res = apply_edit(_scope(install), {"kind": "undo", "edit_id": r2["id"]})
         assert res["ok"]
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "A." in out and "Direct, profanity welcome." in out
 
     def test_cannot_double_undo(self, install: Path) -> None:
-        r = apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "Once."))
-        apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+        r = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "Once."))
+        apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
         # the file no longer matches r's result → a second undo of r is refused
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
         assert ei.value.code == "stale"
 
 
@@ -514,7 +556,7 @@ class TestStateEdit:
     def test_edit_state_happy_path_touches_only_state(self, install: Path) -> None:
         cont = _add_continuity(install)
         before = dict(_split_sections(CONTINUITY))
-        res = apply_edit(install, _state_req(before["State"], "**New focus.** Taper 73mg."))
+        res = apply_edit(_scope(install), _state_req(before["State"], "**New focus.** Taper 73mg."))
         assert res["ok"] and res["heading"] == "State"
         after = dict(_split_sections(cont.read_text(encoding="utf-8")))
         assert after["State"] == "**New focus.** Taper 73mg."
@@ -528,11 +570,11 @@ class TestStateEdit:
 
     def test_audit_records_kind_state(self, install: Path) -> None:
         _add_continuity(install)
-        apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "X."))
-        rec = recent_edits(install)[0]
+        apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"), "X."))
+        rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "state"
         assert rec["heading"] == "State"
-        assert rec["source"] == str(_CONTINUITY_REL)
+        assert rec["source"] == _CONTINUITY_SOURCE
         assert rec["backup"] is not None  # the prior State is recoverable
 
     @pytest.mark.parametrize(
@@ -542,7 +584,7 @@ class TestStateEdit:
         cont = _add_continuity(install)
         original = cont.read_text(encoding="utf-8")
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(_section_body(CONTINUITY, felt), "hacked", heading=felt))
+            apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, felt), "hacked", heading=felt))
         assert ei.value.code == "not_editable" and ei.value.http_status == 403
         assert cont.read_text(encoding="utf-8") == original  # nothing written
 
@@ -552,14 +594,14 @@ class TestStateEdit:
         # a harness wrap rewrote State since the operator loaded the page
         cont.write_text(CONTINUITY.replace(stale_expected, "**Wrapped.** newer."), encoding="utf-8")
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(stale_expected, "operator's edit"))
+            apply_edit(_scope(install), _state_req(stale_expected, "operator's edit"))
         assert ei.value.code == "stale" and ei.value.http_status == 409
 
     def test_undo_restores_state_and_preserves_felt_layer(self, install: Path) -> None:
         cont = _add_continuity(install)
         before = dict(_split_sections(CONTINUITY))
-        r = apply_edit(install, _state_req(before["State"], "edited."))
-        res = apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+        r = apply_edit(_scope(install), _state_req(before["State"], "edited."))
+        res = apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
         assert res["ok"]
         after = dict(_split_sections(cont.read_text(encoding="utf-8")))
         assert after["State"] == before["State"]  # restored
@@ -570,13 +612,13 @@ class TestStateEdit:
         # file) AFTER a State edit, undo refuses — it will not restore an old State
         # into a post-wrap file (a thread the linear history never held).
         cont = _add_continuity(install)
-        r = apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "edited state."))
+        r = apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"), "edited state."))
         wrapped = (cont.read_text(encoding="utf-8")
                    .replace("Phill is a paradox-holding ensemble mind.",
                             "Phill is a paradox-holding ensemble mind, re-consolidated."))
         cont.write_text(wrapped, encoding="utf-8")  # the consolidate touched the felt layer
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "undo", "edit_id": r["id"]})
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
         assert ei.value.code == "stale" and ei.value.http_status == 409
         # the wrap's consolidation stands — undo did not fork it
         assert "re-consolidated." in cont.read_text(encoding="utf-8")
@@ -584,14 +626,14 @@ class TestStateEdit:
     def test_section_break_guard(self, install: Path) -> None:
         _add_continuity(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"),
+            apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"),
                                            "ok\n## Patterns\ninjected"))
         assert ei.value.code == "section_break" and ei.value.http_status == 422
 
     def test_not_found_when_no_continuity(self, install: Path) -> None:
         # no continuity file yet (entity hasn't wrapped) → 404, not a crash
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req("", "first state"))
+            apply_edit(_scope(install), _state_req("", "first state"))
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
     def test_state_target_ignores_request_source(self, install: Path) -> None:
@@ -601,8 +643,8 @@ class TestStateEdit:
         seed_before = (install / "seed" / "origin.md").read_text(encoding="utf-8")
         req = _state_req(_section_body(CONTINUITY, "State"), "edited.")
         req["source"] = "seed/origin.md"  # attacker-supplied — must be ignored
-        res = apply_edit(install, req)
-        assert res["ok"] and res["source"] == str(_CONTINUITY_REL)
+        res = apply_edit(_scope(install), req)
+        assert res["ok"] and res["source"] == _CONTINUITY_SOURCE
         # origin.md untouched; the State write landed in the continuity file
         assert (install / "seed" / "origin.md").read_text(encoding="utf-8") == seed_before
         assert "edited." in dict(_split_sections(cont.read_text(encoding="utf-8")))["State"]
@@ -621,7 +663,7 @@ class TestStateEdit:
         # what the operator sees == what the write compares (both splitlines now)
         seen = _section_body(text, "State")
         assert seen == "line A\nline B"  # the rendered body, separator folded
-        res = apply_edit(install, _state_req(seen, "edited."))
+        res = apply_edit(_scope(install), _state_req(seen, "edited."))
         assert res["ok"]  # would have been a permanent 409 before the fix
         on_disk = cont.read_text(encoding="utf-8")
         assert dict(_split_sections(on_disk))["State"] == "edited."
@@ -639,7 +681,7 @@ class TestStateEdit:
         cont = _add_continuity(install)
         original = cont.read_text(encoding="utf-8")
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"),
+            apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"),
                                            f"ok{sep}## State{sep}shadow"))
         assert ei.value.code == "section_break" and ei.value.http_status == 422
         assert cont.read_text(encoding="utf-8") == original  # nothing written
@@ -666,12 +708,12 @@ class TestStateEdit:
 
         monkeypatch.setattr(W, "_edit_one_section", _inject_wrap)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(_section_body(CONTINUITY, "State"), "my edit"))
+            apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"), "my edit"))
         assert ei.value.code == "stale" and ei.value.http_status == 409
         # the wrap's consolidation STANDS — Levain refused, did not clobber it
         assert "re-consolidated." in cont.read_text(encoding="utf-8")
         # a refused edit leaves no spurious audit/backup record (CAS is pre-audit)
-        assert recent_edits(install) == []
+        assert recent_edits(install / ".levain") == []
 
 
 class TestContinuityLockWiring:
@@ -701,7 +743,7 @@ class TestContinuityLockWiring:
     def test_state_edit_takes_the_lock(self, install: Path, monkeypatch) -> None:
         _add_continuity(install)
         calls = self._spy(monkeypatch)
-        apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+        apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
         assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
 
     def test_state_edit_fails_closed_on_lockless_fs(self, install: Path, monkeypatch) -> None:
@@ -712,7 +754,7 @@ class TestContinuityLockWiring:
         monkeypatch.setattr(store_module, "fcntl", None)
         _add_continuity(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+            apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
         assert ei.value.code == "lock_unavailable" and ei.value.http_status == 503
         # the file must be UNTOUCHED — fail closed means no write happened
         cont = (install / _CONTINUITY_REL).read_text(encoding="utf-8")
@@ -720,25 +762,25 @@ class TestContinuityLockWiring:
 
     def test_config_edit_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
         calls = self._spy(monkeypatch)
-        apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
         assert calls == []
 
     def test_entity_name_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
         calls = self._spy(monkeypatch)
-        apply_edit(install, {"kind": "entity_name", "value": "Aria"})
+        apply_edit(_scope(install), {"kind": "entity_name", "value": "Aria"})
         assert calls == []
 
     def test_undo_of_state_takes_the_lock(self, install: Path, monkeypatch) -> None:
         _add_continuity(install)
-        res = apply_edit(install, _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
+        res = apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, STATE_HEADING), "New focus."))
         calls = self._spy(monkeypatch)  # spy only the undo
-        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
 
     def test_undo_of_config_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
-        res = apply_edit(install, _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
         calls = self._spy(monkeypatch)  # spy only the undo
-        apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+        apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert calls == []
 
 
@@ -768,37 +810,37 @@ def _add_episode(install: Path, *, content: str = "built the writable handle") -
 class TestSporeVerbs:
     def test_touch_is_non_destructive_and_updates_seen(self, install: Path) -> None:
         sid = _add_spore(install)
-        res = apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+        res = apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
         assert res["ok"] and res["action"] == "touch"
         # still open (touch never resolves) and recorded in the audit trail
         assert any(s["id"] == sid for s in _spore_store(install).list_open())
-        rec = recent_edits(install)[0]
+        rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "spore_touch" and rec["source"] == f"spore:{sid}"
         assert rec["undoable"] is False
 
     def test_descend_requires_confirm(self, install: Path) -> None:
         sid = _add_spore(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "spore_descend", "spore_id": sid, "spore_kind": "done"})
+            apply_edit(_scope(install), {"kind": "spore_descend", "spore_id": sid, "spore_kind": "done"})
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
         # refused → the spore is untouched (still open)
         assert any(s["id"] == sid for s in _spore_store(install).list_open())
 
     def test_descend_with_confirm_composts(self, install: Path) -> None:
         sid = _add_spore(install)
-        res = apply_edit(install, {
+        res = apply_edit(_scope(install), {
             "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
         })
         assert res["ok"]
         store = _spore_store(install)
         assert not any(s["id"] == sid for s in store.list_open()), "composted → gone from open"
-        rec = recent_edits(install)[0]
+        rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "spore_descend" and rec["verb_kind"] == "done"
 
     def test_descend_bad_kind_for_type(self, install: Path) -> None:
         sid = _add_spore(install, stype="task")  # task descend kinds = done/dropped/composted
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "spore_descend", "spore_id": sid, "spore_kind": "answered",  # question-only
                 "confirm": True,
             })
@@ -808,33 +850,33 @@ class TestSporeVerbs:
     def test_ascend_requires_ref(self, install: Path) -> None:
         sid = _add_spore(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project", "confirm": True,
             })
         assert ei.value.http_status == 400  # _require_str("ref") missing
 
     def test_ascend_with_ref_and_confirm(self, install: Path) -> None:
         sid = _add_spore(install)
-        res = apply_edit(install, {
+        res = apply_edit(_scope(install), {
             "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
             "ref": "projects/levain", "confirm": True,
         })
         assert res["ok"]
         assert not any(s["id"] == sid for s in _spore_store(install).list_open())
-        rec = recent_edits(install)[0]
+        rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "spore_ascend" and rec["ref"] == "projects/levain"
 
     def test_unknown_spore_id(self, install: Path) -> None:
         _add_spore(install)  # store exists, id doesn't
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {
+            apply_edit(_scope(install), {
                 "kind": "spore_descend", "spore_id": "spore-999", "spore_kind": "done", "confirm": True,
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
     def test_no_spore_store_yet(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "spore_touch", "spore_id": "spore-001"})
+            apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": "spore-001"})
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
 
@@ -842,40 +884,40 @@ class TestEpisodeTombstone:
     def test_requires_confirm(self, install: Path) -> None:
         eid = _add_episode(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid})
+            apply_edit(_scope(install), {"kind": "episode_tombstone", "episode_id": eid})
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
 
     def test_with_confirm_deletes_and_keeps_tombstone(self, install: Path) -> None:
         from anneal_memory import Store
 
         eid = _add_episode(install)
-        res = apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
+        res = apply_edit(_scope(install), {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
         assert res["ok"] and res["action"] == "tombstone"
         with Store(str(install / ".levain" / "memory.db"), read_only=True) as store:
             assert store.status().tombstone_count >= 1
-        rec = recent_edits(install)[0]
+        rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "episode_tombstone" and rec["undoable"] is False
 
     def test_unknown_episode_id(self, install: Path) -> None:
         _add_episode(install)  # db exists, id doesn't
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "episode_tombstone", "episode_id": "nope", "confirm": True})
+            apply_edit(_scope(install), {"kind": "episode_tombstone", "episode_id": "nope", "confirm": True})
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
 
 class TestClassBGovernance:
     def test_undo_refuses_a_verb_record(self, install: Path) -> None:
         sid = _add_spore(install)
-        res = apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+        res = apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "undo", "edit_id": res["id"]})
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert ei.value.code == "not_undoable" and ei.value.http_status == 400
 
     def test_no_crystal_retire_verb_exists(self, install: Path) -> None:
         # Fork 1 = A: a crystal is the entity's own consolidated wisdom (Class C),
         # never an operator button — there is no retire kind to dispatch.
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "crystal_retire", "name": "some_pattern", "confirm": True})
+            apply_edit(_scope(install), {"kind": "crystal_retire", "name": "some_pattern", "confirm": True})
         assert ei.value.code == "bad_kind" and ei.value.http_status == 400
 
 
@@ -896,7 +938,7 @@ class TestClassBRobustness:
         monkeypatch.setattr(W, "_append_audit", boom)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            res = apply_edit(install, {
+            res = apply_edit(_scope(install), {
                 "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
             })
         # committed op reports SUCCESS (not a 500) even though the edit-log line failed;
@@ -914,7 +956,7 @@ class TestClassBRobustness:
 
         monkeypatch.setattr(SporeStore, "touch", boom)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "spore_touch", "spore_id": sid})
+            apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
         assert ei.value.code == "store_unavailable" and ei.value.http_status == 503
 
     def test_tombstone_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
@@ -927,5 +969,85 @@ class TestClassBRobustness:
 
         monkeypatch.setattr(Store, "delete", boom)
         with pytest.raises(EditError) as ei:
-            apply_edit(install, {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
+            apply_edit(_scope(install), {"kind": "episode_tombstone", "episode_id": eid, "confirm": True})
         assert ei.value.code == "store_unavailable" and ei.value.http_status == 503
+
+
+# --- the WriteScope decoupling: a NON-install substrate (flow's own store) ----
+
+class TestExplicitPathsScope:
+    """The capability the Bridge write-enable rests on: a NON-install substrate —
+    ``install_root=None``, explicit anneal paths, a ledger NOT under any install —
+    exactly flow's own store (anneal at ~/.anneal-memory, spores in the repo, no
+    ``.levain/``). The governed write seam runs off the explicit paths, the ledger lands
+    where the scope says, and the seed/config kinds (which need an install) refuse cleanly.
+    The pre-WriteScope code re-derived every target from ``install_root/.levain`` — so
+    none of this was reachable; these tests lock the decoupling."""
+
+    @staticmethod
+    def _make(tmp_path: Path, *, continuity: bool = False, spores: bool = False):
+        """A WriteScope mirroring flow's N-of-1 layout: the anneal store in one dir, the
+        spores file in a SEPARATE 'repo' tree, the ledger under the repo's state dir —
+        and NO install_root. Returns ``(scope, spore_id|None)``."""
+        from anneal_memory.spores import SporeStore
+
+        from levain.dashboard import AnnealPaths
+
+        anneal_dir = tmp_path / "anneal"
+        repo_state = tmp_path / "repo" / "state"
+        anneal_dir.mkdir(parents=True, exist_ok=True)
+        repo_state.mkdir(parents=True, exist_ok=True)
+        paths = AnnealPaths(
+            episodic_db=anneal_dir / "memory.db",
+            continuity_md=anneal_dir / "memory.continuity.md",
+            crystal_json=anneal_dir / "memory.crystal.json",
+            spores_json=repo_state / "spores.json",  # the N-of-1 split (spores in the repo)
+        )
+        if continuity:
+            paths.continuity_md.write_text(CONTINUITY, encoding="utf-8")
+        sid = None
+        if spores:
+            sid = str(SporeStore(paths.spores_json).add(type="task", text="ship slice 1")["id"])
+        ledger = repo_state / "bridge"  # flow's chosen ledger home (state/bridge/)
+        return WriteScope(anneal=paths, ledger_root=ledger, install_root=None), sid
+
+    def test_state_edit_targets_explicit_out_of_tree_continuity(self, tmp_path: Path) -> None:
+        scope, _ = self._make(tmp_path, continuity=True)
+        res = apply_edit(scope, _state_req(_section_body(CONTINUITY, "State"), "explicit edit."))
+        assert res["ok"] and res["source"] == _CONTINUITY_SOURCE
+        # landed in the EXPLICIT continuity file — there is no install root anywhere
+        assert "explicit edit." in scope.anneal.continuity_md.read_text(encoding="utf-8")
+        # the ledger landed under the EXPLICIT ledger_root (flow's state/bridge/), and the
+        # backup is recoverable there (resolved relative to ledger_root)
+        rec = recent_edits(scope.ledger_root)[0]
+        assert rec["kind"] == "state"
+        assert (scope.ledger_root / "edits.jsonl").is_file()
+        assert (scope.ledger_root / rec["backup"]).is_file()
+
+    def test_spore_touch_targets_explicit_spores_json(self, tmp_path: Path) -> None:
+        scope, sid = self._make(tmp_path, spores=True)
+        res = apply_edit(scope, {"kind": "spore_touch", "spore_id": sid})
+        assert res["ok"] and res["source"] == f"spore:{sid}"
+        rec = recent_edits(scope.ledger_root)[0]
+        assert rec["kind"] == "spore_touch" and rec["source"] == f"spore:{sid}"
+
+    def test_config_edit_refused_without_install_root(self, tmp_path: Path) -> None:
+        scope, _ = self._make(tmp_path)
+        with pytest.raises(EditError) as ei:
+            apply_edit(scope, _world_section("Identity", "x", "y"))
+        assert ei.value.http_status == 422 and ei.value.code == "no_install"
+
+    def test_entity_name_refused_without_install_root(self, tmp_path: Path) -> None:
+        scope, _ = self._make(tmp_path)
+        with pytest.raises(EditError) as ei:
+            apply_edit(scope, {"kind": "entity_name", "value": "flow"})
+        assert ei.value.code == "no_install"
+
+    def test_undo_state_edit_without_install_root(self, tmp_path: Path) -> None:
+        scope, _ = self._make(tmp_path, continuity=True)
+        before = scope.anneal.continuity_md.read_text(encoding="utf-8")
+        res = apply_edit(scope, _state_req(_section_body(CONTINUITY, "State"), "tweak."))
+        assert "tweak." in scope.anneal.continuity_md.read_text(encoding="utf-8")
+        undo = apply_edit(scope, {"kind": "undo", "edit_id": res["id"]})
+        assert undo["ok"]
+        assert scope.anneal.continuity_md.read_text(encoding="utf-8") == before

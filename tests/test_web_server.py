@@ -27,6 +27,7 @@ from levain.web_server import (
     make_server,
     run_web_server,
 )
+from levain.writes import WriteScope
 
 
 def _store_with_data(tmp_path: Path) -> SubstrateSource:
@@ -93,28 +94,31 @@ class TestSubstrateJson:
         assert len(data["open_spores"]) == 1
         assert data["sections"][0]["heading"] == "State"
 
-    def test_writable_flag_tracks_install_root(self, tmp_path: Path) -> None:
+    def test_writable_flag_tracks_write_scope(self, tmp_path: Path) -> None:
         # The frontend gates every edit affordance on `writable` (NO THEATER). A
-        # source with no install root (a read-only inspection cockpit, e.g. the flow
-        # self-ops cockpit) is non-writable, matching the server's POST /edit 422; a
-        # source WITH an install root is writable.
-        src = _store_with_data(tmp_path)  # install_root defaults to None
+        # source with no write_scope (a read-only inspection cockpit, e.g. the flow
+        # self-ops cockpit served read-only) is non-writable, matching the server's
+        # POST /edit 422; a source WITH a write_scope is writable.
+        src = _store_with_data(tmp_path)  # write_scope defaults to None
         assert json.loads(build_substrate_json(src))["writable"] is False
-        with_install = SubstrateSource(anneal=src.anneal, install_root=tmp_path)
-        assert json.loads(build_substrate_json(with_install))["writable"] is True
+        writable = SubstrateSource(
+            anneal=src.anneal, install_root=tmp_path,
+            write_scope=WriteScope.from_install_root(tmp_path),
+        )
+        assert json.loads(build_substrate_json(writable))["writable"] is True
 
     def test_no_install_source_flags_readonly_and_refuses_write(self, tmp_path: Path) -> None:
-        # The NO-THEATER coupling end-to-end: a source with no install root BOTH
+        # The NO-THEATER coupling end-to-end: a source with no write_scope BOTH
         # serves writable:false AND 422s POST /edit. Both read the same
-        # source.install_root, so they can't diverge — this locks that they don't
+        # source.write_scope, so they can't diverge — this locks that they don't
         # (catches a future do_POST/flag predicate split with all else green).
-        src = _store_with_data(tmp_path)  # install_root defaults to None
+        src = _store_with_data(tmp_path)  # write_scope defaults to None
         with _serving(src) as (base, _):
             _s, _h, body = _get(base + "/substrate.json")
             assert json.loads(body)["writable"] is False
             status, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
         assert status == 422
-        assert resp["error"] == "no_install"
+        assert resp["error"] == "read_only"
 
     def test_nonloopback_bind_gated_on_read_only(self, tmp_path: Path) -> None:
         # Non-loopback binding (a Tailscale/LAN IP) is allowed for a READ-ONLY source
@@ -123,14 +127,29 @@ class TestSubstrateJson:
         # 192.0.2.1 = TEST-NET-1 (RFC 5737): non-loopback, never a real interface.
         import pytest
 
-        ro = _store_with_data(tmp_path)  # install_root=None → read-only
-        writable = SubstrateSource(anneal=ro.anneal, install_root=tmp_path)
+        ro = _store_with_data(tmp_path)  # write_scope=None → read-only
+        writable = SubstrateSource(
+            anneal=ro.anneal, install_root=tmp_path,
+            write_scope=WriteScope.from_install_root(tmp_path),
+        )
         with pytest.raises(ValueError, match="loopback"):
             make_server(writable, host="192.0.2.1", port=0)  # guard fires BEFORE bind
         # the read-only source clears the guard, then fails to BIND the unroutable
         # address (OSError, not ValueError) — proving the guard was bypassed for it.
         with pytest.raises(OSError):
             make_server(ro, host="192.0.2.1", port=0)
+
+    def test_nonloopback_refused_for_install_bearing_readonly(self, tmp_path: Path) -> None:
+        # [codex L3 MED] An install-bearing but READ-ONLY source (install_root set,
+        # write_scope None) still holds seed/config = operator-PRIVATE data, so it must
+        # stay loopback-only too — matching the pre-WriteScope boundary that gated on
+        # install presence. Only a no-install no-write source may bind the mesh.
+        import pytest
+
+        src = _store_with_data(tmp_path)
+        install_ro = SubstrateSource(anneal=src.anneal, install_root=tmp_path)  # write_scope=None
+        with pytest.raises(ValueError, match="loopback"):
+            make_server(install_ro, host="192.0.2.1", port=0)
 
     def test_wildcard_and_public_bind_refused_for_any_source(self, tmp_path: Path) -> None:
         # A wildcard / public bind is refused for ANY source (read-only included) —
@@ -386,11 +405,14 @@ class TestLoopbackBindBoundary:
 
         from levain.web_server import make_server
 
-        # A WRITABLE source (install_root set) refuses non-loopback binds — its
+        # A WRITABLE source (write_scope set) refuses non-loopback binds — its
         # no-token localhost-sovereign write auth assumes loopback. (A READ-ONLY
         # source MAY bind non-loopback — TestSubstrateJson covers that half.)
         src = _store_with_data(tmp_path)
-        writable = SubstrateSource(anneal=src.anneal, install_root=tmp_path)
+        writable = SubstrateSource(
+            anneal=src.anneal, install_root=tmp_path,
+            write_scope=WriteScope.from_install_root(tmp_path),
+        )
         # non-wildcard, non-public, non-loopback → hits the writable loopback-only
         # guard (wildcard/public are refused for any source — separate test).
         for bad in ("192.168.1.5", "10.0.0.1", "::1"):  # ::1 = IPv6, Slice-2+ nicety

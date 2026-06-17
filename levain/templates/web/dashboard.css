@@ -375,6 +375,7 @@
   .name { color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
   .clause { color: var(--dim); font-size: 12px; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
   .tier { color: var(--operate); flex: 0 0 auto; font: 700 10px/1.6 var(--label); letter-spacing: .08em; text-transform: uppercase; }
+  .sid { color: var(--mind); flex: 0 0 auto; font: 600 11px/1.6 var(--label); letter-spacing: .03em; opacity: .92; }
   .etype { color: var(--identity); flex: 0 0 auto; font: 700 9px/1.7 var(--label); letter-spacing: .1em; text-transform: uppercase;
     border: 1px solid color-mix(in srgb, var(--identity) 30%, var(--line)); border-radius: 3px; padding: 0 5px; }
   .tags { color: color-mix(in srgb, var(--mind) 75%, var(--dim)); font-size: 11px; flex: 0 0 auto; opacity: .85; }
