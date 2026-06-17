@@ -231,6 +231,26 @@ class TestBuildView:
         assert v.open_spores[0].text == "an open loop"
         assert v.open_spores[0].tier == "hot"
 
+    def test_source_level_max_spores_threads_to_every_build(self, tmp_path: Path) -> None:
+        # [codex L3 MED] A source-level max_spores must apply to EVERY build() path —
+        # the web /substrate.json, the TUI refresh, and post-write rebuilds all call a
+        # BARE source.build(), not an explicit build(max_spores=) kwarg. Without the
+        # source-level field, "show ALL spores" silently reverts to the default cap after
+        # the first render.
+        from anneal_memory.spores import SporeStore
+
+        from levain.dashboard import SubstrateSource
+
+        db = tmp_path / "memory.db"
+        spores = SporeStore(tmp_path / "memory.spores.json")
+        for i in range(3):
+            spores.add(type="task", text=f"loop {i}", tier="hot", salience=2)
+        anneal = AnnealPaths.from_db(db)
+        capped = SubstrateSource(anneal=anneal, max_spores=2).build()  # source-level cap
+        assert len(capped.open_spores) == 2
+        uncapped = SubstrateSource(anneal=anneal).build()  # no cap → all three
+        assert len(uncapped.open_spores) == 3
+
     def test_max_spores_cap(self, tmp_path: Path) -> None:
         from anneal_memory.spores import SporeStore
 

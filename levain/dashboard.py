@@ -44,7 +44,10 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from levain.writes import WriteScope
 
 # anneal-memory is Levain's layer-1 dependency (pinned >=0.8 in pyproject); these
 # imports are in-process library calls, not a subprocess. Import lazily inside the
@@ -160,28 +163,63 @@ class SubstrateSource:
     anneal: AnnealPaths
     install_root: Path | None = None
     scope: str = "personal"
+    # The governed WRITE surface (the write-path peer, `writes.WriteScope`). Decoupled
+    # from `install_root` so a NON-install substrate (flow's own store — no `.levain/`)
+    # can still be writable. ``None`` → a read-only source (no write affordances, the
+    # `POST /edit` route 422s). ``.local()`` auto-derives it from the install; a bare /
+    # read-only inspection source leaves it ``None``.
+    write_scope: WriteScope | None = None
+    # Optional view-limit override carried ON the source so EVERY build() path respects
+    # it — the web /substrate.json, the TUI refresh, and post-write rebuilds all call a
+    # bare source.build(), not just the first render. None → build_substrate_view's own
+    # defaults apply. [codex L3 MED]
+    max_spores: int | None = None
+    # Surface-level branding override (entity name + masthead wordmark/model). The bridge
+    # flow-brands its cockpit; None → the view's derived entity + the renderers' Levain
+    # default chrome (so a bare Levain install is untouched).
+    entity_name: str | None = None
+    brand_wordmark: str | None = None
+    brand_model: str | None = None
 
     @classmethod
     def local(cls, install_root: str | Path) -> "SubstrateSource":
         """A Levain install keeps its anneal store at ``<install>/.levain/memory.db``
         (the convention ``doctor._match_store`` enforces) and its seed/config files
-        at the install root. Resolve both from the install directory."""
+        at the install root. Resolve both from the install directory — and derive the
+        governed write surface from the same install (so a local install is writable,
+        exactly as before the WriteScope decoupling)."""
+        from levain.writes import WriteScope  # lazy: avoid the dashboard↔writes cycle
+
         root = Path(str(install_root)).expanduser().resolve()
         return cls(
             anneal=AnnealPaths.from_db(root / ".levain" / "memory.db"),
             install_root=root,
             scope="personal",
+            write_scope=WriteScope.from_install_root(root),
         )
 
     def build(self, **kwargs: Any) -> "SubstrateView":
         """Assemble the view from this source. The single call entry points use,
-        so a team-commons source flows through unchanged."""
-        return build_substrate_view(
+        so a team-commons source flows through unchanged. A source-level ``max_spores``
+        is applied to EVERY build path (an explicit kwarg still wins)."""
+        if self.max_spores is not None:
+            kwargs.setdefault("max_spores", self.max_spores)
+        view = build_substrate_view(
             self.anneal,
             install_root=self.install_root,
+            ledger_root=self.write_scope.ledger_root if self.write_scope else None,
             scope=self.scope,
             **kwargs,
         )
+        # Surface branding override (the bridge flow-brands; a bare Levain install leaves
+        # these None → the view's derived entity + the renderers' own default chrome).
+        if self.entity_name is not None:
+            view.entity_name = self.entity_name
+        if self.brand_wordmark is not None:
+            view.brand_wordmark = self.brand_wordmark
+        if self.brand_model is not None:
+            view.brand_model = self.brand_model
+        return view
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +451,11 @@ class SubstrateView:
     paths: AnnealPaths
     scope: str = "personal"
     entity_name: str | None = None
+    # Optional masthead branding (the SURFACE's identity, not the substrate's). None →
+    # the renderers' Levain defaults. The bridge sets these to flow-brand its cockpit
+    # without forking the shared web assets / TUI chrome.
+    brand_wordmark: str | None = None
+    brand_model: str | None = None
     health: Health | None = None
     graph: AssociationGraph | None = None
     crystal_index: list[CrystalEntry] = field(default_factory=list)
@@ -512,6 +555,8 @@ class SubstrateView:
             },
             "scope": self.scope,
             "entity_name": self.entity_name,
+            "brand_wordmark": self.brand_wordmark,
+            "brand_model": self.brand_model,
             "health": self.health.to_dict() if self.health else None,
             "graph": self.graph.to_dict() if self.graph else None,
             "crystal_index": [c.to_dict() for c in self.crystal_index],
@@ -852,6 +897,7 @@ def build_substrate_view(
     *,
     today: date | None = None,
     install_root: Path | None = None,
+    ledger_root: Path | None = None,
     scope: str = "personal",
     graph_min_strength: float = 0.0,
     max_graph_nodes: int = 300,
@@ -1107,9 +1153,22 @@ def build_substrate_view(
             # (returns [] on any read fault) so it never propagates an error here.
             from levain.writes import recent_edits  # lazy: writes↔dashboard cycle
 
-            view.recent_edits = recent_edits(install_root)
+            # The edit-log ledger: prefer the scope's explicit ledger_root when given
+            # (so the READ surface matches where WRITES land — no read/write split), else
+            # the install convention <root>/.levain (byte-identical to the old
+            # recent_edits(install_root) on the same .levain/edits.jsonl). [L1 MED]
+            view.recent_edits = recent_edits(
+                ledger_root if ledger_root is not None else install_root / ".levain"
+            )
         except (OSError, ValueError) as exc:
             view.errors["config"] = f"{type(exc).__name__}: {exc}"
+    elif ledger_root is not None:
+        # A non-install substrate (flow's own store) has no seed/config surface but DOES
+        # carry an explicit ledger (its WriteScope.ledger_root) — surface its edit log so
+        # the cockpit shows the audit trail + undo affordances. recent_edits is fail-soft.
+        from levain.writes import recent_edits  # lazy: writes↔dashboard cycle
+
+        view.recent_edits = recent_edits(ledger_root)
 
     return view
 
@@ -1143,7 +1202,8 @@ def render_text(view: SubstrateView) -> str:
     the seed/config surface — from outside a session. Degraded tiers are named at
     the bottom, never silently dropped."""
     title = view.entity_name or view.paths.episodic_db.stem
-    out: list[str] = [f"Levain substrate — {title}", f"  store: {view.paths.episodic_db}", ""]
+    masthead = view.brand_model or "Levain substrate"
+    out: list[str] = [f"{masthead} — {title}", f"  store: {view.paths.episodic_db}", ""]
 
     h = view.health
     if h is not None:
@@ -1247,7 +1307,8 @@ def render_summary(view: SubstrateView) -> str:
     content/structuredContent split exists to prevent). Also the text-only
     fallback for hosts without MCP-Apps support."""
     title = view.entity_name or view.paths.episodic_db.stem
-    lines: list[str] = [f"Levain substrate — {title}"]
+    masthead = view.brand_model or "Levain substrate"
+    lines: list[str] = [f"{masthead} — {title}"]
 
     h = view.health
     if h is not None:

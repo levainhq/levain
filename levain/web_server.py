@@ -225,19 +225,20 @@ def build_substrate_json(source: SubstrateSource) -> bytes:
     ``SubstrateSource`` carries the install root, so the served view includes the
     seed/config surface (1.5), not just the anneal store.
 
-    ``writable`` is the transport's write capability — true only when the source has
-    an install root. With no install root (a read-only inspection source, e.g. the
-    flow self-ops cockpit over a store with no ``.levain`` install) the write route
-    ``POST /edit`` 422s server-side; this flag carries that SAME signal to the
-    frontend so it wires no ``commit`` and renders no edit affordances at all (NO
-    THEATER — one signal drives both the server refusal and the UI suppression)."""
+    ``writable`` is the transport's write capability — true only when the source carries
+    a ``write_scope`` (the governed write surface). A read-only inspection source (no
+    write_scope — e.g. the flow self-ops cockpit served read-only, or any source built
+    without one) makes the write route ``POST /edit`` 422 server-side; this flag carries
+    that SAME signal to the frontend so it wires no ``commit`` and renders no edit
+    affordances at all (NO THEATER — one signal drives both the server refusal and the
+    UI suppression)."""
     view = source.build()
     payload = view.to_dict()
     # `writable` is a transport capability, deliberately NOT a SubstrateView field;
     # guard the namespace so a future to_dict() field of the same name can't be
     # silently clobbered (caught in tests, never in prod — complement L3).
     assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
-    payload["writable"] = source.install_root is not None
+    payload["writable"] = source.write_scope is not None
     return json.dumps(payload).encode("utf-8")
 
 
@@ -369,7 +370,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # source can't honor (codex L3). Same predicate as build_substrate_json.
                 body = json.dumps({
                     "paths": {},
-                    "writable": self.server.levain_source.install_root is not None,
+                    "writable": self.server.levain_source.write_scope is not None,
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:
@@ -479,15 +480,17 @@ class _Handler(BaseHTTPRequestHandler):
                     {"error": "bad_json", "message": "body is not valid JSON"}, 400
                 )
                 return
-            install_root = self.server.levain_source.install_root
-            if install_root is None:
+            scope = self.server.levain_source.write_scope
+            if scope is None:
+                # Distinct from writes.py's `no_install` (a writable source whose seed/
+                # config kinds need an install): this is the WHOLE source being read-only.
                 self._send_json(
-                    {"error": "no_install",
-                     "message": "no install root; nothing editable"}, 422
+                    {"error": "read_only",
+                     "message": "this source is read-only; nothing editable"}, 422
                 )
                 return
             try:
-                result = apply_edit(install_root, req)
+                result = apply_edit(scope, req)
             except EditError as exc:
                 self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -518,13 +521,15 @@ def make_server(
     how to report it. Separated from ``run_web_server`` so tests can drive a real
     bound server without the resolve/existence/print/browser/serve_forever wrapper.
 
-    Non-loopback binding (a LAN / Tailscale IP) is allowed ONLY for a READ-ONLY
-    source (``install_root is None``): the write route 422s and the frontend renders
-    read-only, so there is no unauthenticated WRITE surface to expose, and the
-    private mesh (e.g. Tailscale's WireGuard) is the access boundary. A WRITABLE
-    source stays loopback-only — its no-token localhost-sovereign write auth assumes
-    loopback, so off-loopback exposure waits for the Slice-2 write/auth boundary.
-    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind."""
+    Non-loopback binding (a LAN / Tailscale IP) is allowed ONLY for a READ-ONLY,
+    NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` — e.g. flow's
+    self-ops cockpit over a bare anneal store): the write route 422s (no unauthenticated
+    WRITE surface) and there is no seed/config (operator-profile) data to expose, so the
+    private mesh (e.g. Tailscale's WireGuard) is the access boundary. A WRITABLE source
+    (its no-token localhost-sovereign write auth assumes loopback) OR an install-bearing
+    source (its seed/config is operator-private — kept local, matching the pre-WriteScope
+    boundary that gated on install presence) stays loopback-only. Raises ``ValueError``
+    (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -533,14 +538,16 @@ def make_server(
             f"refusing to bind {host!r}: {reason}. Pass a SPECIFIC private interface "
             "IP (e.g. your Tailscale IP), not a wildcard or a public address."
         )
-    if not _is_loopback_host(host) and source.install_root is not None:
+    if not _is_loopback_host(host) and (
+        source.write_scope is not None or source.install_root is not None
+    ):
         raise ValueError(
-            f"refusing to bind {host!r}: a WRITABLE substrate is loopback-only "
-            "(127.0.0.1 / localhost). The no-token localhost-sovereign write boundary "
-            "(POST /edit) assumes loopback; off-loopback exposure of a writable install "
-            "waits for the Slice-2 write/auth boundary. A READ-ONLY source (no install "
-            "root) MAY bind a non-loopback address — e.g. a Tailscale IP — for "
-            "private-mesh access."
+            f"refusing to bind {host!r}: a WRITABLE or install-bearing substrate is "
+            "loopback-only (127.0.0.1 / localhost). A writable source's no-token "
+            "localhost-sovereign write boundary (POST /edit) assumes loopback; an "
+            "install-bearing source's seed/config is operator-private. Only a READ-ONLY, "
+            "NO-INSTALL source (no write_scope, no install_root) MAY bind a non-loopback "
+            "address — e.g. a Tailscale IP — for private-mesh access."
         )
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)

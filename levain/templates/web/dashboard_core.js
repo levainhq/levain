@@ -103,6 +103,17 @@
       entityEl.textContent = view.entity_name || stem.replace(/\.db$/, "");
       wireEntityName(entityEl, view);  // Class-A rename affordance (Slice 2a; commit-gated)
     }
+    // Masthead branding override (the surface's identity) — applied ONLY when the payload
+    // carries it, so a bare Levain install keeps the HTML-default wordmark/model chrome.
+    // The bridge sets these to flow-brand its cockpit.
+    if (view.brand_wordmark) {
+      const wm = document.querySelector(".brand .wordmark");
+      if (wm) wm.textContent = view.brand_wordmark;
+    }
+    if (view.brand_model) {
+      const md = document.querySelector(".brand .model");
+      if (md) md.textContent = view.brand_model;
+    }
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is
@@ -367,6 +378,10 @@
     const verbs = isVerbPanel(entry);
     for (const s of list) {
       const row = el("div", "row");
+      // the spore id is the common reference handle (how flow tracks + you name it,
+      // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
+      // shows the same id trailing (tui.render_panel_lines).
+      if (s.id) row.appendChild(el("span", "sid", s.id));
       if (s.tier) row.appendChild(el("span", "tier", `[${s.tier}]`));
       row.appendChild(el("span", "clause", s.text));
       if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
