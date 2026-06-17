@@ -648,3 +648,74 @@
   .verb-cancel:hover { color: var(--ink); border-color: var(--line-hot); }
   .verb-confirm:active, .verb-cancel:active { transform: translateY(1px); }
   .verb-confirm:disabled, .verb-cancel:disabled { opacity: .45; cursor: default; box-shadow: none; }
+
+  /* ── RESPONSIVE — the deck fits the hand ───────────────────────────────────
+     The chassis was built mobile-first: the grid already reflows 1→2→3 columns
+     at 760/1180px, and flex-wrap + minmax(0,1fr) + overflow-wrap hold every panel
+     on a phone without horizontal scroll. What a touch device needs beyond width
+     is what this block adds — nothing else changes. DESKTOP IS UNTOUCHED: every
+     rule is gated on a narrow viewport OR a coarse (touch) pointer, both inert
+     under a desktop mouse. No redesign — the mid-century-robotic chassis, the
+     living rings, and the glass/metal materiality are pixel-identical; the
+     controls just grow to a thumb. (Part (b), expand-to-modal, is its own slice.)
+     ─────────────────────────────────────────────────────────────────────────── */
+
+  /* the masthead Unit name is sized for a wide faceplate (21px); scale it down as
+     the viewport narrows so it doesn't dominate the brand on tablet/phone (Phill's
+     visual gate). Width-gated — a tablet with a mouse wants it too; desktop ≥1180px
+     keeps the approved 21px. max-width cascade: 1180 first, 760 overrides under it. */
+  @media (max-width: 1180px) { .entity { font-size: 17px; } }
+
+  /* narrow viewports — reclaim the side gutter a phone can't spare (the deck is
+     max-width:1320px/auto-margin, so on a phone it's full-width minus this pad);
+     the Unit name scales down once more. */
+  @media (max-width: 760px) {
+    body { padding: 12px 11px 48px; }
+    .entity { font-size: 15px; }
+  }
+
+  /* touch-primary devices (iPhone / iPad / touch laptops report pointer:coarse,
+     independent of width — so iPad gets comfortable targets at its 2-col width too).
+     Tap targets grow via PADDING + a min-height floor: padding keeps the existing
+     flex/baseline alignment intact, and native <button>s center their own label so
+     no display change is needed (which would have disturbed the "✎ "/"↶ " glyphs).
+     The smallest control labels bump up a hair so the bigger target is also legible. */
+  @media (pointer: coarse) {
+    .tab,
+    button#refresh,
+    .expander,
+    .edit-btn,
+    .name-edit,
+    .edit-save,
+    .edit-cancel,
+    .undo-btn,
+    .verb-btn,
+    .verb-confirm,
+    .verb-cancel,
+    .scope-tb,
+    .scope-ch { min-height: 38px; }
+
+    .verb-btn { padding: 8px 12px; font-size: 10px; }
+    .undo-btn { padding: 8px 12px; font-size: 10px; }
+    .edit-btn, .name-edit { padding: 8px 12px; font-size: 10px; }
+    .verb-confirm, .verb-cancel { padding: 8px 13px; }
+    .scope-tb { padding: 8px 13px; font-size: 11px; }
+    .scope-ch { padding: 7px 10px; font-size: 10px; }
+    .tab { padding: 11px 16px; }
+    button#refresh { padding: 9px 14px; }
+    .expander { padding: 12px; font-size: 10.5px; }
+
+    /* iOS Safari fixes, gated to coarse so desktop is PROVABLY untouched (not
+       merely a no-op there — codex L3): 16px form fields stop the focus jump-zoom
+       (.name-input is already 18px; .edit-ta/.verb-ref/.verb-kind are the sub-16px
+       offenders); text-size-adjust:100% stops body-text auto-inflation on a
+       landscape rotation. */
+    .edit-ta,
+    .verb-ref,
+    .verb-kind { font-size: 16px; }
+    /* tap-target floor on the focusable fields. .name-input (the masthead rename)
+       is 18px so it needs no zoom-fix, but its base height is ~30px — under the
+       floor — so it gets min-height here for a consistent thumb target (L3: complement). */
+    .name-input, .verb-kind, .verb-ref { min-height: 38px; }
+    html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  }
