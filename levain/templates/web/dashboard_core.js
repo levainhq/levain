@@ -47,6 +47,9 @@
       head.appendChild(el("span", "chip chip-" + entry.edit_class, entry.edit_class));
     }
     if (entry.source) head.appendChild(el("span", "src", entry.source));
+    // dense kinds get a ⤢ control in the header → a focused, full-screen re-render
+    // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph/edits don't need it.
+    if (entry.kind && CLAMP_KINDS.has(entry.kind)) head.appendChild(buildExpandBtn(entry));
     p.appendChild(head);
     return p;
   };
@@ -80,6 +83,22 @@
     ["mind", "Mind"],
   ];
 
+  // ---- expand-to-modal state (Slice 2) ----
+  // `currentView` is the last view render() drew — the focus-modal re-projects from
+  // it (so a governed verb fired inside the modal reflects on the next render()).
+  // `modalKey` is the entryKey of the expanded panel (null = closed); `modalReturnFocus`
+  // is the ⤢ trigger to restore focus to on close; `modalEpisodeQuery` persists the
+  // modal's episode search across refresh-rebuilds (the supersede — see renderEpisodes).
+  let currentView = null;
+  let modalKey = null;
+  let modalReturnFocus = null;
+  let modalEpisodeQuery = "";
+  // The scroll position to re-apply after a modal refresh-rebuild. For the episode
+  // panel the result list arrives async (a /recall.json fetch), so buildModal's
+  // synchronous restore clamps to 0 — the episode renderer re-applies this once its
+  // rows land. null = don't restore (cleared on a fresh user search → resets to top).
+  let modalRestoreScroll = null;
+
   // ---------------------------------------------------------------- render ----
   function render(view, opts) {
     // The surface injects its write transport here; a port that provides none (the
@@ -94,6 +113,7 @@
     const storeEl = document.getElementById("store");
     if (!view || typeof view !== "object") {
       board.appendChild(el("p", "empty", "No substrate data delivered."));
+      closeModal();  // don't leave a focus-modal open over a view we can't render
       return;
     }
     const paths = view.paths || {};
@@ -155,6 +175,11 @@
         for (const b of board.querySelectorAll(".pbody.clamped")) measureOverflow(b);
       });
     }
+    // The open focus-modal (if any) re-projects from this same fresh view, so a
+    // governed verb fired INSIDE it reflects at once and it stays put (its place +
+    // its episode search are kept — the inline reset is superseded).
+    currentView = view;
+    if (modalKey) refreshModal();
   }
 
   // Long modules get a BOUNDED body that scrolls within itself past a max-height
@@ -223,13 +248,14 @@
 
   // Dispatch a single manifest entry to its renderer. Singleton kinds read their
   // data from the matching view field; indexed kinds (config/section) use `ref`.
-  function renderPanel(entry, view) {
+  // `opts` (modal context) is forwarded to the kinds that vary in the focus modal.
+  function renderPanel(entry, view, opts) {
     switch (entry.kind) {
       case "health": return renderHealth(entry, view);
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
       case "spores": return renderSpores(entry, view);
-      case "episodes": return renderEpisodes(entry, view);
+      case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
       case "config": return renderConfig(entry, (view.config_docs || [])[entry.ref]);
@@ -446,12 +472,13 @@
     return row;
   }
 
-  function renderEpisodes(entry, view) {
+  function renderEpisodes(entry, view, opts) {
     const list = view.episodes || [];
     const p = panel(entry);
     const err = tierErr(view, "episodes");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     const verbs = isVerbPanel(entry);
+    const modal = !!(opts && opts.modal);
 
     // spore-107: inline keyword search over the episodic store, READ-ONLY. Enter runs
     // a /recall.json query and swaps the recent list for matches; clearing the box
@@ -473,7 +500,19 @@
     // Recompute the panel's overflow scent + keyboard affordance after the result set
     // changes (search shrinks/grows it) — the body is .pbody once finalizePanels has run
     // (a no-op on the initial render, where finalizePanels measures instead).
-    const reMeasure = () => { const b = results.closest(".pbody"); if (b) measureOverflow(b); };
+    const reMeasure = () => {
+      const b = results.closest(".pbody"); if (b) measureOverflow(b);
+      // In the modal, re-apply the scroll preserved across a refresh-rebuild ONCE the
+      // (async) results have landed — buildModal's synchronous restore clamps to 0 here,
+      // because the episode list arrives after the /recall.json round-trip. Cleared by
+      // capture() on user input, so a fresh user search still resets to the top.
+      if (modal && modalRestoreScroll != null) {
+        // one-shot: apply the preserved scroll exactly once, then clear — buildModal
+        // re-sets it on the next rebuild, so stale global state can't re-apply (codex L3).
+        const sc = results.closest(".modal-body");
+        if (sc) { sc.scrollTop = modalRestoreScroll; modalRestoreScroll = null; }
+      }
+    };
     const renderRows = (rows) => {
       results.replaceChildren();
       for (const e of rows) results.appendChild(episodeRow(e, verbs));
@@ -515,13 +554,26 @@
       reMeasure();  // result set changed → recompute the overflow scent + keyboard affordance
     };
 
-    input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); search(input.value); } });
+    // In the focus modal, the query PERSISTS across a refresh-rebuild (a verb fired
+    // inside the modal re-renders it): every keystroke is stashed in modalEpisodeQuery
+    // and, on rebuild, the box is restored + the search re-run — so tombstoning a hit
+    // keeps you IN your search (the grid panel's reset-to-recent is superseded). A
+    // no-op outside the modal (the grid panel keeps its documented reset behavior).
+    const capture = () => {
+      if (!modal) return;
+      modalEpisodeQuery = input.value.trim();
+      modalRestoreScroll = null;  // user is driving the search → don't fight their scroll
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); capture(); search(input.value); }
+    });
     // Emptying the box (backspace or the native search-clear ×) restores recent at once.
     // Any edit invalidates an in-flight search (seq++), so a late response never renders
     // under a changed box (codex L3); emptying also restores the recent list.
-    input.addEventListener("input", () => { seq++; if (!input.value.trim()) showRecent(); });
+    input.addEventListener("input", () => { seq++; capture(); if (!input.value.trim()) showRecent(); });
 
-    showRecent();
+    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; search(modalEpisodeQuery); }
+    else showRecent();
     return p;
   }
 
@@ -650,6 +702,16 @@
       body.dataset.editing = "";
     };
     cancel.addEventListener("click", restore);
+    // Escape cancels the edit (not the whole modal): stopPropagation keeps it from
+    // bubbling to the focus-modal's overlay listener, which would otherwise nuke the
+    // modal + the unsaved text. Mirrors the masthead rename's Escape→restore. While a
+    // save is in-flight (save disabled) Escape is swallowed but does NOT restore — else
+    // the pending commit would report into detached DOM (codex L3).
+    ta.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!save.disabled) restore();
+    });
     save.addEventListener("click", async () => {
       save.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
@@ -743,6 +805,14 @@
 
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
     cancel.addEventListener("click", close);
+    // Escape cancels the confirm-form, not the enclosing focus-modal (stopPropagation).
+    // No-op while the confirm is in-flight (go disabled), so a pending verb can't be
+    // closed out from under its commit / reopened for a double-submit (codex L3).
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
     go.addEventListener("click", async () => {
       const req = { kind: kind, spore_id: s.id, spore_kind: sel.value, confirm: true };
       if (needsRef) {
@@ -780,6 +850,14 @@
     host.appendChild(form);
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
     cancel.addEventListener("click", close);
+    // Escape cancels the confirm-form, not the enclosing focus-modal (stopPropagation).
+    // No-op while the tombstone is in-flight (go disabled) — same reason as the resolve
+    // form: don't close a pending commit out from under itself (codex L3).
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
     go.addEventListener("click", async () => {
       go.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
@@ -887,6 +965,189 @@
     const errs = view.errors || {};
     for (const k of Object.keys(errs)) p.appendChild(el("p", "err", `${k}: ${errs[k]}`));
     return p;
+  }
+
+  // ------------------------------------------------------------ focus modal ----
+  // Expand-to-modal (Slice 2): the ⤢ on a dense panel opens a focused, full-screen
+  // re-render of THAT panel — the SAME per-kind renderer, unbounded (no .clamped cap)
+  // and given the whole screen. So per-type functionality comes for free: the episode
+  // keyword-search becomes a roomy surface (search-into-modal, shape (c)), spore verbs
+  // and the in-place State edit work exactly as in the grid. It is a PURE projection
+  // of `currentView`, rebuilt on every render(), so a verb fired inside it reflects at
+  // once and it stays put. A read-only source (no commit) opens a read+search-only
+  // modal (NO THEATER — same as the grid panels).
+
+  // A stable identity for a layout entry, so a rebuild on re-render re-locates the
+  // SAME panel in the fresh view (the entry objects are new each fetch). Section/config
+  // panels are uniquely identified by their write-address (source + heading), so the key
+  // OMITS the list-index `ref` for them — a ref shift (a section added/removed above the
+  // expanded one between fetches) must NOT spuriously close the modal. Singleton kinds
+  // (episodes/spores/crystals/wraps/…) are unique by kind alone. JSON.stringify + a
+  // disjoint tag keeps the two key spaces from ever colliding.
+  const entryKey = (e) =>
+    e.source
+      ? JSON.stringify(["addr", e.kind, e.source, e.heading || ""])
+      : JSON.stringify(["one", e.kind]);
+
+  function findEntry(view, key) {
+    const layout = view && Array.isArray(view.layout) ? view.layout : [];
+    for (const e of layout) if (entryKey(e) === key) return e;
+    return null;
+  }
+
+  // The header ⤢ control (METAL — you grip it to act). Added in panel() for the dense
+  // kinds; the click opens the focus modal for this entry.
+  function buildExpandBtn(entry) {
+    const b = el("button", "pexpand");
+    b.type = "button";
+    b.title = "focus this panel";
+    b.setAttribute("aria-label", "expand " + (entry.title || "panel") + " to a focus view");
+    b.appendChild(el("span", "pexpand-ico", "⤢"));
+    b.addEventListener("click", () => openModal(entry, b));
+    return b;
+  }
+
+  function openModal(entry, triggerEl) {
+    modalKey = entryKey(entry);
+    modalReturnFocus = triggerEl || null;
+    modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
+    buildModal(entry);
+  }
+
+  // Build the modal's inner content: render the panel, transplant its body (sans the
+  // .phead — the modal supplies its own header), and re-attach the Class-A edit row if
+  // editable. buildEditRow's handler reads host.querySelector(".pbody") → the modal
+  // body, so editing works in-place exactly as the grid does. NOT clamped — the
+  // .modal-body is the scroll container, so the content reads at full height.
+  function modalContent(entry, view) {
+    const p = renderPanel(entry, view, { modal: true });
+    if (!p) return null;
+    const host = el("div", "modal-panel");
+    const phead = p.querySelector(".phead");
+    const body = el("div", "pbody modal-pbody");
+    if (phead) { while (phead.nextSibling) body.appendChild(phead.nextSibling); }
+    else { while (p.firstChild) body.appendChild(p.firstChild); }
+    host.appendChild(body);
+    if (p.dataset.editable === "1" && p._levainEdit) {
+      host.appendChild(buildEditRow(host, p._levainEdit.entry, p._levainEdit.doc));
+    }
+    return { host, zone: p.dataset.zone || "", title: entry.title || "", editClass: entry.edit_class || "" };
+  }
+
+  function buildModal(entry) {
+    const content = currentView ? modalContent(entry, currentView) : null;
+    if (!content) { closeModal(); return; }
+
+    let overlay = document.getElementById("levain-modal");
+    const firstOpen = !overlay;
+    if (!overlay) {
+      overlay = el("div", "modal-overlay");
+      overlay.id = "levain-modal";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.setAttribute("aria-labelledby", "levain-modal-title");
+      // backdrop-dismiss ONLY when both the press AND release land on the overlay
+      // itself (not the card) — robust against a text-selection drag that starts inside
+      // the card and ends on the backdrop, or vice-versa (neither dismisses).
+      let downOnBackdrop = false;
+      overlay.addEventListener("mousedown", (ev) => { downOnBackdrop = ev.target === overlay; });
+      overlay.addEventListener("mouseup", (ev) => {
+        if (downOnBackdrop && ev.target === overlay) closeModal();
+        downOnBackdrop = false;
+      });
+      overlay.addEventListener("keydown", onModalKeydown);
+      document.body.appendChild(overlay);
+      document.body.classList.add("modal-open");
+    }
+    // preserve scroll across a refresh-rebuild (a verb fired inside the modal) so a
+    // tombstone/compost doesn't yank a long list back to the top.
+    const prevBody = overlay.querySelector(".modal-body");
+    const prevScroll = prevBody ? prevBody.scrollTop : 0;
+    modalRestoreScroll = prevScroll;  // re-applied once async modal-episode rows land (reMeasure)
+
+    overlay.dataset.zone = content.zone;
+    const box = el("div", "modal");
+    const head = el("div", "modal-head");
+    const h = el("h2", null, content.title);
+    h.id = "levain-modal-title";
+    head.appendChild(h);
+    if (content.editClass) head.appendChild(el("span", "chip chip-" + content.editClass, content.editClass));
+    const close = el("button", "modal-close");
+    close.type = "button";
+    close.textContent = "✕";
+    close.title = "close";
+    close.setAttribute("aria-label", "close focus view");
+    close.addEventListener("click", closeModal);
+    head.appendChild(close);
+    const mbody = el("div", "modal-body");
+    // .modal-body is ALWAYS the scroll container (the panel renders unbounded inside it),
+    // so make it keyboard-focusable + named — a text-only panel (e.g. an expanded State
+    // section) has no other focusable child, and arrow-key scroll needs a focus target.
+    // (The grid bolts this affordance to an OVERFLOWING .pbody; here the cap lives on
+    // .modal-body, so the affordance moves with it — same a11y class as the Slice-1.5 catch.)
+    mbody.tabIndex = 0;
+    mbody.setAttribute("role", "region");
+    mbody.setAttribute("aria-label", (content.title || "panel") + " — scrollable content");
+    mbody.appendChild(content.host);
+    box.append(head, mbody);
+
+    // Focus management — capture the signal BEFORE replaceChildren detaches the focused
+    // element. After the detach, document.activeElement falls to <body>, so a contains()
+    // check run AFTER would ALWAYS be false → focus would yank to the close button on
+    // EVERY rebuild, defeating the intent (a verb-in-modal user loses their place each
+    // time). So: restore the episode SEARCH input across a rebuild (the search →
+    // tombstone → search triage flow keeps its place); else enter the dialog at the close
+    // button on first open OR when focus had been inside the modal; don't grab focus at
+    // all if it was outside the modal (a background refresh while the user is elsewhere).
+    // [complement + kimi L3 convergence — the bug L1/L2 reasoned about but mis-verified.]
+    const oldSearch = overlay.querySelector(".ep-search-input");
+    const wasSearchFocused = !!oldSearch && oldSearch === document.activeElement;
+    const hadModalFocus = overlay.contains(document.activeElement);
+    overlay.replaceChildren(box);
+    mbody.scrollTop = prevScroll;
+    const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
+    if (newSearch) newSearch.focus();
+    else if (firstOpen || hadModalFocus) close.focus();
+  }
+
+  function refreshModal() {
+    if (!modalKey) return;
+    const entry = findEntry(currentView, modalKey);
+    if (!entry) { closeModal(); return; }  // the panel vanished from the view → close
+    buildModal(entry);
+  }
+
+  function closeModal() {
+    const overlay = document.getElementById("levain-modal");
+    if (overlay) overlay.remove();
+    document.body.classList.remove("modal-open");
+    modalKey = null;
+    const rf = modalReturnFocus;
+    modalReturnFocus = null;
+    // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
+    // re-render may have replaced it — then focus simply falls to <body>, acceptable).
+    if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus();
+  }
+
+  function onModalKeydown(ev) {
+    if (ev.key === "Escape") { ev.preventDefault(); closeModal(); return; }
+    if (ev.key !== "Tab") return;
+    // a minimal focus trap — keep Tab within the dialog. Filter to VISIBLE nodes:
+    // an edit/verb trigger hidden via style.display="none" (not [disabled]) still
+    // matches the selector but can't take focus, so leaving it as first/last would
+    // break the wrap and let Tab escape the dialog (codex L3). getClientRects().length
+    // is 0 for a display:none element.
+    const overlay = document.getElementById("levain-modal");
+    if (!overlay) return;
+    const f = Array.prototype.filter.call(
+      overlay.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), ' +
+        'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'),
+      (n) => n.getClientRects().length > 0);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1], active = document.activeElement;
+    if (ev.shiftKey && (active === first || !overlay.contains(active))) { ev.preventDefault(); last.focus(); }
+    else if (!ev.shiftKey && (active === last || !overlay.contains(active))) { ev.preventDefault(); first.focus(); }
   }
 
   // ----------------------------------------------------------- zone tabs ----

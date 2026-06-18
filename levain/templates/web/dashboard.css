@@ -412,7 +412,12 @@
      the panel-body edges (a real pinned toolbar) so scrolled rows pass cleanly under it. */
   .ep-search { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
     position: sticky; top: 0; z-index: 2; background: var(--panel);
-    margin: -11px -13px 0; padding: 11px 13px 15px; }
+    margin: -11px -13px 0; padding: 11px 13px 12px;
+    /* a hard bottom edge + a downward drop-shadow so the pinned bar reads as a distinct
+       FLOATING layer — without it, a row scrolled up to the bar's bottom abuts it with no
+       delineation and looks tucked UNDER the search box (Phill's visual gate, twice). */
+    border-bottom: 1px solid var(--line-hot);
+    box-shadow: 0 6px 9px -7px rgba(0,0,0,.7); }
   .ep-search-input { flex: 1 1 150px; min-width: 0; background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; font: 12px/1.4 var(--mono);
     -webkit-appearance: none; appearance: none; }
@@ -421,6 +426,12 @@
     box-shadow: 0 0 12px -4px var(--mind); }
   .ep-search-status { color: var(--faint); font-size: 10.5px; letter-spacing: .03em; flex: 0 0 auto; }
   .ep-results { display: flex; flex-direction: column; }
+  /* The grid search bar full-bleeds to the panel-body top via margin-top:-11px, which
+     also pulls the results list UP by 11px → the first episode overlapped the bar by
+     exactly 11px (measured gap -11 at rest). Push the grid results down to clear it (net
+     ~+7px). Grid-scoped (.clamped): the modal bar has no negative top margin, so its
+     results must NOT get this offset. [Phill's visual gate — measured, not guessed.] */
+  .pbody.clamped .ep-results { margin-top: 18px; }
 
   .note { color: var(--dim); font-size: 10.5px; margin-top: 9px; letter-spacing: .03em; }
   /* projection-history size delta (spore-093 v0): the projection regenerating */
@@ -753,4 +764,108 @@
        floor — so it gets min-height here for a consistent thumb target (L3: complement). */
     .name-input, .verb-kind, .verb-ref, .ep-search-input { min-height: 38px; }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  }
+
+  /* ── Slice 2: expand-to-modal — the FOCUS VIEW ──────────────────────────────
+     A dense panel, given the whole screen: the same panel renderer, unbounded, in a
+     chassis-styled dialog over a dimmed deck. The ⤢ control is METAL (you grip it);
+     the dialog wears the panel's zone accent. Mobile-first — near-fullscreen on a
+     phone, where the grid cell is most cramped and the modal earns the most. The
+     scrim is OPAQUE (no backdrop-filter — the deck's own perf decision: a blur over
+     the animating rings re-samples every frame; the scrim occludes them instead).
+     ─────────────────────────────────────────────────────────────────────────── */
+
+  /* the ⤢ header control — small metal, inherits the panel's per-zone --accent. With
+     no `src` it auto-pushes itself to the header's right; WITH a src (config/section),
+     the src's own margin-left:auto already pushes the right-group, so the expander
+     just sits a hair to its right (the `.src ~ .pexpand` override below). */
+  .pexpand {
+    margin-left: auto; flex: 0 0 auto; align-self: center;
+    font: 700 12px/1 var(--mono); color: color-mix(in srgb, var(--accent) 72%, var(--dim));
+    background: linear-gradient(180deg, #131e1c, #0c1513);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line)); border-bottom-width: 2px;
+    border-radius: 3px; padding: 3px 7px; cursor: pointer; transition: all .13s ease;
+  }
+  .src ~ .pexpand { margin-left: 8px; }  /* src already pushed the right-group over */
+  .pexpand:hover { color: #06120c; background: var(--accent); box-shadow: 0 0 12px -4px var(--accent); }
+  .pexpand:active { transform: translateY(1px); }
+  .pexpand:focus-visible { outline: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line-hot)); outline-offset: 1px; }
+  .pexpand-ico { display: block; line-height: 1; }
+
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 50; display: flex; align-items: center;
+    justify-content: center; padding: 24px;
+    background: radial-gradient(120% 90% at 50% 0%, rgba(8,11,11,.82), rgba(6,9,9,.93));
+    animation: modalFade .16s ease-out both;
+  }
+  body.modal-open { overflow: hidden; }  /* lock the deck behind the focus view */
+
+  .modal {
+    --accent: var(--line-hot);
+    display: flex; flex-direction: column; width: min(900px, 100%); max-height: 88vh;
+    background: linear-gradient(180deg, #131d1b, #0c1413);
+    border: 1px solid var(--line-hot);
+    border-top: 2px solid color-mix(in srgb, var(--accent) 60%, var(--line-hot));
+    border-radius: 7px; overflow: hidden; position: relative;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.5), 0 30px 80px -30px #000, 0 0 40px -16px var(--accent);
+    animation: modalRise .2s cubic-bezier(.2,.7,.3,1) both;
+  }
+  .modal-overlay[data-zone="identity"] .modal { --accent: var(--identity); }
+  .modal-overlay[data-zone="operate"]  .modal { --accent: var(--operate); }
+  .modal-overlay[data-zone="mind"]     .modal { --accent: var(--mind); }
+
+  .modal-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 0 0 auto;
+    padding: 13px 16px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,.035), transparent);
+  }
+  .modal-head h2 {
+    font-family: var(--label); font-size: 13px; font-weight: 800; letter-spacing: .14em;
+    text-transform: uppercase; color: color-mix(in srgb, var(--accent) 65%, var(--ink)); margin: 0;
+  }
+  .modal-close {
+    margin-left: auto; flex: 0 0 auto; width: 32px; height: 32px;
+    font: 700 14px/1 var(--mono); color: var(--dim);
+    background: linear-gradient(180deg, #18241f, #0e1714);
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px;
+    cursor: pointer; transition: all .13s ease;
+  }
+  .modal-close:hover { color: #06120c; background: var(--hot); border-color: var(--hot); box-shadow: 0 0 14px -4px var(--hot); }
+  .modal-close:active { transform: translateY(1px); }
+  .modal-close:focus-visible { outline: 1px solid var(--mind); outline-offset: 1px; }
+
+  .modal-body {
+    flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+    scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--line-hot) transparent;
+    padding: 2px 2px 6px;
+  }
+  .modal-body::-webkit-scrollbar { width: 10px; }
+  .modal-body::-webkit-scrollbar-thumb { background: var(--line-hot); border-radius: 5px; border: 2px solid var(--panel); }
+  .modal-body::-webkit-scrollbar-track { background: transparent; }
+  .modal-pbody { padding: 12px 15px 14px; }
+  /* the focused episode search (shape (c)) — the inline box, given room: reset the
+     panel's edge-bleed negative margins, grow the field so it reads as the primary
+     action. The sticky pin tracks the .modal-body scroll. */
+  /* OPAQUE to its own bottom edge (matches the .modal card-top #131d1b) so scrolled
+     rows pass cleanly UNDER the pinned bar — a translucent tail let the first episode
+     bleed through (Phill's visual gate + L2 MED-2). Matches the grid bar's opaque rule. */
+  .modal-body .ep-search { position: sticky; top: 0; z-index: 2; margin: 0 0 8px;
+    padding: 6px 0 13px; background: #131d1b; }
+  .modal-body .ep-search-input { flex-basis: 280px; font-size: 15px; padding: 9px 12px; }
+  .modal-body .ep-search-status { font-size: 11.5px; }
+
+  @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes modalRise { from { opacity: 0; transform: translateY(10px) scale(.99); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .modal-overlay, .modal { animation: none; } }
+
+  /* mobile-first: the focus view goes (near-)fullscreen on a phone — the modal is most
+     valuable exactly where the grid cell is most cramped. 100dvh tracks iOS Safari's
+     dynamic toolbar so the card isn't clipped under it. */
+  @media (max-width: 760px) {
+    .modal-overlay { padding: 0; }
+    .modal { width: 100%; height: 100dvh; max-height: 100dvh; border-radius: 0; border-top-width: 3px; }
+  }
+  @media (pointer: coarse) {
+    .modal-close { width: 40px; height: 40px; }
+    .pexpand { min-height: 36px; padding: 7px 11px; }
   }
