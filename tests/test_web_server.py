@@ -221,6 +221,98 @@ class TestAssets:
         assert "fetch(" in boot
         assert "new App(" not in boot and "app.connect(" not in boot
 
+    def test_frontend_is_textcontent_only(self) -> None:
+        """Structural invariant (`structural_invariants_beat_discipline`): the render
+        core paints store data with textContent ONLY — never innerHTML — so a hostile
+        store value paints as inert text, never markup. The markdown renderer
+        (renderMarkdown, the highest-risk addition) lives under this same contract.
+        A regression that reaches for innerHTML/outerHTML/insertAdjacentHTML/
+        document.write in CODE (not a comment, not a string literal) fails the suite,
+        forever."""
+        import re
+
+        # Blank out /* … */ block comments (whole-file, newlines preserved so line numbers
+        # stay accurate) and string-literal CONTENTS (so a `//` inside a "http://…" URL is
+        # not mistaken for a comment start), THEN cut at the first real `//` line comment,
+        # THEN assert no banned token survives in the remaining code. [L1 + complement L3 — tighten]
+        block_re = re.compile(r"/\*.*?\*/", re.S)
+        str_re = re.compile(r'"(?:[^"\\]|\\.)*"' r"|'(?:[^'\\]|\\.)*'" r"|`(?:[^`\\]|\\.)*`")
+        banned = ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write")
+        for name in ("dashboard_core.js", "dashboard_boot.js"):
+            js = load_web_asset(name)
+            js = block_re.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), js)
+            for lineno, line in enumerate(js.splitlines(), 1):
+                code = str_re.sub('""', line)
+                ci = code.find("//")
+                if ci >= 0:
+                    code = code[:ci]
+                for tok in banned:
+                    assert tok not in code, (
+                        f"{name}:{lineno} uses {tok} in code (not a comment/string) — "
+                        "breaks the textContent-only render contract"
+                    )
+
+    def test_markdown_renderer_link_scheme_gated(self) -> None:
+        """The markdown prose renderer is wired into the section/config display and
+        gates link hrefs through an explicit scheme allowlist (mdSafeHref). Source-
+        level guard that the allowlist exists, names exactly the safe schemes, and is
+        the only path to a link href."""
+        core = load_web_asset("dashboard_core.js")
+        assert "function renderMarkdown" in core
+        assert "function sectionDisplay" in core
+        assert "sectionDisplay(" in core  # wired into the section/config panels
+        assert "function mdSafeHref" in core
+        for safe in ('"http"', '"https"', '"mailto"'):
+            assert safe in core, f"mdSafeHref allowlist missing {safe}"
+
+    def test_markdown_block_parser_does_not_spin(self, tmp_path: Path) -> None:
+        """L1 HIGH regression (behavioral, not source-presence): a fence-marker line
+        that no fence-opener accepts (``mdIsBlockStart`` flags it, but the fence regex
+        rejects an info string containing a backtick/tilde) used to leave ``i`` unmoved
+        → the block loop spun forever, freezing the tab. Drive the REAL extracted
+        renderMarkdown through node on those vectors with a hard timeout: a spin =
+        ``TimeoutExpired`` = test failure. Skips if node is unavailable (the behavioral
+        oracle needs a JS engine; the structural backstop in-source is the guarantee)."""
+        import shutil
+        import subprocess
+        from importlib.resources import files
+
+        node = shutil.which("node")
+        if node is None:
+            import pytest
+
+            pytest.skip("node not available — JS behavioral oracle skipped")
+
+        asset = str(files("levain") / "templates" / "web" / "dashboard_core.js")
+        driver = tmp_path / "spin_check.js"
+        driver.write_text(
+            r"""
+const fs = require("fs");
+const text = fs.readFileSync(process.argv[2], "utf8");
+const a = text.indexOf("MD-EXTRACT-START"), b = text.indexOf("MD-EXTRACT-END");
+const block = text.slice(text.lastIndexOf("\n", a) + 1, text.indexOf("\n", b) + 1);
+function mkEl(t){return {tagName:t,nodeType:1,className:"",_text:null,attrs:{},children:[],
+  set textContent(v){this._text=String(v);this.children=[];},get textContent(){return this._text;},
+  appendChild(c){this.children.push(c);return c;},setAttribute(k,v){this.attrs[k]=String(v);}};}
+const document={createElement:t=>mkEl(t),createTextNode:t=>({nodeType:3,_text:String(t)}),
+  createDocumentFragment:()=>({nodeType:11,tagName:null,children:[],appendChild(c){this.children.push(c);return c;}})};
+const el=(t,c,x)=>{const n=document.createElement(t);if(c)n.className=c;if(x!=null)n.textContent=String(x);return n;};
+const mod=new Function("document","el",block+"\nreturn {renderMarkdown};")(document,el);
+for (const v of ["```~foo","```js`x","~~~`","alpha\n```~x\nbeta","# ok\n```~\nmore"]) { mod.renderMarkdown(v); }
+console.log("OK");
+""",
+            encoding="utf-8",
+        )
+        # timeout kills a spin; the fix renders the stuck line as text and returns fast.
+        result = subprocess.run(
+            [node, str(driver), asset],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+
     def test_index_route(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
             status, headers, body = _get(base + "/")

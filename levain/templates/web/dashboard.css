@@ -400,6 +400,36 @@
   pre.section { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; overflow: visible;
     margin: 0; color: var(--ink); font: 12px/1.6 var(--mono); }
 
+  /* markdown-rendered prose (section/config display panels — display-renders,
+     edit-raw; dashboard_core.js renderMarkdown emits these classed elements). The
+     styling layers only HIERARCHY onto the mono/glass aesthetic — no new fonts. */
+  .section-display { color: var(--ink); font: 12px/1.6 var(--mono); overflow-wrap: anywhere; word-break: break-word; }
+  .section-display > :first-child { margin-top: 0; }
+  .section-display > :last-child { margin-bottom: 0; }
+  .md-p { margin: 0 0 9px; }
+  .md-h { font-weight: 600; line-height: 1.35; margin: 14px 0 6px; }
+  .md-h1 { font-size: 15px; color: var(--mind); }
+  .md-h2 { font-size: 13.5px; color: var(--mind); }
+  .md-h3 { font-size: 12.5px; color: var(--ink); }
+  .md-h4, .md-h5, .md-h6 { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .07em; }
+  .md-b { font-weight: 700; color: color-mix(in srgb, var(--ink) 78%, #fff); }
+  .md-i { font-style: italic; }
+  .md-link { color: var(--mind); text-decoration: underline; text-underline-offset: 2px;
+    text-decoration-color: color-mix(in srgb, var(--mind) 45%, transparent); }
+  .md-link:hover { text-decoration-color: var(--mind); }
+  .md-code-i { font-size: 11.5px; background: var(--bg); color: var(--operate);
+    border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; }
+  .md-pre { margin: 0 0 9px; background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
+    padding: 8px 10px; overflow-x: auto; overscroll-behavior-x: contain; }
+  .md-code-b { font-size: 11.5px; color: var(--ink); white-space: pre; }
+  .md-ul, .md-ol { margin: 0 0 9px; padding-left: 20px; }
+  .md-ul { list-style: none; }
+  .md-ul > .md-li::before { content: "▸ " / ""; color: var(--line-hot); margin-left: -14px; }
+  .md-li { margin: 0 0 3px; }
+  .md-ul .md-ul, .md-ul .md-ol, .md-ol .md-ul, .md-ol .md-ol { margin: 3px 0 4px; }
+  .md-quote { margin: 0 0 9px; padding: 1px 0 1px 11px; border-left: 2px solid var(--line-hot); color: var(--dim); }
+  .md-hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+
   .err { color: var(--hot); font-size: 11.5px; padding: 3px 0; }
   .err::before { content: "▲ "; }
   .empty { color: var(--faint); font-style: italic; font-size: 12px; }
