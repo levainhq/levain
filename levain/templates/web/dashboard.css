@@ -323,20 +323,36 @@
     color: color-mix(in srgb, var(--accent) 62%, var(--ink)); margin: 0;
   }
 
-  /* uniform content body (wrapped by finalizePanels) + click-to-expand */
+  /* uniform content body (wrapped by finalizePanels). Long modules are BOUNDED and
+     scroll within themselves past the cap (Slice 1.5): overscroll-contained so a
+     scroll doesn't chain to the page at the bounds, with a thin glass scrollbar. A short
+     panel stays its natural height (no scrollbar). No clamp-fade, no expander, no
+     expand-in-place reflow — the grid stays spatially stable. */
   .pbody { padding: 11px 13px 12px; }
   .pbody > svg { padding: 0; margin-top: -2px; }
-  .pbody.clamped { max-height: 232px; overflow: hidden; position: relative; }
-  .pbody.clamped::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 56px;
-    background: linear-gradient(transparent, rgba(14,21,20,.94)); pointer-events: none; }
-  .pbody.clamped.expanded { max-height: none; }
-  .pbody.clamped.expanded::after { display: none; }
-  .expander {
-    font: 700 9.5px/1 var(--label); letter-spacing: .16em; text-transform: uppercase;
-    color: color-mix(in srgb, var(--accent) 70%, var(--dim)); background: rgba(255,255,255,.02);
-    border: 0; border-top: 1px solid var(--line); width: 100%; padding: 7px; cursor: pointer; transition: all .13s ease;
+  .pbody.clamped { max-height: 480px; overflow-y: auto; overflow-x: hidden;
+    overscroll-behavior: contain; scrollbar-gutter: stable; position: relative;
+    scrollbar-width: thin; scrollbar-color: var(--line-hot) transparent; }
+  /* the scroll region is keyboard-focusable when it overflows (measureOverflow sets
+     tabindex) — a focus ring on keyboard focus only, so arrow-key scroll is visible. */
+  .pbody.clamped:focus-visible { outline: 1px solid color-mix(in srgb, var(--mind) 45%, var(--line-hot)); outline-offset: -2px; }
+  .pbody.clamped::-webkit-scrollbar { width: 9px; }
+  .pbody.clamped::-webkit-scrollbar-thumb { background: var(--line-hot); border-radius: 5px;
+    border: 2px solid var(--panel); }
+  .pbody.clamped::-webkit-scrollbar-track { background: transparent; }
+  /* "more below" cue: a subtle down-chevron pinned at the SCROLL BODY's bottom edge — an
+     absolute ::after on the position:relative .pbody, so it tracks the scroll viewport (not
+     the panel) and never drifts into a config/section panel's edit-row below it. Shown only
+     when the body overflows (.has-overflow) and hidden once scrolled to the end (.at-end) —
+     scroll-aware, so it telegraphs "scroll" instead of lingering like a vignette. A rotated
+     border (font-independent + crisp) over a soft glow; centered, clear of the scrollbar. */
+  .pbody.clamped.has-overflow:not(.at-end)::after {
+    content: ""; position: absolute; bottom: 6px; left: 50%; width: 7px; height: 7px;
+    transform: translateX(-50%) rotate(45deg);
+    border-right: 1.5px solid var(--mind); border-bottom: 1.5px solid var(--mind);
+    opacity: .82; pointer-events: none; z-index: 2;
+    filter: drop-shadow(0 1px 1px var(--panel)) drop-shadow(0 0 4px color-mix(in srgb, var(--mind) 45%, transparent));
   }
-  .expander:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 
   /* edit-class chip — a recessed status LED (armed/locked; lights up in Slice 2) */
   .chip {
@@ -391,7 +407,12 @@
   /* episode keyword-search (spore-107): the inline read-only search box on the
      episodes panel. Glass aesthetic — a thin mono field that lights to --mind (the
      cognition hue) on focus, matching .name-input's focus language. */
-  .ep-search { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 1px 0 9px; }
+  /* the search bar pins to the top of the (now-scrolling) episodes body so you can
+     search + scroll results without losing it; the negative margins bleed its bg to
+     the panel-body edges (a real pinned toolbar) so scrolled rows pass cleanly under it. */
+  .ep-search { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    position: sticky; top: 0; z-index: 2; background: var(--panel);
+    margin: -11px -13px 0; padding: 11px 13px 15px; }
   .ep-search-input { flex: 1 1 150px; min-width: 0; background: var(--bg); color: var(--ink);
     border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; font: 12px/1.4 var(--mono);
     -webkit-appearance: none; appearance: none; }
@@ -527,7 +548,7 @@
      button → POST /edit, save → the write layer, undo → restore a backup. Controls
      inherit the panel's per-zone --accent, so an Identity edit wears Identity teal. */
   /* the edit affordance: a small metal button on its own right-aligned row at the
-     panel BOTTOM (after the body + any expander) — consistent + light, not a heavy
+     panel BOTTOM (after the body) — consistent + light, not a heavy
      full-width bar, never wrapping in the header. `margin-top: auto` pins it to the
      panel's bottom EDGE: when a short panel is stretched tall by a neighbor (the grid
      stretches same-row panels), the dead space sits ABOVE the button, not below it. */
@@ -698,7 +719,6 @@
   @media (pointer: coarse) {
     .tab,
     button#refresh,
-    .expander,
     .edit-btn,
     .name-edit,
     .edit-save,
@@ -718,7 +738,6 @@
     .scope-ch { padding: 7px 10px; font-size: 10px; }
     .tab { padding: 11px 16px; }
     button#refresh { padding: 9px 14px; }
-    .expander { padding: 12px; font-size: 10.5px; }
 
     /* iOS Safari fixes, gated to coarse so desktop is PROVABLY untouched (not
        merely a no-op there — codex L3): 16px form fields stop the focus jump-zoom

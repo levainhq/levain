@@ -146,15 +146,57 @@
     if (view.errors && Object.keys(view.errors).length) {
       board.appendChild(renderErrors(view));
     }
-    finalizePanels(board);  // wrap content + clamp the long modules (no inner scroll)
+    finalizePanels(board);  // wrap content + bound the long modules (scroll within, no reflow)
     applyFilter();
+    // Webfonts can shift line metrics after first paint — recompute the scents once they
+    // settle so a panel that only overflows post-font-load still gets the cue + affordance.
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => {
+        for (const b of board.querySelectorAll(".pbody.clamped")) measureOverflow(b);
+      });
+    }
   }
 
-  // Long modules clamp to a fixed height with click-to-expand — so the page is a
-  // single scroll context (no inner-scroll wheel capture) AND heights stay uniform
-  // so the grid tiles cleanly instead of stair-stepping.
+  // Long modules get a BOUNDED body that scrolls within itself past a max-height
+  // (overscroll-contained so a scroll doesn't chain to the page at the panel's bounds,
+  // with a thin glass scrollbar) — the grid stays spatially stable (no expand-in-place
+  // reflow), short panels render at natural height (no wasted space, no scrollbar).
+  // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
+  // details-on-demand (the search box + the Slice-2 modal).
   const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores"]);
-  const CLAMP_PX = 232;
+
+  // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
+  // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
+  // no longer overflows (search shrinking results, font reflow) so the scent never goes stale.
+  // Reads layout synchronously; valid because render() builds into the live #board, so the
+  // .clamped max-height is actually applied (a detached board would read zero overflow).
+  function measureOverflow(body) {
+    const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 2;
+    const over = body.scrollHeight > body.clientHeight + 1;
+    body.classList.toggle("has-overflow", over);
+    // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
+    // scroll a text-only panel (no focusable child) — the affordance the expander gave.
+    if (over) {
+      body.tabIndex = 0;
+      body.setAttribute("role", "region");
+      const h = body.parentElement && body.parentElement.querySelector(".phead h2");
+      body.setAttribute("aria-label", (h && h.textContent ? h.textContent + " — " : "") + "scrollable");
+      // The "more below" chevron (CSS, gated on .has-overflow:not(.at-end)) hides once
+      // you've scrolled to the bottom — a down-arrow lingering with nothing below is worse
+      // than none. Wire the scroll→.at-end toggle once; finalizePanels builds a fresh
+      // .pbody each render, so no listener piles up across renders.
+      if (!body.dataset.scrollWired) {
+        body.dataset.scrollWired = "1";
+        body.addEventListener("scroll", () => body.classList.toggle("at-end", atEnd()), { passive: true });
+      }
+      body.classList.toggle("at-end", atEnd());  // recompute now (content size may have changed)
+    } else {
+      body.removeAttribute("tabindex");
+      body.removeAttribute("role");
+      body.removeAttribute("aria-label");
+      body.classList.remove("at-end");
+    }
+  }
 
   function finalizePanels(board) {
     for (const p of board.querySelectorAll(".panel")) {
@@ -163,19 +205,16 @@
       const body = el("div", "pbody");
       while (phead.nextSibling) body.appendChild(phead.nextSibling);
       p.appendChild(body);
-      // measure full height BEFORE clamping; only add the expander if it overflows
-      if (p.hasAttribute("data-clamp") && body.scrollHeight > CLAMP_PX + 28) {
+      // Bound the long modules — the CSS (max-height + overflow-y:auto) does the rest:
+      // a short panel stays natural height, an overflowing one scrolls inside itself.
+      if (p.hasAttribute("data-clamp")) {
         body.classList.add("clamped");
-        const btn = el("button", "expander", "▼ expand");
-        btn.type = "button";
-        btn.addEventListener("click", () => {
-          const open = body.classList.toggle("expanded");
-          btn.textContent = open ? "▲ collapse" : "▼ expand";
-        });
-        p.appendChild(btn);
+        // Overflow cue + keyboard affordance (see measureOverflow): a "more below" chevron
+        // + a focusable scroll region, shown only when the body actually exceeds the cap.
+        measureOverflow(body);
       }
       // editable Class-A config panels get their edit affordance on its own right-
-      // aligned row at the panel BOTTOM (after the pbody + any expander).
+      // aligned row at the panel BOTTOM (after the pbody).
       if (p.dataset.editable === "1" && p._levainEdit) {
         p.appendChild(buildEditRow(p, p._levainEdit.entry, p._levainEdit.doc));
       }
@@ -424,19 +463,26 @@
     input.setAttribute("aria-label", "search episodes by keyword");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
+    // finalizePanels reparents this into .pbody (the scroll container) — the sticky pin
+    // depends on that; if it ever lands outside .pbody, the sticky silently no-ops.
     p.appendChild(bar);
 
     const results = el("div", "ep-results");
     p.appendChild(results);
 
+    // Recompute the panel's overflow scent + keyboard affordance after the result set
+    // changes (search shrinks/grows it) — the body is .pbody once finalizePanels has run
+    // (a no-op on the initial render, where finalizePanels measures instead).
+    const reMeasure = () => { const b = results.closest(".pbody"); if (b) measureOverflow(b); };
     const renderRows = (rows) => {
       results.replaceChildren();
       for (const e of rows) results.appendChild(episodeRow(e, verbs));
     };
     const showRecent = () => {
       status.textContent = "";
-      if (list.length === 0) { results.replaceChildren(el("p", "empty", "no episodes yet")); return; }
-      renderRows(list);
+      if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
+      else renderRows(list);
+      reMeasure();
     };
 
     // Latest-query-wins: a slow earlier response must not clobber a newer one.
@@ -452,16 +498,21 @@
         const data = await res.json();
         if (mine !== seq) return;  // superseded by a newer query
         const rerr = data.errors && (data.errors.episodes || data.errors.server);
-        if (rerr) { results.replaceChildren(el("p", "err", "search unavailable — " + rerr)); status.textContent = ""; return; }
-        const eps = data.episodes || [];
-        status.textContent = eps.length + (eps.length === 1 ? " match" : " matches") + " · ⌫ to clear";
-        if (eps.length === 0) { results.replaceChildren(el("p", "empty", "no matches for “" + q + "”")); return; }
-        renderRows(eps);
+        if (rerr) {
+          results.replaceChildren(el("p", "err", "search unavailable — " + rerr));
+          status.textContent = "";
+        } else {
+          const eps = data.episodes || [];
+          status.textContent = eps.length + (eps.length === 1 ? " match" : " matches") + " · ⌫ to clear";
+          if (eps.length === 0) results.replaceChildren(el("p", "empty", "no matches for “" + q + "”"));
+          else renderRows(eps);
+        }
       } catch (e2) {
         if (mine !== seq) return;
         status.textContent = "";
         results.replaceChildren(el("p", "err", "search failed — " + (e2 && e2.message ? e2.message : e2)));
       }
+      reMeasure();  // result set changed → recompute the overflow scent + keyboard affordance
     };
 
     input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); search(input.value); } });
@@ -530,7 +581,7 @@
     p.appendChild(el("pre", "section", doc.body || ""));
     if (isEditablePanel(entry)) {
       // Mark + stash; the edit bar is appended at the panel BOTTOM in finalizePanels
-      // (a consistent position, after the pbody/expander — never wraps in the header).
+      // (a consistent position, after the pbody — never wraps in the header).
       p.dataset.editable = "1";
       p._levainEdit = { entry, doc };
     }
@@ -572,11 +623,9 @@
     if (!body || body.dataset.editing === "1") return;
     body.dataset.editing = "1";
     const pre = body.querySelector("pre.section");
-    const expander = p.querySelector(".expander");
     if (pre) pre.style.display = "none";
-    if (expander) expander.style.display = "none";
     row.style.display = "none";  // the row is the trigger; hide it while editing
-    body.classList.remove("clamped");  // show full text while editing
+    body.classList.remove("clamped");  // show full untruncated text while editing
 
     const editor = el("div", "editor");
     const ta = el("textarea", "edit-ta");
@@ -594,7 +643,9 @@
     const restore = () => {
       editor.remove();
       if (pre) pre.style.display = "";
-      if (expander) expander.style.display = "";
+      // re-bound after edit; .has-overflow is intentionally NOT recomputed here — cancel
+      // leaves content unchanged (the measure still holds) and save triggers a full re-render.
+      if (p.hasAttribute("data-clamp")) body.classList.add("clamped");
       row.style.display = "";
       body.dataset.editing = "";
     };
