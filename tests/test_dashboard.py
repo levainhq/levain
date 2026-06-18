@@ -18,6 +18,7 @@ from levain.dashboard import (
     _parse_sections,
     _truncate,
     build_substrate_view,
+    recall_episode_rows,
 )
 
 
@@ -757,3 +758,58 @@ class TestEntityNameExtraction:
 
         assert _h1_name_suffix("# Just A Title\nbody") is None
         assert _h1_name_suffix("no heading here") is None
+
+
+class TestRecallEpisodeRows:
+    """recall_episode_rows — the read-only keyword-search data layer (spore-107)."""
+
+    def _db(self, tmp_path: Path):
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            store.record("decided X because Y", "decision")
+            store.record("noticed Z about bridges", "observation")
+        return db
+
+    def test_keyword_matches_content(self, tmp_path: Path) -> None:
+        rows, err = recall_episode_rows(self._db(tmp_path), keyword="bridges", limit=10)
+        assert err is None
+        assert len(rows) == 1
+        assert "bridges" in rows[0].content
+
+    def test_row_shape_matches_panel(self, tmp_path: Path) -> None:
+        # search rows MUST carry the SAME field set as the recent-episodes panel
+        rows, _err = recall_episode_rows(self._db(tmp_path), keyword="decided", limit=10)
+        assert set(rows[0].to_dict()) == {"id", "timestamp", "type", "source", "content", "tags"}
+
+    def test_no_match_is_empty_not_error(self, tmp_path: Path) -> None:
+        rows, err = recall_episode_rows(self._db(tmp_path), keyword="zzznotpresent", limit=10)
+        assert err is None and rows == []
+
+    def test_empty_keyword_is_noop(self, tmp_path: Path) -> None:
+        # an empty keyword never asks the store to match everything
+        rows, err = recall_episode_rows(self._db(tmp_path), keyword="", limit=10)
+        assert err is None and rows == []
+
+    def test_missing_store_degrades_not_raises(self, tmp_path: Path) -> None:
+        rows, err = recall_episode_rows(tmp_path / "nope.db", keyword="x", limit=10)
+        assert rows == []
+        assert err is not None and "no anneal store" in err
+
+    def test_limit_caps_results(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            for i in range(5):
+                store.record(f"shared token episode {i}", "observation")
+        rows, _err = recall_episode_rows(db, keyword="shared token", limit=3)
+        assert len(rows) == 3
+
+    def test_keyword_over_cap_rejected(self, tmp_path: Path) -> None:
+        # an over-long keyword is refused (parity with the POST-body cap) rather than
+        # forcing an unbounded LIKE scan — degrades via the error channel, no rows
+        rows, err = recall_episode_rows(self._db(tmp_path), keyword="x" * 300, limit=10)
+        assert rows == []
+        assert err is not None and "too long" in err

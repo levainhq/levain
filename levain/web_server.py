@@ -54,10 +54,10 @@ Sovereignty boundary (load-bearing, not incidental):
 - **no dependencies, no CDN** — stdlib ``http.server`` + vanilla-JS assets served
   from package data. The dashboard renders with the network cable unplugged. A
   sovereign surface does not rent its client library either.
-- **explicit route allowlist** — GET/HEAD serve four read routes (``/`` + two
-  scripts + ``/substrate.json``); POST serves exactly one (``/edit``). No
-  filesystem mapping, so there is no path-traversal surface. Anything else is a
-  flat 404.
+- **explicit route allowlist** — GET/HEAD serve five read routes (``/`` + two
+  scripts + ``/substrate.json`` + the read-only ``/recall.json`` episode keyword
+  search); POST serves exactly one (``/edit``). No filesystem mapping, so there is
+  no path-traversal surface. Anything else is a flat 404.
 - **bounded concurrency** — the per-request store read and every write run under a
   bounded gate; past the cap a request gets a clean 503 rather than letting an
   unbounded thread pile-up exhaust the box.
@@ -72,12 +72,13 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from levain.dashboard import SubstrateSource, _resolve_source
+from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.writes import MAX_BODY_BYTES, EditError, apply_edit
 
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "build_recall_json",
     "build_substrate_json",
     "load_web_asset",
     "make_server",
@@ -86,6 +87,11 @@ __all__ = [
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7420
+
+# Cap on episode keyword-search results (spore-107). The recall route is a bounded
+# read like /substrate.json; a fixed ceiling keeps a broad keyword from returning an
+# unbounded payload. 100 matches is plenty for a triage glance — narrow for more.
+_RECALL_LIMIT = 100
 
 # The POST body is JSON wrapping an edit (its largest field, ``new_body``, is itself
 # capped at MAX_BODY_BYTES by the write layer). Cap the raw request a little above
@@ -242,6 +248,35 @@ def build_substrate_json(source: SubstrateSource) -> bytes:
     return json.dumps(payload).encode("utf-8")
 
 
+def build_recall_json(source: SubstrateSource, keyword: str) -> bytes:
+    """The ``/recall.json`` body: a read-only keyword search over the episodic store.
+
+    Same read discipline as ``build_substrate_json`` — a fresh ``read_only=True`` open
+    per request, here via ``recall_episode_rows`` (the data layer) — and the matched
+    episodes carry the SAME row shape as the recent-episodes panel, so the surface
+    renders search hits with identical markup. The result count is pinned to
+    ``_RECALL_LIMIT`` HERE (not a caller parameter — the payload bound is the route's, not
+    a caller's to widen, L3 complement). The route is read-only BY CONSTRUCTION:
+    ``recall_episode_rows`` opens the store read-only and there is no write path regardless
+    of the source's ``write_scope`` — so unlike ``/substrate.json`` this body carries no
+    ``writable`` capability bit (nothing to write).
+
+    On a store/data fault the body carries the error and DROPS any partial rows: a partial
+    search result reads as 'all the matches', which is misleading — so error WINS (the box
+    shows 'search unavailable'), never partial-rows-plus-error (L3 complement MED-1). It
+    never 500s."""
+    rows, error = recall_episode_rows(
+        source.anneal.episodic_db, keyword=keyword, limit=_RECALL_LIMIT
+    )
+    if error is not None:
+        return json.dumps(
+            {"keyword": keyword, "episodes": [], "count": 0, "errors": {"episodes": error}}
+        ).encode("utf-8")
+    return json.dumps(
+        {"keyword": keyword, "episodes": [r.to_dict() for r in rows], "count": len(rows)}
+    ).encode("utf-8")
+
+
 class _LevainHTTPServer(ThreadingHTTPServer):
     """A ``ThreadingHTTPServer`` carrying the substrate source, the cached static
     assets, and the Host-header allowlist. A typed subclass (rather than ad-hoc
@@ -256,7 +291,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """Serves the four read-only routes (GET + HEAD). Store paths, cached assets,
+    """Serves the five read-only routes (GET + HEAD). Store paths, cached assets,
     and the Host allowlist live on the typed server instance (``self.server``)."""
 
     # A tidy, modern protocol version (enables keep-alive + proper 1.1 behavior).
@@ -371,6 +406,31 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.dumps({
                     "paths": {},
                     "writable": self.server.levain_source.write_scope is not None,
+                    "errors": {"server": f"{type(exc).__name__}: {exc}"},
+                }).encode("utf-8")
+            finally:
+                self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", head=head)
+            return
+
+        if path == "/recall.json":
+            # Read-only keyword search over episodes (spore-107). Bounded like
+            # /substrate.json — the store read is the expensive part; past the cap → 503.
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(
+                    b"busy\n", "text/plain; charset=utf-8", status=503, head=head
+                )
+                return
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                keyword = parse_qs(urlsplit(self.path).query).get("keyword", [""])[0].strip()
+                body = build_recall_json(self.server.levain_source, keyword)
+            except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
+                body = json.dumps({
+                    "keyword": "",
+                    "episodes": [],
+                    "count": 0,
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:

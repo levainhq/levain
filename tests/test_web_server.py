@@ -775,3 +775,88 @@ class TestClassBRoute:
             })
         assert st == 200 and bt["action"] == "touch"
         assert se == 200 and be["action"] == "tombstone"
+
+
+class TestRecallJson:
+    """/recall.json — the read-only episode keyword-search route (spore-107)."""
+
+    def test_recall_matches_and_carries_no_writable_bit(self, tmp_path: Path) -> None:
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            status, headers, body = _get(base + "/recall.json?keyword=decided")
+        assert status == 200
+        assert headers["Content-Type"].startswith("application/json")
+        data = json.loads(body)
+        assert data["keyword"] == "decided"
+        assert data["count"] == 1
+        assert len(data["episodes"]) == 1
+        assert "decided" in data["episodes"][0]["content"]
+        # the read-only route carries NO write-capability bit (unlike /substrate.json)
+        assert "writable" not in data
+
+    def test_recall_no_match(self, tmp_path: Path) -> None:
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json?keyword=zzznotpresent")
+        data = json.loads(body)
+        assert data["count"] == 0 and data["episodes"] == []
+
+    def test_recall_empty_keyword_is_noop(self, tmp_path: Path) -> None:
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json?keyword=")
+        assert json.loads(body)["count"] == 0
+
+    def test_recall_absent_keyword_param(self, tmp_path: Path) -> None:
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json")
+        assert json.loads(body)["count"] == 0
+
+    def test_recall_caps_at_limit(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            for i in range(105):
+                store.record(f"capword episode {i}", "observation")
+        src = SubstrateSource(anneal=AnnealPaths.from_db(db))
+        with _serving(src) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json?keyword=capword")
+        # the route pins limit to _RECALL_LIMIT (100); the client cannot raise it
+        assert json.loads(body)["count"] == 100
+
+    def test_recall_surfaces_data_layer_error(self, tmp_path: Path, monkeypatch) -> None:
+        # a store/data fault from the data layer must reach the payload as
+        # errors.episodes (the box shows 'search unavailable'), never a 500
+        import levain.web_server as ws
+
+        monkeypatch.setattr(ws, "recall_episode_rows", lambda *a, **k: ([], "boom"))
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json?keyword=anything")
+        data = json.loads(body)
+        assert data["count"] == 0
+        assert data["errors"]["episodes"] == "boom"
+
+    def test_recall_rejects_post(self, tmp_path: Path) -> None:
+        # /recall.json is GET/HEAD only — the sole POST route is /edit. A POST must be
+        # refused (4xx), never silently handled.
+        import urllib.error
+
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            try:
+                _request(base + "/recall.json", method="POST",
+                         headers={"Content-Type": "application/json"})
+                raised = None
+            except urllib.error.HTTPError as e:
+                raised = e.code
+        assert raised is not None and raised >= 400
+
+    def test_recall_drops_partial_rows_on_error(self, tmp_path: Path, monkeypatch) -> None:
+        # MED-1 (L3): a mid-iteration data fault returns partial rows + an error; the
+        # search surface must show the error and DROP the partial rows (a partial result
+        # reads as 'all the matches', misleading). error XOR rows, enforced at the web layer.
+        import levain.web_server as ws
+
+        monkeypatch.setattr(ws, "recall_episode_rows", lambda *a, **k: (["dropme"], "midfault"))
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            _s, _h, body = _get(base + "/recall.json?keyword=anything")
+        data = json.loads(body)
+        assert data["episodes"] == [] and data["count"] == 0
+        assert data["errors"]["episodes"] == "midfault"
