@@ -412,7 +412,7 @@
      the panel-body edges (a real pinned toolbar) so scrolled rows pass cleanly under it. */
   .ep-search { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
     position: sticky; top: 0; z-index: 2; background: var(--panel);
-    margin: -11px -13px 0; padding: 11px 13px 12px;
+    margin: -11px -13px 0; padding: 0 13px 9px;
     /* a hard bottom edge + a downward drop-shadow so the pinned bar reads as a distinct
        FLOATING layer — without it, a row scrolled up to the bar's bottom abuts it with no
        delineation and looks tucked UNDER the search box (Phill's visual gate, twice). */
@@ -431,7 +431,7 @@
      exactly 11px (measured gap -11 at rest). Push the grid results down to clear it (net
      ~+7px). Grid-scoped (.clamped): the modal bar has no negative top margin, so its
      results must NOT get this offset. [Phill's visual gate — measured, not guessed.] */
-  .pbody.clamped .ep-results { margin-top: 18px; }
+  .pbody.clamped .ep-results { margin-top: 12px; }
 
   .note { color: var(--dim); font-size: 10.5px; margin-top: 9px; letter-spacing: .03em; }
   /* projection-history size delta (spore-093 v0): the projection regenerating */
