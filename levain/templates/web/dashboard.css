@@ -387,6 +387,20 @@
   .err { color: var(--hot); font-size: 11.5px; padding: 3px 0; }
   .err::before { content: "▲ "; }
   .empty { color: var(--faint); font-style: italic; font-size: 12px; }
+
+  /* episode keyword-search (spore-107): the inline read-only search box on the
+     episodes panel. Glass aesthetic — a thin mono field that lights to --mind (the
+     cognition hue) on focus, matching .name-input's focus language. */
+  .ep-search { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 1px 0 9px; }
+  .ep-search-input { flex: 1 1 150px; min-width: 0; background: var(--bg); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; font: 12px/1.4 var(--mono);
+    -webkit-appearance: none; appearance: none; }
+  .ep-search-input::placeholder { color: var(--faint); }
+  .ep-search-input:focus { outline: none; border-color: color-mix(in srgb, var(--mind) 55%, var(--line-hot));
+    box-shadow: 0 0 12px -4px var(--mind); }
+  .ep-search-status { color: var(--faint); font-size: 10.5px; letter-spacing: .03em; flex: 0 0 auto; }
+  .ep-results { display: flex; flex-direction: column; }
+
   .note { color: var(--dim); font-size: 10.5px; margin-top: 9px; letter-spacing: .03em; }
   /* projection-history size delta (spore-093 v0): the projection regenerating */
   .delta { flex: 0 0 auto; font: 700 10px/1.4 var(--mono); letter-spacing: .02em; color: var(--faint); }
@@ -713,10 +727,11 @@
        landscape rotation. */
     .edit-ta,
     .verb-ref,
-    .verb-kind { font-size: 16px; }
+    .verb-kind,
+    .ep-search-input { font-size: 16px; }
     /* tap-target floor on the focusable fields. .name-input (the masthead rename)
        is 18px so it needs no zoom-fix, but its base height is ~30px — under the
        floor — so it gets min-height here for a consistent thumb target (L3: complement). */
-    .name-input, .verb-kind, .verb-ref { min-height: 38px; }
+    .name-input, .verb-kind, .verb-ref, .ep-search-input { min-height: 38px; }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }

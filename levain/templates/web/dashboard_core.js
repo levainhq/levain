@@ -391,24 +391,86 @@
     return p;
   }
 
+  // One episode row — the SINGLE markup for both the recent list and keyword-search
+  // hits (spore-107), so they render identically. `verbs` carries the panel's verb
+  // affordance (the tombstone), which works on search rows too: `commit` is the
+  // module-level closure, available to dynamically-added rows.
+  function episodeRow(e, verbs) {
+    const row = el("div", "row");
+    if (e.type) row.appendChild(el("span", "etype", e.type));
+    row.appendChild(el("span", "clause", e.content));
+    if (Array.isArray(e.tags) && e.tags.length) {
+      row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
+    }
+    row.appendChild(el("span", "muted", datePart(e.timestamp)));
+    if (verbs && e.id) row.appendChild(buildEpisodeVerbs(e));
+    return row;
+  }
+
   function renderEpisodes(entry, view) {
     const list = view.episodes || [];
     const p = panel(entry);
     const err = tierErr(view, "episodes");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    if (list.length === 0) { p.appendChild(el("p", "empty", "no episodes yet")); return p; }
     const verbs = isVerbPanel(entry);
-    for (const e of list) {
-      const row = el("div", "row");
-      if (e.type) row.appendChild(el("span", "etype", e.type));
-      row.appendChild(el("span", "clause", e.content));
-      if (Array.isArray(e.tags) && e.tags.length) {
-        row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
+
+    // spore-107: inline keyword search over the episodic store, READ-ONLY. Enter runs
+    // a /recall.json query and swaps the recent list for matches; clearing the box
+    // restores the recent list. (Slice-2 evolution = search-into-modal, shape (c).)
+    const bar = el("div", "ep-search");
+    const input = el("input", "ep-search-input");
+    input.type = "search";
+    input.placeholder = "search episodes by keyword…";
+    input.setAttribute("aria-label", "search episodes by keyword");
+    const status = el("span", "ep-search-status", "");
+    bar.append(input, status);
+    p.appendChild(bar);
+
+    const results = el("div", "ep-results");
+    p.appendChild(results);
+
+    const renderRows = (rows) => {
+      results.replaceChildren();
+      for (const e of rows) results.appendChild(episodeRow(e, verbs));
+    };
+    const showRecent = () => {
+      status.textContent = "";
+      if (list.length === 0) { results.replaceChildren(el("p", "empty", "no episodes yet")); return; }
+      renderRows(list);
+    };
+
+    // Latest-query-wins: a slow earlier response must not clobber a newer one.
+    let seq = 0;
+    const search = async (raw) => {
+      const q = raw.trim();
+      if (!q) { showRecent(); return; }
+      const mine = ++seq;
+      status.textContent = "searching…";
+      try {
+        const res = await fetch("/recall.json?keyword=" + encodeURIComponent(q), { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        if (mine !== seq) return;  // superseded by a newer query
+        const rerr = data.errors && (data.errors.episodes || data.errors.server);
+        if (rerr) { results.replaceChildren(el("p", "err", "search unavailable — " + rerr)); status.textContent = ""; return; }
+        const eps = data.episodes || [];
+        status.textContent = eps.length + (eps.length === 1 ? " match" : " matches") + " · ⌫ to clear";
+        if (eps.length === 0) { results.replaceChildren(el("p", "empty", "no matches for “" + q + "”")); return; }
+        renderRows(eps);
+      } catch (e2) {
+        if (mine !== seq) return;
+        status.textContent = "";
+        results.replaceChildren(el("p", "err", "search failed — " + (e2 && e2.message ? e2.message : e2)));
       }
-      row.appendChild(el("span", "muted", datePart(e.timestamp)));
-      if (verbs && e.id) row.appendChild(buildEpisodeVerbs(e));
-      p.appendChild(row);
-    }
+    };
+
+    input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); search(input.value); } });
+    // Emptying the box (backspace or the native search-clear ×) restores recent at once.
+    // Any edit invalidates an in-flight search (seq++), so a late response never renders
+    // under a changed box (codex L3); emptying also restores the recent list.
+    input.addEventListener("input", () => { seq++; if (!input.value.trim()) showRecent(); });
+
+    showRecent();
     return p;
   }
 

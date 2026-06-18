@@ -878,6 +878,78 @@ def _episode_tags(ep: Any) -> list[str]:
     return []
 
 
+def _episode_row(ep: Any) -> EpisodeRow:
+    """Build the dashboard's ``EpisodeRow`` from a raw anneal episode — the SINGLE
+    place the row shape lives (field mapping + the 280-char content truncation), so
+    the recent-episodes panel and the keyword-recall surface (spore-107) can never
+    drift apart."""
+    return EpisodeRow(
+        id=ep.id,
+        timestamp=ep.timestamp,
+        type=ep.type.value,
+        source=ep.source,
+        content=_truncate(ep.content, 280),
+        tags=_episode_tags(ep),
+    )
+
+
+# A keyword longer than this is pathological (no real search term is) — reject it for
+# parity with the POST-body cap, so an unbounded ?keyword= can't force a giant LIKE scan.
+# Loopback + the bounded read-gate + the result cap already bound the risk; this closes
+# the one remaining unbounded input at the data layer (every caller inherits it).
+_MAX_KEYWORD_LEN = 256
+
+
+def recall_episode_rows(
+    episodic_db: Path, *, keyword: str, limit: int
+) -> tuple[list[EpisodeRow], str | None]:
+    """Read-only keyword search over the episodic store — the data layer behind the
+    cockpit's episode-search box (spore-107). Opens the Store ``read_only=True`` and
+    delegates the match to anneal's own ``Store.recall(keyword=...)`` (content ``LIKE``,
+    wildcards escaped, newest first), returning rows in the SAME shape as the recent-
+    episodes panel (via ``_episode_row``) so the surface renders them identically.
+
+    Returns ``(rows, error)``: a store/data fault degrades into the ``error`` string
+    (the surface shows 'search unavailable', never blanks), mirroring
+    ``build_substrate_view``'s degrade-don't-fail read discipline. An empty ``keyword``
+    is the caller's no-op (returns no rows) — the surface reverts to the recent list on
+    clear rather than asking the store to match everything."""
+    if not keyword:
+        return [], None
+    if len(keyword) > _MAX_KEYWORD_LEN:
+        return [], f"keyword too long (max {_MAX_KEYWORD_LEN} chars)"
+    # Mirror build_substrate_view's fault classification (anneal wraps store faults in
+    # AnnealMemoryError, imported lazily so this module stays importable without anneal).
+    try:
+        from anneal_memory import AnnealMemoryError
+
+        data_faults: tuple[type[BaseException], ...] = (
+            AnnealMemoryError,
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+        )
+    except Exception:  # noqa: BLE001 — anneal absent; the surface reports it
+        data_faults = (OSError, ValueError, json.JSONDecodeError)
+    store_faults: tuple[type[BaseException], ...] = (*data_faults, ImportError)
+
+    rows: list[EpisodeRow] = []
+    try:
+        if not episodic_db.exists():
+            raise FileNotFoundError(f"no anneal store at {episodic_db}")
+        from anneal_memory import Store
+
+        with Store(episodic_db, read_only=True) as store:
+            try:
+                for ep in store.recall(keyword=keyword, limit=limit).episodes:
+                    rows.append(_episode_row(ep))
+            except data_faults as exc:
+                return rows, f"{type(exc).__name__}: {exc}"
+    except store_faults as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    return rows, None
+
+
 # The six neocortex sections of the FLOW_SCHEMA, in canonical order. Slice 1
 # showed only the first two; 1.5 shows them all.
 _ALL_SECTIONS = ("State", "Active Threads", "Patterns", "Decisions", "Context", "Understanding")
@@ -1045,16 +1117,7 @@ def build_substrate_view(
             # recent episodes (the raw input layer; newest first via recall)
             try:
                 for ep in store.recall(limit=max_episodes).episodes:
-                    view.episodes.append(
-                        EpisodeRow(
-                            id=ep.id,
-                            timestamp=ep.timestamp,
-                            type=ep.type.value,
-                            source=ep.source,
-                            content=_truncate(ep.content, 280),
-                            tags=_episode_tags(ep),
-                        )
-                    )
+                    view.episodes.append(_episode_row(ep))
             except data_faults as exc:
                 view.errors["episodes"] = f"{type(exc).__name__}: {exc}"
     except store_faults as exc:  # Store unopenable / missing / anneal import fault
