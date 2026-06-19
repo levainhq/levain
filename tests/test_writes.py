@@ -880,6 +880,281 @@ class TestSporeVerbs:
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
 
+class TestTrayWriteKinds:
+    """Slice 3b: the Tray operator-I/O write kinds — capture (dump→seed), re-route
+    (set_disposition), schedule (surface_at). anneal stays blind to the taxonomy; these
+    persist/clear the opaque disposition tag through the governed seam."""
+
+    # -- spore_seed (the freeform dump→seed) ----------------------------------
+    def test_seed_creates_a_tray_seed_held_out_of_cognition(self, install: Path) -> None:
+        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "call the dentist"})
+        assert res["ok"] and res["action"] == "seed"
+        sid = res["spore_id"]
+        spore = _spore_store(install).get(sid)
+        assert spore is not None
+        assert spore["disposition"] == "seed"  # a Tray item, NOT a key-free loop
+        assert spore["type"] == "thought"  # the catch-all openness of an un-sorted dump
+        assert spore["text"] == "call the dentist"
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["kind"] == "spore_seed" and rec["source"] == f"spore:{sid}"
+        assert rec["undoable"] is False  # verb-mediated, not file-undoable
+
+    def test_seed_is_non_destructive_no_confirm_needed(self, install: Path) -> None:
+        # creation never asks for confirm (unlike descend/ascend/tombstone)
+        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
+        assert res["ok"]
+
+    def test_seed_creates_the_store_when_absent(self, install: Path) -> None:
+        # a fresh entity with no open loops yet: seeding plants the first one
+        assert not (install / ".levain" / "memory.spores.json").is_file()
+        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "first dump"})
+        assert res["ok"]
+        assert (install / ".levain" / "memory.spores.json").is_file()
+
+    def test_seed_rejects_empty_text(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "   "})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_seed_rejects_missing_text(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed"})
+        assert ei.value.http_status == 400  # _require_str
+
+    def test_seed_allows_an_explicit_tray_disposition(self, install: Path) -> None:
+        res = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "pick up the modal work next session",
+            "disposition": "handoff",
+        })
+        assert _spore_store(install).get(res["spore_id"])["disposition"] == "handoff"
+
+    def test_seed_refuses_a_loop_disposition(self, install: Path) -> None:
+        # you don't 'dump' a cognition loop — that's the normal add path, not the Tray
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "disposition": "loop"})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_seed_refuses_unknown_disposition(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "disposition": "bogus"})
+        assert ei.value.http_status == 422
+
+    def test_seed_rejects_oversized_text(self, install: Path) -> None:
+        from levain.writes import MAX_SPORE_TEXT_BYTES
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x" * (MAX_SPORE_TEXT_BYTES + 1)})
+        assert ei.value.code == "too_large" and ei.value.http_status == 413
+
+    def test_seed_defaults_to_thought_type(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "untyped dump"})["spore_id"]
+        assert _spore_store(install).get(sid)["type"] == "thought"
+
+    def test_seed_accepts_an_explicit_type_so_a_todo_can_be_done(self, install: Path) -> None:
+        # H1: a dumped TASK must be able to descend 'done' — which a 'thought' cannot.
+        # A typed capture → metabolize to a loop → the task lifecycle is intact.
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "call the dentist", "type": "task",
+        })["spore_id"]
+        assert _spore_store(install).get(sid)["type"] == "task"
+        # metabolize the task-seed into a cognition loop, then mark it done
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop",
+        })
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+        })
+        assert res["ok"]  # 'done' is valid for a task — the H1 mis-type is gone
+
+    def test_seed_rejects_bad_type(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "type": "bogus"})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    # -- spore_set_disposition (the AI's triage re-route) ---------------------
+    def test_set_disposition_reroutes_within_the_tray(self, install: Path) -> None:
+        sid = res_sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+        })
+        assert _spore_store(install).get(res_sid)["disposition"] == "agenda"
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["kind"] == "spore_set_disposition" and rec["disposition"] == "agenda"
+
+    def test_set_disposition_loop_metabolizes_to_a_keyfree_loop(self, install: Path) -> None:
+        # the triage that pulls a Tray seed INTO cognition: disposition cleared entirely
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "real loop"})["spore_id"]
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop",
+        })
+        spore = _spore_store(install).get(sid)
+        assert "disposition" not in spore  # key-free → back in cognition
+
+    def test_set_disposition_reroute_within_tray_needs_no_confirm(self, install: Path) -> None:
+        # seed → handoff is inbox shuffling, not a cognition demotion → no confirm
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "handoff",
+        })
+        assert res["ok"]
+        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+
+    # -- M1: demoting a LIVE cognition loop into the Tray is the guarded direction --
+    def test_set_disposition_demote_live_loop_requires_confirm(self, install: Path) -> None:
+        sid = _add_spore(install, tier="hot", salience=3)  # a live, high-salience loop
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            })
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+        # refused → the loop is untouched (still a key-free cognition loop)
+        assert "disposition" not in _spore_store(install).get(sid)
+
+    def test_set_disposition_demote_live_loop_with_confirm(self, install: Path) -> None:
+        sid = _add_spore(install, tier="hot")
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            "confirm": True,
+        })
+        assert res["ok"]
+        assert _spore_store(install).get(sid)["disposition"] == "seed"
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["prior_disposition"] == "loop" and rec["disposition"] == "seed"
+
+    def test_set_disposition_parked_loop_to_tray_no_confirm(self, install: Path) -> None:
+        # a parked loop (Keep) is already out of active cognition → no silent loss → no gate
+        sid = _add_spore(install, tier="parked")
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+        })
+        assert res["ok"]
+
+    def test_set_disposition_records_prior_disposition_in_audit(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+        })
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["prior_disposition"] == "seed" and rec["disposition"] == "agenda"
+
+    def test_set_disposition_demote_unknown_disposition_also_gated(self, install: Path) -> None:
+        # H1 (codex L3): is_loop treats an UNKNOWN disposition as in-cognition (fail-open),
+        # so the demote guard must fire for it too — not only for the literal "loop".
+        sid = _add_spore(install, disposition="bogus", tier="hot")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            })
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+
+    def test_set_disposition_cas_rejects_a_stale_read(self, install: Path, monkeypatch) -> None:
+        # H2 (codex L3): the get→update window. Force get() to return a STALE disposition
+        # (what we read) while the real stored value differs (a concurrent writer changed
+        # it) — the CAS in anneal's update must reject, so no write lands on stale state.
+        from anneal_memory.spores import SporeStore
+
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "x", "disposition": "handoff",
+        })["spore_id"]
+        real_get = SporeStore.get
+
+        def stale_get(self, sid_):  # returns disposition="seed" though the store has "handoff"
+            d = real_get(self, sid_)
+            return {**d, "disposition": "seed"} if d else d
+
+        monkeypatch.setattr(SporeStore, "get", stale_get)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+            })
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert "changed since read" in str(ei.value)
+        # undo the stale-get patch so the assertion reads the REAL store: nothing was written
+        monkeypatch.undo()
+        assert _spore_store(install).get(sid)["disposition"] == "handoff"
+
+    def test_set_disposition_rejects_unknown_value(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "bogus",
+            })
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_set_disposition_unknown_id(self, install: Path) -> None:
+        _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": "spore-999", "disposition": "seed",
+            })
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+
+    def test_set_disposition_no_store_yet(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": "spore-001", "disposition": "seed",
+            })
+        assert ei.value.code == "not_found" and ei.value.http_status == 404
+
+    # -- spore_surface_at (schedule the re-surfacing) -------------------------
+    def test_surface_at_sets_the_next_alarm(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(_scope(install), {
+            "kind": "spore_surface_at", "spore_id": sid, "surface_at": "2026-07-01",
+        })
+        assert res["ok"] and res["action"] == "surface_at"
+        assert _spore_store(install).get(sid)["next"] == "2026-07-01"
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["kind"] == "spore_surface_at" and rec["surface_at"] == "2026-07-01"
+
+    def test_surface_at_clears_with_null(self, install: Path) -> None:
+        sid = _add_spore(install, next="2026-07-01")
+        apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid, "surface_at": None})
+        assert _spore_store(install).get(sid)["next"] is None
+
+    def test_surface_at_clears_with_empty_string(self, install: Path) -> None:
+        sid = _add_spore(install, next="2026-07-01")
+        apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid, "surface_at": ""})
+        assert _spore_store(install).get(sid)["next"] is None
+
+    def test_surface_at_requires_the_key_present(self, install: Path) -> None:
+        # complement L3 LOW: a MISSING key must not silently clear the alarm (client bug);
+        # clearing is explicit (null/''). Presence is required.
+        sid = _add_spore(install, next="2026-07-01")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+        assert "required" in str(ei.value)
+        # the alarm is untouched (NOT cleared)
+        assert _spore_store(install).get(sid)["next"] == "2026-07-01"
+
+    def test_surface_at_rejects_bad_date(self, install: Path) -> None:
+        sid = _add_spore(install)
+        # the space-padded "2026-06- 1" and zero-pad "2026-7-1" are the strict-regex cases:
+        # both must be rejected with the user-facing "surface_at" message, NOT anneal's "next".
+        for bad in ("2026-13-45", "07/01/2026", "tomorrow", "2026-7-1", "2026-06- 1"):
+            with pytest.raises(EditError) as ei:
+                apply_edit(_scope(install), {
+                    "kind": "spore_surface_at", "spore_id": sid, "surface_at": bad,
+                })
+            assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422, bad
+            assert "surface_at" in str(ei.value) and "next" not in str(ei.value), bad
+
+    def test_surface_at_unknown_id(self, install: Path) -> None:
+        _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_surface_at", "spore_id": "spore-999", "surface_at": "2026-07-01",
+            })
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+
+    # -- undo refuses every Tray kind (verb-mediated, not file-undoable) ------
+    def test_undo_refuses_a_tray_kind(self, install: Path) -> None:
+        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
+        assert ei.value.code == "not_undoable" and ei.value.http_status == 400
+
+
 class TestEpisodeTombstone:
     def test_requires_confirm(self, install: Path) -> None:
         eid = _add_episode(install)

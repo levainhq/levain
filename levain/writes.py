@@ -75,6 +75,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import uuid
 import warnings
@@ -82,11 +83,19 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal, cast
 
 from anneal_memory import (  # the SHARED cross-process continuity lock
     ContinuityLockUnavailable,
     continuity_lock,
+)
+
+from levain.spores import (  # the Tray disposition vocabulary (anneal stays blind)
+    LOOP_DISPOSITION,
+    TRAY_DISPOSITIONS,
+    VALID_DISPOSITIONS,
+    disposition_of,
+    is_loop,
 )
 
 if TYPE_CHECKING:
@@ -106,6 +115,13 @@ __all__ = [
 # too — this is the data-layer backstop). The name is a short display label.
 MAX_BODY_BYTES = 256 * 1024
 MAX_NAME_LEN = 120
+# A spore is a one-line-ish open loop, not a document; a Tray dump may be a short
+# paragraph. Bound the captured text so a runaway request can't persist an arbitrarily
+# large spore (the server caps the request body too — this is the data-layer backstop).
+MAX_SPORE_TEXT_BYTES = 8 * 1024
+# Strict YYYY-MM-DD shape — anchored \d so a space-padded "2026-06- 1" (which len==10 +
+# datetime.strptime would wrongly accept) is rejected; a real-date check follows.
+_ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 # Ledger artifacts live UNDER a WriteScope.ledger_root (a Levain install's `.levain/`,
 # or any explicit dir — e.g. flow's `state/bridge/`). These names are ledger-RELATIVE;
@@ -523,8 +539,10 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     ``entity_name`` (the .levain/config.json name) — Class-A seed/config, require a
     ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
     ``scope.anneal.continuity_md``); the Class-B verbs (``spore_touch`` /
-    ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off
-    ``scope.anneal``); ``undo`` (restore a Class-A edit's backup)."""
+    ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off ``scope.anneal``);
+    the Slice-3b Tray operator-I/O kinds (``spore_seed`` capture / ``spore_set_disposition``
+    re-route / ``spore_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
+    ``undo`` (restore a Class-A edit's backup)."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
@@ -543,6 +561,12 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_spore_verb(scope, req, now, "descend")
         if kind == "spore_ascend":
             return _apply_spore_verb(scope, req, now, "ascend")
+        if kind == "spore_seed":
+            return _apply_spore_seed(scope, req, now)
+        if kind == "spore_set_disposition":
+            return _apply_spore_set_disposition(scope, req, now)
+        if kind == "spore_surface_at":
+            return _apply_spore_surface_at(scope, req, now)
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
@@ -752,9 +776,15 @@ def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) 
 # tombstoned episode keeps a tombstone row) — so `_apply_undo` REFUSES these.
 # ---------------------------------------------------------------------------
 
-# Verb-mediated kinds: recorded in the audit trail but NOT file-undoable.
+# Verb-mediated kinds: recorded in the audit trail but NOT file-undoable (the
+# mutation is canonical in anneal — the resolved set / a tombstone row / the live
+# spore fields — so undo routes through anneal/the verb, never a file restore).
 _VERB_KINDS = frozenset(
-    {"spore_touch", "spore_descend", "spore_ascend", "episode_tombstone"}
+    {
+        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
+        # Slice 3b — the Tray operator-I/O write kinds (capture + disposition + schedule):
+        "spore_seed", "spore_set_disposition", "spore_surface_at",
+    }
 )
 
 
@@ -879,6 +909,205 @@ def _apply_spore_verb(
         target=f"spore:{spore_id}", now=now, extra=extra,
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
+
+
+# --- Slice 3b: the Tray operator-I/O write kinds -----------------------------
+# Capture (dump→seed), re-route (set_disposition), schedule (surface_at). The
+# disposition is the Levain/flow Tray taxonomy (anneal stays blind — it persists the
+# opaque tag; see ``levain.spores`` + the anneal ``add``/``update`` passthrough). All
+# three are NON-destructive (a mis-capture is composted, a re-route/schedule is just
+# re-applied) → no confirm gate; audit-recorded, NOT file-undoable (the live spore is
+# canonical in anneal). The "human dumps, AI sorts" capture-UX: ``spore_seed`` is the
+# human's freeform dump (always a Tray disposition); ``spore_set_disposition`` /
+# ``spore_surface_at`` are the AI's triage verbs.
+
+
+def _apply_spore_seed(
+    scope: WriteScope, req: dict[str, Any], now: str | None
+) -> dict[str, Any]:
+    """Capture a freeform operator dump as a Tray spore (the in-GUI dump→seed). Creates
+    a NEW spore carrying a Tray ``disposition`` (default ``seed``) so it lands in the
+    operator inbox and is held OUT of the entity's cognition until the AI triages it —
+    not a cognition loop. Creates the store if absent.
+
+    ``type`` defaults to ``thought`` (the catch-all openness of an un-sorted dump — the
+    human freeform dump supplies no type), but is settable when the type IS known (an
+    AI-authored capture, a future typed-dump affordance). NOTE — a spore's ``type`` is
+    IMMUTABLE (anneal has no retype verb, by design — an immune property). So a dump that
+    triage later finds is really a ``task`` is NOT re-typed in place; the clean path is
+    SPAWN-metabolize: the AI ``descend``s the thought-seed and creates the correctly-typed
+    object (recording lineage). ``set_disposition``→``loop`` is the in-place metabolize for
+    a genuine thought-loop only. (The Slice-3b curriculum teaches this.)"""
+    from anneal_memory.spores import SporeError, SporeStore, VALID_TYPES  # lazy
+
+    text = _require_str(req, "text").strip()
+    if not text:
+        raise EditError("bad_verb_arg", 422, "a Tray capture needs non-empty text")
+    if len(text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
+        raise EditError("too_large", 413,
+                        f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
+    stype = req.get("type", "thought")
+    if stype not in VALID_TYPES:
+        raise EditError(
+            "bad_verb_arg", 422,
+            f"type must be one of {list(VALID_TYPES)} (got {stype!r})",
+        )
+    disposition = req.get("disposition", "seed")
+    if disposition not in TRAY_DISPOSITIONS:
+        raise EditError(
+            "bad_verb_arg", 422,
+            f"a Tray capture's disposition must be one of {list(TRAY_DISPOSITIONS)} "
+            f"(got {disposition!r}) — a plain cognition loop is not captured here",
+        )
+
+    store = SporeStore(scope.anneal.spores_json)
+    try:
+        # No explicit tier → anneal's default (`warm`). Harmless for a Tray item: a Tray
+        # disposition is cognition-EXCLUDED (is_loop=False) regardless of tier, so the tier
+        # has no salience/germination effect until the AI metabolizes it to a loop — at
+        # which point `warm` is the right neutral default for a freshly-promoted loop.
+        created = store.add(type=stype, text=text, disposition=disposition)
+    except ValueError as exc:  # anneal arg validation (e.g. empty text)
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except SporeError as exc:  # corrupt/ambiguous store (symmetry with the sibling verbs)
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:  # raw IO from SporeStore._transaction → retryable 503
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+
+    spore_id = created["id"]
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="spore_seed", action="seed",
+        target=f"spore:{spore_id}", now=now,
+        extra={"disposition": disposition, "type": stype, "text": text[:120]},
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
+            "action": "seed", "spore_id": spore_id}
+
+
+def _apply_spore_set_disposition(
+    scope: WriteScope, req: dict[str, Any], now: str | None
+) -> dict[str, Any]:
+    """Re-route an OPEN spore between the operator Tray and the entity's cognition (the
+    AI's triage verb). ``disposition`` ∈ loop/seed/handoff/agenda: ``loop`` METABOLIZES
+    a Tray item into a cognition loop (clears the opaque tag → key-free); a Tray value
+    moves it within / into the Tray.
+
+    Most transitions are non-destructive (re-set to reverse) → no confirm. The ONE guarded
+    direction is **demoting a LIVE cognition loop into the Tray** (current = loop, target =
+    a Tray disposition, tier ≠ parked): that removes it from salience / digest / Top of Mind
+    with no other signal — the silent-cognition-loss the fail-open read-predicate exists to
+    prevent — so it is confirm-gated, like ``descend``/``ascend``. The prior disposition is
+    always recorded in the audit so any move stays reconstructable from the ledger."""
+    from anneal_memory.spores import SporeError, SporeStore  # lazy
+
+    spore_id = _require_str(req, "spore_id")
+    disposition = req.get("disposition")
+    if disposition not in VALID_DISPOSITIONS:
+        raise EditError(
+            "bad_verb_arg", 422,
+            f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {disposition!r})",
+        )
+    paths = scope.anneal
+    if not paths.spores_json.is_file():
+        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
+    store = SporeStore(paths.spores_json)
+
+    # Read current state to (a) record the prior disposition in the audit, (b) gate the one
+    # silent-loss direction, and (c) seed the optimistic CAS below. `is_loop` (the SAME
+    # predicate cognition surfaces use) decides "currently in cognition" — NOT `== "loop"` —
+    # so an unknown/typo'd disposition (which cognition renders as a loop, fail-open) is also
+    # guarded, and the guard can't drift from the render boundary [codex L3 HIGH]. Absent
+    # `status` reads as open (anneal treats it so), so a malformed-but-open record is gated.
+    current = store.get(spore_id)
+    # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
+    prior_raw = cast("str | None", current.get("disposition")) if current else None
+    prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
+    demoting_live_loop = (
+        current is not None
+        and current.get("status", "open") == "open"
+        and is_loop(current)
+        and disposition in TRAY_DISPOSITIONS
+        and current.get("tier") != "parked"
+    )
+    if demoting_live_loop:
+        _require_confirm(
+            req,
+            f"move loop {spore_id} into the Tray? it leaves the entity's active cognition "
+            "(salience / digest / Top of Mind) until it's re-triaged",
+        )
+
+    # ``loop`` → clear the tag (metabolize to a key-free loop); a Tray value → set it.
+    anneal_disposition = None if disposition == LOOP_DISPOSITION else disposition
+    try:
+        # CAS on the disposition we just read closes the read→write window against a
+        # concurrent (cross-process) writer — flow's CLI on the same store [codex L3 HIGH].
+        # If it changed since `get`, anneal raises and nothing is written; the operator
+        # re-reads and the confirm decision is re-made on fresh state.
+        store.update(spore_id, disposition=anneal_disposition, expect_disposition=prior_raw)
+    except ValueError as exc:  # anneal arg validation
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="spore_set_disposition", action="set_disposition",
+        target=f"spore:{spore_id}", now=now,
+        extra={"disposition": disposition, "prior_disposition": prior},
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
+            "action": "set_disposition"}
+
+
+def _apply_spore_surface_at(
+    scope: WriteScope, req: dict[str, Any], now: str | None
+) -> dict[str, Any]:
+    """Schedule WHEN a spore re-surfaces — the operator-input twin of a spore's ``next:``
+    alarm: author now, time the surfacing for a future session-open. ``surface_at`` is
+    ``YYYY-MM-DD`` (or ``null``/``''`` to clear). Reversible → non-destructive."""
+    from anneal_memory.spores import SporeError, SporeStore  # lazy
+
+    spore_id = _require_str(req, "spore_id")
+    # A MISSING key must NOT silently clear the alarm — that's almost always a client bug
+    # (typo'd/omitted field) destroying a scheduled surfacing with no signal [complement L3
+    # LOW]. Clearing is explicit: pass null or "". Presence is required; value may be null.
+    if "surface_at" not in req:
+        raise EditError("bad_verb_arg", 422,
+                        "surface_at is required (use null or '' to clear the alarm)")
+    surface_at = req.get("surface_at")
+    if surface_at not in (None, ""):
+        # Strict YYYY-MM-DD: the anchored \d regex rejects a space-padded "2026-06- 1" that
+        # len==10 + strptime would wrongly accept [codex L3 MED]; strptime then confirms a
+        # REAL date (not 2026-13-45). The operator always sees the user-facing "surface_at"
+        # message, never anneal's internal "next" field name.
+        if not isinstance(surface_at, str) or not _ISO_DATE_RE.match(surface_at):
+            raise EditError("bad_verb_arg", 422,
+                            "surface_at must be YYYY-MM-DD (or null/'' to clear)")
+        try:
+            datetime.strptime(surface_at, "%Y-%m-%d")
+        except ValueError:
+            raise EditError("bad_verb_arg", 422,
+                            "surface_at must be YYYY-MM-DD (or null/'' to clear)") from None
+    paths = scope.anneal
+    if not paths.spores_json.is_file():
+        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
+    store = SporeStore(paths.spores_json)
+    try:
+        store.update(spore_id, next=surface_at or None)  # anneal re-validates the date
+    except ValueError as exc:
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except SporeError as exc:
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="spore_surface_at", action="surface_at",
+        target=f"spore:{spore_id}", now=now, extra={"surface_at": surface_at or None},
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
+            "action": "surface_at"}
 
 
 def _apply_episode_tombstone(

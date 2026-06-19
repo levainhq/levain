@@ -43,8 +43,11 @@ dependencies = [
     # The prior `<0.8` ceiling capped adopters out of the 0.8.x crystal-recall
     # tier (spore-060); `<0.5` before that predated crystals entirely. (0.9.0
     # ships with anneal Slice C — main carries this pin ahead of the PyPI publish,
-    # per the coordinated shadow-ship plan.)
-    "anneal-memory>=0.9.0,<0.10",
+    # per the coordinated shadow-ship plan.) `>=0.9.1` is REQUIRED: Slice-3b's Tray
+    # write seam calls the SporeStore disposition passthrough + the expect_disposition
+    # CAS, both added in 0.9.1 — an older 0.9.0 would TypeError at runtime, not refuse
+    # cleanly [codex L3 HIGH], so the API contract is version-gated, not feature-detected.
+    "anneal-memory>=0.9.1,<0.10",
 ]
 
 [project.optional-dependencies]
