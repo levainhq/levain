@@ -232,6 +232,36 @@ class TestBuildView:
         assert v.open_spores[0].text == "an open loop"
         assert v.open_spores[0].tier == "hot"
 
+    def test_long_spore_text_rides_full_and_raw_on_the_wire(self, tmp_path: Path) -> None:
+        # DATA-SAFETY regression: the wire MUST carry the FULL, RAW spore text — not a
+        # 200-char whitespace-collapsed cap. The old cap (a) hid the tail with no way to
+        # see it AND (b) seeded the 3b text-editor, so save wrote the truncation back =
+        # silent destruction of everything past char 200. Newlines must survive too (the
+        # old _truncate collapsed them → an edit would have flattened structure). The
+        # surface clamps the ROW for density; the canonical text stays whole.
+        from anneal_memory.spores import SporeStore
+
+        long_text = "first line\n" + ("L" * 600) + "\n\ntail marker"  # past 200, multi-line
+        db = tmp_path / "memory.db"
+        SporeStore(tmp_path / "memory.spores.json").add(
+            type="task", text=long_text, tier="hot", salience=2
+        )
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.open_spores[0].text == long_text  # FULL + RAW, byte-for-byte
+
+    def test_long_episode_content_rides_full_on_the_wire(self, tmp_path: Path) -> None:
+        # Same data-safety contract for episode content (was capped at 280). Read-only, so
+        # no edit-loss, but the same un-seeable-tail bug the surface now solves with a
+        # per-item expand over the full canonical content.
+        from anneal_memory import Store
+
+        long_content = "E" * 900  # past the old 280-char cap
+        db = tmp_path / "memory.db"
+        with Store(db) as store:
+            store.record(long_content, "observation")
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert any(e.content == long_content for e in v.episodes)  # FULL, byte-for-byte
+
     def test_source_level_max_spores_threads_to_every_build(self, tmp_path: Path) -> None:
         # [codex L3 MED] A source-level max_spores must apply to EVERY build() path —
         # the web /substrate.json, the TUI refresh, and post-write rebuilds all call a
@@ -674,11 +704,10 @@ class TestSlice15Surfaces:
         assert first_idx["identity"] < first_idx["operate"] < first_idx["mind"]
         last_identity = max(i for i, z in enumerate(zones) if z == "identity")
         assert last_identity < first_idx["operate"]
-        # every edit-classed tier carries A/B/C; the read-only meta/display panels carry
-        # no class: the "edits" audit log (Slice 2a) AND the Tray + Keep projections
-        # (read-only display in 3a — no chip, no verb; 3b flips them to Class B with the
-        # governed dump/sort/park verbs).
-        _no_class = {"edits", "tray", "keep"}
+        # every edit-classed tier carries A/B/C; the only no-class panel is the "edits"
+        # audit log (Slice 2a, read-only display). Tray + Keep were read-only in 3a and
+        # FLIP to Class B in 3b (the governed dump/sort/park verbs).
+        _no_class = {"edits"}
         assert all(
             e["edit_class"] in ("A", "B", "C")
             for e in layout if e["kind"] not in _no_class
@@ -691,9 +720,9 @@ class TestSlice15Surfaces:
         by_kind = {e["kind"]: e for e in layout}
         assert by_kind["spores"]["edit_class"] == "B"
         assert by_kind["episodes"]["edit_class"] == "B"
-        # Tray + Keep (Slice 3): read-only display in the Operate zone, no class chip.
+        # Tray + Keep (Slice 3b): now Class B in the Operate zone (dump/triage/park verbs).
         for k in ("tray", "keep"):
-            assert by_kind[k]["edit_class"] == "" and by_kind[k]["zone"] == "operate"
+            assert by_kind[k]["edit_class"] == "B" and by_kind[k]["zone"] == "operate"
         # consolidated cognition is read-only Class C
         assert by_kind["health"]["edit_class"] == "C"
         assert by_kind["crystals"]["edit_class"] == "C"

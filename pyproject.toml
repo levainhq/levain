@@ -47,7 +47,7 @@ dependencies = [
     # write seam calls the SporeStore disposition passthrough + the expect_disposition
     # CAS, both added in 0.9.1 — an older 0.9.0 would TypeError at runtime, not refuse
     # cleanly [codex L3 HIGH], so the API contract is version-gated, not feature-detected.
-    "anneal-memory>=0.9.1,<0.10",
+    "anneal-memory>=0.9.2,<0.10",
 ]
 
 [project.optional-dependencies]

@@ -156,13 +156,13 @@ def test_panels_for_zone_operate_order():
     # then the edit log (Slice 3 capture-UX (A) ordering).
     assert [p["kind"] for p in panels] == ["spores", "tray", "keep", "episodes", "edits"]
     by_kind = {p["kind"]: p for p in panels}
-    # spores + episodes are Class B (verb-mediated); the edit log + Tray + Keep carry no
-    # chip (Tray/Keep are read-only display in 3a).
+    # spores + episodes are Class B (verb-mediated); Tray + Keep FLIP to Class B in 3b
+    # (the governed dump/triage/park verbs); only the edit log carries no chip.
     assert by_kind["spores"]["edit_class"] == CLASS_B
     assert by_kind["episodes"]["edit_class"] == CLASS_B
     assert by_kind["edits"]["edit_class"] == ""
-    assert by_kind["tray"]["edit_class"] == ""
-    assert by_kind["keep"]["edit_class"] == ""
+    assert by_kind["tray"]["edit_class"] == CLASS_B
+    assert by_kind["keep"]["edit_class"] == CLASS_B
 
 
 def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
@@ -241,6 +241,17 @@ def test_episode_panel_offers_tombstone_and_edits_offers_undo():
 
 def test_panel_verbs_none_is_empty():
     assert tui.panel_verbs(None) == []
+
+
+def test_tray_and_keep_afford_no_curses_verbs():
+    # D (codex L3 MED, NO-THEATER): Tray/Keep are Class B in the shared manifest because the
+    # WEB operates them (Slice 3b) — but the curses surface has no verb for them yet, so
+    # panel_verbs returns []. The _tui_curses chip render keys on exactly this to suppress a
+    # false metal [B] chip (render them as glass) until the TUI grows the verbs. Locking the
+    # precondition here keeps that honest; if the TUI later operates them, this reddens and
+    # the chip returns by construction.
+    for kind in ("tray", "keep"):
+        assert tui.panel_verbs({"kind": kind, "edit_class": CLASS_B}, read_only=False) == []
 
 
 def test_is_record_undoable_mirrors_server_refusal():

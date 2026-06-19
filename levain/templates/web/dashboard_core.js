@@ -93,6 +93,10 @@
   let modalKey = null;
   let modalReturnFocus = null;
   let modalEpisodeQuery = "";
+  // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
+  // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
+  // focus modal. Empty = show all. Matches spore text OR spore-id.
+  let openLoopsQuery = "";
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
@@ -167,12 +171,14 @@
       board.appendChild(renderErrors(view));
     }
     finalizePanels(board);  // wrap content + bound the long modules (scroll within, no reflow)
+    measureClauses(board);  // reveal per-item expand toggles on clauses that overflow the clamp
     applyFilter();
     // Webfonts can shift line metrics after first paint — recompute the scents once they
     // settle so a panel that only overflows post-font-load still gets the cue + affordance.
     if (document.fonts && document.fonts.ready) {
       document.fonts.ready.then(() => {
         for (const b of board.querySelectorAll(".pbody.clamped")) measureOverflow(b);
+        measureClauses(board);  // line metrics shifted → re-measure per-item overflow too
       });
     }
     // The open focus-modal (if any) re-projects from this same fresh view, so a
@@ -196,7 +202,7 @@
   // Reads layout synchronously; valid because render() builds into the live #board, so the
   // .clamped max-height is actually applied (a detached board would read zero overflow).
   function measureOverflow(body) {
-    const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 2;
+    const atTop = () => body.scrollTop <= 1;
     const over = body.scrollHeight > body.clientHeight + 1;
     body.classList.toggle("has-overflow", over);
     // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
@@ -206,20 +212,38 @@
       body.setAttribute("role", "region");
       const h = body.parentElement && body.parentElement.querySelector(".phead h2");
       body.setAttribute("aria-label", (h && h.textContent ? h.textContent + " — " : "") + "scrollable");
-      // The "more below" chevron (CSS, gated on .has-overflow:not(.at-end)) hides once
-      // you've scrolled to the bottom — a down-arrow lingering with nothing below is worse
-      // than none. Wire the scroll→.at-end toggle once; finalizePanels builds a fresh
-      // .pbody each render, so no listener piles up across renders.
+      // The "more below" chevron (CSS, gated on .has-overflow.at-top) shows ONLY at the
+      // resting TOP position — a "there's more, scroll" hint — and fades the moment you
+      // scroll; a chevron hanging mid-scroll reads as crap (Phill's visual gate). Wire the
+      // scroll→.at-top toggle once; finalizePanels builds a fresh .pbody each render, so no
+      // listener piles up across renders.
       if (!body.dataset.scrollWired) {
         body.dataset.scrollWired = "1";
-        body.addEventListener("scroll", () => body.classList.toggle("at-end", atEnd()), { passive: true });
+        body.addEventListener("scroll", () => body.classList.toggle("at-top", atTop()), { passive: true });
       }
-      body.classList.toggle("at-end", atEnd());  // recompute now (content size may have changed)
+      body.classList.toggle("at-top", atTop());  // recompute now (content size may have changed)
     } else {
       body.removeAttribute("tabindex");
       body.removeAttribute("role");
       body.removeAttribute("aria-label");
-      body.classList.remove("at-end");
+      body.classList.remove("at-top");
+    }
+  }
+
+  // Per-ITEM overflow scent — the row-level twin of measureOverflow. A clause clamps to 2
+  // lines (CSS); reveal its expand toggle ONLY when the FULL canonical text actually
+  // overflows that clamp, so short rows stay clean. Reads layout synchronously (valid for
+  // the same reason measureOverflow is — the rows are live in #board / the modal). Skips a
+  // row the user already expanded (leave its toggle as "less"). RE-RUNNABLE.
+  function measureClauses(root) {
+    for (const clause of root.querySelectorAll(".clause.clampable")) {
+      const row = clause.closest(".row");
+      if (!row || row.classList.contains("row-expanded")) continue;
+      // No +1 tolerance: the harm is asymmetric — a false NEGATIVE hides the tail with no
+      // toggle (the bug this slice fixes), a false positive is a harmless toggle on a 2-line
+      // row. Line-clamp overflow is full-line-granular + heights are integers, so an exactly-
+      // 2-line clause measures equal (no spurious toggle) [kimi L3]. .clampable only.
+      row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
   }
 
@@ -436,22 +460,57 @@
     return p;
   }
 
+  // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
+  // FULL canonical text goes into the DOM via textContent (the wire no longer truncates),
+  // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
+  // CSS clamps the clause to 2 lines; measureClauses reveals the toggle only when it
+  // overflows; the toggle flips .row-expanded to show all of it inline.
+  function appendClause(row, text) {
+    // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
+    // wrap/edit labels) stays full so it never clamps without this expand affordance.
+    const clause = el("span", "clause clampable", text);
+    row.appendChild(clause);
+    const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-label", "expand full text");
+    toggle.addEventListener("click", (ev) => {
+      ev.stopPropagation();  // don't trip a row/modal handler
+      const open = row.classList.toggle("row-expanded");
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+      // flip the accessible name with the state — else a screen reader announces "expand
+      // full text … expanded" (contradictory) [codex + kimi + complement L3 converged].
+      toggle.setAttribute("aria-label", open ? "collapse full text" : "expand full text");
+      toggle.textContent = open ? "⌃" : "⌄";
+      // expanding changes the panel's content height → refresh its overflow scent
+      const body = row.closest(".pbody, .modal-body");
+      if (body && body.classList.contains("pbody")) measureOverflow(body);
+    });
+    row.appendChild(toggle);
+    return clause;
+  }
+
   // One spore row, shared by the three projections (Open Loops / Tray / Keep). The
   // leading chip is the panel's salient axis: Tray badges the `disposition` (the
   // operator-I/O class — seed/handoff/agenda), Open Loops + Keep badge the `tier`. `verbs`
   // rides only on a Class-B panel (Open Loops in 3a; Tray + Keep render read-only until 3b
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
-  function sporeRow(s, verbs, badgeField) {
+  function sporeRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
     if (s.id) row.appendChild(el("span", "sid", s.id));
-    const badge = badgeField === "disposition" ? s.disposition : s.tier;
+    // Tray badges the disposition; Open Loops the tier; Keep is mixed — a note badges
+    // "note" (reference), a pinned-dormant loop badges its tier ("parked").
+    let badge;
+    if (badgeField === "disposition") badge = s.disposition;
+    else if (badgeField === "keep") badge = s.disposition === "note" ? "note" : s.tier;
+    else badge = s.tier;
     if (badge) row.appendChild(el("span", "tier", `[${badge}]`));
-    row.appendChild(el("span", "clause", s.text));
+    appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
     if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
-    if (verbs && s.id) row.appendChild(buildSporeVerbs(s));
+    if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
     return row;
   }
 
@@ -468,27 +527,86 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
-    for (const s of list) p.appendChild(sporeRow(s, verbs, badgeField));
+    for (const s of list) p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
     return p;
   }
 
   function renderSpores(entry, view) {
-    return renderSporeProjection(entry, view, view.open_spores,
-      "no open prospective loops", "tier");
+    const p = panel(entry);
+    const err = tierErr(view, "open_spores");
+    if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
+    const all = view.open_spores || [];
+    const verbs = isVerbPanel(entry);
+    // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
+    // unlike the episode keyword search). Matches the spore TEXT (case-insensitive substring)
+    // OR the spore-id ("spore-103" / "103"), so you can jump straight to a loop by handle or
+    // content [Phill 2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
+    const bar = el("div", "ep-search");
+    const input = el("input", "ep-search-input");
+    input.type = "search";
+    input.placeholder = "filter loops by text or spore-id…";
+    input.setAttribute("aria-label", "filter open loops by text or spore id");
+    const status = el("span", "ep-search-status", "");
+    bar.append(input, status);
+    p.appendChild(bar);
+    const results = el("div", "sp-results");
+    p.appendChild(results);
+    const render = (raw) => {
+      const q = raw.trim().toLowerCase();
+      const rows = q
+        ? all.filter((s) => (s.text || "").toLowerCase().includes(q) ||
+                            String(s.id || "").toLowerCase().includes(q))
+        : all;
+      results.replaceChildren();
+      if (rows.length === 0) {
+        results.appendChild(el("p", "empty",
+          q ? "no loops match “" + raw.trim() + "”" : "no open prospective loops"));
+      } else {
+        for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
+      }
+      status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
+      // result set changed → recompute the panel scent + the per-item expand toggles. .pbody
+      // is null on the initial render (finalizePanels reparents later, then measures) — no-op
+      // then, live on every input-driven re-render.
+      const b = results.closest(".pbody"); if (b) measureOverflow(b);
+      measureClauses(results);
+    };
+    input.addEventListener("input", () => { openLoopsQuery = input.value; render(input.value); });
+    if (openLoopsQuery) { input.value = openLoopsQuery; render(openLoopsQuery); }
+    else render("");
+    return p;
   }
 
   // Tray — the operator session-I/O inbox (seed/handoff/agenda dumps awaiting AI triage);
-  // badged by disposition. Read-only in 3a.
-  function renderTray(entry, view) {
-    return renderSporeProjection(entry, view, view.tray,
-      "tray clear — nothing waiting", "disposition");
+  // badged by disposition. Slice 3b: a freeform DUMP input on top (the human dumps; the
+  // AI sorts), then the pending list with per-row Tray verbs.
+  // Mount a capture box right AFTER the panel header (.phead) — so the panel TITLE stays
+  // on top like every other panel, AND so the expand-to-modal picks it up (modalContent
+  // transplants phead.nextSibling onward; a box inserted BEFORE phead is dropped from the
+  // modal). One placement fixes both the grid consistency and the modal presence.
+  function mountCaptureBox(p, box) {
+    const phead = p.querySelector(".phead");
+    if (phead) p.insertBefore(box, phead.nextSibling);
+    else p.insertBefore(box, p.firstChild);
   }
 
-  // Keep — durable pinned-dormant loops (the parked tier), lifted out of Open Loops and
-  // exempt from the dormancy→compost prompt; badged by tier. Read-only in 3a.
+  function renderTray(entry, view) {
+    const p = renderSporeProjection(entry, view, view.tray,
+      "tray clear — nothing waiting", "disposition");
+    // The dump box is the primary capture affordance — mounted under the title when
+    // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
+    if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump());
+    return p;
+  }
+
+  // Keep — durable reference: authored notes + pinned-dormant loops, lifted out of Open
+  // Loops and exempt from the dormancy→compost prompt. Slice 3b: an add-note box on top
+  // (when writable), then the list badged per-item (note → "note", parked loop → "parked").
   function renderKeep(entry, view) {
-    return renderSporeProjection(entry, view, view.keep,
-      "keep empty — no pinned-dormant loops", "tier");
+    const p = renderSporeProjection(entry, view, view.keep,
+      "keep empty — nothing kept", "keep");
+    if (isVerbPanel(entry)) mountCaptureBox(p, buildKeepNote());
+    return p;
   }
 
   // One episode row — the SINGLE markup for both the recent list and keyword-search
@@ -498,7 +616,7 @@
   function episodeRow(e, verbs) {
     const row = el("div", "row");
     if (e.type) row.appendChild(el("span", "etype", e.type));
-    row.appendChild(el("span", "clause", e.content));
+    appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
     if (Array.isArray(e.tags) && e.tags.length) {
       row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
     }
@@ -1056,13 +1174,69 @@
     m.textContent = (res && (res.message || res.error)) || "failed";
   }
 
-  function buildSporeVerbs(s) {
+  function buildSporeVerbs(s, panelKind) {
     const wrap = el("span", "verb-actions");
-    // touch — non-destructive (engage: seen=today, clears an elapsed alarm)
+
+    // A TRAY item (the forming workbench): edit + reclassify (plastic WHILE forming) are
+    // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
+    if (panelKind === "tray") {
+      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
+        openReclassify(wrap, s)));
+      // metabolize — promote into cognition as a live loop (Tray->loop is never the
+      // silent-loss direction, so no confirm); the type LOCKS at this boundary.
+      wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
+        const b = ev.currentTarget; b.disabled = true;
+        const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop" });
+        if (res && res.ok) return;  // re-rendered
+        b.disabled = false;
+        verbErr(wrap, res);
+      }));
+      wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+      if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
+        wrap.appendChild(verbBtn("dismiss", "compost this inbox item", () =>
+          openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
+      }
+      return wrap;
+    }
+
+    // KEEP — durable reference, NOT loop-lifecycle. Always editable; a note removes;
+    // a pinned-dormant loop reactivates (un-park) or removes.
+    if (panelKind === "keep") {
+      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      if (s.disposition !== "note") {
+        wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm" });
+          if (res && res.ok) return;  // re-rendered
+          b.disabled = false;
+          verbErr(wrap, res);
+        }));
+      }
+      if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
+        wrap.appendChild(verbBtn("remove", "delete this from Keep", () => openRemoveConfirm(wrap, s)));
+      }
+      return wrap;
+    }
+
+    // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
     wrap.appendChild(verbBtn("touch", "mark seen — reset its clock", async (ev) => {
       const b = ev.currentTarget; b.disabled = true;
       const res = await commit({ kind: "spore_touch", spore_id: s.id });
       if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
+      b.disabled = false;
+      verbErr(wrap, res);
+    }));
+    wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+    wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+    // park — pin to Keep: hide from active cognition but the loop stays OPEN (exempt from the
+    // dormancy→compost prompt), resurfaceable. The exact inverse of Keep's "reactivate"; a tier
+    // change (spore_update{tier:parked}) → bucket_of routes it to Keep. NON-destructive (the loop
+    // isn't resolved — that's why this is NOT a compost/descend kind), so no confirm.
+    wrap.appendChild(verbBtn("park", "pin to Keep — hide from cognition, stays open (un-park to restore)", async (ev) => {
+      const b = ev.currentTarget; b.disabled = true;
+      const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked" });
+      if (res && res.ok) return;  // re-rendered
       b.disabled = false;
       verbErr(wrap, res);
     }));
@@ -1077,6 +1251,195 @@
         openResolveForm(wrap, "spore_ascend", "promote", s, s.ascend_kinds, true)));
     }
     return wrap;
+  }
+
+  // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
+  // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
+  function openSurfaceForm(host, s) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form");
+    const input = el("input", "verb-date");
+    input.type = "date";
+    if (s.next) input.value = s.next;  // prefill an existing alarm
+    const go = el("button", "verb-confirm", "schedule");
+    const clearBtn = el("button", "verb-cancel", "clear");
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    form.append(input, go, clearBtn, cancel, msg);
+    host.appendChild(form);
+    input.focus();
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
+    const submit = async (value) => {
+      go.disabled = true; clearBtn.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
+      if (res && res.ok) return;  // re-rendered
+      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
+    };
+    go.addEventListener("click", () => {
+      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date (or clear)"; return; }
+      submit(input.value);
+    });
+    clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
+  }
+
+  // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
+  // trigger buttons, mount a form, wire cancel + Escape (stopPropagation so it doesn't nuke an
+  // enclosing focus-modal), and run `onConfirm` which returns the commit request (or null to
+  // validate-fail with `msg`). One form per row at a time.
+  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form");
+    const go = el("button", "verb-confirm" + (danger ? " danger" : ""), confirmLabel);
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    const fields = buildFields();  // {nodes:[...], focus:node}
+    form.append(...fields.nodes, go, cancel, msg);
+    host.appendChild(form);
+    if (fields.focus) fields.focus.focus();
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
+    go.addEventListener("click", async () => {
+      const req = onConfirm(fields, msg);
+      if (!req) return;  // onConfirm set a validation message
+      go.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit(req);
+      if (res && res.ok) return;  // re-rendered
+      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      go.disabled = false; cancel.disabled = false;
+    });
+  }
+
+  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore.
+  function openTextEdit(host, s) {
+    openRowForm(host, () => {
+      const ta = el("textarea", "verb-edit-ta");
+      ta.value = s.text || "";  // FULL canonical text — the wire no longer truncates, so edit
+      // reads/writes the WHOLE thing (edit-raw, no data loss). Size to content so a long spore
+      // is visible without hunting in a 2-row box (it still scrolls past the cap; the full
+      // value is always in .value regardless).
+      const lines = ta.value.split("\n").length;
+      ta.rows = Math.min(16, Math.max(3, lines, Math.ceil(ta.value.length / 56)));
+      return { nodes: [ta], focus: ta, ta };
+    }, (f, msg) => {
+      // Save the value VERBATIM — only trim for the empty-CHECK. trimming the saved text
+      // would silently strip a spore's structural leading/trailing newlines on its first
+      // edit (the small sibling of the truncation data-loss this slice fixes) [complement L3].
+      const text = f.ta.value;
+      if (!text.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
+      return { kind: "spore_update", spore_id: s.id, text };
+    }, "save", false);
+  }
+
+  // Inline reclassify — change a forming Tray item's type (spore_update{type}; the server
+  // gates it to forming items, locks at metabolize).
+  function openReclassify(host, s) {
+    openRowForm(host, () => {
+      const sel = el("select", "verb-kind");
+      for (const t of ["task", "question", "thought"]) { const o = el("option", null, t); o.value = t; sel.appendChild(o); }
+      if (s.type) sel.value = s.type;
+      return { nodes: [sel], focus: sel, sel };
+    }, (f) => ({ kind: "spore_update", spore_id: s.id, type: f.sel.value }), "reclassify", false);
+  }
+
+  // Remove confirm — compost a Keep item (a note/reference or a parked loop). Prefer the
+  // universal 'composted' kind; fall back to the spore's first descend kind. Remove is remove
+  // (one confirm, no kind picker).
+  function openRemoveConfirm(host, s) {
+    const kinds = Array.isArray(s.descend_kinds) ? s.descend_kinds : [];
+    const kind = kinds.indexOf("composted") >= 0 ? "composted" : kinds[0];
+    openRowForm(host, () => ({ nodes: [], focus: null }),
+      (_f, msg) => {
+        if (!kind) { msg.className = "edit-msg err"; msg.textContent = "no remove path"; return null; }
+        return { kind: "spore_descend", spore_id: s.id, spore_kind: kind, confirm: true };
+      }, "confirm remove", true);
+  }
+
+  // A freeform capture box. `submit` builds the request from the typed text. Used by the
+  // Tray dump (with a type dropdown) and the Keep add-note. No own label — it mounts right
+  // under the panel's title (Tray (X) / Keep (X)), like the content of every other panel;
+  // the placeholder carries the purpose hint.
+  function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq) {
+    const box = el("div", "tray-dump");
+    const ta = el("textarea", "tray-dump-ta");
+    ta.placeholder = placeholder; ta.rows = 2;
+    box.appendChild(ta);
+    const controls = el("div", "tray-dump-controls");
+    let sel = null;
+    if (withType) {
+      // "let flow sort" omits type → the server defaults (thought + AI routes it). The
+      // operator classifies only when they want to; the AI/default is the fallback.
+      sel = el("select", "tray-dump-type");
+      for (const [val, lbl] of [["", "let flow sort"], ["task", "task"],
+                                ["question", "question"], ["thought", "thought"]]) {
+        const o = el("option", null, lbl); o.value = val; sel.appendChild(o);
+      }
+      controls.appendChild(sel);
+    }
+    const go = el("button", "tray-dump-btn", btnLabel);
+    go.type = "button";
+    const msg = el("span", "edit-msg", "");
+    const submit = async () => {
+      const text = ta.value.trim();
+      if (!text) { msg.className = "edit-msg err"; msg.textContent = emptyMsg; return; }
+      go.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit(buildReq(text, sel && sel.value));
+      if (res && res.ok) return;  // re-rendered → fresh panel carrying the new item
+      go.disabled = false;
+      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+    };
+    go.addEventListener("click", submit);
+    // Cmd/Ctrl+Enter submits; plain Enter newlines (a capture may be multi-line).
+    ta.addEventListener("keydown", (ev) => {
+      if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") { ev.preventDefault(); submit(); }
+    });
+    controls.append(go, msg);
+    box.appendChild(controls);
+    return box;
+  }
+
+  // The Tray DUMP — the operator's primary capture (a `seed` is born, held out of
+  // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
+  function buildTrayDump() {
+    return buildCaptureBox(
+      "dump anything — a to-do, a thought, a thread to pick up… flow sorts it (⌘/Ctrl+Enter)",
+      "drop", "nothing to drop", true,
+      (text, type) => {
+        const req = { kind: "spore_seed", text };
+        if (type) req.type = type;  // omit → server default (thought + AI routes)
+        return req;
+      });
+  }
+
+  // The Keep ADD-NOTE — authored durable reference (the Docker-commands case): a `note`,
+  // cognition-excluded + resolve-exempt. No type (reference never resolves).
+  function buildKeepNote() {
+    return buildCaptureBox(
+      "add a note — a command, a pointer, durable reference to keep handy (⌘/Ctrl+Enter)",
+      "keep", "nothing to keep", false,
+      (text) => ({ kind: "spore_seed", text, disposition: "note" }));
   }
 
   // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a
@@ -1406,6 +1769,7 @@
     const wasSearchFocused = !!oldSearch && oldSearch === document.activeElement;
     const hadModalFocus = overlay.contains(document.activeElement);
     overlay.replaceChildren(box);
+    measureClauses(box);  // reveal per-item expand toggles inside the focus modal too
     mbody.scrollTop = prevScroll;
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
     if (newSearch) newSearch.focus();

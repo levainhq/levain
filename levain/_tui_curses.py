@@ -33,7 +33,7 @@ import subprocess
 import tempfile
 from dataclasses import replace
 
-from levain.dashboard import CLASS_A, CLASS_C, SubstrateSource, SubstrateView
+from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
 from levain.tui import (
     ZONES,
     TuiModel,
@@ -511,6 +511,14 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
     for row_i, panel in enumerate(panels[left_scroll:left_scroll + body_h]):
         pidx = left_scroll + row_i
         cls = panel.get("edit_class") or ""
+        # NO-THEATER: the metal [A]/[B] chip + bold is THIS surface's operability signal. A
+        # panel can be Class B in the shared manifest because the WEB operates it (Tray/Keep,
+        # Slice 3b) while the curses surface has no verb for it yet → render it as glass (no
+        # chip, dim) rather than a false metal [B] until the TUI grows the verb [codex L3
+        # NO-THEATER]. `read_only=False` probes "can this surface EVER operate this kind?",
+        # independent of the cockpit's current read-only MODE (which suppresses every verb).
+        if cls == CLASS_B and not panel_verbs(panel, read_only=False):
+            cls = ""
         chip = f"[{cls}]" if cls else "   "
         label = str(panel.get("title", panel.get("kind", "?")))
         row = f"{chip} {label}"
