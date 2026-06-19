@@ -1,39 +1,41 @@
 """levain.spores — the spore *disposition* vocabulary (control-plane Slice 3).
 
-A spore's ``disposition`` routes it between the entity's OWN prospective loops (the
-default, absent/``loop`` → these belong in the entity's cognition: recall / salience /
-digest / Top of Mind) and the operator's session-I/O **Tray** (``seed`` / ``handoff`` /
-``agenda`` → the operator inbox, which should NOT pollute that cognition). A ``seed``
-metabolizes into a ``loop`` (or descends/ascends to a real object); lineage rides the
-existing ``pointer``. **Keep**'s pinned-dormant reuses the existing ``parked`` TIER, not
-a disposition.
+A spore's ``disposition`` routes it across THREE operator-facing classes:
+  - ``loop`` (the default, absent/``loop``) — the entity's OWN prospective loop; belongs in
+    its cognition (recall / salience / digest / Top of Mind).
+  - the **Tray** inbox (``seed`` / ``handoff`` / ``agenda``) — operator session-I/O that
+    should NOT pollute cognition; a ``seed`` metabolizes into a ``loop`` (or resolves). It
+    FORMS, then resolves.
+  - **Keep** reference (``note``) — durable operator reference; persists until removed,
+    resolve-EXEMPT (never germinates, never ascends; removed via descend). Keep ALSO holds
+    pinned-dormant loops via the existing ``parked`` TIER.
+Tray + Keep are both ``NON_COGNITION``; lineage rides the existing ``pointer``.
 
 The field is ADDITIVE: every pre-Slice-3 spore has no ``disposition`` key and reads as a
 ``loop`` (no migration; anneal round-trips an unknown ``disposition`` untouched — the
 Slice-3 de-risk, proven empirically, is exactly why anneal needs NO change).
 
-This module is the dashboard's render half (layer 3a): it CLASSIFIES a spore dict into
-the three operator-facing projections — Open Loops / Tray / Keep — via :func:`bucket_of`.
+This module is the dashboard's render half: it CLASSIFIES a spore dict into the three
+operator-facing projections — Open Loops / Tray / Keep — via :func:`bucket_of`.
 
-⚠ **Scope of the "keep Tray OUT of cognition" invariant.** ``is_loop`` is the PREDICATE;
-who ENFORCES it depends on the surface. flow's own store enforces it at its cognition
-reads (``scripts/spores.py`` + flow_state/constellation — flow's already-shipped layer 2).
-A bare LEVAIN install's cognition surfaces are its activation hooks
-(``templates/activation/hooks/*`` — session-start dormant-surface + per-prompt collision),
-which do NOT yet filter disposition: porting ``is_loop`` there is the 3b work that ships
-WITH the Tray write path (a stranger can't CREATE a Tray item until 3b, so the invariant
-is vacuously held until then). This module (3a) only RENDERS the split — it does not, on
-its own, keep anything out of a Levain entity's cognition.
+⚠ **Scope of the "keep operator-I/O OUT of cognition" invariant.** ``is_loop`` is the
+PREDICATE; who ENFORCES it depends on the surface. flow's own store enforces it at its
+cognition reads (``scripts/spores.py`` + flow_state/constellation — flow's layer 2). A bare
+LEVAIN install's cognition surfaces are its activation hooks
+(``templates/activation/hooks/*`` — session-start dormant-surface + per-prompt collision):
+3b ports ``is_loop`` there (the standalone hook copies filter on
+``_NON_COGNITION_DISPOSITIONS``), so the boundary holds for a stranger too.
 
-⚠ **Drift contract (load-bearing).** ``TRAY_DISPOSITIONS`` is duplicated here AND in
-flow's own ``scripts/spores.py`` BY DESIGN. anneal — the shared dependency — deliberately
-does NOT carry the disposition taxonomy (the de-risk keeps the canonical object's storage
-disposition-blind), so each consumer that must INTERPRET disposition carries the vocab:
-flow's ``scripts/spores.py`` for the cognition-exclude (layer 2), this module for the
-render partition (layer 3). They MUST agree on the literal tuple. A NEW Tray-class
-disposition added upstream must be added to BOTH (and to the write seam's ``choices``) or
-the cognition boundary and the render boundary drift apart. The ``is_loop`` definition
-below is the byte-for-byte twin of flow's; keep them identical.
+⚠ **Drift contract (load-bearing).** The taxonomy is duplicated in FOUR places BY DESIGN —
+this module, flow's ``scripts/spores.py``, and the TWO standalone hook copies (Claude +
+Codex adapters, which can't import a package). anneal — the shared dependency — deliberately
+does NOT carry the taxonomy (the de-risk keeps the canonical object's storage
+disposition-blind), so every consumer that must INTERPRET disposition carries the vocab. A
+NEW operator-I/O disposition added upstream must be added to ALL FOUR (and to the write
+seam's ``choices``). Guards: the flow↔levain cross-repo equality test
+(``flow/scripts/test_tray_disposition.py``); the hook↔hook parity + hook↔levain.spores tests
+(``levain/tests/test_hooks.py``). The ``is_loop`` definition below is the byte-for-byte twin
+of flow's; keep them identical.
 """
 
 from __future__ import annotations
@@ -44,6 +46,8 @@ from typing import Any
 __all__ = [
     "LOOP_DISPOSITION",
     "TRAY_DISPOSITIONS",
+    "KEEP_DISPOSITIONS",
+    "NON_COGNITION_DISPOSITIONS",
     "VALID_DISPOSITIONS",
     "PARKED_TIER",
     "BUCKET_LOOP",
@@ -52,12 +56,18 @@ __all__ = [
     "disposition_of",
     "is_loop",
     "is_tray",
+    "is_note",
     "bucket_of",
 ]
 
 LOOP_DISPOSITION = "loop"
-TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")
-VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_DISPOSITIONS
+TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")   # operator INBOX — forms, then resolves
+KEEP_DISPOSITIONS = ("note",)                        # operator durable REFERENCE — never resolves
+# Everything the operator authored as I/O (inbox + reference) — all excluded from the
+# entity's OWN cognition, the complement of a cognition loop. (Tray resolves; a note is
+# resolve-exempt reference. Both are operator I/O, not the entity's prospective loops.)
+NON_COGNITION_DISPOSITIONS = TRAY_DISPOSITIONS + KEEP_DISPOSITIONS
+VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
 # ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is Keep — pinned-dormant, exempt
@@ -69,7 +79,7 @@ PARKED_TIER = "parked"
 # three disposition panels — seed/handoff/agenda all land in Tray).
 BUCKET_LOOP = "loop"   # the entity's active prospective loops (Open Loops panel)
 BUCKET_TRAY = "tray"   # the operator inbox awaiting AI triage (Tray panel)
-BUCKET_KEEP = "keep"   # durable pinned-dormant loops (Keep panel)
+BUCKET_KEEP = "keep"   # durable reference (notes) + pinned-dormant loops (Keep panel)
 
 
 def disposition_of(item: Mapping[str, Any]) -> str:
@@ -80,39 +90,50 @@ def disposition_of(item: Mapping[str, Any]) -> str:
 
 def is_loop(item: Mapping[str, Any]) -> bool:
     """True iff the spore flows into the entity's OWN cognition (salience / Top of Mind /
-    digest / constellation agent seeds). The operator Tray dispositions (seed / handoff /
-    agenda) are the complement — surfaced at session-open, kept OUT of cognition.
+    digest / constellation agent seeds). The operator-I/O dispositions — the Tray inbox
+    (seed/handoff/agenda) AND Keep reference (note) — are the complement, kept OUT of
+    cognition.
 
-    Fail-OPEN on the unknown: only an EXPLICITLY known Tray disposition is excluded; a
-    falsy/absent value (every pre-Slice-3 spore) OR an unrecognized string reads as
-    in-cognition. The exclusion axis is the silent-harm one — a Tray item leaking into a
-    render is visible text, but a real loop wrongly bucketed as Tray vanishes from the
-    Open-Loops panel with no signal. An unknown value is almost always a typo /
-    corruption / version-skew on a real loop, not a legitimate Tray item — fail it toward
-    the visible loop. (Byte-for-byte twin of flow's ``scripts/spores.py:is_loop`` — the
-    cognition-exclude predicate; keeping them identical is the drift contract above.)"""
-    return disposition_of(item) not in TRAY_DISPOSITIONS
+    Fail-OPEN on the unknown: only an EXPLICITLY known operator-I/O disposition is
+    excluded; a falsy/absent value (every pre-Slice-3 spore) OR an unrecognized string
+    reads as in-cognition. The exclusion axis is the silent-harm one — an operator-I/O
+    item leaking into a render is visible text, but a real loop wrongly bucketed out
+    vanishes from the Open-Loops panel with no signal. An unknown value is almost always
+    a typo / corruption / version-skew on a real loop — fail it toward the visible loop.
+    (Byte-for-byte twin of flow's ``scripts/spores.py:is_loop``; keeping them identical
+    is the drift contract above.)"""
+    return disposition_of(item) not in NON_COGNITION_DISPOSITIONS
 
 
 def is_tray(item: Mapping[str, Any]) -> bool:
-    """The explicit complement of :func:`is_loop`: the operator session-I/O Tray set."""
-    return not is_loop(item)
+    """The operator session-I/O INBOX set (seed/handoff/agenda) — EXPLICIT membership,
+    NOT ``not is_loop``: a ``note`` is also non-cognition but it is Keep reference, not
+    the Tray, so the three classes (loop / tray / keep) are distinct."""
+    return disposition_of(item) in TRAY_DISPOSITIONS
+
+
+def is_note(item: Mapping[str, Any]) -> bool:
+    """The operator durable-REFERENCE set (Keep notes) — resolve-exempt, agent-queryable,
+    cognition-excluded. Explicit membership, the complement-within-Keep of a parked loop."""
+    return disposition_of(item) in KEEP_DISPOSITIONS
 
 
 def bucket_of(item: Mapping[str, Any]) -> str:
     """Classify a spore into its operator-facing render bucket — a TOTAL partition (every
     spore lands in exactly one):
 
-    - ``BUCKET_TRAY`` — a Tray disposition (seed/handoff/agenda), ANY tier. Disposition
-      wins over tier: a parked-but-un-triaged seed is still a Tray item (it needs the AI's
-      sort), and this keeps the render boundary identical to layer 2's cognition-exclude
-      (``is_tray`` ≡ ``not is_loop``).
-    - ``BUCKET_KEEP`` — a loop on the ``parked`` tier: durable, pinned-dormant, exempt
-      from the dormancy→compost prompt.
+    - ``BUCKET_TRAY`` — a Tray inbox disposition (seed/handoff/agenda), ANY tier.
+      Disposition wins over tier: a parked-but-un-triaged seed is still a Tray item.
+    - ``BUCKET_KEEP`` — durable reference: a ``note`` disposition (resolve-exempt) OR a
+      loop on the ``parked`` tier (pinned-dormant, exempt from the dormancy→compost
+      prompt). The two Keep halves from the original FATE design.
     - ``BUCKET_LOOP`` — a loop on any active tier: the entity's live cognition.
+
+    Disposition is checked before tier so a (hypothetical) parked note still reads Keep.
     """
-    if is_tray(item):
+    d = disposition_of(item)
+    if d in TRAY_DISPOSITIONS:
         return BUCKET_TRAY
-    if item.get("tier") == PARKED_TIER:
+    if d in KEEP_DISPOSITIONS or item.get("tier") == PARKED_TIER:
         return BUCKET_KEEP
     return BUCKET_LOOP

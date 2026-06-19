@@ -518,19 +518,19 @@ class SubstrateView:
         # --- Operate: the inputs/loops you steer -----------------------------
         # The three spore projections, adjacent: the entity's active loops, the operator
         # session-I/O inbox, the durable pinned-dormant shelf (Slice 3 capture-UX (A) —
-        # ONE Tray, not three disposition panels). Open Loops keeps its Class-B verbs;
-        # Tray + Keep render read-only in 3a (edit_class "" → no chip, no verb, NO-THEATER)
-        # — the governed dump/sort/park verbs land in 3b, which flips these to Class B.
+        # ONE Tray, not three disposition panels). All three are Class B: Open Loops gets
+        # the lifecycle verbs; Tray (Slice 3b) gets the freeform dump box + per-row triage
+        # verbs (metabolize / schedule / dismiss); Keep gets the lifecycle verbs + schedule.
         panels.append(
             {"kind": "spores", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Open loops ({len(self.open_spores)})"}
         )
         panels.append(
-            {"kind": "tray", "zone": ZONE_OPERATE, "edit_class": "",
+            {"kind": "tray", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Tray ({len(self.tray)})"}
         )
         panels.append(
-            {"kind": "keep", "zone": ZONE_OPERATE, "edit_class": "",
+            {"kind": "keep", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Keep ({len(self.keep)})"}
         )
         panels.append(
@@ -916,15 +916,17 @@ def _episode_tags(ep: Any) -> list[str]:
 
 def _episode_row(ep: Any) -> EpisodeRow:
     """Build the dashboard's ``EpisodeRow`` from a raw anneal episode — the SINGLE
-    place the row shape lives (field mapping + the 280-char content truncation), so
-    the recent-episodes panel and the keyword-recall surface (spore-107) can never
-    drift apart."""
+    place the row shape lives, so the recent-episodes panel and the keyword-recall
+    surface (spore-107) can never drift apart. Content rides FULL (raw) over the wire:
+    truncating it here lost the tail with no way to see it (and an edit would have
+    written the truncation back). The surface clamps the row for density + offers a
+    per-item expand; the canonical text stays whole [display-renders / view-clamps]."""
     return EpisodeRow(
         id=ep.id,
         timestamp=ep.timestamp,
         type=ep.type.value,
         source=ep.source,
-        content=_truncate(ep.content, 280),
+        content=ep.content,
         tags=_episode_tags(ep),
     )
 
@@ -1228,7 +1230,12 @@ def build_substrate_view(
                             tier=str(s.get("tier", "")),
                             salience=int(s.get("salience", 0) or 0),
                             domain=str(s.get("domain", "")),
-                            text=_truncate(str(s.get("text", "")), 200),
+                            # FULL (raw) text over the wire — NOT truncated. A 200-char
+                            # cap here lost the tail with no way to see it, and the 3b
+                            # text-edit seeded the editor from this value → save wrote the
+                            # truncation back (silent data loss). The surface clamps the row
+                            # for density + offers a per-item expand; canonical stays whole.
+                            text=str(s.get("text", "")),
                             seen=str(s.get("seen", "")),
                             # str-coerce next like its siblings: the TUI runs _oneline(next)
                             # which would crash on a non-str next from a corrupted store

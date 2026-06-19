@@ -90,12 +90,14 @@ from anneal_memory import (  # the SHARED cross-process continuity lock
     continuity_lock,
 )
 
-from levain.spores import (  # the Tray disposition vocabulary (anneal stays blind)
+from levain.spores import (  # the operator-I/O disposition vocabulary (anneal stays blind)
     LOOP_DISPOSITION,
-    TRAY_DISPOSITIONS,
+    NON_COGNITION_DISPOSITIONS,
     VALID_DISPOSITIONS,
     disposition_of,
     is_loop,
+    is_note,
+    is_tray,
 )
 
 if TYPE_CHECKING:
@@ -567,6 +569,8 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_spore_set_disposition(scope, req, now)
         if kind == "spore_surface_at":
             return _apply_spore_surface_at(scope, req, now)
+        if kind == "spore_update":
+            return _apply_spore_update(scope, req, now)
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
@@ -782,8 +786,9 @@ def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) 
 _VERB_KINDS = frozenset(
     {
         "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
-        # Slice 3b — the Tray operator-I/O write kinds (capture + disposition + schedule):
-        "spore_seed", "spore_set_disposition", "spore_surface_at",
+        # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
+        # the forming-workbench metadata edit: text / reclassify-type / re-tier):
+        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update",
     }
 )
 
@@ -881,6 +886,24 @@ def _apply_spore_verb(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
+    if verb == "ascend":
+        # A note is durable operator REFERENCE, not a prospective loop that BECAME memory —
+        # ascending it would falsely claim reference material as the entity's own graduated
+        # cognition (a pattern/essay/project lineage). Reference is REMOVED (descended), never
+        # transmuted. Disposition-aware policy → enforced here; anneal stays blind. (descend
+        # stays allowed — it's how the Keep "remove" works.) KNOWN RESIDUAL (complement L3,
+        # LOW): the disposition read and `store.ascend` are separate transactions, so a
+        # cross-process writer flipping a loop→note in that window can slip an ascend past this
+        # guard. Sound single-process; closing it cross-process needs an `expect_disposition`
+        # CAS on anneal's `ascend` (it only exists on `update` today) — a future anneal harden,
+        # not grown here for a rare timing window.
+        current = store.get(spore_id)
+        if current is not None and is_note(current):
+            raise EditError(
+                "not_ascendable", 409,
+                "a Keep note is durable reference, not a prospective loop — it can't be "
+                "promoted/ascended; remove it (descend) instead",
+            )
     try:
         if verb == "touch":
             store.touch(spore_id)
@@ -925,24 +948,24 @@ def _apply_spore_verb(
 def _apply_spore_seed(
     scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
-    """Capture a freeform operator dump as a Tray spore (the in-GUI dump→seed). Creates
-    a NEW spore carrying a Tray ``disposition`` (default ``seed``) so it lands in the
-    operator inbox and is held OUT of the entity's cognition until the AI triages it —
-    not a cognition loop. Creates the store if absent.
+    """Capture a freeform operator-I/O item (the in-GUI dump). Creates a NEW spore carrying
+    an operator-I/O ``disposition`` — a Tray inbox item (default ``seed``) OR a Keep
+    durable reference (``note``) — so it lands in the operator surface and is held OUT of
+    the entity's cognition (``is_loop``=False) regardless of tier. Never a plain cognition
+    loop: loops are born from a Tray item metabolizing, or the CLI. Creates the store if
+    absent.
 
-    ``type`` defaults to ``thought`` (the catch-all openness of an un-sorted dump — the
-    human freeform dump supplies no type), but is settable when the type IS known (an
-    AI-authored capture, a future typed-dump affordance). NOTE — a spore's ``type`` is
-    IMMUTABLE (anneal has no retype verb, by design — an immune property). So a dump that
-    triage later finds is really a ``task`` is NOT re-typed in place; the clean path is
-    SPAWN-metabolize: the AI ``descend``s the thought-seed and creates the correctly-typed
-    object (recording lineage). ``set_disposition``→``loop`` is the in-place metabolize for
-    a genuine thought-loop only. (The Slice-3b curriculum teaches this.)"""
+    ``type`` defaults to ``thought`` (the catch-all for an un-sorted dump — the freeform
+    drop supplies no type), settable when known (the type dropdown / an AI capture). A Tray
+    item is EXCEPTIONAL: while forming it is type-PLASTIC — ``spore_update`` can reclassify
+    it (the lock binds at metabolize, not at drop). A ``note`` still CARRIES a type for
+    storage uniformity but it is lifecycle-INERT — a note never ascends (refused) and is
+    removed via descend, so its type is never consulted for resolution."""
     from anneal_memory.spores import SporeError, SporeStore, VALID_TYPES  # lazy
 
     text = _require_str(req, "text").strip()
     if not text:
-        raise EditError("bad_verb_arg", 422, "a Tray capture needs non-empty text")
+        raise EditError("bad_verb_arg", 422, "a capture needs non-empty text")
     if len(text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
         raise EditError("too_large", 413,
                         f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
@@ -953,19 +976,20 @@ def _apply_spore_seed(
             f"type must be one of {list(VALID_TYPES)} (got {stype!r})",
         )
     disposition = req.get("disposition", "seed")
-    if disposition not in TRAY_DISPOSITIONS:
+    if disposition not in NON_COGNITION_DISPOSITIONS:
         raise EditError(
             "bad_verb_arg", 422,
-            f"a Tray capture's disposition must be one of {list(TRAY_DISPOSITIONS)} "
-            f"(got {disposition!r}) — a plain cognition loop is not captured here",
+            f"a captured item's disposition must be operator I/O "
+            f"({list(NON_COGNITION_DISPOSITIONS)}; got {disposition!r}) — a Tray seed or a "
+            f"Keep note, never a plain cognition loop (those come from metabolize or the CLI)",
         )
 
     store = SporeStore(scope.anneal.spores_json)
     try:
-        # No explicit tier → anneal's default (`warm`). Harmless for a Tray item: a Tray
-        # disposition is cognition-EXCLUDED (is_loop=False) regardless of tier, so the tier
-        # has no salience/germination effect until the AI metabolizes it to a loop — at
-        # which point `warm` is the right neutral default for a freshly-promoted loop.
+        # No explicit tier → anneal's default (`warm`). Harmless: an operator-I/O disposition
+        # is cognition-EXCLUDED (is_loop=False) regardless of tier, so tier has no
+        # salience/germination effect until a Tray item metabolizes to a loop — at which
+        # point `warm` is the right neutral default for a freshly-promoted loop.
         created = store.add(type=stype, text=text, disposition=disposition)
     except ValueError as exc:  # anneal arg validation (e.g. empty text)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
@@ -987,17 +1011,21 @@ def _apply_spore_seed(
 def _apply_spore_set_disposition(
     scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
-    """Re-route an OPEN spore between the operator Tray and the entity's cognition (the
-    AI's triage verb). ``disposition`` ∈ loop/seed/handoff/agenda: ``loop`` METABOLIZES
-    a Tray item into a cognition loop (clears the opaque tag → key-free); a Tray value
-    moves it within / into the Tray.
+    """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb).
+    ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop`` METABOLIZES an
+    operator-I/O item into a cognition loop (clears the tag → key-free); a Tray value moves
+    it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
 
-    Most transitions are non-destructive (re-set to reverse) → no confirm. The ONE guarded
-    direction is **demoting a LIVE cognition loop into the Tray** (current = loop, target =
-    a Tray disposition, tier ≠ parked): that removes it from salience / digest / Top of Mind
-    with no other signal — the silent-cognition-loss the fail-open read-predicate exists to
-    prevent — so it is confirm-gated, like ``descend``/``ascend``. The prior disposition is
-    always recorded in the audit so any move stays reconstructable from the ledger."""
+    Two boundaries are guarded. (1) A Keep ``note`` is TERMINAL — re-routing it OUT (note→loop
+    / note→Tray) is REFUSED (409), because it would defeat the note-ascend lock; a note is
+    repurposed by ``descend`` + creating a fresh loop, never by mutation. (2) **Demoting a LIVE
+    cognition loop into operator I/O** (current = loop, target ∈ NON_COGNITION — Tray OR note)
+    removes it from salience / digest / Top of Mind with no other signal — the silent-
+    cognition-loss the fail-open read-predicate exists to prevent — so it is confirm-gated, like
+    ``descend``/``ascend``. The gate reads only CAS-/transaction-guarded fields (disposition +
+    status), NOT tier (that was a TOCTOU). Everything else (loop→loop, Tray↔Tray, filing INTO
+    Keep) is non-destructive → no confirm. The prior disposition is always audited so any move
+    stays reconstructable."""
     from anneal_memory.spores import SporeError, SporeStore  # lazy
 
     spore_id = _require_str(req, "spore_id")
@@ -1022,17 +1050,37 @@ def _apply_spore_set_disposition(
     # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
+    # A Keep note is a TERMINAL, lifecycle-inert durable-reference disposition (ascend REFUSED,
+    # resolve-exempt). Re-routing it OUT (note→loop / note→Tray) DEFEATS that lock: note→loop
+    # clears the tag below, and the now-"loop" item sails past the note-ascend guard in
+    # `_apply_spore_verb` → a reference resolves into a false pattern/project lineage [codex L3
+    # HIGH; kimi/complement concur]. To repurpose a note, `descend` composts THIS object and a
+    # fresh loop is created (a NEW object — not "a reference that became memory"). Filing INTO
+    # Keep (loop→note / Tray→note) still flows; only LEAVING the note state is closed.
+    if current is not None and is_note(current) and disposition != "note":
+        raise EditError(
+            "note_terminal", 409,
+            f"spore {spore_id} is a Keep note — durable reference is lifecycle-inert and "
+            "cannot be re-routed into a loop or the Tray. descend it to remove, or edit in place.",
+        )
+    # Gate ANY demotion of a live cognition loop into operator I/O — the Tray inbox OR a Keep
+    # note (NON_COGNITION, not just TRAY). loop→note is the same silent-cognition-loss and is
+    # even STICKIER (a note is durable + resolve-exempt), so it must confirm too [L1+L2 L3].
+    # loop→loop / I/O→anywhere stay un-gated (no loss, or a gain into cognition). The gate reads
+    # ONLY CAS-guarded `disposition` + transaction-guarded `status` — NOT `tier`: a `tier`-based
+    # exemption was a TOCTOU (the CAS at the write doesn't cover tier, so a concurrent re-tier
+    # between this read and the write defeated the confirm — codex L3 reproduced `warm seed`).
     demoting_live_loop = (
         current is not None
         and current.get("status", "open") == "open"
         and is_loop(current)
-        and disposition in TRAY_DISPOSITIONS
-        and current.get("tier") != "parked"
+        and disposition in NON_COGNITION_DISPOSITIONS
     )
     if demoting_live_loop:
+        dest = "a Keep note" if disposition in ("note",) else "the Tray"
         _require_confirm(
             req,
-            f"move loop {spore_id} into the Tray? it leaves the entity's active cognition "
+            f"move loop {spore_id} into {dest}? it leaves the entity's active cognition "
             "(salience / digest / Top of Mind) until it's re-triaged",
         )
 
@@ -1108,6 +1156,101 @@ def _apply_spore_surface_at(
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
             "action": "surface_at"}
+
+
+def _apply_spore_update(
+    scope: WriteScope, req: dict[str, Any], now: str | None
+) -> dict[str, Any]:
+    """A governed metadata edit of an OPEN spore — the operator's forming-workbench levers:
+    edit ``text`` (refine in place), reclassify ``type`` (ONLY while forming — a Tray item;
+    the type LOCKS once it metabolizes into a loop or is a Keep note), re-``tier`` (e.g.
+    un-park a Keep loop → active). At least one of text/type/tier required; all
+    non-destructive (reversible by re-edit) → no confirm.
+
+    The reclassify gate is the immune-property-at-the-cognition-boundary: ``type`` is
+    plastic while forming, locked once committed. Levain owns that policy (disposition-aware);
+    anneal allows the retype mechanically. A CAS on the disposition guards the type gate's
+    read→write window against a concurrent (cross-process) writer."""
+    from anneal_memory.spores import (  # lazy
+        VALID_TIERS,
+        VALID_TYPES,
+        SporeError,
+        SporeStore,
+    )
+
+    spore_id = _require_str(req, "spore_id")
+    has_text, has_type, has_tier = "text" in req, "type" in req, "tier" in req
+    if not (has_text or has_type or has_tier):
+        raise EditError("bad_verb_arg", 422,
+                        "spore_update needs at least one of: text, type, tier")
+
+    # Validate every provided field up-front (before touching the store).
+    new_text: str | None = None
+    if has_text:
+        new_text = _require_str(req, "text").strip()
+        if not new_text:
+            raise EditError("bad_verb_arg", 422, "text cannot be cleared to empty")
+        if len(new_text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
+            raise EditError("too_large", 413,
+                            f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
+    new_type = req.get("type") if has_type else None
+    if has_type and new_type not in VALID_TYPES:
+        raise EditError("bad_verb_arg", 422,
+                        f"type must be one of {list(VALID_TYPES)} (got {new_type!r})")
+    new_tier = req.get("tier") if has_tier else None
+    if has_tier and new_tier not in VALID_TIERS:
+        raise EditError("bad_verb_arg", 422,
+                        f"tier must be one of {list(VALID_TIERS)} (got {new_tier!r})")
+
+    paths = scope.anneal
+    if not paths.spores_json.is_file():
+        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
+    store = SporeStore(paths.spores_json)
+    current = store.get(spore_id)
+    prior_raw = cast("str | None", current.get("disposition")) if current else None
+
+    # RECLASSIFY GATE — type is plastic ONLY while forming (a Tray item). A committed loop
+    # or a Keep note has a LOCKED type; the immune property binds at the cognition boundary,
+    # not at capture. (A missing id falls through to update's own SporeError, not 409.)
+    if has_type and current is not None and not is_tray(current):
+        raise EditError(
+            "type_locked", 409,
+            "type is only reclassifiable while an item is forming in the Tray; a committed "
+            "loop / a Keep note has a locked type (dismiss + re-capture to change it)",
+        )
+
+    kwargs: dict[str, Any] = {}
+    if has_text:
+        kwargs["text"] = new_text
+    if has_type:
+        kwargs["type"] = new_type
+    if has_tier:
+        kwargs["tier"] = new_tier
+    # CAS only when the type gate is in play — a text/tier-only edit is disposition-
+    # independent, so guarding it on the disposition would spuriously reject under a benign
+    # concurrent re-route. The reclassify, whose gate read the disposition, must be sound.
+    if has_type:
+        kwargs["expect_disposition"] = prior_raw
+    try:
+        store.update(spore_id, **kwargs)
+    except ValueError as exc:  # anneal arg validation
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except SporeError as exc:  # unknown id / resolved / drift / CAS mismatch
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+
+    fields = [f for f, h in (("text", has_text), ("type", has_type), ("tier", has_tier)) if h]
+    extra: dict[str, Any] = {"fields": fields}
+    if has_type:
+        extra["type"] = new_type
+    if has_tier:
+        extra["tier"] = new_tier
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="spore_update", action="update",
+        target=f"spore:{spore_id}", now=now, extra=extra,
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": "update"}
 
 
 def _apply_episode_tombstone(

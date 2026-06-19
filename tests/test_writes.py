@@ -945,6 +945,16 @@ class TestTrayWriteKinds:
             apply_edit(_scope(install), {"kind": "spore_seed", "text": "x" * (MAX_SPORE_TEXT_BYTES + 1)})
         assert ei.value.code == "too_large" and ei.value.http_status == 413
 
+    def test_seed_creates_a_keep_note(self, install: Path) -> None:
+        # the Keep durable-reference half: disposition=note → cognition-excluded, bucket Keep
+        from levain.spores import BUCKET_KEEP, bucket_of, is_loop
+        res = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "docker: levain-vps init", "disposition": "note",
+        })
+        sp = _spore_store(install).get(res["spore_id"])
+        assert sp["disposition"] == "note"
+        assert not is_loop(sp) and bucket_of(sp) == BUCKET_KEEP
+
     def test_seed_defaults_to_thought_type(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "untyped dump"})["spore_id"]
         assert _spore_store(install).get(sid)["type"] == "thought"
@@ -1020,13 +1030,83 @@ class TestTrayWriteKinds:
         rec = recent_edits(install / ".levain")[0]
         assert rec["prior_disposition"] == "loop" and rec["disposition"] == "seed"
 
-    def test_set_disposition_parked_loop_to_tray_no_confirm(self, install: Path) -> None:
-        # a parked loop (Keep) is already out of active cognition → no silent loss → no gate
+    def test_set_disposition_demote_live_loop_to_note_requires_confirm(self, install: Path) -> None:
+        # M1: loop→note is the same silent-cognition-loss as loop→Tray (a note is even
+        # stickier — durable + resolve-exempt), so the confirm gate covers NON_COGNITION,
+        # not just TRAY.
+        sid = _add_spore(install, tier="hot")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+        assert "disposition" not in _spore_store(install).get(sid)  # loop untouched
+
+    def test_set_disposition_parked_loop_to_tray_now_requires_confirm(self, install: Path) -> None:
+        # C (codex L3 MED, reproduced `warm seed`): the confirm gate previously EXEMPTED
+        # parked loops (tier != "parked"). But the CAS at the write guards `disposition`, NOT
+        # `tier` — so a parked read that skipped confirm could be re-tiered to warm by a
+        # concurrent writer before the write landed, demoting a live loop with no confirm. The
+        # gate now reads only CAS-/transaction-guarded fields (disposition + status); a parked
+        # loop demotion is rare and confirming it costs nothing.
         sid = _add_spore(install, tier="parked")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            })
+        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+        # with confirm it goes through
         res = apply_edit(_scope(install), {
             "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            "confirm": True,
         })
         assert res["ok"]
+
+    # -- A: a Keep note is TERMINAL — re-routing it OUT defeats the note-ascend lock --
+    def _seed_note(self, install: Path) -> str:
+        return apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "docker: levain init", "disposition": "note",
+        })["spore_id"]
+
+    def test_set_disposition_note_to_loop_refused(self, install: Path) -> None:
+        # codex L3 HIGH: note→loop cleared the tag, then the now-loop sailed past the
+        # note-ascend guard → a reference resolved into a false lineage. Closed: note is
+        # terminal for re-routing.
+        sid = self._seed_note(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        assert ei.value.code == "note_terminal" and ei.value.http_status == 409
+        assert _spore_store(install).get(sid)["disposition"] == "note"  # untouched
+
+    def test_set_disposition_note_to_tray_refused(self, install: Path) -> None:
+        sid = self._seed_note(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed"})
+        assert ei.value.code == "note_terminal"
+        assert _spore_store(install).get(sid)["disposition"] == "note"
+
+    def test_note_ascend_bypass_is_closed_end_to_end(self, install: Path) -> None:
+        # the full reproduced chain: seed-note → (try) set_disposition loop → ascend. Step 2
+        # is now refused, so step 3 can never reach an ascendable non-note. Direct ascend of
+        # the note is also refused by the H2 guard.
+        sid = self._seed_note(install)
+        with pytest.raises(EditError):  # the metabolize is blocked
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        with pytest.raises(EditError) as ei:  # and a direct ascend stays refused
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+                "ref": "x", "confirm": True})
+        assert ei.value.code == "not_ascendable"
+
+    def test_set_disposition_note_to_note_is_a_noop_not_refused(self, install: Path) -> None:
+        # the terminal guard fires only on LEAVING note (disposition != "note")
+        sid = self._seed_note(install)
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
+        assert res["ok"]
+        assert _spore_store(install).get(sid)["disposition"] == "note"
 
     def test_set_disposition_records_prior_disposition_in_audit(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
@@ -1150,6 +1230,162 @@ class TestTrayWriteKinds:
     # -- undo refuses every Tray kind (verb-mediated, not file-undoable) ------
     def test_undo_refuses_a_tray_kind(self, install: Path) -> None:
         res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
+        assert ei.value.code == "not_undoable" and ei.value.http_status == 400
+
+
+class TestSporeUpdate:
+    """Slice 3b: the forming-workbench metadata edit — edit text / reclassify type (only
+    while forming) / re-tier (un-park). Non-destructive; reclassify gated at the cognition
+    boundary; CAS guards the reclassify read→write window."""
+
+    def test_edit_text(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "draft"})["spore_id"]
+        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "refined"})
+        assert res["ok"] and res["action"] == "update"
+        assert _spore_store(install).get(sid)["text"] == "refined"
+        rec = recent_edits(install / ".levain")[0]
+        assert rec["kind"] == "spore_update" and rec["undoable"] is False
+
+    def test_edit_text_rejects_empty(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "   "})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_no_fields_rejected(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_reclassify_a_forming_tray_item(self, install: Path) -> None:
+        # a dumped (thought) seed is still forming → reclassify to a task is allowed
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "call dentist"})["spore_id"]
+        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+        assert _spore_store(install).get(sid)["type"] == "task"
+
+    def test_reclassify_then_metabolize_grants_the_new_terminal_kinds(self, install: Path) -> None:
+        # M2(b): the reclassify→terminal-kind contract, end-to-end through the seam. A dump
+        # defaults to `thought` (can't descend 'done'); reclassify→task WHILE forming, then
+        # metabolize → the loop now descends 'done' (the task lifecycle the dump needed).
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "ship the thing"})["spore_id"]
+        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True})
+        assert res["ok"]  # 'done' valid because the retype-while-forming took
+
+    def test_note_cannot_ascend(self, install: Path) -> None:
+        # H2: a note is durable reference, NOT a prospective loop that became memory — ascend
+        # is refused (descend/remove is the only resolution path for reference).
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
+                "ref": "some-pattern", "confirm": True})
+        assert ei.value.code == "not_ascendable" and ei.value.http_status == 409
+        assert any(s["id"] == nid for s in _spore_store(install).list_open())  # untouched
+
+    def test_note_can_be_removed_via_descend(self, install: Path) -> None:
+        # the legitimate resolution for reference: remove = descend composted.
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
+        assert res["ok"]
+        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+
+    def test_reclassify_locked_on_a_committed_loop(self, install: Path) -> None:
+        sid = _add_spore(install, stype="thought")  # a loop (no disposition) = committed
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+        assert ei.value.code == "type_locked" and ei.value.http_status == 409
+        assert _spore_store(install).get(sid)["type"] == "thought"  # untouched
+
+    def test_reclassify_locked_on_a_note(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+        assert ei.value.code == "type_locked" and ei.value.http_status == 409
+
+    def test_reclassify_rejects_bad_type(self, install: Path) -> None:
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "bogus"})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_reclassify_cas_rejects_concurrent_metabolize(self, install: Path, monkeypatch) -> None:
+        # the gate read sees a forming Tray item; a concurrent writer metabolizes it to a
+        # loop; the CAS must reject so a now-committed loop isn't retyped on stale state.
+        from anneal_memory.spores import SporeStore
+        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        _spore_store(install).update(sid, disposition=None)  # real: metabolized to a loop
+        real_get = SporeStore.get
+
+        def stale_get(self, sid_):  # returns the STALE forming (seed) view
+            d = real_get(self, sid_)
+            return {**d, "disposition": "seed"} if d else d
+
+        monkeypatch.setattr(SporeStore, "get", stale_get)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert "changed since read" in str(ei.value)
+        monkeypatch.undo()
+        assert _spore_store(install).get(sid)["type"] == "thought"  # not retyped
+
+    def test_retier_unparks_a_keep_loop(self, install: Path) -> None:
+        sid = _add_spore(install, tier="parked")
+        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
+        assert _spore_store(install).get(sid)["tier"] == "warm"
+
+    def test_park_pins_an_open_loop_to_keep_without_resolving(self, install: Path) -> None:
+        # The "park" verb = spore_update{tier:parked} (the mirror of un-park). The loop must
+        # stay OPEN — park is pause-not-resolve (that's why it is NOT a compost/descend kind);
+        # bucket_of then routes the parked-tier OPEN loop into Keep [Phill 2026-06-19].
+        sid = _add_spore(install, tier="warm")
+        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "parked"})
+        rec = _spore_store(install).get(sid)
+        assert rec["tier"] == "parked"
+        assert rec.get("status", "open") == "open"  # NOT resolved — still a live (hidden) loop
+
+    def test_retier_rejects_bad_value(self, install: Path) -> None:
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "bogus"})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    def test_text_only_edit_not_cas_rejected_by_concurrent_reroute(self, install: Path, monkeypatch) -> None:
+        # a text-only edit is disposition-independent → it must NOT be CAS-rejected when the
+        # disposition changed concurrently (only the reclassify gate carries the CAS).
+        from anneal_memory.spores import SporeStore
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "x", "disposition": "handoff"})["spore_id"]
+        real_get = SporeStore.get
+
+        def stale_get(self, sid_):  # stale seed view; real is handoff
+            d = real_get(self, sid_)
+            return {**d, "disposition": "seed"} if d else d
+
+        monkeypatch.setattr(SporeStore, "get", stale_get)
+        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "edited"})
+        assert res["ok"]
+        monkeypatch.undo()
+        assert _spore_store(install).get(sid)["text"] == "edited"
+
+    def test_unknown_id(self, install: Path) -> None:
+        _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": "spore-999", "text": "x"})
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+
+    def test_undo_refuses_spore_update(self, install: Path) -> None:
+        sid = _add_spore(install)
+        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "x"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert ei.value.code == "not_undoable" and ei.value.http_status == 400

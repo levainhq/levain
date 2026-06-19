@@ -163,6 +163,42 @@ def test_generic_work_tokens_dont_false_collide():
     assert hook.spores_colliding("please review the test file i sent", [s]) == []
 
 
+class TestOpenSporesTrayExclusion:
+    """Slice 3b: the stranger-side cognition-exclude. open_spores is the SINGLE chokepoint
+    both germination surfaces (dormant + collision) read; operator-I/O dispositions (Tray
+    inbox + Keep notes) must be filtered OUT so they can't leak into a Levain install's
+    cognition."""
+
+    def test_filters_operator_io_dispositions(self, monkeypatch):
+        rows = [
+            _spore(id="loop1"),                          # no disposition → a loop
+            _spore(id="loop2", disposition="loop"),      # explicit loop
+            _spore(id="seed1", disposition="seed"),
+            _spore(id="handoff1", disposition="handoff"),
+            _spore(id="agenda1", disposition="agenda"),
+            _spore(id="note1", disposition="note"),      # Keep reference — also excluded
+        ]
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: rows)
+        assert [s["id"] for s in hook.open_spores()] == ["loop1", "loop2"]
+
+    def test_unknown_disposition_fails_open_as_a_loop(self, monkeypatch):
+        # a typo'd/unknown disposition is NOT silently dropped (the silent-loss direction)
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: [_spore(id="x", disposition="bogus")])
+        assert [s["id"] for s in hook.open_spores()] == ["x"]
+
+    def test_is_loop_predicate(self):
+        assert hook._is_loop({"disposition": "loop"}) is True
+        assert hook._is_loop({}) is True
+        assert hook._is_loop({"disposition": "seed"}) is False
+        assert hook._is_loop({"disposition": "note"}) is False  # Keep reference excluded
+        assert hook._is_loop({"disposition": ""}) is True  # falsy → loop
+
+    def test_hook_vocab_matches_canonical_levain_spores(self):
+        # DRIFT GUARD: the standalone hook copy must equal the canonical taxonomy.
+        import levain.spores as lv
+        assert hook._NON_COGNITION_DISPOSITIONS == lv.NON_COGNITION_DISPOSITIONS
+
+
 # The substrate-neutral germination surface MUST stay byte-identical between the
 # shared (Claude Code) hooks and the Codex adapter's copy. The two drifted once —
 # Slice 2 wired germination into the shared copy only; the Codex copy was a wrap
@@ -170,7 +206,7 @@ def test_generic_work_tokens_dont_false_collide():
 # recurring until the v1.2 single-_levain_hook refactor collapses the two copies.
 _PORTED_FNS = (
     "_anneal_json", "_is_int_episodes", "episodes_since_wrap",
-    "open_spores", "_tokens", "spores_colliding", "due_dormant_spores",
+    "open_spores", "_is_loop", "_tokens", "spores_colliding", "due_dormant_spores",
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
 )
 
@@ -189,6 +225,9 @@ class TestCodexParity:
         assert codex_hook._STOPWORDS == hook._STOPWORDS
         assert codex_hook._WORD_RE.pattern == hook._WORD_RE.pattern
         assert codex_hook._MAX_TOKENIZE_CHARS == hook._MAX_TOKENIZE_CHARS
+
+    def test_tray_disposition_vocab_matches(self):
+        assert codex_hook._NON_COGNITION_DISPOSITIONS == hook._NON_COGNITION_DISPOSITIONS
 
     def test_codex_collision_surface_works(self):
         # Not just identical text — the Codex module actually imports and runs

@@ -215,16 +215,42 @@ def episodes_since_wrap(timeout: float = 5.0) -> int | None:
 
 # ---- Prospective layer (spores) — the germination surfaces ----
 
+# Operator-I/O dispositions (control-plane Slice 3): the Tray inbox (seed/handoff/agenda)
+# + Keep durable reference (note). A spore carrying one is operator I/O, NOT one of the
+# entity's own prospective loops — so it stays OUT of the activation surfaces that feed the
+# entity's cognition (the session-start dormant-surface + the per-prompt collision), exactly
+# as flow's own layer-2 keeps operator I/O out of salience / digest / Top of Mind.
+#
+# DRIFT CONTRACT (load-bearing): this tuple MUST equal levain.spores.NON_COGNITION_DISPOSITIONS
+# (and flow's scripts/spores.py) — anneal stays disposition-blind, so every interpreter of the
+# taxonomy carries the vocab. This hook is a STANDALONE template (stdlib only, no levain import
+# on a stranger install), so it carries its own copy; keep it byte-identical. (levain's test
+# suite asserts this copy == levain.spores.)
+_NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
+
+
+def _is_loop(spore: dict) -> bool:
+    """True iff the spore flows into the entity's OWN cognition (the complement of operator
+    I/O — the Tray inbox + Keep notes). Fail-OPEN on the unknown: only an EXPLICITLY-known
+    operator-I/O disposition is excluded — a typo'd/unknown value reads as a visible loop,
+    never silently dropped (the silent-loss direction the whole slice guards). Mirrors
+    levain.spores.is_loop / flow's scripts/spores.is_loop."""
+    return (spore.get("disposition") or "loop") not in _NON_COGNITION_DISPOSITIONS
+
+
 def open_spores(timeout: float = 2.0) -> list[dict]:
-    """Open spores for this install, via anneal-memory's `spore list --json`.
-    Returns [] on any failure (an anneal too old to have spores, no store yet,
-    an error) — the prospective surfaces then show nothing. Tight default
-    timeout: the collision surface runs before every prompt."""
+    """The entity's own open prospective loops, via anneal-memory's `spore list --json`.
+    Tray dispositions (the operator inbox) are filtered OUT here — the SINGLE chokepoint
+    both germination surfaces (dormant-surface + collision) read, so the Tray can't leak
+    into a Levain install's cognition (the stranger-side twin of flow's layer-2).
+    Returns [] on any failure (an anneal too old to have spores, no store yet, an error)
+    — the prospective surfaces then show nothing. Tight default timeout: the collision
+    surface runs before every prompt."""
     data = _anneal_json(
         ["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list)
     )
     if isinstance(data, list):
-        return [s for s in data if isinstance(s, dict)]
+        return [s for s in data if isinstance(s, dict) and _is_loop(s)]
     return []
 
 

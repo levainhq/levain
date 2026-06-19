@@ -252,6 +252,29 @@ class TestAssets:
                         "breaks the textContent-only render contract"
                     )
 
+    def test_clause_rides_full_with_per_item_expand(self) -> None:
+        """DATA-SAFETY + UX (the truncation fix): row text rides FULL (the server no longer
+        caps it) and the surface offers a per-item expand so a long clause is readable AND
+        the editor reads the whole thing. Structural guard that the mechanism is wired in
+        BOTH the JS (the shared appendClause/measureClauses + the .row-expanded state + the
+        editor seeding from the full ``s.text``) and the CSS (line-clamp for density with a
+        .row-expanded escape)."""
+        core = load_web_asset("dashboard_core.js")
+        css = load_web_asset("dashboard.css")
+        for token in ("function appendClause", "function measureClauses",
+                      "row-expanded", "clause-toggle", "clause clampable"):
+            assert token in core, f"dashboard_core.js missing {token!r} (per-item expand)"
+        # park = pin an OPEN loop to Keep via a tier change (mirror of reactivate) — NOT a
+        # compost/descend kind (park is pause-not-resolve) [Phill 2026-06-19].
+        assert '"park"' in core and 'tier: "parked"' in core, "Open-Loops 'park' verb missing"
+        # Open-Loops client-side filter (text OR spore-id), persisted across re-renders
+        assert "openLoopsQuery" in core, "Open-Loops filter (openLoopsQuery) missing"
+        assert "ta.value = s.text" in core, "openTextEdit must seed the editor from the full s.text"
+        assert "-webkit-line-clamp" in css, "dashboard.css missing the clause line-clamp"
+        # the clamp is SCOPED to .clampable (only toggle-backed clauses) so a bare .clause
+        # (crystal/wrap label) never clamps without an expand affordance [codex L3 MED]
+        assert ".clause.clampable" in css, "dashboard.css clamp must be scoped to .clause.clampable"
+
     def test_markdown_renderer_link_scheme_gated(self) -> None:
         """The markdown prose renderer is wired into the section/config display and
         gates link hrefs through an explicit scheme allowlist (mdSafeHref). Source-
