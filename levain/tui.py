@@ -353,6 +353,10 @@ def render_panel_lines(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
         return _render_section(view, panel)
     if kind == "spores":
         return _render_spores(view)
+    if kind == "tray":
+        return _render_tray(view)
+    if kind == "keep":
+        return _render_keep(view)
     if kind == "episodes":
         return _render_episodes(view)
     if kind == "edits":
@@ -401,6 +405,27 @@ def _render_spores(view: SubstrateView) -> list[str]:
         + f"  · {s.id}"
         for s in view.open_spores
     ]
+
+
+def _render_tray(view: SubstrateView) -> list[str]:
+    """ONE line per Tray item — the operator session-I/O inbox, badged by disposition
+    (seed/handoff/agenda). Read-only display in 3a (the governed dump/sort verbs are 3b)."""
+    if not view.tray:
+        return ["(tray clear)"]
+    return [
+        f"[{s.disposition}] {_oneline(s.text)}"
+        + (f" → surface {_oneline(s.next)}" if s.next else "")
+        + f"  · {s.id}"
+        for s in view.tray
+    ]
+
+
+def _render_keep(view: SubstrateView) -> list[str]:
+    """ONE line per Keep item — durable pinned-dormant loops (the parked tier), exempt
+    from the dormancy→compost prompt. Read-only display in 3a."""
+    if not view.keep:
+        return ["(keep empty)"]
+    return [f"[{s.tier}] {_oneline(s.text)}  · {s.id}" for s in view.keep]
 
 
 def _render_episodes(view: SubstrateView) -> list[str]:

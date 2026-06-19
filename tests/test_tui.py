@@ -95,6 +95,24 @@ def _view() -> SubstrateView:
             descend_kinds=["done"], ascend_kinds=[],
         ),
     ]
+    tray = [
+        OpenSpore(
+            id="spore-110", type="task", tier="warm", salience=2, domain="ops",
+            text="a fresh freeform dump", seen="2026-06-18", next=None, pointer=None,
+            disposition="seed",
+        ),
+        OpenSpore(
+            id="spore-111", type="question", tier="warm", salience=2, domain="ops",
+            text="pick up the Tray build next session", seen="2026-06-18", next="2026-06-19",
+            pointer=None, disposition="handoff",
+        ),
+    ]
+    keep = [
+        OpenSpore(
+            id="spore-029", type="task", tier="parked", salience=1, domain="ops",
+            text="open-model partner laptop", seen="2026-06-10", next=None, pointer=None,
+        ),
+    ]
     episodes = [
         EpisodeRow("ep1", "2026-06-15T16:55:00", "finding", "session-tui", "built the TUI scaffold", ["levain"]),
         EpisodeRow("ep2", "2026-06-15T12:00:00", "decision", "session-tui", "chose curses", ["levain"]),
@@ -116,7 +134,7 @@ def _view() -> SubstrateView:
     ]
     return SubstrateView(
         paths=paths, entity_name="flow", health=health, graph=graph,
-        crystal_index=crystals, open_spores=spores, episodes=episodes,
+        crystal_index=crystals, open_spores=spores, tray=tray, keep=keep, episodes=episodes,
         sections=sections, config_docs=config_docs, wraps=wraps, recent_edits=recent_edits,
     )
 
@@ -134,11 +152,17 @@ def test_panels_for_zone_identity_is_config_docs():
 def test_panels_for_zone_operate_order():
     v = _view()
     panels = tui.panels_for_zone(v, ZONE_OPERATE)
-    assert [p["kind"] for p in panels] == ["spores", "episodes", "edits"]
-    # spores + episodes are Class B (verb-mediated); the edit log has no chip.
-    assert panels[0]["edit_class"] == CLASS_B
-    assert panels[1]["edit_class"] == CLASS_B
-    assert panels[2]["edit_class"] == ""
+    # the three spore projections are adjacent (Open Loops · Tray · Keep), then episodes,
+    # then the edit log (Slice 3 capture-UX (A) ordering).
+    assert [p["kind"] for p in panels] == ["spores", "tray", "keep", "episodes", "edits"]
+    by_kind = {p["kind"]: p for p in panels}
+    # spores + episodes are Class B (verb-mediated); the edit log + Tray + Keep carry no
+    # chip (Tray/Keep are read-only display in 3a).
+    assert by_kind["spores"]["edit_class"] == CLASS_B
+    assert by_kind["episodes"]["edit_class"] == CLASS_B
+    assert by_kind["edits"]["edit_class"] == ""
+    assert by_kind["tray"]["edit_class"] == ""
+    assert by_kind["keep"]["edit_class"] == ""
 
 
 def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
@@ -384,9 +408,9 @@ def test_select_zone_clamps_and_resets():
 
 
 def test_select_panel_clamps_within_zone():
-    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 3 panels
+    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 5 panels (spores·tray·keep·episodes·edits)
     assert tui.select_panel(m, +1).panel_idx == 1
-    assert tui.select_panel(m, +99).panel_idx == 2
+    assert tui.select_panel(m, +99).panel_idx == 4
     assert tui.select_panel(m, -99).panel_idx == 0
     # moving panel resets item + scroll
     m2 = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0, item_idx=1, scroll=3)
@@ -426,16 +450,18 @@ def test_current_item_helpers():
     assert tui.current_spore(m).id == "spore-093"
     # off the spores panel → None
     assert tui.current_episode(m) is None
-    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=1, item_idx=0)
+    # Operate panels: 0=spores, 1=tray, 2=keep, 3=episodes, 4=edits (Slice 3 inserted
+    # Tray + Keep between Open Loops and episodes).
+    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=3, item_idx=0)
     assert tui.current_episode(me).id == "ep1"
-    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=2, item_idx=0)
+    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=4, item_idx=0)
     assert tui.current_edit_record(med)["id"] == "edit1"
 
 
 # --- per-kind detail renderers (smoke + key content) -----------------------
 
-@pytest.mark.parametrize("kind", ["config", "section", "spores", "episodes", "edits",
-                                  "health", "graph", "crystals", "wraps"])
+@pytest.mark.parametrize("kind", ["config", "section", "spores", "tray", "keep",
+                                  "episodes", "edits", "health", "graph", "crystals", "wraps"])
 def test_render_panel_lines_nonempty_per_kind(kind):
     v = _view()
     panel = next(p for p in v.layout() if p["kind"] == kind)
@@ -456,6 +482,43 @@ def test_render_spores_one_line_per_loop_with_id():
     lines = tui.render_panel_lines(v, panel)
     assert len(lines) == 2  # one line per open loop
     assert "spore-099" in lines[0] and "give Levain a canonical" in lines[0]
+
+
+def test_render_tray_badges_disposition():
+    # The Tray badges the DISPOSITION (the operator-I/O class), not the tier — that is
+    # the salient axis for the operator inbox.
+    v = _view()
+    panel = next(p for p in v.layout() if p["kind"] == "tray")
+    lines = tui.render_panel_lines(v, panel)
+    assert len(lines) == 2
+    assert "[seed]" in lines[0] and "spore-110" in lines[0]
+    assert "[handoff]" in lines[1] and "surface 2026-06-19" in lines[1]
+
+
+def test_render_keep_badges_parked_tier():
+    v = _view()
+    panel = next(p for p in v.layout() if p["kind"] == "keep")
+    lines = tui.render_panel_lines(v, panel)
+    assert len(lines) == 1
+    assert "[parked]" in lines[0] and "spore-029" in lines[0]
+
+
+def test_render_tray_keep_empty_states():
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
+    tray_panel = next(p for p in v.layout() if p["kind"] == "tray")
+    keep_panel = next(p for p in v.layout() if p["kind"] == "keep")
+    assert tui.render_panel_lines(v, tray_panel) == ["(tray clear)"]
+    assert tui.render_panel_lines(v, keep_panel) == ["(keep empty)"]
+
+
+def test_tray_keep_are_not_verb_navigable():
+    # Tray + Keep are read-only display panels in 3a — no per-item cursor (0 selectable
+    # rows), so the driver scrolls them as one body (no verb dispatch).
+    v = _view()
+    for kind in ("tray", "keep"):
+        panel = next(p for p in v.layout() if p["kind"] == kind)
+        assert tui.panel_item_count(v, panel) == 0
+        assert not tui.is_item_list(panel)
 
 
 @pytest.mark.parametrize("kind", ["spores", "episodes", "edits"])
