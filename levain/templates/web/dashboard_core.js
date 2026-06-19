@@ -188,7 +188,7 @@
   // reflow), short panels render at natural height (no wasted space, no scrollbar).
   // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
   // details-on-demand (the search box + the Slice-2 modal).
-  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores"]);
+  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "keep"]);
 
   // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
   // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
@@ -255,6 +255,8 @@
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
       case "spores": return renderSpores(entry, view);
+      case "tray": return renderTray(entry, view);
+      case "keep": return renderKeep(entry, view);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
@@ -434,26 +436,59 @@
     return p;
   }
 
-  function renderSpores(entry, view) {
-    const list = view.open_spores || [];
+  // One spore row, shared by the three projections (Open Loops / Tray / Keep). The
+  // leading chip is the panel's salient axis: Tray badges the `disposition` (the
+  // operator-I/O class — seed/handoff/agenda), Open Loops + Keep badge the `tier`. `verbs`
+  // rides only on a Class-B panel (Open Loops in 3a; Tray + Keep render read-only until 3b
+  // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
+  function sporeRow(s, verbs, badgeField) {
+    const row = el("div", "row");
+    // the spore id is the common reference handle (how flow tracks + you name it,
+    // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
+    // shows the same id trailing (tui.render_panel_lines).
+    if (s.id) row.appendChild(el("span", "sid", s.id));
+    const badge = badgeField === "disposition" ? s.disposition : s.tier;
+    if (badge) row.appendChild(el("span", "tier", `[${badge}]`));
+    row.appendChild(el("span", "clause", s.text));
+    if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+    if (verbs && s.id) row.appendChild(buildSporeVerbs(s));
+    return row;
+  }
+
+  // The three spore projections share one renderer — same read/verb contract, different
+  // source list + badge axis + empty copy. All three read their fault from the single
+  // `open_spores` error key (the dashboard does ONE spore read that fills all three).
+  function renderSporeProjection(entry, view, list, emptyMsg, badgeField) {
     const p = panel(entry);
+    // All three projections (Open Loops / Tray / Keep) come from ONE dashboard spore read,
+    // whose fault is recorded under the single "open_spores" key — so every projection
+    // reads its error from there BY DESIGN (not a copy-paste slip). If a future split gives
+    // Tray/Keep their own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    if (list.length === 0) { p.appendChild(el("p", "empty", "no open prospective loops")); return p; }
+    if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
-    for (const s of list) {
-      const row = el("div", "row");
-      // the spore id is the common reference handle (how flow tracks + you name it,
-      // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
-      // shows the same id trailing (tui.render_panel_lines).
-      if (s.id) row.appendChild(el("span", "sid", s.id));
-      if (s.tier) row.appendChild(el("span", "tier", `[${s.tier}]`));
-      row.appendChild(el("span", "clause", s.text));
-      if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
-      if (verbs && s.id) row.appendChild(buildSporeVerbs(s));
-      p.appendChild(row);
-    }
+    for (const s of list) p.appendChild(sporeRow(s, verbs, badgeField));
     return p;
+  }
+
+  function renderSpores(entry, view) {
+    return renderSporeProjection(entry, view, view.open_spores,
+      "no open prospective loops", "tier");
+  }
+
+  // Tray — the operator session-I/O inbox (seed/handoff/agenda dumps awaiting AI triage);
+  // badged by disposition. Read-only in 3a.
+  function renderTray(entry, view) {
+    return renderSporeProjection(entry, view, view.tray,
+      "tray clear — nothing waiting", "disposition");
+  }
+
+  // Keep — durable pinned-dormant loops (the parked tier), lifted out of Open Loops and
+  // exempt from the dormancy→compost prompt; badged by tier. Read-only in 3a.
+  function renderKeep(entry, view) {
+    return renderSporeProjection(entry, view, view.keep,
+      "keep empty — no pinned-dormant loops", "tier");
   }
 
   // One episode row — the SINGLE markup for both the recent list and keyword-search

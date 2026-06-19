@@ -233,6 +233,10 @@
     board.appendChild(p);
   }
 
+  // NOTE (Slice 3, 2026-06-18): this PARKED MCP-App variant renders only `open_spores`
+  // (now loops-only). The Tray + Keep projections (view.tray / view.keep) are NOT ported
+  // here — the live surface is web/dashboard_core.js. When this app un-parks, port the
+  // Tray/Keep panels from there (renderTray/renderKeep) so it doesn't silently hide them.
   function renderSpores(view) {
     const list = view.open_spores || [];
     const p = panel(`Open loops (${list.length})`);

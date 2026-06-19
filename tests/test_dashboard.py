@@ -284,6 +284,129 @@ class TestBuildView:
         json.dumps(v.to_dict())
 
 
+class TestSporeProjections:
+    """Slice 3: the open-spore layer splits into Open Loops / Tray / Keep by disposition
+    + tier (``levain.spores.bucket_of``). Tests write spores.json DIRECTLY — anneal's
+    ``SporeStore.add`` is disposition-blind by design (the de-risk: anneal round-trips an
+    unknown ``disposition`` untouched), so a disposition can only be set out-of-band."""
+
+    @staticmethod
+    def _write(path: Path, rows: list[dict]) -> None:
+        import json
+
+        path.write_text(
+            json.dumps({"schema_version": 1, "resolved": [], "spores": rows}),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _row(**kw: object) -> dict:
+        base: dict = {"type": "task", "tier": "warm", "salience": 2, "domain": "x",
+                      "seen": "2026-06-18"}
+        base.update(kw)
+        return base
+
+    def test_buckets_partition_by_disposition_and_tier(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json", [
+            self._row(id="s1", tier="hot", text="live loop"),
+            self._row(id="s2", text="fresh dump", disposition="seed"),
+            self._row(id="s3", type="question", text="handoff", disposition="handoff"),
+            self._row(id="s4", type="idea", text="agenda", disposition="agenda"),
+            self._row(id="s5", tier="parked", text="kept reference"),
+            self._row(id="s6", tier="parked", text="parked seed", disposition="seed"),
+        ])
+        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
+        assert [s.id for s in v.open_spores] == ["s1"]
+        # disposition WINS over the parked tier: s6 (parked seed) is an un-triaged Tray
+        # item, not Keep — keeping the render boundary identical to the cognition-exclude.
+        assert {s.id for s in v.tray} == {"s2", "s3", "s4", "s6"}
+        assert [s.id for s in v.keep] == ["s5"]
+        # TOTAL partition — every spore lands in exactly one bucket, nothing lost.
+        assert len(v.open_spores) + len(v.tray) + len(v.keep) == 6
+
+    def test_disposition_defaults_to_loop(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json",
+                    [self._row(id="s1", tier="hot", text="no disposition key")])
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.open_spores[0].disposition == "loop"
+
+    def test_unknown_disposition_fails_open_to_loop(self, tmp_path: Path) -> None:
+        # is_loop fails OPEN: an unknown/typo disposition reads as an in-cognition loop (a
+        # real loop wrongly hidden is the silent-harm class) → it stays in Open Loops, not
+        # silently swallowed into the Tray.
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json",
+                    [self._row(id="s1", tier="hot", text="typo", disposition="sed")])
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert [s.id for s in v.open_spores] == ["s1"]
+        assert v.tray == [] and v.keep == []
+
+    def test_each_bucket_capped_independently(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        rows: list[dict] = []
+        for i in range(4):
+            rows.append(self._row(id=f"loop{i}", tier="hot", text=f"loop {i}"))
+            rows.append(self._row(id=f"seed{i}", text=f"seed {i}", disposition="seed"))
+            rows.append(self._row(id=f"keep{i}", tier="parked", text=f"keep {i}"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=2)
+        assert len(v.open_spores) == 2 and len(v.tray) == 2 and len(v.keep) == 2
+
+    def test_keep_not_starved_by_loop_heavy_store(self, tmp_path: Path) -> None:
+        # Parked (Keep) items rank LAST (parked sorts after hot/warm/cold); a flat
+        # [:max_spores] on the ranked list would drop them. Bucketing the FULL list keeps
+        # Keep alive even when active loops exceed the cap.
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
+        rows.append(self._row(id="kept", tier="parked", text="must survive"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
+        assert len(v.open_spores) == 50
+        assert [s.id for s in v.keep] == ["kept"]
+
+    def test_resolved_status_drift_row_is_skipped(self, tmp_path: Path) -> None:
+        # A status=resolved row left in the `spores` array is store drift (anneal MOVES
+        # resolved spores to the `resolved` array); list_open doesn't filter status, so the
+        # dashboard skips it defensively — it must not render as an open loop with verbs.
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json", [
+            self._row(id="s1", tier="hot", text="live loop"),
+            self._row(id="drift", tier="hot", text="resolved drift", status="resolved"),
+        ])
+        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
+        all_ids = ([s.id for s in v.open_spores]
+                   + [s.id for s in v.tray] + [s.id for s in v.keep])
+        assert all_ids == ["s1"]  # the drift row excluded from EVERY bucket
+
+    def test_non_str_next_is_coerced_not_crashed(self, tmp_path: Path) -> None:
+        # A corrupted store could carry a non-str `next`; the TUI runs _oneline(next) which
+        # would crash on a non-str. The builder str-coerces it (None stays None).
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json",
+                    [self._row(id="s1", tier="hot", text="loop", next=20260626)])
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        assert v.open_spores[0].next == "20260626"
+
+    def test_to_dict_and_render_text_carry_tray_and_keep(self, tmp_path: Path) -> None:
+        from levain.dashboard import render_text
+
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json", [
+            self._row(id="s1", tier="hot", text="live loop"),
+            self._row(id="s2", text="a fresh dump", disposition="seed"),
+            self._row(id="s5", tier="parked", text="kept reference"),
+        ])
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        d = v.to_dict()
+        assert [s["id"] for s in d["tray"]] == ["s2"]
+        assert [s["id"] for s in d["keep"]] == ["s5"]
+        text = render_text(v)
+        assert "Tray (1)" in text and "[seed] a fresh dump" in text
+        assert "Keep (1)" in text and "kept reference" in text
+
+
 # --- CLI surface: run_dashboard / render_text ------------------------------
 
 class TestCLISurface:
@@ -542,8 +665,8 @@ class TestSlice15Surfaces:
         layout = v.layout()
         kinds = [e["kind"] for e in layout]
         # every panel kind is represented
-        for k in ("config", "spores", "episodes", "edits", "health", "graph",
-                  "crystals", "section", "wraps"):
+        for k in ("config", "spores", "tray", "keep", "episodes", "edits", "health",
+                  "graph", "crystals", "section", "wraps"):
             assert k in kinds
         # zones appear in IA order: identity → operate → mind (no interleaving)
         zones = [e["zone"] for e in layout]
@@ -551,11 +674,14 @@ class TestSlice15Surfaces:
         assert first_idx["identity"] < first_idx["operate"] < first_idx["mind"]
         last_identity = max(i for i, z in enumerate(zones) if z == "identity")
         assert last_identity < first_idx["operate"]
-        # every edit-classed tier carries A/B/C; the "edits" meta-panel (the audit
-        # log, not an editable tier) legitimately carries no class (Slice 2a).
+        # every edit-classed tier carries A/B/C; the read-only meta/display panels carry
+        # no class: the "edits" audit log (Slice 2a) AND the Tray + Keep projections
+        # (read-only display in 3a — no chip, no verb; 3b flips them to Class B with the
+        # governed dump/sort/park verbs).
+        _no_class = {"edits", "tray", "keep"}
         assert all(
             e["edit_class"] in ("A", "B", "C")
-            for e in layout if e["kind"] != "edits"
+            for e in layout if e["kind"] not in _no_class
         )
         edits_panel = next(e for e in layout if e["kind"] == "edits")
         assert edits_panel["edit_class"] == "" and edits_panel["zone"] == "operate"
@@ -565,6 +691,9 @@ class TestSlice15Surfaces:
         by_kind = {e["kind"]: e for e in layout}
         assert by_kind["spores"]["edit_class"] == "B"
         assert by_kind["episodes"]["edit_class"] == "B"
+        # Tray + Keep (Slice 3): read-only display in the Operate zone, no class chip.
+        for k in ("tray", "keep"):
+            assert by_kind[k]["edit_class"] == "" and by_kind[k]["zone"] == "operate"
         # consolidated cognition is read-only Class C
         assert by_kind["health"]["edit_class"] == "C"
         assert by_kind["crystals"]["edit_class"] == "C"
