@@ -66,6 +66,22 @@ When you re-engage a spore, `spore_touch` it — that resets its germination clo
 
 When in doubt, ask: *does this close?* If yes, it's a spore. If it only accretes, it's memory.
 
+## The Tray and the Keep — your operator's own I/O
+
+Everything above is *your* prospective memory — open loops that flow into your cognition (salience, and the collision surface that brings the right one back when it's relevant). A spore can also carry a **disposition** that re-routes it to your *operator's* I/O instead of yours. These are deliberately kept OUT of your cognition surfaces — they are the human's inbox and reference shelf, not your open loops — and they split on one question: *does the item resolve, or persist?*
+
+**The Tray — your operator's session inbox (resolves).** Items the operator hands you, surfaced once at the start of each session, then worked off:
+
+- **seed** — a freeform capture the operator dropped for you to **sort**. This is the default for anything they dump. Your job: read it and route it — metabolize it into a real object (promote it to an open `loop` so it joins your cognition, or `ascend` it into a project / episode / a Keep note) — or, if it's actually a handoff or an agenda item, re-disposition it. A raw dump stays a `seed` until you've sorted it.
+- **handoff** — "pick this up next session" / "remember this for later." You consume it at the next session-start, act on it, then resolve it.
+- **agenda** — "something to talk about, not ready to track yet." Discussed, then it resolves or promotes to a `seed`.
+
+**The Keep — your operator's durable reference (persists).**
+
+- **note** — a durable, agent-queryable reference the operator authored (a command they keep forgetting, a pointer, a standing list). It is NOT an open loop: it never germinates, never nags, never ascends. You **recall** it when the current work collides with it — the same collision surface that brings open loops back to you — so you can hand them "that command" without being asked to go look. A note persists until the operator removes it (`descend`); to repurpose one, remove it and author a fresh loop.
+
+**The capture contract — the human dumps; you sort.** This is the load-bearing rule. Your operator's whole mental model is "the Tray is where I drop things for you." They do NOT learn the seed / handoff / agenda / note vocabulary — *you* carry it. Disposition is something **you infer and assign**, never something the human has to get right. So a fresh dump is a `seed` by default (already excluded from your cognition, so a raw dump can never pollute your salience before you've looked at it), and you do the sorting at the next session-start. Keep the freeform door wide: it should always be zero-friction for them to just dump, and yours to make sense of.
+
 ---
 
 The prospective layer is what lets you carry intention across sessions without holding it in working memory or losing it to the gaps between sessions. Plant loops as they open, let them surface to you, and resolve every one — compost what is done, ascend what grew. That is how you stay coherent across time without trying to remember everything at once.
