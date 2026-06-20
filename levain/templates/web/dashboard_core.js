@@ -1102,6 +1102,8 @@
     const editor = el("div", "editor");
     const ta = el("textarea", "edit-ta");
     ta.value = doc.body || "";  // .value (not innerHTML) — store text never becomes markup
+    ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108): an involuntary
+    // re-render (visibilitychange / refresh-button) is deferred while value diverges from this.
     const controls = el("div", "edit-controls");
     const save = el("button", "edit-save", "save");
     const cancel = el("button", "edit-cancel", "cancel");
@@ -1341,6 +1343,7 @@
       // value is always in .value regardless).
       const lines = ta.value.split("\n").length;
       ta.rows = Math.min(16, Math.max(3, lines, Math.ceil(ta.value.length / 56)));
+      ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108)
       return { nodes: [ta], focus: ta, ta };
     }, (f, msg) => {
       // Save the value VERBATIM — only trim for the empty-CHECK. trimming the saved text
@@ -1847,6 +1850,38 @@
 
   wireTabs();
 
-  // Export the one entry point onto a namespace the surface shim calls.
-  window.LevainDashboard = { render };
+  // Is the operator mid-edit/capture with text that an involuntary re-render would
+  // discard? (spore-108) render() rebuilds the whole #board (+ modal) via
+  // replaceChildren, so a visibilitychange / refresh-button re-read fired while a
+  // textarea is open silently loses the typing. The boot shim calls this to DEFER those
+  // passive re-reads — NOT the save's own commit→load reload, which intentionally
+  // rebuilds to show saved state (that's the call-site split that avoids breaking save).
+  //   - an edit-of-existing (`.edit-ta` State/config, `.verb-edit-ta` spore text) is
+  //     dirty once its value diverges from the `data-orig` stamped at open;
+  //   - a capture/free-text box (`.tray-dump-ta` Tray dump / Keep add-note; `.verb-ref`
+  //     the ascend "what it became" ref — both always-empty at open, never prefilled) is
+  //     dirty while it holds any non-whitespace text.
+  // DECIDED exclusions (not blind spots — L1 review):
+  //   - filter/search inputs (open-loops filter, episode search): ephemeral, already
+  //     re-applied across renders, so they must not hold off a refresh;
+  //   - `.verb-date` (schedule picker): a date is a 2-click re-pick (low loss) AND it's
+  //     PREFILLED from an existing `next:`, so a non-empty check would false-positive on
+  //     an untouched form — not worth a `data-orig` stamp for the stakes;
+  //   - the masthead rename (`.name-input`): lives OUTSIDE `#board` and `wireEntityName`
+  //     early-returns while its editor is open, so it already SURVIVES the rebuild — gating
+  //     it would only block a non-destructive refresh.
+  // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
+  // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
+  function hasUnsavedEdit() {
+    for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta")) {
+      if (ta.value !== ta.dataset.orig) return true;
+    }
+    for (const ta of document.querySelectorAll(".tray-dump-ta, .verb-ref")) {
+      if (ta.value.trim() !== "") return true;
+    }
+    return false;
+  }
+
+  // Export the entry points onto a namespace the surface shim calls.
+  window.LevainDashboard = { render, hasUnsavedEdit };
 })();
