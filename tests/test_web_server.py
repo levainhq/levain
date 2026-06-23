@@ -975,3 +975,187 @@ class TestRecallJson:
         data = json.loads(body)
         assert data["episodes"] == [] and data["count"] == 0
         assert data["errors"]["episodes"] == "midfault"
+
+
+@contextmanager
+def _serving_extra(source: SubstrateSource, *, extra_assets=None, extra_json=None):
+    """A real server carrying downstream-registered read-only extra routes — the live
+    harness for the FleetView extension point (make_server extra_assets/extra_json)."""
+    httpd = make_server(
+        source, host="127.0.0.1", port=0,
+        extra_assets=extra_assets, extra_json=extra_json,
+    )
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    try:
+        yield f"http://{host}:{port}", httpd
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+class TestExtraRoutes:
+    """The read-only extra-route extension point — the FleetView seam. A downstream
+    (the flow Bridge) registers additional GET views that ride the SAME security
+    envelope; they cannot shadow a built-in route, cannot become a write surface, and a
+    builder fault degrades to JSON rather than a 500."""
+
+    def test_static_extra_asset_served_with_security_headers(self, tmp_path: Path) -> None:
+        assets = {"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>x</title>")}
+        with _serving_extra(_store_with_data(tmp_path), extra_assets=assets) as (base, _h):
+            status, headers, body = _get(base + "/fleet")
+        assert status == 200
+        assert headers["Content-Type"] == "text/html; charset=utf-8"
+        assert body == b"<!doctype html><title>x</title>"
+        # Rides the full envelope: CSP + nosniff + frame-deny + no-store, same as built-ins.
+        assert "default-src 'none'" in headers["Content-Security-Policy"]
+        assert headers["X-Frame-Options"] == "DENY"
+        assert headers["Cache-Control"] == "no-store"
+
+    def test_dynamic_extra_json_served_per_request(self, tmp_path: Path) -> None:
+        calls = {"n": 0}
+
+        def builder() -> bytes:
+            calls["n"] += 1
+            return json.dumps({"hit": calls["n"]}).encode("utf-8")
+
+        with _serving_extra(_store_with_data(tmp_path), extra_json={"/fleet.json": builder}) as (base, _h):
+            s1, h1, b1 = _get(base + "/fleet.json")
+            s2, _h2, b2 = _get(base + "/fleet.json")
+        assert s1 == 200 and s2 == 200
+        assert h1["Content-Type"] == "application/json; charset=utf-8"
+        # Built per request (live), not cached — the count advances.
+        assert json.loads(b1)["hit"] == 1 and json.loads(b2)["hit"] == 2
+
+    def test_extra_json_builder_fault_degrades_to_json_not_500(self, tmp_path: Path) -> None:
+        def boom() -> bytes:
+            raise RuntimeError("kaboom")
+
+        with _serving_extra(_store_with_data(tmp_path), extra_json={"/fleet.json": boom}) as (base, _h):
+            status, headers, body = _get(base + "/fleet.json")
+        assert status == 200  # never a 500 — surfaced as JSON the surface can render
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        assert "RuntimeError" in json.loads(body)["errors"]["server"]
+
+    def test_extra_route_is_not_a_write_surface(self, tmp_path: Path) -> None:
+        # POST only ever routes /edit; an extra GET route is unreachable by POST (404),
+        # so registering a view can never open a write path. [read-only by construction]
+        assets = {"/fleet": ("text/html; charset=utf-8", b"x")}
+        json_routes = {"/fleet.json": lambda: b"{}"}
+        with _serving_extra(_store_with_data(tmp_path), extra_assets=assets,
+                            extra_json=json_routes) as (base, _h):
+            for path in ("/fleet", "/fleet.json"):
+                try:
+                    _request(base + path, method="POST",
+                             headers={"Content-Type": "application/json"})
+                    code = None
+                except urllib.error.HTTPError as e:
+                    code = e.code
+                assert code == 404, f"POST {path} should 404, got {code}"
+
+    def test_extra_route_honors_host_allowlist(self, tmp_path: Path) -> None:
+        # A DNS-rebinding page's request carries a non-loopback Host; the extra route
+        # must refuse it (403) exactly like the built-in routes — same _route gate.
+        assets = {"/fleet": ("text/html; charset=utf-8", b"x")}
+        with _serving_extra(_store_with_data(tmp_path), extra_assets=assets) as (base, _h):
+            try:
+                _request(base + "/fleet", headers={"Host": "evil.example.com"})
+                code = None
+            except urllib.error.HTTPError as e:
+                code = e.code
+        assert code == 403
+
+    def test_base_product_carries_no_extra_routes(self, tmp_path: Path) -> None:
+        # Regression: with no extras registered, /fleet is just a 404 — the extension
+        # point adds nothing to the base product.
+        with _serving(_store_with_data(tmp_path)) as (base, _httpd):
+            try:
+                _get(base + "/fleet")
+                code = None
+            except urllib.error.HTTPError as e:
+                code = e.code
+        assert code == 404
+
+    def test_reserved_path_collision_refused(self, tmp_path: Path) -> None:
+        source = _store_with_data(tmp_path)
+        for reserved in ("/", "/substrate.json", "/recall.json", "/edit"):
+            try:
+                make_server(source, port=0, extra_assets={reserved: ("text/html", b"x")})
+                raised = False
+            except ValueError:
+                raised = True
+            assert raised, f"{reserved} should be refused as a collision"
+
+    def test_dup_path_in_both_mappings_refused(self, tmp_path: Path) -> None:
+        source = _store_with_data(tmp_path)
+        try:
+            make_server(source, port=0, extra_assets={"/x": ("text/html", b"a")},
+                        extra_json={"/x": lambda: b"{}"})
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised
+
+    def test_malformed_extra_path_refused(self, tmp_path: Path) -> None:
+        source = _store_with_data(tmp_path)
+        # Non-canonical forms are refused for the public seam (codex L3): query/fragment,
+        # percent-encoding, backslash, empty/double/trailing segments, ';' params, dot-segments.
+        for bad in ("noslash", "/has?query", "/has#frag", "/pct%2e", "/back\\slash",
+                    "/double//slash", "/trailing/", "/semi;colon", "/dot/./seg",
+                    "/dot/../seg"):
+            try:
+                make_server(source, port=0, extra_json={bad: lambda: b"{}"})
+                raised = False
+            except ValueError:
+                raised = True
+            assert raised, f"{bad!r} should be refused"
+
+    def test_case_insensitive_reserved_collision_refused(self, tmp_path: Path) -> None:
+        # /EDIT must be refused as a near-collision with /edit even though exact-string
+        # routing would treat them as distinct — defense against a future case-fold.
+        source = _store_with_data(tmp_path)
+        for clash in ("/EDIT", "/Substrate.json", "/RECALL.json"):
+            try:
+                make_server(source, port=0, extra_assets={clash: ("text/html", b"x")})
+                raised = False
+            except ValueError:
+                raised = True
+            assert raised, f"{clash!r} should be refused (case-insensitive reserved)"
+
+    def test_extra_asset_bad_value_shape_refused(self, tmp_path: Path) -> None:
+        source = _store_with_data(tmp_path)
+        for bad_value in (
+            "not-a-tuple",
+            ("text/html",),                 # wrong arity
+            (b"bytes-ct", b"body"),         # content_type must be str
+            ("text/html", "str-body"),      # body must be bytes
+        ):
+            try:
+                make_server(source, port=0, extra_assets={"/x": bad_value})
+                raised = False
+            except ValueError:
+                raised = True
+            assert raised, f"asset value {bad_value!r} should be refused"
+
+    def test_extra_asset_content_type_crlf_refused(self, tmp_path: Path) -> None:
+        # content_type flows into send_header — CR/LF would inject response headers.
+        source = _store_with_data(tmp_path)
+        for bad_ct in ("text/html\r\nX-Evil: 1", "text/html\nSet-Cookie: x"):
+            try:
+                make_server(source, port=0, extra_assets={"/x": (bad_ct, b"body")})
+                raised = False
+            except ValueError:
+                raised = True
+            assert raised, f"content_type {bad_ct!r} should be refused"
+
+    def test_extra_json_non_bytes_return_degrades_not_breaks_framing(self, tmp_path: Path) -> None:
+        # A builder that returns str (not bytes) must NOT emit a Content-Length then
+        # TypeError on the wire — it degrades to a JSON error like any other fault.
+        with _serving_extra(_store_with_data(tmp_path),
+                            extra_json={"/fleet.json": lambda: "i am a str, not bytes"}) as (base, _h):
+            status, headers, body = _get(base + "/fleet.json")
+        assert status == 200
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        assert "TypeError" in json.loads(body)["errors"]["server"]

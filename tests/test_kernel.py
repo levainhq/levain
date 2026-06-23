@@ -94,6 +94,15 @@ class TestKernelContractDepth:
         params = inspect.signature(kernel.make_server).parameters
         assert "host" in params
 
+    def test_make_server_accepts_read_only_extra_routes(self) -> None:
+        # The kernel's published web seam carries the read-only extension point a
+        # downstream control plane (the flow Bridge's FleetView) registers its extra
+        # views through — without it the only way to add a view is a second server that
+        # re-implements the bind-refusal contract.
+        params = inspect.signature(kernel.make_server).parameters
+        assert "extra_assets" in params
+        assert "extra_json" in params
+
 
 class TestKernelEncapsulation:
     def test_does_not_publish_private_driver_module(self) -> None:
