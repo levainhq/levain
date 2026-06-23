@@ -54,10 +54,13 @@ Sovereignty boundary (load-bearing, not incidental):
 - **no dependencies, no CDN** — stdlib ``http.server`` + vanilla-JS assets served
   from package data. The dashboard renders with the network cable unplugged. A
   sovereign surface does not rent its client library either.
-- **explicit route allowlist** — GET/HEAD serve five read routes (``/`` + two
-  scripts + ``/substrate.json`` + the read-only ``/recall.json`` episode keyword
-  search); POST serves exactly one (``/edit``). No filesystem mapping, so there is
-  no path-traversal surface. Anything else is a flat 404.
+- **explicit route allowlist** — GET/HEAD serve the built-in read routes (``/`` +
+  the css + two scripts + ``/substrate.json`` + the read-only ``/recall.json`` episode
+  keyword search) PLUS any read-only routes a downstream registers via
+  ``make_server(extra_assets=..., extra_json=...)`` (the FleetView extension point — a
+  collision with a reserved built-in route is refused at registration); POST serves
+  exactly one (``/edit``), and no extra route can reach it. No filesystem mapping, so
+  there is no path-traversal surface. Anything else is a flat 404.
 - **bounded concurrency** — the per-request store read and every write run under a
   bounded gate; past the cap a request gets a clean 503 rather than letting an
   unbounded thread pile-up exhaust the box.
@@ -69,6 +72,7 @@ import ipaddress
 import json
 import sys
 import threading
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -207,6 +211,18 @@ _ASSETS: dict[str, tuple[str, str]] = {
 }
 
 
+# Paths a downstream-registered extra route may NEVER shadow: the built-in static
+# assets + the two dynamic read routes + the one write route. A control plane
+# (the flow Bridge's FleetView) registers ADDITIONAL read-only views; it must not
+# be able to override the substrate dashboard, the JSON reads, or the governed write
+# route. make_server refuses a collision loudly (a packaging-class bug, not runtime).
+_RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
+    "/substrate.json",
+    "/recall.json",
+    "/edit",
+}
+
+
 def load_web_asset(filename: str) -> str:
     """Read a web UI asset from package data (``templates/web/``).
 
@@ -288,6 +304,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
+    # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
+    # default to empty so the base product carries nothing extra. extra_assets are
+    # cached static bytes (ungated, like levain_assets); extra_json are per-request
+    # builders served under the concurrency gate (like /substrate.json).
+    extra_assets: dict[str, tuple[str, bytes]]
+    extra_json: dict[str, Callable[[], bytes]]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -438,10 +460,52 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
+        # Downstream-registered dynamic JSON routes (the FleetView extension point):
+        # read-only, gated EXACTLY like /substrate.json so a control plane's extra views
+        # ride this same security envelope (Host allowlist, CSP, concurrency gate, the
+        # bind-refusal contract) instead of standing up a second server that would
+        # duplicate — and could drift from — that contract. GET/HEAD only; there is no
+        # POST path to them, so an extra route can never become a write surface.
+        json_builder = self.server.extra_json.get(path)
+        if json_builder is not None:
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                body = json_builder()
+                if not isinstance(body, bytes):
+                    # The route contract is bytes. A non-bytes return would let _send emit
+                    # a Content-Length header and then TypeError on wfile.write AFTER the
+                    # headers are already on the wire (broken framing) — catch it HERE so it
+                    # degrades to a JSON error like any other builder fault (codex L3).
+                    raise TypeError(
+                        f"extra_json builder for {path} must return bytes, "
+                        f"got {type(body).__name__}"
+                    )
+            except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
+                # Same discipline as /substrate.json: surface the fault as JSON the
+                # registering surface can render, never a dead connection.
+                body = json.dumps(
+                    {"errors": {"server": f"{type(exc).__name__}: {exc}"}}
+                ).encode("utf-8")
+            finally:
+                self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", head=head)
+            return
+
         asset = _ASSETS.get(path)
         if asset is not None:
             filename, content_type = asset
             self._send(self.server.levain_assets[filename], content_type, head=head)
+            return
+
+        # Downstream-registered static assets (cached bytes, ungated — same class as the
+        # built-in assets above). Checked after the built-ins so it can never shadow them
+        # (make_server also refuses a reserved-path collision at registration).
+        extra = self.server.extra_assets.get(path)
+        if extra is not None:
+            content_type, body = extra
+            self._send(body, content_type, head=head)
             return
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
@@ -571,7 +635,12 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    source: SubstrateSource, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT
+    source: SubstrateSource,
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    extra_assets: Mapping[str, tuple[str, bytes]] | None = None,
+    extra_json: Mapping[str, Callable[[], bytes]] | None = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -580,6 +649,25 @@ def make_server(
     ``OSError`` if the bind fails (e.g. the port is in use) — the caller decides
     how to report it. Separated from ``run_web_server`` so tests can drive a real
     bound server without the resolve/existence/print/browser/serve_forever wrapper.
+
+    ``extra_assets`` / ``extra_json`` are the READ-ONLY extension point a downstream
+    control plane uses to register additional GET views that ride this server's
+    security envelope (the Host allowlist, CSP, the concurrency gate, the bind-refusal
+    contract) — the flow Bridge's FleetView registers its ``/fleet`` landing (static)
+    + ``/fleet.json`` (live) here rather than standing up a second server that would
+    re-implement (and could drift from) the bind-refusal contract
+    (``structural_invariants_beat_discipline``). ``extra_assets`` maps a path →
+    ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets);
+    ``extra_json`` maps a path → a zero-arg builder called per request under the gate
+    (like ``/substrate.json``), its body served as ``application/json``. Both are
+    GET/HEAD-only: Levain dispatches them ONLY from the read path and has no POST handler
+    for an extra route, so the kernel cannot be made to add a WRITE ROUTE through this
+    seam. (The registered builders themselves must be side-effect-free — that is the
+    REGISTRANT's contract, which the kernel cannot enforce on an arbitrary ``Callable``;
+    the Bridge's fleet builders are pure reads.) A path that collides with a
+    reserved built-in route (the dashboard assets / the JSON reads / ``/edit``) or that
+    appears in BOTH mappings raises ``ValueError`` (a registration-time packaging bug,
+    surfaced loud — never a silent shadow of the dashboard or the write route).
 
     Non-loopback binding (a LAN / Tailscale IP) is allowed ONLY for a READ-ONLY,
     NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` — e.g. flow's
@@ -609,10 +697,77 @@ def make_server(
             "NO-INSTALL source (no write_scope, no install_root) MAY bind a non-loopback "
             "address — e.g. a Tailscale IP — for private-mesh access."
         )
+    # Validate downstream routes BEFORE binding a socket — a collision is a packaging
+    # bug, caught at registration, never a silent shadow at request time.
+    extra_assets = dict(extra_assets or {})
+    extra_json = dict(extra_json or {})
+    _reserved_lower = {p.lower() for p in _RESERVED_PATHS}
+    for path in (*extra_assets, *extra_json):
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError(
+                f"refusing extra route {path!r}: must be an absolute path (start with '/')."
+            )
+        # CANONICAL-FORM safe, not merely exact-string safe (codex L3): the dispatcher
+        # routes on the raw exact path, so a percent-encoded / dot-segment / double-slash /
+        # backslash path is harmless TODAY — but this is now a public kernel seam, so reject
+        # any non-canonical form up front rather than let a future normalization layer turn
+        # a harmless near-collision into route ambiguity.
+        if any(c in path for c in "?#%\\;"):
+            raise ValueError(
+                f"refusing extra route {path!r}: no query/fragment, percent-encoding, "
+                "backslash, or ';' params — pass a bare canonical path."
+            )
+        # Reject any empty path segment after the leading slash — i.e. a double slash OR a
+        # trailing slash (`/edit/` is the same future-normalization-ambiguity class the guard
+        # closes; codex L3). `path.split('/')[1:]` drops the always-empty leading element.
+        if any(seg == "" for seg in path.split("/")[1:]):
+            raise ValueError(
+                f"refusing extra route {path!r}: no empty path segment "
+                "(double slash or trailing slash)."
+            )
+        if any(seg in (".", "..") for seg in path.split("/")):
+            raise ValueError(
+                f"refusing extra route {path!r}: no '.'/'..' path segments."
+            )
+        # Case-INSENSITIVE reserved check: /EDIT must be refused as a near-collision even
+        # though exact-string routing would treat it as a distinct path — defense against a
+        # future case-folding normalization.
+        if path.lower() in _reserved_lower:
+            raise ValueError(
+                f"refusing extra route {path!r}: it collides with a built-in route "
+                "(a dashboard asset, the JSON reads, or /edit) and may not be overridden."
+            )
+    dup = set(extra_assets) & set(extra_json)
+    if dup:
+        raise ValueError(
+            f"refusing extra routes {sorted(dup)!r}: registered as BOTH a static asset "
+            "and a dynamic JSON route — a path resolves to exactly one handler."
+        )
+    # Validate the static-asset VALUE shape at registration (a (content_type, body) pair
+    # of the right types) so a malformed asset surfaces here, not as a 500 / broken framing
+    # at request time. The dynamic extra_json builders are validated to return bytes at the
+    # call site (inside the request handler's guarded block).
+    for path, value in extra_assets.items():
+        if (not isinstance(value, tuple) or len(value) != 2
+                or not isinstance(value[0], str) or not isinstance(value[1], bytes)):
+            raise ValueError(
+                f"refusing extra asset {path!r}: value must be "
+                "(content_type: str, body: bytes)."
+            )
+        # The content_type flows into send_header("Content-Type", ...) — reject CR/LF so a
+        # bad registrant can't inject response headers through the seam (codex L3 defense-in-
+        # depth; FleetView's values are safe constants, but this is a public kernel seam).
+        if "\r" in value[0] or "\n" in value[0]:
+            raise ValueError(
+                f"refusing extra asset {path!r}: content_type must not contain CR/LF."
+            )
+
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
     httpd.levain_assets = assets
+    httpd.extra_assets = extra_assets
+    httpd.extra_json = extra_json
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
