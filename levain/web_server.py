@@ -236,7 +236,10 @@ def load_web_asset(filename: str) -> str:
     )
 
 
-def build_substrate_json(source: SubstrateSource) -> bytes:
+def build_substrate_json(
+    source: SubstrateSource,
+    extra_panels: "Callable[[], list[dict]] | None" = None,
+) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
     Pure read — ``source.build()`` opens the episodic Store ``read_only=True`` and
@@ -261,6 +264,59 @@ def build_substrate_json(source: SubstrateSource) -> bytes:
     # silently clobbered (caught in tests, never in prod — complement L3).
     assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
     payload["writable"] = source.write_scope is not None
+    # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
+    # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
+    # under payload["extra_panels"][id], so the frontend renders them inline among the substrate
+    # panels. The provider is a DOWNSTREAM read (e.g. the Bridge's inbox) — gated like this whole
+    # route. FAIL-SOFT: a provider fault degrades to no extra panels, never breaks the cockpit.
+    if extra_panels is not None:
+        assert "extra_panels" not in payload, "to_dict() collided with transport `extra_panels`"
+        try:
+            panels = extra_panels()
+            # the provider CONTRACT is a list/tuple of dicts; coerce anything else (None, an
+            # int, a generator) to empty so a malformed return degrades to no panels rather
+            # than raising out of the otherwise-unguarded iteration below [codex L3 MED].
+            if not isinstance(panels, (list, tuple)):
+                panels = []
+        except Exception:  # noqa: BLE001 — a downstream provider fault must not break the dashboard
+            panels = []
+        data: dict[str, dict] = {}
+        layout = payload.get("layout")
+        seen_ids: set[str] = set()
+        for p in panels:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get("id") or "")  # explicit None/"" → missing (not the literal "None") [codex L3 LOW]
+            if not pid or pid in seen_ids:
+                continue  # id required + UNIQUE — a dup renders the last's data under both [codex L3 MED]
+            seen_ids.add(pid)
+            zone = str(p.get("zone", "operate"))
+            if zone not in ("identity", "operate", "mind"):
+                zone = "operate"  # unknown zones have no tab + would orphan a divider [codex L3 LOW]
+            entry = {"kind": "external", "id": pid, "zone": zone,
+                     "title": str(p.get("title", pid))}
+            if isinstance(layout, list):
+                # Insert AFTER the last panel of the SAME zone, not at the end: the base layout
+                # is zone-contiguous (Identity→Operate→Mind) and the frontend drops a zone
+                # divider on each zone change, so appending an operate panel past the Mind block
+                # would re-emit an orphaned 2nd "Operate" header in the all-view (L1 LOW-1).
+                # Grouping it into its zone's run preserves the contiguity the divider relies on.
+                insert_at = len(layout)
+                for i in range(len(layout) - 1, -1, -1):
+                    if isinstance(layout[i], dict) and layout[i].get("zone") == zone:
+                        insert_at = i + 1
+                        break
+                layout.insert(insert_at, entry)
+                # record the data ONLY when the layout entry actually landed — so a missing /
+                # non-list layout (a future to_dict() regression) can't leave orphan panel data
+                # that exists in the payload but never renders (complement L3 MED).
+                data[pid] = {
+                    "note": p.get("note", ""),
+                    "lines": p.get("lines", []),
+                    "empty": p.get("empty", ""),
+                    "error": p.get("error"),
+                }
+        payload["extra_panels"] = data
     return json.dumps(payload).encode("utf-8")
 
 
@@ -310,6 +366,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # builders served under the concurrency gate (like /substrate.json).
     extra_assets: dict[str, tuple[str, bytes]]
     extra_json: dict[str, Callable[[], bytes]]
+    # Downstream-injected READ-ONLY inline PANELS (the panel peer of the extra-route seam): a
+    # per-request provider returning panel descriptors+data that render INLINE in the dashboard
+    # alongside the substrate panels (vs extra_json, which serves a SEPARATE page). None → the
+    # base product injects nothing. Generic by design (a `kind:"external"` panel of titled
+    # lines) so the kernel stays domain-agnostic — the flow Bridge injects its inbox here.
+    extra_panels: "Callable[[], list[dict]] | None"
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -416,7 +478,8 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                body = build_substrate_json(self.server.levain_source)
+                body = build_substrate_json(
+                    self.server.levain_source, self.server.extra_panels)
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
@@ -641,6 +704,7 @@ def make_server(
     port: int = DEFAULT_PORT,
     extra_assets: Mapping[str, tuple[str, bytes]] | None = None,
     extra_json: Mapping[str, Callable[[], bytes]] | None = None,
+    extra_panels: "Callable[[], list[dict]] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -762,12 +826,19 @@ def make_server(
                 f"refusing extra asset {path!r}: content_type must not contain CR/LF."
             )
 
+    # Inline external-panel provider (read-only, per-request, fail-soft); None for the base
+    # product. A non-callable is a registrant bug — reject it BEFORE binding a socket, with the
+    # rest of the pre-bind registration validation (codex L3: reject registration bugs first).
+    if extra_panels is not None and not callable(extra_panels):
+        raise ValueError("extra_panels must be a zero-arg callable returning a list of panels.")
+
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
     httpd.levain_assets = assets
     httpd.extra_assets = extra_assets
     httpd.extra_json = extra_json
+    httpd.extra_panels = extra_panels
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
