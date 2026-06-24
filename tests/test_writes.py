@@ -1061,52 +1061,179 @@ class TestTrayWriteKinds:
         })
         assert res["ok"]
 
-    # -- A: a Keep note is TERMINAL — re-routing it OUT defeats the note-ascend lock --
+    # -- A: the KEEP-NOTE PROMOTE lifecycle — a note CAN be re-routed OUT (relaxed 2026-06-23) --
     def _seed_note(self, install: Path) -> str:
         return apply_edit(_scope(install), {
             "kind": "spore_seed", "text": "docker: levain init", "disposition": "note",
         })["spore_id"]
 
-    def test_set_disposition_note_to_loop_refused(self, install: Path) -> None:
-        # codex L3 HIGH: note→loop cleared the tag, then the now-loop sailed past the
-        # note-ascend guard → a reference resolved into a false lineage. Closed: note is
-        # terminal for re-routing.
+    def test_set_disposition_note_to_loop_promotes(self, install: Path) -> None:
+        # note→loop ACTIVATES a note into a key-free cognition loop (was refused as note-terminal
+        # pre-2026-06-23). Lineage preserved — same spore id, the tag cleared (metabolized).
         sid = self._seed_note(install)
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
-        assert ei.value.code == "note_terminal" and ei.value.http_status == 409
-        assert _spore_store(install).get(sid)["disposition"] == "note"  # untouched
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        assert res["ok"]
+        sp = _spore_store(install).get(sid)
+        assert sp["id"] == sid  # lineage: same spore, not delete+recreate
+        assert sp.get("disposition") in (None, "loop")  # key-free loop
 
-    def test_set_disposition_note_to_tray_refused(self, install: Path) -> None:
+    def test_set_disposition_note_to_tray_promotes(self, install: Path) -> None:
+        # note→Tray (seed): the note moves to the inbox for triage. No confirm — promoting a note
+        # OUT is a gain / lateral move, never the silent-loss demote of a LIVE loop.
         sid = self._seed_note(install)
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed"})
-        assert ei.value.code == "note_terminal"
-        assert _spore_store(install).get(sid)["disposition"] == "note"
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed"})
+        assert res["ok"] and res["action"] == "set_disposition"
+        assert _spore_store(install).get(sid)["disposition"] == "seed"
 
-    def test_note_ascend_bypass_is_closed_end_to_end(self, install: Path) -> None:
-        # the full reproduced chain: seed-note → (try) set_disposition loop → ascend. Step 2
-        # is now refused, so step 3 can never reach an ascendable non-note. Direct ascend of
-        # the note is also refused by the H2 guard.
+    def test_note_promote_then_ascend_is_the_deliberate_two_step(self, install: Path) -> None:
+        # The note-ascend lock MOVED, it wasn't lost. A DIRECT ascend of a note stays refused;
+        # the someday→memory path is the deliberate, audited TWO-STEP — activate (note→loop),
+        # THEN ascend the loop. Both legs verified end-to-end (the chain the old guard blocked
+        # whole is now gated only at its first dangerous move — the direct ascend).
         sid = self._seed_note(install)
-        with pytest.raises(EditError):  # the metabolize is blocked
-            apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
-        with pytest.raises(EditError) as ei:  # and a direct ascend stays refused
+        # (1) a direct ascend of the note is STILL refused (the H2 guard stays)
+        with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
                 "ref": "x", "confirm": True})
         assert ei.value.code == "not_ascendable"
+        # (2) activate it to a loop, THEN ascend the loop — now sanctioned, the deliberate step
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        res = apply_edit(_scope(install), {
+            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "ref": "projects/x", "confirm": True})
+        assert res["ok"]
 
-    def test_set_disposition_note_to_note_is_a_noop_not_refused(self, install: Path) -> None:
-        # the terminal guard fires only on LEAVING note (disposition != "note")
+    def test_set_disposition_note_to_note_is_a_noop(self, install: Path) -> None:
+        # note→note: a harmless same-state write (the relaxed verb still accepts it).
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
             "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
         assert res["ok"]
         assert _spore_store(install).get(sid)["disposition"] == "note"
+
+    def test_set_disposition_promote_note_needs_no_confirm(self, install: Path) -> None:
+        # The confirm gate fires ONLY on demoting a LIVE loop into operator-I/O. A note is not a
+        # loop (is_loop False), so promoting it OUT lands WITHOUT a confirm (no EditError raised).
+        sid = self._seed_note(install)
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        assert res["ok"]
+
+    # -- A': "remind me" — promote + schedule the resurface ATOMICALLY (optional surface_at) --
+    def test_set_disposition_remind_me_promotes_and_schedules_atomically(self, install: Path) -> None:
+        # The "remind me" tickler: note→seed carrying surface_at lands BOTH in one write (one
+        # transaction, one CAS) — disposition AND schedule, never half-applied. The note becomes
+        # a Tray seed hidden until the date; the schedule is audited alongside the re-route.
+        sid = self._seed_note(install)
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid,
+            "disposition": "seed", "surface_at": "2026-07-01"})
+        assert res["ok"]
+        sp = _spore_store(install).get(sid)
+        assert sp["disposition"] == "seed" and sp["next"] == "2026-07-01"
+        assert recent_edits(install / ".levain")[0]["surface_at"] == "2026-07-01"
+
+    def test_set_disposition_absent_surface_at_leaves_next_untouched(self, install: Path) -> None:
+        # ABSENT key ≠ clear: a plain reroute must not wipe an existing alarm (the same
+        # presence-not-value rule spore_surface_at enforces, here as "leave next alone").
+        sid = _add_spore(install, disposition="seed", next="2026-07-01")
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda"})
+        assert _spore_store(install).get(sid)["next"] == "2026-07-01"  # alarm preserved
+
+    def test_set_disposition_date_on_note_destination_refused(self, install: Path) -> None:
+        # L1 2026-06-23: a Keep note has no temporal dimension. Setting a date while the
+        # destination STAYS a note is refused (fail-loud) — it would write an inert `next` no Keep
+        # renderer reads; "remind me" PROMOTES it to the Tray instead. Fail-closed: untouched.
+        sid = self._seed_note(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid,
+                "disposition": "note", "surface_at": "2026-07-01"})
+        assert ei.value.code == "bad_verb_arg" and "schedule" in str(ei.value)
+        sp = _spore_store(install).get(sid)
+        assert sp["disposition"] == "note" and sp.get("next") is None  # untouched, no inert next
+
+    def test_set_disposition_clear_surface_at_on_note_allowed(self, install: Path) -> None:
+        # the guard refuses SETTING a date on a note, but CLEARING (null/'') is harmless cleanup.
+        sid = self._seed_note(install)
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid,
+            "disposition": "note", "surface_at": ""})
+        assert res["ok"]
+        assert _spore_store(install).get(sid)["disposition"] == "note"
+
+    def test_set_disposition_routing_a_dated_seed_into_note_force_clears_next(self, install: Path) -> None:
+        # codex L3 MED + complement L3 HIGH: routing a DATED item into a note must CLEAR the carried
+        # `next` (no explicit surface_at given) — else the note holds an inert date and a later
+        # note→Tray promote would hide it until that date (silent loss from both surfaces).
+        sid = _add_spore(install, disposition="seed", next="2026-07-01")
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note"})
+        assert res["ok"]
+        sp = _spore_store(install).get(sid)
+        assert sp["disposition"] == "note" and sp.get("next") is None  # carried date force-cleared
+
+    def test_set_disposition_demote_dated_loop_into_note_clears_next_with_confirm(self, install: Path) -> None:
+        # the demote variant (loop→note is confirm-gated): with confirm, the carried alarm is also
+        # force-cleared — the note ends up with no `next`, no later silent resurface.
+        sid = _add_spore(install, disposition=None, tier="hot", next="2026-07-01")  # a live, scheduled loop
+        res = apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "note", "confirm": True})
+        assert res["ok"]
+        sp = _spore_store(install).get(sid)
+        assert sp["disposition"] == "note" and sp.get("next") is None
+
+    def test_ascend_toctou_concurrent_flip_to_note_fails_closed(self, install: Path, monkeypatch) -> None:
+        # codex L3 HIGH 2026-06-23 CLOSED: the note-ascend guard reads the disposition in a SEPARATE
+        # step from store.ascend. Simulate a concurrent loop→note flip in that window — patch the
+        # guard's `get` to see a key-free LOOP (so it passes + reads expect=None) while the REAL
+        # store holds a note. The expect_disposition CAS inside store.ascend must then REFUSE,
+        # leaving the note unresolved (no reference transmuted into a false lineage).
+        from anneal_memory.spores import SporeStore
+        sid = self._seed_note(install)  # a real note in the store
+        real_get = SporeStore.get
+
+        def loop_looking_get(self, sid_):  # the guard's read sees a LOOP (disposition stripped)
+            d = real_get(self, sid_)
+            if d is None:
+                return d
+            d = {**d}
+            d.pop("disposition", None)  # looks key-free → is_note False → guard passes, expect=None
+            return d
+
+        monkeypatch.setattr(SporeStore, "get", loop_looking_get)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "ref": "projects/x", "confirm": True})
+        assert ei.value.code == "verb_failed" and "changed since read" in str(ei.value)
+        monkeypatch.undo()  # read the REAL store: the note was NOT ascended
+        again = _spore_store(install).get(sid)
+        assert again is not None and again["disposition"] == "note"  # still open, still a note
+
+    def test_set_disposition_surface_at_empty_clears_the_alarm(self, install: Path) -> None:
+        # surface_at:"" clears next WHILE re-routing — symmetric with spore_surface_at's clear.
+        sid = _add_spore(install, disposition="seed", next="2026-07-01")
+        apply_edit(_scope(install), {
+            "kind": "spore_set_disposition", "spore_id": sid,
+            "disposition": "agenda", "surface_at": ""})
+        assert _spore_store(install).get(sid)["next"] is None
+
+    def test_set_disposition_surface_at_rejects_bad_date_fail_closed(self, install: Path) -> None:
+        # the optional schedule rides the SAME validator as spore_surface_at — a bad date is
+        # rejected (user-facing "surface_at" name) BEFORE any write, so the spore is untouched.
+        sid = self._seed_note(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_set_disposition", "spore_id": sid,
+                "disposition": "seed", "surface_at": "2026-13-45"})
+        assert ei.value.code == "bad_verb_arg" and "surface_at" in str(ei.value)
+        assert _spore_store(install).get(sid)["disposition"] == "note"  # fail-closed: unchanged
 
     def test_set_disposition_records_prior_disposition_in_audit(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]

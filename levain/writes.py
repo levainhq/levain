@@ -886,17 +886,19 @@ def _apply_spore_verb(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
+    ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
     if verb == "ascend":
         # A note is durable operator REFERENCE, not a prospective loop that BECAME memory —
         # ascending it would falsely claim reference material as the entity's own graduated
         # cognition (a pattern/essay/project lineage). Reference is REMOVED (descended), never
         # transmuted. Disposition-aware policy → enforced here; anneal stays blind. (descend
-        # stays allowed — it's how the Keep "remove" works.) KNOWN RESIDUAL (complement L3,
-        # LOW): the disposition read and `store.ascend` are separate transactions, so a
-        # cross-process writer flipping a loop→note in that window can slip an ascend past this
-        # guard. Sound single-process; closing it cross-process needs an `expect_disposition`
-        # CAS on anneal's `ascend` (it only exists on `update` today) — a future anneal harden,
-        # not grown here for a rare timing window.
+        # stays allowed — it's how the Keep "remove" works.) The read-then-resolve TOCTOU is
+        # CLOSED cross-process (was a documented complement-L3 residual; codex L3 HIGH
+        # 2026-06-23): the disposition we read here is passed as `expect_disposition` to
+        # `store.ascend`, which CAS-checks it INSIDE the resolve transaction — so a concurrent
+        # writer flipping loop→note between this read and the resolve makes the ascend FAIL
+        # CLOSED (SporeError → verb_failed) rather than transmute a now-note. The CAS mirrors
+        # the one `update` already uses (anneal `AM-SPORE-CAS`).
         current = store.get(spore_id)
         if current is not None and is_note(current):
             raise EditError(
@@ -904,6 +906,7 @@ def _apply_spore_verb(
                 "a Keep note is durable reference, not a prospective loop — it can't be "
                 "promoted/ascended; remove it (descend) instead",
             )
+        ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
     try:
         if verb == "touch":
             store.touch(spore_id)
@@ -912,7 +915,9 @@ def _apply_spore_verb(
             store.descend(spore_id, kind=spore_kind)
         else:  # ascend
             assert spore_kind is not None and ref is not None  # set in the ascend branch
-            store.ascend(spore_id, kind=spore_kind, ref=ref)
+            # expect_disposition = the (non-note) value we just read → fail-closed if a
+            # concurrent writer flipped it to a note (or anything else) before this resolve.
+            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect)
     except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift
@@ -1011,21 +1016,29 @@ def _apply_spore_seed(
 def _apply_spore_set_disposition(
     scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
-    """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb).
-    ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop`` METABOLIZES an
-    operator-I/O item into a cognition loop (clears the tag → key-free); a Tray value moves
-    it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
+    """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb, AND the
+    Keep-note promote). ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop``
+    METABOLIZES an operator-I/O item into a cognition loop (clears the tag → key-free); a Tray
+    value moves it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
+    An optional ``surface_at`` (``YYYY-MM-DD`` / null / '') rides the re-route atomically — the
+    "remind me" tickler: promote a note to a Tray seed AND schedule its resurface in one write.
 
-    Two boundaries are guarded. (1) A Keep ``note`` is TERMINAL — re-routing it OUT (note→loop
-    / note→Tray) is REFUSED (409), because it would defeat the note-ascend lock; a note is
-    repurposed by ``descend`` + creating a fresh loop, never by mutation. (2) **Demoting a LIVE
-    cognition loop into operator I/O** (current = loop, target ∈ NON_COGNITION — Tray OR note)
-    removes it from salience / digest / Top of Mind with no other signal — the silent-
-    cognition-loss the fail-open read-predicate exists to prevent — so it is confirm-gated, like
-    ``descend``/``ascend``. The gate reads only CAS-/transaction-guarded fields (disposition +
-    status), NOT tier (that was a TOCTOU). Everything else (loop→loop, Tray↔Tray, filing INTO
-    Keep) is non-destructive → no confirm. The prior disposition is always audited so any move
-    stays reconstructable."""
+    The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep ``note`` CAN be re-routed OUT
+    (note→loop / note→Tray) — the former note-terminal refusal is RELAXED (it was right for a
+    true reference, wrong for a deferred someday/maybe that had no path out but delete+recreate).
+    The note-ascend lock is preserved as a deliberate TWO-STEP, not lost: a note still can't
+    ``ascend`` DIRECTLY (``_apply_spore_verb``'s guard), so a reference can't resolve into a false
+    lineage in one move — you activate it to a loop first, then ascend the loop. Lineage is
+    preserved (same spore; mutation, not re-create).
+
+    ONE boundary is confirm-guarded: **demoting a LIVE cognition loop into operator I/O**
+    (current = loop, target ∈ NON_COGNITION — Tray OR note) removes it from salience / digest /
+    Top of Mind with no other signal — the silent-cognition-loss the fail-open read-predicate
+    exists to prevent — so it is confirm-gated, like ``descend``/``ascend``. The gate reads only
+    CAS-/transaction-guarded fields (disposition + status), NOT tier (that was a TOCTOU).
+    Everything else — loop→loop, Tray↔Tray, filing INTO Keep, AND promoting a note OUT (a gain
+    into cognition / a lateral move into the Tray) — is non-destructive → no confirm. The prior
+    disposition is always audited so any move stays reconstructable."""
     from anneal_memory.spores import SporeError, SporeStore  # lazy
 
     spore_id = _require_str(req, "spore_id")
@@ -1035,6 +1048,38 @@ def _apply_spore_set_disposition(
             "bad_verb_arg", 422,
             f"disposition must be one of {list(VALID_DISPOSITIONS)} (got {disposition!r})",
         )
+    # Optional surface_at — the "remind me" tickler: promote a note to a Tray seed AND schedule
+    # its resurface in ONE atomic op. Two sequential GUI commits is impossible — a successful
+    # commit re-renders, destroying the form's DOM — so the schedule must ride the promote.
+    # ABSENT key ⇒ leave `next` untouched (the plain reroutes don't reschedule); present ⇒ set it
+    # (null/'' clears). Validated via the SAME helper as spore_surface_at (no drift).
+    has_surface_at = "surface_at" in req
+    surface_at = _validate_surface_at(req.get("surface_at")) if has_surface_at else None
+    # A Keep note has NO temporal dimension — it does not resurface on a schedule (promoting it to
+    # the Tray via "remind me" is what scheduling a note MEANS). germination_tier + surface_at_reached
+    # both document "notes carry no surface_at"; enforce that on the RESULTING STATE, not just an
+    # explicit set (codex L3 MED + complement L3 HIGH 2026-06-23):
+    #   - explicit non-empty date + note destination → user error, refuse loud (point at the Tray);
+    #   - ANY →note transition → force `next` = None, which CLEARS a date CARRIED IN from a demoted
+    #     scheduled loop/seed. Without this, a dated item routed into a note kept its date, and the
+    #     new promote-out edge (note→Tray) then hid it until that future date — vanishing from BOTH
+    #     Keep and the Tray (silent loss), and note{past-date}→loop landed instantly `dormant`.
+    # Pre-read decision (no `current` needed — the target disposition + request determine it):
+    #   →note ⇒ write next=None · →non-note + surface_at present ⇒ write surface_at · else leave untouched.
+    # The flow CLI twin (cmd_update) enforces the identical rule — cross-repo parity (L2 2026-06-23).
+    if surface_at is not None and disposition == "note":
+        raise EditError(
+            "bad_verb_arg", 422,
+            "a Keep note doesn't resurface on a schedule — promote it to the Tray "
+            "(disposition 'seed'/'handoff'/'agenda') to set a reminder. Clearing surface_at on a "
+            "note is allowed.",
+        )
+    if disposition == "note":
+        set_next, next_value = True, None            # invariant: a note carries no `next` — clear any carried alarm
+    elif has_surface_at:
+        set_next, next_value = True, surface_at       # the "remind me" schedule (or an explicit clear)
+    else:
+        set_next, next_value = False, None            # absent ⇒ leave `next` untouched (plain reroute)
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
@@ -1050,19 +1095,19 @@ def _apply_spore_set_disposition(
     # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
-    # A Keep note is a TERMINAL, lifecycle-inert durable-reference disposition (ascend REFUSED,
-    # resolve-exempt). Re-routing it OUT (note→loop / note→Tray) DEFEATS that lock: note→loop
-    # clears the tag below, and the now-"loop" item sails past the note-ascend guard in
-    # `_apply_spore_verb` → a reference resolves into a false pattern/project lineage [codex L3
-    # HIGH; kimi/complement concur]. To repurpose a note, `descend` composts THIS object and a
-    # fresh loop is created (a NEW object — not "a reference that became memory"). Filing INTO
-    # Keep (loop→note / Tray→note) still flows; only LEAVING the note state is closed.
-    if current is not None and is_note(current) and disposition != "note":
-        raise EditError(
-            "note_terminal", 409,
-            f"spore {spore_id} is a Keep note — durable reference is lifecycle-inert and "
-            "cannot be re-routed into a loop or the Tray. descend it to remove, or edit in place.",
-        )
+    # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
+    # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop
+    # metabolize. The former note-terminal guard here was the OVER-correction: terminal is right
+    # for a true reference, WRONG for a deferred someday/maybe (which had no path out but
+    # delete+recreate — friction + lost lineage). The note-ascend lock is NOT lost — it MOVES to
+    # the deliberate two-step: a note still can't `ascend` DIRECTLY (`_apply_spore_verb`'s H2
+    # guard STAYS), so promoting note→loop here does NOT let a reference ascend in one move — the
+    # now-loop must be ascended as a SECOND explicit, audited verb. A pure reference note simply
+    # never gets promoted (reference-vs-someday stays emergent). LINEAGE preserved (same spore id
+    # + history; mutation, not re-create). Promotion is a GAIN into cognition (or a lateral move
+    # into the Tray), never the silent-loss direction, so it needs no confirm — `demoting_live_loop`
+    # below is False for a note (is_loop(note) is False); only DEMOTING a live loop confirms.
+    #
     # Gate ANY demotion of a live cognition loop into operator I/O — the Tray inbox OR a Keep
     # note (NON_COGNITION, not just TRAY). loop→note is the same silent-cognition-loss and is
     # even STICKIER (a note is durable + resolve-exempt), so it must confirm too [L1+L2 L3].
@@ -1086,12 +1131,19 @@ def _apply_spore_set_disposition(
 
     # ``loop`` → clear the tag (metabolize to a key-free loop); a Tray value → set it.
     anneal_disposition = None if disposition == LOOP_DISPOSITION else disposition
+    update_kwargs: dict[str, Any] = {
+        "disposition": anneal_disposition, "expect_disposition": prior_raw,
+    }
+    if set_next:
+        update_kwargs["next"] = next_value  # None ⇒ clear (incl. the →note force-clear); a date ⇒ set — SAME atomic write
     try:
         # CAS on the disposition we just read closes the read→write window against a
         # concurrent (cross-process) writer — flow's CLI on the same store [codex L3 HIGH].
         # If it changed since `get`, anneal raises and nothing is written; the operator
-        # re-reads and the confirm decision is re-made on fresh state.
-        store.update(spore_id, disposition=anneal_disposition, expect_disposition=prior_raw)
+        # re-reads and the confirm decision is re-made on fresh state. The disposition + the
+        # optional surface_at land in ONE store.update (one transaction, one CAS) — the promote
+        # and its schedule never half-apply.
+        store.update(spore_id, **update_kwargs)
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
@@ -1102,10 +1154,35 @@ def _apply_spore_set_disposition(
     edit_id = _audit_verb(
         scope.ledger_root, kind="spore_set_disposition", action="set_disposition",
         target=f"spore:{spore_id}", now=now,
-        extra={"disposition": disposition, "prior_disposition": prior},
+        extra={"disposition": disposition, "prior_disposition": prior,
+               **({"surface_at": next_value} if set_next else {})},
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
             "action": "set_disposition"}
+
+
+def _validate_surface_at(value: Any) -> str | None:
+    """Validate a surface_at date value → the normalized result (a ``YYYY-MM-DD`` string, or
+    ``None`` for a clear). Shared by ``spore_surface_at`` AND the optional schedule carried on a
+    ``spore_set_disposition`` promote (the "remind me" tickler) so the date contract can't drift
+    between them. Caller owns the key-PRESENCE policy (surface_at requires the key present;
+    set_disposition treats an absent key as "leave next alone"); this validates only the VALUE.
+
+    Strict YYYY-MM-DD: the anchored \\d regex rejects a space-padded "2026-06- 1" that len==10 +
+    strptime would wrongly accept [codex L3 MED]; strptime then confirms a REAL date (not
+    2026-13-45). The operator always sees the user-facing "surface_at" name, never anneal's
+    internal "next" field."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        raise EditError("bad_verb_arg", 422,
+                        "surface_at must be YYYY-MM-DD (or null/'' to clear)")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise EditError("bad_verb_arg", 422,
+                        "surface_at must be YYYY-MM-DD (or null/'' to clear)") from None
+    return value
 
 
 def _apply_spore_surface_at(
@@ -1123,20 +1200,7 @@ def _apply_spore_surface_at(
     if "surface_at" not in req:
         raise EditError("bad_verb_arg", 422,
                         "surface_at is required (use null or '' to clear the alarm)")
-    surface_at = req.get("surface_at")
-    if surface_at not in (None, ""):
-        # Strict YYYY-MM-DD: the anchored \d regex rejects a space-padded "2026-06- 1" that
-        # len==10 + strptime would wrongly accept [codex L3 MED]; strptime then confirms a
-        # REAL date (not 2026-13-45). The operator always sees the user-facing "surface_at"
-        # message, never anneal's internal "next" field name.
-        if not isinstance(surface_at, str) or not _ISO_DATE_RE.match(surface_at):
-            raise EditError("bad_verb_arg", 422,
-                            "surface_at must be YYYY-MM-DD (or null/'' to clear)")
-        try:
-            datetime.strptime(surface_at, "%Y-%m-%d")
-        except ValueError:
-            raise EditError("bad_verb_arg", 422,
-                            "surface_at must be YYYY-MM-DD (or null/'' to clear)") from None
+    surface_at = _validate_surface_at(req.get("surface_at"))
     paths = scope.anneal
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")

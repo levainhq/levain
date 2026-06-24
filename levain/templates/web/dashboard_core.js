@@ -595,7 +595,7 @@
       "tray clear — nothing waiting", "disposition");
     // The dump box is the primary capture affordance — mounted under the title when
     // writable. A read-only port (mesh) shows the Tray but offers no dump (NO-THEATER).
-    if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump());
+    if (isVerbPanel(entry)) mountCaptureBox(p, buildTrayDump(view.entity_name || "the assistant"));
     return p;
   }
 
@@ -1202,11 +1202,38 @@
       return wrap;
     }
 
-    // KEEP — durable reference, NOT loop-lifecycle. Always editable; a note removes;
-    // a pinned-dormant loop reactivates (un-park) or removes.
+    // KEEP — durable reference, NOT loop-lifecycle. Always editable. A NOTE gets the promote
+    // lifecycle (→ tray / activate / remind me); a pinned-dormant LOOP reactivates (un-park).
+    // Both end with remove.
     if (panelKind === "keep") {
       wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
-      if (s.disposition !== "note") {
+      if (s.disposition === "note") {
+        // The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a deferred someday/maybe note re-enters
+        // the flow without delete+recreate (lineage preserved). A pure reference note simply
+        // never gets promoted — reference-vs-someday stays emergent (no taxonomy split). Each is
+        // a GAIN into cognition / a lateral move into the Tray (never the silent-loss demote), so
+        // no confirm. A note can't ascend directly — `activate` to a loop first, then the loop's
+        // own `promote` (ascend) is what reaches memory: a deliberate two-step.
+        // "→ tray" promotes to a generic `seed` (NOT handoff/agenda) by DESIGN — the operator
+        // triages a promoted note to the inbox, then re-classifies it there. The server + CLI
+        // allow note→{handoff,agenda} too; the GUI deliberately offers the one triage entry, not
+        // every governed transition (L2 2026-06-23, intentional narrowing — "human dumps, AI sorts").
+        wrap.appendChild(verbBtn("→ tray", "promote to the Tray inbox — surfaces for triage at next session", async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "seed" });
+          if (res && res.ok) return;  // re-rendered
+          b.disabled = false;
+          verbErr(wrap, res);
+        }));
+        wrap.appendChild(verbBtn("activate", "metabolize into a live cognition loop", async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop" });
+          if (res && res.ok) return;  // re-rendered
+          b.disabled = false;
+          verbErr(wrap, res);
+        }));
+        wrap.appendChild(verbBtn("remind me", "resurface in the Tray on a future date", () => openRemindForm(wrap, s)));
+      } else {
         wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
           const b = ev.currentTarget; b.disabled = true;
           const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm" });
@@ -1379,11 +1406,27 @@
       }, "confirm remove", true);
   }
 
+  // "remind me" — promote a Keep note to a Tray seed AND schedule its resurface, ATOMICALLY:
+  // one spore_set_disposition carrying surface_at. Two sequential commits is impossible — a
+  // successful commit re-renders and the form's DOM is gone — so the schedule rides the promote
+  // server-side (one transaction, one CAS). The note leaves Keep for the Tray, hidden until the
+  // date, then surfaces for triage; lineage preserved (same spore).
+  function openRemindForm(host, s) {
+    openRowForm(host, () => {
+      const input = el("input", "verb-date");
+      input.type = "date";
+      return { nodes: [input], focus: input, input };
+    }, (f, msg) => {
+      if (!f.input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date"; return null; }
+      return { kind: "spore_set_disposition", spore_id: s.id, disposition: "seed", surface_at: f.input.value };
+    }, "remind me", false);
+  }
+
   // A freeform capture box. `submit` builds the request from the typed text. Used by the
   // Tray dump (with a type dropdown) and the Keep add-note. No own label — it mounts right
   // under the panel's title (Tray (X) / Keep (X)), like the content of every other panel;
   // the placeholder carries the purpose hint.
-  function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq) {
+  function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
     const box = el("div", "tray-dump");
     const ta = el("textarea", "tray-dump-ta");
     ta.placeholder = placeholder; ta.rows = 2;
@@ -1391,10 +1434,11 @@
     const controls = el("div", "tray-dump-controls");
     let sel = null;
     if (withType) {
-      // "let flow sort" omits type → the server defaults (thought + AI routes it). The
-      // operator classifies only when they want to; the AI/default is the fallback.
+      // "let <entity> sort" omits type → the server defaults (thought + AI routes it). The
+      // operator classifies only when they want to; the AI/default is the fallback. The
+      // entity name is install-specific (flow / Chip / …), so derive it — never hardcode.
       sel = el("select", "tray-dump-type");
-      for (const [val, lbl] of [["", "let flow sort"], ["task", "task"],
+      for (const [val, lbl] of [["", `let ${sortEntity} sort`], ["task", "task"],
                                 ["question", "question"], ["thought", "thought"]]) {
         const o = el("option", null, lbl); o.value = val; sel.appendChild(o);
       }
@@ -1425,15 +1469,15 @@
 
   // The Tray DUMP — the operator's primary capture (a `seed` is born, held out of
   // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
-  function buildTrayDump() {
+  function buildTrayDump(entity) {
     return buildCaptureBox(
-      "dump anything — a to-do, a thought, a thread to pick up… flow sorts it (⌘/Ctrl+Enter)",
+      `dump anything — a to-do, a thought, a thread to pick up… ${entity} sorts it (⌘/Ctrl+Enter)`,
       "drop", "nothing to drop", true,
       (text, type) => {
         const req = { kind: "spore_seed", text };
         if (type) req.type = type;  // omit → server default (thought + AI routes)
         return req;
-      });
+      }, entity);
   }
 
   // The Keep ADD-NOTE — authored durable reference (the Docker-commands case): a `note`,
