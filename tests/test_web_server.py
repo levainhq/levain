@@ -94,6 +94,79 @@ class TestSubstrateJson:
         assert len(data["open_spores"]) == 1
         assert data["sections"][0]["heading"] == "State"
 
+    def test_extra_panels_merge_into_layout_and_data(self, tmp_path: Path) -> None:
+        # the inline extra-panel seam: a provider returns full panel dicts; build_substrate_json
+        # splits each into a kind:"external" layout entry + its data under payload["extra_panels"].
+        src = _store_with_data(tmp_path)
+        provider = lambda: [{  # noqa: E731
+            "id": "inbox", "zone": "operate", "title": "Inbox (1 unread)",
+            "note": "1 unread", "lines": [{"meta": "x", "text": "hi", "accent": True}],
+        }]
+        data = json.loads(build_substrate_json(src, provider))
+        ext = [p for p in data["layout"] if p.get("kind") == "external"]
+        assert len(ext) == 1 and ext[0]["id"] == "inbox" and ext[0]["zone"] == "operate"
+        assert data["extra_panels"]["inbox"]["lines"][0]["text"] == "hi"
+        assert data["extra_panels"]["inbox"]["note"] == "1 unread"
+
+    def test_extra_panels_insert_grouped_by_zone(self, tmp_path: Path) -> None:
+        # an operate external panel must land WITHIN the operate run, not appended past the
+        # Mind block — else the all-view re-emits a duplicate zone divider (L1 LOW-1). Lock
+        # the invariant: every zone forms ONE contiguous run in the layout order.
+        src = _store_with_data(tmp_path)
+        provider = lambda: [{"id": "inbox", "zone": "operate", "title": "Inbox", "lines": []}]  # noqa: E731
+        data = json.loads(build_substrate_json(src, provider))
+        zones = [p["zone"] for p in data["layout"] if p.get("zone")]
+        runs = [z for i, z in enumerate(zones) if i == 0 or zones[i - 1] != z]
+        assert len(runs) == len(set(runs)), f"zones not contiguous (duplicate divider): {zones}"
+        ext = next(p for p in data["layout"] if p.get("kind") == "external")
+        assert ext["zone"] == "operate"
+
+    def test_extra_panels_malformed_return_is_failsoft(self, tmp_path: Path) -> None:
+        # a provider returning a NON-list (int / None / dict / generator) must degrade to no
+        # panels, never raise out of the iteration into the degraded handler path [codex L3 MED].
+        src = _store_with_data(tmp_path)
+        for bad in (lambda: 42, lambda: None, lambda: {"id": "x"}, lambda: (x for x in [1])):  # noqa: E731
+            data = json.loads(build_substrate_json(src, bad))
+            assert not [p for p in data["layout"] if p.get("kind") == "external"]
+            assert data["extra_panels"] == {}
+
+    def test_extra_panels_dedupes_ids_and_coerces_unknown_zone(self, tmp_path: Path) -> None:
+        provider = lambda: [  # noqa: E731
+            {"id": "dup", "zone": "mind", "title": "first", "lines": [{"text": "A"}]},
+            {"id": "dup", "zone": "operate", "title": "second", "lines": [{"text": "B"}]},  # dup → skip
+            {"id": None, "zone": "operate", "title": "nil", "lines": []},   # None id → skip (not "None")
+            {"id": "weird", "zone": "frobnicate", "title": "w", "lines": []},  # unknown zone → operate
+        ]
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+        ext = [p for p in data["layout"] if p.get("kind") == "external"]
+        assert [p["id"] for p in ext].count("dup") == 1                     # dup id deduped [codex MED]
+        assert "None" not in [p["id"] for p in ext]                         # None id skipped, not coerced [codex LOW]
+        assert data["extra_panels"]["dup"]["lines"][0]["text"] == "A"       # FIRST kept, not clobbered
+        assert next(p for p in ext if p["id"] == "weird")["zone"] == "operate"  # unknown zone coerced [codex LOW]
+
+    def test_extra_panels_provider_fault_is_failsoft(self, tmp_path: Path) -> None:
+        # a provider that raises must NOT break /substrate.json — it degrades to no extra panels.
+        def boom():
+            raise RuntimeError("provider down")
+
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), boom))
+        assert not [p for p in data["layout"] if p.get("kind") == "external"]
+        assert data["extra_panels"] == {}
+
+    def test_extra_panels_none_adds_nothing(self, tmp_path: Path) -> None:
+        # the base product (no provider) carries no external panels and no extra_panels key.
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path)))
+        assert not [p for p in data["layout"] if p.get("kind") == "external"]
+        assert "extra_panels" not in data
+
+    def test_make_server_rejects_non_callable_extra_panels(self, tmp_path: Path) -> None:
+        import pytest
+
+        from levain.web_server import make_server
+
+        with pytest.raises(ValueError, match="extra_panels must be a zero-arg callable"):
+            make_server(_store_with_data(tmp_path), port=0, extra_panels=[{"id": "x"}])
+
     def test_writable_flag_tracks_write_scope(self, tmp_path: Path) -> None:
         # The frontend gates every edit affordance on `writable` (NO THEATER). A
         # source with no write_scope (a read-only inspection cockpit, e.g. the flow
@@ -576,7 +649,7 @@ class TestHandlerFaultPath:
         a 500 / dead connection."""
         import levain.web_server as ws
 
-        def boom(_paths):
+        def boom(_paths, _extra_panels=None):  # 2-arg: build_substrate_json gained extra_panels
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(ws, "build_substrate_json", boom)

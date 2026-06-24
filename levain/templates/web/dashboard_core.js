@@ -48,7 +48,7 @@
     }
     if (entry.source) head.appendChild(el("span", "src", entry.source));
     // dense kinds get a ⤢ control in the header → a focused, full-screen re-render
-    // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph/edits don't need it.
+    // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph stay natural-height.
     if (entry.kind && CLAMP_KINDS.has(entry.kind)) head.appendChild(buildExpandBtn(entry));
     p.appendChild(head);
     return p;
@@ -194,7 +194,7 @@
   // reflow), short panels render at natural height (no wasted space, no scrollbar).
   // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
   // details-on-demand (the search box + the Slice-2 modal).
-  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "keep"]);
+  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "keep", "external", "edits"]);
 
   // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
   // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
@@ -230,7 +230,7 @@
     }
   }
 
-  // Per-ITEM overflow scent — the row-level twin of measureOverflow. A clause clamps to 2
+  // Per-ITEM overflow scent — the row-level twin of measureOverflow. A clause clamps to 4
   // lines (CSS); reveal its expand toggle ONLY when the FULL canonical text actually
   // overflows that clamp, so short rows stay clean. Reads layout synchronously (valid for
   // the same reason measureOverflow is — the rows are live in #board / the modal). Skips a
@@ -286,6 +286,7 @@
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
       case "config": return renderConfig(entry, (view.config_docs || [])[entry.ref]);
       case "edits": return renderEdits(entry, view);
+      case "external": return renderExternal(entry, view);
       default: return null;
     }
   }
@@ -463,7 +464,7 @@
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
   // FULL canonical text goes into the DOM via textContent (the wire no longer truncates),
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
-  // CSS clamps the clause to 2 lines; measureClauses reveals the toggle only when it
+  // CSS clamps the clause to 4 lines; measureClauses reveals the toggle only when it
   // overflows; the toggle flips .row-expanded to show all of it inline.
   function appendClause(row, text) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
@@ -1599,6 +1600,37 @@
   // would discard newer ones; that's a Slice-2b time-travel concern). Verb-mediated
   // records (undoable === false) show in the log but get no undo (anneal owns their
   // reversibility). Undo restores that edit's backup via the same commit transport.
+  // A generic READ-ONLY inline panel injected by a downstream through the extra-panel seam.
+  // It is a FIRST-CLASS dashboard panel: "external" is in CLAMP_KINDS, so it gets the SAME
+  // fixed-height + internal scroll + ⤢ expand-to-modal every other box has (no link off the
+  // page — the modal IS the full view). Each line renders as a `.row` with an optional leading
+  // `meta` label + the body as an `appendClause` (clamped to 4 lines with per-item expand —
+  // the episodes/spores idiom), plus an optional `accent` (e.g. unread) / `dim` (e.g. read)
+  // flag. The kernel knows nothing domain-specific — the flow Bridge renders its inbox here.
+  // Every store-derived string is textContent (via el()/appendClause), never innerHTML.
+  function renderExternal(entry, view) {
+    const p = panel(entry);
+    const data = (view.extra_panels || {})[entry.id] || {};
+    if (data.error) {
+      p.appendChild(el("p", "err", "unavailable — " + data.error));
+      return p;
+    }
+    if (data.note) p.appendChild(el("div", "ext-note", data.note));
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+    if (lines.length === 0) {
+      p.appendChild(el("p", "empty", data.empty || "nothing here"));
+      return p;
+    }
+    for (const ln of lines) {
+      const o = ln && typeof ln === "object" ? ln : {};
+      const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
+      if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
+      appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
+      p.appendChild(row);
+    }
+    return p;
+  }
+
   function renderEdits(entry, view) {
     const list = view.recent_edits || [];
     const p = panel(entry);
@@ -1711,9 +1743,11 @@
   // (episodes/spores/crystals/wraps/…) are unique by kind alone. JSON.stringify + a
   // disjoint tag keeps the two key spaces from ever colliding.
   const entryKey = (e) =>
-    e.source
-      ? JSON.stringify(["addr", e.kind, e.source, e.heading || ""])
-      : JSON.stringify(["one", e.kind]);
+    e.kind === "external"
+      ? JSON.stringify(["ext", e.id || ""])   // external panels are id-keyed (N may coexist)
+      : e.source
+        ? JSON.stringify(["addr", e.kind, e.source, e.heading || ""])
+        : JSON.stringify(["one", e.kind]);
 
   function findEntry(view, key) {
     const layout = view && Array.isArray(view.layout) ? view.layout : [];

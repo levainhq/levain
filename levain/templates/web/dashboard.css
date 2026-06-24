@@ -270,6 +270,10 @@
   }
 
   /* ── the board ─────────────────────────────────────────────────────────── */
+  /* default align-items: stretch — every box stretches to its grid-row height, so a row reads
+     as UNIFORM, intentional cards (NOT ragged natural heights). This relies on every dense
+     panel being a CLAMP_KIND (max-height 480 + internal scroll) so no single box blows its row
+     to an extreme height; an unclamped long box would stretch the whole row. */
   .grid { display: grid; gap: 13px; grid-template-columns: minmax(0, 1fr); }
   @media (min-width: 760px) { .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
   @media (min-width: 1180px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
@@ -394,7 +398,7 @@
   .clause { color: var(--dim); font-size: 12px; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
   /* Per-item progressive disclosure. The wire now carries the FULL canonical text (it
      no longer truncates → no data loss on edit, and the whole thing is reachable). A
-     long clause clamps to 2 lines for list density; the per-item toggle expands it to
+     long clause clamps to 4 lines for list density; the per-item toggle expands it to
      full inline. The toggle only appears when the clause actually overflows the clamp
      (measureClauses sets .has-more on the row, mirroring panel-level measureOverflow).
      ONLY clauses routed through appendClause carry .clampable — a bare .clause (a crystal
@@ -458,6 +462,16 @@
   .err { color: var(--hot); font-size: 11.5px; padding: 3px 0; }
   .err::before { content: "▲ "; }
   .empty { color: var(--faint); font-style: italic; font-size: 12px; }
+
+  /* external panels (the downstream extra-panel seam): first-class `.row` panels (clamped +
+     ⤢ modal like every box). A status note on top; each row gets the actionable accent (e.g.
+     unread → operate left-rule) or the dim/inert read state. The body rides the shared
+     .clause/.row machinery, so per-item expand + line-clamp are inherited, not re-invented. */
+  .ext-note { color: var(--dim); font-size: 11px; margin: 2px 0 8px; }
+  .row.ext-accent { border-left: 2px solid var(--operate); padding-left: 9px; }
+  .row.ext-dim .clause { color: var(--dim); }
+  .ext-meta { color: var(--faint); flex: 0 0 auto; font: 700 10px/1.6 var(--label);
+    letter-spacing: .06em; }
 
   /* episode keyword-search (spore-107): the inline read-only search box on the
      episodes panel. Glass aesthetic — a thin mono field that lights to --mind (the
