@@ -240,10 +240,12 @@ def _handle_verb(
         # One verb, three faces by panel (parity with the web): Open Loops "compost" +
         # Tray "dismiss" both pick a resolve kind; Keep "remove" auto-picks 'composted'
         # (else the first kind) with a single confirm and NO picker (web openRemoveConfirm).
-        # KNOWN CAS GAP (codex L3, spore-173): the kind/face is chosen off the SNAPSHOT row;
-        # the server descend has no expect_disposition CAS (unlike ascend's AM-SPORE-CAS), so
-        # a cross-process re-route in the confirm window can resolve a now-live loop. PRE-
-        # EXISTING + parity-equal with the web; the fix is the anneal-side descend CAS (spore-173).
+        # CAS-GUARDED (spore-173): the kind/face is chosen off the SNAPSHOT row, so the
+        # snapshot disposition rides the request as expect_disposition; the server descend
+        # CASes it (anneal AM-SPORE-CAS-DESCEND, parity with ascend), so a cross-process
+        # re-route in the confirm window FAILS CLOSED (verb_failed → re-read) rather than
+        # composting a now-live loop under a Keep-"remove" intent. (s.disposition is the
+        # rendered value; the server normalizes 'loop'→key-absent for the raw compare.)
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
@@ -255,14 +257,18 @@ def _handle_verb(
             if not _confirm(stdscr, f"remove {s.id} from Keep (as '{chosen}')? "
                                     "(recoverable in anneal's resolved set)"):
                 return replace(model, status="cancelled")
-            return _apply(model, source, build_descend_req(s.id, chosen), f"removed {s.id}")
+            return _apply(model, source,
+                          build_descend_req(s.id, chosen, expect_disposition=s.disposition),
+                          f"removed {s.id}")
         word, past = ("dismiss", "dismissed") if pk == "tray" else ("compost", "composted")
         chosen = _choose(stdscr, f"{word} {s.id} as:", list(s.descend_kinds))
         if chosen is None:
             return replace(model, status="cancelled")
         if not _confirm(stdscr, f"{word} {s.id} as '{chosen}'? (recoverable in anneal's resolved set)"):
             return replace(model, status="cancelled")
-        return _apply(model, source, build_descend_req(s.id, chosen), f"{past} {s.id}")
+        return _apply(model, source,
+                      build_descend_req(s.id, chosen, expect_disposition=s.disposition),
+                      f"{past} {s.id}")
 
     if kind == "spore_ascend":
         s = current_row(model)
@@ -346,7 +352,10 @@ def _handle_verb(
         s = current_row(model)
         if s is None:
             return replace(model, status="no loop selected")
-        return _apply(model, source, build_spore_update_req(s.id, tier="parked"),
+        # CAS the snapshot (spore-173): park is offered only on a loop; the snapshot rides the
+        # tier update so a concurrent re-route before the write fails closed (not tier-parks a note).
+        return _apply(model, source,
+                      build_spore_update_req(s.id, tier="parked", expect_disposition=s.disposition),
                       f"parked {s.id} → Keep")
 
     if kind == "spore_to_tray":  # promote a Keep note → the Tray inbox (note→seed)
@@ -364,11 +373,12 @@ def _handle_verb(
             # note → loop: backstopped server-side (set_disposition CASes the disposition).
             return _apply(model, source, build_set_disposition_req(s.id, "loop"),
                           f"activated {s.id} → loop")
-        # parked loop → un-park: KNOWN CAS GAP (codex/complement L3, spore-173) — the note-vs-
-        # parked route is read off the SNAPSHOT, and spore_update{tier} is CAS-free server-side,
-        # so a stale note here accepts tier=warm + reports "reactivated" while staying a note.
-        # Low-probability single-operator; fix = expect_disposition on the tier update (spore-173).
-        return _apply(model, source, build_spore_update_req(s.id, tier="warm"),
+        # parked loop → un-park: CAS-GUARDED (spore-173) — the note-vs-parked route is read off
+        # the SNAPSHOT, so the snapshot disposition rides the tier update as expect_disposition;
+        # a stale note now FAILS CLOSED (verb_failed → re-read) instead of accepting tier=warm +
+        # falsely reporting "reactivated" while it stays a note.
+        return _apply(model, source,
+                      build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition),
                       f"reactivated {s.id} → warm")
 
     if kind == "keep_remind":  # note → Tray seed + future surface, atomically (one CAS)
