@@ -849,6 +849,33 @@ def _audit_verb(
     return edit_id
 
 
+def _normalize_expect_disposition(value: Any) -> str | None:
+    """Map a client SNAPSHOT disposition (the rendered row's value) → anneal's RAW
+    compare-and-set value. A plain loop RENDERS as ``LOOP_DISPOSITION`` ('loop') but is
+    STORED key-absent (``None``), so 'loop'/null/'' → ``None``; an operator-I/O tag passes
+    through. Mirrors ``anneal_disposition = None if d == LOOP_DISPOSITION else d`` in
+    ``_apply_spore_set_disposition`` — one translation point so the wire→store mapping can't
+    drift. The CALLER owns PRESENCE: it threads the CAS ONLY when the request carries a
+    snapshot (``"expect_disposition" in req``); absent ⇒ no CAS (back-compat for callers that
+    don't render-snapshot, e.g. the flow CLI, which is already single-flock-atomic).
+
+    PRECONDITION (the loop sentinel is KEY-ABSENT, owned by THIS vocabulary layer — anneal
+    stays blind to the taxonomy): every governed writer clears ``loop``→``None`` at write time
+    (``_apply_spore_seed`` refuses it; ``_apply_spore_set_disposition`` maps it), so the store
+    never holds a literal ``'loop'`` string. A raw-anneal-API caller that BYPASSES this layer and
+    stores ``'loop'`` verbatim would make this mapping (``'loop'``→``None``) mismatch the raw
+    stored ``'loop'`` → the CAS fails CLOSED (a false REJECT on a valid loop, the safe direction;
+    never a false match). [L3 converged LOW: codex/complement/nemotron, spore-173.]"""
+    if value in (None, "", LOOP_DISPOSITION):
+        return None
+    if not isinstance(value, str):
+        raise EditError(
+            "bad_verb_arg", 422,
+            f"expect_disposition must be a string or null (got {value!r})",
+        )
+    return value
+
+
 def _apply_spore_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
     verb: Literal["touch", "descend", "ascend"],
@@ -858,7 +885,14 @@ def _apply_spore_verb(
     resolving verbs are destructive (the loop leaves the open set) → confirm-gated
     and carry a ``kind`` anneal validates against the spore's type; ``ascend`` also
     requires a ``ref`` (what the loop became). anneal owns the validation + the
-    atomic write (its own ``_transaction`` flock); this records the audit entry."""
+    atomic write (its own ``_transaction`` flock); this records the audit entry.
+
+    Both resolving verbs CAS the disposition against the operator's render-time SNAPSHOT
+    (spore-173): ``ascend`` reads it server-side for its own ``is_note`` refusal gate (so a
+    server-fresh read is correct — the gate asks "can this CURRENTLY ascend"); ``descend``
+    has NO server gate (any disposition descends — it's how Keep "remove", Tray "dismiss",
+    and loop "compost" all work), so its kind/FACE is chosen client-side off the rendered
+    snapshot, and the CAS must verify THAT snapshot (an absent key ⇒ no CAS, back-compat)."""
     from anneal_memory.spores import SporeError, SporeStore  # lazy
 
     spore_id = _require_str(req, "spore_id")
@@ -887,6 +921,13 @@ def _apply_spore_verb(
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
+    # The descend CAS uses the CLIENT render-time SNAPSHOT (spore-173) — validated + normalized up
+    # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
+    # absent key ⇒ no CAS (back-compat). Hoisted so the audit trail can record it too [L1 #5].
+    descend_has_snapshot = verb == "descend" and "expect_disposition" in req
+    descend_expect = (
+        _normalize_expect_disposition(req["expect_disposition"]) if descend_has_snapshot else None
+    )
     if verb == "ascend":
         # A note is durable operator REFERENCE, not a prospective loop that BECAME memory —
         # ascending it would falsely claim reference material as the entity's own graduated
@@ -912,7 +953,16 @@ def _apply_spore_verb(
             store.touch(spore_id)
         elif verb == "descend":
             assert spore_kind is not None  # set in the descend validation branch above
-            store.descend(spore_id, kind=spore_kind)
+            # CAS the operator's render-time SNAPSHOT disposition (the resolve FACE — Keep
+            # "remove" vs Tray "dismiss" vs loop "compost" — was chosen against it client-side):
+            # a cross-process re-route in the render→confirm→resolve window now FAILS CLOSED
+            # rather than compost a now-live loop under a Keep-"remove" intent [codex L3 HIGH,
+            # spore-173]. The snapshot must be the CLIENT's (a server-fresh read would already
+            # reflect the re-route and pass vacuously). Absent key ⇒ no CAS (back-compat).
+            descend_kwargs: dict[str, Any] = {"kind": spore_kind}
+            if descend_has_snapshot:
+                descend_kwargs["expect_disposition"] = descend_expect
+            store.descend(spore_id, **descend_kwargs)
         else:  # ascend
             assert spore_kind is not None and ref is not None  # set in the ascend branch
             # expect_disposition = the (non-note) value we just read → fail-closed if a
@@ -932,6 +982,14 @@ def _apply_spore_verb(
         extra["verb_kind"] = spore_kind
     if ref is not None:
         extra["ref"] = ref
+    # Record the disposition that was RESOLVED — the forensic "which Keep note / Tray item / loop
+    # did this remove" the sibling set_disposition audit already keeps [L1 #5]. descend: the client
+    # snapshot (present when the surface render-snapshots); ascend: the server-read value. Normalize
+    # None→LOOP_DISPOSITION for a readable trail (matches set_disposition's `prior_disposition`).
+    if verb == "ascend":
+        extra["prior_disposition"] = ascend_expect or LOOP_DISPOSITION
+    elif descend_has_snapshot:
+        extra["prior_disposition"] = descend_expect or LOOP_DISPOSITION
     edit_id = _audit_verb(
         scope.ledger_root, kind=f"spore_{verb}", action=verb,
         target=f"spore:{spore_id}", now=now, extra=extra,
@@ -1290,11 +1348,36 @@ def _apply_spore_update(
         kwargs["type"] = new_type
     if has_tier:
         kwargs["tier"] = new_tier
-    # CAS only when the type gate is in play — a text/tier-only edit is disposition-
-    # independent, so guarding it on the disposition would spuriously reject under a benign
-    # concurrent re-route. The reclassify, whose gate read the disposition, must be sound.
+    # CAS the disposition when a disposition-DEPENDENT decision is in play:
+    #  - ``type`` (reclassify): the gate ("plastic only while forming") read the disposition
+    #    SERVER-side just above, so CAS the server-read ``prior_raw`` — closes the server's own
+    #    get→update window (the gate re-evaluates fresh, so the client snapshot isn't needed).
+    #  - ``tier`` (park / un-park): the ROUTE (park a loop vs un-park a parked LOOP, as opposed
+    #    to promoting a NOTE) is chosen client-side off the rendered SNAPSHOT; with no CAS,
+    #    tier=warm lands on a now-NOTE and reports "reactivated" while it stays a note [codex MED
+    #    + complement MED-1, spore-173]. CAS the CLIENT snapshot (a server-fresh read would pass
+    #    vacuously). anneal.update already supports the param — no anneal change for this half.
+    # A text-only edit is disposition-independent → no CAS (a benign concurrent re-route mustn't
+    # spuriously reject a text refine). Absent snapshot on a tier edit ⇒ no CAS (back-compat).
+    client_snapshot_present = "expect_disposition" in req
+    client_snapshot = (
+        _normalize_expect_disposition(req["expect_disposition"]) if client_snapshot_present else None
+    )
     if has_type:
         kwargs["expect_disposition"] = prior_raw
+        # Combined type+tier edit (no surface emits one — type-only reclassify vs tier-only park).
+        # The type gate CASes the server-read prior_raw, which closes the read→write window for
+        # BOTH fields; but a client tier-snapshot would otherwise be silently dropped, leaving the
+        # tier route's render→submit window unguarded [L1/L2 #4]. If a snapshot was sent and
+        # disagrees with the server read, a re-route already happened → fail closed, don't half-guard.
+        if has_tier and client_snapshot_present and client_snapshot != prior_raw:
+            raise EditError(
+                "verb_failed", 422,
+                f"disposition changed since read (expected {client_snapshot!r}, "
+                f"found {prior_raw!r}); re-read the spore and retry.",
+            )
+    elif has_tier and client_snapshot_present:
+        kwargs["expect_disposition"] = client_snapshot
     try:
         store.update(spore_id, **kwargs)
     except ValueError as exc:  # anneal arg validation

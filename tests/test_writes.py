@@ -847,6 +847,62 @@ class TestSporeVerbs:
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
         assert any(s["id"] == sid for s in _spore_store(install).list_open()), "rejected → still open"
 
+    # -- descend expect_disposition CAS (spore-173): the resolve FACE (compost/dismiss/remove) is
+    # -- chosen CLIENT-side off the rendered SNAPSHOT, so the snapshot rides the request; a mismatch
+    # -- fails closed. Unlike ascend (which reads the disposition server-side for its is_note gate),
+    # -- descend has NO server gate, so the client snapshot is the only guard — a direct mismatch
+    # -- IS the test (no need to fake a concurrent flip; the stale snapshot is the stale state).
+    def test_descend_expect_disposition_match_composts(self, install: Path) -> None:
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
+            "confirm": True, "expect_disposition": "note"})  # snapshot matches → removes
+        assert res["ok"]
+        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+
+    def test_descend_expect_disposition_mismatch_fails_closed(self, install: Path) -> None:
+        # the operator rendered this as a Keep note + chose "remove" (expect "note"), but it is a
+        # live loop now — the CAS must refuse so a live cognition loop isn't composted as a note.
+        sid = _add_spore(install)  # a plain key-free loop (no disposition)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+                "confirm": True, "expect_disposition": "note"})  # stale snapshot
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert "changed since read" in str(ei.value)
+        assert any(s["id"] == sid for s in _spore_store(install).list_open())  # NOT composted
+
+    def test_descend_loop_snapshot_normalizes_to_key_absent(self, install: Path) -> None:
+        # a plain loop RENDERS as 'loop' but is stored key-absent — the server maps 'loop'→None so
+        # a real loop's snapshot matches (no spurious CAS failure on the common compost path).
+        sid = _add_spore(install)  # key-free loop
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+            "confirm": True, "expect_disposition": "loop"})
+        assert res["ok"]
+        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+
+    def test_descend_without_expect_disposition_skips_cas(self, install: Path) -> None:
+        # back-compat: a caller that doesn't render-snapshot (omits the key) gets no CAS — the flow
+        # CLI, which is already single-flock-atomic, descends through anneal without the param.
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
+        assert res["ok"]
+        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+
+    def test_descend_expect_disposition_non_string_rejected(self, install: Path) -> None:
+        # a non-string/null snapshot is a client bug → reject loud BEFORE the store, fail-closed.
+        sid = _add_spore(install)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+                "confirm": True, "expect_disposition": 42})
+        assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+        assert any(s["id"] == sid for s in _spore_store(install).list_open())  # untouched
+
     def test_ascend_requires_ref(self, install: Path) -> None:
         sid = _add_spore(install)
         with pytest.raises(EditError) as ei:
@@ -1485,6 +1541,81 @@ class TestSporeUpdate:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "bogus"})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
+
+    # -- tier expect_disposition CAS (spore-173): park/un-park's ROUTE is chosen CLIENT-side off the
+    # -- rendered snapshot (note→loop via set_disposition vs parked-loop→un-park via tier=warm), so
+    # -- a tier edit threads the snapshot; a mismatch fails closed instead of tier-warming a note.
+    def test_retier_expect_disposition_match_unparks(self, install: Path) -> None:
+        sid = _add_spore(install, tier="parked")  # a parked plain loop → snapshot 'loop'
+        res = apply_edit(_scope(install), {
+            "kind": "spore_update", "spore_id": sid, "tier": "warm", "expect_disposition": "loop"})
+        assert res["ok"] and _spore_store(install).get(sid)["tier"] == "warm"
+
+    def test_retier_expect_disposition_mismatch_fails_closed(self, install: Path) -> None:
+        # the operator saw a parked LOOP + clicked "reactivate" (expect 'loop'), but it's a NOTE
+        # now — without the CAS, tier=warm lands on the note + falsely reports "reactivated". The
+        # note carries a DISTINCTIVE tier ('cold') so the no-write is provable (a seeded note would
+        # default to 'warm', masking the failure).
+        nid = _add_spore(install, disposition="note", tier="cold")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_update", "spore_id": nid, "tier": "warm",
+                "expect_disposition": "loop"})  # stale snapshot
+        assert ei.value.code == "verb_failed" and ei.value.http_status == 422
+        assert "changed since read" in str(ei.value)
+        rec = _spore_store(install).get(nid)
+        assert rec["disposition"] == "note" and rec["tier"] == "cold"  # untouched, still a cold note
+
+    def test_retier_without_expect_disposition_skips_cas(self, install: Path) -> None:
+        # back-compat: a tier edit with no snapshot gets no CAS (the original park/un-park path).
+        sid = _add_spore(install, tier="parked")
+        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
+        assert res["ok"] and _spore_store(install).get(sid)["tier"] == "warm"
+
+    def test_text_only_ignores_a_mismatched_expect_disposition(self, install: Path) -> None:
+        # a text edit is disposition-INDEPENDENT → even a mismatched snapshot must NOT CAS-reject;
+        # only the tier path threads the snapshot (the type path CASes its own server-read value).
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "x", "disposition": "handoff"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_update", "spore_id": sid, "text": "edited",
+            "expect_disposition": "seed"})  # mismatched, but text-only → ignored, no CAS
+        assert res["ok"] and _spore_store(install).get(sid)["text"] == "edited"
+
+    def test_combined_type_tier_edit_consistency_guard(self, install: Path) -> None:
+        # L1/L2 #4: no surface emits a combined type+tier edit, but the seam must be sound. The type
+        # gate CASes the server-read disposition; a client tier-snapshot that DISAGREES means a
+        # re-route already happened → fail closed (don't silently leave the tier route unguarded).
+        sid = apply_edit(_scope(install), {  # a forming seed (is_tray → type is reclassifiable)
+            "kind": "spore_seed", "text": "x", "disposition": "seed"})["spore_id"]
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "spore_update", "spore_id": sid, "type": "task", "tier": "warm",
+                "expect_disposition": "loop"})  # snapshot disagrees with the server-read "seed"
+        assert ei.value.code == "verb_failed" and "changed since read" in str(ei.value)
+        rec = _spore_store(install).get(sid)
+        assert rec["type"] == "thought" and rec["disposition"] == "seed"  # fail-closed: untouched
+
+    def test_combined_type_tier_edit_matching_snapshot_applies(self, install: Path) -> None:
+        # the agreeing combined case: snapshot == server-read → one CAS covers both fields, applies.
+        sid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "x", "disposition": "seed"})["spore_id"]
+        res = apply_edit(_scope(install), {
+            "kind": "spore_update", "spore_id": sid, "type": "task", "tier": "hot",
+            "expect_disposition": "seed"})
+        assert res["ok"]
+        rec = _spore_store(install).get(sid)
+        assert rec["type"] == "task" and rec["tier"] == "hot"
+
+    def test_descend_audit_records_resolved_disposition(self, install: Path) -> None:
+        # L1 #5: the forensic trail records WHICH disposition was resolved (the snapshot, normalized
+        # None→'loop'), mirroring set_disposition's prior_disposition.
+        nid = apply_edit(_scope(install), {
+            "kind": "spore_seed", "text": "ref", "disposition": "note"})["spore_id"]
+        apply_edit(_scope(install), {
+            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
+            "confirm": True, "expect_disposition": "note"})
+        assert recent_edits(install / ".levain")[0]["prior_disposition"] == "note"
 
     def test_text_only_edit_not_cas_rejected_by_concurrent_reroute(self, install: Path, monkeypatch) -> None:
         # a text-only edit is disposition-independent → it must NOT be CAS-rejected when the

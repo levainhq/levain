@@ -324,13 +324,22 @@ def build_touch_req(spore_id: str) -> dict[str, Any]:
     return {"kind": "spore_touch", "spore_id": spore_id}
 
 
-def build_descend_req(spore_id: str, spore_kind: str) -> dict[str, Any]:
-    return {
+def build_descend_req(
+    spore_id: str, spore_kind: str, *, expect_disposition: Any = _UNSET
+) -> dict[str, Any]:
+    """Compost/dismiss/remove a spore. ``expect_disposition`` (when supplied) carries the
+    rendered row's SNAPSHOT disposition — the resolve FACE was chosen against it, so the
+    server CASes it and a concurrent re-route in the confirm window fails closed (spore-173).
+    OMITTED ⇒ no CAS (the server's anneal default)."""
+    req: dict[str, Any] = {
         "kind": "spore_descend",
         "spore_id": spore_id,
         "spore_kind": spore_kind,
         "confirm": True,
     }
+    if expect_disposition is not _UNSET:
+        req["expect_disposition"] = expect_disposition
+    return req
 
 
 def build_ascend_req(spore_id: str, spore_kind: str, ref: str) -> dict[str, Any]:
@@ -384,12 +393,18 @@ def build_surface_at_req(spore_id: str, surface_at: str | None) -> dict[str, Any
 def build_spore_update_req(
     spore_id: str, *, text: str | None = None,
     spore_type: str | None = None, tier: str | None = None,
+    expect_disposition: Any = _UNSET,
 ) -> dict[str, Any]:
     """The forming-workbench metadata edit: refine ``text``, reclassify ``type`` (only
     while a Tray item is forming — locked once it metabolizes), or re-``tier`` (park a
     loop → ``parked``, un-park a Keep loop → ``warm``). At least one field; all
     non-destructive (reversible by re-edit) → no confirm. ``type`` is sent under the
-    wire key ``type`` (named ``spore_type`` here to avoid shadowing the builtin)."""
+    wire key ``type`` (named ``spore_type`` here to avoid shadowing the builtin).
+
+    ``expect_disposition`` (when supplied) carries the rendered row's SNAPSHOT disposition
+    for a TIER edit — park/un-park's route was chosen against it, so the server CASes it and
+    a concurrent re-route in the render→submit window fails closed (spore-173). OMITTED ⇒ no
+    CAS (a text-only refine is disposition-independent; the type path CASes server-side)."""
     req: dict[str, Any] = {"kind": "spore_update", "spore_id": spore_id}
     if text is not None:
         req["text"] = text
@@ -397,6 +412,8 @@ def build_spore_update_req(
         req["type"] = spore_type
     if tier is not None:
         req["tier"] = tier
+    if expect_disposition is not _UNSET:
+        req["expect_disposition"] = expect_disposition
     return req
 
 

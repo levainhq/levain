@@ -1236,7 +1236,11 @@
       } else {
         wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
           const b = ev.currentTarget; b.disabled = true;
-          const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm" });
+          // spore-173: the note-vs-parked-loop route was read off the rendered snapshot → CAS it,
+          // so a concurrent re-route to a note fails closed instead of tier=warm-ing a note and
+          // falsely reporting "reactivated". (Server normalizes 'loop'→key-absent for the compare.)
+          const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm",
+                                     expect_disposition: s.disposition });
           if (res && res.ok) return;  // re-rendered
           b.disabled = false;
           verbErr(wrap, res);
@@ -1264,7 +1268,10 @@
     // isn't resolved — that's why this is NOT a compost/descend kind), so no confirm.
     wrap.appendChild(verbBtn("park", "pin to Keep — hide from cognition, stays open (un-park to restore)", async (ev) => {
       const b = ev.currentTarget; b.disabled = true;
-      const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked" });
+      // spore-173: park is offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
+      // concurrent re-route before the write fails closed instead of tier-parking a now-note.
+      const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked",
+                                 expect_disposition: s.disposition });
       if (res && res.ok) return;  // re-rendered
       b.disabled = false;
       verbErr(wrap, res);
@@ -1402,7 +1409,10 @@
     openRowForm(host, () => ({ nodes: [], focus: null }),
       (_f, msg) => {
         if (!kind) { msg.className = "edit-msg err"; msg.textContent = "no remove path"; return null; }
-        return { kind: "spore_descend", spore_id: s.id, spore_kind: kind, confirm: true };
+        // spore-173: CAS the rendered snapshot — a concurrent promote of this Keep item to a live
+        // loop during the confirm fails closed instead of composting the now-live loop.
+        return { kind: "spore_descend", spore_id: s.id, spore_kind: kind, confirm: true,
+                 expect_disposition: s.disposition };
       }, "confirm remove", true);
   }
 
@@ -1527,6 +1537,10 @@
     });
     go.addEventListener("click", async () => {
       const req = { kind: kind, spore_id: s.id, spore_kind: sel.value, confirm: true };
+      // spore-173: a DESCEND's face (compost/dismiss) was chosen off the rendered snapshot → CAS
+      // that snapshot so a concurrent re-route in the confirm window fails closed. ASCEND keeps
+      // its own server-read CAS (its is_note gate reads fresh) — don't double-guard with a snapshot.
+      if (kind === "spore_descend") req.expect_disposition = s.disposition;
       if (needsRef) {
         const ref = refInput.value.trim();
         if (!ref) { msg.className = "edit-msg err"; msg.textContent = "a ref is required"; return; }

@@ -50,7 +50,11 @@ dependencies = [
     # `>=0.9.4` (AM-SPORE-CAS): the KEEP-NOTE LIFECYCLE's `_apply_spore_verb` ascend guard now
     # passes `expect_disposition` to `SporeStore.ascend` (the ascend CAS added in 0.9.4) — same
     # version-gated contract: an older anneal lacks the param and would TypeError, not refuse.
-    "anneal-memory>=0.9.4,<0.10",
+    # `>=0.9.5` (AM-SPORE-CAS-DESCEND, spore-173): `_apply_spore_verb`'s descend branch now passes
+    # `expect_disposition` to `SporeStore.descend` (the descend CAS added in 0.9.5). Same contract —
+    # 0.9.4's `descend` has no such param, so the first compost/dismiss/remove would TypeError, not
+    # refuse cleanly. (The tier CAS rides `update`'s expect_disposition, present since 0.9.1.)
+    "anneal-memory>=0.9.5,<0.10",
 ]
 
 [project.optional-dependencies]

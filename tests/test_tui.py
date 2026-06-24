@@ -321,6 +321,14 @@ def test_build_descend_req_carries_confirm_and_kind():
     assert r == {"kind": "spore_descend", "spore_id": "s1", "spore_kind": "done", "confirm": True}
 
 
+def test_build_descend_req_threads_snapshot_when_given():
+    # spore-173: the rendered snapshot rides as expect_disposition when supplied; OMITTED ⇒ absent
+    # (the server's anneal _UNSET default → no CAS), so the back-compat shape stays exactly as above.
+    assert "expect_disposition" not in tui.build_descend_req("s1", "done")
+    r = tui.build_descend_req("s1", "composted", expect_disposition="note")
+    assert r["expect_disposition"] == "note" and r["spore_kind"] == "composted"
+
+
 def test_build_ascend_req_carries_ref():
     r = tui.build_ascend_req("s1", "pattern", "thinness")
     assert r["kind"] == "spore_ascend" and r["ref"] == "thinness" and r["confirm"] is True
@@ -656,6 +664,12 @@ def test_build_spore_update_req_threads_only_given_fields():
     }
     # `spore_type` maps to the wire key `type` (kwarg renamed to avoid shadowing the builtin)
     assert tui.build_spore_update_req("spore-1", spore_type="task")["type"] == "task"
+    # spore-173: a tier edit threads the rendered snapshot as expect_disposition when supplied;
+    # OMITTED ⇒ absent (no CAS — the server's anneal default), so the prior shapes are unchanged.
+    assert "expect_disposition" not in tui.build_spore_update_req("spore-1", tier="warm")
+    assert tui.build_spore_update_req("spore-1", tier="warm", expect_disposition="loop") == {
+        "kind": "spore_update", "spore_id": "spore-1", "tier": "warm", "expect_disposition": "loop",
+    }
 
 
 # --- current_row: the unified selector over the three spore projections -----
@@ -754,11 +768,14 @@ def test_handle_verb_keep_activate_dispatches_by_row_type(monkeypatch):
     vnote = SubstrateView(paths=p, keep=[_spore("spore-n", disposition="note")])
     _tui_curses._handle_verb(None, _model_on(vnote, "keep", read_only=False), None, verb)
     assert cap["req"] == {"kind": "spore_set_disposition", "spore_id": "spore-n", "disposition": "loop"}
-    # a parked LOOP → un-park (spore_update{tier:warm}) — the SAME key, different op
+    # a parked LOOP → un-park (spore_update{tier:warm}) — the SAME key, different op. The
+    # rendered snapshot ('loop' — a parked plain loop) rides as expect_disposition (spore-173):
+    # a concurrent re-route to a note now fails closed server-side instead of tier-warming a note.
     cap.clear()
     vpark = SubstrateView(paths=p, keep=[_spore("spore-p", tier="parked")])
     _tui_curses._handle_verb(None, _model_on(vpark, "keep", read_only=False), None, verb)
-    assert cap["req"] == {"kind": "spore_update", "spore_id": "spore-p", "tier": "warm"}
+    assert cap["req"] == {"kind": "spore_update", "spore_id": "spore-p", "tier": "warm",
+                          "expect_disposition": "loop"}
 
 
 def test_handle_verb_descend_is_panel_aware(monkeypatch):
@@ -767,19 +784,23 @@ def test_handle_verb_descend_is_panel_aware(monkeypatch):
     monkeypatch.setattr(_tui_curses, "_confirm", lambda stdscr, msg: True)
     monkeypatch.setattr(_tui_curses, "_choose", lambda stdscr, label, opts: opts[0])
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    # Open Loops: a kind picker (_choose → first), then confirm
+    # Open Loops: a kind picker (_choose → first), then confirm. The rendered snapshot ('loop')
+    # rides as expect_disposition (spore-173) so the descend CASes it — a concurrent re-route in
+    # the confirm window fails closed instead of composting a now-different spore.
     vlo = SubstrateView(paths=p, open_spores=[_spore("spore-1", descend_kinds=["done", "dropped"])])
     _tui_curses._handle_verb(None, _model_on(vlo, "spores", read_only=False), None,
                              _verb_of("spores", "spore_descend"))
     assert cap["req"] == {"kind": "spore_descend", "spore_id": "spore-1",
-                          "spore_kind": "done", "confirm": True}
-    # Keep "remove": NO picker — auto-picks 'composted' over the first kind ('done')
+                          "spore_kind": "done", "confirm": True, "expect_disposition": "loop"}
+    # Keep "remove": NO picker — auto-picks 'composted' over the first kind ('done'); the note
+    # snapshot rides so removing it CASes 'note' (a concurrent promote→loop fails closed).
     cap.clear()
     vk = SubstrateView(paths=p, keep=[_spore("spore-k", disposition="note",
                                              descend_kinds=["done", "composted"])])
     _tui_curses._handle_verb(None, _model_on(vk, "keep", read_only=False), None,
                              _verb_of("keep", "spore_descend"))
-    assert cap["req"]["kind"] == "spore_descend" and cap["req"]["spore_kind"] == "composted"
+    assert (cap["req"]["kind"] == "spore_descend" and cap["req"]["spore_kind"] == "composted"
+            and cap["req"]["expect_disposition"] == "note")
 
 
 def test_handle_verb_schedule_dash_clears_the_alarm(monkeypatch):
