@@ -68,6 +68,7 @@ Sovereignty boundary (load-bearing, not incidental):
 
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
 import sys
@@ -121,6 +122,16 @@ _MAX_INFLIGHT = 8
 # ``same-site``, or even ``none`` (a top-level navigation, which can't carry a JSON
 # POST anyway) — is an unexpected/hostile origin and is refused.
 _WRITE_SEC_FETCH_ALLOWED = "same-origin"
+
+# The OFF-BOX write governance factor (spore-129). The no-token rule above is for the
+# LOCALHOST-SOVEREIGN seat: when the surface is bound to loopback, the bind IS the auth and
+# a token there is theater (principle #6). But the MOMENT a writable surface binds an
+# off-loopback (private-mesh / Tailscale) address, loopback-is-auth no longer holds — so a
+# write MUST then carry a shared token the device holds, in this header, constant-time
+# compared against the token ``make_server`` was given. This is NOT a seat-layer password;
+# it is the factor that replaces loopback when the write surface leaves the machine.
+# Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
+_WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 
 # The page only ever loads its own same-origin scripts + stylesheet and fetches its
 # own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
@@ -200,6 +211,26 @@ def _rejected_bind_host(host: str) -> str | None:
         return "a public/global IP would expose the substrate to the internet"
     return None
 
+
+def _is_install_bearing(source: SubstrateSource) -> bool:
+    """True if the source carries operator-private seed/config that must stay loopback-only.
+
+    Checks BOTH install_root fields, because they can DIVERGE and the write path keys off the
+    WRITE_SCOPE's, not the source's: ``writes._require_install_root`` gates a config/seed/
+    entity_name edit on ``scope.install_root`` (= ``source.write_scope.install_root``), while
+    the old bind guard only consulted ``source.install_root`` [L1 + codex L3]. So a source with
+    ``install_root=None`` but a ``write_scope`` whose ``install_root`` is set would slip past a
+    source-only guard and serve operator-private seed WRITES off-box. A write_scope whose
+    install_root can't be proven None is treated as install-bearing (fail-closed)."""
+    if source.install_root is not None:
+        return True
+    ws = source.write_scope
+    if ws is None:
+        return False
+    # getattr default True (a non-None sentinel) → a write_scope MISSING the attr is treated as
+    # install-bearing (the safe direction), never silently as no-install.
+    return getattr(ws, "install_root", True) is not None
+
 # The static assets, by request path → (package-data filename, content-type).
 # An explicit allowlist: there is no path → filesystem mapping anywhere, so a
 # crafted path cannot escape this set.
@@ -239,6 +270,8 @@ def load_web_asset(filename: str) -> str:
 def build_substrate_json(
     source: SubstrateSource,
     extra_panels: "Callable[[], list[dict]] | None" = None,
+    *,
+    write_token_required: bool = False,
 ) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
@@ -264,6 +297,13 @@ def build_substrate_json(
     # silently clobbered (caught in tests, never in prod — complement L3).
     assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
     payload["writable"] = source.write_scope is not None
+    # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
+    # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
+    # It tells the frontend to attach the device-held token; on a loopback-bound (or read-only)
+    # surface it stays false and the localhost-sovereign token-free path is unchanged. The
+    # handler computes the predicate (it owns the bound-address fact); default False here.
+    assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
+    payload["write_token_required"] = write_token_required
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
     # full panel descriptors+data; split each into a layout entry (kind:"external") + its data
     # under payload["extra_panels"][id], so the frontend renders them inline among the substrate
@@ -360,6 +400,12 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
+    # OFF-BOX write auth (spore-129). ``is_loopback_bind`` is computed from the ACTUAL bound
+    # address (un-foolable) and gates whether POST /edit requires a token. ``write_token`` is
+    # the shared secret an off-loopback writable surface demands; None on a loopback-bound or
+    # read-only server (then the token check is skipped — the localhost path stays token-free).
+    is_loopback_bind: bool
+    write_token: str | None
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
     # cached static bytes (ungated, like levain_assets); extra_json are per-request
@@ -448,6 +494,16 @@ class _Handler(BaseHTTPRequestHandler):
         hostname = hostname.rstrip(".").lower()
         return hostname in self.server.allowed_hosts
 
+    def _write_token_required(self) -> bool:
+        """True iff a write to this surface must carry ``X-Levain-Write-Token`` — i.e. the
+        surface is writable AND bound off-loopback (spore-129). Mirrors do_POST's gate
+        EXACTLY (off-loopback ⟹ token required) so the frontend signal can never disagree
+        with the server's actual enforcement. Loopback-bound or read-only → False."""
+        return (
+            not self.server.is_loopback_bind
+            and self.server.levain_source.write_scope is not None
+        )
+
     def _route(self, *, head: bool) -> None:
         if not self._host_ok():
             self._send(
@@ -479,7 +535,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 body = build_substrate_json(
-                    self.server.levain_source, self.server.extra_panels)
+                    self.server.levain_source, self.server.extra_panels,
+                    write_token_required=self._write_token_required())
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
@@ -491,6 +548,7 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.dumps({
                     "paths": {},
                     "writable": self.server.levain_source.write_scope is not None,
+                    "write_token_required": self._write_token_required(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:
@@ -621,6 +679,22 @@ class _Handler(BaseHTTPRequestHandler):
         sfs = self.headers.get("Sec-Fetch-Site")
         if sfs is not None and sfs != _WRITE_SEC_FETCH_ALLOWED:
             return self._reject(403, "forbidden", "cross-origin write refused")
+        # OFF-BOX write governance factor (spore-129): when this surface is bound off-loopback,
+        # loopback-is-auth no longer holds, so the write MUST carry the shared device-held token.
+        # Constant-time compare against the token make_server was given. Fail CLOSED if the
+        # server is off-loopback yet somehow has no token (make_server refuses to bind a writable
+        # off-loopback source WITHOUT one, so reaching here token-less is defense-in-depth). A
+        # loopback bind skips this entirely — the localhost-sovereign token-free path is unchanged.
+        # The gate also requires write_scope (writability): a READ-ONLY off-box surface has no
+        # write path, so it falls through to the 422 'read_only' refusal below (NOT a token-403)
+        # — which keeps this gate MIRRORING `_write_token_required` exactly [codex L3 LOW].
+        if not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None:
+            expected = self.server.write_token or ""
+            supplied = self.headers.get(_WRITE_TOKEN_HEADER, "")
+            if not expected or not hmac.compare_digest(
+                supplied.encode("utf-8"), expected.encode("utf-8")
+            ):
+                return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
         ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -705,6 +779,7 @@ def make_server(
     extra_assets: Mapping[str, tuple[str, bytes]] | None = None,
     extra_json: Mapping[str, Callable[[], bytes]] | None = None,
     extra_panels: "Callable[[], list[dict]] | None" = None,
+    write_token: str | None = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -733,15 +808,19 @@ def make_server(
     appears in BOTH mappings raises ``ValueError`` (a registration-time packaging bug,
     surfaced loud — never a silent shadow of the dashboard or the write route).
 
-    Non-loopback binding (a LAN / Tailscale IP) is allowed ONLY for a READ-ONLY,
-    NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` — e.g. flow's
-    self-ops cockpit over a bare anneal store): the write route 422s (no unauthenticated
-    WRITE surface) and there is no seed/config (operator-profile) data to expose, so the
-    private mesh (e.g. Tailscale's WireGuard) is the access boundary. A WRITABLE source
-    (its no-token localhost-sovereign write auth assumes loopback) OR an install-bearing
-    source (its seed/config is operator-private — kept local, matching the pre-WriteScope
-    boundary that gated on install presence) stays loopback-only. Raises ``ValueError``
-    (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
+    Non-loopback binding (a LAN / Tailscale IP) is governed by the source's nature:
+    - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
+      e.g. flow's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
+      route 422s and there is no seed/config to expose, so the private mesh (Tailscale's
+      WireGuard) is the access boundary;
+    - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
+      off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
+      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no token
+      (the localhost-sovereign path is unchanged). Without a token a writable source stays
+      loopback-only;
+    - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
+      operator-private; a token does not relax this — a different concern than spore-129).
+    Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -750,17 +829,29 @@ def make_server(
             f"refusing to bind {host!r}: {reason}. Pass a SPECIFIC private interface "
             "IP (e.g. your Tailscale IP), not a wildcard or a public address."
         )
-    if not _is_loopback_host(host) and (
-        source.write_scope is not None or source.install_root is not None
-    ):
-        raise ValueError(
-            f"refusing to bind {host!r}: a WRITABLE or install-bearing substrate is "
-            "loopback-only (127.0.0.1 / localhost). A writable source's no-token "
-            "localhost-sovereign write boundary (POST /edit) assumes loopback; an "
-            "install-bearing source's seed/config is operator-private. Only a READ-ONLY, "
-            "NO-INSTALL source (no write_scope, no install_root) MAY bind a non-loopback "
-            "address — e.g. a Tailscale IP — for private-mesh access."
-        )
+    if not _is_loopback_host(host):
+        # An INSTALL-bearing source is loopback-only UNCONDITIONALLY — its seed/config is
+        # operator-private (matching the pre-WriteScope boundary that gated on install
+        # presence). A token does NOT relax this; it is a different concern than spore-129.
+        # _is_install_bearing checks BOTH install_root fields (source + write_scope) — they can
+        # diverge and the write path keys off the write_scope's [L1 + codex L3].
+        if _is_install_bearing(source):
+            raise ValueError(
+                f"refusing to bind {host!r}: an install-bearing substrate is loopback-only "
+                "(127.0.0.1 / localhost) — its seed/config is operator-private. Only a "
+                "NO-INSTALL source MAY bind a non-loopback address for private-mesh access."
+            )
+        # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
+        # the off-box governance factor that replaces loopback-is-auth. Without one it stays
+        # loopback-only (its no-token localhost-sovereign POST /edit boundary assumes loopback).
+        if source.write_scope is not None and write_token is None:
+            raise ValueError(
+                f"refusing to bind {host!r}: a WRITABLE substrate may bind a non-loopback "
+                "(private-mesh / Tailscale) address ONLY with a write_token — the off-box "
+                "governance factor that replaces the loopback bind as the write auth. Pass "
+                "write_token=<shared secret the device holds>, or bind loopback "
+                "(127.0.0.1 / localhost) for the token-free localhost-sovereign write path."
+            )
     # Validate downstream routes BEFORE binding a socket — a collision is a packaging
     # bug, caught at registration, never a silent shadow at request time.
     extra_assets = dict(extra_assets or {})
@@ -839,6 +930,27 @@ def make_server(
     httpd.extra_assets = extra_assets
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
+    # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
+    # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
+    # server skips the POST /edit token check (the token-free localhost-sovereign path is
+    # unchanged); an off-loopback writable bind enforces ``write_token`` (the bind-refusal
+    # above already guaranteed a writable off-loopback source was given one).
+    httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
+    httpd.write_token = write_token
+    # POST-BIND reality check (codex L3 MED): the bind-refusal above validates the REQUESTED
+    # host string, but a loopback-CLASSIFIED host that RESOLVES off-box (e.g. a tampered/odd
+    # hosts file mapping 'localhost' to a non-loopback IP the box holds) would bind off-loopback
+    # with is_loopback_bind False. For an INSTALL-bearing source that means its operator-private
+    # seed/config becomes READABLE off-box via GET (writes already token-gate / 422). Re-verify
+    # against the ACTUAL bound address and refuse — verify-the-bound-address, don't trust the
+    # resolver (the same structural discipline the flow Bridge applies at its own exposure point).
+    if _is_install_bearing(source) and not httpd.is_loopback_bind:
+        httpd.server_close()
+        raise ValueError(
+            f"refusing to serve: requested host {host!r} bound a non-loopback address "
+            f"({str(httpd.server_address[0])}), but an install-bearing source's seed/config is "
+            "operator-private (loopback-only). Bind an explicit loopback address."
+        )
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}

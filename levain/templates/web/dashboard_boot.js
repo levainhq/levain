@@ -26,21 +26,60 @@
   // an overlapping passive read (which would leave the editor wedged open). [codex L3 round-2]
   let pendingReload = false;
 
+  // OFF-BOX write token (spore-129). When the substrate is served off-loopback (a Tailscale
+  // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
+  // factor that replaces loopback-is-auth once the surface leaves the machine. The server
+  // signals it via `view.write_token_required` (set in load()); we hold the device's token in
+  // localStorage and attach it. On a loopback (default) surface this stays false and the
+  // localhost-sovereign token-free path is unchanged. (This localStorage entry is the
+  // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
+  // and injects the same header — the server gate underneath is identical.)
+  //
+  // ⚠ SECURITY (TCB, L2 review): storing the token here puts it in the page's localStorage, so
+  // the render core (dashboard_core.js) is now part of this token's trust boundary — its
+  // confidentiality depends on the core NEVER introducing an HTML/script-injection sink (it
+  // renders via textContent/replaceChildren only, and the substrate is the operator's OWN store,
+  // so the surface is low). The strict CSP (script-src 'self', no unsafe-inline) is the backstop.
+  // Conscious tradeoff: localStorage (persists → enter once) over sessionStorage (per-session)
+  // for daily-driver convenience on the operator's personal device; the native keychain is the
+  // real fix at Lane 1.
+  const WRITE_TOKEN_KEY = "levain_write_token";
+  let writeTokenRequired = false;
+
+  function writeHeaders() {
+    const h = { "Content-Type": "application/json" };
+    if (!writeTokenRequired) return h;
+    let tok = "";
+    try { tok = window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { /* private mode */ }
+    if (!tok) {
+      tok = (window.prompt("Off-box write token (shown on the bridge --write startup line):") || "").trim();
+      if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
+    }
+    if (tok) h["X-Levain-Write-Token"] = tok;
+    return h;
+  }
+
   // The write transport for Slice-2a governed edits. POSTs the edit to /edit with a
   // same-origin fetch (browser sends Sec-Fetch-Site: same-origin + we set
-  // application/json — exactly what the server's write/auth boundary requires). On
-  // success it reloads so the dashboard reflects the saved state; on refusal it
-  // returns {ok:false, error, message} so the render core can surface it inline.
+  // application/json — exactly what the server's write/auth boundary requires; off-box it
+  // also carries the write token via writeHeaders). On success it reloads so the dashboard
+  // reflects the saved state; on refusal it returns {ok:false, error, message} so the render
+  // core can surface it inline.
   async function commit(request) {
     try {
       const res = await fetch("/edit", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: writeHeaders(),
         body: JSON.stringify(request),
       });
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
       if (res.ok) { await load(); return { ok: true }; }
+      // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
+      // — covers a mistyped/rotated token without wedging every future write.
+      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) {
+        try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
+      }
       return {
         ok: false,
         error: data.error || "HTTP " + res.status,
@@ -93,6 +132,9 @@
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
       if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+      // Track whether THIS surface demands the off-box write token (spore-129) so commit()'s
+      // writeHeaders attaches it. False on a loopback/read-only surface (the default).
+      writeTokenRequired = view.write_token_required === true;
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
