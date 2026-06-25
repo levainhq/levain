@@ -649,7 +649,10 @@ class TestHandlerFaultPath:
         a 500 / dead connection."""
         import levain.web_server as ws
 
-        def boom(_paths, _extra_panels=None):  # 2-arg: build_substrate_json gained extra_panels
+        def boom(_paths, _extra_panels=None, *, write_token_required=False):
+            # mirror build_substrate_json's real signature (gained extra_panels, then the
+            # keyword-only write_token_required for spore-129) so the stub is CALLED, not
+            # TypeError'd on an unexpected kwarg — the fault under test is the RuntimeError.
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(ws, "build_substrate_json", boom)
@@ -1232,3 +1235,164 @@ class TestExtraRoutes:
         assert status == 200
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         assert "TypeError" in json.loads(body)["errors"]["server"]
+
+
+# --- spore-129: the OFF-BOX write-token (Tailscale-write) boundary ----------
+
+class TestOffBoxWriteToken:
+    """A WRITABLE source MAY bind off-loopback ONLY with a ``write_token`` (the off-box
+    governance factor that replaces loopback-is-auth); POST /edit then requires the
+    ``X-Levain-Write-Token`` header (constant-time compared); loopback stays token-free.
+
+    The off-loopback BIND itself can't be exercised in a test (no real mesh interface →
+    OSError on the unroutable TEST-NET addr), so the bind-LOGIC is asserted via the
+    pre-bind ValueError, and the token ENFORCEMENT via a loopback server whose
+    ``is_loopback_bind`` is forced False — exactly what a real Tailscale bind sets."""
+
+    def _writable_noinstall(self, tmp_path: Path) -> SubstrateSource:
+        # flow's bridge shape: write_scope set, install_root=None (no Levain seed). The
+        # WriteScope itself is install-less too (ledger-only), mirroring scripts/bridge.py.
+        src = _store_with_data(tmp_path)
+        return SubstrateSource(
+            anneal=src.anneal, install_root=None,
+            write_scope=WriteScope(
+                anneal=src.anneal, ledger_root=tmp_path / "ledger", install_root=None
+            ),
+        )
+
+    def test_writable_offloopback_without_token_refused_at_bind(self, tmp_path: Path) -> None:
+        import pytest
+        # writable + no-install + non-loopback + NO token → refused BEFORE any bind.
+        with pytest.raises(ValueError, match="write_token"):
+            make_server(self._writable_noinstall(tmp_path), host="192.0.2.1", port=0)
+
+    def test_writable_offloopback_with_token_clears_bind_guard(self, tmp_path: Path) -> None:
+        import pytest
+        # WITH a token the writable bind-guard is RELAXED → it proceeds to actually bind the
+        # unroutable TEST-NET addr and fails THERE (OSError, not ValueError) — proving the
+        # guard was cleared for it (same proof shape as the read-only mesh test).
+        with pytest.raises(OSError):
+            make_server(self._writable_noinstall(tmp_path), host="192.0.2.1", port=0,
+                        write_token="s3cret")
+
+    def test_install_bearing_offloopback_token_does_not_relax(self, tmp_path: Path) -> None:
+        import pytest
+        # A token MUST NOT relax the install-bearing loopback-only rule — its seed/config is
+        # operator-private, a DIFFERENT concern than spore-129. Refused even WITH a token.
+        src = _store_with_data(tmp_path)
+        install_writable = SubstrateSource(
+            anneal=src.anneal, install_root=tmp_path,
+            write_scope=WriteScope.from_install_root(tmp_path),
+        )
+        with pytest.raises(ValueError, match="install-bearing"):
+            make_server(install_writable, host="192.0.2.1", port=0, write_token="s3cret")
+
+    def test_loopback_writable_is_token_free(self, tmp_path: Path) -> None:
+        # The localhost-sovereign path is UNCHANGED: a loopback writable bind needs no token,
+        # write_token_required is False, and a tokenless write is NOT the token-403.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            assert httpd.is_loopback_bind is True
+            assert httpd.write_token is None
+            v = json.loads(_get(base + "/substrate.json")[2])
+            assert v["writable"] is True
+            assert v["write_token_required"] is False
+            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+            assert resp.get("message") != "missing or invalid write token"
+
+    def test_offbox_substrate_json_flags_token_required(self, tmp_path: Path) -> None:
+        # Simulate an off-box bind (is_loopback_bind False + a token): the JSON tells the
+        # frontend to attach the token. The predicate mirrors do_POST exactly.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is True
+
+    def test_offbox_write_requires_correct_token(self, tmp_path: Path) -> None:
+        # The enforcement: off-box, POST /edit demands X-Levain-Write-Token == the server's
+        # token. Missing or wrong → 403 token error; correct → clears the gate (reaches the
+        # write layer, where no-install yields some OTHER error, never the token message).
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+            assert st == 403 and resp["message"] == "missing or invalid write token"
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                             headers={"X-Levain-Write-Token": "wrong"})
+            assert st == 403 and resp["message"] == "missing or invalid write token"
+            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                              headers={"X-Levain-Write-Token": "s3cret"})
+            assert resp.get("message") != "missing or invalid write token"
+
+    def test_offbox_with_no_server_token_fails_closed(self, tmp_path: Path) -> None:
+        # Defense-in-depth: a server somehow off-loopback yet token-less (make_server refuses
+        # to BIND that, but do_POST must not TRUST that) refuses every write, fail-closed.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = None
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+                             headers={"X-Levain-Write-Token": "anything"})
+            assert st == 403 and resp["message"] == "missing or invalid write token"
+
+    def test_readonly_offbox_post_is_422_not_token_403(self, tmp_path: Path) -> None:
+        # codex/L2: a READ-ONLY off-box surface (write_scope None) must fall through to the
+        # honest 422 'read_only', NOT a token-403 — the token gate also requires writability, so
+        # it mirrors _write_token_required exactly. (write_token_required is False here.)
+        with _serving(_store_with_data(tmp_path)) as (base, httpd):  # write_scope=None
+            httpd.is_loopback_bind = False
+            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is False
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+            assert st == 422 and resp["error"] == "read_only"
+
+    def test_writescope_install_root_divergence_refused(self, tmp_path: Path) -> None:
+        import pytest
+        # L1 MED-1: source.install_root=None but the WRITE_SCOPE's install_root is SET. The write
+        # path keys off write_scope.install_root, so this IS install-bearing and must stay
+        # loopback-only — refused off-loopback EVEN WITH a token (a source-only guard misses this).
+        src = _store_with_data(tmp_path)
+        diverged = SubstrateSource(
+            anneal=src.anneal, install_root=None,
+            write_scope=WriteScope.from_install_root(tmp_path),  # install_root SET on the scope
+        )
+        with pytest.raises(ValueError, match="install-bearing"):
+            make_server(diverged, host="192.0.2.1", port=0, write_token="s3cret")
+
+    def test_install_bearing_postbind_drift_refused(self, tmp_path: Path, monkeypatch) -> None:
+        import pytest
+
+        import levain.web_server as ws
+        # codex L3 MED: a loopback-CLASSIFIED requested host that BINDS off-loopback (hosts-file
+        # drift) must STILL refuse an install-bearing source — verified against the ACTUAL bound
+        # address post-bind. Simulate the drift: _is_loopback_host answers True for the requested
+        # gate (1st call) and False for the post-bind reality check (2nd call).
+        src = _store_with_data(tmp_path)
+        install = SubstrateSource(anneal=src.anneal, install_root=tmp_path)  # write_scope None
+        calls = {"n": 0}
+
+        def fake(_h: str) -> bool:
+            calls["n"] += 1
+            return calls["n"] == 1  # 1st = requested-host gate (loopback) → 2nd = post-bind (off-box)
+
+        monkeypatch.setattr(ws, "_is_loopback_host", fake)
+        with pytest.raises(ValueError, match="operator-private"):
+            ws.make_server(install, host="127.0.0.1", port=0)
+
+    def test_loopback_bind_ignores_passed_token(self, tmp_path: Path) -> None:
+        # L1 LOW-2: exercise the REAL make_server computation — a 127.0.0.1 bind yields
+        # is_loopback_bind True even with a write_token passed, and do_POST IGNORES the token
+        # (the localhost-sovereign token-free path). (The other tests force the attr; this one
+        # proves make_server derives it from the actual bound address.)
+        httpd = make_server(self._writable_noinstall(tmp_path), host="127.0.0.1", port=0,
+                            write_token="ignored-on-loopback")
+        assert httpd.is_loopback_bind is True
+        assert httpd.write_token == "ignored-on-loopback"
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}"
+            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is False
+            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+            assert resp.get("message") != "missing or invalid write token"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
