@@ -99,6 +99,38 @@ class _Field:
     slot: str
 
 
+@dataclass
+class InterviewField:
+    """One resolved interview field — the slot, its input style, the operator-
+    facing guidance, and its section context. The PUBLIC, surface-agnostic unit
+    of the field plan (`build_field_plan`), consumed by BOTH the terminal
+    `conduct_interview` walk and the web init form so the two onboarding
+    surfaces share one derivation and never drift. Every attribute is a JSON
+    primitive (str/int/bool) — no live template/section object — so the plan
+    projects cleanly to JSON for the web surface.
+
+    Shape ratified by the spore-181 Slice-A seam-lens review (still provisional
+    until the live web form consumes it). Two guidance fields by design:
+    `section_guidance` is the FULL section guidance, shown ONCE under the section
+    header (mirroring the terminal); `guidance` is this slot's split sub-clause
+    for multi-slot sections (empty for single-slot, where the section guidance
+    is the whole story). `section_index` is a STABLE per-section identity for
+    grouping — group by it, never by `section_title`, which can collide across
+    duplicate `## headers`."""
+
+    slot: str
+    style: str             # exactly one of _VALID_STYLES
+    guidance: str          # this slot's split sub-clause; "" for single-slot sections
+    section_guidance: str  # the FULL section guidance (shown once, on first_in_section)
+    section_title: str     # "" for the preamble section
+    section_index: int     # stable per-section grouping key (NOT the title — titles collide)
+    first_in_section: bool # the field that should print the section header + guidance
+    optional: bool         # section-level optional flag
+    optional_reason: str
+    current: str           # pre-fill value ("" if none) — attached, never excluded
+    spec_name: str         # source template filename (for grouping/display)
+
+
 def parse_template(path: Path) -> TemplateSpec:
     text = path.read_text(encoding="utf-8")
     sections: list[Section] = []
@@ -233,20 +265,10 @@ def conduct_interview(
     """
     answers = dict(answers or {})
 
-    # Build the flat, ordered field plan. Cross-spec/-section dedup is
-    # simulated here (a slot already answered, or already planned by an
-    # earlier section/spec, is not re-asked) — reproducing the cumulative
-    # contract the old nested loop got from checking `answers`. Optional-
-    # section skip is resolved interactively in the walk below.
-    plan: list[_Field] = []
-    planned: set[str] = set(answers.keys())
-    for spec in specs:
-        for section in spec.sections:
-            for slot in section.slots:
-                if slot in planned:
-                    continue
-                planned.add(slot)
-                plan.append(_Field(spec=spec, section=section, slot=slot))
+    # Build the flat, ordered field plan via the shared derivation (so the
+    # terminal walk and the web init form can never drift). Optional-section
+    # skip is resolved interactively in the walk below.
+    plan = _plan_fields(specs, set(answers.keys()))
 
     if not plan:
         return answers
@@ -332,16 +354,7 @@ def conduct_interview(
 
         visited_fields.add(i)
 
-        # Style precedence: explicit `style=X` tag on the section (interview
-        # engine v2) > keyword-soup detection on the section's per-slot clause
-        # (single-slot inherits section hints; multi-slot uses its sub-clause).
-        sub_guidance = _split_guidance(section.guidance, section.slots)
-        if section.explicit_style is not None:
-            style = section.explicit_style
-        else:
-            clause = sub_guidance.get(field.slot)
-            style_basis = clause if clause is not None else section.hints
-            style = _detect_input_style(field.slot, style_basis)
+        style = _resolve_style(section, field.slot)
 
         result = _prompt_for_slot(
             field.slot, style, input_fn, output_fn,
@@ -376,6 +389,86 @@ def conduct_interview(
         i += 1
 
     return answers
+
+
+def _plan_fields(specs: list[TemplateSpec], planned: set[str]) -> list[_Field]:
+    """The flat, ordered, deduplicated field walk shared by `conduct_interview`
+    and `build_field_plan`.
+
+    `planned` is the set of already-known slots to skip — a slot already
+    answered, or already planned by an earlier section/spec, is not re-asked,
+    reproducing the cumulative cross-spec/-section dedup. Copied internally so
+    the caller's set is not mutated.
+    """
+    planned = set(planned)
+    plan: list[_Field] = []
+    for spec in specs:
+        for section in spec.sections:
+            for slot in section.slots:
+                if slot in planned:
+                    continue
+                planned.add(slot)
+                plan.append(_Field(spec=spec, section=section, slot=slot))
+    return plan
+
+
+def _resolve_style(section: Section, slot: str) -> str:
+    """Resolve the input style for one slot. Precedence: an explicit `style=X`
+    section tag (interview engine v2) > keyword detection on the per-slot
+    guidance clause (multi-slot) or the section hints (single-slot inherits)."""
+    if section.explicit_style is not None:
+        return section.explicit_style
+    sub_guidance = _split_guidance(section.guidance, section.slots)
+    clause = sub_guidance.get(slot)
+    style_basis = clause if clause is not None else section.hints
+    return _detect_input_style(slot, style_basis)
+
+
+def build_field_plan(
+    specs: list[TemplateSpec],
+    values: dict[str, str] | None = None,
+) -> list[InterviewField]:
+    """The ORDERED interview field plan as flat `InterviewField`s.
+
+    The shared, surface-agnostic derivation behind both the terminal
+    `conduct_interview` walk and the web init form — pure (no I/O, no prompting),
+    so a downstream surface renders the SAME questions, in the SAME order, with
+    the SAME resolved styles the CLI would ask.
+
+    `values` PRE-FILLS each field's `current` (a checkpoint / resume map); it
+    does NOT exclude — the web form renders EVERY field, editable. Cross-template
+    shared-slot dedup is automatic (a slot defined in two specs is planned once,
+    on its first occurrence) and independent of `values`. Sections appear as
+    contiguous runs; `section_index` + `first_in_section` mark their boundaries
+    so a section-grouped renderer never has to infer them from the (collidable)
+    title.
+    """
+    values = values or {}
+    fields: list[InterviewField] = []
+    section_indices: dict[int, int] = {}  # id(section) -> stable section_index
+    for field in _plan_fields(specs, set()):
+        section = field.section
+        sid = id(section)
+        first_in_section = sid not in section_indices
+        if first_in_section:
+            section_indices[sid] = len(section_indices)
+        sub_guidance = _split_guidance(section.guidance, section.slots)
+        fields.append(
+            InterviewField(
+                slot=field.slot,
+                style=_resolve_style(section, field.slot),
+                guidance=sub_guidance.get(field.slot, ""),
+                section_guidance=section.guidance,
+                section_title=section.title,
+                section_index=section_indices[sid],
+                first_in_section=first_in_section,
+                optional=section.optional,
+                optional_reason=section.optional_reason,
+                current=values.get(field.slot, ""),
+                spec_name=field.spec.path.name,
+            )
+        )
+    return fields
 
 
 def _split_guidance(guidance: str, slots: list[str]) -> dict[str, str]:
