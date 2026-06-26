@@ -76,6 +76,7 @@ import threading
 from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.writes import MAX_BODY_BYTES, EditError, apply_edit
@@ -418,6 +419,23 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # base product injects nothing. Generic by design (a `kind:"external"` panel of titled
     # lines) so the kernel stays domain-agnostic — the flow Bridge injects its inbox here.
     extra_panels: "Callable[[], list[dict]] | None"
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """Swallow the benign client-disconnect family instead of dumping a traceback.
+
+        ``_Handler.protocol_version = "HTTP/1.1"`` keeps connections alive, so a
+        browser pools several and RESETs the idle ones as normal lifecycle; on a mesh
+        (``--host``) bind, several devices each bring a pool. Each reset raises a
+        ``ConnectionError`` (or a socket ``TimeoutError``) up through ``socketserver``'s
+        per-connection thread, whose default ``handle_error`` prints a full traceback —
+        flooding the console with noise for connections that were never a server fault
+        (the server keeps serving thread-per-connection; only the log is wrong). Filter
+        that family to silence; defer any genuine error to the base so real bugs still
+        surface (spore-178)."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class _Handler(BaseHTTPRequestHandler):
