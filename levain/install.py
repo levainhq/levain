@@ -31,6 +31,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.resources import as_file, files
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from levain.interview import TemplateSpec
 
 
 def run_init(path: Path, adapter: str | None, force: bool) -> int:
@@ -89,7 +93,10 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             from levain.interview import (
                 conduct_interview,
                 parse_template,
-                render_template,
+                # Imported here only to validate the interview engine UPFRONT —
+                # a corrupt/partial module fails cleanly before the interview
+                # rather than mid-install. apply_init re-imports it where used.
+                render_template,  # noqa: F401
             )
         except Exception as e:
             print(f"FAIL: interview engine unavailable: {e}")
@@ -135,39 +142,87 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             _report_partial_state(install)
             return 1
 
-        install_seed = install / "seed"
-        install_seed.mkdir(parents=True, exist_ok=True)
-        (install_seed / "world.md").write_text(
-            render_template(spec_world, answers), encoding="utf-8"
+        store_ok = apply_init(
+            install,
+            chosen,
+            answers,
+            templates_root,
+            python_path,
+            anneal_path,
+            [spec_world, spec_origin],
         )
-        (install_seed / "origin.md").write_text(
-            render_template(spec_origin, answers), encoding="utf-8"
-        )
-
-        for f in (
-            "partnership.md",
-            "memory.md",
-            "spore_instructions.md",
-            "continuity.md",
-            "README.md",
-        ):
-            src = templates_root / "seed" / f
-            if src.is_file():
-                shutil.copy2(src, install_seed / f)
-
-        _install_adapter(chosen, install, templates_root, python_path, anneal_path)
-
-    store = install / ".levain" / "memory.db"
-    store.parent.mkdir(parents=True, exist_ok=True)
-    store_ok = _init_store(store, anneal_path)
 
     # Interview completed successfully — clear the checkpoint so the next
     # `levain init --force` doesn't offer to resume stale answers.
     _clear_checkpoint(install)
 
+    store = install / ".levain" / "memory.db"
     _print_manifest(install, chosen, store, store_ok=store_ok)
     _print_next_steps(install, chosen, store_ok=store_ok)
     return 0 if store_ok else 1
+
+
+def apply_init(
+    install: Path,
+    chosen: str,
+    answers: dict[str, str],
+    templates_root: Path,
+    python_path: str,
+    anneal_path: str,
+    specs: list[TemplateSpec],
+) -> bool:
+    """The shared WRITE-HALF of init: render each interview template from
+    `answers`, copy the verbatim seed files, install the adapter, and initialize
+    the store. Returns the store-init success flag.
+
+    Called by BOTH `run_init` (the CLI, after the terminal interview) and the
+    web init POST (after the form submit) so the two surfaces perform the WRITE
+    steps IDENTICALLY from an already-resolved `answers` map. The shared surface
+    is the writes ONLY — each caller resolves its OWN inputs first (install path,
+    adapter choice, python/anneal paths, the template preflight, and
+    `parse_template`-ing the specs); that resolution half stays per-surface.
+    apply_init does NOT validate `answers` completeness — `render_template`
+    substitutes a missing slot with `""`, so the CALLER must ensure `answers`
+    covers the slots (the CLI via `conduct_interview`; the web via a form driven
+    from `build_field_plan`).
+
+    `specs` is the list of templates to RENDER (world.md + origin.md today);
+    each is written to `install/seed/<spec.path.name>`. The verbatim
+    (non-rendered) seed files are copied separately below.
+
+    MUST be called inside a live `_templates_root()` context: the render/copy/
+    adapter steps read from `templates_root`, which a zipped distribution
+    materializes only for that context's lifetime. The store-init is
+    `templates_root`-independent but folded in so one call IS the whole write
+    sequence — it now runs inside the context (vs. just after it in the old
+    inline form), which is benign because `_init_store` never reads
+    `templates_root`.
+    """
+    from levain.interview import render_template
+
+    install_seed = install / "seed"
+    install_seed.mkdir(parents=True, exist_ok=True)
+    for spec in specs:
+        (install_seed / spec.path.name).write_text(
+            render_template(spec, answers), encoding="utf-8"
+        )
+
+    for f in (
+        "partnership.md",
+        "memory.md",
+        "spore_instructions.md",
+        "continuity.md",
+        "README.md",
+    ):
+        src = templates_root / "seed" / f
+        if src.is_file():
+            shutil.copy2(src, install_seed / f)
+
+    _install_adapter(chosen, install, templates_root, python_path, anneal_path)
+
+    store = install / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    return _init_store(store, anneal_path)
 
 
 # ---------- interview checkpoint persistence ----------

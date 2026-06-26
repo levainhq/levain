@@ -1,6 +1,10 @@
-"""Tests for the install module — the _templates_root() context manager
-and the install-path safety helpers. Integration test for run_init lives
-separate because it requires the full interview-driver dance.
+"""Tests for the install module — the _templates_root() context manager,
+the install-path safety helpers, and apply_init (the shared write-half).
+
+`run_init`'s orchestration half (the interactive safety refusal, checkpoint
+resume / --force, interview wiring, manifest) is NOT covered here — it needs a
+full interview-driver dance and has no automated test yet. The apply_init tests
+below cover the write-half it now delegates to.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from levain.install import (
     _save_checkpoint,
     _substitute_hook_placeholders,
     _templates_root,
+    apply_init,
 )
 
 
@@ -720,3 +725,123 @@ def test_print_manifest_expands_activation_files(tmp_path: Path, capsys):
 
     assert "session_start.py" in out
     assert "posture.md" in out
+
+
+# ---------- apply_init: the shared write-half (spore-181 Slice B1) ----------
+
+def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypatch):
+    """apply_init is the write-half extracted from run_init so the CLI and the
+    web POST install IDENTICALLY. Drive it directly (no interview/form) against
+    the REAL shipped templates + a real claude-code adapter install (pure fs),
+    mocking only the anneal-memory store subprocess. This is the write-half's
+    first direct coverage — run_init had none."""
+    from levain.interview import build_field_plan, parse_template
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Result())
+
+    install = tmp_path / "install"
+    install.mkdir()
+
+    with _templates_root() as templates_root:
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        # Fill every slot via the shared field-plan seam so no optional section
+        # is dropped and every {{SLOT}} resolves.
+        answers = {
+            f.slot: f"VAL_{f.slot}"
+            for f in build_field_plan([spec_world, spec_origin])
+        }
+        ok = apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+        )
+        # "Verbatim" means byte-identical to the template source — pin it.
+        src_partnership = (templates_root / "seed" / "partnership.md").read_bytes()
+
+    assert ok is True
+    # Seed rendered from answers — values substituted, no leftover slots.
+    world = (install / "seed" / "world.md").read_text(encoding="utf-8")
+    assert "{{" not in world
+    assert "VAL_" in world
+    assert (install / "seed" / "origin.md").is_file()
+    # Verbatim seed files copied — byte-for-byte, not just present.
+    assert (install / "seed" / "partnership.md").read_bytes() == src_partnership
+    assert (install / "seed" / "spore_instructions.md").is_file()
+    # claude-code adapter wiring laid down.
+    assert (install / "CLAUDE.md").is_file()
+    assert (install / ".claude" / "settings.json").is_file()
+    assert (install / ".mcp.json").is_file()
+
+
+def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
+    """Store-init failure propagates as the return value (run_init maps it to a
+    non-zero exit; the web POST will surface it as an error)."""
+    from levain.interview import parse_template
+
+    class _Fail:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Fail())
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        ok = apply_init(
+            install, "claude-code", {}, templates_root,
+            "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+        )
+    assert ok is False
+    # Even on store failure, the seed + adapter were written (the store is the
+    # last step; partial-install reporting is the caller's job).
+    assert (install / "seed" / "world.md").is_file()
+
+
+def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
+    """The codex adapter path through apply_init — the higher-risk adapter (it
+    mutates global ~/.codex). apply_init is the shared entry a web POST can hit
+    with chosen='codex', so it needs direct coverage. CODEX_HOME is redirected
+    to a tmp dir so the real ~/.codex is never touched."""
+    from levain.interview import build_field_plan, parse_template
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Result())
+    codex_home = tmp_path / "codex_home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        answers = {
+            f.slot: f"VAL_{f.slot}"
+            for f in build_field_plan([spec_world, spec_origin])
+        }
+        ok = apply_init(
+            install, "codex", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+        )
+
+    assert ok is True
+    # codex adapter wiring: AGENTS.md in the install, the activation tree, and
+    # the global codex config under the redirected CODEX_HOME.
+    assert (install / "AGENTS.md").is_file()
+    assert (install / "activation").is_dir()
+    assert (codex_home / "hooks.json").is_file()
+    assert (codex_home / "config.toml").is_file()
+    # The redirected CODEX_HOME means the real ~/.codex was never touched.
+    config = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert "mcp_servers.anneal_memory" in config
