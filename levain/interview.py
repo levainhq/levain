@@ -40,9 +40,14 @@ _ONBOARDING_BLURB_RE = re.compile(
 
 # Operator commands recognized at any interview prompt. `:back` re-opens the
 # previous answer for editing (composable — repeat to step further back).
-# These exact strings are reserved — an operator cannot enter ":back"/":b" as a
-# literal field value (acceptable: seed slots are names/bios/roles, not commands).
+# `:clear`/`:empty` forces an EXPLICIT empty value, overriding the blank=keep
+# rule on a revisit (blank keeps `current`; `:clear` discards it — the only way
+# to empty an already-entered field).
+# These exact strings are reserved — an operator cannot enter ":back"/":b"/
+# ":clear"/":empty" as a literal field value (acceptable: seed slots are
+# names/bios/roles, not commands).
 _BACK_COMMANDS = (":back", ":b")
+_CLEAR_COMMANDS = (":clear", ":empty")
 
 
 class _Back:
@@ -440,22 +445,34 @@ def _prompt_for_slot(
     """Prompt for one slot's value.
 
     Returns the entered value, the `_BACK` sentinel if the operator typed a
-    back-navigation command (`:back`/`:b`), or `current` if they submitted an
-    immediate blank. That one rule — *blank = leave as-is* — covers both
+    back-navigation command (`:back`/`:b`), an explicit empty string if they
+    typed a clear command (`:clear`/`:empty`), or `current` if they submitted
+    an immediate blank. The blank rule — *blank = leave as-is* — covers both
     skip-and-scaffold-empty on a first visit (`current == ""`) and keep-the-
-    prior-answer on a back-navigation revisit (`current` is the old value).
+    prior-answer on a back-navigation revisit (`current` is the old value);
+    `:clear` is the explicit override that DISCARDS `current`, the only way to
+    empty an already-entered field on a revisit (where blank keeps it).
     """
     if current:
         output_fn(f"  {slot} — current value:")
         for line in current.splitlines():
             output_fn(f"      | {line}")
-        output_fn("      (blank = keep, retype = replace, :back = previous)")
+        output_fn(
+            "      (blank = keep, retype = replace, :clear/:empty = empty, "
+            ":back = previous)"
+        )
 
     blank_action = "keep" if current else "skip"
+    # `:clear` is only meaningful on a revisit (where blank keeps `current`) —
+    # surfaced inline for the multi-line styles so it sits alongside their
+    # restated `:back`, matching `:back`'s own block+inline parity. The single-
+    # line styles get it from the current-value block directly above (and the
+    # `line` prompt string is held byte-exact by a back-compat test).
+    clear_hint = ", :clear = empty" if current else ""
 
     if style == "bullet":
         output_fn(
-            f"  {slot} (one per line; blank line = {blank_action}, "
+            f"  {slot} (one per line; blank line = {blank_action}{clear_hint}, "
             f":back = previous):"
         )
         items: list[str] = []
@@ -468,6 +485,8 @@ def _prompt_for_slot(
                 break
             if not items and line in _BACK_COMMANDS:
                 return _BACK
+            if not items and line in _CLEAR_COMMANDS:
+                return ""
             if not line:
                 if items:
                     break
@@ -477,8 +496,8 @@ def _prompt_for_slot(
 
     if style == "prose":
         output_fn(
-            f"  {slot} (multi-line; blank line = {blank_action}, write then "
-            f"blank line to finish, :back = previous):"
+            f"  {slot} (multi-line; blank line = {blank_action}{clear_hint}, "
+            f"write then blank line to finish, :back = previous):"
         )
         lines: list[str] = []
         while True:
@@ -491,6 +510,8 @@ def _prompt_for_slot(
             stripped = line.strip()
             if not lines and stripped in _BACK_COMMANDS:
                 return _BACK
+            if not lines and stripped in _CLEAR_COMMANDS:
+                return ""
             if stripped == "":
                 if lines:
                     break  # blank after content = finish
@@ -502,11 +523,15 @@ def _prompt_for_slot(
         raw = input_fn(f"  {slot} (optional, blank to skip, :back = previous): ").strip()
         if raw in _BACK_COMMANDS:
             return _BACK
+        if raw in _CLEAR_COMMANDS:
+            return ""
         return current if raw == "" else raw
 
     raw = input_fn(f"  {slot}: ").strip()
     if raw in _BACK_COMMANDS:
         return _BACK
+    if raw in _CLEAR_COMMANDS:
+        return ""
     return current if raw == "" else raw
 
 

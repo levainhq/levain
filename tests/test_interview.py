@@ -8,8 +8,6 @@ drift (rename canonicalization, style detection, slot extraction).
 
 from __future__ import annotations
 
-import io
-import sys
 from pathlib import Path
 
 import pytest
@@ -470,6 +468,111 @@ def test_prompt_for_slot_line_prompt_string_unchanged_for_back_compat():
 
     _prompt_for_slot("X", "line", input_fn=driver, output_fn=lambda s: None, current="")
     assert captured == ["  X: "]
+
+
+# ---------- _prompt_for_slot: :clear / :empty (spore-070) ----------
+
+@pytest.mark.parametrize("style", ["line", "prose", "bullet", "optional-line"])
+@pytest.mark.parametrize("cmd", [":clear", ":empty"])
+def test_prompt_for_slot_clear_command_discards_current(style, cmd):
+    # The core behavior: on a revisit (current set) a clear command returns an
+    # EXPLICIT empty string, overriding the blank=keep rule — across every style.
+    result = _prompt_for_slot(
+        "X", style, input_fn=lambda p: cmd, output_fn=lambda s: None,
+        current="prior value",
+    )
+    assert result == ""
+
+
+@pytest.mark.parametrize("style", ["line", "prose", "bullet", "optional-line"])
+@pytest.mark.parametrize("cmd", [":clear", ":empty"])
+def test_prompt_for_slot_clear_command_on_first_visit_returns_empty(style, cmd):
+    # On a first visit (current="") a clear command is harmless — same "" as a
+    # blank — so the token stays consistently reserved at every prompt.
+    result = _prompt_for_slot(
+        "X", style, input_fn=lambda p: cmd, output_fn=lambda s: None, current=""
+    )
+    assert result == ""
+
+
+@pytest.mark.parametrize("style", ["line", "prose", "bullet", "optional-line"])
+def test_prompt_for_slot_clear_hint_shown_when_current_set(style):
+    # The `:clear` affordance is taught in the one-time current-value block
+    # (shown for EVERY style whenever there's a value to clear) — and additionally
+    # inline for the multi-line styles. Parametrized so the test matches the
+    # design claim ("shown for every style"), not just the line style.
+    out: list[str] = []
+    _prompt_for_slot(
+        "NAME", style, input_fn=lambda p: "", output_fn=out.append, current="Alex"
+    )
+    assert any(":clear" in line and "empty" in line for line in out)
+
+
+@pytest.mark.parametrize("style", ["bullet", "prose"])
+def test_prompt_for_slot_clear_hint_shown_inline_for_multiline_styles(style):
+    # The multi-line styles restate :back in their own prompt line; :clear must
+    # ride alongside it when there's a value to clear (no "back works here but
+    # maybe clear doesn't?" ambiguity at the revisit moment).
+    out: list[str] = []
+    _prompt_for_slot(
+        "X", style, input_fn=lambda p: "", output_fn=out.append, current="prior"
+    )
+    # The inline prompt line (contains "blank line") carries the :clear hint.
+    assert any("blank line" in line and ":clear = empty" in line for line in out)
+
+
+@pytest.mark.parametrize("style", ["bullet", "prose"])
+def test_prompt_for_slot_clear_hint_absent_inline_on_first_visit(style):
+    # On a first visit there's nothing to clear → no inline :clear hint (and no
+    # current-value block either).
+    out: list[str] = []
+    _prompt_for_slot(
+        "X", style, input_fn=lambda p: "", output_fn=out.append, current=""
+    )
+    assert not any(":clear" in line for line in out)
+
+
+@pytest.mark.parametrize("style,sep", [("bullet", "- "), ("prose", "")])
+def test_prompt_for_slot_clear_after_content_is_literal(style, sep):
+    # LOCK the first-line-only invariant for :clear (mirrors :back): a :clear
+    # typed AFTER content has begun is literal text, NOT a clear command. Pins
+    # the inherited-not-locked behavior the apparatus flagged.
+    feed = iter(["alpha", ":clear", ""])
+    result = _prompt_for_slot(
+        style, style, input_fn=lambda p: next(feed), output_fn=lambda s: None,
+        current="",
+    )
+    assert result == f"{sep}alpha\n{sep}:clear"
+
+
+def test_prompt_for_slot_clear_hint_absent_on_first_visit():
+    # No current value → no current-value block → no :clear hint (nothing to clear).
+    out: list[str] = []
+    _prompt_for_slot(
+        "NAME", "line", input_fn=lambda p: "v", output_fn=out.append, current=""
+    )
+    assert not any(":clear" in line for line in out)
+
+
+def test_prompt_for_slot_line_prompt_string_unchanged_by_clear():
+    # The clear affordance must NOT alter the line prompt string (back-compat).
+    captured: list[str] = []
+    _prompt_for_slot(
+        "X", "line", input_fn=lambda p: (captured.append(p) or "v"),
+        output_fn=lambda s: None, current="",
+    )
+    assert captured == ["  X: "]
+
+
+def test_conduct_interview_back_then_clear_empties_prior_answer(tmp_path: Path):
+    # NAME="Alpha"; at CITY :back; at the NAME revisit type :clear → NAME="";
+    # then CITY="Columbus". The integration peer of the back-then-blank-keeps test.
+    spec = _two_section_spec(tmp_path)
+    feed = iter(["Alpha", ":back", ":clear", "Columbus"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
+    )
+    assert answers == {"NAME": "", "CITY": "Columbus"}
 
 
 # ---------- conduct_interview: back-navigation (item 2) ----------
