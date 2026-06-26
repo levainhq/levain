@@ -268,6 +268,26 @@ class TestSubstrateJson:
         assert status == 200
         assert "store" in json.loads(body)["errors"]
 
+    def test_handle_error_swallows_client_disconnects(self, tmp_path: Path, capsys) -> None:
+        """A kept-alive client RESET (HTTP/1.1 + a browser connection pool on a mesh
+        bind — spore-178) raises ConnectionResetError up through socketserver; the
+        ``_LevainHTTPServer.handle_error`` override swallows that family silently, while
+        a genuine error still delegates to the base so real bugs surface."""
+        httpd = make_server(_store_with_data(tmp_path), host="127.0.0.1", port=0)
+        try:
+            try:
+                raise ConnectionResetError(54, "Connection reset by peer")
+            except ConnectionResetError:
+                httpd.handle_error(object(), ("100.71.105.99", 58063))
+            assert capsys.readouterr().err == ""  # swallowed — no traceback flood
+            try:
+                raise ValueError("a real server bug")
+            except ValueError:
+                httpd.handle_error(object(), ("127.0.0.1", 1234))
+            assert "ValueError" in capsys.readouterr().err  # genuine error surfaces
+        finally:
+            httpd.server_close()
+
 
 # --- the static assets ------------------------------------------------------
 
