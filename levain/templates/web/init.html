@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Levain · init</title>
+<link rel="stylesheet" href="/init.css" />
+</head>
+<body>
+  <div class="deck">
+    <header class="masthead">
+      <div class="brand">
+        <div class="wordmark">Levain</div>
+        <div class="model">init · grow a new partnership entity</div>
+      </div>
+      <div class="readout">
+        <span class="unit-label">install target</span>
+        <span class="target" id="target">—</span>
+      </div>
+    </header>
+
+    <p class="lede">
+      Every field at once — pre-filled, yours to edit. Fill what you know, skip
+      what you don't (blank just leaves it empty). When you submit, Levain renders
+      your seed, lays down the adapter, and initializes the store.
+    </p>
+
+    <p class="status" id="status">loading the interview…</p>
+    <div id="target-banner" class="banner" hidden></div>
+
+    <form id="init-form" autocomplete="off" novalidate>
+      <section class="card adapter-card">
+        <h2>Harness adapter</h2>
+        <p class="hint">
+          v1 installs one adapter per install. To use both harnesses on this
+          machine, run two separate installs.
+        </p>
+        <div id="adapters" class="adapters"></div>
+      </section>
+
+      <div id="sections"></div>
+
+      <div class="actions">
+        <button id="submit" type="submit" disabled>Install</button>
+        <span id="submit-note" class="submit-note"></span>
+      </div>
+    </form>
+
+    <section id="result" class="card result" hidden></section>
+
+    <footer class="deck-foot">
+      sovereign · localhost · governed — grow the seed, don't rent the practice
+    </footer>
+  </div>
+
+<!-- Vanilla, no-deps, no-CDN, no innerHTML — the form is built with
+     createElement/textContent only, served by `levain init --web` from package
+     data. Runs offline. -->
+<script src="/init.js"></script>
+</body>
+</html>

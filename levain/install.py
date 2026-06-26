@@ -27,14 +27,36 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from levain.interview import TemplateSpec
+
+
+@dataclass
+class InitResult:
+    """The structured outcome of `apply_init` — the write-half's full status,
+    not just the store flag (the bare bool was only step-d). Self-describing so a
+    caller can render the manifest + next-steps without re-threading the inputs:
+    a web init POST returns this plus the captured `emit` transcript + the pure
+    `_manifest_rows` / `_next_steps_lines` projections."""
+
+    install: Path
+    adapter: str
+    store_ok: bool
+
+    @property
+    def complete(self) -> bool:
+        """True iff the whole install succeeded. Today the store is the only
+        soft-failure step (seed/adapter writes raise on hard failure), so this
+        equals `store_ok`; a future per-step status would widen here, not at the
+        callsites."""
+        return self.store_ok
 
 
 def run_init(path: Path, adapter: str | None, force: bool) -> int:
@@ -142,7 +164,7 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             _report_partial_state(install)
             return 1
 
-        store_ok = apply_init(
+        result = apply_init(
             install,
             chosen,
             answers,
@@ -157,9 +179,9 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
     _clear_checkpoint(install)
 
     store = install / ".levain" / "memory.db"
-    _print_manifest(install, chosen, store, store_ok=store_ok)
-    _print_next_steps(install, chosen, store_ok=store_ok)
-    return 0 if store_ok else 1
+    _print_manifest(install, chosen, store, store_ok=result.store_ok)
+    _print_next_steps(install, chosen, store_ok=result.store_ok)
+    return 0 if result.store_ok else 1
 
 
 def apply_init(
@@ -170,10 +192,18 @@ def apply_init(
     python_path: str,
     anneal_path: str,
     specs: list[TemplateSpec],
-) -> bool:
+    emit: Callable[[str], None] = print,
+) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
     `answers`, copy the verbatim seed files, install the adapter, and initialize
-    the store. Returns the store-init success flag.
+    the store. Returns an `InitResult` carrying the store-init success flag (plus
+    the install/adapter, so the result is self-describing).
+
+    `emit` is the progress/remediation sink threaded through the write steps
+    (adapter-install notices, backup warnings, store-init remediation). It
+    defaults to `print` so the CLI is byte-unchanged; the web init POST passes a
+    capturing sink (e.g. `lines.append`) so install progress + failure
+    remediation reach the BROWSER, not just the server console.
 
     Called by BOTH `run_init` (the CLI, after the terminal interview) and the
     web init POST (after the form submit) so the two surfaces perform the WRITE
@@ -218,11 +248,12 @@ def apply_init(
         if src.is_file():
             shutil.copy2(src, install_seed / f)
 
-    _install_adapter(chosen, install, templates_root, python_path, anneal_path)
+    _install_adapter(chosen, install, templates_root, python_path, anneal_path, emit=emit)
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
-    return _init_store(store, anneal_path)
+    store_ok = _init_store(store, anneal_path, emit=emit)
+    return InitResult(install=install, adapter=chosen, store_ok=store_ok)
 
 
 # ---------- interview checkpoint persistence ----------
@@ -294,7 +325,7 @@ def _report_partial_state(install: Path) -> None:
         return
     print(f"  Install dir {install} contains: {', '.join(contents)}")
     if not checkpoint:
-        print(f"  Re-run `levain init` with --force to overwrite, or delete the dir first.")
+        print("  Re-run `levain init` with --force to overwrite, or delete the dir first.")
 
 
 class _UserCancelled(Exception):
@@ -360,21 +391,61 @@ def _templates_root() -> Iterator[Path]:
         yield Path(path)
 
 
+class InitError(Exception):
+    """A user-facing init failure with a ready-to-show message — raised by the
+    shared template wrapper when the packaged seed templates are missing/corrupt.
+    The web init POST maps it to an HTTP error carrying `.message`; the CLI's own
+    inline preflight keeps its own print path."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+@contextmanager
+def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec]]]:
+    """Yield ``(templates_root, [world_spec, origin_spec])`` for an init run.
+
+    The shared templates-context + corruption preflight + parse, so a SECOND init
+    surface (the web POST) doesn't re-implement the ``with _templates_root()``
+    block, the missing-template check, and the two ``parse_template`` calls that
+    ``run_init`` does inline. MUST be consumed inside the ``with`` (the
+    materialized tempdir under a zipped distribution is cleaned up on exit, and
+    ``apply_init`` reads from ``templates_root``). Raises ``InitError`` (with a
+    ready-to-surface ``.message``) if the packaged templates are missing/corrupt.
+    """
+    from levain.interview import parse_template
+
+    with _templates_root() as templates_root:
+        if not (templates_root / "seed" / "world.md").is_file():
+            raise InitError(
+                f"Levain templates not found in the installed package at "
+                f"{templates_root}. The wheel may be corrupt; reinstall with "
+                f"`pip install --force-reinstall levain`."
+            )
+        specs = [
+            parse_template(templates_root / "seed" / "world.md"),
+            parse_template(templates_root / "seed" / "origin.md"),
+        ]
+        yield templates_root, specs
+
+
 def _install_adapter(
     name: str,
     install: Path,
     templates_root: Path,
     python_path: str,
     anneal_path: str,
+    emit: Callable[[str], None] = print,
 ) -> None:
     adapter_root = templates_root / "adapters" / name
 
     if name == "claude-code":
-        _install_claude_code(install, templates_root, adapter_root, python_path, anneal_path)
+        _install_claude_code(install, templates_root, adapter_root, python_path, anneal_path, emit=emit)
         return
 
     if name == "codex":
-        _install_codex(install, adapter_root, python_path, anneal_path)
+        _install_codex(install, adapter_root, python_path, anneal_path, emit=emit)
         return
 
     raise ValueError(f"unknown adapter: {name}")  # pragma: no cover
@@ -386,11 +457,13 @@ def _install_claude_code(
     adapter_root: Path,
     python_path: str,
     anneal_path: str,
+    emit: Callable[[str], None] = print,
 ) -> None:
     _copy_activation_tree(
         templates_root / "activation",
         install / "activation",
         anneal_path=anneal_path,
+        emit=emit,
     )
 
     shutil.copy2(adapter_root / "CLAUDE.md.template", install / "CLAUDE.md")
@@ -406,7 +479,7 @@ def _install_claude_code(
     mcp_text = mcp_text.replace("{{ANNEAL_MEMORY}}", anneal_path)
     (install / ".mcp.json").write_text(mcp_text, encoding="utf-8")
 
-    print("  Claude Code adapter installed.")
+    emit("  Claude Code adapter installed.")
 
 
 def _install_codex(
@@ -414,11 +487,13 @@ def _install_codex(
     adapter_root: Path,
     python_path: str,
     anneal_path: str,
+    emit: Callable[[str], None] = print,
 ) -> None:
     _copy_activation_tree(
         adapter_root / "activation",
         install / "activation",
         anneal_path=anneal_path,
+        emit=emit,
     )
     shutil.copy2(adapter_root / "AGENTS.md.template", install / "AGENTS.md")
 
@@ -438,8 +513,8 @@ def _install_codex(
         # Unlink first (in case it's a symlink into a dotfiles repo) so we don't
         # silently modify the symlink's target.
         hooks_target.unlink()
-        print(f"  ! Existing {hooks_target} backed up to {bak}")
-        print(f"    (Codex is one-install-per-machine at v1 — this install now owns it.)")
+        emit(f"  ! Existing {hooks_target} backed up to {bak}")
+        emit("    (Codex is one-install-per-machine at v1 — this install now owns it.)")
     hooks_target.write_text(hooks_text, encoding="utf-8")
 
     mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
@@ -447,7 +522,7 @@ def _install_codex(
     mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
     _merge_codex_config(codex_home / "config.toml", mcp_fragment)
 
-    print("  Codex adapter installed.")
+    emit("  Codex adapter installed.")
 
 
 def _timestamped_backup_path(target: Path) -> Path:
@@ -458,7 +533,12 @@ def _timestamped_backup_path(target: Path) -> Path:
 _OPERATOR_EDITABLE = ("posture.md", "recency_directives.md")
 
 
-def _copy_activation_tree(src: Path, dst: Path, anneal_path: str | None = None) -> None:
+def _copy_activation_tree(
+    src: Path,
+    dst: Path,
+    anneal_path: str | None = None,
+    emit: Callable[[str], None] = print,
+) -> None:
     """Copy `src` -> `dst`, but preserve operator edits to known editable files.
 
     `posture.md` and `recency_directives.md` are documented as operator-editable
@@ -513,7 +593,7 @@ def _copy_activation_tree(src: Path, dst: Path, anneal_path: str | None = None) 
     if anneal_path is not None:
         _substitute_hook_placeholders(dst / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
     for current, bak in backups:
-        print(f"  ! Operator-edited {current.name} preserved at {bak}")
+        emit(f"  ! Operator-edited {current.name} preserved at {bak}")
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:
@@ -625,9 +705,14 @@ def _store_schema_name(store: Path, anneal_path: str) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _init_store(store: Path, anneal_path: str) -> bool:
-    """Initialize (or schema-migrate) the anneal-memory store. Return True on success."""
-    print()
+def _init_store(
+    store: Path, anneal_path: str, emit: Callable[[str], None] = print
+) -> bool:
+    """Initialize (or schema-migrate) the anneal-memory store. Return True on success.
+
+    `emit` (default `print`) sinks the progress + failure-remediation lines so a
+    web init can surface them in the browser; the CLI is byte-unchanged."""
+    emit("")
     if store.is_file() and store.stat().st_size > 0:
         # An existing store carries the entity's memory + identity; --force
         # overlays seed/adapter files but never touches the memory CONTENT. We DO
@@ -641,24 +726,24 @@ def _init_store(store: Path, anneal_path: str) -> bool:
         # The migration itself (`set-schema`) preserves memory content (episodes,
         # wraps, continuity text); it rewrites the schema metadata row and records
         # a `section_schema_set` audit event.
-        print(f"anneal-memory store already present at {store} — memory preserved.")
+        emit(f"anneal-memory store already present at {store} — memory preserved.")
         if _store_schema_name(store, anneal_path) == "partnership":
-            print("  Section schema already partnership — nothing to migrate.")
+            emit("  Section schema already partnership — nothing to migrate.")
             return True
         ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["set-schema", "partnership"])
         if ok:
-            print("  Section schema migrated to partnership (memory content preserved).")
+            emit("  Section schema migrated to partnership (memory content preserved).")
             return True
-        print("  ! Could not ensure the partnership schema on the existing store:")
+        emit("  ! Could not ensure the partnership schema on the existing store:")
         for e in errors:
-            print(f"    - {e}")
-        print(f"    The memory is preserved, but the schema may still be the ops")
-        print(f"    default — a partnership entity needs the 6-section schema.")
-        print(f"    Fix: pip install -U anneal-memory")
-        print(f"    Then: anneal-memory --db {store} set-schema partnership")
+            emit(f"    - {e}")
+        emit("    The memory is preserved, but the schema may still be the ops")
+        emit("    default — a partnership entity needs the 6-section schema.")
+        emit("    Fix: pip install -U anneal-memory")
+        emit(f"    Then: anneal-memory --db {store} set-schema partnership")
         return False
 
-    print(f"Initializing anneal-memory store at {store}...")
+    emit(f"Initializing anneal-memory store at {store}...")
 
     # Persist the 6-section partnership schema at creation (anneal AM-INITSCHEMA).
     # This is the only point the felt-layer proportion-gate + schema-aware budget
@@ -667,35 +752,34 @@ def _init_store(store: Path, anneal_path: str) -> bool:
     # because a silently-ops partnership entity is exactly the failure to prevent.
     ok, _out, errors = _run_anneal_cmd(store, anneal_path, ["init", "--schema", "partnership"])
     if ok:
-        print("  Store initialized (partnership schema).")
+        emit("  Store initialized (partnership schema).")
         return True
 
-    print("  ! Could not initialize store:")
+    emit("  ! Could not initialize store:")
     for e in errors:
-        print(f"    - {e}")
-    print(f"    Most likely cause: anneal-memory is not installed in this Python,")
-    print(f"    or is older than the release that supports `init --schema` /")
-    print(f"    `set-schema` (the 6-section partnership schema).")
-    print(f"    Fix: pip install -U anneal-memory")
-    print(f"    Then: anneal-memory --db {store} init --schema partnership")
+        emit(f"    - {e}")
+    emit("    Most likely cause: anneal-memory is not installed in this Python,")
+    emit("    or is older than the release that supports `init --schema` /")
+    emit("    `set-schema` (the 6-section partnership schema).")
+    emit("    Fix: pip install -U anneal-memory")
+    emit(f"    Then: anneal-memory --db {store} init --schema partnership")
     return False
 
 
-def _print_manifest(
+def _manifest_rows(
     install: Path, adapter: str, store: Path, store_ok: bool = True
-) -> None:
-    """List every file the install laid down — so the operator knows what
-    landed, that they can hand-edit it, and where to look before first launch.
+) -> list[tuple[str, Path]]:
+    """The (label, path) rows of files the install laid down, filtered to paths
+    that actually EXIST.
 
-    Built from the known install layout (the orchestrator controls exactly
-    what gets written), filtered to paths that actually exist so the
-    conditional seed copies and a failed store init drop out cleanly. Includes
-    the Codex global files (`hooks.json` / `config.toml`) since they live
-    outside the install dir but ARE created/modified by a codex install.
+    Pure — built from the known install layout (the orchestrator controls exactly
+    what gets written), so the conditional seed copies and a failed store init
+    drop out cleanly. Includes the Codex global files (`hooks.json` /
+    `config.toml`) since they live outside the install dir but ARE
+    created/modified by a codex install. Extracted from `_print_manifest` so a
+    web init can render the same file list as structured rows instead of stdout
+    text.
     """
-    print()
-    print("Files created (you can hand-edit any of these):")
-
     rows: list[tuple[str, Path]] = []
 
     seed = install / "seed"
@@ -729,12 +813,24 @@ def _print_manifest(
     if store_ok and store.exists():
         rows.append(("store", store))
 
-    present = [(label, path) for label, path in rows if path.exists()]
+    return [(label, path) for label, path in rows if path.exists()]
+
+
+def _print_manifest(
+    install: Path, adapter: str, store: Path, store_ok: bool = True
+) -> None:
+    """List every file the install laid down — so the operator knows what
+    landed, that they can hand-edit it, and where to look before first launch.
+    Renders `_manifest_rows` (the pure projection) to stdout."""
+    print()
+    print("Files created (you can hand-edit any of these):")
+
+    present = _manifest_rows(install, adapter, store, store_ok)
     width = max((len(label) for label, _ in present), default=0)
     for label, path in present:
         print(f"  {label:<{width}}  {path}")
 
-    if activation.is_dir():
+    if (install / "activation").is_dir():
         print()
         print(
             "  (activation/posture.md + activation/recency_directives.md are yours "
@@ -742,30 +838,40 @@ def _print_manifest(
         )
 
 
-def _print_next_steps(install: Path, adapter: str, store_ok: bool = True) -> None:
-    print()
-    print("=" * 60)
+def _next_steps_lines(install: Path, adapter: str, store_ok: bool = True) -> list[str]:
+    """The post-install next-steps banner as a list of lines (leading + trailing
+    blank included, so a plain print-each reproduces the CLI byte-for-byte).
+    Pure — extracted from `_print_next_steps` so a web init renders the same
+    guidance as structured lines."""
+    lines: list[str] = [""]
+    lines.append("=" * 60)
     if store_ok:
-        print("Install complete.")
+        lines.append("Install complete.")
     else:
-        print("Install PARTIAL — files laid down, store init FAILED. See above.")
-    print("=" * 60)
-    print(f"  Install:   {install}")
-    print(f"  Adapter:   {adapter}")
-    print()
-    print("Next steps:")
+        lines.append("Install PARTIAL — files laid down, store init FAILED. See above.")
+    lines.append("=" * 60)
+    lines.append(f"  Install:   {install}")
+    lines.append(f"  Adapter:   {adapter}")
+    lines.append("")
+    lines.append("Next steps:")
     if adapter == "claude-code":
-        print(f"  - Open in Claude Code:")
-        print(f"        cd {install} && claude")
+        lines.append("  - Open in Claude Code:")
+        lines.append(f"        cd {install} && claude")
     if adapter == "codex":
-        print(f"  - IMPORTANT — Codex hook trust is per-content-hash. The very")
-        print(f"    first invocation MUST be interactive `codex` (not `codex exec`)")
-        print(f"    so Codex can prompt to trust the hook scripts. Editing the")
-        print(f"    hook scripts invalidates trust until re-approved interactively.")
-        print(f"        cd {install} && codex")
-    print(f"  - Verify the install (loud):  levain doctor --path {install}")
-    print(f"  - Smoke-test the hooks:       levain verify-hooks --path {install}")
-    print(f"  - (`doctor` static-checks wiring; `verify-hooks` actually invokes the")
-    print(f"     hook scripts. The harness still has to invoke them — verify in an")
-    print(f"     interactive session.)")
-    print()
+        lines.append("  - IMPORTANT — Codex hook trust is per-content-hash. The very")
+        lines.append("    first invocation MUST be interactive `codex` (not `codex exec`)")
+        lines.append("    so Codex can prompt to trust the hook scripts. Editing the")
+        lines.append("    hook scripts invalidates trust until re-approved interactively.")
+        lines.append(f"        cd {install} && codex")
+    lines.append(f"  - Verify the install (loud):  levain doctor --path {install}")
+    lines.append(f"  - Smoke-test the hooks:       levain verify-hooks --path {install}")
+    lines.append("  - (`doctor` static-checks wiring; `verify-hooks` actually invokes the")
+    lines.append("     hook scripts. The harness still has to invoke them — verify in an")
+    lines.append("     interactive session.)")
+    lines.append("")
+    return lines
+
+
+def _print_next_steps(install: Path, adapter: str, store_ok: bool = True) -> None:
+    for line in _next_steps_lines(install, adapter, store_ok):
+        print(line)

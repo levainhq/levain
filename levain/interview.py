@@ -144,13 +144,18 @@ def parse_template(path: Path) -> TemplateSpec:
     preamble_for_slots = _ONBOARDING_BLURB_RE.sub("", preamble)
     preamble_slots = _unique_slots(preamble_for_slots)
     if preamble_slots:
+        # The preamble can carry its own `<!-- interview ... -->` comment too
+        # (origin.md has no `## ` sections — its entity fields live in the
+        # preamble), so extract guidance for it exactly as a `## ` section does.
+        guidance, hints, explicit_style = _parse_interview(preamble)
         sections.append(
             Section(
                 title="",
                 slots=preamble_slots,
-                guidance="",
-                hints="",
+                guidance=guidance,
+                hints=hints,
                 optional=False,
+                explicit_style=explicit_style,
             )
         )
 
@@ -168,21 +173,7 @@ def parse_template(path: Path) -> TemplateSpec:
             continue
 
         optional_match = OPTIONAL_RE.search(section_body)
-        interview_match = INTERVIEW_RE.search(section_body)
-        hints = ""
-        guidance = ""
-        explicit_style: str | None = None
-        if interview_match:
-            hints = re.sub(r"\s+", " ", interview_match.group(1)).strip()
-            # Strip a leading `style=X` tag before any other processing so
-            # it doesn't leak into the operator-facing guidance.
-            style_match = _STYLE_TAG_RE.match(hints)
-            if style_match:
-                explicit_style = style_match.group(1)
-                hints = hints[style_match.end():].strip()
-            # Drop the meta-parenthetical (`(elicit ... synthesize ...)`) +
-            # its colon so the operator sees only the question(s).
-            guidance = _LEADING_PAREN_COLON_RE.sub("", hints).lstrip(": ").strip()
+        guidance, hints, explicit_style = _parse_interview(section_body)
 
         sections.append(
             Section(
@@ -203,6 +194,34 @@ def parse_template(path: Path) -> TemplateSpec:
     spec = TemplateSpec(path=path, sections=sections, raw=text)
     _warn_on_unsplittable_multislot_sections(spec)
     return spec
+
+
+def _parse_interview(body: str) -> tuple[str, str, str | None]:
+    """Extract ``(guidance, hints, explicit_style)`` from a section/preamble
+    body's ``<!-- interview ... -->`` comment.
+
+    The single extraction used by BOTH a ``## `` section and the preamble (so
+    origin.md's title-less entity fields get guidance the same way a titled
+    section does). ``hints`` is the full comment body (kept for style detection,
+    which keys off the whole text); ``guidance`` is the operator-facing text with
+    a leading ``style=X`` tag and a leading meta-parenthetical stripped;
+    ``explicit_style`` is the ``style=X`` tag if present. Returns
+    ``("", "", None)`` when the body has no interview comment."""
+    m = INTERVIEW_RE.search(body)
+    if not m:
+        return "", "", None
+    hints = re.sub(r"\s+", " ", m.group(1)).strip()
+    explicit_style: str | None = None
+    # Strip a leading `style=X` tag before anything else so it doesn't leak into
+    # the operator-facing guidance.
+    style_match = _STYLE_TAG_RE.match(hints)
+    if style_match:
+        explicit_style = style_match.group(1)
+        hints = hints[style_match.end():].strip()
+    # Drop a leading meta-parenthetical (`(elicit ... synthesize ...)`) + its
+    # colon so the operator sees only the question(s).
+    guidance = _LEADING_PAREN_COLON_RE.sub("", hints).lstrip(": ").strip()
+    return guidance, hints, explicit_style
 
 
 def _warn_on_unsplittable_multislot_sections(spec: TemplateSpec) -> None:

@@ -888,3 +888,51 @@ def test_build_field_plan_matches_conduct_interview_walk_order(tmp_path: Path):
 
     conduct_interview([spec], input_fn=driver, output_fn=lambda s: None)
     assert asked == plan_slots
+
+
+def test_preamble_interview_guidance_extracted(tmp_path: Path):
+    # The preamble (slots before the first `## ` — origin.md's entity fields) can
+    # carry its own `<!-- interview -->` comment, parsed exactly like a section's,
+    # so its title-less slots get guidance instead of a bare slot name.
+    template = tmp_path / "origin.md"
+    template.write_text(
+        "# Who You Are — {{ENTITY_NAME}}\n\n"
+        "You run on {{SUBSTRATE}}.\n\n"
+        "<!-- interview: The name; The model it runs on; Your job -->\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    plan = build_field_plan([spec])
+    by = {f.slot: f for f in plan}
+    assert by["ENTITY_NAME"].section_title == ""        # preamble, no header
+    assert by["ENTITY_NAME"].guidance == "The name"     # per-slot split
+    assert by["SUBSTRATE"].guidance == "The model it runs on"
+
+
+def test_real_origin_template_entity_fields_have_guidance(tmp_path: Path):
+    # The shipped origin.md preamble now explains SUBSTRATE + JOB (gate feedback).
+    from levain.install import open_init_templates
+
+    with open_init_templates() as (_tr, specs):
+        plan = build_field_plan(specs)
+    by = {f.slot: f for f in plan}
+    assert "substrate" in by["SUBSTRATE"].guidance.lower()
+    assert by["JOB"].guidance != ""
+    assert by["SUBSTRATE"].style == "line"
+    assert by["JOB"].style == "line"
+
+
+def test_real_world_template_is_second_person(tmp_path: Path):
+    # Gate feedback: the operator sections address the operator as "you", not "they".
+    from levain.install import open_init_templates
+
+    with open_init_templates() as (_tr, specs):
+        plan = build_field_plan(specs)
+    by = {f.slot: f for f in plan}
+    # the section header was renamed They→You
+    assert any(f.section_title == "How You Think" for f in plan)
+    assert "How They Think" not in {f.section_title for f in plan}
+    # the Identity per-field guidance is second-person + properly cased
+    assert by["OPERATOR_NAME"].guidance == "Your full name"
+    assert by["ROLES"].style == "bullet"        # style keyword preserved
+    assert by["AGE"].style == "optional-line"   # style keyword preserved

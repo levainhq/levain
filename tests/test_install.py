@@ -756,14 +756,17 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
             f.slot: f"VAL_{f.slot}"
             for f in build_field_plan([spec_world, spec_origin])
         }
-        ok = apply_init(
+        result = apply_init(
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
         )
         # "Verbatim" means byte-identical to the template source — pin it.
         src_partnership = (templates_root / "seed" / "partnership.md").read_bytes()
 
-    assert ok is True
+    assert result.store_ok is True
+    assert result.install == install
+    assert result.adapter == "claude-code"
+    assert result.complete is True
     # Seed rendered from answers — values substituted, no leftover slots.
     world = (install / "seed" / "world.md").read_text(encoding="utf-8")
     assert "{{" not in world
@@ -795,11 +798,12 @@ def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
     with _templates_root() as templates_root:
         spec_world = parse_template(templates_root / "seed" / "world.md")
         spec_origin = parse_template(templates_root / "seed" / "origin.md")
-        ok = apply_init(
+        result = apply_init(
             install, "claude-code", {}, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
         )
-    assert ok is False
+    assert result.store_ok is False
+    assert result.complete is False
     # Even on store failure, the seed + adapter were written (the store is the
     # last step; partial-install reporting is the caller's job).
     assert (install / "seed" / "world.md").is_file()
@@ -830,12 +834,13 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
             f.slot: f"VAL_{f.slot}"
             for f in build_field_plan([spec_world, spec_origin])
         }
-        ok = apply_init(
+        result = apply_init(
             install, "codex", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
         )
 
-    assert ok is True
+    assert result.store_ok is True
+    assert result.adapter == "codex"
     # codex adapter wiring: AGENTS.md in the install, the activation tree, and
     # the global codex config under the redirected CODEX_HOME.
     assert (install / "AGENTS.md").is_file()
