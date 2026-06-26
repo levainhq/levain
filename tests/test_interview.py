@@ -18,6 +18,7 @@ from levain.interview import (
     _prompt_for_slot,
     _split_guidance,
     _unique_slots,
+    build_field_plan,
     conduct_interview,
     parse_template,
     render_template,
@@ -709,3 +710,181 @@ def test_conduct_interview_return_to_bailed_field_restores_section_context(tmp_p
     assert answers == {"NAME": "a2", "CITY": "b1"}
     second_headers = [line for line in out if line.strip().startswith("## Second")]
     assert len(second_headers) >= 2  # first arrival + the re-orient on return
+
+
+# ---------- build_field_plan: the shared field-plan seam (spore-181) ----------
+
+def _three_line_spec(tmp_path: Path):
+    template = tmp_path / "three.md"
+    template.write_text(
+        "# T\n\n"
+        "## A\n\n<!-- interview: their name -->\n\n{{NAME}}\n\n"
+        "## B\n\n<!-- interview: their city -->\n\n{{CITY}}\n\n"
+        "## C\n\n<!-- interview: their role -->\n\n{{ROLE}}\n",
+        encoding="utf-8",
+    )
+    return parse_template(template)
+
+
+def test_build_field_plan_ordered_slots(tmp_path: Path):
+    plan = build_field_plan([_three_line_spec(tmp_path)])
+    assert [f.slot for f in plan] == ["NAME", "CITY", "ROLE"]
+    assert all(f.style == "line" for f in plan)
+    assert plan[0].section_title == "A"
+    assert plan[0].spec_name == "three.md"
+    # Each line-slot is its own single-slot section → distinct indices, each
+    # first_in_section, no pre-fill, section guidance carried.
+    assert [f.section_index for f in plan] == [0, 1, 2]
+    assert all(f.first_in_section for f in plan)
+    assert all(f.current == "" for f in plan)
+    assert plan[0].section_guidance == "their name"
+
+
+def test_build_field_plan_prefills_current_without_excluding(tmp_path: Path):
+    # The web-form contract (NOT the terminal's exclude-answered): every field is
+    # rendered, and `values` pre-fills `current`. An already-valued slot stays in
+    # the plan, carrying its value — it does NOT vanish.
+    plan = {f.slot: f for f in build_field_plan(
+        [_three_line_spec(tmp_path)], values={"CITY": "Columbus"}
+    )}
+    assert set(plan) == {"NAME", "CITY", "ROLE"}  # nothing excluded
+    assert plan["CITY"].current == "Columbus"
+    assert plan["NAME"].current == ""
+
+
+def test_build_field_plan_dedupes_shared_slot_across_specs(tmp_path: Path):
+    a = tmp_path / "a.md"
+    a.write_text("# A\n\n## S\n\n<!-- interview: name -->\n\n{{NAME}}\n", encoding="utf-8")
+    b = tmp_path / "b.md"
+    b.write_text(
+        "# B\n\n## S\n\n<!-- interview: name; city -->\n\n{{NAME}} {{CITY}}\n",
+        encoding="utf-8",
+    )
+    plan = build_field_plan([parse_template(a), parse_template(b)])
+    # NAME asked once (first spec); CITY from the second spec only.
+    assert [f.slot for f in plan] == ["NAME", "CITY"]
+    assert plan[0].spec_name == "a.md"
+    assert plan[1].spec_name == "b.md"
+    # Both sections are titled "S" but are DIFFERENT objects → distinct
+    # section_index (the title-collision fix — a grouped renderer keying on
+    # title alone would wrongly merge them).
+    assert plan[0].section_index != plan[1].section_index
+
+
+def test_build_field_plan_multislot_guidance_and_grouping(tmp_path: Path):
+    # A multi-slot section: per-slot `guidance` holds the SPLIT clause, while
+    # `section_guidance` holds the FULL string (shown once); both slots share one
+    # section_index, and first_in_section marks only the first.
+    template = tmp_path / "multi.md"
+    template.write_text(
+        "# T\n\n## Identity\n\n<!-- interview: full name; city of residence -->\n\n"
+        "{{NAME}} {{CITY}}\n",
+        encoding="utf-8",
+    )
+    plan = build_field_plan([parse_template(template)])
+    assert [f.slot for f in plan] == ["NAME", "CITY"]
+    assert plan[0].guidance == "full name"
+    assert plan[1].guidance == "city of residence"
+    assert plan[0].section_guidance == plan[1].section_guidance == "full name; city of residence"
+    assert plan[0].section_index == plan[1].section_index
+    assert plan[0].first_in_section is True
+    assert plan[1].first_in_section is False
+
+
+def test_build_field_plan_single_slot_guidance_is_empty_clause(tmp_path: Path):
+    # Single-slot section: no per-slot clause to split → `guidance` is "" and the
+    # whole guidance lives in `section_guidance` (so a renderer shows it once, not
+    # duplicated onto the lone field).
+    plan = build_field_plan([_three_line_spec(tmp_path)])
+    assert plan[0].guidance == ""
+    assert plan[0].section_guidance == "their name"
+
+
+def test_build_field_plan_optional_line_style(tmp_path: Path):
+    # optional-line is the one style with its own regex path in _detect_input_style
+    # — pin that it resolves through the shared seam.
+    template = tmp_path / "optline.md"
+    template.write_text(
+        "# T\n\n## Identity\n\n"
+        "<!-- interview: full name; age (optional — omit if unknown) -->\n\n"
+        "{{NAME}} {{AGE}}\n",
+        encoding="utf-8",
+    )
+    plan = {f.slot: f for f in build_field_plan([parse_template(template)])}
+    assert plan["AGE"].style == "optional-line"
+    assert plan["NAME"].style == "line"
+
+
+def test_build_field_plan_preamble_section(tmp_path: Path):
+    # A template whose TITLE line holds a slot (origin.md's
+    # `# Who You Are — {{ENTITY_NAME}}`) → a title="" preamble section. The
+    # docstring claims section_title=="" here; pin it.
+    template = tmp_path / "origin.md"
+    template.write_text(
+        "# Who You Are — {{ENTITY_NAME}}\n\n"
+        "## Body\n\n<!-- interview: a note -->\n\n{{NOTE}}\n",
+        encoding="utf-8",
+    )
+    plan = build_field_plan([parse_template(template)])
+    assert plan[0].slot == "ENTITY_NAME"
+    assert plan[0].section_title == ""
+    assert plan[0].first_in_section is True
+
+
+def test_build_field_plan_resolves_styles(tmp_path: Path):
+    template = tmp_path / "styles.md"
+    template.write_text(
+        "# T\n\n"
+        "## Name\n\n<!-- interview: their name -->\n\n{{NAME}}\n\n"
+        "## Bio\n\n<!-- interview: write a paragraph of prose -->\n\n{{BIO}}\n\n"
+        "## Skills\n\n<!-- interview: a bulleted list, one line each -->\n\n{{SKILLS}}\n\n"
+        "## Tag\n\n<!-- interview style=prose: anything -->\n\n{{TAG}}\n",
+        encoding="utf-8",
+    )
+    plan = {f.slot: f.style for f in build_field_plan([parse_template(template)])}
+    assert plan == {"NAME": "line", "BIO": "prose", "SKILLS": "bullet", "TAG": "prose"}
+
+
+def test_build_field_plan_carries_optional_flag(tmp_path: Path):
+    template = tmp_path / "opt.md"
+    template.write_text(
+        "# T\n\n"
+        "## Core\n\n<!-- interview: name -->\n\n{{NAME}}\n\n"
+        "## Extra\n\n<!-- optional: only if relevant -->\n"
+        "<!-- interview: a note -->\n\n{{NOTE}}\n",
+        encoding="utf-8",
+    )
+    plan = {f.slot: f for f in build_field_plan([parse_template(template)])}
+    assert plan["NAME"].optional is False
+    assert plan["NOTE"].optional is True
+    assert plan["NOTE"].optional_reason == "only if relevant"
+
+
+def test_build_field_plan_does_not_mutate_values(tmp_path: Path):
+    values = {"NAME": "Alex"}
+    build_field_plan([_three_line_spec(tmp_path)], values=values)
+    assert values == {"NAME": "Alex"}  # caller's dict untouched
+
+
+def test_build_field_plan_empty_specs():
+    assert build_field_plan([]) == []
+
+
+def test_build_field_plan_matches_conduct_interview_walk_order(tmp_path: Path):
+    # DRIFT-LOCK: the plan's order MUST equal the order conduct_interview
+    # actually prompts (the seam's whole reason for existing). Line-style slots
+    # appear verbatim in the "  {slot}: " input prompt, so we can record the
+    # real walk order and assert it against build_field_plan.
+    spec = _three_line_spec(tmp_path)
+    plan_slots = [f.slot for f in build_field_plan([spec])]
+    asked: list[str] = []
+
+    def driver(prompt: str) -> str:
+        for s in plan_slots:
+            if f"  {s}: " == prompt and s not in asked:
+                asked.append(s)
+                break
+        return "x"
+
+    conduct_interview([spec], input_fn=driver, output_fn=lambda s: None)
+    assert asked == plan_slots
