@@ -79,7 +79,13 @@ from pathlib import Path
 from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.writes import MAX_BODY_BYTES, EditError, apply_edit
+from levain.writes import (
+    MAX_BODY_BYTES,
+    ActionVerb,
+    EditError,
+    apply_action,
+    apply_edit,
+)
 
 __all__ = [
     "DEFAULT_HOST",
@@ -151,6 +157,44 @@ _CSP = (
 # The actual bound address is added to this set in ``make_server``. (Lowercase —
 # the Host check normalizes case before comparing, per RFC 7230 §2.7.3.)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def host_header_allowed(
+    raw_host: str | None, allowed_hosts: "frozenset[str] | set[str]"
+) -> bool:
+    """True iff a request's raw ``Host`` header names one of ``allowed_hosts``.
+
+    The SECURITY-CRITICAL DNS-rebinding parse, factored out so the dashboard
+    server (``_Handler._host_ok``) and the standalone init server
+    (``levain.init_server``) share ONE implementation and can never DIVERGE on it
+    — a divergence here is a rebinding read-disclosure hole, exactly the class a
+    shared structural invariant beats per-surface discipline at. Strict RFC-7230:
+    absent Host → refuse (fail-closed); a bracketed IPv6 literal must be
+    well-formed (``[host]`` optionally ``:port``); a non-bracket Host with a ``:``
+    must carry a clean numeric port; the hostname is normalized (trailing FQDN dot
+    dropped, case-folded) before the allowlist compare. So neither ``LOCALHOST``
+    false-rejects nor ``[::1]evil`` / a junk ``:`` port sneaks through."""
+    if raw_host is None:
+        return False  # HTTP/1.1 requires a Host; absent = refuse (fail-closed)
+    host = raw_host.strip()
+    if host.startswith("["):  # bracketed IPv6 literal: [::1] or [::1]:port
+        end = host.find("]")
+        if end == -1:
+            return False  # unterminated bracket
+        hostname = host[1:end]
+        rest = host[end + 1 :]
+        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
+            return False  # junk after the bracket (e.g. "[::1]evil")
+    else:
+        head_part, sep, port = host.rpartition(":")
+        if sep:
+            if not port.isdigit():
+                return False  # a ":" that isn't a clean numeric port → malformed
+            hostname = head_part
+        else:
+            hostname = host  # bare host, no port
+    hostname = hostname.rstrip(".").lower()
+    return hostname in allowed_hosts
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -252,6 +296,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/substrate.json",
     "/recall.json",
     "/edit",
+    "/action",
 }
 
 
@@ -419,6 +464,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # base product injects nothing. Generic by design (a `kind:"external"` panel of titled
     # lines) so the kernel stays domain-agnostic — the flow Bridge injects its inbox here.
     extra_panels: "Callable[[], list[dict]] | None"
+    # Downstream-registered governed ACTION verbs (the write-peer of extra_panels): a
+    # name → ActionVerb registry the POST /action route dispatches to. Empty on the base
+    # product. Present ONLY on a WRITABLE source (make_server enforces it), so the off-box
+    # write-token gate — keyed on write_scope — already governs /action with no second path.
+    extra_verbs: dict[str, ActionVerb]
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -484,33 +534,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         Closes DNS-rebinding read-disclosure: bind-localhost stops network peers,
         but a hostile page that rebinds its own name to 127.0.0.1 still sends its
-        own ``Host``, so a loopback-only allowlist refuses it (403). Parsing is
-        strict (RFC 7230): the Host is normalized (trim, case-fold, drop the
-        trailing FQDN dot) before comparison, and a bracketed-IPv6 form must be
-        well-formed (``[host]`` optionally ``:port``) or it's refused — so neither
-        ``LOCALHOST`` false-rejects nor ``[::1]evil`` sneaks through."""
-        host = self.headers.get("Host")
-        if host is None:
-            return False  # HTTP/1.1 requires a Host; absent = refuse (fail-closed)
-        host = host.strip()
-        if host.startswith("["):  # bracketed IPv6 literal: [::1] or [::1]:port
-            end = host.find("]")
-            if end == -1:
-                return False  # unterminated bracket
-            hostname = host[1:end]
-            rest = host[end + 1 :]
-            if rest and not (rest.startswith(":") and rest[1:].isdigit()):
-                return False  # junk after the bracket (e.g. "[::1]evil")
-        else:
-            head_part, sep, port = host.rpartition(":")
-            if sep:
-                if not port.isdigit():
-                    return False  # a ":" that isn't a clean numeric port → malformed
-                hostname = head_part
-            else:
-                hostname = host  # bare host, no port
-        hostname = hostname.rstrip(".").lower()
-        return hostname in self.server.allowed_hosts
+        own ``Host``, so a loopback-only allowlist refuses it (403). The strict
+        RFC-7230 parse lives in the shared ``host_header_allowed`` so this surface
+        and the standalone init server can't diverge on it."""
+        return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     def _write_token_required(self) -> bool:
         """True iff a write to this surface must carry ``X-Levain-Write-Token`` — i.e. the
@@ -720,8 +747,13 @@ class _Handler(BaseHTTPRequestHandler):
             return self._reject(
                 415, "unsupported_media_type", "Content-Type must be application/json"
             )
-        # Exactly one write route.
-        if self.path.split("?", 1)[0] != "/edit":
+        # The write routes: substrate edits (/edit) + governed channel actions (/action).
+        # Both ride this ONE auth gate above (Host → CSRF → off-box token → Content-Type) —
+        # /action carries no second, weaker auth path. The off-box token check keys on
+        # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
+        # the spore-129 governance already covers /action with no change here.
+        route = self.path.split("?", 1)[0]
+        if route not in ("/edit", "/action"):
             return self._reject(404, "not_found", "no such route")
         # Content-Length: required + numeric (checked before reading a byte).
         clen_raw = self.headers.get("Content-Length")
@@ -769,7 +801,10 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 return
             try:
-                result = apply_edit(scope, req)
+                if route == "/edit":
+                    result = apply_edit(scope, req)
+                else:  # /action — governed channel-verb dispatch (the write-peer of extra_panels)
+                    result = apply_action(scope, self.server.extra_verbs, req)
             except EditError as exc:
                 self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -797,6 +832,7 @@ def make_server(
     extra_assets: Mapping[str, tuple[str, bytes]] | None = None,
     extra_json: Mapping[str, Callable[[], bytes]] | None = None,
     extra_panels: "Callable[[], list[dict]] | None" = None,
+    extra_verbs: "Mapping[str, ActionVerb] | None" = None,
     write_token: str | None = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
@@ -862,7 +898,11 @@ def make_server(
         # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
         # the off-box governance factor that replaces loopback-is-auth. Without one it stays
         # loopback-only (its no-token localhost-sovereign POST /edit boundary assumes loopback).
-        if source.write_scope is not None and write_token is None:
+        # `not write_token` (not `is None`): an EMPTY-string token must also refuse the bind, not
+        # bind-then-brick. The per-request gate already treats "" as no-token (`not expected` →
+        # 403), so without this an off-box writable bind with write_token="" would pass here and
+        # then 403 every write — a silently bricked surface instead of a clean refusal [L2 LOW].
+        if source.write_scope is not None and not write_token:
             raise ValueError(
                 f"refusing to bind {host!r}: a WRITABLE substrate may bind a non-loopback "
                 "(private-mesh / Tailscale) address ONLY with a write_token — the off-box "
@@ -941,6 +981,28 @@ def make_server(
     if extra_panels is not None and not callable(extra_panels):
         raise ValueError("extra_panels must be a zero-arg callable returning a list of panels.")
 
+    # Governed action verbs (the POST /action seam — the write-peer of extra_panels): a
+    # name → ActionVerb registry. REQUIRE a writable source: actions are mutations, and tying
+    # them to write_scope means the off-box write-token governance (the bind-refusal above + the
+    # per-request gate, both keyed on write_scope) already covers /action with NO second auth
+    # path (structural_invariants_beat_discipline). Validate the registry shape at registration
+    # so a bug surfaces here, not as a 500 at request time.
+    extra_verbs = dict(extra_verbs or {})
+    if extra_verbs:
+        if source.write_scope is None:
+            raise ValueError(
+                "refusing extra_verbs: action verbs are mutations and require a WRITABLE source "
+                "(write_scope) — a read-only source has no governed write/audit path for them."
+            )
+        for name, spec in extra_verbs.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"refusing action verb {name!r}: name must be a non-empty string.")
+            if not isinstance(spec, ActionVerb):
+                raise ValueError(
+                    f"refusing action verb {name!r}: value must be an ActionVerb "
+                    "(handler, confirm_required, label)."
+                )
+
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
@@ -948,6 +1010,7 @@ def make_server(
     httpd.extra_assets = extra_assets
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
+    httpd.extra_verbs = extra_verbs
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the token-free localhost-sovereign path is
@@ -955,19 +1018,53 @@ def make_server(
     # above already guaranteed a writable off-loopback source was given one).
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
     httpd.write_token = write_token
+    # GENERAL post-bind reality check (codex L3): the pre-bind refusal rejects a wildcard/PUBLIC
+    # *requested* host, but the ACTUAL bound address can still be wildcard/public via a resolver
+    # surprise (a hosts-file/DNS mapping of a loopback-CLASSIFIED name to such an address) — for
+    # ANY source class, including a read-only or token'd one the specific checks below don't cover.
+    # Serving flow's substrate on 0.0.0.0 / a public IP is the catastrophic case the whole bind
+    # refusal exists to prevent, so verify the BOUND address and refuse it universally. (Private /
+    # CGNAT-mesh addresses — Tailscale 100.64/10 — are is_global False, so a legit mesh bind passes.)
+    try:
+        _bound_ip = ipaddress.ip_address(str(httpd.server_address[0]))
+        _disallowed_bound = _bound_ip.is_unspecified or _bound_ip.is_global
+    except ValueError:
+        _disallowed_bound = False  # a non-IP bound address (unix socket etc.) — not this concern
+    if _disallowed_bound:
+        bound = str(httpd.server_address[0])
+        httpd.server_close()
+        raise ValueError(
+            f"refusing to serve: requested host {host!r} bound a wildcard/public address "
+            f"({bound}). Verify the ACTUAL bound address, never trust the resolver — bind an "
+            "explicit loopback or private-mesh interface."
+        )
     # POST-BIND reality check (codex L3 MED): the bind-refusal above validates the REQUESTED
     # host string, but a loopback-CLASSIFIED host that RESOLVES off-box (e.g. a tampered/odd
     # hosts file mapping 'localhost' to a non-loopback IP the box holds) would bind off-loopback
-    # with is_loopback_bind False. For an INSTALL-bearing source that means its operator-private
-    # seed/config becomes READABLE off-box via GET (writes already token-gate / 422). Re-verify
-    # against the ACTUAL bound address and refuse — verify-the-bound-address, don't trust the
-    # resolver (the same structural discipline the flow Bridge applies at its own exposure point).
-    if _is_install_bearing(source) and not httpd.is_loopback_bind:
+    # with is_loopback_bind False. Re-verify against the ACTUAL bound address and refuse —
+    # verify-the-bound-address, don't trust the resolver (the same structural discipline the flow
+    # Bridge applies at its own exposure point). Two cases the actual-address check closes:
+    #   (a) an INSTALL-bearing source → its operator-private seed/config is READABLE off-box via GET;
+    #   (b) a WRITABLE (non-install) source given NO token → it was meant to be the token-free
+    #       loopback-sovereign write path, but resolved off-box, so its substrate reads (and the
+    #       /action verbs) would be served off-box without the token the off-box factor requires
+    #       (writes still token-gate / 422, but the GET read path does not) [L2 LOW]. A writable
+    #       source WITH a token is a legitimate off-box mesh bind — not refused here.
+    if not httpd.is_loopback_bind and (
+        _is_install_bearing(source)
+        or (source.write_scope is not None and not write_token)
+    ):
+        bound = str(httpd.server_address[0])
         httpd.server_close()
+        why = ("an install-bearing source's seed/config is operator-private (loopback-only)"
+               if _is_install_bearing(source)
+               else "a writable source without a write_token is loopback-only (its reads + "
+                    "action verbs must not be served off-box without the off-box token factor)")
         raise ValueError(
             f"refusing to serve: requested host {host!r} bound a non-loopback address "
-            f"({str(httpd.server_address[0])}), but an install-bearing source's seed/config is "
-            "operator-private (loopback-only). Bind an explicit loopback address."
+            f"({bound}), but {why}. Bind an explicit loopback address"
+            + ("" if _is_install_bearing(source) else " or pass a write_token for an off-box bind")
+            + "."
         )
     # Allow the loopback names + the exact bound address (covers a 127.0.0.x bind),
     # normalized lowercase to match the Host check; any other Host is refused.

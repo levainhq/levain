@@ -28,6 +28,10 @@ Contract surface:
                                NOT in the contract: an N-of-1 / aggregated source has no
                                single install path (same axis as run_curses-vs-run_tui).
   - governed verb-dispatch   : WriteScope, apply_edit, EditError
+  - governed ACTION-dispatch : ActionVerb, apply_action — the write-peer of extra_panels;
+                               a downstream registers ``make_server(extra_verbs=...)`` to
+                               steer flow's N-of-1 channels (inbox/relay/...) through the
+                               same auth + confirm + audit envelope as ``POST /edit``.
 
 This module is a pure re-export façade: it adds NO logic (the moat stays
 substrate-side), it only publishes the contract. Adding to the kernel = adding a
@@ -51,7 +55,7 @@ from levain.dashboard import (
     build_substrate_view,
 )
 from levain.web_server import make_server
-from levain.writes import EditError, WriteScope, apply_edit
+from levain.writes import ActionVerb, EditError, WriteScope, apply_action, apply_edit
 
 __all__ = [
     # data model + render-prep
@@ -67,4 +71,7 @@ __all__ = [
     "WriteScope",
     "apply_edit",
     "EditError",
+    # governed action-dispatch (the write-peer of extra_panels)
+    "ActionVerb",
+    "apply_action",
 ]

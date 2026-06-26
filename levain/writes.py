@@ -83,7 +83,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast
 
 from anneal_memory import (  # the SHARED cross-process continuity lock
     ContinuityLockUnavailable,
@@ -106,7 +106,9 @@ if TYPE_CHECKING:
 __all__ = [
     "EditError",
     "WriteScope",
+    "ActionVerb",
     "apply_edit",
+    "apply_action",
     "recent_edits",
     "MAX_BODY_BYTES",
     "MAX_NAME_LEN",
@@ -204,6 +206,42 @@ class EditError(Exception):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+
+
+@dataclass(frozen=True)
+class ActionVerb:
+    """One registered governed action verb for the ``POST /action`` seam — a downstream
+    control plane (the flow Bridge) registers a ``name → ActionVerb`` so the kernel can
+    GOVERN dispatch (auth → confirm → audit) while the handler does the domain work. The
+    write-peer of the read-only ``extra_panels`` seam: the kernel stays domain-agnostic;
+    the verb operates flow's N-of-1 channels (inbox / relay / consult), which never live
+    in the kernel (``dogfood_discriminator``). Action verbs require a WRITABLE source —
+    they are mutations, so the off-box write-token governance already covers ``/action``
+    with no second auth path (``structural_invariants_beat_discipline``).
+
+    - ``handler`` — ``(params: dict) -> dict``. The domain action (e.g. send an inbox
+      message). Called ONLY after the kernel's auth + confirm gate. Returns a JSON-able
+      result dict (a ``summary: str`` is recorded in the audit trail). Error signalling:
+      raise an ``EditError`` for a TYPED pre-execution refusal (e.g. bad input → it picks
+      its own 4xx status, and — by this contract, raised BEFORE any side effect — nothing is
+      audited); raise ANY OTHER exception for an execution failure (the kernel audits the
+      attempt + surfaces a clean 502, never a traceback). The handler must NOT return content
+      that shouldn't be logged via ``summary``, and SHOULD bound its own I/O (it runs inside
+      the server's concurrency gate; a long action must be async/job-based, not a blocking call).
+    - ``confirm_required`` — when True (the safe default) the kernel REFUSES (409, NO
+      execution, NO audit — nothing happened) a request lacking ``confirm: true``; the
+      structural fat-finger / speak-FOR-not-AS guard for an outbound or destructive verb.
+      NOTE this is a FAT-FINGER guard, NOT an at-most-once guard: the seam does NOT dedupe a
+      replayed ``confirm: true`` request (a tailnet retry of a non-idempotent POST re-runs the
+      handler). For ``send_inbox`` a replay is a harmless duplicate message; the FIRST
+      irreversible verb (relay / consult) MUST add an idempotency key (a client-supplied id
+      recorded in the receipt + deduped) — the same at-most-once discipline the vagus efferent
+      gate uses. Until then, handlers should be idempotent / replay-tolerant.
+    - ``label`` — a short human label for the audit trail + the operator affordance."""
+
+    handler: Callable[[dict[str, Any]], dict[str, Any]]
+    confirm_required: bool = True
+    label: str = ""
 
 
 @contextmanager
@@ -576,6 +614,103 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
         if kind == "undo":
             return _apply_undo(scope, req, now)
     raise EditError("bad_kind", 400, f"unknown edit kind {kind!r}")
+
+
+def _action_record(edit_id: str, verb: str, label: str, now: str | None,
+                   *, outcome: str, detail: str | None) -> dict[str, Any]:
+    """The receipt-shaped audit record for a governed action — the 'Bridge write outcome'
+    trace face of the DecisionInfluenceReceipt. ``actor: operator`` because a Bridge action
+    is HUMAN-initiated (the operator clicked it; no autonomous trust ladder, unlike the
+    vagus efferent gate); ``kind: action`` + ``outcome`` bind the record to what ACTUALLY
+    happened (anti-spoofing). Same shape family as ``_audit_verb``'s record so the existing
+    ``recent_edits`` reader renders it (``undoable: False`` — a sent message has no undo)."""
+    return {
+        "id": edit_id,
+        "ts": _now_iso(now),
+        "kind": "action",
+        "action": verb,
+        "source": f"action:{verb}",
+        "label": label,
+        "actor": "operator",
+        "outcome": outcome,
+        "detail": detail,
+        "heading": None,
+        "undoable": False,
+    }
+
+
+def _best_effort_action_audit(ledger_root: Path, record: dict[str, Any]) -> None:
+    """Append the action receipt, single-writer. BEST-EFFORT by design: the handler has
+    already run by the time we audit (the side effect happened or definitively failed), so
+    a failed ledger append must NOT change the reported outcome / make the operator retry an
+    already-sent message — warn (surfaces in the server log) and move on. Mirrors the
+    ``_audit_verb`` best-effort discipline, one layer out."""
+    with _WRITE_LOCK:  # hold the lock only for the brief append, NOT the (possibly slow) handler
+        try:
+            _append_audit(ledger_root, record)
+        except OSError as exc:
+            warnings.warn(
+                f"action {record.get('action')!r} ran ({record.get('outcome')}) but its "
+                f"audit append failed ({exc}); the receipt line is skipped, the outcome stands",
+                RuntimeWarning, stacklevel=2,
+            )
+
+
+def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
+                 req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+    """Dispatch ONE governed operator action described by ``req`` against a registered verb.
+    The kernel GOVERNS (validate → confirm-gate → execute → audit-receipt); the verb's
+    ``handler`` does the domain work. Returns a result dict; raises ``EditError`` (HTTP-
+    mapped, so the server's existing ``except EditError`` handles it) on refusal or failure.
+
+    ``req``: ``{"verb": str, "params": dict?, "confirm": bool?}``. Unknown verb → 404; a
+    ``confirm_required`` verb without ``confirm: true`` → 409 (NO execution, NO audit —
+    nothing happened); a handler that raises → the attempt is AUDITED (outcome "error") then
+    surfaced as 502 (the receipt binds to what actually happened — NO-THEATER; a rendered
+    confirmation never stands in for a real outcome). The handler runs OUTSIDE the write lock
+    (it may be slow / network-bound — a long action must not block substrate edits); only the
+    audit append is serialized."""
+    if not isinstance(req, dict):
+        raise EditError("bad_request", 400, "request must be a JSON object")
+    verb = req.get("verb")
+    if not isinstance(verb, str) or verb not in registry:
+        raise EditError("unknown_verb", 404, f"no such action verb: {verb!r}")
+    spec = registry[verb]
+    if spec.confirm_required and req.get("confirm") is not True:
+        # NO execution, NO audit — the action did not happen; the operator must confirm.
+        raise EditError("confirm_required", 409, f"action {verb!r} requires confirm:true")
+    # params: distinguish OMITTED (→ {}) from PRESENT-but-malformed (→ 400). A mutation seam must
+    # not silently coerce a malformed params to {} — for a future verb with optional/default
+    # params that would turn malformed JSON into a valid default action [codex L3].
+    if "params" not in req:
+        params: dict[str, Any] = {}
+    elif isinstance(req["params"], dict):
+        params = req["params"]
+    else:
+        raise EditError("bad_request", 400, "'params' must be a JSON object")
+    edit_id = uuid.uuid4().hex[:12]
+    try:
+        result = spec.handler(params)   # lock-free: may be slow / network-bound
+    except EditError:
+        # A TYPED refusal the handler chose (e.g. bad input → 400). By contract a handler raises
+        # EditError BEFORE any side effect (input validation), so — like the confirm-required
+        # refusal — nothing happened and there is nothing to audit. Re-raise as-is; the handler
+        # picked its own status (a 4xx client error, distinct from a 502 execution failure).
+        raise
+    except Exception as exc:  # noqa: BLE001 — any OTHER handler fault → audit the attempt + 502
+        _best_effort_action_audit(scope.ledger_root, _action_record(
+            edit_id, verb, spec.label, now, outcome="error", detail=type(exc).__name__))
+        raise EditError("action_failed", 502,
+                        f"action {verb!r} failed: {type(exc).__name__}") from exc
+    if not isinstance(result, dict):
+        _best_effort_action_audit(scope.ledger_root, _action_record(
+            edit_id, verb, spec.label, now, outcome="error", detail="bad_handler_result"))
+        raise EditError("action_failed", 502, f"action {verb!r} returned a non-dict result")
+    summary = result.get("summary")
+    _best_effort_action_audit(scope.ledger_root, _action_record(
+        edit_id, verb, spec.label, now, outcome="ok",
+        detail=summary if isinstance(summary, str) else None))
+    return {"ok": True, "id": edit_id, "verb": verb, "outcome": "ok", "result": result}
 
 
 def _require_str(req: dict[str, Any], field: str) -> str:

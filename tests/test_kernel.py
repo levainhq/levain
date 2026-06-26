@@ -27,6 +27,8 @@ CONTRACT = {
     "WriteScope",
     "apply_edit",
     "EditError",
+    "ActionVerb",
+    "apply_action",
 }
 
 
@@ -66,6 +68,15 @@ class TestKernelIdentity:
         assert kernel.apply_edit is writes.apply_edit
         assert kernel.EditError is writes.EditError
 
+    def test_action_seam_is_from_writes(self) -> None:
+        from levain import writes
+
+        # the governed ACTION-dispatch seam (the write-peer of extra_panels) — a downstream
+        # registers verbs via make_server(extra_verbs=...) and the kernel dispatches them
+        # through POST /action under the same auth+confirm+audit envelope as apply_edit.
+        assert kernel.ActionVerb is writes.ActionVerb
+        assert kernel.apply_action is writes.apply_action
+
     def test_web_driver_is_from_web_server(self) -> None:
         from levain import web_server
 
@@ -102,6 +113,13 @@ class TestKernelContractDepth:
         params = inspect.signature(kernel.make_server).parameters
         assert "extra_assets" in params
         assert "extra_json" in params
+
+    def test_make_server_accepts_extra_verbs(self) -> None:
+        # The kernel's web seam carries the governed-ACTION extension point (the write-peer
+        # of extra_panels) a downstream control plane registers steer-verbs through —
+        # without it the only way to add a channel action is a second write route.
+        params = inspect.signature(kernel.make_server).parameters
+        assert "extra_verbs" in params
 
 
 class TestKernelEncapsulation:
