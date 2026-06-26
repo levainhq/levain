@@ -66,6 +66,36 @@ def main(argv: list[str] | None = None) -> int:
             "to avoid clobbering an existing install."
         ),
     )
+    init_p.add_argument(
+        "--web",
+        action="store_true",
+        help=(
+            "Run onboarding in the browser instead of the terminal: serve a "
+            "one-page, pre-filled form on localhost (loopback-only). The form "
+            "collects the same interview the CLI does and runs the identical "
+            "install on submit."
+        ),
+    )
+    init_p.add_argument(
+        "--port",
+        type=int,
+        default=7430,
+        help="Port for `--web` to bind on localhost (default: 7430).",
+    )
+    init_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Loopback address for `--web` to bind (default: 127.0.0.1). "
+            "Onboarding is loopback-only — a non-loopback address is refused."
+        ),
+    )
+    init_p.add_argument(
+        "--no-open",
+        action="store_true",
+        dest="no_open",
+        help="With `--web`, do not open a browser tab on startup.",
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -240,6 +270,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    if args.web:
+        from levain.init_server import run_init_web
+
+        return run_init_web(
+            path=args.path,
+            adapter=args.adapter,
+            force=args.force,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+
     from levain.install import run_init
 
     return run_init(path=args.path, adapter=args.adapter, force=args.force)
