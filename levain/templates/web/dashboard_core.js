@@ -1666,8 +1666,40 @@
   }
   // [ACTION-EXTRACT-END]
 
+  // A client-supplied idempotency key for an irreversible verb (the at-most-once retry token).
+  // crypto.randomUUID in a secure context (localhost / Tailscale-Serve HTTPS); a getRandomValues
+  // hex fallback otherwise. Generated ONCE per compose-box instance (below) and reused across any
+  // retry of THIS send — a successful send rebuilds the board (load()), so the next message gets
+  // a fresh box → a fresh key. So every distinct send dedupes on its own key; every retry of the
+  // same send (network fail → re-click, or a tailnet/proxy replay) reuses it.
+  function newIdempotencyKey() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+        const a = new Uint8Array(16);
+        window.crypto.getRandomValues(a);
+        return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+      }
+    } catch (_) { /* fall through */ }
+    return "idem-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+  }
+
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
+    // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
+    // content (a network-fail re-click, or a tailnet/proxy/browser replay of the same body) reuses
+    // the key → dedupe; editing the content before resending mints a new key → a new logical send
+    // (fires). null for a non-idempotent verb → omitted from the POST (the legacy replay-tolerant
+    // path). A successful send rebuilds the board (load()) → a fresh box → this cache resets.
+    let lastSend = null;  // { fp, key }
+    const keyForSend = (params) => {
+      if (!spec.idempotent) return null;
+      const fp = JSON.stringify(params);
+      if (!lastSend || lastSend.fp !== fp) lastSend = { fp: fp, key: newIdempotencyKey() };
+      return lastSend.key;
+    };
     const fields = Array.isArray(action.fields) ? action.fields : [];
     // Each control exposes read() → its current value (string for text/textarea/csv, ARRAY for
     // multiselect) and nodes[] → the inputs to freeze on confirm. A uniform shape so collect()
@@ -1732,9 +1764,10 @@
     go.addEventListener("click", () => {
       const c = collect();
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
+      const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
-        commitAction(action.verb, c.params, false).then((res) => { if (!(res && res.ok)) failed(res); });
+        commitAction(action.verb, c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -1764,7 +1797,7 @@
       yes.addEventListener("click", async () => {
         yes.disabled = true; no.disabled = true; setDisabled(true);
         msg.className = "edit-msg busy"; msg.textContent = "…";
-        const res = await commitAction(action.verb, c.params, true);
+        const res = await commitAction(action.verb, c.params, true, sendKey);
         if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
         close(); failed(res);
       });

@@ -487,7 +487,10 @@ def build_substrate_json(
     if extra_verbs:
         assert "action_verbs" not in payload, "to_dict() collided with transport `action_verbs`"
         payload["action_verbs"] = {
-            name: {"confirm_required": bool(spec.confirm_required), "label": spec.label}
+            # `idempotent` tells the frontend to mint + send a client `idempotency_key` for this
+            # verb (the at-most-once retry token); sourced from the registry, never drift-prone.
+            name: {"confirm_required": bool(spec.confirm_required),
+                   "idempotent": bool(spec.idempotent), "label": spec.label}
             for name, spec in extra_verbs.items()
         }
     return json.dumps(payload).encode("utf-8")

@@ -90,6 +90,7 @@ from anneal_memory import (  # the SHARED cross-process continuity lock
     continuity_lock,
 )
 
+from levain.idempotency import StoreCorruptError  # the at-most-once dedup keystore's corrupt sentinel
 from levain.spores import (  # the operator-I/O disposition vocabulary (anneal stays blind)
     LOOP_DISPOSITION,
     NON_COGNITION_DISPOSITIONS,
@@ -102,6 +103,7 @@ from levain.spores import (  # the operator-I/O disposition vocabulary (anneal s
 
 if TYPE_CHECKING:
     from levain.dashboard import AnnealPaths
+    from levain.idempotency import IdempotencyStore
 
 __all__ = [
     "EditError",
@@ -119,6 +121,9 @@ __all__ = [
 # too — this is the data-layer backstop). The name is a short display label.
 MAX_BODY_BYTES = 256 * 1024
 MAX_NAME_LEN = 120
+# A client-supplied idempotency key is an opaque token (a UUID is 36 chars); bound it so a
+# runaway request can't persist an arbitrarily large key into the dedup store.
+MAX_IDEMPOTENCY_KEY_LEN = 200
 # A spore is a one-line-ish open loop, not a document; a Tray dump may be a short
 # paragraph. Bound the captured text so a runaway request can't persist an arbitrarily
 # large spore (the server caps the request body too — this is the data-layer backstop).
@@ -233,14 +238,30 @@ class ActionVerb:
       structural fat-finger / speak-FOR-not-AS guard for an outbound or destructive verb.
       NOTE this is a FAT-FINGER guard, NOT an at-most-once guard: the seam does NOT dedupe a
       replayed ``confirm: true`` request (a tailnet retry of a non-idempotent POST re-runs the
-      handler). For ``send_inbox`` a replay is a harmless duplicate message; the FIRST
-      irreversible verb (relay / consult) MUST add an idempotency key (a client-supplied id
-      recorded in the receipt + deduped) — the same at-most-once discipline the vagus efferent
-      gate uses. Until then, handlers should be idempotent / replay-tolerant.
+      handler). For ``send_inbox`` a replay is a harmless duplicate message.
+    - ``idempotent`` — when True, the verb is IRREVERSIBLE / not replay-tolerant (relay /
+      consult), so the kernel routes its dispatch through the at-most-once
+      :class:`~levain.idempotency.IdempotencyStore`: the request MUST carry a client-supplied
+      ``idempotency_key`` (a non-empty string), recorded with the request's content fingerprint
+      and deduped within a window. A replayed ``idempotency_key`` returns the ORIGINAL response
+      WITHOUT re-firing (``replayed: true``); a key reused for a DIFFERENT request is a 422
+      collision. This is the same at-most-once discipline the vagus efferent gate uses
+      (``vagus.efferent.pending``). The default (False) keeps the legacy replay-tolerant
+      behavior — a handler that omits ``idempotent`` must itself be idempotent / replay-tolerant.
+
+      HARD CONTRACT for an idempotent handler (the at-most-once guarantee rests on it — L1/L2
+      flagged this is discipline, not yet a structural invariant): an ``EditError`` MUST be raised
+      ONLY BEFORE any side effect (it triggers RELEASE → a same-key retry re-fires). The instant a
+      side effect MIGHT have started, every failure path must raise a NON-``EditError`` (it
+      triggers POISON → the key is never re-fired). A handler that fires its side effect and THEN
+      raises ``EditError`` would release a key whose action already happened → a replay re-fires →
+      a double-send. (``send_relay`` complies: all its ``EditError``s are input validation before
+      the POST; a transport fault is a ``RelayError``.)
     - ``label`` — a short human label for the audit trail + the operator affordance."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
+    idempotent: bool = False
     label: str = ""
 
 
@@ -617,14 +638,19 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
 
 
 def _action_record(edit_id: str, verb: str, label: str, now: str | None,
-                   *, outcome: str, detail: str | None) -> dict[str, Any]:
+                   *, outcome: str, detail: str | None,
+                   idempotency_key: str | None = None) -> dict[str, Any]:
     """The receipt-shaped audit record for a governed action — the 'Bridge write outcome'
     trace face of the DecisionInfluenceReceipt. ``actor: operator`` because a Bridge action
     is HUMAN-initiated (the operator clicked it; no autonomous trust ladder, unlike the
     vagus efferent gate); ``kind: action`` + ``outcome`` bind the record to what ACTUALLY
     happened (anti-spoofing). Same shape family as ``_audit_verb``'s record so the existing
-    ``recent_edits`` reader renders it (``undoable: False`` — a sent message has no undo)."""
-    return {
+    ``recent_edits`` reader renders it (``undoable: False`` — a sent message has no undo).
+
+    ``idempotency_key`` (when the verb is idempotent) is RECORDED ON THE RECEIPT (spore-188):
+    the trace carries the at-most-once key, so the receipt corpus shows which fire each retry
+    deduped against. ``outcome="replay"`` marks a deduped retry that did NOT re-fire."""
+    record: dict[str, Any] = {
         "id": edit_id,
         "ts": _now_iso(now),
         "kind": "action",
@@ -637,6 +663,9 @@ def _action_record(edit_id: str, verb: str, label: str, now: str | None,
         "heading": None,
         "undoable": False,
     }
+    if idempotency_key is not None:
+        record["idempotency_key"] = idempotency_key
+    return record
 
 
 def _best_effort_action_audit(ledger_root: Path, record: dict[str, Any]) -> None:
@@ -663,13 +692,21 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
     ``handler`` does the domain work. Returns a result dict; raises ``EditError`` (HTTP-
     mapped, so the server's existing ``except EditError`` handles it) on refusal or failure.
 
-    ``req``: ``{"verb": str, "params": dict?, "confirm": bool?}``. Unknown verb → 404; a
-    ``confirm_required`` verb without ``confirm: true`` → 409 (NO execution, NO audit —
-    nothing happened); a handler that raises → the attempt is AUDITED (outcome "error") then
-    surfaced as 502 (the receipt binds to what actually happened — NO-THEATER; a rendered
+    ``req``: ``{"verb": str, "params": dict?, "confirm": bool?, "idempotency_key": str?}``.
+    Unknown verb → 404; a ``confirm_required`` verb without ``confirm: true`` → 409 (NO execution,
+    NO audit — nothing happened); a handler that raises → the attempt is AUDITED (outcome "error")
+    then surfaced as 502 (the receipt binds to what actually happened — NO-THEATER; a rendered
     confirmation never stands in for a real outcome). The handler runs OUTSIDE the write lock
     (it may be slow / network-bound — a long action must not block substrate edits); only the
-    audit append is serialized."""
+    audit append is serialized.
+
+    IDEMPOTENT verbs (``spec.idempotent``): the dispatch routes through the at-most-once
+    :class:`~levain.idempotency.IdempotencyStore` — a client ``idempotency_key`` is REQUIRED (400
+    if missing); a REPLAY returns the original response without re-firing (``replayed: true``); a
+    key reused for a different request → 422; a concurrent in-flight duplicate → 409. The key is
+    reserved BEFORE the handler fires: a pre-side-effect ``EditError`` RELEASES it (a corrected
+    retry re-attempts); an execution fault KEEPS it reserved (at-most-once — a replay must not
+    re-fire an action that may have happened mid-fire); success FINALIZES it with the response."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     verb = req.get("verb")
@@ -688,29 +725,152 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
         params = req["params"]
     else:
         raise EditError("bad_request", 400, "'params' must be a JSON object")
+
+    now_iso = _now_iso(now)   # one timestamp shared by the dedup store + the audit receipt
+    # The at-most-once gate (irreversible verbs only). A replay short-circuits here WITHOUT
+    # re-firing; a fresh claim returns the store + key so success/failure can finalize/release it.
+    idem_store: "IdempotencyStore | None" = None
+    idem_key: str | None = None
+    if spec.idempotent:
+        replay, idem_store, idem_key = _idempotency_claim(scope, verb, spec, params, req, now_iso)
+        if replay is not None:
+            return replay
+
     edit_id = uuid.uuid4().hex[:12]
     try:
         result = spec.handler(params)   # lock-free: may be slow / network-bound
     except EditError:
         # A TYPED refusal the handler chose (e.g. bad input → 400). By contract a handler raises
         # EditError BEFORE any side effect (input validation), so — like the confirm-required
-        # refusal — nothing happened and there is nothing to audit. Re-raise as-is; the handler
-        # picked its own status (a 4xx client error, distinct from a 502 execution failure).
+        # refusal — nothing happened and there is nothing to audit. RELEASE the idempotency
+        # reservation (nothing fired → a corrected retry with the same key may re-attempt), then
+        # re-raise as-is; the handler picked its own status (a 4xx, distinct from a 502 fault).
+        # Best-effort: a release fault (a corrupt store fails CLOSED) must not mask the handler's
+        # EditError — the reservation stays in_flight, which 409s (safe; the operator re-composes).
+        if idem_store is not None and idem_key is not None:
+            try:
+                idem_store.release(idem_key)
+            except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
+                warnings.warn(f"idempotency release failed ({exc}); the reservation stays in_flight",
+                              RuntimeWarning, stacklevel=2)
         raise
     except Exception as exc:  # noqa: BLE001 — any OTHER handler fault → audit the attempt + 502
+        # Execution fault — AMBIGUOUS (the side effect may have happened mid-fire). At-most-once:
+        # POISON the reservation (mark_faulted, never re-firable, never expires) so a replay does
+        # not re-fire. Audit + 502.
         _best_effort_action_audit(scope.ledger_root, _action_record(
-            edit_id, verb, spec.label, now, outcome="error", detail=type(exc).__name__))
+            edit_id, verb, spec.label, now_iso, outcome="error", detail=type(exc).__name__,
+            idempotency_key=idem_key))
+        _best_effort_mark_faulted(idem_store, idem_key, now_iso)
         raise EditError("action_failed", 502,
                         f"action {verb!r} failed: {type(exc).__name__}") from exc
     if not isinstance(result, dict):
+        # The handler RAN (it returned something) → a side effect may have happened → also the
+        # ambiguous case: POISON the reservation (do not release). Audit + 502.
         _best_effort_action_audit(scope.ledger_root, _action_record(
-            edit_id, verb, spec.label, now, outcome="error", detail="bad_handler_result"))
+            edit_id, verb, spec.label, now_iso, outcome="error", detail="bad_handler_result",
+            idempotency_key=idem_key))
+        _best_effort_mark_faulted(idem_store, idem_key, now_iso)
         raise EditError("action_failed", 502, f"action {verb!r} returned a non-dict result")
     summary = result.get("summary")
     _best_effort_action_audit(scope.ledger_root, _action_record(
-        edit_id, verb, spec.label, now, outcome="ok",
-        detail=summary if isinstance(summary, str) else None))
-    return {"ok": True, "id": edit_id, "verb": verb, "outcome": "ok", "result": result}
+        edit_id, verb, spec.label, now_iso, outcome="ok",
+        detail=summary if isinstance(summary, str) else None, idempotency_key=idem_key))
+    response = {"ok": True, "id": edit_id, "verb": verb, "outcome": "ok", "result": result}
+    if idem_store is not None and idem_key is not None:
+        # Record the response so a within-window replay returns it verbatim (no re-fire). BEST-
+        # EFFORT (mirrors _best_effort_action_audit, one layer out — L1 MED-1): the send already
+        # SUCCEEDED, so a finalize write-fault must NOT turn a real 200 into a false 500 (which the
+        # operator would read as "it failed" → recompose → a NEW key → DOUBLE-SEND). The kept
+        # in_flight record still 409s a same-key replay (no re-fire); the operator gets the truthful
+        # 200, and the cache simply isn't populated (a within-window replay 409s instead of 200).
+        # `_now_iso(now)` stamps the REAL completion time (fresh wall-clock in prod; the fixed test
+        # `now`) — created_at was the claim time, so the done record's completed_at is accurate
+        # for a network-bound handler (L3 complement LOW-2).
+        try:
+            idem_store.finalize(idem_key, response, _now_iso(now))
+        except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
+            warnings.warn(
+                f"action {verb!r} succeeded but its idempotency finalize failed ({exc}); the "
+                f"response stands — a same-key replay will 409 until the window prunes",
+                RuntimeWarning, stacklevel=2,
+            )
+    return response
+
+
+def _best_effort_mark_faulted(
+    store: "IdempotencyStore | None", key: str | None, now_iso: str,
+) -> None:
+    """Poison an idempotency reservation after an execution fault — best-effort. If the mark write
+    fails the record stays ``in_flight``, which ALSO 409s a same-key retry (no re-fire), so the
+    at-most-once guarantee holds either way; the only loss is the clearer ``faulted`` retry message."""
+    if store is None or key is None:
+        return
+    try:
+        store.mark_faulted(key, now_iso)
+    except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
+        warnings.warn(f"idempotency mark_faulted failed ({exc}); the reservation stays in_flight "
+                      "(still refuses a re-fire)", RuntimeWarning, stacklevel=2)
+
+
+def _idempotency_claim(
+    scope: WriteScope, verb: str, spec: "ActionVerb", params: dict[str, Any],
+    req: dict[str, Any], now_iso: str,
+) -> tuple[dict[str, Any] | None, "IdempotencyStore | None", str | None]:
+    """Run the at-most-once gate for an idempotent verb. Returns ``(replay_response, store, key)``:
+    a non-None ``replay_response`` ⇒ RETURN it immediately (a deduped retry — no re-fire);
+    otherwise ``(None, store, key)`` and the caller OWNS executing the action (then finalize on
+    success / mark_faulted on an execution fault / release on a pre-fire refusal). Raises
+    ``EditError`` for the terminal refusals: a missing/oversize key (400), a key reused for a
+    different request (422), a concurrent in-flight duplicate (409), a prior FAULTED attempt
+    (409 — ambiguous, poisoned), or an unreadable store/record (500 — fail closed, never re-fire)."""
+    from levain.idempotency import IdempotencyStore, request_fingerprint
+
+    key = req.get("idempotency_key")
+    if not isinstance(key, str) or not key.strip():
+        raise EditError("bad_request", 400, f"action {verb!r} is idempotent — an "
+                        "'idempotency_key' (a non-empty string) is required")
+    key = key.strip()
+    if len(key) > MAX_IDEMPOTENCY_KEY_LEN:
+        raise EditError("bad_request", 400,
+                        f"'idempotency_key' exceeds {MAX_IDEMPOTENCY_KEY_LEN} characters")
+    store = IdempotencyStore(scope.ledger_root / "idempotency.json")
+    try:
+        fingerprint = request_fingerprint(verb, params)
+    except ValueError as exc:
+        # params that can't be canonically fingerprinted (non-string dict key / non-finite float —
+        # L3 codex LOW). Unreachable via HTTP (JSON keys are strings); a clean 400 for the API path.
+        raise EditError("bad_request", 400, f"params cannot be fingerprinted: {exc}") from exc
+    outcome = store.claim_or_replay(key, fingerprint, now_iso)
+    if outcome.kind == "fresh":
+        return None, store, key
+    if outcome.kind == "replay":
+        # The original already fired + audited; this retry was deduped. Record a best-effort
+        # replay line (honest telemetry that a dedup happened — NO re-fire) and return the
+        # ORIGINAL response verbatim plus a ``replayed`` marker.
+        prior = outcome.result or {}
+        _best_effort_action_audit(scope.ledger_root, _action_record(
+            str(prior.get("id", "")), verb, spec.label, now_iso,
+            outcome="replay", detail=None, idempotency_key=key))
+        return {**prior, "replayed": True}, None, None
+    if outcome.kind == "in_flight":
+        # A concurrent duplicate with this key is still executing — the first owns the fire.
+        raise EditError("in_flight", 409,
+                        f"a request with this idempotency_key is already executing — "
+                        f"not re-firing {verb!r}")
+    if outcome.kind == "faulted":
+        # A prior attempt with this key faulted (it may have partially fired) → AMBIGUOUS, so the
+        # key is poisoned (never re-fired). The operator re-composes (a fresh key) to retry IF they
+        # confirm it did not go through.
+        raise EditError("faulted", 409,
+                        f"a prior attempt with this idempotency_key faulted (it may have partially "
+                        f"fired) — not re-firing {verb!r}; re-compose to retry")
+    if outcome.kind == "collision":
+        raise EditError("idempotency_key_reuse", 422,
+                        f"this idempotency_key was already used for a different {verb!r} request")
+    # corrupt → fail closed (never re-fire an action whose record we cannot trust)
+    raise EditError("idempotency_corrupt", 500,
+                    f"the idempotency record for this key is unreadable — refusing to re-fire {verb!r}")
 
 
 def _require_str(req: dict[str, Any], field: str) -> str:

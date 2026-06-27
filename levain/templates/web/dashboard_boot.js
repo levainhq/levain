@@ -96,9 +96,14 @@
   // Governed operator ACTION verbs → POST /action (the external-panel-ACTION seam). `verb` is
   // the registered extra_verb name, `params` the compose fields; confirm:true is sent only AFTER
   // the operator confirms a confirm_required verb (the kernel 409s without it — the fat-finger
-  // gate). Mirror of commit: same auth/token/reload contract via postWrite.
-  async function commitAction(verb, params, confirm) {
-    return postWrite("/action", { verb: verb, params: params || {}, confirm: confirm === true });
+  // gate). `idempotencyKey` (a string) is included for an IDEMPOTENT verb — the at-most-once
+  // retry token the kernel dedupes on, so a tailnet/proxy/browser retry of this same POST (or an
+  // operator re-click after a network error) returns the original response WITHOUT re-firing.
+  // Mirror of commit: same auth/token/reload contract via postWrite.
+  async function commitAction(verb, params, confirm, idempotencyKey) {
+    const body = { verb: verb, params: params || {}, confirm: confirm === true };
+    if (idempotencyKey) body.idempotency_key = idempotencyKey;
+    return postWrite("/action", body);
   }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and

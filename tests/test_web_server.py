@@ -161,14 +161,26 @@ class TestSubstrateJson:
 
     def test_action_verbs_exposed_for_compose_affordance(self, tmp_path: Path) -> None:
         # the external-panel-ACTION seam: when verbs are registered, build_substrate_json exposes
-        # each verb's confirm_required + label so the frontend sources the confirm step from the
-        # REGISTRY (the single source of truth), never a panel-declared flag that could drift.
+        # each verb's confirm_required + idempotent + label so the frontend sources the confirm
+        # step + the idempotency-key requirement from the REGISTRY (the single source of truth),
+        # never a panel-declared flag that could drift.
         from levain.writes import ActionVerb
 
         verbs = {"send_inbox": ActionVerb(handler=lambda p: {"ok": True},
                                           confirm_required=True, label="Send to inbox")}
         data = json.loads(build_substrate_json(_store_with_data(tmp_path), extra_verbs=verbs))
-        assert data["action_verbs"]["send_inbox"] == {"confirm_required": True, "label": "Send to inbox"}
+        assert data["action_verbs"]["send_inbox"] == {
+            "confirm_required": True, "idempotent": False, "label": "Send to inbox"}
+
+    def test_action_verbs_exposes_idempotent_flag(self, tmp_path: Path) -> None:
+        # an idempotent verb advertises idempotent:true so the frontend mints + sends a client
+        # idempotency_key for the at-most-once retry token.
+        from levain.writes import ActionVerb
+
+        verbs = {"send_relay": ActionVerb(handler=lambda p: {"ok": True}, confirm_required=True,
+                                          idempotent=True, label="Send to relay")}
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), extra_verbs=verbs))
+        assert data["action_verbs"]["send_relay"]["idempotent"] is True
 
     def test_no_verbs_omits_action_verbs(self, tmp_path: Path) -> None:
         # a read-only serve passes no verbs (None or {}) → the key is absent → the frontend renders
