@@ -173,6 +173,183 @@ class TestApplyAction:
         assert seen == [{}]                                          # handler NOT re-called
 
 
+# --- the at-most-once idempotency path (irreversible verbs) ---------------------------
+
+T0 = "2026-06-27T12:00:00+00:00"
+T_SOON = "2026-06-27T12:05:00+00:00"          # within the dedup window
+
+
+def _counting_verb(results=None):
+    """An idempotent verb whose handler counts calls; each call returns a distinct id so a replay
+    (which must NOT re-fire) is detectable by the id staying the original."""
+    calls: list[dict] = []
+
+    def _h(p):
+        calls.append(p)
+        return {"summary": f"fired #{len(calls)}", "n": len(calls)}
+
+    return ActionVerb(handler=_h, confirm_required=False, idempotent=True, label="Send"), calls
+
+
+class TestApplyActionIdempotency:
+    def test_idempotent_verb_requires_a_key(self, tmp_path: Path) -> None:
+        verb, calls = _counting_verb()
+        scope = _scope(tmp_path)
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, {"v": verb}, {"verb": "v"}, now=T0)   # no idempotency_key
+        assert ei.value.code == "bad_request" and ei.value.http_status == 400
+        assert calls == []                                           # handler never ran
+        assert recent_edits(scope.ledger_root) == []                # nothing happened, nothing audited
+
+    def test_oversize_key_rejected(self, tmp_path: Path) -> None:
+        verb, _ = _counting_verb()
+        with pytest.raises(EditError) as ei:
+            apply_action(_scope(tmp_path), {"v": verb},
+                         {"verb": "v", "idempotency_key": "x" * 5000}, now=T0)
+        assert ei.value.http_status == 400
+
+    def test_replay_returns_recorded_response_without_refire(self, tmp_path: Path) -> None:
+        verb, calls = _counting_verb()
+        scope = _scope(tmp_path)
+        req = {"verb": "v", "params": {"to": "chip"}, "idempotency_key": "key-1"}
+        first = apply_action(scope, {"v": verb}, req, now=T0)
+        assert first["result"]["n"] == 1 and "replayed" not in first
+        # the retry: SAME key + params → the original response verbatim, no re-fire
+        second = apply_action(scope, {"v": verb}, dict(req), now=T_SOON)
+        assert second["replayed"] is True
+        assert second["id"] == first["id"] and second["result"] == first["result"]
+        assert len(calls) == 1                                       # handler fired exactly ONCE
+        # the receipt corpus: the original `ok` line + a `replay` line, both carrying the key
+        recs = recent_edits(scope.ledger_root)
+        oks = [r for r in recs if r["outcome"] == "ok"]
+        replays = [r for r in recs if r["outcome"] == "replay"]
+        assert len(oks) == 1 and oks[0]["idempotency_key"] == "key-1"
+        assert len(replays) == 1 and replays[0]["idempotency_key"] == "key-1"
+
+    def test_key_reuse_for_a_different_request_is_422(self, tmp_path: Path) -> None:
+        verb, calls = _counting_verb()
+        scope = _scope(tmp_path)
+        apply_action(scope, {"v": verb},
+                     {"verb": "v", "params": {"to": "chip"}, "idempotency_key": "key-1"}, now=T0)
+        with pytest.raises(EditError) as ei:                         # same key, DIFFERENT params
+            apply_action(scope, {"v": verb},
+                         {"verb": "v", "params": {"to": "daemon"}, "idempotency_key": "key-1"},
+                         now=T_SOON)
+        assert ei.value.code == "idempotency_key_reuse" and ei.value.http_status == 422
+        assert len(calls) == 1                                       # the second never fired
+
+    def test_concurrent_duplicate_in_flight_is_409(self, tmp_path: Path) -> None:
+        # seed an in_flight reservation (a duplicate still executing) → a second dispatch refuses
+        from levain.idempotency import IdempotencyStore, request_fingerprint
+
+        verb, calls = _counting_verb()
+        scope = _scope(tmp_path)
+        store = IdempotencyStore(scope.ledger_root / "idempotency.json")
+        fp = request_fingerprint("v", {"to": "chip"})
+        assert store.claim_or_replay("key-1", fp, T0).kind == "fresh"   # reserve, never finalize
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, {"v": verb},
+                         {"verb": "v", "params": {"to": "chip"}, "idempotency_key": "key-1"},
+                         now=T_SOON)
+        assert ei.value.code == "in_flight" and ei.value.http_status == 409
+        assert calls == []                                          # did not re-fire
+
+    def test_pre_fire_editerror_releases_the_key_so_a_retry_refires(self, tmp_path: Path) -> None:
+        # the handler raises EditError on the FIRST call (a pre-side-effect refusal), succeeds on
+        # the SECOND — the release must let the same key re-fire (nothing happened the first time).
+        state = {"n": 0}
+
+        def _h(p):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise EditError("bad_request", 400, "transient validation")
+            return {"summary": "ok now"}
+
+        verb = ActionVerb(handler=_h, confirm_required=False, idempotent=True)
+        scope = _scope(tmp_path)
+        req = {"verb": "v", "idempotency_key": "key-1"}
+        with pytest.raises(EditError):
+            apply_action(scope, {"v": verb}, dict(req), now=T0)     # released
+        out = apply_action(scope, {"v": verb}, dict(req), now=T_SOON)  # re-fires with the same key
+        assert out["ok"] and state["n"] == 2
+
+    def test_execution_fault_poisons_the_key_so_a_replay_does_not_refire(self, tmp_path: Path) -> None:
+        # an execution fault is AMBIGUOUS (the side effect may have happened) → at-most-once POISONS
+        # the reservation (faulted); a retry of the same key gets 409 faulted, never a second fire —
+        # and a faulted key never expires (a far-future retry STILL refuses, never re-fires).
+        from levain.idempotency import IdempotencyStore
+
+        state = {"n": 0}
+
+        def _h(p):
+            state["n"] += 1
+            raise RuntimeError("relay transport down")
+
+        verb = ActionVerb(handler=_h, confirm_required=False, idempotent=True)
+        scope = _scope(tmp_path)
+        req = {"verb": "v", "idempotency_key": "key-1"}
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, {"v": verb}, dict(req), now=T0)
+        assert ei.value.http_status == 502
+        # the error attempt is audited WITH the key; the record is now `faulted`
+        errs = [r for r in recent_edits(scope.ledger_root) if r["outcome"] == "error"]
+        assert len(errs) == 1 and errs[0]["idempotency_key"] == "key-1"
+        rec = IdempotencyStore(scope.ledger_root / "idempotency.json").get("key-1")
+        assert rec is not None and rec.status == "faulted"
+        # the retry refuses with the distinct faulted code — NO second fire — even far in the future
+        with pytest.raises(EditError) as ei2:
+            apply_action(scope, {"v": verb}, dict(req), now="2099-01-01T00:00:00+00:00")
+        assert ei2.value.code == "faulted" and ei2.value.http_status == 409 and state["n"] == 1
+
+    def test_finalize_failure_does_not_turn_success_into_a_500(self, tmp_path: Path, monkeypatch) -> None:
+        # L1 MED-1: a finalize write-fault on the SUCCESS path must NOT turn a real 200 into a false
+        # 500 (which the operator would read as failure → recompose → a NEW key → double-send). The
+        # response stands; a same-key replay simply 409s (no cache) instead of re-firing.
+        from levain import idempotency
+
+        fired: list = []
+        verb = ActionVerb(handler=lambda p: fired.append(p) or {"summary": "sent"},
+                          confirm_required=False, idempotent=True)
+        scope = _scope(tmp_path)
+
+        def _boom(self, *a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(idempotency.IdempotencyStore, "finalize", _boom)
+        with pytest.warns(RuntimeWarning, match="finalize failed"):
+            out = apply_action(scope, {"v": verb}, {"verb": "v", "idempotency_key": "key-1"}, now=T0)
+        assert out["ok"] is True and len(fired) == 1     # the send succeeded; the operator gets 200
+
+    def test_corrupt_record_fails_closed(self, tmp_path: Path) -> None:
+        import json as _json
+
+        verb, calls = _counting_verb()
+        scope = _scope(tmp_path)
+        ledger = scope.ledger_root
+        ledger.mkdir(parents=True, exist_ok=True)
+        # a matching record with an unknown status → the store returns `corrupt` → 500, never refire
+        (ledger / "idempotency.json").write_text(_json.dumps([
+            {"key": "key-1", "fingerprint": "whatever", "status": "bogus",
+             "created_at": T0, "result": None, "completed_at": None}]), encoding="utf-8")
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, {"v": verb},
+                         {"verb": "v", "params": {"to": "chip"}, "idempotency_key": "key-1"},
+                         now=T_SOON)
+        assert ei.value.code == "idempotency_corrupt" and ei.value.http_status == 500
+        assert calls == []
+
+    def test_non_idempotent_verb_ignores_a_key(self, tmp_path: Path) -> None:
+        # a non-idempotent verb (the legacy path) does not require/route through the store even if
+        # a key is present — backward-compatible, no idempotency.json written.
+        calls: list = []
+        verb = ActionVerb(handler=lambda p: calls.append(p) or {"ok": True}, confirm_required=False)
+        scope = _scope(tmp_path)
+        apply_action(scope, {"v": verb}, {"verb": "v", "idempotency_key": "ignored"}, now=T0)
+        apply_action(scope, {"v": verb}, {"verb": "v", "idempotency_key": "ignored"}, now=T_SOON)
+        assert len(calls) == 2                                        # both fired (no dedup)
+        assert not (scope.ledger_root / "idempotency.json").exists()  # store untouched
+
+
 # --- make_server validation + the live POST /action route -----------------------------
 
 class TestActionRegistration:
@@ -252,6 +429,29 @@ class TestActionRoute:
             status, body = _post(base + "/action", {"verb": "send_test", "params": {}})
         assert status == 409 and body["error"] == "confirm_required"
         assert ran == []                                  # NO execution without confirm
+
+    def test_idempotent_replay_over_the_live_route(self, tmp_path: Path) -> None:
+        # the full HTTP round-trip: an irreversible verb POSTed twice with the SAME idempotency_key
+        # (a tailnet/proxy retry) fires ONCE; the replay returns the original response, replayed:true.
+        fired: list = []
+        verbs = {"send_relay": ActionVerb(
+            handler=lambda p: fired.append(p) or {"ok": True, "summary": "relay → chip"},
+            confirm_required=True, idempotent=True, label="Send to relay")}
+        body1 = {"verb": "send_relay", "params": {"message": "hi"}, "confirm": True,
+                 "idempotency_key": "retry-key-1"}
+        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+            s1, b1 = _post(base + "/action", body1)
+            s2, b2 = _post(base + "/action", dict(body1))     # the retry — identical body
+        assert s1 == 200 and "replayed" not in b1
+        assert s2 == 200 and b2["replayed"] is True and b2["id"] == b1["id"]
+        assert len(fired) == 1                                # the irreversible action fired ONCE
+
+    def test_idempotent_missing_key_400_over_the_route(self, tmp_path: Path) -> None:
+        verbs = {"send_relay": ActionVerb(handler=lambda p: {"ok": True},
+                                          confirm_required=False, idempotent=True)}
+        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+            status, body = _post(base + "/action", {"verb": "send_relay", "params": {}})
+        assert status == 400 and body["error"] == "bad_request"
 
     def test_unknown_verb_404(self, tmp_path: Path) -> None:
         with _serving_verbs(_writable_source(tmp_path), {}) as (base, _httpd):
