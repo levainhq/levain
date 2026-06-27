@@ -313,11 +313,78 @@ def load_web_asset(filename: str) -> str:
     )
 
 
+_ACTION_FIELD_KINDS = ("text", "textarea", "csv", "multiselect")
+_UNSAFE_FIELD_NAMES = ("__proto__", "prototype", "constructor")
+
+
+def _valid_multiselect_options(options: object) -> bool:
+    """A multiselect's ``options`` must be a non-empty list whose entries are each a non-empty
+    (post-trim) string OR a {value, label} dict with a non-empty string value + (if present) a
+    string label, with NO duplicate values. Validated per-FIELD (not just per-entry) so a malformed
+    chooser — whitespace-only value, non-string label, dup values rendering dup checkboxes — is
+    rejected at the seam, not left for the downstream handler to clean (codex L3)."""
+    if not isinstance(options, list) or not options:
+        return False
+    seen: set[str] = set()
+    for opt in options:
+        value: object
+        label: object
+        if isinstance(opt, str):
+            value, label = opt, None
+        elif isinstance(opt, dict):
+            value, label = opt.get("value"), opt.get("label")
+        else:
+            return False
+        if not isinstance(value, str) or not value.strip():
+            return False
+        if label is not None and not isinstance(label, str):
+            return False
+        if value in seen:
+            return False
+        seen.add(value)
+    return True
+
+
+def _validated_panel_action(action: object) -> "dict | None":
+    """Validate an external panel's optional compose `action` before it reaches the frontend
+    (the panel author's contract — defense-in-depth for any adopter). Well-formed = a dict with a
+    non-empty string ``verb`` + a ``fields`` list of dicts, each with a UNIQUE, non-empty,
+    NON-dunder string ``name`` and a ``kind`` in {text,textarea,csv}. Malformed → ``None`` (the
+    compose box just doesn't render; the panel still shows read-only). Rejecting
+    ``__proto__``/``prototype``/``constructor`` field names blocks the JS prototype-pollution +
+    silent-overwrite class at the source (codex L3); the frontend's null-proto params is the
+    matching belt-and-suspenders."""
+    if not isinstance(action, dict):
+        return None
+    verb = action.get("verb")
+    if not isinstance(verb, str) or not verb:
+        return None
+    fields = action.get("fields")
+    if not isinstance(fields, list):
+        return None
+    seen: set[str] = set()
+    for f in fields:
+        if not isinstance(f, dict):
+            return None
+        name = f.get("name")
+        if (not isinstance(name, str) or not name
+                or name in _UNSAFE_FIELD_NAMES or name in seen):
+            return None
+        kind = f.get("kind")
+        if kind not in _ACTION_FIELD_KINDS:
+            return None
+        if kind == "multiselect" and not _valid_multiselect_options(f.get("options")):
+            return None
+        seen.add(name)
+    return {"verb": verb, "fields": fields}
+
+
 def build_substrate_json(
     source: SubstrateSource,
     extra_panels: "Callable[[], list[dict]] | None" = None,
     *,
     write_token_required: bool = False,
+    extra_verbs: "Mapping[str, ActionVerb] | None" = None,
 ) -> bytes:
     """The ``/substrate.json`` body: a fresh read-only ``SubstrateView`` snapshot.
 
@@ -401,8 +468,28 @@ def build_substrate_json(
                     "lines": p.get("lines", []),
                     "empty": p.get("empty", ""),
                     "error": p.get("error"),
+                    # OPTIONAL governed compose/action affordance (the external-panel-ACTION
+                    # seam, the write-peer of how spore panels carry verbs): a {verb, fields}
+                    # spec the frontend renders as a confirm-gated compose box → POST /action.
+                    # Passed through like lines/note (the panel author's contract); the frontend
+                    # renders it ONLY when the surface is writable AND the verb is in the
+                    # action_verbs registry below — double-gated, NO THEATER. Validated here (verb
+                    # + unique non-dunder field names + known kinds) so a malformed adopter action
+                    # is dropped to None rather than reaching the frontend (codex L3).
+                    "action": _validated_panel_action(p.get("action")),
                 }
         payload["extra_panels"] = data
+    # Expose the registered action verbs' governance metadata (confirm requirement + label) so a
+    # compose affordance sources its confirm step from the verb REGISTRY (the single source of
+    # truth) — never a panel-declared flag that could drift from the ActionVerb. Absent when no
+    # verbs are registered (a read-only serve passes none), so the frontend renders no compose
+    # affordance at all even if a panel still declares an `action` (NO THEATER).
+    if extra_verbs:
+        assert "action_verbs" not in payload, "to_dict() collided with transport `action_verbs`"
+        payload["action_verbs"] = {
+            name: {"confirm_required": bool(spec.confirm_required), "label": spec.label}
+            for name, spec in extra_verbs.items()
+        }
     return json.dumps(payload).encode("utf-8")
 
 
@@ -581,7 +668,8 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 body = build_substrate_json(
                     self.server.levain_source, self.server.extra_panels,
-                    write_token_required=self._write_token_required())
+                    write_token_required=self._write_token_required(),
+                    extra_verbs=self.server.extra_verbs)
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
                 # view; reaching here is an unexpected fault. Surface it as JSON the
@@ -1002,6 +1090,16 @@ def make_server(
                     f"refusing action verb {name!r}: value must be an ActionVerb "
                     "(handler, confirm_required, label)."
                 )
+            # Validate the runtime FIELD types too (codex L3): a non-callable handler, non-bool
+            # confirm_required, or non-str label passes the isinstance check above but later breaks
+            # dispatch or /substrate.json serialization (label is JSON-emitted in action_verbs).
+            # Fail at registration (before bind), matching the published API.
+            if not callable(spec.handler):
+                raise ValueError(f"refusing action verb {name!r}: handler must be callable.")
+            if not isinstance(spec.confirm_required, bool):
+                raise ValueError(f"refusing action verb {name!r}: confirm_required must be a bool.")
+            if not isinstance(spec.label, str):
+                raise ValueError(f"refusing action verb {name!r}: label must be a string.")
 
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)

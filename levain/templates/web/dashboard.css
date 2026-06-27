@@ -805,6 +805,18 @@
   .tray-dump-btn:hover { box-shadow: 0 0 18px -3px var(--operate); }
   .tray-dump-btn:active { transform: translateY(1px); }
   .tray-dump-btn:disabled { opacity: .45; cursor: default; box-shadow: none; }
+  /* multiselect compose field (a fixed set of checkboxes, e.g. inbox readers) */
+  .action-multiselect { display: flex; flex-direction: column; gap: 4px; }
+  .action-ms-label {
+    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+  }
+  .action-ms-opts { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .action-ms-opt {
+    display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+    font: 12px/1.4 var(--mono); color: var(--ink);
+  }
+  .action-ms-opt input { accent-color: var(--operate); cursor: pointer; }
+  .action-ms-opt:has(input:disabled) { opacity: .45; cursor: default; }
   .verb-date {
     font: 11px/1.4 var(--mono); color: var(--ink); background: #0a0f0e; color-scheme: dark;
     border: 1px solid var(--line-hot); border-radius: 3px; padding: 3px 7px; outline: none;

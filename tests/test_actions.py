@@ -193,6 +193,22 @@ class TestActionRegistration:
             make_server(_writable_source(tmp_path), port=0,
                         extra_verbs={"": ActionVerb(handler=lambda p: {})})
 
+    def test_refuses_bad_actionverb_field_types(self, tmp_path: Path) -> None:
+        # codex L3: an ActionVerb whose runtime fields are the wrong type passes the isinstance
+        # check but later breaks dispatch / serialization (label is JSON-emitted in action_verbs).
+        # Each must be refused AT REGISTRATION, before bind. (One source — validation raises before
+        # any bind, so it's reused across the three cases.)
+        src = _writable_source(tmp_path)
+        with pytest.raises(ValueError, match="label must be a string"):
+            make_server(src, port=0,
+                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, label=object())})  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="confirm_required must be a bool"):
+            make_server(src, port=0,
+                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, confirm_required="yes")})  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="handler must be callable"):
+            make_server(src, port=0,
+                        extra_verbs={"v": ActionVerb(handler="nope")})  # type: ignore[arg-type]
+
     def test_action_is_a_reserved_route(self, tmp_path: Path) -> None:
         # /action can't be shadowed by a downstream extra_json route (it's a write route).
         with pytest.raises(ValueError, match="built-in route"):
