@@ -75,6 +75,9 @@
   // so the governance model stays in the schema and the read-only port needs zero
   // change. `commit(request) → Promise<{ok} | {ok:false, error, message}>`.
   let commit = null;
+  // The governed ACTION transport (POST /action), injected alongside commit by the boot layer.
+  // null on a read-only port → external-panel compose affordances render nothing (NO THEATER).
+  let commitAction = null;
 
   // Friendly zone labels, in IA order — used for the "All" view separators.
   const ZONE_LABELS = [
@@ -108,6 +111,7 @@
     // The surface injects its write transport here; a port that provides none (the
     // parked MCP-App) renders read-only — no edit affordances, zero other change.
     commit = opts && typeof opts.commit === "function" ? opts.commit : null;
+    commitAction = opts && typeof opts.commitAction === "function" ? opts.commitAction : null;
 
     const board = document.getElementById("board");
     if (!board) return;
@@ -1608,12 +1612,194 @@
   // the episodes/spores idiom), plus an optional `accent` (e.g. unread) / `dim` (e.g. read)
   // flag. The kernel knows nothing domain-specific — the flow Bridge renders its inbox here.
   // Every store-derived string is textContent (via el()/appendClause), never innerHTML.
+  // The governed COMPOSE affordance for an external panel's action verb (the external-panel-
+  // ACTION seam — the write-peer of how spore panels carry verbs). One control per declared
+  // field (textarea | text | csv); a submit labeled from the verb REGISTRY; when the verb is
+  // confirm_required, a confirm/cancel step before sending confirm:true (the kernel 409s without
+  // it — the confirm is the fat-finger affordance, the server is the gate). On success the board
+  // re-renders (the sent item appears, the box clears); errors surface inline. Every value is
+  // read via .value and built via el()/createElement — never innerHTML.
+  // [ACTION-EXTRACT-START — the node behavioral harness slices between these markers.]
+  // Pure field→params coercion for the compose affordance (DOM-free so it's behaviorally
+  // testable): csv → trimmed non-empty list, omitted when empty (so send_inbox's `for` keeps its
+  // STRICT list contract — a real list or absent, never a coerced string); text/textarea →
+  // trimmed string, omitted when empty + optional; a required field resolving empty → {error}.
+  // It reads the values it is GIVEN — the caller snapshots them at submit and the confirm step
+  // FREEZES the inputs, so the snapshot can't drift from what the operator sees (WYSIWYG).
+  function collectActionParams(fields) {
+    // null-proto params (codex L3): a field literally named "__proto__"/"constructor" can't mutate
+    // the params prototype + silently drop from JSON — it lands as a normal own key. (The server
+    // ALSO rejects such field names when folding the panel action; this is defense-in-depth.)
+    const params = Object.create(null);
+    const seen = new Set();
+    for (const f of fields) {
+      if (seen.has(f.name)) return { error: "duplicate field " + f.name };  // no silent overwrite
+      seen.add(f.name);
+      if (f.kind === "multiselect") {
+        // a fixed-set peer of csv: value is the ARRAY of chosen option values (checkboxes), so it
+        // never round-trips through a string. FAIL CLOSED on a non-array (a read() regression that
+        // returns "cli" must error, not silently broadcast — codex L3); trim + drop blanks + dedupe.
+        if (!Array.isArray(f.value)) return { error: (f.label || f.name) + " is invalid" };
+        const ms = new Set();
+        const list = [];
+        for (const v of f.value) {
+          if (typeof v !== "string") continue;
+          const t = v.trim();
+          if (t && !ms.has(t)) { ms.add(t); list.push(t); }
+        }
+        if (f.required && !list.length) return { error: (f.label || f.name) + " is required" };
+        if (list.length) params[f.name] = list;
+        continue;
+      }
+      const raw = f.value != null ? String(f.value) : "";
+      if (f.kind === "csv") {
+        const list = raw.split(",").map((s) => s.trim()).filter((s) => s.length);
+        if (f.required && !list.length) return { error: (f.label || f.name) + " is required" };
+        if (list.length) params[f.name] = list;
+      } else {
+        const val = raw.trim();
+        if (f.required && !val) return { error: (f.label || f.name) + " is required" };
+        if (val) params[f.name] = val;
+      }
+    }
+    return { params: params };
+  }
+  // [ACTION-EXTRACT-END]
+
+  function buildActionBox(action, spec) {
+    const box = el("div", "tray-dump");
+    const fields = Array.isArray(action.fields) ? action.fields : [];
+    // Each control exposes read() → its current value (string for text/textarea/csv, ARRAY for
+    // multiselect) and nodes[] → the inputs to freeze on confirm. A uniform shape so collect()
+    // and setDisabled() don't branch on the field kind.
+    const controls = [];
+    for (const f of fields) {
+      if (!f || typeof f !== "object" || !f.name) continue;
+      if (f.kind === "multiselect") {
+        // a fixed-set chooser (checkboxes) — the operator picks from known options instead of
+        // recalling names; nothing checked → the field is omitted (e.g. broadcast for `for`).
+        const group = el("div", "action-multiselect");
+        if (f.label) group.appendChild(el("div", "action-ms-label", String(f.label)));
+        const opts = el("div", "action-ms-opts");
+        const boxes = [];
+        for (const opt of (Array.isArray(f.options) ? f.options : [])) {
+          const value = typeof opt === "string" ? opt : (opt && opt.value);
+          if (typeof value !== "string" || !value) continue;
+          const lbl = el("label", "action-ms-opt");
+          const cb = el("input"); cb.type = "checkbox"; cb.value = value;
+          lbl.appendChild(cb);
+          lbl.appendChild(el("span", null, typeof opt === "string" ? opt : (opt.label || value)));
+          opts.appendChild(lbl);
+          boxes.push(cb);
+        }
+        group.appendChild(opts);
+        box.appendChild(group);
+        controls.push({ f: f, nodes: boxes,
+                        read: () => boxes.filter((b) => b.checked).map((b) => b.value) });
+        continue;
+      }
+      const isTA = f.kind === "textarea";
+      const node = el(isTA ? "textarea" : "input", "tray-dump-ta");
+      if (isTA) node.rows = 2; else node.type = "text";
+      if (f.placeholder) node.placeholder = String(f.placeholder);
+      if (f.label) node.setAttribute("aria-label", String(f.label));
+      box.appendChild(node);
+      controls.push({ f: f, nodes: [node], read: () => node.value });
+    }
+    const row = el("div", "tray-dump-controls");
+    const go = el("button", "tray-dump-btn", spec.label || action.verb);
+    go.type = "button";
+    const msg = el("span", "edit-msg", "");
+    row.append(go, msg);
+    box.appendChild(row);
+
+    const setDisabled = (d) => {
+      go.disabled = d;
+      for (const c of controls) for (const n of c.nodes) n.disabled = d;
+    };
+
+    // Snapshot the live field values → the pure coercion (collectActionParams above). The confirm
+    // step freezes the inputs after this snapshot, so what's reviewed == what's sent (WYSIWYG).
+    const collect = () => collectActionParams(controls.map((c) =>
+      ({ name: c.f.name, kind: c.f.kind, required: c.f.required, label: c.f.label, value: c.read() })));
+
+    const failed = (res) => {
+      setDisabled(false);
+      msg.className = "edit-msg err";
+      msg.textContent = (res && (res.message || res.error)) || "failed";
+    };
+
+    go.addEventListener("click", () => {
+      const c = collect();
+      if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
+      if (!spec.confirm_required) {
+        setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
+        commitAction(action.verb, c.params, false).then((res) => { if (!(res && res.ok)) failed(res); });
+        return;
+      }
+      // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
+      // FREEZE the fields — the params were snapshotted by collect() above, so disabling the
+      // inputs makes what-you-see == what-you-send (a still-editable field would let the operator
+      // change the text after the payload is frozen → a stale send; L1+L2 converged). Disabling
+      // them also drops focus off the textarea, so Escape reliably lands on the confirm form (it
+      // cancels the confirm — NOT the enclosing focus-modal, via stopPropagation). cancel/fail
+      // re-enable. We focus `no` so a stray Enter/Space defaults to cancel, never send.
+      go.style.display = "none";
+      setDisabled(true);
+      const form = el("span", "verb-form");
+      const yes = el("button", "verb-confirm", "send");
+      const no = el("button", "verb-cancel", "cancel");
+      yes.type = "button"; no.type = "button";
+      form.append(yes, no);
+      row.insertBefore(form, msg);
+      no.focus();
+      msg.className = "edit-msg"; msg.textContent = "";
+      const close = () => { form.remove(); go.style.display = ""; setDisabled(false); };
+      no.addEventListener("click", close);
+      form.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape") return;
+        ev.preventDefault(); ev.stopPropagation();
+        if (!yes.disabled) close();
+      });
+      yes.addEventListener("click", async () => {
+        yes.disabled = true; no.disabled = true; setDisabled(true);
+        msg.className = "edit-msg busy"; msg.textContent = "…";
+        const res = await commitAction(action.verb, c.params, true);
+        if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
+        close(); failed(res);
+      });
+    });
+
+    // Cmd/Ctrl+Enter on a textarea triggers the first step (matches the capture-box idiom), but
+    // only while the send button is showing (not mid-confirm).
+    for (const c of controls) {
+      if (c.f.kind !== "textarea") continue;
+      c.nodes[0].addEventListener("keydown", (ev) => {
+        if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter" && go.style.display !== "none") {
+          ev.preventDefault(); go.click();
+        }
+      });
+    }
+    return box;
+  }
+
   function renderExternal(entry, view) {
     const p = panel(entry);
     const data = (view.extra_panels || {})[entry.id] || {};
     if (data.error) {
       p.appendChild(el("p", "err", "unavailable — " + data.error));
       return p;
+    }
+    // Governed compose affordance: mount it when the surface is writable (commitAction injected)
+    // AND the panel declares an `action` whose verb is in the server's registered action_verbs.
+    // Mounted under the head (mountCaptureBox) so it sits on top + the expand-to-modal transplants
+    // it — like the Tray dump / Keep add-note. Mounted EARLY so it shows even on an empty panel
+    // (compose the first message). Double-gated + NO THEATER: a read-only serve registers no verbs
+    // → action_verbs is absent → no box, even if the panel still declares an action.
+    const act = data.action;
+    if (act && commitAction && act.verb) {
+      const spec = (view.action_verbs || {})[act.verb];
+      if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
     if (data.note) p.appendChild(el("div", "ext-note", data.note));
     const lines = Array.isArray(data.lines) ? data.lines : [];

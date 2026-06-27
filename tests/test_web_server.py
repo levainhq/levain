@@ -159,6 +159,92 @@ class TestSubstrateJson:
         assert not [p for p in data["layout"] if p.get("kind") == "external"]
         assert "extra_panels" not in data
 
+    def test_action_verbs_exposed_for_compose_affordance(self, tmp_path: Path) -> None:
+        # the external-panel-ACTION seam: when verbs are registered, build_substrate_json exposes
+        # each verb's confirm_required + label so the frontend sources the confirm step from the
+        # REGISTRY (the single source of truth), never a panel-declared flag that could drift.
+        from levain.writes import ActionVerb
+
+        verbs = {"send_inbox": ActionVerb(handler=lambda p: {"ok": True},
+                                          confirm_required=True, label="Send to inbox")}
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), extra_verbs=verbs))
+        assert data["action_verbs"]["send_inbox"] == {"confirm_required": True, "label": "Send to inbox"}
+
+    def test_no_verbs_omits_action_verbs(self, tmp_path: Path) -> None:
+        # a read-only serve passes no verbs (None or {}) → the key is absent → the frontend renders
+        # NO compose affordance at all (NO THEATER), even if a panel still declares an `action`.
+        assert "action_verbs" not in json.loads(build_substrate_json(_store_with_data(tmp_path)))
+        assert "action_verbs" not in json.loads(
+            build_substrate_json(_store_with_data(tmp_path), extra_verbs={}))
+
+    def test_panel_action_folds_into_extra_panel_data(self, tmp_path: Path) -> None:
+        # a panel's optional `action` (the compose spec) rides through into its extra_panels data,
+        # like lines/note — the panel author's contract; the frontend gates the actual render.
+        action = {"verb": "send_inbox", "fields": [{"name": "message", "kind": "textarea"}]}
+        provider = lambda: [{"id": "inbox", "zone": "operate", "title": "Inbox",  # noqa: E731
+                             "lines": [], "action": action}]
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+        assert data["extra_panels"]["inbox"]["action"] == action
+
+    def test_panel_without_action_carries_none(self, tmp_path: Path) -> None:
+        # a panel that declares no action carries action=None — a uniform data shape; the frontend
+        # treats falsy as "no affordance" (the gate is `act && commitAction && verb-registered`).
+        provider = lambda: [{"id": "x", "zone": "operate", "title": "X", "lines": []}]  # noqa: E731
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+        assert data["extra_panels"]["x"]["action"] is None
+
+    def test_malformed_panel_action_dropped_to_none(self, tmp_path: Path) -> None:
+        # defense-in-depth (codex L3): a malformed adopter `action` is dropped to None (the compose
+        # box just doesn't render) rather than reaching the frontend — blocks the prototype-pollution
+        # + bad-kind class at the source. A dunder field name is the load-bearing case.
+        for bad in (
+            {"verb": "v", "fields": [{"name": "__proto__", "kind": "text"}]},   # dangerous name
+            {"verb": "v", "fields": [{"name": "a", "kind": "text"}, {"name": "a", "kind": "csv"}]},  # dup name
+            {"verb": "v", "fields": [{"name": "a", "kind": "bogus"}]},          # unknown kind
+            {"verb": "", "fields": []},                                          # empty verb
+            {"fields": [{"name": "a", "kind": "text"}]},                         # no verb
+            {"verb": "v", "fields": "notalist"},                                 # fields not a list
+            "notadict",                                                          # not a dict
+        ):
+            provider = lambda b=bad: [{"id": "x", "zone": "operate", "title": "X",  # noqa: E731
+                                       "lines": [], "action": b}]
+            data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+            assert data["extra_panels"]["x"]["action"] is None, bad
+        # a well-formed action survives intact
+        good = {"verb": "send_inbox", "fields": [{"name": "message", "kind": "textarea"},
+                                                 {"name": "for", "kind": "csv"}]}
+        provider = lambda: [{"id": "x", "zone": "operate", "title": "X", "lines": [], "action": good}]  # noqa: E731
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+        assert data["extra_panels"]["x"]["action"] == good
+
+    def test_multiselect_action_field_validated(self, tmp_path: Path) -> None:
+        # a multiselect field must carry a non-empty options list of valid string values (or
+        # {value,label} dicts) — else the action is dropped, so a malformed chooser never renders.
+        for bad in (
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect"}]},                  # no options
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect", "options": []}]},    # empty options
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect", "options": [123]}]}, # non-str opt
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect",
+                                      "options": [{"value": ""}]}]},                            # empty value
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect", "options": ["  "]}]},  # whitespace value
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect",
+                                      "options": ["cli", "cli"]}]},                              # duplicate value
+            {"verb": "v", "fields": [{"name": "r", "kind": "multiselect",
+                                      "options": [{"value": "cli", "label": 5}]}]},              # non-str label
+        ):
+            provider = lambda b=bad: [{"id": "x", "zone": "operate", "title": "X",  # noqa: E731
+                                       "lines": [], "action": b}]
+            data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+            assert data["extra_panels"]["x"]["action"] is None, bad
+        # both option shapes (bare string + {value,label}) survive
+        good = {"verb": "send_inbox", "fields": [
+            {"name": "message", "kind": "textarea"},
+            {"name": "for", "kind": "multiselect",
+             "options": ["cli", {"value": "daemon", "label": "daemon"}]}]}
+        provider = lambda: [{"id": "x", "zone": "operate", "title": "X", "lines": [], "action": good}]  # noqa: E731
+        data = json.loads(build_substrate_json(_store_with_data(tmp_path), provider))
+        assert data["extra_panels"]["x"]["action"] == good
+
     def test_make_server_rejects_non_callable_extra_panels(self, tmp_path: Path) -> None:
         import pytest
 
@@ -344,6 +430,105 @@ class TestAssets:
                         f"{name}:{lineno} uses {tok} in code (not a comment/string) — "
                         "breaks the textContent-only render contract"
                     )
+
+    def test_external_panel_action_seam_wired(self) -> None:
+        """The external-panel-ACTION seam (the compose affordance) is wired in BOTH layers:
+        the boot transport (commitAction → POST /action, the write-peer of commit → /edit) and
+        the render core (buildActionBox + the renderExternal gate + the commitAction injection).
+        Structural guard that the seam exists end-to-end; the textContent-only contract above
+        already covers the new DOM for safety."""
+        core = load_web_asset("dashboard_core.js")
+        boot = load_web_asset("dashboard_boot.js")
+        # boot: a dedicated /action transport, the peer of commit's /edit, injected into render
+        assert "function commitAction" in boot and '"/action"' in boot
+        assert "{ commit, commitAction }" in boot
+        # core: the compose box + its gate, the pure coercion, and commitAction stored from opts
+        for token in ("function buildActionBox", "function collectActionParams",
+                      "ACTION-EXTRACT-START", "opts.commitAction",
+                      "view.action_verbs", "spec.confirm_required"):
+            assert token in core, f"dashboard_core.js missing {token!r} (action seam)"
+
+    def test_action_params_coercion_behavioral(self, tmp_path: Path) -> None:
+        """Behavioral oracle (not source-presence) for the compose-affordance field→params
+        coercion (collectActionParams) — the bug-class L1+L2 flagged (a divergent/stale params
+        send) lives in this logic, so drive the REAL extracted function through node: csv →
+        trimmed non-empty list or omitted; text → trimmed or omitted; required-empty → {error};
+        and the params equal EXACTLY the given field values (the confirm-step freeze guarantees
+        given == displayed → WYSIWYG). Skips if node is unavailable (the structural seam test is
+        the in-source backstop)."""
+        import shutil
+        import subprocess
+        from importlib.resources import files
+
+        node = shutil.which("node")
+        if node is None:
+            import pytest
+
+            pytest.skip("node not available — JS behavioral oracle skipped")
+
+        asset = str(files("levain") / "templates" / "web" / "dashboard_core.js")
+        driver = tmp_path / "action_params_check.js"
+        driver.write_text(
+            r"""
+const fs = require("fs");
+const text = fs.readFileSync(process.argv[2], "utf8");
+const a = text.indexOf("ACTION-EXTRACT-START"), b = text.indexOf("ACTION-EXTRACT-END");
+const block = text.slice(text.lastIndexOf("\n", a) + 1, text.indexOf("\n", b) + 1);
+const { collectActionParams } = new Function(block + "\nreturn { collectActionParams };")();
+const eq = (got, want, label) => {
+  if (JSON.stringify(got) !== JSON.stringify(want)) {
+    console.error("FAIL " + label + ": got " + JSON.stringify(got) + " want " + JSON.stringify(want));
+    process.exit(1);
+  }
+};
+// csv splits + trims + drops empties → a real list, never a coerced string
+eq(collectActionParams([{name:"for",kind:"csv",required:false,value:" chip , cli ,"}]),
+   {params:{for:["chip","cli"]}}, "csv split/trim");
+// csv all-blank → key OMITTED (broadcast), not [] and not ""
+eq(collectActionParams([{name:"for",kind:"csv",required:false,value:" , "}]),
+   {params:{}}, "csv blank omitted");
+// required csv empty → error (never a silent broadcast)
+eq(collectActionParams([{name:"for",kind:"csv",required:true,label:"Readers",value:""}]),
+   {error:"Readers is required"}, "csv required empty");
+// text trims; optional empty omitted; required empty → error
+eq(collectActionParams([{name:"message",kind:"textarea",required:true,value:"  hi  "}]),
+   {params:{message:"hi"}}, "text trim");
+eq(collectActionParams([{name:"x",kind:"text",required:false,value:"   "}]),
+   {params:{}}, "text optional empty omitted");
+eq(collectActionParams([{name:"message",kind:"textarea",required:true,label:"Message",value:""}]),
+   {error:"Message is required"}, "text required empty");
+// multi-field: message + for together, EXACTLY the given values (params == input → WYSIWYG)
+eq(collectActionParams([{name:"message",kind:"textarea",required:true,value:"deploy"},
+                        {name:"for",kind:"csv",required:false,value:"chip"}]),
+   {params:{message:"deploy",for:["chip"]}}, "multi-field");
+// null-proto params (codex L3): a field named __proto__ can't pollute the prototype + silently
+// drop from JSON — the params object's prototype stays null.
+const rp = collectActionParams([{name:"__proto__",kind:"csv",required:false,value:"x"}]);
+if (Object.getPrototypeOf(rp.params) !== null) { console.error("FAIL: params prototype not null"); process.exit(1); }
+// duplicate field names → error, never a silent overwrite
+eq(collectActionParams([{name:"a",kind:"text",required:false,value:"1"},
+                        {name:"a",kind:"text",required:false,value:"2"}]),
+   {error:"duplicate field a"}, "duplicate name");
+// multiselect: value is the array of checked options → a real list, omitted when none checked
+eq(collectActionParams([{name:"for",kind:"multiselect",required:false,value:["cli","daemon"]}]),
+   {params:{for:["cli","daemon"]}}, "multiselect list");
+eq(collectActionParams([{name:"for",kind:"multiselect",required:false,value:[]}]),
+   {params:{}}, "multiselect none omitted (broadcast)");
+eq(collectActionParams([{name:"r",kind:"multiselect",required:true,label:"Readers",value:[]}]),
+   {error:"Readers is required"}, "multiselect required empty");
+// fails closed on a non-array value (a read() regression must error, not silently broadcast)
+eq(collectActionParams([{name:"for",kind:"multiselect",required:false,value:"cli"}]),
+   {error:"for is invalid"}, "multiselect non-array fails closed");
+// trims, drops blanks, dedupes
+eq(collectActionParams([{name:"for",kind:"multiselect",required:false,value:[" cli ","cli","  ","daemon"]}]),
+   {params:{for:["cli","daemon"]}}, "multiselect trim/dedupe/drop-blank");
+console.log("OK");
+""",
+            encoding="utf-8",
+        )
+        result = subprocess.run([node, str(driver), asset], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
 
     def test_clause_rides_full_with_per_item_expand(self) -> None:
         """DATA-SAFETY + UX (the truncation fix): row text rides FULL (the server no longer
@@ -669,10 +854,11 @@ class TestHandlerFaultPath:
         a 500 / dead connection."""
         import levain.web_server as ws
 
-        def boom(_paths, _extra_panels=None, *, write_token_required=False):
+        def boom(_paths, _extra_panels=None, *, write_token_required=False, extra_verbs=None):
             # mirror build_substrate_json's real signature (gained extra_panels, then the
-            # keyword-only write_token_required for spore-129) so the stub is CALLED, not
-            # TypeError'd on an unexpected kwarg — the fault under test is the RuntimeError.
+            # keyword-only write_token_required for spore-129, then extra_verbs for the
+            # action-seam) so the stub is CALLED, not TypeError'd on an unexpected kwarg —
+            # the fault under test is the RuntimeError.
             raise RuntimeError("kaboom")
 
         monkeypatch.setattr(ws, "build_substrate_json", boom)

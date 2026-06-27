@@ -65,12 +65,12 @@
   // also carries the write token via writeHeaders). On success it reloads so the dashboard
   // reflects the saved state; on refusal it returns {ok:false, error, message} so the render
   // core can surface it inline.
-  async function commit(request) {
+  async function postWrite(route, body) {
     try {
-      const res = await fetch("/edit", {
+      const res = await fetch(route, {
         method: "POST",
         headers: writeHeaders(),
-        body: JSON.stringify(request),
+        body: JSON.stringify(body),
       });
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
@@ -88,6 +88,17 @@
     } catch (e) {
       return { ok: false, error: "network", message: e && e.message ? e.message : String(e) };
     }
+  }
+
+  // Class-A/B substrate edits → POST /edit (the request carries its own `kind`).
+  async function commit(request) { return postWrite("/edit", request); }
+
+  // Governed operator ACTION verbs → POST /action (the external-panel-ACTION seam). `verb` is
+  // the registered extra_verb name, `params` the compose fields; confirm:true is sent only AFTER
+  // the operator confirms a confirm_required verb (the kernel 409s without it — the fat-finger
+  // gate). Mirror of commit: same auth/token/reload contract via postWrite.
+  async function commitAction(verb, params, confirm) {
+    return postWrite("/action", { verb: verb, params: params || {}, confirm: confirm === true });
   }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
@@ -139,7 +150,7 @@
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
       // `writable` defaults to writable, so existing installs are unchanged.
-      window.LevainDashboard.render(view, view.writable === false ? {} : { commit });
+      window.LevainDashboard.render(view, view.writable === false ? {} : { commit, commitAction });
       status("read " + new Date().toLocaleTimeString());
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
