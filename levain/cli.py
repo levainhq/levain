@@ -280,6 +280,53 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve_p.set_defaults(func=_cmd_serve_app)
 
+    daemon_p = subparsers.add_parser(
+        "daemon",
+        help="Install/manage the always-on `serve` autostart (login-start, crash-survive).",
+        description=(
+            "Make `levain serve --write` always-on — start on login and survive a crash — so "
+            "the cockpit just works without an ad-hoc `nohup`. Per-user, no admin/root: a "
+            "launchd user agent on macOS (systemd --user / Task Scheduler are planned "
+            "pure-additions). An always-on serve is a 24/7 loopback-LOCAL write window; "
+            "off-box serve is never daemonized (install-bearing serve is loopback-only)."
+        ),
+    )
+    daemon_sub = daemon_p.add_subparsers(
+        dest="daemon_action", metavar="<action>", required=True
+    )
+
+    d_install = daemon_sub.add_parser(
+        "install", help="Install + start the autostart (idempotent).",
+    )
+    d_install.add_argument("--path", type=Path, default=Path.cwd(),
+                           help="Install directory to serve (default: cwd).")
+    d_install.add_argument("--port", type=int, default=7420,
+                           help="Loopback port (default: 7420).")
+    d_install.add_argument("--label", default="com.levainhq.levain",
+                           help="Service label (default: com.levainhq.levain).")
+    d_install.set_defaults(func=_cmd_daemon_install)
+
+    d_uninstall = daemon_sub.add_parser(
+        "uninstall", help="Stop + remove the autostart (no-op if absent).",
+    )
+    d_uninstall.add_argument("--label", default="com.levainhq.levain",
+                             help="Service label (default: com.levainhq.levain).")
+    d_uninstall.set_defaults(func=_cmd_daemon_uninstall)
+
+    d_status = daemon_sub.add_parser(
+        "status", help="Report installed/running state.",
+    )
+    d_status.add_argument("--label", default="com.levainhq.levain",
+                          help="Service label (default: com.levainhq.levain).")
+    d_status.set_defaults(func=_cmd_daemon_status)
+
+    d_restart = daemon_sub.add_parser(
+        "restart", help="Restart the running serve (pick up new code / a crash).",
+    )
+    d_restart.add_argument("--label", default="com.levainhq.levain",
+                           help="Service label (default: com.levainhq.levain).")
+    d_restart.set_defaults(func=_cmd_daemon_restart)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
@@ -342,6 +389,73 @@ def _cmd_serve_app(args: argparse.Namespace) -> int:
     from levain.app_server import run_app_server
 
     return run_app_server(path=args.path)
+
+
+def _daemon_provider():
+    """Resolve this OS's provider, or print the planned-addition message + signal exit 2."""
+    from levain import daemon
+
+    try:
+        return daemon.select_provider(), None
+    except NotImplementedError as exc:
+        print(f"levain daemon: {exc}", file=sys.stderr)
+        return None, 2
+
+
+def _cmd_daemon_install(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    spec = daemon.build_spec(install_path=args.path, port=args.port, label=args.label)
+    try:
+        result = provider.install(spec)
+    except daemon.DaemonError as exc:
+        print(f"levain daemon install failed: {exc}", file=sys.stderr)
+        return 1
+    print(result)
+    print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
+    print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
+    return 0
+
+
+def _cmd_daemon_uninstall(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    try:
+        print(provider.uninstall(args.label))
+    except daemon.DaemonError as exc:
+        print(f"levain daemon uninstall failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_daemon_status(args: argparse.Namespace) -> int:
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    st = provider.status(args.label)
+    print(f"{args.label}: installed={st.installed} running={st.running}")
+    print(f"  {st.detail}")
+    return 0
+
+
+def _cmd_daemon_restart(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    try:
+        print(provider.restart(args.label))
+    except daemon.DaemonError as exc:
+        print(f"levain daemon restart failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
