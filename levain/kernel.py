@@ -54,6 +54,7 @@ from levain.dashboard import (
     SubstrateView,
     build_substrate_view,
 )
+from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.web_server import make_server
 from levain.writes import ActionVerb, EditError, WriteScope, apply_action, apply_edit
 
@@ -74,4 +75,8 @@ __all__ = [
     # governed action-dispatch (the write-peer of extra_panels)
     "ActionVerb",
     "apply_action",
+    # the async-job seam (the propose→job→poll runtime for I/O-bound `job=True` verbs)
+    "JobStore",
+    "JobRuntime",
+    "JobStoreCorruptError",
 ]

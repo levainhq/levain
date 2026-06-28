@@ -80,11 +80,13 @@ import json
 import sys
 import threading
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
+from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
     ActionVerb,
@@ -96,6 +98,7 @@ from levain.writes import (
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "build_job_json",
     "build_recall_json",
     "build_substrate_json",
     "load_web_asset",
@@ -301,6 +304,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
 _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/substrate.json",
     "/recall.json",
+    "/job.json",
     "/edit",
     "/action",
 }
@@ -494,9 +498,12 @@ def build_substrate_json(
         assert "action_verbs" not in payload, "to_dict() collided with transport `action_verbs`"
         payload["action_verbs"] = {
             # `idempotent` tells the frontend to mint + send a client `idempotency_key` for this
-            # verb (the at-most-once retry token); sourced from the registry, never drift-prone.
+            # verb (the at-most-once retry token); `job` tells it the POST returns a job HANDLE to
+            # POLL (GET /job.json) rather than a final result — both sourced from the registry,
+            # never drift-prone.
             name: {"confirm_required": bool(spec.confirm_required),
-                   "idempotent": bool(spec.idempotent), "label": spec.label}
+                   "idempotent": bool(spec.idempotent), "job": bool(spec.job),
+                   "label": spec.label}
             for name, spec in extra_verbs.items()
         }
     return json.dumps(payload).encode("utf-8")
@@ -529,6 +536,26 @@ def build_recall_json(source: SubstrateSource, keyword: str) -> bytes:
     return json.dumps(
         {"keyword": keyword, "episodes": [r.to_dict() for r in rows], "count": len(rows)}
     ).encode("utf-8")
+
+
+def build_job_json(job_runtime: "JobRuntime | None", job_id: str) -> bytes:
+    """The ``GET /job.json?id=<job_id>`` body: an async job's current status (the POLL read).
+
+    Returns ``{job_id, status, result?|error?}`` — ``pending``/``running`` (keep polling),
+    ``done`` (with the handler ``result``), ``failed`` (with an ``error``), or ``unknown`` (a
+    missing / pruned id; the operator re-proposes). A repeatable read — polling N times is the
+    SAME result; the at-most-once guarantee is on the job's EXECUTION (the single-winner
+    ``pending``→``running`` claim) + on the propose (idempotency), never on this read.
+
+    A server with no job runtime → ``unknown`` (it has no jobs). FAIL-CLOSED on a corrupt store:
+    :meth:`JobStore.read_status` raises :class:`JobStoreCorruptError`, which the route maps to a
+    500 — NEVER a false ``unknown`` (that would make the operator re-propose a duplicate expensive
+    job) nor a false ``done``. The lease backstop (a non-terminal record past its window reads as
+    ``failed``) is applied inside ``read_status``."""
+    if job_runtime is None:
+        return json.dumps({"job_id": job_id, "status": "unknown"}).encode("utf-8")
+    now = datetime.now(timezone.utc).isoformat()
+    return json.dumps(job_runtime.store.read_status(job_id, now)).encode("utf-8")
 
 
 class _LevainHTTPServer(ThreadingHTTPServer):
@@ -565,6 +592,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # product. Present ONLY on a WRITABLE source (make_server enforces it), so the off-box
     # write-token gate — keyed on write_scope — already governs /action with no second path.
     extra_verbs: dict[str, ActionVerb]
+    # The async-job runtime (levain.jobs) for I/O-BOUND (``job=True``) action verbs. None unless a
+    # job verb is registered — then make_server auto-creates it (store under the write_scope's
+    # ledger_root + a bounded executor) and sweeps orphaned jobs at startup. apply_action routes a
+    # job verb's propose through it; GET /job.json polls it.
+    job_runtime: "JobRuntime | None"
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -721,6 +753,40 @@ class _Handler(BaseHTTPRequestHandler):
             finally:
                 self.server.request_gate.release()
             self._send(body, "application/json; charset=utf-8", head=head)
+            return
+
+        if path == "/job.json":
+            # The async-job POLL (the propose→job→POLL seam). A read like /substrate.json
+            # (gated, GET/HEAD only — no write path), so it rides this same envelope. Returns the
+            # job's status/result; FAILS CLOSED on a corrupt job store (500) so a poll never reports
+            # a false `unknown` that would make the operator re-propose a duplicate expensive job.
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                job_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0].strip()
+                if not job_id:
+                    body = json.dumps({"error": "bad_request", "message": "id is required"}).encode("utf-8")
+                    status_code = 400
+                else:
+                    body = build_job_json(self.server.job_runtime, job_id)
+                    status_code = 200
+            except JobStoreCorruptError as exc:
+                # fail-closed: the store is untrustworthy → 500, NEVER a false unknown/done.
+                body = json.dumps(
+                    {"error": "job_store_corrupt", "message": f"job store unreadable: {exc}"}
+                ).encode("utf-8")
+                status_code = 500
+            except Exception as exc:  # noqa: BLE001 — any other fault → 500, fail-closed (never false unknown)
+                body = json.dumps(
+                    {"error": "internal", "message": f"{type(exc).__name__}: {exc}"}
+                ).encode("utf-8")
+                status_code = 500
+            finally:
+                self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", status=status_code, head=head)
             return
 
         # Downstream-registered dynamic JSON routes (the FleetView extension point):
@@ -903,7 +969,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if route == "/edit":
                     result = apply_edit(scope, req)
                 else:  # /action — governed channel-verb dispatch (the write-peer of extra_panels)
-                    result = apply_action(scope, self.server.extra_verbs, req)
+                    result = apply_action(scope, self.server.extra_verbs, req,
+                                          job_runtime=self.server.job_runtime)
             except EditError as exc:
                 self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -933,6 +1000,7 @@ def make_server(
     extra_panels: "Callable[[], list[dict]] | None" = None,
     extra_verbs: "Mapping[str, ActionVerb] | None" = None,
     write_token: str | None = None,
+    job_runtime: "JobRuntime | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1109,8 +1177,22 @@ def make_server(
                 raise ValueError(f"refusing action verb {name!r}: handler must be callable.")
             if not isinstance(spec.confirm_required, bool):
                 raise ValueError(f"refusing action verb {name!r}: confirm_required must be a bool.")
+            if not isinstance(spec.job, bool):
+                raise ValueError(f"refusing action verb {name!r}: job must be a bool.")
             if not isinstance(spec.label, str):
                 raise ValueError(f"refusing action verb {name!r}: label must be a string.")
+
+    # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
+    # registered and the caller didn't inject its own (tests inject; production auto-creates): the
+    # store lives under the write_scope's ledger_root (the same governed location as the idempotency
+    # store + audit trail), with a bounded executor. extra_verbs already required a write_scope, so
+    # ledger_root is present. SWEEP at startup — a fresh process has no live workers, so any
+    # non-terminal job on disk is a crash orphan, marked ``failed`` so a poll tells the truth.
+    if job_runtime is None and any(getattr(s, "job", False) for s in extra_verbs.values()):
+        assert source.write_scope is not None  # guaranteed by the extra_verbs write-scope check above
+        job_runtime = JobRuntime(JobStore(source.write_scope.ledger_root / "jobs.json"))
+    if job_runtime is not None:
+        job_runtime.store.sweep(datetime.now(timezone.utc).isoformat())
 
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
@@ -1120,6 +1202,7 @@ def make_server(
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
     httpd.extra_verbs = extra_verbs
+    httpd.job_runtime = job_runtime
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the token-free localhost-sovereign path is

@@ -170,7 +170,7 @@ class TestSubstrateJson:
                                           confirm_required=True, label="Send to inbox")}
         data = json.loads(build_substrate_json(_store_with_data(tmp_path), extra_verbs=verbs))
         assert data["action_verbs"]["send_inbox"] == {
-            "confirm_required": True, "idempotent": False, "label": "Send to inbox"}
+            "confirm_required": True, "idempotent": False, "job": False, "label": "Send to inbox"}
 
     def test_action_verbs_exposes_idempotent_flag(self, tmp_path: Path) -> None:
         # an idempotent verb advertises idempotent:true so the frontend mints + sends a client
@@ -453,12 +453,32 @@ class TestAssets:
         boot = load_web_asset("dashboard_boot.js")
         # boot: a dedicated /action transport, the peer of commit's /edit, injected into render
         assert "function commitAction" in boot and '"/action"' in boot
-        assert "{ commit, commitAction }" in boot
+        assert "{ commit, commitAction, commitJob, pollJob, onJobsIdle }" in boot
         # core: the compose box + its gate, the pure coercion, and commitAction stored from opts
         for token in ("function buildActionBox", "function collectActionParams",
                       "ACTION-EXTRACT-START", "opts.commitAction",
                       "view.action_verbs", "spec.confirm_required"):
             assert token in core, f"dashboard_core.js missing {token!r} (action seam)"
+
+    def test_async_job_seam_wired(self) -> None:
+        """The async-job (consult) seam (spore-206) is wired end-to-end across BOTH JS layers:
+        boot exposes commitJob (POST /action, NO board reload) + pollJob (GET /job.json) + injects
+        them into render; core stores them from opts, branches on spec.job in buildActionBox, runs
+        the in-box poll loop, and renders the result via textContent (CSP-safe)."""
+        core = load_web_asset("dashboard_core.js")
+        boot = load_web_asset("dashboard_boot.js")
+        assert "function commitJob" in boot and "function pollJob" in boot
+        assert '"/job.json?id="' in boot
+        for token in ("opts.commitJob", "opts.pollJob", "spec.job", "const startPoll",
+                      "_activeJobs", "job-result", "jobsActive", "onJobsIdle"):
+            assert token in core, f"dashboard_core.js missing {token!r} (async-job seam)"
+        # the result is MODULE state projected to the DOM (survives the modal/rebuild — visual gate)
+        for token in ("_jobState", "refreshJobBoxes", "data-job-verb", "dataset.jobVerb"):
+            assert token in core, f"dashboard_core.js missing {token!r} (job result projection)"
+        # the result text is MARKDOWN-rendered via the shipped safe renderer (CSP-safe — no innerHTML)
+        assert "renderMarkdown(text)" in core
+        # a board-reloading write defers while a job polls (L3 codex MED — no detached result box)
+        assert "deferredReload" in boot and "jobsActive()" in boot
 
     def test_action_params_coercion_behavioral(self, tmp_path: Path) -> None:
         """Behavioral oracle (not source-presence) for the compose-affordance field→params

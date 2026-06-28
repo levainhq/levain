@@ -104,6 +104,7 @@ from levain.spores import (  # the operator-I/O disposition vocabulary (anneal s
 if TYPE_CHECKING:
     from levain.dashboard import AnnealPaths
     from levain.idempotency import IdempotencyStore
+    from levain.jobs import JobRuntime
 
 __all__ = [
     "EditError",
@@ -257,11 +258,24 @@ class ActionVerb:
       raises ``EditError`` would release a key whose action already happened → a replay re-fires →
       a double-send. (``send_relay`` complies: all its ``EditError``s are input validation before
       the POST; a transport fault is a ``RelayError``.)
+    - ``job`` — when True, the verb is I/O-BOUND (the flow Bridge's ``consult`` — 30s–3min,
+      spawns reviewer subprocesses) and MUST NOT run inline in the request-gate slot (it would
+      pin a request thread for minutes). The kernel routes a ``job`` verb through the async
+      :mod:`levain.jobs` runtime: the propose creates a job + submits ``handler`` to a bounded
+      executor + returns a HANDLE (``{job_id, status:"pending"}``) immediately; the handler runs
+      OUT OF BAND in a worker thread; the operator polls ``GET /job.json?id=<job_id>`` for the
+      terminal result. ``apply_action`` REQUIRES a ``job_runtime`` for a job verb (500 if absent —
+      fail-closed). The confirm + idempotency + audit envelope still applies to the PROPOSE; a
+      ``job`` verb is naturally ``idempotent`` too (the idempotency key keeps a retried propose
+      from launching a DUPLICATE expensive job). The handler runs in the worker, so its input
+      validation surfaces via poll as a ``failed`` job (the frontend validates required fields
+      client-side before the propose — server-side validation is defense-in-depth).
     - ``label`` — a short human label for the audit trail + the operator affordance."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
     idempotent: bool = False
+    job: bool = False
     label: str = ""
 
 
@@ -686,7 +700,8 @@ def _best_effort_action_audit(ledger_root: Path, record: dict[str, Any]) -> None
 
 
 def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
-                 req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+                 req: dict[str, Any], *, now: str | None = None,
+                 job_runtime: "JobRuntime | None" = None) -> dict[str, Any]:
     """Dispatch ONE governed operator action described by ``req`` against a registered verb.
     The kernel GOVERNS (validate → confirm-gate → execute → audit-receipt); the verb's
     ``handler`` does the domain work. Returns a result dict; raises ``EditError`` (HTTP-
@@ -706,7 +721,16 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
     key reused for a different request → 422; a concurrent in-flight duplicate → 409. The key is
     reserved BEFORE the handler fires: a pre-side-effect ``EditError`` RELEASES it (a corrected
     retry re-attempts); an execution fault KEEPS it reserved (at-most-once — a replay must not
-    re-fire an action that may have happened mid-fire); success FINALIZES it with the response."""
+    re-fire an action that may have happened mid-fire); success FINALIZES it with the response.
+
+    JOB verbs (``spec.job``): an I/O-BOUND verb (30s–3min) must NOT run inline (it would pin a
+    request thread). It requires a ``job_runtime`` (:mod:`levain.jobs`); the propose creates a job +
+    submits the handler to the runtime's bounded executor + returns a HANDLE
+    (``{ok, job_id, status:"pending"}``) immediately, and the operator polls ``GET /job.json`` for
+    the result. The confirm + idempotency envelope governs the PROPOSE: the idempotency record
+    caches the HANDLE (not the eventual result), so a deduped retry replays the same ``job_id``
+    WITHOUT launching a duplicate job; a full executor → 503 (pre-fire, releases the key); a missing
+    ``job_runtime`` → 500 (fail-closed, releases the key). The worker writes the completion audit."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     verb = req.get("verb")
@@ -736,6 +760,10 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
         if replay is not None:
             return replay
 
+    if spec.job:
+        return _dispatch_job(scope, verb, spec, params, now, now_iso,
+                             job_runtime, idem_store, idem_key)
+
     edit_id = uuid.uuid4().hex[:12]
     try:
         result = spec.handler(params)   # lock-free: may be slow / network-bound
@@ -747,12 +775,7 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
         # re-raise as-is; the handler picked its own status (a 4xx, distinct from a 502 fault).
         # Best-effort: a release fault (a corrupt store fails CLOSED) must not mask the handler's
         # EditError — the reservation stays in_flight, which 409s (safe; the operator re-composes).
-        if idem_store is not None and idem_key is not None:
-            try:
-                idem_store.release(idem_key)
-            except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
-                warnings.warn(f"idempotency release failed ({exc}); the reservation stays in_flight",
-                              RuntimeWarning, stacklevel=2)
+        _best_effort_release(idem_store, idem_key)
         raise
     except Exception as exc:  # noqa: BLE001 — any OTHER handler fault → audit the attempt + 502
         # Execution fault — AMBIGUOUS (the side effect may have happened mid-fire). At-most-once:
@@ -811,6 +834,85 @@ def _best_effort_mark_faulted(
     except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
         warnings.warn(f"idempotency mark_faulted failed ({exc}); the reservation stays in_flight "
                       "(still refuses a re-fire)", RuntimeWarning, stacklevel=2)
+
+
+def _best_effort_release(store: "IdempotencyStore | None", key: str | None) -> None:
+    """Release an idempotency reservation after a PROVABLY pre-side-effect refusal (nothing fired —
+    a corrected retry with the same key may re-attempt). Best-effort: a release fault (a corrupt
+    store fails CLOSED) leaves the record ``in_flight``, which 409s a same-key retry — the safe
+    direction (no re-fire), the operator re-composes. Used by both the inline-handler EditError path
+    and the job-dispatch pre-fire refusals (no runtime / store fault / executor full)."""
+    if store is None or key is None:
+        return
+    try:
+        store.release(key)
+    except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
+        warnings.warn(f"idempotency release failed ({exc}); the reservation stays in_flight",
+                      RuntimeWarning, stacklevel=2)
+
+
+def _dispatch_job(
+    scope: WriteScope, verb: str, spec: "ActionVerb", params: dict[str, Any],
+    now: str | None, now_iso: str, job_runtime: "JobRuntime | None",
+    idem_store: "IdempotencyStore | None", idem_key: str | None,
+) -> dict[str, Any]:
+    """The async (``spec.job``) dispatch path of :func:`apply_action`. Create a job + submit the
+    handler to the bounded runtime + return a HANDLE (``{ok, job_id, status:"pending"}``); the
+    handler runs OUT OF BAND in a worker. Every pre-fire refusal (no runtime / a job-store fault at
+    create / the executor full) RELEASES the idempotency key (nothing fired → a corrected retry may
+    re-attempt). On accept the idempotency record caches the HANDLE, so a deduped retry replays the
+    SAME ``job_id`` without launching a duplicate job. The propose audits ``outcome="queued"`` (NOT
+    a success — NO-THEATER); the WORKER writes the terminal ``ok``/``error`` audit on completion."""
+    if job_runtime is None:
+        # Fail-closed: a job verb registered but the server built no job runtime. Pre-fire (no job)
+        # → release the reservation so a fixed-config retry can re-attempt, then 500.
+        _best_effort_release(idem_store, idem_key)
+        raise EditError("job_unavailable", 500,
+                        f"action {verb!r} is a job verb but the server has no job runtime")
+    job_id = uuid.uuid4().hex
+
+    def _on_finish(status: str, result: dict[str, Any] | None, error: str | None) -> None:
+        # The REAL outcome audit, written by the worker when the job finishes (the propose only
+        # audited "queued"). Best-effort, single-writer (the shared _WRITE_LOCK serializes it
+        # against concurrent worker/request audits).
+        _best_effort_action_audit(scope.ledger_root, _action_record(
+            job_id, verb, spec.label, _now_iso(None),
+            outcome=("ok" if status == "done" else "error"),
+            detail=(result.get("summary") if status == "done" and isinstance(result, dict)
+                    else error),
+            idempotency_key=idem_key))
+
+    try:
+        accepted = job_runtime.submit(
+            job_id, verb, lambda: spec.handler(params), _on_finish, now_iso)
+    except Exception as exc:  # noqa: BLE001 — a job-store fault at create (corrupt / IO); pre-fire
+        _best_effort_release(idem_store, idem_key)
+        raise EditError("job_store_error", 500,
+                        f"could not enqueue {verb!r}: {type(exc).__name__}") from exc
+    if not accepted:
+        # Back-pressure: the executor is full → NO job was created (pre-fire) → release + 503.
+        _best_effort_release(idem_store, idem_key)
+        raise EditError("busy", 503,
+                        f"the {verb!r} job queue is full ({job_runtime.max_concurrent} running) — "
+                        "retry shortly")
+    _best_effort_action_audit(scope.ledger_root, _action_record(
+        job_id, verb, spec.label, now_iso, outcome="queued", detail=None,
+        idempotency_key=idem_key))
+    response = {"ok": True, "job_id": job_id, "status": "pending", "verb": verb}
+    if idem_store is not None and idem_key is not None:
+        # Cache the HANDLE (not the eventual result) so a within-window deduped retry returns the
+        # SAME job_id WITHOUT launching a duplicate job. Best-effort (mirrors the inline path): the
+        # job already launched, so a finalize fault must not turn a real 200 into a false 500. The
+        # kept in_flight record 409s a same-key replay (no duplicate job); the operator polls the
+        # job_id they already received.
+        try:
+            idem_store.finalize(idem_key, response, _now_iso(now))
+        except (OSError, TypeError, ValueError, StoreCorruptError) as exc:
+            warnings.warn(
+                f"job {verb!r} launched but its idempotency finalize failed ({exc}); the handle "
+                f"stands — a same-key replay will 409 until the window prunes",
+                RuntimeWarning, stacklevel=2)
+    return response
 
 
 def _idempotency_claim(

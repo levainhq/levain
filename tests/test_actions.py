@@ -466,3 +466,142 @@ class TestActionRoute:
             status, _body = _post(base + "/action", {"verb": "send_test"},
                                   headers={"Sec-Fetch-Site": "cross-site"})
         assert status == 403
+
+
+# --- the async-job (consult) seam: apply_action job dispatch + the /job.json poll route ----
+
+import time as _time  # noqa: E402
+
+from levain.jobs import JobRuntime, JobStore  # noqa: E402
+from levain.web_server import build_job_json  # noqa: E402
+
+
+def _get(url: str):
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _wait_job(store: JobStore, job_id: str, status: str, timeout: float = 3.0) -> dict:
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        st = store.read_status(job_id, _now_aware())
+        if st.get("status") == status:
+            return st
+        _time.sleep(0.02)
+    raise AssertionError(f"job {job_id} did not reach {status}")
+
+
+def _now_aware() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+class TestApplyActionJobPath:
+    def test_job_verb_without_runtime_500_and_releases_key(self, tmp_path: Path) -> None:
+        # a job verb but no runtime is a config bug → fail-closed 500; the idempotency key is
+        # released (pre-fire, nothing ran) so a fixed-config retry can re-attempt.
+        scope = _scope(tmp_path)
+        reg = {"consult": ActionVerb(handler=lambda p: {"text": "x"}, idempotent=True, job=True,
+                                     confirm_required=False)}
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, reg, {"verb": "consult", "idempotency_key": "k1"}, job_runtime=None)
+        assert ei.value.http_status == 500 and ei.value.code == "job_unavailable"
+
+    def test_job_propose_returns_handle_and_polls_done(self, tmp_path: Path) -> None:
+        scope = _scope(tmp_path)
+        rt = JobRuntime(JobStore(tmp_path / "jobs.json"), max_concurrent=2)
+        reg = {"consult": ActionVerb(handler=lambda p: {"text": "REVIEW " + p["q"], "summary": "s"},
+                                     idempotent=True, job=True, confirm_required=False)}
+        r = apply_action(scope, reg, {"verb": "consult", "params": {"q": "hi"},
+                                      "idempotency_key": "k1"}, job_runtime=rt)
+        assert r["ok"] and r["status"] == "pending" and "job_id" in r
+        st = _wait_job(rt.store, r["job_id"], "done")
+        assert st["result"]["text"] == "REVIEW hi"
+
+    def test_replay_returns_same_job_no_duplicate_launch(self, tmp_path: Path) -> None:
+        # the core safety property: a deduped retry replays the SAME job_id and the handler fires
+        # EXACTLY ONCE (no duplicate expensive job).
+        scope = _scope(tmp_path)
+        rt = JobRuntime(JobStore(tmp_path / "jobs.json"), max_concurrent=2)
+        calls: list = []
+        reg = {"consult": ActionVerb(handler=lambda p: calls.append(p) or {"text": "ok"},
+                                     idempotent=True, job=True, confirm_required=False)}
+        req = {"verb": "consult", "params": {"q": "x"}, "idempotency_key": "k1"}
+        r1 = apply_action(scope, reg, dict(req), job_runtime=rt)
+        r2 = apply_action(scope, reg, dict(req), job_runtime=rt)
+        assert r2["job_id"] == r1["job_id"] and r2.get("replayed") is True
+        _wait_job(rt.store, r1["job_id"], "done")
+        assert len(calls) == 1  # the replay did NOT launch a second job
+
+    def test_back_pressure_503_releases_key(self, tmp_path: Path) -> None:
+        scope = _scope(tmp_path)
+        rt = JobRuntime(JobStore(tmp_path / "jobs.json"), max_concurrent=1)
+        gate = threading.Event()
+        reg = {"consult": ActionVerb(handler=lambda p: (gate.wait(2), {"text": "x"})[1],
+                                     idempotent=True, job=True, confirm_required=False)}
+        r1 = apply_action(scope, reg, {"verb": "consult", "params": {"q": "a"},
+                                       "idempotency_key": "k1"}, job_runtime=rt)
+        _wait_job(rt.store, r1["job_id"], "running")
+        with pytest.raises(EditError) as ei:
+            apply_action(scope, reg, {"verb": "consult", "params": {"q": "b"},
+                                      "idempotency_key": "k2"}, job_runtime=rt)
+        assert ei.value.http_status == 503 and ei.value.code == "busy"
+        gate.set()
+
+    def test_queued_then_ok_audit_trail(self, tmp_path: Path) -> None:
+        scope = _scope(tmp_path)
+        rt = JobRuntime(JobStore(tmp_path / "jobs.json"), max_concurrent=1)
+        reg = {"consult": ActionVerb(handler=lambda p: {"text": "x", "summary": "did it"},
+                                     idempotent=True, job=True, confirm_required=False)}
+        r = apply_action(scope, reg, {"verb": "consult", "params": {"q": "x"},
+                                      "idempotency_key": "k1"}, job_runtime=rt)
+        _wait_job(rt.store, r["job_id"], "done")
+        _time.sleep(0.1)  # let the worker's completion audit land
+        outcomes = [rec["outcome"] for rec in recent_edits(scope.ledger_root)]
+        assert "queued" in outcomes and "ok" in outcomes  # propose audits queued, worker audits ok
+
+
+class TestJobPollRoute:
+    def test_live_propose_poll_done(self, tmp_path: Path) -> None:
+        # end-to-end over the REAL server: a job verb auto-creates the runtime; propose via
+        # POST /action, poll via GET /job.json until done.
+        verbs = {"consult": ActionVerb(handler=lambda p: {"text": "synthesis", "summary": "s"},
+                                       idempotent=True, job=True, confirm_required=True,
+                                       label="Consult")}
+        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+            status, body = _post(base + "/action",
+                                 {"verb": "consult", "params": {"q": "x"}, "confirm": True,
+                                  "idempotency_key": "k1"})
+            assert status == 200 and body["status"] == "pending"
+            jid = body["job_id"]
+            # poll until terminal
+            for _ in range(150):
+                st, pb = _get(base + "/job.json?id=" + jid)
+                assert st == 200
+                if pb["status"] in ("done", "failed"):
+                    break
+                _time.sleep(0.05)
+            assert pb["status"] == "done" and pb["result"]["text"] == "synthesis"
+
+    def test_poll_unknown_id(self, tmp_path: Path) -> None:
+        verbs = {"consult": ActionVerb(handler=lambda p: {"text": "x"}, idempotent=True, job=True,
+                                       confirm_required=False, label="Consult")}
+        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+            st, body = _get(base + "/job.json?id=ghost")
+            assert st == 200 and body["status"] == "unknown"
+
+    def test_poll_missing_id_400(self, tmp_path: Path) -> None:
+        verbs = {"consult": ActionVerb(handler=lambda p: {"text": "x"}, idempotent=True, job=True,
+                                       confirm_required=False, label="Consult")}
+        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+            st, body = _get(base + "/job.json")
+            assert st == 400 and body["error"] == "bad_request"
+
+
+def test_build_job_json_no_runtime_unknown() -> None:
+    # a server with no job runtime → unknown (it has no jobs); never a crash.
+    assert json.loads(build_job_json(None, "anything")) == {"job_id": "anything", "status": "unknown"}
