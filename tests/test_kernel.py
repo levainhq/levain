@@ -29,6 +29,9 @@ CONTRACT = {
     "EditError",
     "ActionVerb",
     "apply_action",
+    "JobStore",
+    "JobRuntime",
+    "JobStoreCorruptError",
 }
 
 

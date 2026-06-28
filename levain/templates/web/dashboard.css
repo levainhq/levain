@@ -775,6 +775,21 @@
     margin: 0 0 10px; padding: 8px; border-radius: 4px;
     background: #0a0f0e; border: 1px solid color-mix(in srgb, var(--operate) 22%, var(--line));
   }
+  /* Async-job (consult) in-box result: a status line + the scrollable result text. CSP-safe
+     (a served class, never an inline style); textContent-only on the render side. */
+  .job-result-wrap { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+  .job-status { font: 11px/1.4 var(--mono); letter-spacing: .03em; color: var(--dim); }
+  .job-status.running::before { content: "◌ "; }
+  .job-status.done { color: var(--operate); }
+  .job-status.done::before { content: "✓ "; }
+  .job-status.err { color: var(--hot); }
+  .job-status.err::before { content: "▲ "; }
+  /* The result is MARKDOWN-rendered (a .section-display inside this scroll box), so the .md-*
+     prose styles apply; this is just the bounded scroll container. */
+  .job-result {
+    max-height: 360px; overflow: auto;
+    background: #070b0a; border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px;
+  }
   .tray-dump-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .tray-dump-ta, .verb-edit-ta {
     width: 100%; min-width: 0; resize: vertical;

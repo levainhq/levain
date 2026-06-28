@@ -78,6 +78,20 @@
   // The governed ACTION transport (POST /action), injected alongside commit by the boot layer.
   // null on a read-only port → external-panel compose affordances render nothing (NO THEATER).
   let commitAction = null;
+  // The async-JOB transports for an I/O-bound (`job:true`) verb: `commitJob` proposes (POST /action,
+  // NO board reload — the result lands in the box, not a rebuild) and returns a job HANDLE;
+  // `pollJob` reads GET /job.json for the terminal result. Both null on a read-only port.
+  let commitJob = null;
+  let pollJob = null;
+  // Called when the LAST active job poll terminates → the boot layer flushes a board reload it
+  // DEFERRED while a job was polling (so a sibling write — inbox/relay/edit — doesn't rebuild the
+  // board and detach the live consult box mid-job; L3 codex MED). null on a read-only port.
+  let onJobsIdle = null;
+  // Job ids with a LIVE in-box poll loop. hasUnsavedEdit() reports true while non-empty so a
+  // passive board reload (visibilitychange / refresh) defers instead of nuking the polling box +
+  // its eventual result mid-consult (a job runs 30s–3min). Cleared when a poll reaches a terminal
+  // state (or its result box detaches). Module-level so it survives a render() rebuild.
+  const _activeJobs = new Set();
 
   // Friendly zone labels, in IA order — used for the "All" view separators.
   const ZONE_LABELS = [
@@ -112,6 +126,9 @@
     // parked MCP-App) renders read-only — no edit affordances, zero other change.
     commit = opts && typeof opts.commit === "function" ? opts.commit : null;
     commitAction = opts && typeof opts.commitAction === "function" ? opts.commitAction : null;
+    commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
+    pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
+    onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
 
     const board = document.getElementById("board");
     if (!board) return;
@@ -1686,6 +1703,40 @@
     return "idem-" + Date.now() + "-" + Math.random().toString(16).slice(2);
   }
 
+  // An async job's result lives in MODULE state; the DOM is a PROJECTION of it (the canonical-object
+  // discipline). So the result survives ANY re-render — a board rebuild AND the expand-to-modal,
+  // which builds a FRESH consult box (the carry-over the visual gate flagged). Keyed by verb.
+  const _jobState = {};  // verb → { kind: "running"|"done"|"err", payload?, label }
+  function renderJobResultInto(wrap, verb) {
+    const st = _jobState[verb];
+    wrap.replaceChildren();
+    if (!st) return;  // no run yet → empty (the box just shows the compose controls)
+    const label = st.label || verb;
+    if (st.kind === "running") {
+      wrap.appendChild(el("div", "job-status running", label + " — running…"));
+      return;
+    }
+    if (st.kind === "done") {
+      const p = st.payload || {};
+      wrap.appendChild(el("div", "job-status done", typeof p.summary === "string" ? p.summary : "done"));
+      const scroll = el("div", "job-result");
+      const md = el("div", "section-display");  // markdown styling container (the .md-* classes)
+      const text = typeof p.text === "string" ? p.text : JSON.stringify(p, null, 2);
+      md.appendChild(renderMarkdown(text));     // MARKDOWN → DOM, CSP-safe (the shipped renderer)
+      scroll.appendChild(md);
+      wrap.appendChild(scroll);
+      return;
+    }
+    wrap.appendChild(el("div", "job-status err", typeof st.payload === "string" ? st.payload : "failed"));
+  }
+  // Re-render the cached job state into EVERY current result-wrap for this verb — the inline panel
+  // AND an open modal can each hold one. DOM-queried fresh, so it also reaches a box built AFTER the
+  // poll began (e.g. the modal opened mid-consult).
+  function refreshJobBoxes(verb) {
+    document.querySelectorAll('[data-job-verb="' + verb + '"] .job-result-wrap')
+      .forEach((w) => renderJobResultInto(w, verb));
+  }
+
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
     // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
@@ -1761,12 +1812,62 @@
       msg.textContent = (res && (res.message || res.error)) || "failed";
     };
 
+    // ── async-job (spec.job) result area + poll loop ──
+    // A job verb PROPOSES (commitJob — NO board reload) then polls /job.json. The result lives in
+    // MODULE state (_jobState[verb], rendered by refreshJobBoxes); THIS box just hosts a result-wrap
+    // tagged with the verb so the projection finds it. Mount it + render the current cached state on
+    // EVERY build, so the result carries into a fresh box (the modal / a rebuild). The cockpit stays
+    // responsive while a 30s–3min consult runs out-of-band.
+    if (spec.job) {
+      box.dataset.jobVerb = action.verb;
+      const wrap = el("div", "job-result-wrap");
+      box.appendChild(wrap);
+      renderJobResultInto(wrap, action.verb);  // re-show the last/live result in this fresh box
+    }
+    const setJob = (kind, payload) => {
+      _jobState[action.verb] = { kind: kind, payload: payload, label: spec.label || action.verb };
+      refreshJobBoxes(action.verb);
+    };
+    const startPoll = (jobId) => {
+      _activeJobs.add(jobId);
+      let netErrs = 0;
+      const stop = () => {
+        _activeJobs.delete(jobId);
+        // last job done → let the boot layer flush any board reload it deferred while polling.
+        if (_activeJobs.size === 0 && onJobsIdle) onJobsIdle();
+      };
+      const tick = async () => {
+        let r;
+        try { r = await pollJob(jobId); netErrs = 0; }
+        catch (e) {
+          if (++netErrs > 5) { setJob("err", "poll failed — the job may still be running"); stop(); return; }
+          setTimeout(tick, 2000); return;
+        }
+        const st = r && r.status;
+        if (st === "pending" || st === "running") { setTimeout(tick, 2000); return; }
+        if (st === "done") { setJob("done", r.result); stop(); return; }
+        if (st === "failed") { setJob("err", "failed: " + ((r && r.error) || "")); stop(); return; }
+        if (st === "unknown") { setJob("err", "job not found (expired) — run again"); stop(); return; }
+        setJob("err", "unexpected status: " + st); stop();
+      };
+      setTimeout(tick, 1000);  // first poll soon, then every 2s
+    };
+    const startJob = async (params, key) => {
+      msg.className = "edit-msg busy"; msg.textContent = "starting…";
+      const res = await commitJob(action.verb, params, true, key);
+      if (!(res && res.ok)) { failed(res); return; }
+      msg.className = "edit-msg"; msg.textContent = "";
+      setJob("running", null);
+      startPoll(res.job_id);
+    };
+
     go.addEventListener("click", () => {
       const c = collect();
       if (c.error) { msg.className = "edit-msg err"; msg.textContent = c.error; return; }
       const sendKey = keyForSend(c.params);  // stable across a retry of THIS content (above)
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
+        if (spec.job) { startJob(c.params, sendKey).then(() => setDisabled(false)); return; }
         commitAction(action.verb, c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res); });
         return;
       }
@@ -1797,6 +1898,13 @@
       yes.addEventListener("click", async () => {
         yes.disabled = true; no.disabled = true; setDisabled(true);
         msg.className = "edit-msg busy"; msg.textContent = "…";
+        if (spec.job) {
+          // A job verb PROPOSES (no board reload), then polls in-box. Close the confirm form
+          // (restores the compose box + re-enables it for a next run); the result renders below.
+          await startJob(c.params, sendKey);
+          close();
+          return;
+        }
         const res = await commitAction(action.verb, c.params, true, sendKey);
         if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
         close(); failed(res);
@@ -2184,6 +2292,10 @@
   // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
   // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
   function hasUnsavedEdit() {
+    // A live async-job poll is "unsaved work" for reload-deferral purposes: a passive rebuild would
+    // discard the polling box + its pending result mid-consult (the job keeps running server-side,
+    // but the operator loses the handle). Defer the rebuild until the poll terminates.
+    if (_activeJobs.size > 0) return true;
     for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta")) {
       if (ta.value !== ta.dataset.orig) return true;
     }
@@ -2193,6 +2305,8 @@
     return false;
   }
 
-  // Export the entry points onto a namespace the surface shim calls.
-  window.LevainDashboard = { render, hasUnsavedEdit };
+  // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
+  // layer DEFER a board reload while an async job is polling (a reload would detach the live result
+  // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
+  window.LevainDashboard = { render, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
 })();

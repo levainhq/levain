@@ -25,6 +25,10 @@
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
   // an overlapping passive read (which would leave the editor wedged open). [codex L3 round-2]
   let pendingReload = false;
+  // A board reload a write DEFERRED because an async job was polling (a reload rebuilds the board +
+  // would detach the live consult result box; L3 codex MED). Flushed by onJobsIdle() when the last
+  // job finishes — so the sibling write's saved state still lands, just after the job.
+  let deferredReload = false;
 
   // OFF-BOX write token (spore-129). When the substrate is served off-loopback (a Tailscale
   // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
@@ -74,7 +78,17 @@
       });
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
-      if (res.ok) { await load(); return { ok: true }; }
+      if (res.ok) {
+        // Defer the reload while an async job is polling — rebuilding the board would detach the
+        // live consult result box (L3 codex MED). onJobsIdle() flushes it when the job ends.
+        if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function"
+            && window.LevainDashboard.jobsActive()) {
+          deferredReload = true;
+        } else {
+          await load();
+        }
+        return { ok: true, data: data };
+      }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
       if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) {
@@ -104,6 +118,47 @@
     const body = { verb: verb, params: params || {}, confirm: confirm === true };
     if (idempotencyKey) body.idempotency_key = idempotencyKey;
     return postWrite("/action", body);
+  }
+
+  // A JOB (I/O-bound) verb PROPOSES via POST /action but does NOT reload the board: the result
+  // lands in the compose box via polling, and a board reload would nuke the polling box mid-job.
+  // Returns the job HANDLE { ok, job_id, status } (or { ok:false, error, message }). Same
+  // auth/token contract as postWrite, minus the reload.
+  async function commitJob(verb, params, confirm, idempotencyKey) {
+    const body = { verb: verb, params: params || {}, confirm: confirm === true };
+    if (idempotencyKey) body.idempotency_key = idempotencyKey;
+    try {
+      const res = await fetch("/action", { method: "POST", headers: writeHeaders(), body: JSON.stringify(body) });
+      let data = {};
+      try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
+      if (res.ok) { return { ok: true, job_id: data.job_id, status: data.status }; }
+      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) {
+        try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
+      }
+      return { ok: false, error: data.error || "HTTP " + res.status, message: data.message || "HTTP " + res.status };
+    } catch (e) {
+      return { ok: false, error: "network", message: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  // Poll an async job's status → { status, result?, error? }. A read-only GET (no write token —
+  // the read path, like /substrate.json). Throws on a non-OK response (incl. the fail-closed 500 a
+  // corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
+  async function pollJob(jobId) {
+    const res = await fetch("/job.json?id=" + encodeURIComponent(jobId), { cache: "no-store" });
+    if (!res.ok) {
+      let m = "HTTP " + res.status;
+      try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
+      throw new Error(m);
+    }
+    return res.json();
+  }
+
+  // The render core calls this when the LAST active job poll terminates → flush a board reload a
+  // sibling write deferred while the job was polling (L3 codex MED). A passive reload (the editor
+  // baseline still applies); if an edit is now open it defers again via the normal load() guard.
+  function onJobsIdle() {
+    if (deferredReload) { deferredReload = false; load({ passive: true }); }
   }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
@@ -155,7 +210,7 @@
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
       // `writable` defaults to writable, so existing installs are unchanged.
-      window.LevainDashboard.render(view, view.writable === false ? {} : { commit, commitAction });
+      window.LevainDashboard.render(view, view.writable === false ? {} : { commit, commitAction, commitJob, pollJob, onJobsIdle });
       status("read " + new Date().toLocaleTimeString());
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
