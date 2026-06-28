@@ -938,6 +938,59 @@ class TestStartupContract:
         assert "Could not bind" in err and "--port" in err
 
 
+class TestServeWriteFlag:
+    """`levain serve` is READ-ONLY by default; --write opts into the governed writable
+    cockpit. The command was historically documented read-only while its resolved source
+    (`SubstrateSource.local`) carries a write_scope for `levain tui` — so serve inherited
+    writability silently. These lock the now-EXPLICIT posture: read-only by default, the
+    governed write surface only on --write."""
+
+    def _real_install(self, tmp_path: Path) -> Path:
+        from anneal_memory import Store
+
+        levain_dir = tmp_path / ".levain"
+        levain_dir.mkdir()
+        with Store(levain_dir / "memory.db"):
+            pass
+        return tmp_path
+
+    def _source_served(self, tmp_path: Path, monkeypatch, *, write: bool):
+        # Capture the source run_web_server hands to make_server, then bail before
+        # serve_forever (raise OSError → the clean rc=1 bind-failure path).
+        import levain.web_server as ws
+
+        captured: dict = {}
+
+        def fake_make_server(source, **kw):
+            captured["source"] = source
+            raise OSError("captured — bail before serve")
+
+        monkeypatch.setattr(ws, "make_server", fake_make_server)
+        rc = run_web_server(self._real_install(tmp_path), open_browser=False, write=write)
+        assert rc == 1  # we never meant to serve; the OSError path returns 1
+        return captured["source"]
+
+    def test_readonly_by_default(self, tmp_path: Path, monkeypatch) -> None:
+        src = self._source_served(tmp_path, monkeypatch, write=False)
+        assert src.write_scope is None  # READ-ONLY: no governed write surface → POST /edit 422s
+        assert src.install_root is not None  # install_root KEPT → seed/config still render
+
+    def test_write_flag_keeps_write_scope(self, tmp_path: Path, monkeypatch) -> None:
+        src = self._source_served(tmp_path, monkeypatch, write=True)
+        assert src.write_scope is not None  # --write: the governed writable cockpit
+
+    def test_cli_serve_threads_write(self, tmp_path: Path, monkeypatch) -> None:
+        import levain.web_server as ws
+        from levain.cli import main
+
+        seen: dict = {}
+        monkeypatch.setattr(ws, "run_web_server", lambda **kw: seen.update(kw) or 0)
+        main(["serve", "--path", str(tmp_path), "--no-open"])
+        assert seen["write"] is False  # default → read-only
+        main(["serve", "--path", str(tmp_path), "--no-open", "--write"])
+        assert seen["write"] is True  # --write opts in
+
+
 # --- Slice 2a: the governed write boundary (POST /edit) ---------------------
 
 _W_WORLD = (

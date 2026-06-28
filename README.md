@@ -67,14 +67,14 @@ levain verify-hooks --path /path/to/install
 
 ## Inspect your substrate
 
-Your partner's memory normally only exists *inside* a session. These read-only commands let you look at it from outside — memory health (is the Hebbian write-path live or silently dark?), the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. All read-only: they inspect, they never change anything.
+Your partner's memory normally only exists *inside* a session. These commands let you look at it from outside — memory health (is the Hebbian write-path live or silently dark?), the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. Read-only by default: they inspect, not change (the one exception is `levain serve --write`, the governed writable cockpit, noted below).
 
 ```
 levain dashboard          # a terminal glance (add --json for the raw view)
 levain serve              # a local web-app in your browser — localhost only
 ```
 
-`levain serve` runs a tiny localhost web server (default `http://127.0.0.1:7420`) and opens your browser to a live dashboard of your own substrate. It binds loopback only, refuses non-loopback Hosts, ships its UI from the package (no CDN, no account, renders offline) — your memory stays on your machine. `Ctrl+C` to stop; `--port` / `--no-open` to adjust.
+`levain serve` runs a tiny localhost web server (default `http://127.0.0.1:7420`) and opens your browser to a live dashboard of your own substrate. It binds loopback only, refuses non-loopback Hosts, ships its UI from the package (no CDN, no account, renders offline) — your memory stays on your machine. `Ctrl+C` to stop; `--port` / `--no-open` to adjust. Read-only by default; **`--write`** opts into the governed writable cockpit — operate your State / spores / Tray-Keep right from the browser, through the same governed seam `levain tui` uses (loopback-only, the localhost bind is the auth).
 
 ```
 pip install 'levain[app]'   # optional: the in-host render
