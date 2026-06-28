@@ -209,11 +209,15 @@ def main(argv: list[str] | None = None) -> int:
         "serve",
         help="Serve the substrate dashboard as a local web-app (localhost).",
         description=(
-            "Run the read-only substrate dashboard as a local web-app — your "
-            "browser, your machine, no vendor host, no CDN, no account. Binds "
-            "127.0.0.1 only and serves a fresh read-only SubstrateView snapshot "
-            "on every request: acts on nothing. This is the sovereign v2 control "
-            "surface; the in-host `serve-app` MCP App is the parked alternative."
+            "Run the substrate dashboard as a local web-app — your browser, your "
+            "machine, no vendor host, no CDN, no account. Binds 127.0.0.1 only and "
+            "serves a fresh SubstrateView snapshot on every request. READ-ONLY by "
+            "default — it binds a socket, so read-only is the safe default (unlike "
+            "`levain tui`, a local terminal, which defaults writable); pass --write for "
+            "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
+            "the same governed seam `levain tui` uses, under localhost-sovereign auth). "
+            "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
+            "is the parked alternative."
         ),
     )
     web_p.add_argument(
@@ -232,10 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         "--host",
         default="127.0.0.1",
         help=(
-            "Loopback address to bind (default: 127.0.0.1). Slice-1 serve is "
-            "loopback-only by construction — a non-loopback address is refused, "
-            "because the surface is read-only and unauthenticated until the "
-            "Slice-2 write/auth boundary lands."
+            "Loopback address to bind (default: 127.0.0.1). `serve` is loopback-only: "
+            "an install-bearing substrate's seed/config is operator-private, so a "
+            "non-loopback (LAN / mesh) address is refused — there is no off-box `serve`."
         ),
     )
     web_p.add_argument(
@@ -243,6 +246,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         dest="no_open",
         help="Do not open a browser tab on startup.",
+    )
+    web_p.add_argument(
+        "--write",
+        action="store_true",
+        help=(
+            "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
+            "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
+            "edits through the governed write seam. Loopback-sovereign (the localhost "
+            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "is no off-box writable serve (an install's seed/config is operator-private). "
+            "Default is read-only."
+        ),
     )
     web_p.set_defaults(func=_cmd_serve)
 
@@ -319,6 +334,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
         open_browser=not args.no_open,
+        write=args.write,
     )
 
 

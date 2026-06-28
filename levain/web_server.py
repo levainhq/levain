@@ -19,12 +19,16 @@ delta between the two surfaces.
 Properties carried straight from the data layer:
 - **reads stay read-only** — every GET builds a fresh ``SubstrateView`` with the
   store opened ``read_only=True``; the read path acts on nothing.
-- **writes are governed (Slice 2a)** — exactly ONE write route, ``POST /edit``,
-  behind the write/auth boundary below. It edits ONLY Class-A operator inputs
-  (``world.md`` sections, ``posture``/``recency`` thinking-style, the entity name)
-  via ``levain.writes`` — never the consolidated cognition (scope §1). Every write
-  is backed up + audited + reversible; the consolidate stays the felt layer's
-  single writer.
+- **writes are governed** — TWO write routes, ``POST /edit`` + the governed
+  ``POST /action`` ops-verb seam, both behind the write/auth boundary below.
+  ``/edit`` mutates Class-A operator inputs (``world.md`` sections, ``posture``/
+  ``recency``, the entity name), the ``## State`` section, the spore lifecycle
+  (touch/descend/ascend/seed/disposition/surface_at), and episode tombstones via
+  ``levain.writes`` — never the consolidated FELT layer (the five felt sections;
+  the consolidate stays their single writer). Every write is backed up + audited +
+  reversible. The write surface is served ONLY when the source carries a
+  ``write_scope`` — ``levain serve --write`` (the default ``serve`` strips it →
+  read-only); a writable source needs loopback or, off-box, a write token.
 - **migration-free** — reads the operator's EXISTING store; zero re-seed.
 - **billing-immune** — a human runs it and reads it; never headless.
 
@@ -59,8 +63,9 @@ Sovereignty boundary (load-bearing, not incidental):
   keyword search) PLUS any read-only routes a downstream registers via
   ``make_server(extra_assets=..., extra_json=...)`` (the FleetView extension point — a
   collision with a reserved built-in route is refused at registration); POST serves
-  exactly one (``/edit``), and no extra route can reach it. No filesystem mapping, so
-  there is no path-traversal surface. Anything else is a flat 404.
+  exactly two GOVERNED write routes (``/edit`` + ``/action``, the ops-verb seam), and
+  no downstream extra route can add, shadow, or reach a POST handler. No filesystem
+  mapping, so there is no path-traversal surface. Anything else is a flat 404.
 - **bounded concurrency** — the per-request store read and every write run under a
   bounded gate; past the cap a request gets a clean 503 rather than letting an
   unbounded thread pile-up exhaust the box.
@@ -68,6 +73,7 @@ Sovereignty boundary (load-bearing, not incidental):
 
 from __future__ import annotations
 
+import dataclasses
 import hmac
 import ipaddress
 import json
@@ -798,7 +804,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"error": error, "message": message}, status)
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        """The Slice-2a write route — ``POST /edit``, behind the write/auth boundary.
+        """The governed write routes — ``POST /edit`` + ``POST /action`` — behind the
+        write/auth boundary. Both fork only at dispatch, AFTER the shared auth checks;
+        both refuse with 422 ``read_only`` when the source carries no ``write_scope``.
 
         The cheap fail-closed checks (Host → CSRF → Content-Type → route →
         Content-Length) run BEFORE any body read and each closes the connection on
@@ -1181,15 +1189,39 @@ def run_web_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
+    write: bool = False,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
+
+    READ-ONLY by default (``write=False``): the served source carries no write scope,
+    so every edit affordance is dark and ``POST /edit`` 422s — a pure inspection
+    cockpit. ``write=True`` (``levain serve --write``) serves the GOVERNED WRITABLE
+    cockpit — State / spore / Tray-Keep / episode edits through the same ``apply_edit``
+    seam ``levain tui`` uses, under the localhost-sovereign auth (the loopback bind +
+    the Host/CSRF guards ARE the auth; no token on loopback). An install-bearing
+    substrate is loopback-only either way (its seed/config is operator-private), so
+    ``serve`` never binds off-box — a posture that fits a network surface: read-only
+    is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).
 
     Returns nonzero only if the store is unreachable before the server starts, or
     the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
     ``serve-app``. A degraded sub-tier renders visibly and is not a startup
     failure. Blocks in ``serve_forever`` until interrupted (Ctrl+C → clean exit 0).
     """
+    # `serve` ALWAYS resolves an install-bearing source (SubstrateSource.local sets
+    # install_root), so make_server keeps it loopback-only in BOTH read-only and --write
+    # modes — the `--host` "there is no off-box serve" help relies on this invariant. If a
+    # future refactor ever lets `serve` resolve a no-install source, the read-only strip
+    # below would leave write_scope=None AND install_root=None, which make_server permits
+    # off-loopback — re-pin loopback-only here if that ever changes.
     source = _resolve_source(path)
+    if not write:
+        # READ-ONLY by default — drop the governed write surface the install source
+        # carries (`SubstrateSource.local` sets a write_scope for `levain tui`; `serve`
+        # opts OUT unless --write). install_root is KEPT so seed/config still RENDER —
+        # only the WRITE path is suppressed (writable:false + POST /edit 422). A network
+        # surface defaults read-only; --write is the deliberate, governed opt-in.
+        source = dataclasses.replace(source, write_scope=None)
     if not source.anneal.episodic_db.exists():
         print(
             f"No anneal store at {source.anneal.episodic_db}.\n"
@@ -1200,7 +1232,7 @@ def run_web_server(
 
     try:
         httpd = make_server(source, host=host, port=port)
-    except ValueError as exc:  # non-loopback bind refused (the Slice-1 boundary)
+    except ValueError as exc:  # bind refused — wildcard/public, or an install-bearing/writable source off-loopback
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
@@ -1221,7 +1253,8 @@ def run_web_server(
     url = f"http://{host_for_url}:{bound_port}/"
     print(f"Levain substrate → {url}")
     print(f"  store: {source.anneal.episodic_db}")
-    print("  read-only · localhost-only · Ctrl+C to stop")
+    mode = "GOVERNED WRITABLE" if source.write_scope is not None else "read-only"
+    print(f"  {mode} · localhost-only · Ctrl+C to stop")
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
