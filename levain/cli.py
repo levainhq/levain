@@ -344,6 +344,58 @@ def main(argv: list[str] | None = None) -> int:
                            help="Service label (default: com.levainhq.levain).")
     d_restart.set_defaults(func=_cmd_daemon_restart)
 
+    upd_p = subparsers.add_parser(
+        "update",
+        help="Update the known-good version set together (anneal + schema + migrations).",
+        description=(
+            "Reconcile this install's composed stack to the declared known-good "
+            "SET in one ordered, fail-safe operation: bring anneal-memory to the "
+            "tested version, re-run the partnership schema if the store drifted, "
+            "surface anneal's `migrate check` instruction proposals for you to "
+            "apply under review, and record the composed set. The fix for "
+            "version-drift — a new anneal feature landing as a CONFLICT with stale "
+            "methodology instructions instead of an addition. The env-mutating pip "
+            "step is gated (it prompts; --yes auto-confirms, --no-pip skips it)."
+        ),
+    )
+    upd_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    upd_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show the reconcile plan and change NOTHING (a plan is not a result).",
+    )
+    upd_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="Auto-confirm the env-mutating pip step (non-interactive).",
+    )
+    upd_p.add_argument(
+        "--no-pip",
+        action="store_true",
+        dest="no_pip",
+        help=(
+            "Do not run pip — reconcile only the store-side steps and print the "
+            "exact pip command for your own package manager."
+        ),
+    )
+    upd_p.add_argument(
+        "--ack",
+        action="store_true",
+        help=(
+            "After surfacing the migration proposals, record your instruction "
+            "files as reconciled (advances anneal's `migrate ack` marker). Use "
+            "ONLY once you have applied the proposed edits — anneal never edits "
+            "them for you."
+        ),
+    )
+    upd_p.set_defaults(func=_cmd_update)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
@@ -479,6 +531,18 @@ def _cmd_daemon_would_install(args: argparse.Namespace) -> int:
     print(f"  action:  {plan.action}")
     print("\n  honesty floor: a unit file on disk is NOT proof the service is loaded or running.")
     return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    from levain.update import run_update
+
+    return run_update(
+        path=args.path,
+        dry_run=args.dry_run,
+        yes=args.yes,
+        no_pip=args.no_pip,
+        ack=args.ack,
+    )
 
 
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:

@@ -88,6 +88,14 @@ def main() -> int:
             if due:
                 sections.append(hook.format_due_spores(due))
 
+            # Compatibility drift — a once-per-fresh-session nudge if the version
+            # SET fell out of sync (anneal changed underneath the install, or
+            # unreviewed migration proposals exist). Cheap + fail-silent; the
+            # authoritative multi-axis verify is `levain doctor`.
+            drift = hook.compat_drift()
+            if drift:
+                sections.append(drift)
+
         if sections:
             hook.emit("\n\n".join(sections), "SessionStart")
     except Exception:

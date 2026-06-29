@@ -253,7 +253,54 @@ def apply_init(
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
     store_ok = _init_store(store, anneal_path, emit=emit)
+    if store_ok:
+        _record_compat_lock(install, store, anneal_path, emit=emit)
     return InitResult(install=install, adapter=chosen, store_ok=store_ok)
+
+
+def _record_compat_lock(
+    install: Path, store: Path, anneal_path: str, emit: Callable[[str], None] = print
+) -> None:
+    """Record the composed known-good set to ``.levain/manifest.json`` so drift
+    detection (``levain doctor`` / ``levain update`` / the session-start ping)
+    has a baseline of what this install composed.
+
+    Deliberately does NOT auto-ack anneal's migration marker. Acking would assert
+    the freshly-rendered methodology files are current as of the known-good anneal
+    — but whether the templates incorporate every migration entry is the
+    methodology author's reviewed assertion (a release-checklist step), NOT
+    something this version-manifest can verify. Silently advancing the marker
+    would SUPPRESS proposals the operator should review — the worst failure
+    direction for a drift tool (anneal's own `migrate ack` guards the same way).
+    So a fresh adopter sees the migration proposals on their first
+    `levain update` / session-start (correct, and a useful feature tour); they
+    review + ack via `levain update --ack`.
+
+    Best-effort: a failure here never fails the install (the store is already up).
+    """
+    from levain import manifest
+
+    declared = manifest.declared_set()
+    installed = manifest.discover_installed_set(store, anneal_path)
+    # Honesty floor: if discovery failed, do NOT record a lock from declared
+    # fallbacks — a poisoned baseline reads as a VERIFIED compose next session.
+    # (The same fix update._record_lock carries; codex L3 caught that the init
+    # path had the old fall-back-to-declared polarity while update did not.)
+    if installed.anneal is None or installed.schema is None:
+        emit("  Could not verify the installed set (anneal/schema unread) — "
+             "compatibility lock not recorded.")
+        return
+    composed = manifest.CompatSet(
+        levain=declared.levain,
+        anneal=installed.anneal,
+        schema=installed.schema,
+    )
+    try:
+        manifest.write_lock(install, composed)
+        emit(f"  Recorded the known-good set (anneal {composed.anneal} / "
+             f"schema {composed.schema}).")
+    except OSError:
+        pass
 
 
 # ---------- interview checkpoint persistence ----------

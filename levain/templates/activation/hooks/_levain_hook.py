@@ -209,6 +209,72 @@ def episodes_since_wrap(timeout: float = 5.0) -> int | None:
     return None
 
 
+# ---- Compatibility manifest — version-set drift (a session-init signal) ----
+
+def read_manifest_lock() -> dict | None:
+    """The recorded known-good set for THIS install (``.levain/manifest.json``,
+    written by ``levain init`` / ``levain update``). Returns the parsed dict, or
+    None when absent/unreadable/malformed (a pre-manifest install or a corrupt
+    lock — either way the drift line stays silent). Stdlib only: the hook never
+    imports the levain package (it runs on a stranger install)."""
+    try:
+        raw = (install_root() / ".levain" / "manifest.json").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _is_migrate_check(data: object) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("pending"), list)
+
+
+def compat_drift(timeout: float = 5.0) -> str | None:
+    """A terse compatibility-drift line for session start, or None when the set
+    is in sync / undeterminable.
+
+    Cheap + fail-silent: one ``migrate check --json`` call (the live anneal
+    version + the unreviewed instruction-edit proposals, from anneal's own tool)
+    plus the recorded lock. Flags only the two operator-actionable signals — the
+    installed anneal changed underneath the install (the out-of-band-upgrade
+    drift that lands a new feature as a CONFLICT with stale instructions), or
+    unreviewed migration proposals exist. The authoritative multi-axis verify
+    lives in ``levain doctor``; this is the gentle nudge toward it."""
+    data = _anneal_json(
+        ["migrate", "check", "--json"], timeout, validator=_is_migrate_check
+    )
+    if not isinstance(data, dict):
+        return None
+    pending = data.get("pending")
+    n_pending = len(pending) if isinstance(pending, list) else 0
+    installed = data.get("installed_version")
+    lock = read_manifest_lock()
+    lock_anneal = lock.get("anneal") if isinstance(lock, dict) else None
+
+    signals: list[str] = []
+    if (
+        isinstance(installed, str) and installed.strip()
+        and isinstance(lock_anneal, str) and lock_anneal.strip()
+        and installed != lock_anneal
+    ):
+        signals.append(
+            f"anneal-memory changed {lock_anneal} -> {installed} since this "
+            f"install was last composed"
+        )
+    if n_pending > 0:
+        signals.append(f"{n_pending} unreviewed anneal migration proposal(s)")
+    if not signals:
+        return None
+    return (
+        "[compatibility] " + "; ".join(signals) + ". Run `levain update` (or "
+        "`levain doctor`) to reconcile the version set — a substrate change can "
+        "otherwise land a new feature as a conflict with stale instructions."
+    )
+
+
 # ---- Prospective layer (spores) — the germination surfaces ----
 
 # Operator-I/O dispositions (control-plane Slice 3): the Tray inbox (seed/handoff/agenda)

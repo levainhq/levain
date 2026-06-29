@@ -208,6 +208,8 @@ _PORTED_FNS = (
     "_anneal_json", "_is_int_episodes", "episodes_since_wrap",
     "open_spores", "_is_loop", "_tokens", "spores_colliding", "due_dormant_spores",
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
+    # compatibility-manifest drift surface — byte-identical across both copies
+    "read_manifest_lock", "_is_migrate_check", "compat_drift",
 )
 
 
@@ -242,3 +244,65 @@ class TestCodexParity:
             _spore(id="b", germination="growing"),
         ]
         assert {s["id"] for s in codex_hook.due_dormant_spores(spores)} == {"a"}
+
+
+class TestCompatDrift:
+    """The session-start compatibility-drift ping: cheap, fail-silent, flags only
+    the two operator-actionable signals (anneal changed underneath the lock,
+    unreviewed migration proposals)."""
+
+    def _migrate(self, installed="0.9.5", pending=0):
+        return {"installed_version": installed, "acknowledged_version": None,
+                "pending": [{"version": f"0.{i}"} for i in range(pending)]}
+
+    def test_in_sync_returns_none(self, monkeypatch):
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: self._migrate())
+        monkeypatch.setattr(hook, "read_manifest_lock",
+                            lambda: {"anneal": "0.9.5", "schema": "partnership"})
+        assert hook.compat_drift() is None
+
+    def test_pending_proposals_flagged(self, monkeypatch):
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: self._migrate(pending=6))
+        monkeypatch.setattr(hook, "read_manifest_lock",
+                            lambda: {"anneal": "0.9.5"})
+        msg = hook.compat_drift()
+        assert msg is not None and "6 unreviewed" in msg and "levain update" in msg
+
+    def test_anneal_changed_underneath_lock_flagged(self, monkeypatch):
+        monkeypatch.setattr(hook, "_anneal_json",
+                            lambda *a, **k: self._migrate(installed="0.9.6"))
+        monkeypatch.setattr(hook, "read_manifest_lock", lambda: {"anneal": "0.9.5"})
+        msg = hook.compat_drift()
+        assert msg is not None and "0.9.5 -> 0.9.6" in msg
+
+    def test_no_lock_suppresses_anneal_signal_but_not_pending(self, monkeypatch):
+        # Without a lock there is no "changed underneath" baseline; only pending fires.
+        monkeypatch.setattr(hook, "_anneal_json",
+                            lambda *a, **k: self._migrate(installed="0.9.6", pending=2))
+        monkeypatch.setattr(hook, "read_manifest_lock", lambda: None)
+        msg = hook.compat_drift()
+        assert msg is not None and "2 unreviewed" in msg and "->" not in msg
+
+    def test_anneal_unreadable_returns_none(self, monkeypatch):
+        # migrate check failed -> None -> the ping stays silent (no false signal).
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: None)
+        monkeypatch.setattr(hook, "read_manifest_lock", lambda: {"anneal": "0.9.5"})
+        assert hook.compat_drift() is None
+
+    def test_read_lock_missing_file_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook.read_manifest_lock() is None
+
+    def test_read_lock_round_trip(self, tmp_path, monkeypatch):
+        import json
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        (tmp_path / ".levain" / "manifest.json").write_text(
+            json.dumps({"anneal": "0.9.5", "schema": "partnership"}), encoding="utf-8")
+        assert hook.read_manifest_lock() == {"anneal": "0.9.5", "schema": "partnership"}
+
+    def test_read_lock_corrupt_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        (tmp_path / ".levain" / "manifest.json").write_text("{bad", encoding="utf-8")
+        assert hook.read_manifest_lock() is None
