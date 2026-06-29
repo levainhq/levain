@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from levain import doctor, install, manifest
 from levain.manifest import CompatSet, InstalledSet
@@ -140,7 +145,8 @@ def test_doctor_compat_unknown_is_not_green(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# install: apply_init writes the lock, does NOT auto-ack
+# install: apply_init writes the lock + acks a fresh install to the reconciled
+# templates version (advance-only, capped at installed) — spore-216
 # --------------------------------------------------------------------------
 
 def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
@@ -151,19 +157,57 @@ def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
     assert lock == CompatSet(manifest.declared_set().levain, "0.9.5", "partnership")
 
 
-def test_record_compat_lock_does_not_ack(tmp_path, monkeypatch):
-    # Acking on a fresh install would silently suppress proposals the templates
-    # may not yet cover — the worst failure direction for a drift tool. So the
-    # lock is written but the migrate marker is NEVER advanced here.
+def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypatch):
+    # A fresh install (marker None) acks UP to the templates-reconciled version
+    # (capped at installed) so a current adopter sees a clean doctor (spore-216).
     store = _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(pending_count=6))
-    anneal_calls = []
+                        lambda *a, **k: _inst(migrate_acked=None))
+    calls = []
     monkeypatch.setattr(install, "_run_anneal_cmd",
-                        lambda *a, **k: anneal_calls.append(a) or (True, "", []))
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
-    assert not any("ack" in str(c) for c in anneal_calls)
+    target = manifest.template_ack_target("0.9.5")  # == TEMPLATES_RECONCILED_ANNEAL
+    assert ["migrate", "ack", target] in calls
     assert manifest.read_lock(tmp_path) is not None
+
+
+def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
+    # A --force re-install over a store already acked HIGHER than the reconciled
+    # version must NOT be lowered (it would needlessly re-surface reviewed edits).
+    store = _store(tmp_path)
+    monkeypatch.setattr(manifest, "discover_installed_set",
+                        lambda *a, **k: _inst(migrate_acked="0.9.0"))
+    calls = []
+    monkeypatch.setattr(install, "_run_anneal_cmd",
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
+    install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
+    assert not any(a[:2] == ["migrate", "ack"] for a in calls)
+
+
+def test_record_compat_lock_no_reack_at_target(tmp_path, monkeypatch):
+    # A store already acked EXACTLY at the target must not be redundantly re-acked
+    # (strict `<` guard; guards a refactor to `<=` re-acking every --force, L1 LOW).
+    store = _store(tmp_path)
+    monkeypatch.setattr(manifest, "discover_installed_set",
+                        lambda *a, **k: _inst(migrate_acked=manifest.TEMPLATES_RECONCILED_ANNEAL))
+    calls = []
+    monkeypatch.setattr(install, "_run_anneal_cmd",
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
+    install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
+    assert not any(a[:2] == ["migrate", "ack"] for a in calls)
+
+
+def test_record_compat_lock_no_ack_when_anneal_unknown(tmp_path, monkeypatch):
+    # Discovery failed -> no lock AND no ack (the cap is unverifiable; honesty floor).
+    store = _store(tmp_path)
+    monkeypatch.setattr(manifest, "discover_installed_set",
+                        lambda *a, **k: _inst(anneal=None, schema=None, migrate_acked=None))
+    calls = []
+    monkeypatch.setattr(install, "_run_anneal_cmd",
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
+    install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
+    assert not any("ack" in str(c) for c in calls)
 
 
 def test_record_compat_lock_skips_write_on_unknown(tmp_path, monkeypatch):
@@ -174,3 +218,67 @@ def test_record_compat_lock_skips_write_on_unknown(tmp_path, monkeypatch):
                         lambda *a, **k: _inst(anneal=None, schema=None))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
     assert manifest.read_lock(tmp_path) is None  # no poisoned baseline
+
+
+# --------------------------------------------------------------------------
+# spore-216: templates reconciled -> a fresh install shows zero pending drift
+# --------------------------------------------------------------------------
+
+def test_templates_reconciled_constant_within_known_good():
+    # Release-gate invariant: you cannot reconcile the templates to a version you
+    # don't ship. TEMPLATES_RECONCILED_ANNEAL <= KNOWN_GOOD_ANNEAL.
+    assert manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL) <= \
+        manifest.version_tuple(manifest.KNOWN_GOOD_ANNEAL)
+
+
+def test_template_ack_target_caps_and_skips():
+    assert manifest.template_ack_target("0.9.5") == manifest.TEMPLATES_RECONCILED_ANNEAL
+    assert manifest.template_ack_target("0.4.0") == "0.4.0"   # installed older than reconciled -> cap at installed
+    assert manifest.template_ack_target(None) is None         # unknown -> skip the ack
+
+
+def test_seed_templates_carry_the_reconciled_guidance():
+    # TEMPLATES_RECONCILED_ANNEAL asserts the seed templates incorporate the
+    # migrate-manifest guidance through that version. Lock the two reconciled gaps
+    # (spore-216) so a future template edit that DROPS them fails here — forcing a
+    # re-review of the constant instead of silently making the init-ack dishonest.
+    memory_md = (
+        Path(install.__file__).parent / "templates" / "seed" / "memory.md"
+    ).read_text(encoding="utf-8")
+    # AM-LINKGATE (0.8.3): co-citation guidance, not a bare single-id example.
+    assert "Co-citing 2+ episodes" in memory_md
+    assert "[evidence: <id1>, <id2>" in memory_md
+    # AM-MIGRATE-NOTIFY (0.4.7): the levain-native upgrade habit.
+    assert "## On upgrade" in memory_md
+    assert "levain update" in memory_md
+
+
+@pytest.mark.skipif(
+    shutil.which("anneal-memory") is None
+    and subprocess.run([sys.executable, "-m", "anneal_memory", "--version"],
+                       capture_output=True).returncode != 0,
+    reason="anneal-memory not installed",
+)
+def test_fresh_install_acks_the_covered_entries(tmp_path):
+    # After `_record_compat_lock` on a fresh store, anneal's own `migrate check`
+    # drops the entries the seed templates cover (acked through the reconciled
+    # version). At the current 0.4.8 cap that clears the spores + migrate-notify +
+    # bare-path entries; the crystal-tier entries (0.7.1/0.8.2) + linkgate (0.8.3)
+    # stay HONEST pending until the crystal-recall slice raises the cap to 0.8.3.
+    store = tmp_path / ".levain" / "memory.db"
+    store.parent.mkdir(parents=True)
+    ap = shutil.which("anneal-memory") or "anneal-memory"
+    subprocess.run(
+        [sys.executable, "-m", "anneal_memory", "--db", str(store),
+         "init", "--schema", "partnership"],
+        capture_output=True, check=True,
+    )
+    before = manifest.discover_installed_set(store, ap)
+    assert before.pending_count and before.pending_count > 0  # fresh store: all pending
+    install._record_compat_lock(tmp_path, store, ap, emit=lambda _l: None)
+    after = manifest.discover_installed_set(store, ap)
+    # The ack REDUCED pending (covered entries cleared) but did not zero it (crystal
+    # deferred) — honest: never suppresses an uncovered proposal.
+    assert after.pending_count is not None
+    assert 0 < after.pending_count < before.pending_count
+    assert after.migrate_acked == manifest.TEMPLATES_RECONCILED_ANNEAL
