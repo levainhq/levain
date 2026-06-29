@@ -71,6 +71,13 @@
     isolation: isolate;  /* contains the screen-blending inside this group */
     opacity: .28; filter: saturate(.92); transition: opacity 1.4s ease, filter 1.4s ease;
   }
+  /* PHONE: drop the entire ambient-rings layer. The 13 large (up to 1750px) blurred
+     (blur 9–30px), perpetually-animating, screen-blended ring/core/nucleus layers are
+     GPU-composited renderer memory a phone can't afford — on iOS they OOM the WebKit
+     renderer a few seconds after display ("A problem repeatedly occurred"), independent
+     of payload size. The rings are aria-hidden decoration → zero function lost; the iPad
+     (>760px) keeps them. (spore-103 ③ — iPhone crash-on-load.) */
+  @media (max-width: 760px) { .rings { display: none; } }
   /* recede-to-background as a STATIC vignette painted over the rings — NOT a mask
      on the container: masking a group of independently-animating layers forces a
      full offscreen flatten of the group every frame (the flicker source); this
