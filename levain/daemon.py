@@ -30,6 +30,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,8 +71,27 @@ class DaemonStatus:
     """The result of :meth:`DaemonProvider.status`."""
 
     installed: bool            # the unit file is on disk
-    running: bool              # the service manager reports it loaded/active
+    running: bool              # a live process exists (a numeric pid) — the cross-version run signal
     detail: str                # a one-line human summary (the state line, when available)
+    load_state: str = "unknown"  # running | loaded | not-loaded | unknown — keyed on the service
+                                  # manager, NEVER on file presence (file-on-disk ≠ loaded; the
+                                  # honesty floor). "unknown" = the domain itself is unreadable (ssh /
+                                  # no Aqua), which must never read as a false "not-loaded".
+
+
+@dataclass(frozen=True)
+class DaemonPlan:
+    """What :meth:`DaemonProvider.would_install` reports — computed WITHOUT mutating anything. The
+    honesty floor (06-29 Daily Sharpening): a unit file on disk is NOT proof the service is
+    installed-and-loaded. So the plan diffs the rendered unit against any on-disk unit AND reads the
+    TRUE live state — file-present ≠ loaded ≠ running."""
+
+    label: str
+    unit_path: Path
+    on_disk: bool              # a unit file already exists at unit_path
+    would_change: bool         # the rendered unit differs from what's on disk (or nothing's on disk)
+    current: DaemonStatus      # the TRUE live state — keyed on the service manager, not file presence
+    action: str                # one-line human summary of what install would do
 
 
 # --- path / bin / env resolution (shared across every provider) ------------------------------
@@ -184,6 +204,12 @@ class DaemonProvider(ABC):
         """Report installed/running state."""
 
     @abstractmethod
+    def would_install(self, spec: DaemonSpec) -> DaemonPlan:
+        """DRY-RUN: report what :meth:`install` WOULD do + the TRUE current state, mutating nothing
+        (no file write, no service-manager call that changes state). The honesty floor: prove a unit
+        file on disk is not proof the service is loaded — read the live state, don't infer it."""
+
+    @abstractmethod
     def restart(self, label: str) -> str:
         """Restart the running service (pick up new code / a crashed instance)."""
 
@@ -239,18 +265,67 @@ class LaunchdProvider(DaemonProvider):
         }
         return plistlib.dumps(doc).decode("utf-8")
 
+    @staticmethod
+    def _atomic_write(path: Path, data: bytes) -> None:
+        """Write `data` to `path` atomically — to a same-dir temp then ``os.replace`` (a
+        same-filesystem rename), so a crash/partial write can never leave a TRUNCATED unit on disk
+        that the next run reads as a valid install (codex+complement+L2)."""
+        tmp = path.with_name(f"{path.name}.new.{os.getpid()}")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+
+    def _bootstrap_with_retry(self, domain: str, plist_path: Path,
+                              attempts: int = 3) -> str | None:
+        """bootstrap with a bounded retry — launchd is RACY: a ``bootout``'s teardown can still hold
+        the label when the next ``bootstrap`` fires ("Bootstrap failed: 5: Input/output error"), a
+        TRANSIENT not a bad def. Retry to ride it. SUCCESS = a bootstrap that RETURNS 0 (the new def
+        actually loaded); do NOT treat a visible ``launchctl print`` as success — right after a
+        ``bootout`` the OLD registration can still be tearing down, so a visible reg would FALSE-GREEN
+        the stale def (codex L3 HIGH). The retry, not a print-probe, rides the race. Returns None on
+        success, else the last failure detail."""
+        detail = ""
+        for i in range(attempts):
+            proc = _run(["launchctl", "bootstrap", domain, str(plist_path)], check=False)
+            if proc.returncode == 0:
+                return None
+            detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
+            if i < attempts - 1:
+                time.sleep(1)
+        return detail or "bootstrap failed"
+
     def install(self, spec: DaemonSpec) -> str:
         _refuse_root()
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
         spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
         spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
         plist_path = self._plist_path(spec.label)
-        plist_path.write_text(self.render_unit(spec))
         domain = self._domain()
+        # TRANSACTIONAL + ATOMIC (the install-honesty floor): a failed bootstrap must neither DESTROY a
+        # prior good unit nor leave a half-written one on disk. Back up any prior unit; ATOMIC-swap the
+        # new one in (temp + os.replace); bootout; bootstrap WITH RETRY (the "Bootstrap failed: 5"
+        # teardown race is transient, not a bad def). On a GENUINE reject (it survives the retries):
+        # roll back to the prior unit (bootout first to clear a partial registration); on a FIRST
+        # install KEEP the new unit — it's valid (render_unit produced it + plist is well-formed), so
+        # macOS RunAtLoad self-heals it at next login, and DELETING a valid unit would regress autostart
+        # on a transient/no-domain failure (the regression codex+L2 caught). Never delete a valid unit.
+        prior = plist_path.read_bytes() if plist_path.exists() else None
+        self._atomic_write(plist_path, self.render_unit(spec).encode("utf-8"))
         # Idempotent: bootout any existing instance first (a stale/loaded unit makes bootstrap
         # fail with "service already loaded"); ignore its failure when nothing is loaded.
         _run(["launchctl", "bootout", domain, str(plist_path)], check=False)
-        _run(["launchctl", "bootstrap", domain, str(plist_path)], check=True)
+        failure = self._bootstrap_with_retry(domain, plist_path)
+        if failure is not None:
+            if prior is not None:
+                _run(["launchctl", "bootout", domain, str(plist_path)], check=False)  # clear partial reg
+                self._atomic_write(plist_path, prior)                                 # roll back the prior def
+                self._bootstrap_with_retry(domain, plist_path)                        # best-effort reload
+                raise DaemonError(
+                    f"bootstrap of the new unit failed: {failure} — rolled back to the prior installed "
+                    f"unit at {plist_path}")
+            raise DaemonError(
+                f"bootstrap failed: {failure} — the unit is KEPT at {plist_path} (it is valid; macOS "
+                f"RunAtLoad will retry it at next login). A valid unit is not deleted on a transient/"
+                f"no-domain failure.")
         # kickstart so it's running NOW (bootstrap + RunAtLoad starts it at next login otherwise).
         _run(["launchctl", "kickstart", "-k", f"{domain}/{spec.label}"], check=False)
         # VERIFY-don't-assume: report the ACTUAL run state. A kickstart that silently failed, or a
@@ -276,7 +351,16 @@ class LaunchdProvider(DaemonProvider):
         installed = self._plist_path(label).exists()
         proc = _run(["launchctl", "print", f"{domain}/{label}"], check=False)
         if proc.returncode != 0:
-            return DaemonStatus(installed=installed, running=False, detail="not loaded")
+            # rc != 0 means the service print failed — but that is EITHER genuinely-not-loaded OR an
+            # unreadable domain (ssh / no Aqua session). Probe the domain to tell them apart: a false
+            # "not loaded" when we simply can't SEE the domain is the no-data≠no-event violation
+            # (codex+L2 HIGH). domain readable + service absent = not-loaded; domain unreadable = unknown.
+            domain_ok = _run(["launchctl", "print", domain], check=False).returncode == 0
+            if domain_ok:
+                return DaemonStatus(installed=installed, running=False, detail="not loaded",
+                                    load_state="not-loaded")
+            return DaemonStatus(installed=installed, running=False,
+                                detail=f"unknown (cannot read {domain})", load_state="unknown")
         # rc==0 means LOADED, not running (codex L3 MED). The robust cross-version "actually
         # running" signal is a LIVE PID — launchctl prints `pid = N` only while a process exists.
         # The `state = ` STRING varies by macOS/job-type ("running" / "active" / ...), so don't key
@@ -298,7 +382,41 @@ class LaunchdProvider(DaemonProvider):
             detail += f", pid = {pid}"
         if last_exit not in (None, "0"):
             detail += f", last exit = {last_exit}"
-        return DaemonStatus(installed=installed, running=running, detail=detail)
+        return DaemonStatus(installed=installed, running=running, detail=detail,
+                            load_state="running" if running else "loaded")
+
+    def would_install(self, spec: DaemonSpec) -> DaemonPlan:
+        # DRY-RUN — render the unit, diff it against any on-disk unit, and read the TRUE live state,
+        # WITHOUT writing a file or calling a state-changing launchctl verb (status() only calls
+        # `launchctl print`, which is read-only). Proves the honesty floor: an unchanged unit that is
+        # NOT loaded still needs a (re-)bootstrap, so "on disk" can never read as "installed + loaded".
+        plist_path = self._plist_path(spec.label)
+        on_disk = plist_path.exists()
+        rendered = self.render_unit(spec)
+        try:
+            existing = plist_path.read_text(encoding="utf-8") if on_disk else None
+        except OSError:
+            existing = None        # unreadable on-disk unit → treat as a change (a real reinstall)
+        would_change = existing != rendered
+        current = self.status(spec.label)
+        if not on_disk:
+            action = "FRESH INSTALL — write the unit + bootstrap"
+        elif would_change:
+            action = "REINSTALL — the unit changed; back up, atomic-swap, re-bootstrap"
+        elif current.load_state == "running":
+            action = "no-op — unit unchanged and the service is running"
+        elif current.load_state == "loaded":
+            action = "no-op — unit unchanged and loaded (idle)"
+        elif current.load_state == "unknown":
+            # can't read the service-manager domain (ssh / no Aqua) — don't claim a load state we
+            # can't see (the honesty floor: no-data ≠ not-loaded).
+            action = "UNKNOWN — unit unchanged, but the service-manager state can't be read"
+        else:  # not-loaded
+            # unit on disk + unchanged BUT not actually loaded — the honesty floor: a file is not a
+            # loaded service, so install would still (re-)bootstrap it.
+            action = "RE-BOOTSTRAP — unit unchanged but NOT loaded (a file on disk is not a loaded service)"
+        return DaemonPlan(label=spec.label, unit_path=plist_path, on_disk=on_disk,
+                          would_change=would_change, current=current, action=action)
 
     def restart(self, label: str) -> str:
         _refuse_root()
