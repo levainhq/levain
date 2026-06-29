@@ -97,7 +97,11 @@ def test_select_provider_unsupported_raises(os_name: str) -> None:
 # --- launchd lifecycle (faked launchctl) -----------------------------------------------------
 
 class _FakeRun:
-    """Records launchctl invocations; returns a CompletedProcess with a per-subcommand rc/stdout."""
+    """Records launchctl invocations; returns a CompletedProcess with a per-subcommand rc/stdout.
+
+    `print` of a SERVICE (target `gui/UID/label`, ≥2 slashes) keys on `"print"`; `print` of a DOMAIN
+    (target `gui/UID`, the honesty-floor probe) keys on `"print_domain"` and DEFAULTS to rc 0 (domain
+    readable) unless set — so a not-loaded service can still sit in a readable domain."""
 
     def __init__(self, rc_for: dict[str, int] | None = None,
                  stdout_for: dict[str, str] | None = None) -> None:
@@ -108,8 +112,12 @@ class _FakeRun:
     def __call__(self, cmd, capture_output=True, text=True):  # noqa: ANN001
         self.calls.append(cmd)
         sub = cmd[1] if len(cmd) > 1 else ""
-        return subprocess.CompletedProcess(
-            cmd, self._rc_for.get(sub, 0), stdout=self._stdout_for.get(sub, ""), stderr="")
+        key = sub
+        if sub == "print":
+            key = "print" if str(cmd[-1]).count("/") >= 2 else "print_domain"
+        rc = self._rc_for.get(key, 0)
+        out = self._stdout_for.get(key, "")
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
 
     @property
     def subs(self) -> list[str]:
@@ -119,6 +127,7 @@ class _FakeRun:
 @pytest.fixture
 def launchd(tmp_path, monkeypatch):
     monkeypatch.setattr(LaunchdProvider, "UNIT_DIR", tmp_path / "LaunchAgents")
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)  # don't sleep through bootstrap retries
     fake = _FakeRun()
     monkeypatch.setattr(daemon.subprocess, "run", fake)
     return LaunchdProvider(), fake
@@ -139,15 +148,132 @@ def test_install_writes_plist_then_bootout_bootstrap_kickstart(launchd, tmp_path
     assert (tmp_path / "logs").exists()    # log dir created
 
 
-def test_install_raises_when_bootstrap_fails(tmp_path, monkeypatch) -> None:
+def test_install_first_install_failure_keeps_valid_unit_for_runatload(tmp_path, monkeypatch) -> None:
+    # the apparatus pivot (codex+L2 HIGH): a FIRST install whose bootstrap fails must NOT delete the
+    # unit — the failure is usually TRANSIENT (the bootout-teardown race) or environmental (no Aqua
+    # domain), not a bad def. The plist is valid (render_unit produced it); KEEP it so macOS RunAtLoad
+    # self-heals it at next login. Deleting it would regress autostart.
     monkeypatch.setattr(LaunchdProvider, "UNIT_DIR", tmp_path / "LaunchAgents")
-    fake = _FakeRun(rc_for={"bootstrap": 5},
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    # bootstrap fails AND the service never reads as loaded (so the retry exhausts, no false success)
+    fake = _FakeRun(rc_for={"bootstrap": 5, "print": 113},
                     stdout_for={"bootstrap": "Bootstrap failed: 5: Input/output error"})
     monkeypatch.setattr(daemon.subprocess, "run", fake)
+    prov = LaunchdProvider()
     spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
                       log_dir=tmp_path / "logs")
-    with pytest.raises(DaemonError):
-        LaunchdProvider().install(spec)
+    plist = prov._plist_path("com.levainhq.t")
+    with pytest.raises(DaemonError, match="KEPT"):
+        prov.install(spec)
+    assert plist.exists()                                    # valid unit kept for RunAtLoad
+    assert fake.subs.count("bootstrap") == 3                 # retried the transient before giving up
+
+
+def test_install_rolls_back_to_prior_unit_on_bootstrap_failure(launchd, tmp_path) -> None:
+    # a CHANGED unit whose bootstrap fails must roll back to the prior GOOD unit (degraded-but-running
+    # beats down) — never destroy the working def AND never leave the rejected one.
+    prov, fake = launchd
+    prov.install(build_spec(install_path=tmp_path / "inst", port=7420, label="com.levainhq.t",
+                            log_dir=tmp_path / "logs"))
+    plist = prov._plist_path("com.levainhq.t")
+    prior_bytes = plist.read_bytes()
+    fake._rc_for["bootstrap"] = 5            # the next bootstrap (of the changed unit) fails
+    fake._rc_for["print"] = 113              # ...and the service never reads loaded (retry exhausts)
+    fake._stdout_for["bootstrap"] = "Bootstrap failed: 5"
+    spec2 = build_spec(install_path=tmp_path / "inst2", port=7421, label="com.levainhq.t",
+                       log_dir=tmp_path / "logs")
+    with pytest.raises(DaemonError, match="rolled back"):
+        prov.install(spec2)
+    assert plist.exists()
+    assert plist.read_bytes() == prior_bytes  # the prior good unit, NOT the rejected spec2 unit
+
+
+# --- would_install (dry-run, mutation-free; the honesty floor) --------------------------------
+
+def _no_mutation(fake) -> bool:
+    # a dry-run must call only the read-only `print` probe — never a state-changing verb.
+    return all(s == "print" for s in fake.subs) and fake.subs.count("print") >= 1
+
+
+def test_would_install_fresh_when_nothing_on_disk(launchd, tmp_path) -> None:
+    prov, fake = launchd
+    fake._rc_for["print"] = 113              # service not loaded (domain readable by default)
+    spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
+                      log_dir=tmp_path / "logs")
+    plan = prov.would_install(spec)
+    assert plan.on_disk is False and plan.would_change is True
+    assert "FRESH INSTALL" in plan.action
+    assert plan.current.installed is False and plan.current.running is False
+    assert not plan.unit_path.exists()       # DRY-RUN: nothing written
+    assert _no_mutation(fake)                # only read-only print probes, no bootout/bootstrap/kickstart
+
+
+def test_would_install_noop_when_unchanged_and_running(launchd, tmp_path) -> None:
+    prov, fake = launchd
+    spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
+                      log_dir=tmp_path / "logs")
+    prov.install(spec)
+    fake.calls.clear()
+    fake._stdout_for["print"] = "com.levainhq.t = {\n\tstate = running\n\tpid = 5\n}"
+    plan = prov.would_install(spec)
+    assert plan.on_disk is True and plan.would_change is False
+    assert plan.current.load_state == "running"
+    assert "no-op" in plan.action
+    assert _no_mutation(fake)                # still mutation-free even with a unit on disk
+
+
+def test_would_install_rebootstrap_when_on_disk_but_not_loaded(launchd, tmp_path) -> None:
+    # the honesty floor: a unit FILE on disk that is NOT actually loaded still needs a (re-)bootstrap
+    # — "on disk" must never read as "installed + loaded".
+    prov, fake = launchd
+    spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
+                      log_dir=tmp_path / "logs")
+    prov.install(spec)
+    fake._rc_for["print"] = 113              # service NOT loaded, BUT domain readable (default rc 0)
+    plan = prov.would_install(spec)
+    assert plan.on_disk is True and plan.would_change is False
+    assert plan.current.load_state == "not-loaded"
+    assert "RE-BOOTSTRAP" in plan.action
+
+
+def test_would_install_unknown_when_domain_unreadable(launchd, tmp_path) -> None:
+    # the no-data≠not-loaded honesty floor: when the GUI/Aqua domain itself is unreadable (ssh), the
+    # dry-run must say UNKNOWN — never assert a load state it cannot see.
+    prov, fake = launchd
+    spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
+                      log_dir=tmp_path / "logs")
+    prov.install(spec)
+    fake._rc_for["print"] = 113              # service print fails
+    fake._rc_for["print_domain"] = 113       # ...AND the domain probe fails → genuinely UNKNOWN
+    plan = prov.would_install(spec)
+    assert plan.current.load_state == "unknown"
+    assert "UNKNOWN" in plan.action
+
+
+def test_would_install_reinstall_when_unit_changed(launchd, tmp_path) -> None:
+    prov, _ = launchd
+    prov.install(build_spec(install_path=tmp_path / "inst", port=7420, label="com.levainhq.t",
+                            log_dir=tmp_path / "logs"))
+    spec2 = build_spec(install_path=tmp_path / "inst2", port=7421, label="com.levainhq.t",
+                       log_dir=tmp_path / "logs")
+    plan = prov.would_install(spec2)
+    assert plan.on_disk is True and plan.would_change is True
+    assert "REINSTALL" in plan.action
+
+
+def test_would_install_unreadable_on_disk_unit_treated_as_change(launchd, tmp_path, monkeypatch) -> None:
+    # the OSError branch: an on-disk unit we can't READ is treated as a change (a real reinstall), not
+    # a silent no-op.
+    prov, _ = launchd
+    spec = build_spec(install_path=tmp_path / "inst", label="com.levainhq.t",
+                      log_dir=tmp_path / "logs")
+    prov.install(spec)
+    def _boom(*a, **k):
+        raise OSError("unreadable")
+    monkeypatch.setattr(Path, "read_text", _boom)
+    plan = prov.would_install(spec)
+    assert plan.on_disk is True and plan.would_change is True
+    assert "REINSTALL" in plan.action
 
 
 def test_uninstall_removes_plist(launchd, tmp_path) -> None:
@@ -202,10 +328,22 @@ def test_status_crash_loop_surfaces_last_exit(launchd) -> None:
 
 def test_status_not_loaded(launchd) -> None:
     prov, fake = launchd
-    fake._rc_for["print"] = 113   # launchctl: could not find service
+    fake._rc_for["print"] = 113   # service print fails; domain probe (print_domain) defaults rc 0 = readable
     st = prov.status("com.levainhq.gone")
     assert st.installed is False and st.running is False
     assert st.detail == "not loaded"
+    assert st.load_state == "not-loaded"   # domain readable + service absent = genuinely not-loaded
+
+
+def test_status_unknown_when_domain_unreadable(launchd) -> None:
+    # the no-data≠not-loaded honesty floor (codex+L2 HIGH): a failed service print PLUS a failed
+    # domain probe (ssh / no Aqua session) must read as UNKNOWN, never a false "not loaded".
+    prov, fake = launchd
+    fake._rc_for["print"] = 113          # service print fails
+    fake._rc_for["print_domain"] = 113   # ...AND the domain itself is unreadable
+    st = prov.status("com.levainhq.t")
+    assert st.running is False and st.load_state == "unknown"
+    assert "unknown" in st.detail
 
 
 def test_status_loaded_but_waiting_is_not_running(launchd) -> None:

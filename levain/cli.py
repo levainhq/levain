@@ -320,6 +320,23 @@ def main(argv: list[str] | None = None) -> int:
                           help="Service label (default: com.levainhq.levain).")
     d_status.set_defaults(func=_cmd_daemon_status)
 
+    d_would = daemon_sub.add_parser(
+        "would-install",
+        help="DRY-RUN: show what `install` would do + the true current state (changes nothing).",
+        description=(
+            "Report what `daemon install` WOULD do — diff the rendered unit against any on-disk "
+            "unit and read the TRUE live state — WITHOUT writing a file or touching the service "
+            "manager. The honesty floor: a unit file on disk is not proof the service is loaded."
+        ),
+    )
+    d_would.add_argument("--path", type=Path, default=Path.cwd(),
+                         help="Install directory to serve (default: cwd).")
+    d_would.add_argument("--port", type=int, default=7420,
+                         help="Loopback port (default: 7420).")
+    d_would.add_argument("--label", default="com.levainhq.levain",
+                         help="Service label (default: com.levainhq.levain).")
+    d_would.set_defaults(func=_cmd_daemon_would_install)
+
     d_restart = daemon_sub.add_parser(
         "restart", help="Restart the running serve (pick up new code / a crash).",
     )
@@ -441,6 +458,26 @@ def _cmd_daemon_status(args: argparse.Namespace) -> int:
     st = provider.status(args.label)
     print(f"{args.label}: installed={st.installed} running={st.running}")
     print(f"  {st.detail}")
+    return 0
+
+
+def _cmd_daemon_would_install(args: argparse.Namespace) -> int:
+    from levain import daemon
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+    spec = daemon.build_spec(install_path=args.path, port=args.port, label=args.label)
+    plan = provider.would_install(spec)
+    st = plan.current
+    on_disk = ("yes (differs from rendered)" if plan.on_disk and plan.would_change
+               else "yes (matches rendered)" if plan.on_disk else "no")
+    print(f"would-install dry-run for {plan.label} (NOTHING is changed):")
+    print(f"  unit:    {plan.unit_path}")
+    print(f"  on disk: {on_disk}")
+    print(f"  live:    {st.load_state} — {st.detail}")
+    print(f"  action:  {plan.action}")
+    print("\n  honesty floor: a unit file on disk is NOT proof the service is loaded or running.")
     return 0
 
 
