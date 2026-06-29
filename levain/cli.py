@@ -205,6 +205,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     tui_p.set_defaults(func=_cmd_tui)
 
+    focus_p = subparsers.add_parser(
+        "focus",
+        help="Set / show the operator's live focus — what you're working on now.",
+        description=(
+            "The operator's live, self-authored attention context — 'what I'm on "
+            "right now' — that every session reads to orient (it travels across "
+            "sessions, like the rest of the substrate). With TEXT, sets it; with no "
+            "argument, shows the current focus + its freshness; --clear unsets it. "
+            "Stored in the install's .levain/context.json and read into the "
+            "dashboard / TUI / web cockpit. (A sensor app may write the same "
+            "three-key contract into its own context file instead.)"
+        ),
+    )
+    focus_p.add_argument(
+        "text", nargs="?", default=None,
+        help="The focus to set (omit to show the current one).",
+    )
+    focus_p.add_argument(
+        "--path", type=Path, default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    focus_p.add_argument("--clear", action="store_true", help="Unset the focus.")
+    focus_p.add_argument(
+        "--source", default="cli",
+        help="Provenance tag for who set it (default: cli).",
+    )
+    focus_p.set_defaults(func=_cmd_focus)
+
     web_p = subparsers.add_parser(
         "serve",
         help="Serve the substrate dashboard as a local web-app (localhost).",
@@ -440,6 +468,14 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
     return run_tui(path=args.path, read_only=args.read_only)
+
+
+def _cmd_focus(args: argparse.Namespace) -> int:
+    from levain.dashboard import run_focus
+
+    return run_focus(
+        path=args.path, text=args.text, source=args.source, clear=args.clear
+    )
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:

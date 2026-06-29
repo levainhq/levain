@@ -971,3 +971,346 @@ class TestRecallEpisodeRows:
         rows, err = recall_episode_rows(self._db(tmp_path), keyword="x" * 300, limit=10)
         assert rows == []
         assert err is not None and "too long" in err
+
+
+# --- live operator context (focus) -----------------------------------------
+
+class TestFocus:
+    """The focus primitive: the freshness helper (pure), the fail-soft +
+    superset-tolerant ``_read_focus``, and the integration through
+    ``build_substrate_view`` / ``SubstrateSource``."""
+
+    import datetime as _dt
+
+    UTC = _dt.timezone.utc
+
+    def _now(self) -> "TestFocus._dt.datetime":
+        return self._dt.datetime(2026, 6, 29, 17, 0, 0, tzinfo=self.UTC)
+
+    # -- _humanize_focus_age (pure) --
+    def test_age_just_now(self) -> None:
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(10) == "set just now"
+
+    def test_age_minutes(self) -> None:
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(12 * 60) == "set 12m ago"
+
+    def test_age_hours(self) -> None:
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(3 * 3600) == "set 3h ago"
+
+    def test_age_days(self) -> None:
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(2 * 86400) == "set 2d ago"
+
+    def test_age_negative_is_blank(self) -> None:
+        # a future set_at (clock skew / bad data) is unparseable-as-age → "" not a lie
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(-500) == ""
+
+    def test_age_subsecond_future_is_blank(self) -> None:
+        # int(-0.5)==0 would slip an int-only guard → a sub-second future stamp must
+        # still be "" (the float guard); honesty-floor contract (complement L3 FIND-1).
+        from levain.dashboard import _humanize_focus_age
+        assert _humanize_focus_age(-0.5) == ""
+
+    # -- _read_focus (fail-soft + contract) --
+    def _write(self, tmp_path: Path, payload: object) -> Path:
+        import json
+        p = tmp_path / "context.json"
+        p.write_text(json.dumps(payload), encoding="utf-8")
+        return p
+
+    def test_no_source_returns_none(self) -> None:
+        from levain.dashboard import _read_focus
+        assert _read_focus(None, self._now()) is None
+
+    def test_missing_file_returns_none(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        assert _read_focus(tmp_path / "nope.json", self._now()) is None
+
+    def test_malformed_json_is_dark_not_crash(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        p = tmp_path / "context.json"
+        p.write_text("{not json", encoding="utf-8")
+        f = _read_focus(p, self._now())
+        assert f is not None and f.text is None
+
+    def test_non_dict_json_is_dark(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        f = _read_focus(self._write(tmp_path, [1, 2, 3]), self._now())
+        assert f is not None and f.text is None
+
+    def test_file_present_no_focus_renders_unset(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        f = _read_focus(self._write(tmp_path, {"location": "home"}), self._now())
+        assert f is not None and f.text is None and f.stale is False
+
+    def test_empty_focus_is_none(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        f = _read_focus(self._write(tmp_path, {"focus": "   "}), self._now())
+        assert f is not None and f.text is None
+
+    def test_fresh_focus(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {
+            "focus": "Pressable work + flow work",
+            "focus_set_at": "2026-06-29T14:00:00+00:00",  # 3h before now
+            "focus_source": "flowconnect",
+        }
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None
+        assert f.text == "Pressable work + flow work"
+        assert f.source == "flowconnect"
+        assert f.age_label == "set 3h ago"
+        assert f.stale is False
+
+    def test_stale_focus_flagged(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {
+            "focus": "yesterday's thing",
+            "focus_set_at": "2026-06-27T14:00:00+00:00",  # ~51h before now
+        }
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.text == "yesterday's thing"
+        assert f.age_label == "set 2d ago"
+        assert f.stale is True
+
+    def test_focus_without_set_at_no_age_no_stale(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        f = _read_focus(self._write(tmp_path, {"focus": "headless task"}), self._now())
+        assert f is not None and f.text == "headless task"
+        assert f.age_label == "" and f.stale is False
+
+    def test_unparseable_set_at_no_age_no_stale(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {"focus": "x", "focus_set_at": "not-a-timestamp"}
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.age_label == "" and f.stale is False
+
+    def test_naive_set_at_treated_utc(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {"focus": "x", "focus_set_at": "2026-06-29T14:00:00"}  # naive → UTC
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.age_label == "set 3h ago" and f.stale is False
+
+    def test_superset_file_only_focus_keys_read(self, tmp_path: Path) -> None:
+        # flow's context_state.json is a SUPERSET — body/mind/sensors are IGNORED; the
+        # primitive stays general (only the three focus keys are contract).
+        from levain.dashboard import _read_focus
+        payload = {
+            "focus": "the real thing",
+            "focus_set_at": "2026-06-29T16:00:00+00:00",
+            "focus_source": "flowconnect",
+            "body": 5, "mind": 5, "social": 3,
+            "ios_focus_mode": "none", "battery_level": 0.45, "pressure_hpa": 989.9,
+        }
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.text == "the real thing"
+        assert f.age_label == "set 1h ago" and f.freshness == "fresh"
+        d = f.to_dict()
+        assert set(d) == {"text", "set_at", "source", "age_label", "stale", "freshness"}
+        assert "body" not in d and "ios_focus_mode" not in d
+
+    def test_freshness_unknown_for_missing_stamp(self, tmp_path: Path) -> None:
+        # text present, no stamp → freshness "unknown" (not "fresh") so no surface
+        # renders it as current. honesty floor (codex L3 MED1).
+        from levain.dashboard import _read_focus
+        f = _read_focus(self._write(tmp_path, {"focus": "no stamp"}), self._now())
+        assert f is not None and f.text == "no stamp" and f.freshness == "unknown"
+
+    def test_freshness_unknown_for_future_stamp(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {"focus": "tomorrow's", "focus_set_at": "2026-06-30T17:00:00+00:00"}
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.freshness == "unknown" and f.age_label == ""
+
+    def test_freshness_unknown_for_unparseable_stamp(self, tmp_path: Path) -> None:
+        from levain.dashboard import _read_focus
+        payload = {"focus": "x", "focus_set_at": "not-a-timestamp"}
+        f = _read_focus(self._write(tmp_path, payload), self._now())
+        assert f is not None and f.freshness == "unknown"
+
+    def test_naive_now_does_not_raise(self, tmp_path: Path) -> None:
+        # _read_focus documents "never raises"; a naive `now` + aware stamp must not
+        # crash the subtraction (codex L3 MED2).
+        import datetime as dt
+        from levain.dashboard import _read_focus
+        payload = {"focus": "x", "focus_set_at": "2026-06-29T16:00:00+00:00"}
+        naive_now = dt.datetime(2026, 6, 29, 17, 0, 0)  # no tzinfo
+        f = _read_focus(self._write(tmp_path, payload), naive_now)
+        assert f is not None and f.freshness == "fresh"
+
+    # -- integration through build_substrate_view / to_dict --
+    def test_build_carries_focus(self, tmp_path: Path) -> None:
+        from levain.dashboard import build_substrate_view, AnnealPaths
+        ctx = self._write(tmp_path, {
+            "focus": "wiring the primitive",
+            "focus_set_at": "2026-06-29T16:30:00+00:00",
+            "focus_source": "cli",
+        })
+        paths = AnnealPaths.from_db(tmp_path / "memory.db")  # no store → store error, focus still reads
+        view = build_substrate_view(paths, context_json=ctx, now=self._now())
+        assert view.focus is not None and view.focus.text == "wiring the primitive"
+        assert view.to_dict()["focus"]["text"] == "wiring the primitive"
+        assert view.to_dict()["focus"]["age_label"] == "set 30m ago"
+
+    def test_build_no_context_json_focus_none(self, tmp_path: Path) -> None:
+        from levain.dashboard import build_substrate_view, AnnealPaths
+        paths = AnnealPaths.from_db(tmp_path / "memory.db")
+        view = build_substrate_view(paths, now=self._now())
+        assert view.focus is None
+        assert view.to_dict()["focus"] is None
+
+    def test_source_local_defaults_context_path(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+        src = SubstrateSource.local(tmp_path)
+        assert src.context_json == tmp_path / ".levain" / "context.json"
+
+    def test_source_build_passes_context_json(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource, AnnealPaths
+        ctx = self._write(tmp_path, {"focus": "via source"})
+        src = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "memory.db"),
+                              context_json=ctx)
+        view = src.build(now=self._now())
+        assert view.focus is not None and view.focus.text == "via source"
+
+
+class TestWriteFocus:
+    """write_focus — the write-peer; round-trips with _read_focus, merge-preserves
+    sibling keys, atomically writes, and clears on blank."""
+
+    import datetime as _dt
+    UTC = _dt.timezone.utc
+
+    def test_set_then_read_roundtrip(self, tmp_path: Path) -> None:
+        from levain.dashboard import write_focus, _read_focus
+        ctx = tmp_path / ".levain" / "context.json"  # parent created by write_focus
+        write_focus(ctx, "  shipping  the   primitive ")
+        f = _read_focus(ctx, self._dt.datetime.now(self.UTC))
+        assert f is not None
+        assert f.text == "shipping the primitive"  # whitespace collapsed
+        assert f.source == "cli"
+        assert f.age_label == "set just now" and f.stale is False
+
+    def test_merge_preserves_sibling_keys(self, tmp_path: Path) -> None:
+        import json
+        from levain.dashboard import write_focus
+        ctx = tmp_path / "context.json"
+        ctx.write_text(json.dumps({"body": 5, "location": "home"}), encoding="utf-8")
+        write_focus(ctx, "new focus", source="flowconnect")
+        data = json.loads(ctx.read_text(encoding="utf-8"))
+        assert data["body"] == 5 and data["location"] == "home"  # untouched
+        assert data["focus"] == "new focus" and data["focus_source"] == "flowconnect"
+        assert "focus_set_at" in data
+
+    def test_blank_clears(self, tmp_path: Path) -> None:
+        from levain.dashboard import write_focus, _read_focus
+        ctx = tmp_path / "context.json"
+        write_focus(ctx, "something")
+        write_focus(ctx, "   ")  # clear
+        f = _read_focus(ctx, self._dt.datetime.now(self.UTC))
+        assert f is not None and f.text is None
+
+    def test_corrupt_existing_replaced_not_failed(self, tmp_path: Path) -> None:
+        import json
+        from levain.dashboard import write_focus
+        ctx = tmp_path / "context.json"
+        ctx.write_text("{not json", encoding="utf-8")
+        write_focus(ctx, "recovered")  # must not raise
+        assert json.loads(ctx.read_text(encoding="utf-8"))["focus"] == "recovered"
+
+    def test_set_at_is_tz_aware(self, tmp_path: Path) -> None:
+        import json
+        from datetime import datetime
+        from levain.dashboard import write_focus
+        ctx = tmp_path / "context.json"
+        write_focus(ctx, "x")
+        stamp = json.loads(ctx.read_text(encoding="utf-8"))["focus_set_at"]
+        assert datetime.fromisoformat(stamp).tzinfo is not None
+
+
+class TestRunFocus:
+    """run_focus — the `levain focus` entry point: set / show / clear over an
+    install's .levain/context.json."""
+
+    def test_set_and_show(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from levain.dashboard import run_focus
+        (tmp_path / ".levain").mkdir()
+        rc = run_focus(path=tmp_path, text="auditing the seam")
+        assert rc == 0 and "focus set: auditing the seam" in capsys.readouterr().out
+        rc = run_focus(path=tmp_path)  # show
+        assert rc == 0 and "⊙ auditing the seam" in capsys.readouterr().out
+
+    def test_show_when_unset(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from levain.dashboard import run_focus
+        rc = run_focus(path=tmp_path)
+        assert rc == 0 and "no focus set" in capsys.readouterr().out
+
+    def test_clear(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from levain.dashboard import run_focus
+        run_focus(path=tmp_path, text="temp")
+        rc = run_focus(path=tmp_path, clear=True)
+        assert rc == 0 and "focus cleared" in capsys.readouterr().out
+        run_focus(path=tmp_path)
+        assert "no focus set" in capsys.readouterr().out
+
+
+class TestFocusReviewFixes:
+    """Apparatus-driven hardening: collapse internal whitespace on READ (L1-#3), and
+    focus in the model-visible render_summary (L1-#1)."""
+
+    import datetime as _dt
+    UTC = _dt.timezone.utc
+
+    def test_collapses_internal_newlines_on_read(self, tmp_path: Path) -> None:
+        # a foreign/hand-edited focus with a newline must not split the single-line
+        # render_text / TUI rule row → collapse on read (not just on write).
+        import json
+        from levain.dashboard import _read_focus
+        p = tmp_path / "context.json"
+        p.write_text(json.dumps({"focus": "line one\nline two\t  tabbed"}), encoding="utf-8")
+        f = _read_focus(p, self._dt.datetime.now(self.UTC))
+        assert f is not None and f.text == "line one line two tabbed"
+
+    def test_render_summary_includes_focus(self, tmp_path: Path) -> None:
+        from levain.dashboard import build_substrate_view, render_summary, AnnealPaths
+        import json
+        ctx = tmp_path / "context.json"
+        ctx.write_text(json.dumps({
+            "focus": "the model-visible frame",
+            "focus_set_at": "2026-06-29T16:00:00+00:00",
+        }), encoding="utf-8")
+        view = build_substrate_view(
+            AnnealPaths.from_db(tmp_path / "memory.db"), context_json=ctx,
+            now=self._dt.datetime(2026, 6, 29, 17, 0, 0, tzinfo=self.UTC),
+        )
+        out = render_summary(view)
+        assert "Focus: the model-visible frame" in out
+        assert "set 1h ago" in out
+
+    def test_render_summary_no_focus_omits_line(self, tmp_path: Path) -> None:
+        from levain.dashboard import build_substrate_view, render_summary, AnnealPaths
+        view = build_substrate_view(AnnealPaths.from_db(tmp_path / "memory.db"))
+        assert "Focus:" not in render_summary(view)
+
+    def test_run_focus_show_surfaces_source(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from levain.dashboard import run_focus
+        (tmp_path / ".levain").mkdir()
+        run_focus(path=tmp_path, text="x", source="flowconnect")
+        capsys.readouterr()
+        run_focus(path=tmp_path)
+        assert "via flowconnect" in capsys.readouterr().out
+
+    def test_run_focus_warns_when_no_store(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # no .levain/memory.db → a soft stderr note (still honors the set)
+        from levain.dashboard import run_focus
+        rc = run_focus(path=tmp_path, text="early focus")
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "no Levain store" in err

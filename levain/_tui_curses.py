@@ -655,7 +655,25 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         attr = curses.A_REVERSE if i == model.zone_idx else curses.A_NORMAL
         _safe_addstr(stdscr, 1, x, tab, attr)
         x += len(tab) + 1
+    # Rule row (row 2) — overlay the operator's live focus on the separator: their
+    # OWN declared frame (pure-echo), freshness-tagged. NO-THEATER: a stale focus
+    # dims + carries a "?" re-confirm nudge; no live-context source → a plain rule.
     _safe_addstr(stdscr, 2, 0, "─" * w, curses.A_DIM)
+    focus = view.focus
+    if focus is not None and w > 12:
+        if focus.text and focus.freshness == "unknown":
+            # age can't be established — say so, dimmed (unknown ≠ fresh).
+            tag = f" ⊙ {focus.text} · age unknown "
+            f_attr = curses.A_DIM
+        elif focus.text:
+            age = focus.age_label.replace("set ", "") if focus.age_label else ""
+            suffix = f" · {age}{' ?' if focus.stale else ''}" if age else ""
+            tag = f" ⊙ {focus.text}{suffix} "
+            f_attr = curses.A_DIM if focus.stale else curses.A_NORMAL
+        else:
+            tag = " ⊙ no focus set "
+            f_attr = curses.A_DIM
+        _safe_addstr(stdscr, 2, 2, tag[: w - 4], f_attr)
 
     left_w = min(_LEFT_W, w // 3)
     body_top, body_bottom = 3, h - 3  # inclusive rows for the body
