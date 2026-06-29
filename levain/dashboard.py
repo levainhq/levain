@@ -40,9 +40,11 @@ make visible).
 from __future__ import annotations
 
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -75,11 +77,14 @@ __all__ = [
     "WrapRow",
     "ConfigDoc",
     "Section",
+    "Focus",
     "SubstrateView",
     "build_substrate_view",
+    "write_focus",
     "render_text",
     "render_summary",
     "run_dashboard",
+    "run_focus",
 ]
 
 
@@ -188,6 +193,11 @@ class SubstrateSource:
     entity_name: str | None = None
     brand_wordmark: str | None = None
     brand_model: str | None = None
+    # WHERE the live operator-context (focus) is read from. ``.local()`` defaults it
+    # to the install's ``.levain/context.json``; a downstream control plane with an
+    # N-of-1 source overrides it to wherever its own sensor app writes. None →
+    # ``view.focus`` is None (no live-context source).
+    context_json: Path | None = None
 
     @classmethod
     def local(cls, install_root: str | Path) -> "SubstrateSource":
@@ -204,6 +214,7 @@ class SubstrateSource:
             install_root=root,
             scope="personal",
             write_scope=WriteScope.from_install_root(root),
+            context_json=root / ".levain" / "context.json",
         )
 
     def build(self, **kwargs: Any) -> "SubstrateView":
@@ -216,6 +227,7 @@ class SubstrateSource:
             self.anneal,
             install_root=self.install_root,
             ledger_root=self.write_scope.ledger_root if self.write_scope else None,
+            context_json=self.context_json,
             scope=self.scope,
             **kwargs,
         )
@@ -454,6 +466,181 @@ class Section:
         return self.__dict__.copy()
 
 
+# Past ~a working day plus an overnight, an unchanged focus is more likely stale
+# than current → the render flags it so the operator can re-confirm (operator-
+# reports-first: a prompt, never a verdict). A coarse, deliberately un-tuned bound.
+FOCUS_STALE_AFTER_HOURS = 18
+
+
+@dataclass
+class Focus:
+    """The operator's live, self-authored attention context — "what I'm on right
+    now" — set via the ``levain focus`` CLI or a sensor/companion app, and read by
+    every session so the partner orients to the operator's OWN declared frame across
+    sessions (``the substrate escapes the session``, applied to attention). The
+    cockpits (web / TUI) RENDER it read-only; the set-path is the CLI or the app.
+
+    PURE-ECHO operator self-report: the operator authors it, the partner reflects
+    it — so it carries NO deference-risk (you cannot defer to your own input) and
+    needs no machine interpretation. This is what makes it the cleanest piece of
+    live operator-context to generalize, and it is distinct from BOTH the neocortex
+    ``State`` (consolidated memory, the consolidate's single-writer territory) and
+    any machine-SENSED signal (an OS focus-mode, measured energy/HRV) — those don't
+    generalize / carry deference-risk and stay out of the primitive.
+
+    Live-state, last-writer-wins, freshness-bearing: a stale focus presented as
+    current is a lie, so ``set_at`` is half the signal — the render shows the age
+    and FLAGS a stale one rather than passing an old focus off as live."""
+
+    text: str | None  # the authored focus; None when unset → render "no focus set"
+    set_at: str | None  # the stored ISO-8601 timestamp, verbatim; None if absent
+    source: str | None  # who set it: "cli" / a sensor app / …; None if absent
+    age_label: str = ""  # human "set 3h ago"; "" when set_at is absent/unparseable (unknown ≠ fresh)
+    stale: bool = False  # older than FOCUS_STALE_AFTER_HOURS; False when age is unknown
+    # Tri-state freshness so a focus whose AGE can't be established (missing /
+    # unparseable / future stamp) never renders as implicitly-CURRENT — the honesty
+    # floor (unknown ≠ fresh). "fresh" | "stale" | "unknown". Only meaningful when
+    # ``text`` is set (a None focus renders "no focus set", freshness ignored).
+    freshness: str = "unknown"
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+def _humanize_focus_age(delta_seconds: float) -> str:
+    """``set just now`` / ``set 12m ago`` / ``set 3h ago`` / ``set 2d ago``. Coarse
+    by design — focus is a daily-ish signal, not a stopwatch. A negative delta (a
+    future ``set_at`` — clock skew / bad data) is unparseable-as-age → "" (never a
+    fabricated freshness)."""
+    if delta_seconds < 0:
+        return ""  # guard the FLOAT — int(-0.5)==0 would slip a sub-second future stamp
+    s = int(delta_seconds)
+    if s < 90:
+        return "set just now"
+    if s < 3600:
+        return f"set {s // 60}m ago"
+    if s < 86400:
+        return f"set {s // 3600}h ago"
+    return f"set {s // 86400}d ago"
+
+
+def _read_focus(context_json: Path | None, now: datetime) -> "Focus | None":
+    """Read the live operator focus from the minimal context contract
+    ``{focus, focus_set_at, focus_source}``.
+
+    Returns ``None`` when there is NO context source at all (a substrate with no
+    live-context file → render nothing, not an empty "no focus"). Returns a
+    ``Focus`` with ``text=None`` when the file exists but carries no focus (render
+    "no focus set"). FAIL-SOFT: a missing/unreadable/malformed file → ``text=None``,
+    never raises (an operator-context read must not blank the cockpit).
+
+    The file MAY be a SUPERSET — a sensor app's context file may also carry
+    location/body/sensors — but ONLY the three focus keys are read; everything else
+    is ignored. That superset-tolerance is exactly what keeps the primitive general:
+    a generic adopter's ``.levain/context.json`` holds just the three keys, a sensor
+    app keeps writing its richer file untouched, and both satisfy the same
+    contract."""
+    if context_json is None:
+        return None
+    try:
+        if not context_json.exists():
+            return None
+        data = json.loads(context_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return Focus(text=None, set_at=None, source=None)
+    if not isinstance(data, dict):
+        return Focus(text=None, set_at=None, source=None)
+
+    raw_text = data.get("focus")
+    # Collapse internal whitespace/newlines on READ too (write_focus collapses on
+    # write, but this is the GENERAL ingress for hand-edited / foreign context files):
+    # a newline in the focus would split the single-line render_text / TUI rule row.
+    text = " ".join(raw_text.split()) if isinstance(raw_text, str) and raw_text.split() else None
+    raw_at = data.get("focus_set_at")
+    set_at = raw_at if isinstance(raw_at, str) and raw_at.strip() else None
+    raw_src = data.get("focus_source")
+    source = raw_src if isinstance(raw_src, str) and raw_src.strip() else None
+
+    age_label = ""
+    stale = False
+    freshness = "unknown"  # tri-state; only an established age flips it off "unknown"
+    if text and set_at:  # age is meaningless without a focus to be the age OF
+        if now.tzinfo is None:
+            # a direct caller may pass a naive `now`; this helper documents "never
+            # raises", so coerce rather than crash the aware-minus-naive subtraction.
+            now = now.replace(tzinfo=timezone.utc)
+        try:
+            ts = datetime.fromisoformat(set_at)
+        except (ValueError, TypeError):
+            ts = None  # unparseable stamp → unknown age, NOT stale (don't lie)
+        if ts is not None:
+            if ts.tzinfo is None:
+                # the `levain focus` writer always stamps tz-aware; a naive stamp only
+                # arrives on a hand-edited / foreign file → treat as UTC to compare.
+                ts = ts.replace(tzinfo=timezone.utc)
+            try:
+                delta = (now - ts).total_seconds()
+            except (TypeError, OverflowError):
+                delta = None  # belt-and-braces — degrade to unknown, never raise
+            # A NEGATIVE delta (future stamp) yields age_label "" → freshness stays
+            # "unknown" (the honest read of a clock-skewed stamp), not a false "fresh".
+            if delta is not None and delta >= 0:
+                age_label = _humanize_focus_age(delta)
+                stale = delta >= FOCUS_STALE_AFTER_HOURS * 3600
+                freshness = "stale" if stale else "fresh"
+    return Focus(
+        text=text, set_at=set_at, source=source,
+        age_label=age_label, stale=stale, freshness=freshness,
+    )
+
+
+def write_focus(context_json: Path, text: str, *, source: str = "cli") -> None:
+    """Set the operator's live focus — the WRITE-PEER of ``_read_focus``, kept
+    adjacent so the contract (the three keys, a tz-aware ISO stamp) cannot drift
+    between read and write.
+
+    MERGE-preserving: reads the existing object and updates ONLY the three focus
+    keys, so a file that carries other keys (a sensor app's superset) keeps them.
+    Live-state, last-writer-wins — a plain ATOMIC write (temp + ``os.replace``), NO
+    CAS / lock. This is the SINGLE-WRITER-per-file path: the only writer of a generic
+    adopter's ``.levain/context.json`` is the operator's own ``levain focus`` (a
+    re-set IS the re-confirm). It does NOT serialize against a FOREIGN concurrent
+    writer of the same file (a sensor app owns + writes ITS OWN superset file and is
+    never pointed here) — the read-merge-write would lose a sibling key written
+    between the read and the swap; that hazard is out of scope by construction, not
+    handled. An all-blank ``text`` CLEARS the focus (``_read_focus`` then reads it as
+    unset). The parent dir is created if absent. A corrupt/unreadable existing file
+    is replaced rather than failing the set (the operator's intent to set wins)."""
+    text = " ".join(text.split())  # collapse whitespace; "" → clear
+    data: dict[str, Any] = {}
+    try:
+        if context_json.exists():
+            existing = json.loads(context_json.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                data = existing
+    except (OSError, ValueError):
+        data = {}  # corrupt → start fresh; don't fail the operator's set
+    data["focus"] = text
+    data["focus_set_at"] = datetime.now(timezone.utc).isoformat()
+    data["focus_source"] = source
+    # Write THROUGH a symlink to its target (don't clobber the link with a regular
+    # file), and keep os.replace atomic by putting the temp in the TARGET's dir.
+    target = Path(os.path.realpath(context_json)) if context_json.is_symlink() else context_json
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # A TRULY-unique temp in the target's dir (mkstemp, not a name that could collide
+    # under concurrent writers); unlinked on a mid-write fault so a failure leaves the
+    # real file untouched AND no litter.
+    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, target)  # atomic same-filesystem swap — no torn read
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
 @dataclass
 class SubstrateView:
     """The whole substrate, assembled. Any tier may be ``None`` / empty with a
@@ -486,6 +673,10 @@ class SubstrateView:
     config_docs: list[ConfigDoc] = field(default_factory=list)
     wraps: list[WrapRow] = field(default_factory=list)
     recent_edits: list[dict[str, Any]] = field(default_factory=list)
+    # The operator's live self-authored attention context (set from any surface,
+    # read by every session). None when there is no live-context source. NOT one of
+    # the anneal memory stores — live-state, not consolidated cognition.
+    focus: Focus | None = None
     errors: dict[str, str] = field(default_factory=dict)
 
     def layout(self) -> list[dict[str, Any]]:
@@ -610,6 +801,7 @@ class SubstrateView:
             "config_docs": [d.to_dict() for d in self.config_docs],
             "wraps": [w.to_dict() for w in self.wraps],
             "recent_edits": self.recent_edits,
+            "focus": self.focus.to_dict() if self.focus else None,
             "layout": self.layout(),
             "errors": self.errors,
         }
@@ -1014,8 +1206,10 @@ def build_substrate_view(
     paths: AnnealPaths,
     *,
     today: date | None = None,
+    now: datetime | None = None,
     install_root: Path | None = None,
     ledger_root: Path | None = None,
+    context_json: Path | None = None,
     scope: str = "personal",
     graph_min_strength: float = 0.0,
     max_graph_nodes: int = 300,
@@ -1037,8 +1231,21 @@ def build_substrate_view(
     ``install_root`` (when given) locates the seed/config surface — the
     operator/origin/posture/constitution docs that live at the install root, not
     next to the db. Without it (a bare store with no install context) the config
-    tier is simply absent (no error — there is nothing to read there)."""
+    tier is simply absent (no error — there is nothing to read there).
+
+    ``context_json`` (when given) locates the live operator-context file holding the
+    minimal ``{focus, focus_set_at, focus_source}`` contract — read fail-soft into
+    ``view.focus`` (None when absent). ``now`` is the reference instant for focus
+    freshness (defaults to UTC-now; passed explicitly in tests)."""
     view = SubstrateView(paths=paths, scope=scope)
+
+    # --- live operator context (focus) — independent of the anneal stores; its own
+    # fail-soft read (never raises). A daily-driver cockpit must not blank on an
+    # operator-context read fault, so _read_focus degrades to text=None internally.
+    _now = now if now is not None else datetime.now(timezone.utc)
+    if _now.tzinfo is None:  # a naive caller-supplied now → compare in UTC
+        _now = _now.replace(tzinfo=timezone.utc)
+    view.focus = _read_focus(context_json, _now)
 
     # Data/IO fault classes we degrade on; programming bugs propagate (loud).
     # anneal wraps store faults in AnnealMemoryError, imported lazily so this
@@ -1347,7 +1554,16 @@ def render_text(view: SubstrateView) -> str:
     the bottom, never silently dropped."""
     title = view.entity_name or view.paths.episodic_db.stem
     masthead = view.brand_model or "Levain substrate"
-    out: list[str] = [f"{masthead} — {title}", f"  store: {view.paths.episodic_db}", ""]
+    out: list[str] = [f"{masthead} — {title}", f"  store: {view.paths.episodic_db}"]
+    if view.focus is not None and view.focus.text:
+        if view.focus.freshness == "unknown":
+            meta = " (age unknown)"
+        elif view.focus.stale:
+            meta = f" ({view.focus.age_label}) — stale; still live?"
+        else:
+            meta = f" ({view.focus.age_label})"
+        out.append(f"  focus: ⊙ {view.focus.text}{meta}")
+    out.append("")
 
     h = view.health
     if h is not None:
@@ -1468,6 +1684,17 @@ def render_summary(view: SubstrateView) -> str:
     title = view.entity_name or view.paths.episodic_db.stem
     masthead = view.brand_model or "Levain substrate"
     lines: list[str] = [f"{masthead} — {title}"]
+    # The operator's live focus, FIRST — for a generic MCP adopter the partner IS the
+    # model and reasons over THIS digest, so the "every session orients to the
+    # operator's declared frame" telos has to land here, not only on the cockpit.
+    if view.focus is not None and view.focus.text:
+        if view.focus.freshness == "unknown":
+            meta = " (age unknown — confirm still live)"
+        elif view.focus.stale:
+            meta = f" ({view.focus.age_label}) — STALE; confirm still live"
+        else:
+            meta = f" ({view.focus.age_label})"
+        lines.append(f"Focus: {view.focus.text}{meta}")
 
     h = view.health
     if h is not None:
@@ -1538,3 +1765,46 @@ def run_dashboard(path: Path, as_json: bool = False) -> int:
     else:
         print(render_text(view), end="")
     return 1 if "store" in view.errors else 0
+
+
+def run_focus(
+    path: Path, text: str | None = None, *, source: str = "cli", clear: bool = False
+) -> int:
+    """``levain focus`` entry point — set / show / clear the operator's live focus.
+
+    Resolves the install's ``.levain/context.json`` from ``path``. With ``text`` (or
+    ``--clear``) it SETS (clear = an empty focus); with neither it SHOWS the current
+    focus + freshness. The general (non-sensor-app) operator's set-path; a downstream
+    with its own sensor app sets focus into that app's context file, not here."""
+    install_root = Path(path).expanduser().resolve()
+    context_json = install_root / ".levain" / "context.json"
+    # Soft guard: setting focus in a dir with NO Levain store writes a stray
+    # `.levain/context.json` no cockpit will ever read (a typo'd --path). Warn, but
+    # still honor the set (an operator may legitimately set focus before `levain init`).
+    if (text is not None or clear) and not (install_root / ".levain" / "memory.db").exists():
+        print(
+            f"note: no Levain store at {install_root} — setting focus here anyway; "
+            "run `levain init` (or pass --path to an install) so a cockpit reads it.",
+            file=sys.stderr,
+        )
+    if clear:
+        text = ""
+    if text is not None:
+        write_focus(context_json, text, source=source)
+        print(f"focus set: {text.strip()}" if text.strip() else "focus cleared")
+        return 0
+    focus = _read_focus(context_json, datetime.now(timezone.utc))
+    if focus is None or focus.text is None:
+        print("no focus set")
+        return 0
+    bits = []
+    if focus.freshness == "unknown":
+        bits.append("age unknown")
+    elif focus.age_label:
+        bits.append(focus.age_label)
+    if focus.source:
+        bits.append(f"via {focus.source}")
+    meta = f"  ({' · '.join(bits)})" if bits else ""
+    stale = "  — stale; still live?" if focus.stale else ""
+    print(f"⊙ {focus.text}{meta}{stale}")
+    return 0

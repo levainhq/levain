@@ -120,6 +120,37 @@
   // rows land. null = don't restore (cleared on a fresh user search → resets to top).
   let modalRestoreScroll = null;
 
+  // The masthead focus line. `focus` is the view.focus payload (or null/undefined).
+  //   null/absent        → no live-context source → hide the line entirely.
+  //   {text: null}       → a source exists but no focus is set → "no focus set".
+  //   {text, age_label}  → the focus + its freshness; a stale focus dims + nudges.
+  // textContent throughout (the operator authored the string, but the cockpit never
+  // routes operator text through innerHTML — consistent with the rest of the app).
+  function renderFocus(focus) {
+    const fEl = document.getElementById("focus");
+    if (!fEl) return;
+    fEl.replaceChildren();
+    fEl.classList.remove("unset", "stale");
+    if (!focus) { fEl.hidden = true; return; }  // no live-context source
+    fEl.hidden = false;
+    if (!focus.text) {
+      fEl.classList.add("unset");
+      fEl.appendChild(el("span", "ftext", "no focus set"));
+      return;
+    }
+    fEl.appendChild(el("span", "ftext", focus.text));
+    if (focus.freshness === "unknown") {
+      // age can't be established (missing/unparseable/future stamp) — say so, dimmed;
+      // unknown ≠ fresh, so it must NOT render like a current focus.
+      fEl.appendChild(el("span", "fage", "· age unknown"));
+      fEl.classList.add("stale");
+    } else if (focus.age_label) {
+      fEl.appendChild(el("span", "fage",
+        focus.age_label + (focus.stale ? " · still live?" : "")));
+      if (focus.stale) fEl.classList.add("stale");
+    }
+  }
+
   // ---------------------------------------------------------------- render ----
   function render(view, opts) {
     // The surface injects its write transport here; a port that provides none (the
@@ -159,6 +190,12 @@
       const md = document.querySelector(".brand .model");
       if (md) md.textContent = view.brand_model;
     }
+    // The operator's live focus — their OWN declared "what I'm on", reflected back
+    // (pure-echo: no machine interpretation, so no "does this match?" loop-close
+    // needed — it IS their read). Hidden when there's no live-context source; "no
+    // focus set" when present-but-empty; freshness-stamped, a stale focus flagged so
+    // the operator can re-confirm (operator-reports-first — a nudge, not a verdict).
+    renderFocus(view.focus);
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is

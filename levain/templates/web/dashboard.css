@@ -260,6 +260,18 @@
   button#refresh:active { transform: translateY(1px); box-shadow: inset 0 2px 4px rgba(0,0,0,.4); }
   button#refresh:disabled { opacity: .4; cursor: default; box-shadow: none; }
 
+  /* the operator's live focus — their own declared "what I'm on", reflected back.
+     Operate-amber (it's the operator's frame, not cognition); freshness-stamped;
+     a stale focus dims + carries a re-confirm nudge (operator-reports-first). */
+  .focusline { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+               margin: 11px 2px 3px; font-size: 12.5px; letter-spacing: .02em; }
+  .focusline::before { content: "⊙ focus"; align-self: center; color: var(--operate);
+               font: 700 9px/1 var(--label); letter-spacing: .3em; text-transform: uppercase; }
+  .focusline .ftext { color: var(--ink); overflow-wrap: anywhere; min-width: 0; }
+  .focusline .fage  { color: var(--faint); font-size: 10.5px; letter-spacing: .05em; }
+  .focusline.unset .ftext { color: var(--faint); font-style: italic; }
+  .focusline.stale { opacity: .62; }
+  .focusline.stale .fage { color: var(--operate); }
   .sub { color: var(--faint); font-size: 10.5px; letter-spacing: .05em; margin: 9px 2px 14px; word-break: break-all; }
   .sub::before { content: "◇ store "; color: color-mix(in srgb, var(--mind) 60%, var(--faint)); }
 
