@@ -521,17 +521,25 @@ class SubstrateView:
         # ONE Tray, not three disposition panels). All three are Class B: Open Loops gets
         # the lifecycle verbs; Tray (Slice 3b) gets the freeform dump box + per-row triage
         # verbs (metabolize / schedule / dismiss); Keep gets the lifecycle verbs + schedule.
+        # Honesty floor: the three projections share ONE spore read; when it FAULTS the
+        # count is meaningless, so the header must show "(unavailable)" — never "(0)" over
+        # an unreadable store (that would contradict the body's "unavailable" and read as a
+        # false zero on a header-only glance). [no_data != no_event; header/body parity]
+        _spore_err = "open_spores" in self.errors
+        _oc = "unavailable" if _spore_err else len(self.open_spores)
+        _tc = "unavailable" if _spore_err else len(self.tray)
+        _kc = "unavailable" if _spore_err else len(self.keep)
         panels.append(
             {"kind": "spores", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
-             "title": f"Open loops ({len(self.open_spores)})"}
+             "title": f"Open loops ({_oc})"}
         )
         panels.append(
             {"kind": "tray", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
-             "title": f"Tray ({len(self.tray)})"}
+             "title": f"Tray ({_tc})"}
         )
         panels.append(
             {"kind": "keep", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
-             "title": f"Keep ({len(self.keep)})"}
+             "title": f"Keep ({_kc})"}
         )
         panels.append(
             {"kind": "episodes", "zone": ZONE_OPERATE, "edit_class": CLASS_B,

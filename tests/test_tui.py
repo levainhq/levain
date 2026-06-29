@@ -565,6 +565,36 @@ def test_render_tray_keep_empty_states():
     assert tui.render_panel_lines(v, keep_panel) == ["(keep empty)"]
 
 
+def test_spore_panels_degraded_on_store_fault_not_false_zero():
+    # Honesty floor (no_data != no_event): a spore-store fault lands under "open_spores"; the TUI
+    # must render DEGRADED on all three projections, NEVER a false "(no open loops)/(tray clear)/
+    # (keep empty)" over an unreadable store. (The bug: TUI renderers ignored view.errors while the
+    # web path already degraded — caught by codex L3 on the trust audit.)
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
+                      errors={"open_spores": "SporeError: spores.json is not valid JSON"})
+    for kind in ("spores", "tray", "keep"):
+        panel = next(p for p in v.layout() if p["kind"] == kind)
+        lines = tui.render_panel_lines(v, panel)
+        assert len(lines) == 1
+        assert "unavailable" in lines[0] and "SporeError" in lines[0], (kind, lines)
+        for false_zero in ("(no open loops)", "(tray clear)", "(keep empty)"):
+            assert false_zero not in lines[0], (kind, lines)
+
+
+def test_spore_panel_titles_degraded_not_zero_count_on_fault():
+    # The shared panel manifest (web header + TUI title) must not assert "(0)" over a faulted read.
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
+                      errors={"open_spores": "SporeError: bad"})
+    titles = {p["kind"]: p["title"] for p in v.layout() if p["kind"] in ("spores", "tray", "keep")}
+    assert titles["spores"] == "Open loops (unavailable)", titles
+    assert titles["tray"] == "Tray (unavailable)", titles
+    assert titles["keep"] == "Keep (unavailable)", titles
+    # control: a healthy (empty) store still shows the honest "(0)" count, not a false degrade
+    ok = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
+    ok_titles = {p["kind"]: p["title"] for p in ok.layout() if p["kind"] in ("spores", "tray", "keep")}
+    assert ok_titles["spores"] == "Open loops (0)", ok_titles
+
+
 def test_tray_keep_are_verb_navigable():
     # Tray + Keep grew Class-B operator-I/O verbs (the curses peer of the web's Slice-3b
     # verbs), so they are now item-navigable: a per-row cursor the verbs act on. (The
