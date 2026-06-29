@@ -63,6 +63,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_install_layout(install))
     core.extend(_check_runtime(install))
     core.extend(_check_store(install))
+    core.extend(_check_compat_set(install))
     for r in core:
         _emit(r)
 
@@ -372,6 +373,69 @@ def _check_store(install: Path) -> list[CheckResult]:
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
     return [CheckResult(".levain/memory.db", True, label)]
+
+
+def _check_compat_set(install: Path) -> list[CheckResult]:
+    """Compatibility-manifest drift: is the installed version SET (anneal +
+    schema + acked migrations) at the known-good this levain release declares?
+
+    Folds the manifest's verify into doctor (the natural home — doctor already
+    checks the anneal CLI + the store). Each drift axis becomes a check; only an
+    in_sync axis is green (honesty floor — `unknown` is reported, never passed).
+    Gated on the store existing: a missing store is already reported by
+    `_check_store`, so we don't double-fail it here."""
+    from levain import manifest
+
+    store = install / ".levain" / "memory.db"
+    if not store.is_file():
+        return []
+
+    anneal_path = shutil.which("anneal-memory") or "anneal-memory"
+    declared = manifest.declared_set()
+    installed = manifest.discover_installed_set(store, anneal_path)
+    lock, lock_status = manifest.read_lock_status(install)
+    drift = manifest.compute_drift(declared, installed, lock)
+
+    results: list[CheckResult] = []
+    # A CORRUPT lock (the file exists but is unreadable) is an UNKNOWN provenance
+    # state worth a loud FAIL; an ABSENT lock is benign (a pre-manifest install),
+    # so it gets no check line.
+    if lock_status == "corrupt":
+        results.append(CheckResult(
+            "compat: lock", False,
+            "the recorded set (.levain/manifest.json) exists but is unreadable/corrupt",
+            "Run `levain update` to re-record a verified compose.",
+        ))
+    # `pending` (unreviewed migration proposals) and `ahead` (anneal NEWER than
+    # this release's known-good — pip allowed it, the install works, and `update`
+    # won't downgrade it) are ADVISORIES, not version-SET failures. A fresh
+    # `levain init` legitimately has pending proposals, and an operator who runs
+    # `pip install -U anneal-memory` within the pin is `ahead` — failing doctor on
+    # either would false-alarm a healthy install. Report loudly, green.
+    advisory = {"pending", "ahead"}
+    for v in drift.verdicts:
+        if v.status in advisory:
+            results.append(CheckResult(
+                f"compat: {v.axis}", True,
+                f"{v.detail} — advisory (run `levain update`); not a set failure",
+            ))
+        else:
+            results.append(
+                CheckResult(f"compat: {v.axis}", v.status == "in_sync", v.detail, v.hint)
+            )
+    # Release-gate: the reviewed known-good constant vs the actual pip floor. This
+    # is a RELEASE-INTEGRITY check, not an operator-actionable one — a drift
+    # (mis-cut wheel: KNOWN_GOOD != the dependency pin) or unknown (unreadable dep
+    # metadata) is something the OPERATOR cannot fix, and `doctor`'s exit code
+    # composes with their shell pipelines. So surface it loudly but NEVER fail
+    # their doctor on it; CI / a release script reads `pip_floor_verdict()` to gate.
+    pin = manifest.pip_floor_verdict()
+    pin_detail = (
+        pin.detail if pin.status == "in_sync"
+        else f"{pin.detail} — advisory (release integrity; not operator-actionable)"
+    )
+    results.append(CheckResult(f"compat: {pin.axis}", True, pin_detail))
+    return results
 
 
 def _python_resolvable(token: str) -> bool:
