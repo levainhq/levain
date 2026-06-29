@@ -476,6 +476,10 @@ def build_substrate_json(
                 data[pid] = {
                     "note": p.get("note", ""),
                     "lines": p.get("lines", []),
+                    # OPTIONAL markdown body (prose external panels): an alternative to `lines` —
+                    # the frontend renders it via the shipped CSP-safe markdown renderer when
+                    # present, else falls back to the lines model. Passed through like lines/note.
+                    "markdown": p.get("markdown"),
                     "empty": p.get("empty", ""),
                     "error": p.get("error"),
                     # OPTIONAL governed compose/action affordance (the external-panel-ACTION

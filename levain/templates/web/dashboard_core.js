@@ -1943,6 +1943,16 @@
       if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
     if (data.note) p.appendChild(el("div", "ext-note", data.note));
+    // Prose external panels (e.g. the morning-ritual reports) carry a `markdown` string instead of
+    // `lines` — render it via the shipped CSP-safe markdown renderer (textContent-only, the same one
+    // the section/config panels use). Falls through to the lines model when `markdown` is absent, so
+    // the feed panels (inbox/relay/ops/stream) are unaffected.
+    if (data.markdown != null) {
+      const md = String(data.markdown);
+      if (md.trim() === "") { p.appendChild(el("p", "empty", data.empty || "nothing here")); }
+      else { p.appendChild(renderMarkdown(md)); }
+      return p;
+    }
     const lines = Array.isArray(data.lines) ? data.lines : [];
     if (lines.length === 0) {
       p.appendChild(el("p", "empty", data.empty || "nothing here"));
