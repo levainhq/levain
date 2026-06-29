@@ -60,6 +60,8 @@ The sequence is `prepare_wrap → compress → save_continuity`. All three, ever
 
 During each wrap the server tracks which episodes you cite together. Episodes cited on the same continuity line form strong direct links (+1.0); episodes cited in the same wrap on different lines form weaker session links (+0.3). Over time this builds a cognitive topology. The `prepare_wrap` output includes an "Association Context" section showing which current episodes are already linked — use it to inform compression; strongly-linked episodes probably belong together in your patterns. Links decay 0.9× per unreinforced wrap and are cleaned up below 0.1. Only validated citations form links — the citation-validation pipeline extends to associations (and its limits — see *What it does NOT catch* above).
 
+**Co-citing 2+ episodes in one graduation's `[evidence:]` is what FORMS the direct link.** A single-id citation validates the pattern but wires no direct association — so a habit of single-id citations lets the graph decay wrap after wrap until associative recall goes dark (it never errors; it just quietly stops surfacing). When more than one episode genuinely supports a pattern, cite them together: `[evidence: <id1>, <id2> "how BOTH episodes validate it"]`. Do not pad to reach two — a lone genuinely-relevant episode is a fine single citation; the discipline is to co-cite when the support is genuinely plural, not to invent a second id.
+
 ## Limbic layer (optional — your functional state)
 
 When calling `save_continuity` you may include an `affective_state`:
@@ -85,14 +87,18 @@ For **factual corrections** (wrong detail, outdated info) — record a new episo
 - `save_continuity` reports missing sections → your output needs all six: `## State`, `## Active Threads`, `## Patterns`, `## Decisions`, `## Context`, `## Understanding`. (The exact required set comes from your store's schema; a partnership entity carries all six.)
 - `save_continuity` reports demoted graduations → your evidence citations didn't match real episodes; check episode IDs from the `prepare_wrap` package and cite accurately.
 - Continuity contains `(ungrounded)` markers → those patterns were demoted earlier; in a *future* wrap, provide fresh evidence to re-graduate them, or remove them. Do not re-save within the current session to chase this — wrap once.
-- Continuity contains `(needs-evidence)` markers → include `[evidence: <id> "explanation"]` on all 2x and 3x patterns.
+- Continuity contains `(needs-evidence)` markers → include `[evidence: <id1>, <id2> "explanation"]` on all 2x and 3x patterns (co-cite the episodes that genuinely support it — that is what forms the Hebbian link).
+
+## On upgrade — keep your instructions current with the substrate
+
+Your memory substrate (anneal-memory) and your kit (Levain) evolve. When either upgrades, the substrate can gain capabilities your always-loaded instructions predate — and a new feature then reads as a *conflict* with stale guidance instead of an addition (the failure that makes a working memory feature feel broken). The fix is one command: **on an upgrade, run `levain update`.** It reconciles the known-good version set, surfaces any instruction-file edits the new substrate suggests — for your review, never auto-applied — and records the reconciled baseline. Apply the proposals that fit; show your operator the diff for anything load-bearing, then `levain update --ack` records them as reconciled. You don't have to hunt for this — your session-start surface flags substrate drift the moment it appears.
 
 ## Compression quality
 
 - Follow the compression instructions from `prepare_wrap` — they carry the marker reference and the format requirements.
 - Principles over facts: "We keep hitting X because Y" beats "X happened."
 - One insightful line beats three vague ones.
-- Temporal graduation: new patterns start at 1x; validated patterns graduate to 2x and 3x with `[evidence: <id> "explanation"]` citations referencing real episode IDs.
+- Temporal graduation: new patterns start at 1x; validated patterns graduate to 2x and 3x with `[evidence: <id1>, <id2> "how both episodes validate it"]` citations referencing real episode IDs — co-cite when more than one episode supports the pattern (that is what forms the Hebbian link; a single id is fine when only one genuinely does).
 - If removing something wouldn't change your next decision, cut it.
 
 **The felt layer needs its own discipline.** Your `## Understanding` section is timeless — relationship-shape, not dated events — and it compresses against the *whole arc* of the partnership, not the latest session. Every felt section carries the same trap: the first times you write it, the most recent conversation feels like the whole relationship and dominates the prose. It is not. Proportion `## Understanding` against everything so far; if one recent session is running away with it, rewrite. The library's catastrophic-shrink gate will refuse a save that *collapses* this section (that protection is structural), but the recency *over-weighting* is subtler and yours to catch — and it is exactly the kind of drift your operator, watching from outside your loaded context, will catch for you. Let them.

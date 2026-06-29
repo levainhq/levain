@@ -71,6 +71,27 @@ KNOWN_GOOD_ANNEAL = "0.9.5"
 # schema — the exact invariant `levain init` protects; the manifest re-checks it.
 KNOWN_GOOD_SCHEMA = "partnership"
 
+# The highest anneal-memory version whose migration-manifest entries the SEED
+# TEMPLATES already incorporate. `levain init` acks a fresh install's migrate
+# marker up to this (capped at the installed anneal) so a freshly-rendered,
+# CURRENT adopter sees no false "pending drift" — while NEVER suppressing a
+# proposal the templates don't yet cover. A reviewed release-checklist
+# assertion: bump it only when the seed templates are reconciled to that
+# version's manifest entries. Invariant (release-gate, test-locked): must be
+# <= KNOWN_GOOD_ANNEAL — you cannot reconcile templates to a version you don't ship.
+#
+# Capped at 0.4.8 (the last entry before the crystal tier): the seed now carries
+# the spores boundary (0.4.7), the `levain update` upgrade habit (0.4.7), and the
+# co-citation/linkgate discipline (0.8.3) — BUT the apparatus (L1+L2) caught that
+# the crystal-tier entries 0.7.1 (AM-CRYSTAL) + 0.8.2 (AM-MCP-CRYSTAL) are NOT
+# genuinely reconciled: the activation hook never fires crystal recall (memory.md
+# line 7's "automatic per-turn crystal recall" is aspirational, not shipped), so
+# acking past them would silently suppress real guidance. They stay HONEST pending
+# advisories until the crystal-recall slice lands (wire the UserPromptSubmit hook
+# at the crystal tier + teach wrap-time crystallization routing), which raises this
+# to 0.8.3 — the linkgate guidance is already in place and rides up with it.
+TEMPLATES_RECONCILED_ANNEAL = "0.4.8"
+
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).
 MANIFEST_LOCK_REL = (".levain", "manifest.json")
@@ -449,6 +470,20 @@ def _cmp(a: str, b: str) -> int:
     """-1 / 0 / 1 comparing two versions by their numeric tuples."""
     ta, tb = version_tuple(a), version_tuple(b)
     return (ta > tb) - (ta < tb)
+
+
+def template_ack_target(installed_anneal: str | None) -> str | None:
+    """The version a fresh ``levain init`` acks its migrate marker to: the version
+    the seed templates are reconciled against (:data:`TEMPLATES_RECONCILED_ANNEAL`),
+    CAPPED at the installed anneal (anneal refuses an ack ahead of the installed
+    version). Returns ``None`` when the installed version is unknown — then skip
+    the ack entirely (a missing read is UNKNOWN, never a default; and the cap is
+    unverifiable)."""
+    if installed_anneal is None:
+        return None
+    if _cmp(installed_anneal, TEMPLATES_RECONCILED_ANNEAL) < 0:
+        return installed_anneal
+    return TEMPLATES_RECONCILED_ANNEAL
 
 
 # ---------------------------------------------------------------------------

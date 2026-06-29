@@ -261,20 +261,22 @@ def apply_init(
 def _record_compat_lock(
     install: Path, store: Path, anneal_path: str, emit: Callable[[str], None] = print
 ) -> None:
-    """Record the composed known-good set to ``.levain/manifest.json`` so drift
-    detection (``levain doctor`` / ``levain update`` / the session-start ping)
-    has a baseline of what this install composed.
+    """Record the composed known-good set to ``.levain/manifest.json`` (the drift
+    baseline) AND ack a fresh install's migrate marker up to the version the seed
+    templates are reconciled against.
 
-    Deliberately does NOT auto-ack anneal's migration marker. Acking would assert
-    the freshly-rendered methodology files are current as of the known-good anneal
-    — but whether the templates incorporate every migration entry is the
-    methodology author's reviewed assertion (a release-checklist step), NOT
-    something this version-manifest can verify. Silently advancing the marker
-    would SUPPRESS proposals the operator should review — the worst failure
-    direction for a drift tool (anneal's own `migrate ack` guards the same way).
-    So a fresh adopter sees the migration proposals on their first
-    `levain update` / session-start (correct, and a useful feature tour); they
-    review + ack via `levain update --ack`.
+    Auto-acking is honest BECAUSE the seed templates incorporate every anneal
+    migration-manifest entry through ``manifest.TEMPLATES_RECONCILED_ANNEAL`` (a
+    reviewed release-checklist assertion, test-locked) — so a freshly-rendered,
+    current adopter genuinely has nothing to review through that version, and
+    acking it does NOT suppress a real proposal. (This is the spore-216 reconcile
+    of the spore-213 default: before the templates carried the migrate-notify /
+    linkgate guidance, NOT acking was the honest call; now that they do, acking
+    to the reconciled version is — and it gives a fresh adopter a clean `doctor`
+    instead of a wall of already-incorporated proposals.) The ack is ADVANCE-ONLY
+    (never lowers a `--force` re-install's existing higher ack) and CAPPED at the
+    installed anneal; a newer anneal feature past the reconciled version still
+    surfaces.
 
     Best-effort: a failure here never fails the install (the store is already up).
     """
@@ -301,6 +303,27 @@ def _record_compat_lock(
              f"schema {composed.schema}).")
     except OSError:
         pass
+
+    # Ack a fresh install's migrate marker to the version the seed templates are
+    # reconciled against (capped at installed) — so a freshly-rendered, CURRENT
+    # adopter sees no false "pending drift". This is honest because the templates
+    # genuinely incorporate every migration entry through that version (the
+    # reviewed TEMPLATES_RECONCILED_ANNEAL assertion); it never suppresses a
+    # proposal the templates don't cover. ONLY ADVANCE the marker: a `--force`
+    # re-install over an existing store may already be acked further, and acking
+    # lower would needlessly re-surface already-reviewed proposals. Best-effort —
+    # never fails the install (the store is already up).
+    ack_target = manifest.template_ack_target(installed.anneal)
+    if ack_target is not None and (
+        installed.migrate_acked is None
+        or manifest._cmp(installed.migrate_acked, ack_target) < 0
+    ):
+        ok, _out, _errs = _run_anneal_cmd(
+            store, anneal_path, ["migrate", "ack", ack_target]
+        )
+        if ok:
+            emit(f"  Methodology baseline set (migrations through {ack_target} — "
+                 f"your seed is current as of this release).")
 
 
 # ---------- interview checkpoint persistence ----------
