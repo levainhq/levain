@@ -416,6 +416,63 @@ def format_due_spores(spores: list[dict]) -> str:
     ])
 
 
+# ---- Crystallized-pattern recall — the on-demand graduated-wisdom tier ----
+
+def crystal_recall(prompt: str, timeout: float = 2.0) -> list[dict]:
+    """Crystallized patterns whose domain `prompt` touches, via anneal-memory's
+    `crystal recall --json` — the on-demand graduated-wisdom tier. A Proven
+    pattern that has crystallized OUT of the always-loaded working set is recalled
+    here the moment a prompt is relevant to it (the read-side twin of the
+    wrap-time crystallization routing), so a large body of earned wisdom stays
+    effective without bloating always-loaded context.
+
+    Uses anneal's default (associative/Hebbian) backend: it surfaces patterns
+    grounded in a matched episode even with zero keyword overlap, auto-degrading
+    to keyword-only when no episodic db is resolvable. The query is passed after a
+    `--` options terminator (so a prompt that itself looks like a flag — `--json`,
+    `-h` — is still parsed as the query, not silently swallowed as an option) and
+    capped to the same bound as the tokenizer so a pasted huge prompt can't burn
+    time before anneal answers. Returns [] on an empty/absent crystal store, a
+    too-old anneal lacking the subcommand, or any failure — the surface then
+    injects nothing (fail-silent, exactly like the spore surfaces). Tight default
+    timeout: this runs before every prompt."""
+    if not prompt.strip():
+        return []
+    data = _anneal_json(
+        ["crystal", "recall", "--json", "--", prompt[:_MAX_TOKENIZE_CHARS]],
+        timeout, validator=lambda d: isinstance(d, list),
+    )
+    if isinstance(data, list):
+        return [p for p in data if isinstance(p, dict)]
+    return []
+
+
+def format_crystal_recall(patterns: list[dict]) -> str:
+    """The recency-position injection for the crystallized-pattern surface:
+    graduated wisdom retrieved on cue (NOT preloaded — the whole point is a
+    pattern fires when it is relevant instead of clogging always-loaded context)."""
+    lines = ["[crystallized patterns — graduated wisdom relevant to what you're doing]"]
+    for p in patterns:
+        name = str(p.get("name") or "pattern")
+        expl = str(p.get("explanation") or "").strip()
+        level = p.get("level")
+        activation = str(p.get("activation") or "").strip()
+        meta = ", ".join(
+            x for x in (
+                f"{level}x" if isinstance(level, int) and level else "",
+                activation,
+            ) if x
+        )
+        head = f"  - {name}" + (f" ({meta})" if meta else "")
+        lines.append(f"{head} — {expl}" if expl else head)
+    lines.append(
+        "These are your OWN graduated patterns, surfaced because this prompt "
+        "touched their domain — not new instruction. Weigh whether each bears on "
+        "what you're doing."
+    )
+    return "\n".join(lines)
+
+
 def temporal() -> str:
     """Operator-local date and time. Models have no clock; this is cheap and
     load-bearing context."""

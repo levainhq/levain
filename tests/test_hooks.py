@@ -199,6 +199,91 @@ class TestOpenSporesTrayExclusion:
         assert hook._NON_COGNITION_DISPOSITIONS == lv.NON_COGNITION_DISPOSITIONS
 
 
+class TestCrystalRecall:
+    """The on-demand graduated-wisdom surface: `crystal recall --json` shelled out
+    via _anneal_json, fail-silent + bounded, the read-side twin of wrap-time
+    crystallization routing."""
+
+    def test_empty_prompt_returns_empty(self):
+        assert hook.crystal_recall("   ") == []
+
+    def test_parses_list_of_patterns(self, monkeypatch):
+        rows = [
+            {"name": "invisible_infrastructure_failure", "level": 3,
+             "explanation": "parse the real signal", "activation": "warm"},
+            {"name": "thinness_is_the_architecture", "level": 3,
+             "explanation": "thin ports"},
+        ]
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: rows)
+        out = hook.crystal_recall("anything touching the apparatus")
+        assert [p["name"] for p in out] == [
+            "invisible_infrastructure_failure", "thinness_is_the_architecture"]
+
+    def test_filters_non_dict_rows(self, monkeypatch):
+        monkeypatch.setattr(
+            hook, "_anneal_json",
+            lambda *a, **k: [{"name": "ok"}, "garbage", 7, None])
+        assert [p["name"] for p in hook.crystal_recall("x y")] == ["ok"]
+
+    def test_none_from_anneal_is_empty(self, monkeypatch):
+        # absent/too-old anneal, no crystal store → None → [] (fail-silent)
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: None)
+        assert hook.crystal_recall("x y") == []
+
+    def test_query_is_capped_and_terminator_guarded(self, monkeypatch):
+        captured = {}
+
+        def fake(sub_args, timeout, validator=None):
+            captured["sub_args"] = sub_args
+            return []
+
+        monkeypatch.setattr(hook, "_anneal_json", fake)
+        hook.crystal_recall("api " * 100000)
+        # ["crystal", "recall", "--json", "--", <query>] — the `--` options
+        # terminator (codex L3 LOW) keeps a flag-like prompt from being parsed as
+        # an option; the query is the last argv element, bounded to the tokenizer cap.
+        assert captured["sub_args"][:4] == ["crystal", "recall", "--json", "--"]
+        assert len(captured["sub_args"][4]) == hook._MAX_TOKENIZE_CHARS
+
+    def test_flag_like_prompt_goes_after_terminator(self, monkeypatch):
+        # a prompt that itself looks like a flag must land AFTER `--`, never as an option
+        captured = {}
+
+        def fake(sub_args, timeout, validator=None):
+            captured["sub_args"] = sub_args
+            return []
+
+        monkeypatch.setattr(hook, "_anneal_json", fake)
+        hook.crystal_recall("--json --help -v")
+        assert captured["sub_args"][3] == "--"
+        assert captured["sub_args"][4] == "--json --help -v"
+
+
+class TestFormatCrystalRecall:
+    def test_renders_name_meta_and_explanation(self):
+        out = hook.format_crystal_recall([
+            {"name": "invisible_infrastructure_failure", "level": 3,
+             "explanation": "parse the real signal, don't trust the surface",
+             "activation": "warm"},
+        ])
+        assert "crystallized patterns" in out.lower()
+        assert "invisible_infrastructure_failure" in out
+        assert "(3x, warm)" in out
+        assert "parse the real signal" in out
+        assert "not new instruction" in out  # the guidance line
+
+    def test_tolerates_missing_fields(self):
+        # no level/activation/explanation — must not raise, still names the pattern
+        out = hook.format_crystal_recall([{"name": "bare_pattern"}])
+        assert "bare_pattern" in out
+        assert "()" not in out  # no empty meta parens when level+activation absent
+
+    def test_coerces_non_string_fields(self):
+        # defensive str()-coercion against future return-shape drift
+        out = hook.format_crystal_recall([{"name": None, "explanation": 42, "level": "x"}])
+        assert "pattern" in out  # name=None → "pattern" fallback
+
+
 # The substrate-neutral germination surface MUST stay byte-identical between the
 # shared (Claude Code) hooks and the Codex adapter's copy. The two drifted once —
 # Slice 2 wired germination into the shared copy only; the Codex copy was a wrap
@@ -210,6 +295,8 @@ _PORTED_FNS = (
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
+    # crystallized-pattern recall surface — byte-identical across both copies
+    "crystal_recall", "format_crystal_recall",
 )
 
 
@@ -244,6 +331,16 @@ class TestCodexParity:
             _spore(id="b", germination="growing"),
         ]
         assert {s["id"] for s in codex_hook.due_dormant_spores(spores)} == {"a"}
+
+    def test_codex_crystal_surface_works(self, monkeypatch):
+        # the Codex copy actually imports + runs the crystal surface (guards a
+        # codex-only import/typo that source-identity alone wouldn't catch).
+        monkeypatch.setattr(
+            codex_hook, "_anneal_json",
+            lambda *a, **k: [{"name": "p", "level": 3, "explanation": "e"}])
+        out = codex_hook.crystal_recall("touches p")
+        assert out and out[0]["name"] == "p"
+        assert "p" in codex_hook.format_crystal_recall(out)
 
 
 class TestCompatDrift:

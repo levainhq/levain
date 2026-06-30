@@ -80,17 +80,27 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # version's manifest entries. Invariant (release-gate, test-locked): must be
 # <= KNOWN_GOOD_ANNEAL — you cannot reconcile templates to a version you don't ship.
 #
-# Capped at 0.4.8 (the last entry before the crystal tier): the seed now carries
-# the spores boundary (0.4.7), the `levain update` upgrade habit (0.4.7), and the
-# co-citation/linkgate discipline (0.8.3) — BUT the apparatus (L1+L2) caught that
-# the crystal-tier entries 0.7.1 (AM-CRYSTAL) + 0.8.2 (AM-MCP-CRYSTAL) are NOT
-# genuinely reconciled: the activation hook never fires crystal recall (memory.md
-# line 7's "automatic per-turn crystal recall" is aspirational, not shipped), so
-# acking past them would silently suppress real guidance. They stay HONEST pending
-# advisories until the crystal-recall slice lands (wire the UserPromptSubmit hook
-# at the crystal tier + teach wrap-time crystallization routing), which raises this
-# to 0.8.3 — the linkgate guidance is already in place and rides up with it.
-TEMPLATES_RECONCILED_ANNEAL = "0.4.8"
+# Reconciled through 0.8.3 (spore-216 — the crystal-recall slice). The seed now
+# genuinely incorporates every migration entry through this version: the spores
+# boundary (0.4.7 AM-SPORES-BOUNDARY), the `levain update` upgrade habit (0.4.7
+# AM-MIGRATE-NOTIFY), the bare-path demotion fix (0.4.8 AM-PRESERVE-BARE-PATH — a
+# transparent engine fix, no template edit required), the crystallized-pattern tier
+# (0.7.1 AM-CRYSTAL) and its MCP read surface (0.8.2 AM-MCP-CRYSTAL) — memory.md
+# describes crystallize-OUT, per-turn recall, wrap-time crystallization routing, and
+# the `crystal_recall` / `crystal_index` tools, and the activation hook NOW fires
+# per-turn crystal recall (that hook gap was exactly what the apparatus caught at
+# the old 0.4.8 cap: the claim was aspirational because the hook never recalled) —
+# and the co-citation/linkgate discipline (0.8.3 AM-LINKGATE). A fresh `levain
+# doctor` therefore shows no pending drift for any entry AT OR BELOW this version;
+# an entry ABOVE the cap (e.g. AM-WRAP-GENERATED at 0.9.5, landing via spore-217)
+# stays HONESTLY pending until a follow-up reconciles its guidance into the seed and
+# raises the cap — never pre-acked here. A reviewed release-checklist assertion:
+# bump it only when the seed templates are reconciled to that version's manifest
+# entries; the manifest-driven coverage test
+# (test_seed_templates_carry_the_reconciled_guidance) locks each entry's guidance so
+# a future template edit that DROPS it — or a new at/below-cap entry left unmapped —
+# fails the suite instead of silently making the init-ack dishonest.
+TEMPLATES_RECONCILED_ANNEAL = "0.8.3"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).

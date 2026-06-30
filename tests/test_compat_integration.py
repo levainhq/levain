@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from anneal_memory import migration
 
 from levain import doctor, install, manifest
 from levain.manifest import CompatSet, InstalledSet
@@ -221,7 +222,8 @@ def test_record_compat_lock_skips_write_on_unknown(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# spore-216: templates reconciled -> a fresh install shows zero pending drift
+# spore-216: templates reconciled through 0.8.3 -> a fresh install's pending
+# drift drops to exactly the entries ABOVE the cap (uncovered, honestly surfaced)
 # --------------------------------------------------------------------------
 
 def test_templates_reconciled_constant_within_known_good():
@@ -232,25 +234,75 @@ def test_templates_reconciled_constant_within_known_good():
 
 
 def test_template_ack_target_caps_and_skips():
+    # Reconciled target when installed is at/above it; capped at installed when
+    # older; skipped when unknown. Exercises the 0.8.3 boundary explicitly.
     assert manifest.template_ack_target("0.9.5") == manifest.TEMPLATES_RECONCILED_ANNEAL
-    assert manifest.template_ack_target("0.4.0") == "0.4.0"   # installed older than reconciled -> cap at installed
+    assert manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL) == \
+        manifest.TEMPLATES_RECONCILED_ANNEAL                  # exactly at the cap -> the cap
+    assert manifest.template_ack_target("0.8.2") == "0.8.2"   # just below the cap -> cap at installed
+    assert manifest.template_ack_target("0.4.0") == "0.4.0"   # well below -> cap at installed
     assert manifest.template_ack_target(None) is None         # unknown -> skip the ack
 
 
+# Per-MANIFEST-ENTRY coverage sentinels: feature-code → a literal string that MUST
+# appear in the seed templates, proving that entry's guidance landed. Keyed by
+# `feature` (unique per entry) because two entries share version 0.4.7 — a
+# version-keyed map could not hold both.
+_COVERAGE_SENTINELS = {
+    "AM-SPORES-BOUNDARY": "spore_add",                  # the prospective-layer tools
+    "AM-MIGRATE-NOTIFY": "levain update",               # the upgrade habit
+    "AM-CRYSTAL": "crystallization candidates",         # crystallize-OUT routing
+    "AM-MCP-CRYSTAL": "crystal_recall",                 # the MCP read surface
+    "AM-LINKGATE": "Co-citing 2+ episodes",             # co-citation, not single-id
+}
+# EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
+# sentinel" is a reviewed decision rather than an omission. (0.4.8 AM-PRESERVE-BARE-
+# PATH is a transparent engine fix — its own manifest suggested_edit says so.)
+_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH"}
+
+
 def test_seed_templates_carry_the_reconciled_guidance():
-    # TEMPLATES_RECONCILED_ANNEAL asserts the seed templates incorporate the
-    # migrate-manifest guidance through that version. Lock the two reconciled gaps
-    # (spore-216) so a future template edit that DROPS them fails here — forcing a
-    # re-review of the constant instead of silently making the init-ack dishonest.
-    memory_md = (
-        Path(install.__file__).parent / "templates" / "seed" / "memory.md"
-    ).read_text(encoding="utf-8")
-    # AM-LINKGATE (0.8.3): co-citation guidance, not a bare single-id example.
-    assert "Co-citing 2+ episodes" in memory_md
-    assert "[evidence: <id1>, <id2>" in memory_md
-    # AM-MIGRATE-NOTIFY (0.4.7): the levain-native upgrade habit.
-    assert "## On upgrade" in memory_md
-    assert "levain update" in memory_md
+    # Manifest-DRIVEN coverage (spore-216 L1 finding): TEMPLATES_RECONCILED_ANNEAL
+    # asserts the seed templates incorporate the migration-manifest guidance through
+    # that version. Iterate the MANIFEST ITSELF — for every entry at/below the
+    # reconciled cap, assert a per-entry coverage sentinel (or an explicit no-edit
+    # allowlist). A future template edit that DROPS any covered guidance, OR a new
+    # manifest entry reconciled-but-unmapped, fails HERE — instead of silently
+    # making the init-ack dishonest.
+    seed_dir = Path(install.__file__).parent / "templates" / "seed"
+    seed_text = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in sorted(seed_dir.rglob("*")) if p.is_file()
+    )
+    reconciled = manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL)
+
+    checked = 0
+    for entry in migration.MIGRATION_MANIFEST:
+        if manifest.version_tuple(entry["version"]) > reconciled:
+            continue  # past the cap — not claimed as covered, no sentinel required
+        feature = entry["feature"]
+        if feature in _NO_EDIT_REQUIRED:
+            continue
+        sentinel = _COVERAGE_SENTINELS.get(feature)
+        assert sentinel is not None, (
+            f"{feature} (v{entry['version']}) is reconciled (<= "
+            f"{manifest.TEMPLATES_RECONCILED_ANNEAL}) but has no coverage sentinel "
+            f"or no-edit allowlist entry — add its guidance + a sentinel here, or "
+            f"allowlist it as no-edit-required."
+        )
+        assert sentinel in seed_text, (
+            f"{feature} (v{entry['version']}) guidance missing from the seed "
+            f"templates — sentinel {sentinel!r} not found. The init-ack would "
+            f"silently suppress this proposal; restore the guidance or lower "
+            f"TEMPLATES_RECONCILED_ANNEAL."
+        )
+        checked += 1
+    # Non-vacuous: at the 0.8.3 cap we exercise spores + migrate-notify + crystal +
+    # mcp-crystal + linkgate (0.4.8 is allowlisted).
+    assert checked >= 5
+
+    # The linkgate example is co-citation, not a bare single-id (AM-LINKGATE detail).
+    assert "[evidence: <id1>, <id2>" in seed_text
 
 
 @pytest.mark.skipif(
@@ -261,10 +313,15 @@ def test_seed_templates_carry_the_reconciled_guidance():
 )
 def test_fresh_install_acks_the_covered_entries(tmp_path):
     # After `_record_compat_lock` on a fresh store, anneal's own `migrate check`
-    # drops the entries the seed templates cover (acked through the reconciled
-    # version). At the current 0.4.8 cap that clears the spores + migrate-notify +
-    # bare-path entries; the crystal-tier entries (0.7.1/0.8.2) + linkgate (0.8.3)
-    # stay HONEST pending until the crystal-recall slice raises the cap to 0.8.3.
+    # drops exactly the entries the seed templates cover (acked through the
+    # reconciled cap). What stays pending is exactly the manifest entries ABOVE the
+    # cap but <= the installed anneal — the entries the seed honestly does NOT yet
+    # reconcile. We compute that expected count from the LIVE manifest so this stays
+    # correct as anneal ships entries above the cap (e.g. AM-WRAP-GENERATED at 0.9.5,
+    # spore-217): then this asserts 1, not a brittle 0. (A bare `== 0` was the
+    # off-by-one — it only held while the installed manifest topped out at the cap;
+    # codex/L3 + L1 caught it.) The cap is NOT raised to clear that pending — that
+    # would require the seed to actually reconcile the above-cap entry first.
     store = tmp_path / ".levain" / "memory.db"
     store.parent.mkdir(parents=True)
     ap = shutil.which("anneal-memory") or "anneal-memory"
@@ -277,8 +334,13 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
     assert before.pending_count and before.pending_count > 0  # fresh store: all pending
     install._record_compat_lock(tmp_path, store, ap, emit=lambda _l: None)
     after = manifest.discover_installed_set(store, ap)
-    # The ack REDUCED pending (covered entries cleared) but did not zero it (crystal
-    # deferred) — honest: never suppresses an uncovered proposal.
-    assert after.pending_count is not None
-    assert 0 < after.pending_count < before.pending_count
+    # Honest expected pending = manifest entries strictly above the reconciled cap
+    # but <= the installed anneal version (these are uncovered by construction).
+    reconciled_t = manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL)
+    installed_t = manifest.version_tuple(after.anneal) if after.anneal else reconciled_t
+    expected_pending = sum(
+        1 for e in migration.MIGRATION_MANIFEST
+        if reconciled_t < manifest.version_tuple(e["version"]) <= installed_t
+    )
+    assert after.pending_count == expected_pending
     assert after.migrate_acked == manifest.TEMPLATES_RECONCILED_ANNEAL
