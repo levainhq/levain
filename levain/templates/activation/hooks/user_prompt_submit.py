@@ -51,6 +51,7 @@ WRAP_NUDGE_THRESHOLD = 12
 # it fires once per session and is not latency-sensitive.)
 WRAP_CHECK_TIMEOUT = 2.0
 SPORE_CHECK_TIMEOUT = 2.0
+CRYSTAL_CHECK_TIMEOUT = 2.0
 
 
 def main() -> int:
@@ -84,6 +85,17 @@ def main() -> int:
             )
             if hits:
                 sections.append(hook.format_spore_collisions(hits))
+
+        # Crystallized-pattern recall — the on-demand graduated-wisdom tier.
+        # A Proven pattern crystallized OUT of the always-loaded working set is
+        # recalled here the moment this prompt touches its domain (the read-side
+        # twin of wrap-time crystallization routing). Independent of the spore
+        # surface above; fail-silent on an empty/absent crystal store. Same tight
+        # per-prompt timeout.
+        if isinstance(prompt, str) and prompt.strip():
+            patterns = hook.crystal_recall(prompt, timeout=CRYSTAL_CHECK_TIMEOUT)
+            if patterns:
+                sections.append(hook.format_crystal_recall(patterns))
 
         # Layer D — ambient nudge. Independent of the sections above.
         n = hook.episodes_since_wrap(timeout=WRAP_CHECK_TIMEOUT)

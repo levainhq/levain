@@ -271,9 +271,11 @@ def _record_compat_lock(
     current adopter genuinely has nothing to review through that version, and
     acking it does NOT suppress a real proposal. (This is the spore-216 reconcile
     of the spore-213 default: before the templates carried the migrate-notify /
-    linkgate guidance, NOT acking was the honest call; now that they do, acking
-    to the reconciled version is — and it gives a fresh adopter a clean `doctor`
-    instead of a wall of already-incorporated proposals.) The ack is ADVANCE-ONLY
+    crystal / linkgate guidance — and before the activation hook actually fired
+    per-turn crystal recall — NOT acking was the honest call; now that they do,
+    acking to the reconciled version is — and it gives a fresh adopter a clean
+    `doctor` instead of a wall of already-incorporated proposals.) The ack is
+    ADVANCE-ONLY
     (never lowers a `--force` re-install's existing higher ack) and CAPPED at the
     installed anneal; a newer anneal feature past the reconciled version still
     surfaces.
