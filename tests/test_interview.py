@@ -913,7 +913,7 @@ def test_real_origin_template_entity_fields_have_guidance(tmp_path: Path):
     # The shipped origin.md preamble now explains SUBSTRATE + JOB (gate feedback).
     from levain.install import open_init_templates
 
-    with open_init_templates() as (_tr, specs):
+    with open_init_templates() as (_tr, specs, _vb):
         plan = build_field_plan(specs)
     by = {f.slot: f for f in plan}
     assert "substrate" in by["SUBSTRATE"].guidance.lower()
@@ -926,7 +926,7 @@ def test_real_world_template_is_second_person(tmp_path: Path):
     # Gate feedback: the operator sections address the operator as "you", not "they".
     from levain.install import open_init_templates
 
-    with open_init_templates() as (_tr, specs):
+    with open_init_templates() as (_tr, specs, _vb):
         plan = build_field_plan(specs)
     by = {f.slot: f for f in plan}
     # the section header was renamed They→You

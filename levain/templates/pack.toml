@@ -1,0 +1,14 @@
+# Levain base templates — pack #0.
+#
+# The base pack the installer always resolves first; domain/role packs layer on
+# top (higher `order` wins on filename collision). See levain/packs.py.
+#
+# `render` is the ORDERED interview sequence — the files the scripted interview
+# fills. Every other seed/*.md (partnership, memory, spore_instructions,
+# continuity, README) is copied byte-exact. Render-vs-verbatim is an authored
+# decision, not inferable from content (README.md / continuity.md carry
+# placeholders yet must be copied verbatim).
+
+name = "levain-base"
+order = 0
+render = ["world.md", "origin.md"]

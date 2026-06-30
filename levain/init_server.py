@@ -223,7 +223,7 @@ class _InitHandler(BaseHTTPRequestHandler):
         adapter choices, the FIXED install path + force flag, and the live
         target-dir status the form warns on. Pure read — parses the packaged
         templates; writes nothing."""
-        with open_init_templates() as (_templates_root, specs):
+        with open_init_templates() as (_templates_root, specs, _verbatim):
             fields = build_field_plan(specs)
         payload = {
             "fields": [asdict(f) for f in fields],
@@ -367,7 +367,7 @@ class _InitHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with open_init_templates() as (templates_root, specs):
+            with open_init_templates() as (templates_root, specs, verbatim):
                 # Drive validation from the shared field plan: render_template
                 # silently renders a MISSING slot to "" and ignores an UNKNOWN one,
                 # so reject any answer key that isn't a real slot at the boundary
@@ -403,6 +403,7 @@ class _InitHandler(BaseHTTPRequestHandler):
                     self.server.python_path,
                     self.server.anneal_path,
                     specs,
+                    verbatim,
                     emit=messages.append,
                 )
                 store = install / ".levain" / "memory.db"
