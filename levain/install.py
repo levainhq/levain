@@ -36,7 +36,13 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from levain.packs import PackError, discover_roster, render_entries, verbatim_names
+from levain.packs import (
+    PackError,
+    SeedEntry,
+    compose_roster,
+    render_entries,
+    verbatim_entries,
+)
 
 if TYPE_CHECKING:
     from levain.interview import TemplateSpec
@@ -63,10 +69,15 @@ class InitResult:
         return self.store_ok
 
 
-def run_init(path: Path, adapter: str | None, force: bool) -> int:
+def run_init(
+    path: Path, adapter: str | None, force: bool, packs: list[Path] | None = None
+) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
     install = Path(str(path)).expanduser().resolve()
+    # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved
+    # the same way as --path; a bad pack dir / missing pack.toml fails loud below.
+    pack_dirs = [Path(str(p)).expanduser().resolve() for p in (packs or [])]
 
     try:
         chosen = _resolve_adapter(adapter)
@@ -129,12 +140,12 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             return 1
 
         try:
-            roster = discover_roster(templates_root)
+            roster = compose_roster([templates_root, *pack_dirs])
         except PackError as e:
             print(f"FAIL: {e}")
             return 1
         render_specs = [parse_template(entry.path) for entry in render_entries(roster)]
-        verbatim = verbatim_names(roster)
+        verbatim = verbatim_entries(roster)
 
         rendered_names = ", ".join(s.path.name for s in render_specs)
         print("=" * 60)
@@ -203,13 +214,14 @@ def apply_init(
     python_path: str,
     anneal_path: str,
     specs: list[TemplateSpec],
-    verbatim: Sequence[str],
+    verbatim: Sequence[SeedEntry],
     emit: Callable[[str], None] = print,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
-    `answers`, copy the verbatim seed files, install the adapter, and initialize
-    the store. Returns an `InitResult` carrying the store-init success flag (plus
-    the install/adapter, so the result is self-describing).
+    `answers`, copy the verbatim seed files (each from its winning layer's source
+    path), install the adapter, and initialize the store. Returns an `InitResult`
+    carrying the store-init success flag (plus the install/adapter, so the result
+    is self-describing).
 
     `emit` is the progress/remediation sink threaded through the write steps
     (adapter-install notices, backup warnings, store-init remediation). It
@@ -230,9 +242,11 @@ def apply_init(
 
     `specs` is the list of templates to RENDER (the roster's render entries,
     parsed by the caller); each is written to `install/seed/<spec.path.name>`.
-    `verbatim` is the list of non-rendered seed filenames to copy byte-exact.
-    Both derive from one `packs.discover_roster` call in the caller, so render
-    and verbatim are the same partition the interview/form was built from.
+    `verbatim` is the list of non-rendered seed ENTRIES (name + source path) to
+    copy byte-exact — each copied from its own `entry.path`, so a layered pack's
+    verbatim file copies from the pack, not a reconstructed base path. Both derive
+    from one `packs.compose_roster` call in the caller, so render and verbatim are
+    the same partition the interview/form was built from.
 
     MUST be called inside a live `_templates_root()` context: the render/copy/
     adapter steps read from `templates_root`, which a zipped distribution
@@ -251,10 +265,10 @@ def apply_init(
             render_template(spec, answers), encoding="utf-8"
         )
 
-    for f in verbatim:
-        src = templates_root / "seed" / f
-        if src.is_file():
-            shutil.copy2(src, install_seed / f)
+    for entry in verbatim:
+        # No is_file() guard: a vanished source (TOCTOU) is a hard failure that
+        # must surface, not silently yield an install missing a seed file.
+        shutil.copy2(entry.path, install_seed / entry.name)
 
     _install_adapter(chosen, install, templates_root, python_path, anneal_path, emit=emit)
 
@@ -483,18 +497,19 @@ class InitError(Exception):
 
 
 @contextmanager
-def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[str]]]:
+def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[SeedEntry]]]:
     """Yield ``(templates_root, render_specs, verbatim)`` for an init run.
 
     The shared templates-context + corruption preflight + roster resolution, so a
     SECOND init surface (the web POST) doesn't re-implement the ``with
     _templates_root()`` block, the missing-template check, and the roster
     discovery that ``run_init`` does inline. ``render_specs`` are the parsed
-    interview templates; ``verbatim`` is the list of non-rendered seed filenames
-    ``apply_init`` copies. MUST be consumed inside the ``with`` (the materialized
-    tempdir under a zipped distribution is cleaned up on exit, and ``apply_init``
-    reads from ``templates_root``). Raises ``InitError`` (with a ready-to-surface
-    ``.message``) if the packaged templates are missing/corrupt.
+    interview templates; ``verbatim`` is the list of non-rendered seed ENTRIES
+    ``apply_init`` copies. The web onboarding path is base-only (no pack layers);
+    pack composition is a CLI capability. MUST be consumed inside the ``with``
+    (the materialized tempdir under a zipped distribution is cleaned up on exit,
+    and ``apply_init`` reads from ``templates_root``). Raises ``InitError`` (with
+    a ready-to-surface ``.message``) if the packaged templates are missing/corrupt.
     """
     from levain.interview import parse_template
 
@@ -506,11 +521,11 @@ def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[str]]
                 f"`pip install --force-reinstall levain`."
             )
         try:
-            roster = discover_roster(templates_root)
+            roster = compose_roster([templates_root])
         except PackError as e:
             raise InitError(str(e)) from e
         specs = [parse_template(entry.path) for entry in render_entries(roster)]
-        verbatim = verbatim_names(roster)
+        verbatim = verbatim_entries(roster)
         yield templates_root, specs, verbatim
 
 

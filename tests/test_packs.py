@@ -16,6 +16,7 @@ import pytest
 from levain.install import _templates_root
 from levain.packs import (
     PackError,
+    compose_roster,
     discover_roster,
     load_pack_manifest,
     render_entries,
@@ -34,6 +35,7 @@ BASE_VERBATIM = {
 
 
 def _write_pack(root: Path, toml: str, seed_files: dict[str, str]) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
     (root / "pack.toml").write_text(toml, encoding="utf-8")
     seed = root / "seed"
     seed.mkdir()
@@ -187,3 +189,120 @@ def test_discover_roster_rejects_non_md_seed_file(tmp_path: Path):
     (tmp_path / "seed" / "logo.png").write_bytes(b"\x89PNG\r\n")
     with pytest.raises(PackError, match=r"only \.md"):
         discover_roster(tmp_path)
+
+
+# ---------- multi-layer composition (Slice 2) ----------
+
+def test_compose_single_layer_reproduces_base_partition():
+    # compose_roster([base]) — the single-layer path — must reproduce the base
+    # partition against INDEPENDENT literals. (Asserting it equals discover_roster
+    # would be tautological: discover_roster IS compose_roster([dir]).)
+    with _templates_root() as tr:
+        roster = compose_roster([tr])
+    assert [e.name for e in render_entries(roster)] == BASE_RENDER
+    assert set(verbatim_names(roster)) == BASE_VERBATIM
+
+
+def test_compose_empty_raises():
+    with pytest.raises(PackError, match="at least one pack layer"):
+        compose_roster([])
+
+
+def test_compose_unions_new_files(tmp_path: Path):
+    base = _write_pack(tmp_path / "base", 'name = "base"\norder = 0\nrender = ["world.md"]\n',
+                       {"world.md": "{{X}}", "partnership.md": "P"})
+    dom = _write_pack(tmp_path / "dom", 'name = "dom"\norder = 10\n',
+                      {"audit.md": "doctrine", "sizing.md": "doctrine"})
+    roster = compose_roster([base, dom])
+    assert {e.name for e in roster} == {"world.md", "partnership.md", "audit.md", "sizing.md"}
+    assert [e.name for e in render_entries(roster)] == ["world.md"]
+    assert set(verbatim_names(roster)) == {"partnership.md", "audit.md", "sizing.md"}
+
+
+def test_compose_last_layer_wins_by_filename(tmp_path: Path):
+    base = _write_pack(tmp_path / "base", 'name = "base"\norder = 0\n', {"world.md": "BASE"})
+    over = _write_pack(tmp_path / "over", 'name = "over"\norder = 10\n', {"world.md": "OVERRIDE"})
+    roster = compose_roster([base, over])
+    entry = next(e for e in roster if e.name == "world.md")
+    assert entry.path.read_text() == "OVERRIDE"
+
+
+def test_compose_precedence_by_order_not_arg_order(tmp_path: Path):
+    lo = _write_pack(tmp_path / "lo", 'name = "lo"\norder = 10\n', {"x.md": "LO"})
+    hi = _write_pack(tmp_path / "hi", 'name = "hi"\norder = 20\n', {"x.md": "HI"})
+    for args in ([lo, hi], [hi, lo]):
+        entry = next(e for e in compose_roster(args) if e.name == "x.md")
+        assert entry.path.read_text() == "HI"
+
+
+def test_compose_render_order_base_first_then_pack(tmp_path: Path):
+    base = _write_pack(
+        tmp_path / "base",
+        'name = "base"\norder = 0\nrender = ["world.md", "origin.md"]\n',
+        {"world.md": "{{A}}", "origin.md": "{{B}}"},
+    )
+    role = _write_pack(tmp_path / "role", 'name = "role"\norder = 20\nrender = ["queue.md"]\n',
+                       {"queue.md": "{{C}}"})
+    roster = compose_roster([base, role])
+    assert [e.name for e in render_entries(roster)] == ["world.md", "origin.md", "queue.md"]
+
+
+def test_compose_verbatim_override_of_render_file_becomes_verbatim(tmp_path: Path):
+    # The documented footgun: overriding a render file WITHOUT re-listing it in
+    # the override's `render` ships it verbatim (with unfilled placeholders).
+    base = _write_pack(tmp_path / "base", 'name = "base"\norder = 0\nrender = ["world.md"]\n',
+                       {"world.md": "{{X}}"})
+    over = _write_pack(tmp_path / "over", 'name = "over"\norder = 10\n',
+                       {"world.md": "static override"})
+    entry = next(e for e in compose_roster([base, over]) if e.name == "world.md")
+    assert entry.mode == "verbatim"
+    assert entry.path.read_text() == "static override"
+
+
+def test_scan_seed_layer_unreadable_dir_raises_packerror(tmp_path: Path, monkeypatch):
+    # An OSError reading seed/ must surface as PackError, so run_init's clean
+    # FAIL: path catches it instead of an unhandled traceback (codex L3 LOW).
+    _write_pack(tmp_path, 'name = "p"\n', {"a.md": "x"})
+
+    def boom(self, pattern):  # noqa: ANN001
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "glob", boom)
+    with pytest.raises(PackError, match="could not read"):
+        discover_roster(tmp_path)
+
+
+def test_compose_render_override_relisted_stays_render(tmp_path: Path):
+    base = _write_pack(tmp_path / "base", 'name = "base"\norder = 0\nrender = ["world.md"]\n',
+                       {"world.md": "{{X}}"})
+    over = _write_pack(tmp_path / "over", 'name = "over"\norder = 10\nrender = ["world.md"]\n',
+                       {"world.md": "{{Y}} override"})
+    entry = next(e for e in compose_roster([base, over]) if e.name == "world.md")
+    assert entry.mode == "render"
+    assert entry.path.read_text() == "{{Y}} override"
+
+
+def test_compose_same_order_tie_is_deterministic_arg_order_last_wins(tmp_path: Path):
+    # Equal `order`: the stable sort preserves arg order, so the LATER pack wins a
+    # filename collision. Pin it — a regression to an unstable sort would slip.
+    a = _write_pack(tmp_path / "a", 'name = "a"\norder = 5\n', {"x.md": "A"})
+    b = _write_pack(tmp_path / "b", 'name = "b"\norder = 5\n', {"x.md": "B"})
+    entry = next(e for e in compose_roster([a, b]) if e.name == "x.md")
+    assert entry.path.read_text() == "B"
+
+
+def test_compose_render_override_keeps_base_interview_position(tmp_path: Path):
+    # A pack overrides + re-lists a base render file: CONTENT comes from the pack
+    # but the interview POSITION stays where base put it (first-appearance order).
+    # Overriding content must not reorder the interview.
+    base = _write_pack(
+        tmp_path / "base",
+        'name = "base"\norder = 0\nrender = ["world.md", "origin.md"]\n',
+        {"world.md": "{{A}}", "origin.md": "{{B}}"},
+    )
+    over = _write_pack(tmp_path / "over", 'name = "over"\norder = 10\nrender = ["world.md"]\n',
+                       {"world.md": "{{A}} override"})
+    roster = compose_roster([base, over])
+    assert [e.name for e in render_entries(roster)] == ["world.md", "origin.md"]
+    world = next(e for e in roster if e.name == "world.md")
+    assert world.path.read_text() == "{{A}} override"

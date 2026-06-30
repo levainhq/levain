@@ -107,23 +107,19 @@ def load_pack_manifest(pack_dir: Path) -> PackManifest:
     return PackManifest(name=name, order=order, render=tuple(render_raw))
 
 
-def discover_roster(pack_dir: Path) -> list[SeedEntry]:
-    """Resolve the seed roster of a single pack-layer.
+def _scan_seed_layer(pack_dir: Path, manifest: PackManifest) -> dict[str, Path]:
+    """Validate one layer's ``seed/`` and index it ``{filename: path}``.
 
-    Returns the RENDER entries first, in the manifest's declared ``render`` order
-    (that order IS the interview sequence — never glob order, which would flip
-    e.g. world.md/origin.md), then the VERBATIM entries sorted by filename (a
-    stable, deterministic order; verbatim files are copied independently so order
-    is non-behavioral). A ``render`` entry with no matching ``seed/<name>`` is a
-    :class:`PackError` (the declaration outran the files). Only ``.md`` seed
-    files are supported — a non-.md file in ``seed/`` raises rather than being
-    silently dropped (the honesty floor)."""
-    manifest = load_pack_manifest(pack_dir)
+    Honesty floor: a missing ``seed/`` directory, a non-.md asset (which would
+    otherwise be silently dropped), or a ``render`` entry naming a file the layer
+    does not provide all raise :class:`PackError`."""
     seed_dir = pack_dir / "seed"
     if not seed_dir.is_dir():
         raise PackError(f"pack {manifest.name!r}: seed directory not found at {seed_dir}")
-
-    files = [f for f in seed_dir.glob("*") if f.is_file()]
+    try:
+        files = [f for f in seed_dir.glob("*") if f.is_file()]
+    except OSError as e:
+        raise PackError(f"pack {manifest.name!r}: could not read {seed_dir}: {e}") from e
     non_md = sorted(f.name for f in files if f.suffix != ".md")
     if non_md:
         raise PackError(
@@ -132,23 +128,72 @@ def discover_roster(pack_dir: Path) -> list[SeedEntry]:
             f"dropped from the install)."
         )
     by_name = {f.name: f for f in files}
-
-    entries: list[SeedEntry] = []
     for name in manifest.render:
-        src = by_name.get(name)
-        if src is None:
+        if name not in by_name:
             raise PackError(
                 f"pack {manifest.name!r}: render lists {name!r} but seed/{name} is missing"
             )
-        entries.append(SeedEntry(name=name, path=src, mode="render"))
+    return by_name
 
-    rendered = {e.name for e in entries}
-    for name in sorted(by_name):
-        if name in rendered:
-            continue
-        entries.append(SeedEntry(name=name, path=by_name[name], mode="verbatim"))
 
-    return entries
+def compose_roster(pack_dirs: Sequence[Path]) -> list[SeedEntry]:
+    """Compose an ordered STACK of pack-layers into one seed roster.
+
+    Each entry of ``pack_dirs`` is a pack-layer directory (``pack.toml`` +
+    ``seed/``). Layers are sorted by manifest ``order`` ascending (the base pack,
+    ``order = 0``, comes first); the LAST layer providing a filename WINS
+    (override). A file's render-vs-verbatim mode and its interview position
+    follow its winning layer's manifest — so a layer overriding a render file
+    (e.g. ``world.md``) must RE-LIST it in its own ``render`` to keep it rendered,
+    else the override ships verbatim with unfilled ``{{...}}`` placeholders.
+
+    Render entries come first, ordered by each render file's FIRST appearance
+    (layer rank, then position in that layer's ``render`` list) — so base render
+    files keep their interview order, a pack's new render files append after, and
+    overriding a render file's CONTENT does not reorder the interview. Verbatim
+    entries follow, sorted by filename (non-behavioral — each is copied
+    independently)."""
+    if not pack_dirs:
+        raise PackError("compose_roster requires at least one pack layer")
+    loaded = sorted(
+        [(d, load_pack_manifest(d)) for d in pack_dirs],
+        key=lambda dm: dm[1].order,
+    )
+
+    winning_path: dict[str, Path] = {}
+    is_render: dict[str, bool] = {}
+    sort_key: dict[str, tuple[int, int]] = {}  # (layer rank, render position) — render files only
+    for rank, (pack_dir, manifest) in enumerate(loaded):
+        by_name = _scan_seed_layer(pack_dir, manifest)
+        render_index = {name: i for i, name in enumerate(manifest.render)}
+        for name, path in by_name.items():
+            winning_path[name] = path
+            if name in render_index:
+                is_render[name] = True
+                # setdefault = FIRST render appearance keeps the interview position
+                # stable: overriding a render file's CONTENT does not reorder the
+                # interview (a base render file stays where base put it).
+                sort_key.setdefault(name, (rank, render_index[name]))
+            else:
+                is_render[name] = False
+                sort_key.pop(name, None)  # a verbatim override of a prior layer's render file
+
+    render_names = sorted((n for n in winning_path if is_render[n]), key=lambda n: sort_key[n])
+    verbatim = sorted(n for n in winning_path if not is_render[n])
+    return (
+        [SeedEntry(name=n, path=winning_path[n], mode="render") for n in render_names]
+        + [SeedEntry(name=n, path=winning_path[n], mode="verbatim") for n in verbatim]
+    )
+
+
+def discover_roster(pack_dir: Path) -> list[SeedEntry]:
+    """Resolve the seed roster of a SINGLE pack-layer — the base case of
+    :func:`compose_roster`. Render entries in the manifest's declared ``render``
+    order (the interview sequence — never glob order, which would flip
+    world.md/origin.md), then verbatim entries sorted by filename. A ``render``
+    entry with no matching ``seed/<name>`` raises; only ``.md`` seed files are
+    supported (a non-.md file raises rather than being silently dropped)."""
+    return compose_roster([pack_dir])
 
 
 def render_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
@@ -156,6 +201,13 @@ def render_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     return [e for e in roster if e.is_render]
 
 
+def verbatim_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
+    """The verbatim-mode entries (name + winning-layer source path), in roster
+    order. Carries the source path so a copy reads from the file's WINNING layer
+    (which may be a pack), not a reconstructed base path."""
+    return [e for e in roster if not e.is_render]
+
+
 def verbatim_names(roster: Sequence[SeedEntry]) -> list[str]:
     """The verbatim-mode filenames, in roster order."""
-    return [e.name for e in roster if not e.is_render]
+    return [e.name for e in verbatim_entries(roster)]
