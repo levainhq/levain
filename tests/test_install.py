@@ -28,6 +28,7 @@ from levain.install import (
     _templates_root,
     apply_init,
 )
+from levain.packs import SeedEntry, compose_roster, render_entries, verbatim_entries
 
 
 # ---------- _templates_root context manager ----------
@@ -759,7 +760,11 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
         result = apply_init(
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
-            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
+            [
+                SeedEntry(n, templates_root / "seed" / n, "verbatim")
+                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                          "continuity.md", "README.md")
+            ],
         )
         # "Verbatim" means byte-identical to the template source — pin it.
         src_partnership = (templates_root / "seed" / "partnership.md").read_bytes()
@@ -802,7 +807,11 @@ def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
         result = apply_init(
             install, "claude-code", {}, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
-            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
+            [
+                SeedEntry(n, templates_root / "seed" / n, "verbatim")
+                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                          "continuity.md", "README.md")
+            ],
         )
     assert result.store_ok is False
     assert result.complete is False
@@ -839,7 +848,11 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
         result = apply_init(
             install, "codex", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
-            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
+            [
+                SeedEntry(n, templates_root / "seed" / n, "verbatim")
+                for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                          "continuity.md", "README.md")
+            ],
         )
 
     assert result.store_ok is True
@@ -863,7 +876,6 @@ def test_roster_to_apply_init_produces_byte_identical_seed(tmp_path: Path, monke
     test makes the byte-identity claim self-contained, so the exact regression
     this roster refactor must never reintroduce is locked in a single place."""
     from levain.interview import build_field_plan, parse_template
-    from levain.packs import discover_roster, render_entries, verbatim_names
 
     class _OK:
         returncode = 0
@@ -875,9 +887,9 @@ def test_roster_to_apply_init_produces_byte_identical_seed(tmp_path: Path, monke
     install = tmp_path / "install"
     install.mkdir()
     with _templates_root() as templates_root:
-        roster = discover_roster(templates_root)
+        roster = compose_roster([templates_root])
         specs = [parse_template(e.path) for e in render_entries(roster)]
-        verbatim = verbatim_names(roster)
+        verbatim = verbatim_entries(roster)
         answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
         apply_init(
             install, "claude-code", answers, templates_root,
@@ -892,9 +904,114 @@ def test_roster_to_apply_init_produces_byte_identical_seed(tmp_path: Path, monke
     # full partition installed
     assert sorted(p.name for p in seed.glob("*.md")) == sorted(src)
     # verbatim files byte-identical to their template source
-    for name in verbatim:
-        assert (seed / name).read_bytes() == src[name], f"{name} not byte-identical"
+    for entry in verbatim:
+        assert (seed / entry.name).read_bytes() == src[entry.name], f"{entry.name} not byte-identical"
     # render files slot-filled, no leftover placeholders
     for entry in render_entries(roster):
         text = (seed / entry.name).read_text(encoding="utf-8")
         assert "{{" not in text and "VAL_" in text
+
+
+def test_apply_init_installs_layered_pack_files(tmp_path: Path, monkeypatch):
+    """Multi-root end-to-end (Slice 2): a pack-layer's verbatim file installs from
+    the PACK's path (not a reconstructed base path), and a pack override replaces
+    the base file's content. Proves apply_init copies each verbatim entry from its
+    winning layer."""
+    from levain.interview import build_field_plan, parse_template
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    # A pack that ADDS a verbatim file and OVERRIDES the base partnership.md.
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text('name = "dom"\norder = 10\n', encoding="utf-8")
+    (pack / "seed" / "audit_method.md").write_text("PRESSABLE AUDIT DOCTRINE\n", encoding="utf-8")
+    (pack / "seed" / "partnership.md").write_text("PACK PARTNERSHIP OVERRIDE\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root, pack])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+        )
+
+    seed = install / "seed"
+    # the pack's NEW verbatim file installed — copied from the pack, not base
+    assert (seed / "audit_method.md").read_text(encoding="utf-8") == "PRESSABLE AUDIT DOCTRINE\n"
+    # the pack OVERRODE the base partnership.md (last-layer-wins by filename)
+    assert (seed / "partnership.md").read_text(encoding="utf-8") == "PACK PARTNERSHIP OVERRIDE\n"
+    # base render files still present + filled
+    world = (seed / "world.md").read_text(encoding="utf-8")
+    assert "{{" not in world and "VAL_" in world
+
+
+def test_apply_init_renders_pack_overridden_template(tmp_path: Path, monkeypatch):
+    """A pack overriding (and re-listing) a base RENDER file: the installed,
+    rendered output comes from the PACK's template — proving render reads each
+    spec from its winning layer, not just the base templates."""
+    from levain.interview import build_field_plan, parse_template
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text(
+        'name = "dom"\norder = 10\nrender = ["world.md"]\n', encoding="utf-8"
+    )
+    (pack / "seed" / "world.md").write_text("PACK WORLD {{OPERATOR_NAME}}\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root, pack])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+        )
+
+    world = (install / "seed" / "world.md").read_text(encoding="utf-8")
+    assert "PACK WORLD" in world          # content from the pack's overriding template
+    assert "{{" not in world              # slots filled
+    assert "VAL_OPERATOR_NAME" in world
+
+
+def test_apply_init_raises_on_missing_verbatim_source(tmp_path: Path, monkeypatch):
+    """A verbatim entry whose source vanished must FAIL LOUD — never a silent
+    skip that yields an install missing a seed file (codex L3, Slice 2 MED)."""
+    from levain.interview import parse_template
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        specs = [parse_template(templates_root / "seed" / "world.md")]
+        bogus = [SeedEntry("ghost.md", tmp_path / "nope" / "ghost.md", "verbatim")]
+        with pytest.raises(FileNotFoundError):
+            apply_init(
+                install, "claude-code", {}, templates_root,
+                "/usr/bin/python3", "anneal-memory", specs, bogus,
+            )
