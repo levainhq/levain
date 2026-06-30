@@ -211,3 +211,68 @@ def verbatim_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
 def verbatim_names(roster: Sequence[SeedEntry]) -> list[str]:
     """The verbatim-mode filenames, in roster order."""
     return [e.name for e in verbatim_entries(roster)]
+
+
+# --- import classification: which seed files load as always-on harness context ---
+#
+# Orthogonal to render-vs-verbatim (the composition mode): a seed file is render
+# OR verbatim AND, separately, imported-as-context OR not. This is the canonical
+# seed import taxonomy — install.py renders the per-adapter import list from it,
+# and doctor.py's required-seed list points here (one source of truth).
+
+# Seed files that are NOT loaded as always-on harness context. EVERYTHING ELSE in
+# the roster IS imported — a pack's new methodology file loads by DEFAULT (fail
+# toward loading: a seed file that installs to disk but never reaches context is
+# the invisible-infrastructure failure the adapter import list exists to prevent).
+#   - continuity.md is the entity's living memory; it loads through the
+#     anneal-memory server (the ``anneal://continuity`` resource), not as a static
+#     context file. Importing it as static text would fork the memory surface.
+#   - README.md documents the seed directory for a human browsing it; it is not
+#     entity context.
+NON_IMPORT_SEED: tuple[str, ...] = ("continuity.md", "README.md")
+
+# The authored load ORDER of the base methodology-core seed files — the curriculum
+# sequence (who you are -> how we work -> who your operator is -> your memory ->
+# your open loops). This is an ORDER HINT, not a membership gate: an importable
+# seed file NOT named here (a pack's addition, or a future base file) still loads,
+# appended after these in roster order. Overriding one of these (same filename)
+# keeps its curriculum position.
+BASE_IMPORT_ORDER: tuple[str, ...] = (
+    "origin.md",
+    "partnership.md",
+    "world.md",
+    "memory.md",
+    "spore_instructions.md",
+)
+
+
+def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
+    """The seed entries that load as always-on harness context, in load order.
+
+    Membership: every roster seed file EXCEPT those in :data:`NON_IMPORT_SEED`
+    (continuity.md / README.md) — so a pack's new seed file imports by default.
+
+    Order: the :data:`BASE_IMPORT_ORDER` curriculum first (for the base files the
+    roster actually provides, each taken from its WINNING layer), then any other
+    importable file appended in roster order — so a pack's additions land after
+    the base curriculum. Override-stable: overriding a base file's CONTENT keeps
+    its curriculum position (the lookup is by filename, the entry is the winner)."""
+    by_name = {e.name: e for e in roster}
+    ordered: list[SeedEntry] = []
+    seen: set[str] = set()
+    for name in BASE_IMPORT_ORDER:
+        entry = by_name.get(name)
+        if entry is not None and name not in NON_IMPORT_SEED:
+            ordered.append(entry)
+            seen.add(name)
+    for entry in roster:
+        if entry.name in seen or entry.name in NON_IMPORT_SEED:
+            continue
+        ordered.append(entry)
+        seen.add(entry.name)
+    return ordered
+
+
+def import_names(roster: Sequence[SeedEntry]) -> list[str]:
+    """The importable seed filenames, in load order (see :func:`import_entries`)."""
+    return [e.name for e in import_entries(roster)]

@@ -125,6 +125,14 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     return 1 if failed or verify_rc != 0 else 0
 
 
+# The base-install REQUIRED-minimum seed set (a static check on an installed
+# dir). NOT the full seed taxonomy: the canonical seed classification — which
+# files load as harness context (the roster-driven adapter @import list) vs the
+# non-context files (continuity.md / README.md) — lives in `levain.packs`
+# (NON_IMPORT_SEED / BASE_IMPORT_ORDER / import_entries). A PACK extends the seed
+# set, so this fixed list checks only the base minimum; if doctor ever needs to
+# validate a pack-layered install's full import list it must read the installed
+# adapter file or a recorded roster, not grow this constant (Slice 3 deferral).
 _SEED_REQUIRED = ("origin.md", "partnership.md", "world.md", "memory.md")
 _SEED_EXPECTED = _SEED_REQUIRED + ("continuity.md", "README.md")
 _HOOK_REQUIRED = ("session_start.py", "user_prompt_submit.py", "_levain_hook.py")
