@@ -4,117 +4,146 @@
 
 ```
 pip install levain
-levain init
 ```
 
-**Heads-up before you scroll** — Levain v1 boundaries (kept honest):
+Levain gives your AI partner a memory that persists across sessions, and keeps that memory **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
 
-- **Harnesses:** Claude Code + Codex CLI at v1. One adapter per install (use two installs if you need both).
-- **Python:** 3.12+ required. The package uses `importlib.resources.as_file()` on a directory resource, which gained support in 3.12. v0.1.0 supported 3.11+ but only for filesystem installs; v0.1.1 bumps the floor to 3.12 and adds zipapp / PyInstaller / `pip install --target` into zip support.
-- **Web pane onboarding:** CLI interview at v1.0. Browser-based onboarding lands in v1.1.
-- **Codex hook reliability:** Codex 0.132/0.133 has a known platform-level hook-trust gap that no harness consumer can work around. `levain doctor` + `levain verify-hooks` surface the wiring; whether your Codex install actually fires the hooks is up to Codex itself ([upstream tracking issue](https://github.com/openai/codex/issues/17532)).
-- **Memory substrate:** anneal-memory (0.7.x) is the layer-1 dependency; pinned in `pyproject.toml`. It now carries the **crystallized-pattern tier** (on-demand graduated memory) — see *Dependencies* below.
+Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI.
 
 ---
 
 ## What this is
 
-If you've been working with an AI partner long enough to feel the session-amnesia problem — every conversation starts over, every insight has to be re-explained, the *quality* of the partnership keeps resetting — Levain is the kit you'd otherwise build for yourself.
+If you've worked with an AI partner long enough to feel the session-amnesia problem — every conversation starts cold, every insight gets re-explained, the *quality* of the partnership keeps resetting — Levain is the kit you'd otherwise build for yourself.
 
 It packages four things that work together:
 
-1. **A Complementary Learning Systems memory substrate** via the `anneal-memory` library — four layers (episodic + continuity + Hebbian associations + limbic) plus two sibling stores: prospective **spores** (open loops that self-clean) and an on-demand **crystallized** pattern tier (proven, stable wisdom held *out* of always-loaded context and recalled on cue, so the working set stays bounded while earned wisdom keeps growing). Your partner's hippocampus, working memory, lateral connections, and long-term semantic store.
-2. **A methodology-core seed** — a small set of files defining who the entity is, how partnership works, how memory accrues, who its operator is.
-3. **An activation mechanism** — primacy-position posture + recency directives + session-boundary wrap discipline, wired through harness hooks.
-4. **A scripted onboarding interview** — `levain init` walks you through filling the seed templates so the entity is uniquely yours from session one.
+1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, an association graph that surfaces related memories on its own, and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and close themselves when they're done.
 
-The kit installs into a Claude Code or Codex CLI workspace. Both harnesses are tier-1 supported at v1.
+2. **A methodology-core seed.** A small, dense set of files defining who your partner is, how the partnership works, how memory accrues, and who you are to it. Written so your partner lives *inside* the method instead of pointing at it.
+
+3. **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
+
+4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, or a browser form with `--web`.
+
+The kit runs under Claude Code or Codex CLI. Both are first-class.
 
 ## Why a seed, not a finished methodology
 
-The load-bearing claim under the name *levain* (the sourdough starter you feed):
+The claim under the name *levain*, the sourdough starter you feed:
 
-**A grown cognitive-partnership methodology cannot be shipped as a methodology.** Hand someone the artifact and they get a fossil — text describing practices that don't accrete in their substrate. Practice-encoded knowledge transfers through use, not specification.
+**A grown cognitive-partnership methodology can't be shipped as a methodology.** Hand someone the finished artifact and they get a fossil. Text describing practices that never take root in their substrate. Practice-encoded knowledge transfers through use, not specification.
 
-So Levain ships the *engine that grows* a methodology: substrate + graduation mechanism + wrap discipline + reflection loop + minimal starting posture. Your own methodology accretes from your sessions. Which is why it sticks, and why it's yours.
+So Levain ships the *engine that grows* a methodology: the substrate, a graduation mechanism, a discipline for how sessions close, a reflection loop, a minimal starting posture. Your own methodology accretes from your own sessions. Which is why it sticks, and why it's yours. Run Levain and you will *not* end up with this operator's memory. Different texture, different graduated patterns, different shape.
 
-A separate operator running Levain will not end up with this operator's continuity — different texture, different graduated patterns, different shape. That's the point.
+## The proof
 
-## Proof
+See [`examples/accrual/growth_timeline.md`](https://github.com/levainhq/levain/blob/main/examples/accrual/growth_timeline.md) — one continuity file rendered at four points across five calendar months. It started at 96 lines and 6 sections, hit one architectural cliff between week 4 and week 12, locked into a 9-section shape, and has held that shape since while density grew inside it (96 → 549 lines, +3 sections total).
 
-See [`examples/accrual/growth_timeline.md`](examples/accrual/growth_timeline.md) — one continuity file rendered at four snapshots over five months. It started at 96 lines / 6 sections, locked into 9 sections around week 12, and has held that shape since while density grew inside it.
+Your week 1 will look like the first snapshot. That's the right starting place, not the last snapshot, which is what *this* partnership grew into. The trajectory is the proof; the endpoint is not the target.
 
-Your week 1 will look like the first snapshot. That's the right starting place — not the last snapshot, which is what this operator's partnership grew into. The trajectory is the proof; the endpoint is not the target.
+## What fires on its own
 
-## Install
+This is why Levain exists instead of just installing a memory library. Raw memory libraries quietly rot, because episodes pile up but you only recall what you happen to remember to query. A library can't fix that without hooking your session, and hooking every prompt would cost it the neutrality that lets it run under any harness. So that's the harness's job, and it's what Levain wires:
+
+- **Open loops surface on collision.** A relevant open loop drops into context the moment your prompt touches it.
+- **Crystallized patterns recall per turn.** Your proven, stable wisdom is held out of the always-loaded context and surfaced when what you're doing calls for it. Useful without clogging the window.
+
+The store is universal; the *firing* is the harness's job. (Under Codex there's a platform caveat on whether hooks fire at all — see *Boundaries, kept honest*. `levain verify-hooks` proves your wiring is correct regardless.)
+
+## Set it up
 
 ```
 pip install levain
-levain init
+levain init --path ./my-partner
 ```
 
-`levain init` runs the scripted interview, lays down the seed templates, registers the chosen adapter (Claude Code or Codex), and initializes the memory store at `.levain/memory.db`. One adapter per install at v1 — multi-adapter layering is a v1.1 candidate.
+This creates `./my-partner`, runs the interview, lays down the seed, registers the adapter you choose, initializes the store at `.levain/memory.db`, and records the exact version set it composed. Then open that directory with Claude Code or Codex and start working.
 
 ```
-levain init --path /path/to/install [--adapter claude-code|codex] [--force]
-levain doctor --path /path/to/install
-levain verify-hooks --path /path/to/install
+levain init                          # install into the current directory (must be empty)
+levain init --force                  # install into an existing workspace (backs up anything it touches)
+levain init --adapter claude-code    # or --adapter codex; prompts if omitted
+levain init --web                    # fill the same interview in a browser form, localhost only
 ```
 
-`levain doctor` is the loud in-environment health check — interpreter resolution, MCP server registration, store reachability, hook injection liveness.
+One adapter per install. To run both Claude Code and Codex, make two installs.
 
-`levain verify-hooks` actually invokes the activation hooks via stdin JSON and verifies they emit valid output. Closes the silent-skip class — particularly the Codex platform hook-reliability gap where the harness itself doesn't surface failures.
+## Keep it in sync — `doctor` and `update`
 
-## Inspect your substrate
+Levain composes a stack across two version lines that `pip` alone can't keep aligned: the `anneal-memory` library (versioned separately on PyPI) and your methodology seed (versioned inside Levain). `pip` keeps the *library* compatible, but it's blind to *methodology* drift. A new memory feature can land as a contradiction with your older, hand-tuned instructions instead of a clean addition. That drift is what breaks a long-running install.
 
-Your partner's memory normally only exists *inside* a session. These commands let you look at it from outside — memory health (is the Hebbian write-path live or silently dark?), the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. Read-only by default: they inspect, not change (the one exception is `levain serve --write`, the governed writable cockpit, noted below).
-
-```
-levain dashboard          # a terminal glance (add --json for the raw view)
-levain serve              # a local web-app in your browser — localhost only
-```
-
-`levain serve` runs a tiny localhost web server (default `http://127.0.0.1:7420`) and opens your browser to a live dashboard of your own substrate. It binds loopback only, refuses non-loopback Hosts, ships its UI from the package (no CDN, no account, renders offline) — your memory stays on your machine. `Ctrl+C` to stop; `--port` / `--no-open` to adjust. Read-only by default; **`--write`** opts into the governed writable cockpit — operate your State / spores / Tray-Keep right from the browser, through the same governed seam `levain tui` uses (loopback-only, the localhost bind is the auth).
+Levain ships a known-good version set and two commands to hold it:
 
 ```
-pip install 'levain[app]'   # optional: the in-host render
-levain serve-app            # serve the same dashboard as an MCP App, inside the host
+levain doctor          # loud, in-environment health check
+levain update          # reconcile the whole set in one fail-safe pass
 ```
 
-`levain serve-app` is the alternate surface for hosts that render MCP Apps (Claude desktop/web, etc.). It needs the optional `mcp` extra; `levain serve` needs nothing beyond the base install.
+**`levain doctor`** checks the things a silently-dead install hides: the interpreter resolves, `anneal-memory` is reachable, the store opens, the memory server `init` set up is still wired to your store, the hooks point at *this* install. It also reports whether your version set has drifted from the tested known-good — library version, store schema, unreviewed memory-migration proposals. It exits nonzero on failure, so it drops into a shell pipeline. A read that fails is reported as a failure, never quietly passed.
+
+**`levain update`** brings the stack back to known-good in one ordered, reversible pass: bring `anneal-memory` to the tested version (the env-mutating step asks first; `--yes` to auto-confirm, `--no-pip` to skip it and print the exact command for your own package manager), re-run the partnership schema if the store drifted, surface the library's migration proposals for you to apply *under review* (it never edits your instruction files for you), and record the reconciled set. `--dry-run` shows the plan and changes nothing.
+
+## Look at — and operate — your own memory
+
+Your partner's memory normally only exists *inside* a session. These look at it from outside, and optionally let you steer it. All on your machine, no vendor host, no account.
+
+```
+levain dashboard          # a one-shot terminal glance (add --json for the raw view)
+levain serve              # a live local view in your browser
+levain tui                # a full-screen interactive terminal view
+```
+
+**`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
+
+**`levain tui`** is the terminal-native peer of `serve`: read and steer without a browser or a port. `--read-only` drops to a pure inspection view.
+
+**`levain focus`** sets the one line your sessions read to orient: *what you're working on right now*. It travels across sessions like the rest of your memory.
+
+```
+levain focus "shipping the v2 onboarding flow"   # set it
+levain focus                                       # show it + how fresh it is
+levain focus --clear                               # unset it
+```
+
+Two of those write targets are your own inbox into the partnership. Dump anything mid-stream (a thought, a handoff, something to pick up next time) and it surfaces at the start of your next session, then resolves. Keep durable reference you want your partner to recall when it's relevant. You dump freely; the kit sorts.
+
+For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
+
+## Keep it running on login (macOS)
+
+```
+levain daemon install       # start the local write window on login, survive a crash
+levain daemon status        # is it actually installed and running?
+levain daemon would-install  # dry-run: show what install would do, change nothing
+levain daemon uninstall
+```
+
+`levain daemon` keeps the local writable view of your memory available without an ad-hoc background process. It starts on login and restarts on crash, per-user with no admin or root (a launchd user agent on macOS today; Linux `systemd --user` and Windows Task Scheduler are planned). It's always pointed at loopback, never off-box. `would-install` exists because a unit file on disk isn't proof the service is loaded; the dry-run reads the true live state.
 
 ## Audience
 
-Operator-class developers — the ~5% who already sense session-amnesia is a real problem and would build their own fix. The ceiling isn't a crack; it's the shape of the correct audience.
+Operator-class developers: the people who already feel session-amnesia as a real problem and would build their own fix. If you've built your own substrate-management scripts, you'll recognize the pieces. If "continuity file" and "session-closing reflection" don't land yet, this probably isn't your tool yet.
 
-If you've already built your own substrate-management scripts, you'll recognize the pieces. If "continuity file" and "wrap protocol" don't land, this isn't your tool yet.
+## Boundaries, kept honest
 
-## What's in v1
+- **Harnesses:** Claude Code and Codex CLI. One adapter per install — two installs if you need both.
+- **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
+- **Always-on daemon:** macOS today; Linux and Windows are planned.
+- **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
 
-- Methodology-core seed templates (harness-neutral, small, dense)
-- Claude Code adapter (tier-1)
-- Codex CLI adapter (tier-1)
-- `levain init` / `levain doctor` / `levain verify-hooks` CLI
-- Accrual demo showing the empirical growth trajectory
+## What it's built on
 
-## What's not in v1
+Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=0.9.6,<0.10`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
 
-- The framework (heartbeat, control pane) — a native flow-shaped framework is parked at v2, held off substitution-drift by one invariant: the human is the fan-in.
-- The web-pane onboarding — the CLI interview is the only front-end at v1.0; the web pane absorbs into v1.1.
-- Multi-adapter layering — one adapter per install at v1; two installs if you need both Claude Code and Codex.
+## Build on it
 
-## Dependencies
-
-Levain layers on [`anneal-memory`](https://github.com/phillipclapham/anneal-memory) — the memory library. Both ship to PyPI. Clean dependency direction: Levain depends on anneal-memory, never the reverse.
-
-The division of labor is the point: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session — a memory library that hooked every prompt would forfeit the framework-neutrality that lets it work everywhere. So raw anneal gives you the stores and *manual* recall (you query if you remember to — the dead-store failure mode discipline rots into). Levain wires the hooks that surface the right memory at the right moment automatically — discipline becomes an invariant. Today that fires for the **prospective** layer: an open loop (spore) germinates into context the moment your prompt collides with it. The same hook **will extend** to the **crystallized** pattern tier in v2 — per-turn recall of proven, stable wisdom so it stays effective without clogging always-loaded context. That extension is proven in the flow reference workspace and is Levain v2's opening slice; it is **not** wired into the v1 adapter yet (v1 fires spores, not crystals). This is why "anneal only *fully* works inside a complementary harness" is a feature line, not a caveat: the store is universal, the firing is the harness's job.
+Writing your own surface over a substrate? `levain.kernel` is the published seam: the data model, the terminal and web drivers, and the governed write and action dispatch. Import one namespace instead of reaching into internals. Register extra read-only panels or extra governed verbs through `make_server(...)` and they ride the same auth, confirm, and audit envelope as the built-in edits. It's a pure re-export; the governance lives in the substrate, not the surface.
 
 ## License
 
-Apache 2.0. See [`LICENSE`](LICENSE) for full text and [`NOTICE`](NOTICE) for attribution.
-
-The patent grant matters: as the kit accrues operator-class contributions, downstream operators are protected against future contributor patent ambush. The "second sourdough surface" — the activation layer that the operator edits — is the design intent. Apache 2.0 protects that surface.
+Apache 2.0. See [`LICENSE`](https://github.com/levainhq/levain/blob/main/LICENSE) and [`NOTICE`](https://github.com/levainhq/levain/blob/main/NOTICE). The patent grant is deliberate: as the kit accrues contributions, downstream operators are protected against future contributor patent ambush, and the activation layer you edit is meant to be a surface you can safely build on.
 
 ---
 
-*Built inside the flow reference workspace; lives at levainhq.com.*
+*levainhq.com*
