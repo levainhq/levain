@@ -17,8 +17,10 @@ from pathlib import Path
 import pytest
 
 from levain.install import (
+    InitError,
     _checkpoint_path,
     _clear_checkpoint,
+    _fill_seed_imports,
     _init_store,
     _is_safe_install_target,
     _load_checkpoint,
@@ -1015,3 +1017,234 @@ def test_apply_init_raises_on_missing_verbatim_source(tmp_path: Path, monkeypatc
                 install, "claude-code", {}, templates_root,
                 "/usr/bin/python3", "anneal-memory", specs, bogus,
             )
+
+
+# --- Slice 3: roster-driven adapter @import generation ------------------------
+
+class _OKRun:
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def _base_apply(install: Path, adapter: str, templates_root: Path) -> None:
+    """Run a BASE (no-pack) apply_init for `adapter` into `install`."""
+    from levain.interview import build_field_plan, parse_template
+
+    roster = compose_roster([templates_root])
+    specs = [parse_template(e.path) for e in render_entries(roster)]
+    verbatim = verbatim_entries(roster)
+    answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+    apply_init(
+        install, adapter, answers, templates_root,
+        "/usr/bin/python3", "anneal-memory", specs, verbatim,
+    )
+
+
+def test_apply_init_generates_claude_seed_imports_byte_identical(tmp_path: Path, monkeypatch):
+    """Slice 3: the claude-code CLAUDE.md @seed import list is GENERATED from the
+    roster, but a base install reproduces the authored curriculum block exactly
+    (behavior-preserving) — continuity.md + README.md excluded."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        _base_apply(install, "claude-code", templates_root)
+        template = (
+            templates_root / "adapters" / "claude-code" / "CLAUDE.md.template"
+        ).read_text(encoding="utf-8")
+
+    expected_block = (
+        "@seed/origin.md\n@seed/partnership.md\n@seed/world.md\n"
+        "@seed/memory.md\n@seed/spore_instructions.md"
+    )
+    expected = template.replace("{{SEED_IMPORTS}}", expected_block)
+    got = (install / "CLAUDE.md").read_text(encoding="utf-8")
+    assert got == expected
+    assert "@seed/continuity.md" not in got
+    assert "@seed/README.md" not in got
+    # the surrounding template prose survives — not just the generated block
+    assert "anneal://continuity resource" in got
+
+
+def test_apply_init_generates_codex_seed_imports_byte_identical(tmp_path: Path, monkeypatch):
+    """Slice 3: the codex AGENTS.md read-list is generated; a base install
+    reproduces the authored numbered+described list exactly (descriptions
+    self-source from each seed H1), continuity.md + README.md excluded."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex_home"))
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        _base_apply(install, "codex", templates_root)
+        template = (
+            templates_root / "adapters" / "codex" / "AGENTS.md.template"
+        ).read_text(encoding="utf-8")
+
+    expected_block = (
+        "1. `seed/origin.md` — Who You Are\n"
+        "2. `seed/partnership.md` — How We Work\n"
+        "3. `seed/world.md` — Who Your Operator Is\n"
+        "4. `seed/memory.md` — Your Memory\n"
+        "5. `seed/spore_instructions.md` — Your Open Loops"
+    )
+    expected = template.replace("{{SEED_IMPORTS}}", expected_block)
+    got = (install / "AGENTS.md").read_text(encoding="utf-8")
+    assert got == expected
+    # The backtick-wrapped form is the import-LIST entry — absent here (continuity
+    # / README never load). The bare names DO appear in the trailing explanatory
+    # comment, so assert the list form, not the substring.
+    assert "`seed/continuity.md`" not in got
+    assert "`seed/README.md`" not in got
+    # the surrounding template prose survives — not just the generated block
+    assert "anneal://continuity resource" in got
+
+
+def test_apply_init_pack_seed_file_loads_in_both_adapters(tmp_path: Path, monkeypatch):
+    """THE load-bearing Slice 3 catch: a pack's NEW seed file must LOAD, not just
+    install to disk. It appears in the claude-code @seed imports AND the codex
+    read-list, appended after the base curriculum; the codex description
+    self-sources from the file's H1. A pack OVERRIDE without an H1 falls back to a
+    bare codex entry, curriculum position preserved."""
+    from levain.interview import build_field_plan, parse_template
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex_home"))
+
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text('name = "dom"\norder = 10\n', encoding="utf-8")
+    (pack / "seed" / "audit_method.md").write_text(
+        "# Pressable Audit Method\n\nbody\n", encoding="utf-8"
+    )
+    (pack / "seed" / "partnership.md").write_text("PACK OVERRIDE no h1\n", encoding="utf-8")
+
+    def _apply(install: Path, adapter: str) -> None:
+        with _templates_root() as templates_root:
+            roster = compose_roster([templates_root, pack])
+            specs = [parse_template(e.path) for e in render_entries(roster)]
+            verbatim = verbatim_entries(roster)
+            answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+            apply_init(
+                install, adapter, answers, templates_root,
+                "/usr/bin/python3", "anneal-memory", specs, verbatim,
+            )
+
+    cc = tmp_path / "cc"
+    cc.mkdir()
+    _apply(cc, "claude-code")
+    claude = (cc / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "@seed/audit_method.md" in claude
+    # appended AFTER the base curriculum (the last base import is spore_instructions)
+    assert claude.index("@seed/spore_instructions.md") < claude.index("@seed/audit_method.md")
+
+    cx = tmp_path / "cx"
+    cx.mkdir()
+    _apply(cx, "codex")
+    agents = (cx / "AGENTS.md").read_text(encoding="utf-8")
+    assert "6. `seed/audit_method.md` — Pressable Audit Method" in agents
+    # the no-H1 override falls back to a BARE entry, curriculum position 2 kept
+    assert "2. `seed/partnership.md`\n" in agents
+
+
+def test_fill_seed_imports_requires_exactly_one_placeholder():
+    """Honesty floor: a template with ZERO or MULTIPLE {{SEED_IMPORTS}}
+    placeholders fails loud (a multi-placeholder template would duplicate the
+    import block), never silently produces a wrong adapter file."""
+    with pytest.raises(InitError, match="SEED_IMPORTS"):
+        _fill_seed_imports("no placeholder here\n", "@seed/origin.md")
+    with pytest.raises(InitError, match="exactly one"):
+        _fill_seed_imports("a {{SEED_IMPORTS}} b {{SEED_IMPORTS}} c", "X")
+    # happy path: exactly one placeholder substitutes
+    assert _fill_seed_imports("a {{SEED_IMPORTS}} b", "X") == "a X b"
+
+
+def test_seed_role_title_extraction(tmp_path: Path):
+    """The codex description self-sources from the H1, stripping a ' — <suffix>'
+    tail, requiring a column-0 H1, and dropping an empty/placeholder title (a bare
+    entry beats leaking raw {{...}})."""
+    from levain.install import _seed_role_title
+
+    def title_of(text: str) -> str | None:
+        p = tmp_path / "s.md"
+        p.write_text(text, encoding="utf-8")
+        return _seed_role_title(p)
+
+    assert title_of("# Who You Are — {{ENTITY_NAME}}\n\nbody\n") == "Who You Are"
+    assert title_of("# Who Your Operator Is\n") == "Who Your Operator Is"
+    assert title_of("# Audit Method — Pressable — v2\n") == "Audit Method"
+    # placeholder BEFORE any em-dash -> meaningless description -> bare entry
+    assert title_of("# {{ENTITY_NAME}}'s Origin\n") is None
+    # empty H1 -> bare entry
+    assert title_of("# \n\nbody\n") is None
+    # indented "    # cmd" is a code line, not an H1
+    assert title_of("    # not a heading\n\n# Real Title\n") == "Real Title"
+    # no H1 at all -> None (graceful)
+    assert title_of("just prose, no heading\n") is None
+
+
+def test_apply_init_pack_render_file_loads_in_import_list(tmp_path: Path, monkeypatch):
+    """A pack-added RENDER file (not just verbatim) also loads — the import list is
+    mode-agnostic (a seed file is render XOR verbatim, and both import)."""
+    from levain.interview import build_field_plan, parse_template
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text(
+        'name = "dom"\norder = 10\nrender = ["method.md"]\n', encoding="utf-8"
+    )
+    (pack / "seed" / "method.md").write_text("# Audit Method\n\n{{DETAIL}}\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root, pack])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+        )
+
+    claude = (install / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "@seed/method.md" in claude
+    # the render file was actually rendered AND imported
+    rendered = (install / "seed" / "method.md").read_text(encoding="utf-8")
+    assert "{{" not in rendered and "VAL_DETAIL" in rendered
+
+
+def test_apply_init_missing_base_seed_fails_loud(tmp_path: Path, monkeypatch):
+    """Honesty floor (base half): a corrupt roster missing a base methodology seed
+    fails loud, naming it — never silently generates an adapter without that
+    import (the invisible-infrastructure failure for a BASE seed)."""
+    from levain.interview import parse_template
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        # verbatim DELIBERATELY omits spore_instructions.md (the corrupt-wheel case)
+        verbatim = [
+            SeedEntry(n, templates_root / "seed" / n, "verbatim")
+            for n in ("partnership.md", "memory.md", "continuity.md", "README.md")
+        ]
+        with pytest.raises(InitError, match="spore_instructions.md"):
+            apply_init(
+                install, "claude-code", {}, templates_root,
+                "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin], verbatim,
+            )
+
+
+def test_fill_seed_imports_empty_block_raises():
+    """Honesty floor: an EMPTY generated block must fail loud too (it would
+    otherwise write an import-less adapter) — self-contained, not relying on a
+    caller preflight."""
+    with pytest.raises(InitError, match="import-less"):
+        _fill_seed_imports("x {{SEED_IMPORTS}} y", "")
+    with pytest.raises(InitError, match="import-less"):
+        _fill_seed_imports("x {{SEED_IMPORTS}} y", "   \n  ")

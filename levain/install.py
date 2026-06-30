@@ -37,9 +37,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from levain.packs import (
+    BASE_IMPORT_ORDER,
     PackError,
     SeedEntry,
     compose_roster,
+    import_entries,
     render_entries,
     verbatim_entries,
 )
@@ -270,7 +272,34 @@ def apply_init(
         # must surface, not silently yield an install missing a seed file.
         shutil.copy2(entry.path, install_seed / entry.name)
 
-    _install_adapter(chosen, install, templates_root, python_path, anneal_path, emit=emit)
+    # Reconstruct the composed roster from the two halves of one compose_roster
+    # (render `specs` + `verbatim` entries) to derive the adapter import list —
+    # the seed files that load as always-on context. Deriving it HERE (rather than
+    # adding an apply_init parameter) keeps the shared write-half signature stable
+    # for both init surfaces. Each render spec carries `spec.path` = the winning
+    # layer's source; `verbatim` entries are already SeedEntry.
+    render_seed = [
+        SeedEntry(name=spec.path.name, path=spec.path, mode="render") for spec in specs
+    ]
+    import_seed = import_entries([*render_seed, *verbatim])
+
+    # Honesty floor (the base half): every base methodology-core seed must be in
+    # the import list. A corrupt wheel that dropped one (e.g. spore_instructions.md)
+    # would otherwise generate an adapter SILENTLY missing that import — recreating,
+    # for a base seed, the invisible-infrastructure failure this seam closes (the
+    # old hard-coded template named it, so the break was visible). Fail loud, named.
+    imported = {entry.name for entry in import_seed}
+    missing_base = [name for name in BASE_IMPORT_ORDER if name not in imported]
+    if missing_base:
+        raise InitError(
+            f"base methodology seed file(s) missing from the install roster: "
+            f"{missing_base}. The wheel may be corrupt; reinstall with "
+            f"`pip install --force-reinstall levain`."
+        )
+
+    _install_adapter(
+        chosen, install, templates_root, python_path, anneal_path, import_seed, emit=emit
+    )
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -535,19 +564,103 @@ def _install_adapter(
     templates_root: Path,
     python_path: str,
     anneal_path: str,
+    import_seed: Sequence[SeedEntry],
     emit: Callable[[str], None] = print,
 ) -> None:
     adapter_root = templates_root / "adapters" / name
 
     if name == "claude-code":
-        _install_claude_code(install, templates_root, adapter_root, python_path, anneal_path, emit=emit)
+        _install_claude_code(
+            install, templates_root, adapter_root, python_path, anneal_path,
+            import_seed, emit=emit,
+        )
         return
 
     if name == "codex":
-        _install_codex(install, adapter_root, python_path, anneal_path, emit=emit)
+        _install_codex(install, adapter_root, python_path, anneal_path, import_seed, emit=emit)
         return
 
     raise ValueError(f"unknown adapter: {name}")  # pragma: no cover
+
+
+# ---------- adapter seed-import-list generation (the load-side @import seam) ----------
+
+_SEED_IMPORTS_PLACEHOLDER = "{{SEED_IMPORTS}}"
+
+
+def _seed_role_title(path: Path) -> str | None:
+    """The seed file's role label for the Codex read-list — its first ``# `` H1's
+    text, stripped of any ``" — <suffix>"`` (the suffix is the entity name or a
+    parenthetical, e.g. ``# Who You Are — {{ENTITY_NAME}}`` -> ``Who You Are``;
+    ``# Your Memory — anneal-memory`` -> ``Your Memory``). Read from the seed
+    SOURCE, so a render file's H1 placeholder sits after the separator and drops
+    out cleanly. Returns ``None`` when the file has no ``# `` H1 — the Codex line
+    then omits the description (a reading hint is not a correctness signal, so its
+    absence never fails the install)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        # A real Markdown H1 sits at column 0 ("# Title"); do NOT strip leading
+        # whitespace first, or an indented "    # cmd" code line would be misread
+        # as the title.
+        if line.startswith("# "):
+            title = line[2:].split(" — ", 1)[0].strip()
+            # Drop an empty title OR one still holding an unrendered placeholder (a
+            # pack H1 like "# {{NAME}}'s Method", placeholder BEFORE any " — "): a
+            # description carrying raw {{...}} is meaningless, so omit it (bare
+            # entry) rather than leak the placeholder into the read-list. The base
+            # render files keep their {{ENTITY_NAME}} AFTER the " — ", so it drops
+            # out cleanly and the title is placeholder-free.
+            if not title or "{{" in title:
+                return None
+            return title
+    return None
+
+
+def _claude_import_block(import_seed: Sequence[SeedEntry]) -> str:
+    """The Claude Code ``@seed/<name>`` import lines, one per importable seed file,
+    in load order — fills ``{{SEED_IMPORTS}}`` in CLAUDE.md.template."""
+    return "\n".join(f"@seed/{entry.name}" for entry in import_seed)
+
+
+def _codex_import_block(import_seed: Sequence[SeedEntry]) -> str:
+    """The Codex numbered read-list — one entry per importable seed file, in load
+    order: ``N. `seed/<name>` — <role>`` (role from the file's H1, omitted when
+    absent). Fills ``{{SEED_IMPORTS}}`` in AGENTS.md.template."""
+    lines: list[str] = []
+    for i, entry in enumerate(import_seed, start=1):
+        title = _seed_role_title(entry.path)
+        if title:
+            lines.append(f"{i}. `seed/{entry.name}` — {title}")
+        else:
+            lines.append(f"{i}. `seed/{entry.name}`")
+    return "\n".join(lines)
+
+
+def _fill_seed_imports(template_text: str, block: str) -> str:
+    """Substitute the single ``{{SEED_IMPORTS}}`` placeholder with the generated
+    import block. Honesty floor — BOTH failure modes write an import-less adapter
+    file (the invisible-infrastructure failure this seam closes), so fail loud on
+    either, self-contained (not relying on a caller's preflight):
+      - the template MISSING the placeholder (a corrupt/hand-edited template); and
+      - an EMPTY generated block (a roster with no loadable seed files)."""
+    count = template_text.count(_SEED_IMPORTS_PLACEHOLDER)
+    if count != 1:
+        raise InitError(
+            f"adapter template must contain exactly one {_SEED_IMPORTS_PLACEHOLDER} "
+            f"placeholder (found {count}) — the wheel may be corrupt or the template "
+            f"hand-edited; reinstall with `pip install --force-reinstall levain`."
+        )
+    if not block.strip():
+        raise InitError(
+            "the generated seed-import block is empty — refusing to write an "
+            "import-less adapter file (no loadable seed files in the roster). "
+            "The wheel may be corrupt; reinstall with "
+            "`pip install --force-reinstall levain`."
+        )
+    return template_text.replace(_SEED_IMPORTS_PLACEHOLDER, block)
 
 
 def _install_claude_code(
@@ -556,6 +669,7 @@ def _install_claude_code(
     adapter_root: Path,
     python_path: str,
     anneal_path: str,
+    import_seed: Sequence[SeedEntry],
     emit: Callable[[str], None] = print,
 ) -> None:
     _copy_activation_tree(
@@ -565,7 +679,12 @@ def _install_claude_code(
         emit=emit,
     )
 
-    shutil.copy2(adapter_root / "CLAUDE.md.template", install / "CLAUDE.md")
+    # The @seed import list is roster-driven, not hard-coded — so a pack's added
+    # seed file actually LOADS (install-to-disk without import = the bug this seam
+    # fixes). Fill {{SEED_IMPORTS}} rather than copy the template byte-for-byte.
+    claude_md = (adapter_root / "CLAUDE.md.template").read_text(encoding="utf-8")
+    claude_md = _fill_seed_imports(claude_md, _claude_import_block(import_seed))
+    (install / "CLAUDE.md").write_text(claude_md, encoding="utf-8")
 
     settings_dir = install / ".claude"
     settings_dir.mkdir(parents=True, exist_ok=True)
@@ -586,6 +705,7 @@ def _install_codex(
     adapter_root: Path,
     python_path: str,
     anneal_path: str,
+    import_seed: Sequence[SeedEntry],
     emit: Callable[[str], None] = print,
 ) -> None:
     _copy_activation_tree(
@@ -594,7 +714,11 @@ def _install_codex(
         anneal_path=anneal_path,
         emit=emit,
     )
-    shutil.copy2(adapter_root / "AGENTS.md.template", install / "AGENTS.md")
+    # Roster-driven read-list (same load-side seam as claude-code): a pack's added
+    # seed file appears in the numbered "read these, in order" list it must load.
+    agents_md = (adapter_root / "AGENTS.md.template").read_text(encoding="utf-8")
+    agents_md = _fill_seed_imports(agents_md, _codex_import_block(import_seed))
+    (install / "AGENTS.md").write_text(agents_md, encoding="utf-8")
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     codex_home.mkdir(parents=True, exist_ok=True)

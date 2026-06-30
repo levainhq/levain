@@ -6,11 +6,7 @@ who your operator is, how your memory works, and how you hold open loops.
 
 Edit the seed files themselves, not these import lines.
 
-@seed/origin.md
-@seed/partnership.md
-@seed/world.md
-@seed/memory.md
-@seed/spore_instructions.md
+{{SEED_IMPORTS}}
 
 <!-- seed/continuity.md is intentionally not imported here — it is the entity's
      living memory and loads through the anneal-memory server (the

@@ -16,8 +16,11 @@ import pytest
 from levain.install import _templates_root
 from levain.packs import (
     PackError,
+    SeedEntry,
     compose_roster,
     discover_roster,
+    import_entries,
+    import_names,
     load_pack_manifest,
     render_entries,
     verbatim_names,
@@ -306,3 +309,60 @@ def test_compose_render_override_keeps_base_interview_position(tmp_path: Path):
     assert [e.name for e in render_entries(roster)] == ["world.md", "origin.md"]
     world = next(e for e in roster if e.name == "world.md")
     assert world.path.read_text() == "{{A}} override"
+
+
+# --- import classification (Slice 3) ------------------------------------------
+
+def _entry(name: str, path: Path | None = None, mode: str = "verbatim") -> SeedEntry:
+    return SeedEntry(name=name, path=path or Path(f"/src/{name}"), mode=mode)
+
+
+# The base compose order: render entries (world, origin) then verbatim (alpha).
+_BASE_ROSTER = [
+    _entry("world.md", mode="render"),
+    _entry("origin.md", mode="render"),
+    _entry("continuity.md"),
+    _entry("memory.md"),
+    _entry("partnership.md"),
+    _entry("README.md"),
+    _entry("spore_instructions.md"),
+]
+
+_CURRICULUM = ["origin.md", "partnership.md", "world.md", "memory.md", "spore_instructions.md"]
+
+
+def test_import_entries_curriculum_order_excludes_continuity_and_readme():
+    """The base import list is the authored curriculum order — NOT the roster's
+    render-then-verbatim-alpha order — and continuity.md + README.md never load
+    (continuity loads via the anneal server; README is documentation)."""
+    names = import_names(_BASE_ROSTER)
+    assert names == _CURRICULUM
+    assert "continuity.md" not in names
+    assert "README.md" not in names
+
+
+def test_import_entries_pack_file_loads_appended_after_curriculum():
+    """A pack's NEW seed file imports BY DEFAULT (fail toward loading), appended
+    after the base curriculum — the load-bearing Slice 3 behavior."""
+    roster = [*_BASE_ROSTER, _entry("audit_method.md")]
+    names = import_names(roster)
+    assert names[:5] == _CURRICULUM
+    assert names[-1] == "audit_method.md"
+
+
+def test_import_entries_override_keeps_position_and_uses_winning_entry():
+    """Overriding a base file's CONTENT keeps its curriculum position (lookup by
+    filename) and resolves to the WINNING layer's entry (its source path), no
+    matter where the override sits in the roster."""
+    pack_partnership = _entry("partnership.md", path=Path("/pack/partnership.md"))
+    roster = [e for e in _BASE_ROSTER if e.name != "partnership.md"]
+    roster.append(pack_partnership)  # winning override at the END of the roster
+    result = import_entries(roster)
+    assert [e.name for e in result] == _CURRICULUM       # position 2 preserved
+    assert result[1].path == Path("/pack/partnership.md")  # the winning entry
+
+
+def test_import_entries_multiple_pack_files_append_in_roster_order():
+    """Two pack additions both load, appended in roster order after the base."""
+    roster = [*_BASE_ROSTER, _entry("audit_method.md"), _entry("sizing.md")]
+    assert import_names(roster) == [*_CURRICULUM, "audit_method.md", "sizing.md"]
