@@ -196,6 +196,56 @@ def discover_roster(pack_dir: Path) -> list[SeedEntry]:
     return compose_roster([pack_dir])
 
 
+def order_activation_roots(
+    base_pack_dir: Path, base_activation: Path, pack_dirs: Sequence[Path]
+) -> list[Path]:
+    """The activation-tree layer roots in winning order (last wins) for an install.
+
+    The activation peer of :func:`compose_roster`'s seed layering: each layer
+    carries its ``pack.toml`` ``order``; the result is stable-sorted by ``(order,
+    input rank)`` ascending — IDENTICAL ordering to the seed roster (base = pack
+    #0, higher ``order`` = later = WINS, equal orders keep input order). So a pack's
+    ``activation/posture.md`` overrides base exactly as its ``seed/world.md`` does,
+    and a pack ordered BELOW base LOSES to base (base is later) — the same edge
+    ``compose_roster`` produces.
+
+    Base's ``order`` is READ from ``base_pack_dir``'s ``pack.toml`` — the SAME
+    source :func:`compose_roster` reads (``compose_roster([base_pack_dir, ...])``)
+    — NOT hard-coded, so the seed and activation layerings can never desync on base
+    order (today both see ``order = 0``). ``base_activation`` is the base activation
+    TREE, passed separately because it sits at a per-adapter path
+    (``templates/activation`` for Claude Code, ``adapters/codex/activation`` for
+    Codex), distinct from ``base_pack_dir`` (``templates_root``).
+
+    Returns ``base_activation`` plus each pack's ``<pack>/activation`` dir THAT
+    EXISTS — a pack's activation tree is OPTIONAL (a pack may layer only seed
+    files); base is always included (it is the adapter's required tree). Raises
+    :class:`PackError` if ``base_activation`` is MISSING (a corrupt wheel — and a
+    pack contributing files must not mask it) or a pack manifest is malformed
+    (though in the install flow ``compose_roster`` has already validated those)."""
+    # The base activation tree is REQUIRED (it carries the entity's posture/hooks).
+    # A missing one = corrupt wheel — fail loud HERE so a pack contributing files
+    # can't mask an absent base (the composed map would be non-empty, slipping past
+    # the downstream empty-composition guard and installing a base-less tree). codex
+    # L3 re-verify HIGH.
+    if not base_activation.is_dir():
+        raise PackError(
+            f"base activation tree not found at {base_activation}. The wheel may be "
+            f"corrupt; reinstall with `pip install --force-reinstall levain`."
+        )
+    # (order, input rank, root, is_base) — the explicit (order, rank) key
+    # reproduces compose_roster's stable sort over [base, *packs] exactly,
+    # including the below-base base-wins edge. base order is READ (not 0-literal)
+    # so it tracks compose_roster's same-source read.
+    base_order = load_pack_manifest(base_pack_dir).order
+    layers: list[tuple[int, int, Path, bool]] = [(base_order, 0, base_activation, True)]
+    for rank, pack_dir in enumerate(pack_dirs, start=1):
+        manifest = load_pack_manifest(pack_dir)
+        layers.append((manifest.order, rank, pack_dir / "activation", False))
+    layers.sort(key=lambda layer: (layer[0], layer[1]))
+    return [root for _order, _rank, root, is_base in layers if is_base or root.is_dir()]
+
+
 def render_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     """The render-mode entries, in interview order."""
     return [e for e in roster if e.is_render]
