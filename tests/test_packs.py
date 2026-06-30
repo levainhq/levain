@@ -22,6 +22,7 @@ from levain.packs import (
     import_entries,
     import_names,
     load_pack_manifest,
+    order_activation_roots,
     render_entries,
     verbatim_names,
 )
@@ -366,3 +367,116 @@ def test_import_entries_multiple_pack_files_append_in_roster_order():
     """Two pack additions both load, appended in roster order after the base."""
     roster = [*_BASE_ROSTER, _entry("audit_method.md"), _entry("sizing.md")]
     assert import_names(roster) == [*_CURRICULUM, "audit_method.md", "sizing.md"]
+
+
+# ---------- order_activation_roots: the activation peer of seed layering ----------
+#
+# These pin that the activation tree composes with the SAME ordering semantics as
+# the seed roster (base = pack #0 with its OWN pack.toml order, higher order = later
+# = WINS, ties keep input order, below-base order loses to base) and that a pack's
+# activation/ tree is OPTIONAL. Signature is
+# order_activation_roots(base_pack_dir, base_activation, pack_dirs) — base_pack_dir
+# carries base's pack.toml order; base_activation is the (per-adapter) tree path.
+
+def _base_pack(tmp_path: Path, order: int = 0) -> tuple[Path, Path]:
+    """A base pack-layer dir (pack.toml + seed/) plus its activation/ tree; returns
+    (base_pack_dir, base_activation)."""
+    base_pack = _write_pack(
+        tmp_path / "base", f'name = "levain-base"\norder = {order}\n', {"world.md": "BASE\n"}
+    )
+    base_act = base_pack / "activation"
+    base_act.mkdir()
+    return base_pack, base_act
+
+
+def _activation_pack(root: Path, order: int, *, with_activation: bool) -> Path:
+    """A minimal valid pack layer (pack.toml + seed/), optionally with an
+    activation/ dir. order_activation_roots reads only the manifest + the
+    activation/ dir's existence, so the seed body is immaterial here."""
+    _write_pack(root, f'name = "p{order}"\norder = {order}\n', {"x.md": "x\n"})
+    if with_activation:
+        (root / "activation").mkdir()
+    return root
+
+
+def test_order_activation_roots_base_only(tmp_path: Path):
+    base_pack, base_act = _base_pack(tmp_path)
+    assert order_activation_roots(base_pack, base_act, []) == [base_act]
+
+
+def test_order_activation_roots_includes_pack_with_activation(tmp_path: Path):
+    base_pack, base_act = _base_pack(tmp_path)
+    pack = _activation_pack(tmp_path / "pack", 10, with_activation=True)
+    assert order_activation_roots(base_pack, base_act, [pack]) == [
+        base_act, pack / "activation"
+    ]
+
+
+def test_order_activation_roots_drops_pack_without_activation(tmp_path: Path):
+    """A pack's activation/ tree is OPTIONAL — a seed-only pack contributes no
+    activation root (base is the whole stack)."""
+    base_pack, base_act = _base_pack(tmp_path)
+    pack = _activation_pack(tmp_path / "pack", 10, with_activation=False)
+    assert order_activation_roots(base_pack, base_act, [pack]) == [base_act]
+
+
+def test_order_activation_roots_orders_by_pack_order(tmp_path: Path):
+    """Higher pack order = later = wins; base (order 0) first. Passed in REVERSE
+    input order to prove it sorts by manifest order, not input order."""
+    base_pack, base_act = _base_pack(tmp_path)
+    lo = _activation_pack(tmp_path / "lo", 10, with_activation=True)
+    hi = _activation_pack(tmp_path / "hi", 20, with_activation=True)
+    assert order_activation_roots(base_pack, base_act, [hi, lo]) == [
+        base_act, lo / "activation", hi / "activation"
+    ]
+
+
+def test_order_activation_roots_equal_order_keeps_input_order(tmp_path: Path):
+    """Equal order → stable sort keeps input order (matches compose_roster)."""
+    base_pack, base_act = _base_pack(tmp_path)
+    a = _activation_pack(tmp_path / "a", 10, with_activation=True)
+    b = _activation_pack(tmp_path / "b", 10, with_activation=True)
+    assert order_activation_roots(base_pack, base_act, [a, b]) == [
+        base_act, a / "activation", b / "activation"
+    ]
+
+
+def test_order_activation_roots_below_base_order_loses_to_base(tmp_path: Path):
+    """A pack ordered BELOW base sorts BEFORE base → base is LATER → base WINS, the
+    same edge compose_roster's [base, *packs] stable sort produces."""
+    base_pack, base_act = _base_pack(tmp_path)  # base order 0
+    neg = _activation_pack(tmp_path / "neg", -5, with_activation=True)
+    # base is last in the returned winning order → it overrides the pack.
+    assert order_activation_roots(base_pack, base_act, [neg]) == [neg / "activation", base_act]
+
+
+def test_order_activation_roots_missing_base_raises_even_with_pack(tmp_path: Path):
+    """A MISSING base activation tree fails loud even when a pack contributes
+    activation files — a pack must not mask an absent base (codex L3 re-verify
+    HIGH: otherwise the composed map is non-empty and an entity installs with no
+    base posture/hooks)."""
+    base_pack = _write_pack(
+        tmp_path / "base", 'name = "levain-base"\norder = 0\n', {"world.md": "x\n"}
+    )
+    missing_base_act = base_pack / "activation"  # deliberately NOT created
+    pack = _activation_pack(tmp_path / "pack", 10, with_activation=True)
+    with pytest.raises(PackError, match="base activation tree not found"):
+        order_activation_roots(base_pack, missing_base_act, [pack])
+
+
+def test_order_activation_roots_tracks_base_order_like_compose_roster(tmp_path: Path):
+    """order_activation_roots READS base's pack.toml order (not a hard-coded 0), so
+    it tracks compose_roster's same-source read: a NON-ZERO base order flips the
+    winner identically in both. The structural invariant against seed/activation
+    desync (L1 MED). base order 10, pack order 5 → pack sorts before base → base
+    WINS in BOTH layerings."""
+    base_pack, base_act = _base_pack(tmp_path, order=10)
+    pack = _write_pack(tmp_path / "pack", 'name = "p"\norder = 5\n', {"world.md": "PACK\n"})
+    (pack / "activation").mkdir()
+    # seed layering (compose_roster): base wins world.md (base order 10 > pack 5)
+    roster = compose_roster([base_pack, pack])
+    world_winner = next(e.path for e in roster if e.name == "world.md")
+    assert world_winner == base_pack / "seed" / "world.md"
+    # activation layering must AGREE: base wins → base_act is LAST in winning order.
+    roots = order_activation_roots(base_pack, base_act, [pack])
+    assert roots[-1] == base_act

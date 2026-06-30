@@ -22,6 +22,7 @@ the Codex global `~/.codex/hooks.json` is backed up before being overwritten.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from levain.packs import (
     SeedEntry,
     compose_roster,
     import_entries,
+    order_activation_roots,
     render_entries,
     verbatim_entries,
 )
@@ -143,6 +145,15 @@ def run_init(
 
         try:
             roster = compose_roster([templates_root, *pack_dirs])
+            # Resolve the activation-tree layer stack HERE — from the same manifest
+            # read as compose_roster, BEFORE the interview — so (a) a bad/mutated
+            # manifest fails cleanly at this gate (not as a traceback deep in the
+            # write-half), and (b) seed and activation layering share ONE manifest
+            # snapshot (a pack mutated mid-interview can't make seed use the old
+            # order while activation uses the new one). codex + L2 + nemotron L3.
+            activation_roots = order_activation_roots(
+                templates_root, _base_activation_root(chosen, templates_root), pack_dirs
+            )
         except PackError as e:
             print(f"FAIL: {e}")
             return 1
@@ -187,16 +198,25 @@ def run_init(
             _report_partial_state(install)
             return 1
 
-        result = apply_init(
-            install,
-            chosen,
-            answers,
-            templates_root,
-            python_path,
-            anneal_path,
-            render_specs,
-            verbatim,
-        )
+        try:
+            result = apply_init(
+                install,
+                chosen,
+                answers,
+                templates_root,
+                python_path,
+                anneal_path,
+                render_specs,
+                verbatim,
+                activation_roots=activation_roots,
+            )
+        except InitError as e:
+            # The write-half fails loud (a corrupt-wheel activation tree, an
+            # operator edit that can't be preserved) — render it as a clean FAIL +
+            # partial-state report, not a traceback. codex L3 re-verify MED.
+            print(f"FAIL: {e.message}")
+            _report_partial_state(install)
+            return 1
 
     # Interview completed successfully — clear the checkpoint so the next
     # `levain init --force` doesn't offer to resume stale answers.
@@ -217,6 +237,8 @@ def apply_init(
     anneal_path: str,
     specs: list[TemplateSpec],
     verbatim: Sequence[SeedEntry],
+    *,
+    activation_roots: Sequence[Path] | None = None,
     emit: Callable[[str], None] = print,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
@@ -250,6 +272,17 @@ def apply_init(
     from one `packs.compose_roster` call in the caller, so render and verbatim are
     the same partition the interview/form was built from.
 
+    `activation_roots` is the (keyword-only) ordered activation-tree layer stack
+    (base first, then composing packs by `pack.toml` order — see
+    `packs.order_activation_roots`). It is needed for the ACTIVATION tree layering,
+    which (unlike the seed roster's import list) CANNOT be reconstructed from
+    `specs`/`verbatim`: those carry only seed-file paths, never a pack's
+    `activation/` tree. The CLI resolves it ONCE up-front (in `run_init`, from the
+    same manifest read as `compose_roster`, BEFORE the interview) and passes it
+    here — so seed and activation layering share one manifest snapshot. `None`
+    (the default) means base-only: the adapter's own base activation tree, which is
+    what the web onboarding path (base-only by design) gets unchanged.
+
     MUST be called inside a live `_templates_root()` context: the render/copy/
     adapter steps read from `templates_root`, which a zipped distribution
     materializes only for that context's lifetime. The store-init is
@@ -274,10 +307,12 @@ def apply_init(
 
     # Reconstruct the composed roster from the two halves of one compose_roster
     # (render `specs` + `verbatim` entries) to derive the adapter import list —
-    # the seed files that load as always-on context. Deriving it HERE (rather than
-    # adding an apply_init parameter) keeps the shared write-half signature stable
-    # for both init surfaces. Each render spec carries `spec.path` = the winning
-    # layer's source; `verbatim` entries are already SeedEntry.
+    # the seed files that load as always-on context. The import list IS
+    # reconstructable from `specs`/`verbatim` (every seed path is in one of them),
+    # so it needs no extra parameter; the ACTIVATION tree is not (it lives in each
+    # pack's `activation/` subtree, not in the seed roster) — that is what
+    # `pack_dirs` is threaded for, below. Each render spec carries `spec.path` =
+    # the winning layer's source; `verbatim` entries are already SeedEntry.
     render_seed = [
         SeedEntry(name=spec.path.name, path=spec.path, mode="render") for spec in specs
     ]
@@ -297,8 +332,16 @@ def apply_init(
             f"`pip install --force-reinstall levain`."
         )
 
+    # Base-only (activation_roots is None) = just the adapter's own base activation
+    # tree — the web onboarding path, which never composes packs.
+    roots = (
+        list(activation_roots)
+        if activation_roots is not None
+        else [_base_activation_root(chosen, templates_root)]
+    )
     _install_adapter(
-        chosen, install, templates_root, python_path, anneal_path, import_seed, emit=emit
+        chosen, install, templates_root, python_path, anneal_path, import_seed,
+        activation_roots=roots, emit=emit,
     )
 
     store = install / ".levain" / "memory.db"
@@ -558,6 +601,16 @@ def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[SeedE
         yield templates_root, specs, verbatim
 
 
+def _base_activation_root(adapter: str, templates_root: Path) -> Path:
+    """The adapter's BASE activation tree. Claude Code's is `templates/activation`;
+    Codex's is `adapters/codex/activation`. Distinct from `templates_root` itself
+    (the base PACK dir, whose `pack.toml` carries the base order that
+    `order_activation_roots` reads)."""
+    if adapter == "codex":
+        return templates_root / "adapters" / "codex" / "activation"
+    return templates_root / "activation"
+
+
 def _install_adapter(
     name: str,
     install: Path,
@@ -565,6 +618,8 @@ def _install_adapter(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    *,
+    activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
 ) -> None:
     adapter_root = templates_root / "adapters" / name
@@ -572,12 +627,15 @@ def _install_adapter(
     if name == "claude-code":
         _install_claude_code(
             install, templates_root, adapter_root, python_path, anneal_path,
-            import_seed, emit=emit,
+            import_seed, activation_roots=activation_roots, emit=emit,
         )
         return
 
     if name == "codex":
-        _install_codex(install, adapter_root, python_path, anneal_path, import_seed, emit=emit)
+        _install_codex(
+            install, adapter_root, python_path, anneal_path, import_seed,
+            activation_roots=activation_roots, emit=emit,
+        )
         return
 
     raise ValueError(f"unknown adapter: {name}")  # pragma: no cover
@@ -670,11 +728,18 @@ def _install_claude_code(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    *,
+    activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
 ) -> None:
+    # `activation_roots` was resolved up-front (run_init / apply_init) — base
+    # (templates/activation) first, then any pack activation/ trees by order.
+    # base_activation is passed explicitly so its OWN completeness can be checked
+    # (a pack must not mask an empty base).
     _copy_activation_tree(
-        templates_root / "activation",
+        activation_roots,
         install / "activation",
+        base_activation=templates_root / "activation",
         anneal_path=anneal_path,
         emit=emit,
     )
@@ -706,11 +771,18 @@ def _install_codex(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    *,
+    activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
 ) -> None:
+    # `activation_roots` was resolved up-front (run_init / apply_init) — base
+    # (adapters/codex/activation, NOT templates/activation) first, then any pack
+    # activation/ trees by order. base_activation passed explicitly for the
+    # base-completeness check (a pack must not mask an empty base).
     _copy_activation_tree(
-        adapter_root / "activation",
+        activation_roots,
         install / "activation",
+        base_activation=adapter_root / "activation",
         anneal_path=anneal_path,
         emit=emit,
     )
@@ -756,71 +828,235 @@ def _timestamped_backup_path(target: Path) -> Path:
 _OPERATOR_EDITABLE = ("posture.md", "recency_directives.md")
 
 
+def _activation_excluded(rel: Path) -> bool:
+    """Whether a relative activation path matches the copytree
+    `ignore_patterns("__pycache__", "*.pyc")` semantics — a basename fnmatch at ANY
+    path component (exactly what `shutil.ignore_patterns` does, including its
+    `os.path.normcase` case handling). So a `__pycache__` dir, a `*.pyc` file, AND a
+    directory whose name matches `*.pyc` are all excluded, just like the legacy
+    copytree — the per-component check is strictly closer to copytree than the old
+    `path.suffix == ".pyc"` (file-suffix-only) form."""
+    return any(
+        part == "__pycache__" or fnmatch.fnmatch(part, "*.pyc")
+        for part in rel.parts
+    )
+
+
+def _compose_activation_layers(layer_roots: Sequence[Path]) -> dict[str, Path]:
+    """Compose an ordered STACK of activation-tree roots into one
+    ``{relative_posix_path: winning_source_path}`` map.
+
+    ``layer_roots`` is in winning order (see :func:`packs.order_activation_roots`):
+    a LATER layer overrides an earlier one per RELATIVE path, so a pack's
+    ``activation/posture.md`` replaces base's and a pack's ``hooks/x.py`` replaces
+    base's ``hooks/x.py``. ``__pycache__`` directories and ``*.pyc`` files are
+    excluded (:func:`_activation_excluded`) — mirroring the ``ignore_patterns`` the
+    pre-layering ``copytree`` used, so a single-root (base-only) stack composes
+    byte-for-byte (file CONTENT) to the legacy copy. A non-existent root is skipped
+    (a pack's activation tree is optional; base always exists)."""
+    composed: dict[str, Path] = {}
+    for root in layer_roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            if _activation_excluded(rel):
+                continue
+            composed[rel.as_posix()] = path
+    return composed
+
+
 def _copy_activation_tree(
-    src: Path,
+    layer_roots: Sequence[Path],
     dst: Path,
+    *,
+    base_activation: Path,
     anneal_path: str | None = None,
     emit: Callable[[str], None] = print,
 ) -> None:
-    """Copy `src` -> `dst`, but preserve operator edits to known editable files.
+    """Compose the ordered activation-tree layer STACK `layer_roots` into `dst`,
+    preserving operator edits to known editable files.
+
+    `layer_roots` (base first, then composing packs by `pack.toml` order — see
+    `packs.order_activation_roots`) is merged per relative path, LAST layer wins,
+    so a pack's `activation/posture.md` overrides base's. A single base root (no
+    pack ships an `activation/` tree) is the base-only case, byte-identical (file
+    content + directory structure, including empty dirs) to the pre-layering
+    copytree.
+
+    Honesty floor — `base_activation` (the adapter's OWN base tree) must itself
+    contribute files: a present-but-empty base (a corrupt wheel) must not be masked
+    by a pack contributing files (which would slip past an aggregate-only check and
+    install a base-less tree). Finer per-file completeness of the INSTALLED tree is
+    `levain doctor`'s job; here we guard that base is a real, non-empty source —
+    BEFORE any destructive write.
 
     `posture.md` and `recency_directives.md` are documented as operator-editable
-    (the "second sourdough surface" — the activation block accretes as the
-    operator finds their own RLHF-leakage patterns). If those exist at `dst`
-    and differ from the template at `src`, back them up OUTSIDE the dst tree
-    so the `rmtree(dst)` below doesn't immediately destroy the backup. The
-    backups land at `<install>/.levain/backups/activation/<timestamp>/` so the
-    operator can find them via the documented backup convention.
+    (the "second sourdough surface" — the activation block accretes as the operator
+    finds their own RLHF-leakage patterns). On a re-install, any such file present
+    at `dst` whose content will NOT survive byte-identically — it differs from the
+    WINNING layer's version, OR no layer provides it (so `rmtree` would delete it)
+    — is backed up OUTSIDE the dst tree
+    (`<install>/.levain/backups/activation/<timestamp>/`) BEFORE the `rmtree`. If
+    such an edit cannot be preserved (the backup dir won't create, the read/copy
+    fails), this raises rather than silently destroying it — fail loud beats data
+    loss.
 
     `anneal_path`, when provided, is substituted into the `{{ANNEAL_MEMORY}}`
-    placeholder in any hook .py file under `dst/hooks/`. The hooks use the
-    substituted absolute path as their first CLI candidate so hook firing
-    doesn't depend on PATH (which Claude Code + Codex sanitize aggressively).
-    """
-    backups: list[tuple[Path, Path]] = []
-    if dst.exists():
-        # `dst` is `<install>/activation/`; parent is the install root.
-        # Stage backups outside `dst` so `rmtree(dst)` doesn't consume them.
-        staging = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
-        backup_dir: Path | None
-        try:
-            staging.mkdir(parents=True, exist_ok=True)
-            backup_dir = staging
-        except OSError:
-            backup_dir = None  # backups disabled if we can't stage
+    placeholder in any hook .py file under `dst/hooks/` (recursively, so a pack's
+    nested hook is reached). The hooks use the substituted absolute path as their
+    first CLI candidate so hook firing doesn't depend on PATH (which Claude Code +
+    Codex sanitize aggressively).
 
-        if backup_dir is not None:
-            for name in _OPERATOR_EDITABLE:
-                current = dst / name
-                template = src / name
-                if not current.is_file() or not template.is_file():
-                    continue
+    Honesty floor: a winning source that vanishes between scan and copy raises (a
+    silent skip would yield an install missing an activation file — the same
+    fail-loud contract the verbatim seed copy in `apply_init` holds). The new tree
+    is assembled in a staging dir and swapped in atomically, so ANY build failure
+    (a vanished source, a cross-layer file/dir name collision) leaves the existing
+    `dst` untouched — never a partial activation tree.
+    """
+    composed = _compose_activation_layers(layer_roots)
+
+    # Base must itself contribute files — a pack must not mask an empty/missing base
+    # (which would pass an aggregate-only check yet install a base-less tree). Since
+    # base is always in `layer_roots`, base-non-empty implies `composed` non-empty.
+    if not _compose_activation_layers([base_activation]):
+        raise InitError(
+            f"the base activation tree at {base_activation} contributes no files "
+            f"(missing or empty — a corrupt wheel). Refusing to install a base-less "
+            f"activation/; reinstall with `pip install --force-reinstall levain`."
+        )
+
+    backups: list[tuple[Path, Path]] = []
+    backup_staging: Path | None = None  # this run's backup dir; cleaned on any failure
+    if dst.exists():
+        # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch them.
+        candidate = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            backup_staging = candidate
+        except OSError:
+            backup_staging = None  # can't stage — see the fail-loud guard below
+
+        for name in _OPERATOR_EDITABLE:
+            current = dst / name
+            if not current.is_file():
+                continue
+            try:
+                current_bytes = current.read_bytes()
+            except OSError as e:
+                # We're about to rmtree it but can't inspect it — don't destroy blind.
+                raise InitError(
+                    f"could not read {current} to check for operator edits before "
+                    f"replacing the activation tree ({e}). Refusing to overwrite a "
+                    f"possibly-edited file; resolve the read error and re-run."
+                ) from e
+            winning = composed.get(name)
+            # Survives byte-identically? (winning present AND equal). winning is None
+            # means no layer provides it → rmtree would DELETE it → must preserve.
+            if winning is not None:
                 try:
-                    if current.read_bytes() == template.read_bytes():
+                    if current_bytes == winning.read_bytes():
                         continue
                 except OSError:
-                    continue
-                bak = backup_dir / name
-                try:
-                    shutil.copy2(current, bak)
-                    backups.append((current, bak))
-                except OSError:
-                    continue
+                    pass  # can't read the winning source → treat current as needing preservation
+            # This operator-editable file is about to be overwritten or deleted.
+            if backup_staging is None:
+                raise InitError(
+                    f"operator-edited {name} would be replaced by this re-install, "
+                    f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
+                    f"could not be created. Refusing to overwrite your edit; fix the "
+                    f"backup-dir permissions (or back {current} up yourself) and re-run."
+                )
+            bak = backup_staging / name
+            try:
+                shutil.copy2(current, bak)
+            except OSError as e:
+                raise InitError(
+                    f"operator-edited {name} could not be backed up to {bak} ({e}). "
+                    f"Refusing to overwrite your edit; back {current} up yourself and "
+                    f"re-run."
+                ) from e
+            backups.append((current, bak))
 
-        shutil.rmtree(dst)
-    shutil.copytree(
-        src,
-        dst,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-    )
-    if anneal_path is not None:
-        _substitute_hook_placeholders(dst / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
+    # Build the new tree in a STAGING dir, then swap it into place atomically — so
+    # NO build failure (a cross-layer file/dir name collision, a vanished source)
+    # can leave `dst` partial: `dst` is untouched until the whole tree is assembled
+    # and is replaced in a single rename. codex L3 re-verify HIGH.
+    new_tree = dst.parent / f".levain-activation-new-{time.time_ns()}"
+    try:
+        # Directory structure first (including EMPTY dirs — copytree did) so the
+        # base-only stack is byte-identical to the legacy copy. Dirs are structure,
+        # not content: they don't "win", so create every non-excluded dir.
+        for root in layer_roots:
+            if not root.is_dir():
+                continue
+            for d in sorted(root.rglob("*")):
+                if not d.is_dir():
+                    continue
+                rel = d.relative_to(root)
+                if not _activation_excluded(rel):
+                    (new_tree / rel).mkdir(parents=True, exist_ok=True)
+        for rel_str, source in composed.items():
+            target = new_tree / rel_str
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # Cross-layer file/dir collision: another layer contributed `x/...`, so
+            # the dir pass created `target` as a DIRECTORY. shutil.copy2 would copy
+            # the file INTO it (a silently malformed tree) — fail loud instead (the
+            # staging keeps dst intact). The inverse (a parent that's a file) is
+            # caught by the parent mkdir above raising. codex L3 re-verify MED.
+            if target.is_dir():
+                raise InitError(
+                    f"activation layer conflict: {rel_str!r} is a file in one layer "
+                    f"and a directory in another. Composing packs must not collide on "
+                    f"a path; fix the pack layout and re-run."
+                )
+            # No is_file() guard on the source: a vanished source (TOCTOU) is a hard
+            # failure that must surface (into staging — `dst` stays intact), not
+            # silently yield an install missing an activation file.
+            shutil.copy2(source, target)
+        if anneal_path is not None:
+            _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
+    except BaseException:
+        # Any build failure (vanished source, collision, interrupt) leaves dst
+        # untouched. Clean the staged tree AND this run's backups — the originals
+        # still live in the untouched dst, so the backups would be misleading.
+        shutil.rmtree(new_tree, ignore_errors=True)
+        if backup_staging is not None:
+            shutil.rmtree(backup_staging, ignore_errors=True)
+        raise
+
+    # Atomic swap with rollback: move the old tree ASIDE (atomic rename), move the
+    # new one into place (atomic rename), delete the old on success. A swap failure
+    # restores the original — `dst` is never left missing or partial. Both renames
+    # are same-filesystem (all under `dst.parent`). codex L3 re-verify MED.
+    old_aside: Path | None = None
+    try:
+        if dst.exists():
+            old_aside = dst.parent / f".levain-activation-old-{time.time_ns()}"
+            os.replace(dst, old_aside)
+        os.replace(new_tree, dst)
+    except BaseException:
+        shutil.rmtree(new_tree, ignore_errors=True)
+        if old_aside is not None and not dst.exists():
+            os.replace(old_aside, dst)  # restore the original tree
+        if backup_staging is not None:
+            shutil.rmtree(backup_staging, ignore_errors=True)
+        raise
+    if old_aside is not None:
+        shutil.rmtree(old_aside, ignore_errors=True)
+
     for current, bak in backups:
         emit(f"  ! Operator-edited {current.name} preserved at {bak}")
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:
-    """Replace install-time placeholders in every .py file under `hooks_dir`.
+    """Replace install-time placeholders in every .py file under `hooks_dir`,
+    RECURSIVELY (so a pack's nested hook, e.g. `hooks/sub/x.py`, is reached — the
+    composition supports nested subtrees, so the substitution must too; base hooks
+    are flat and unaffected).
 
     Hooks ship with `{{ANNEAL_MEMORY}}` (and potentially more keys later) so
     they can use the install-time-resolved absolute path of anneal-memory
@@ -830,7 +1066,7 @@ def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> N
     """
     if not hooks_dir.is_dir():
         return
-    for py_file in hooks_dir.glob("*.py"):
+    for py_file in hooks_dir.rglob("*.py"):
         try:
             text = py_file.read_text(encoding="utf-8")
         except OSError:

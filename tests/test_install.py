@@ -18,8 +18,11 @@ import pytest
 
 from levain.install import (
     InitError,
+    _base_activation_root,
     _checkpoint_path,
     _clear_checkpoint,
+    _compose_activation_layers,
+    _copy_activation_tree,
     _fill_seed_imports,
     _init_store,
     _is_safe_install_target,
@@ -30,7 +33,13 @@ from levain.install import (
     _templates_root,
     apply_init,
 )
-from levain.packs import SeedEntry, compose_roster, render_entries, verbatim_entries
+from levain.packs import (
+    SeedEntry,
+    compose_roster,
+    order_activation_roots,
+    render_entries,
+    verbatim_entries,
+)
 
 
 # ---------- _templates_root context manager ----------
@@ -1248,3 +1257,409 @@ def test_fill_seed_imports_empty_block_raises():
         _fill_seed_imports("x {{SEED_IMPORTS}} y", "")
     with pytest.raises(InitError, match="import-less"):
         _fill_seed_imports("x {{SEED_IMPORTS}} y", "   \n  ")
+
+
+# --- Slice 4a: activation-tree multi-root layering ---------------------------
+#
+# A pack's activation/ tree composes ON TOP of the adapter's base activation tree
+# with the SAME order/last-wins semantics as the seed roster (a pack's
+# activation/posture.md overrides base's). The two adapters layer onto DIFFERENT
+# base trees (claude = templates/activation; codex = adapters/codex/activation).
+
+def _make_activation_pack(
+    root: Path, *, order: int, activation: dict[str, str],
+    seed: dict[str, str] | None = None,
+) -> Path:
+    """A valid pack layer (pack.toml + seed/) carrying an activation/ tree.
+    `activation` maps a relative posix path -> file body."""
+    (root / "seed").mkdir(parents=True)
+    (root / "pack.toml").write_text(f'name = "dom{order}"\norder = {order}\n', encoding="utf-8")
+    for name, body in (seed or {"dom_doctrine.md": "DOMAIN\n"}).items():
+        (root / "seed" / name).write_text(body, encoding="utf-8")
+    for rel, body in activation.items():
+        target = root / "activation" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    return root
+
+
+def _apply_with_packs(install: Path, adapter: str, packs: list[Path]) -> None:
+    """Run apply_init for `adapter` composing `packs` on top of base (the CLI path
+    — resolves the activation-tree layer stack up-front, as run_init does)."""
+    from levain.interview import build_field_plan, parse_template
+
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root, *packs])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        activation_roots = order_activation_roots(
+            templates_root, _base_activation_root(adapter, templates_root), packs
+        )
+        apply_init(
+            install, adapter, answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+            activation_roots=activation_roots,
+        )
+
+
+def test_activation_pack_overrides_posture_claude(tmp_path: Path, monkeypatch):
+    """A pack's activation/posture.md overrides base's (claude-code); base hooks
+    that the pack does NOT override survive."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    pack = _make_activation_pack(
+        tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE OVERRIDE\n"}
+    )
+    install = tmp_path / "install"
+    install.mkdir()
+    _apply_with_packs(install, "claude-code", [pack])
+
+    assert (install / "activation" / "posture.md").read_text(encoding="utf-8") == (
+        "PACK POSTURE OVERRIDE\n"
+    )
+    # base hooks (not overridden) still present + anneal-substituted
+    hook = install / "activation" / "hooks" / "session_start.py"
+    assert hook.is_file()
+    assert "{{ANNEAL_MEMORY}}" not in hook.read_text(encoding="utf-8")
+
+
+def test_activation_pack_overrides_posture_codex(tmp_path: Path, monkeypatch):
+    """The codex adapter layers a pack onto its OWN base activation tree
+    (adapters/codex/activation) — the override lands and codex base hooks survive."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex_home"))
+    pack = _make_activation_pack(
+        tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE CODEX\n"}
+    )
+    install = tmp_path / "install"
+    install.mkdir()
+    _apply_with_packs(install, "codex", [pack])
+
+    assert (install / "activation" / "posture.md").read_text(encoding="utf-8") == (
+        "PACK POSTURE CODEX\n"
+    )
+    assert (install / "activation" / "hooks" / "session_start.py").is_file()
+
+
+def test_activation_pack_adds_new_file(tmp_path: Path, monkeypatch):
+    """A pack ADDS an activation file base does not have — it installs, and base's
+    own posture.md (not overridden) is untouched."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    pack = _make_activation_pack(
+        tmp_path / "pack", order=10, activation={"domain_directives.md": "EXTRA DIRECTIVES\n"}
+    )
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        base_posture = (templates_root / "activation" / "posture.md").read_bytes()
+    _apply_with_packs(install, "claude-code", [pack])
+
+    assert (install / "activation" / "domain_directives.md").read_text(encoding="utf-8") == (
+        "EXTRA DIRECTIVES\n"
+    )
+    assert (install / "activation" / "posture.md").read_bytes() == base_posture
+
+
+def test_activation_base_only_byte_identical_and_pyc_excluded(tmp_path: Path, monkeypatch):
+    """No packs → the composed activation tree is the base tree: posture.md is
+    byte-identical to the template and __pycache__/*.pyc are excluded (the
+    pre-layering copytree's ignore_patterns contract)."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        _base_apply(install, "claude-code", templates_root)
+        base_posture = (templates_root / "activation" / "posture.md").read_bytes()
+
+    assert (install / "activation" / "posture.md").read_bytes() == base_posture
+    assert not (install / "activation" / "hooks" / "__pycache__").exists()
+    assert list((install / "activation").rglob("*.pyc")) == []
+
+
+def test_activation_seed_only_pack_leaves_base_activation(tmp_path: Path, monkeypatch):
+    """A seed-only pack (no activation/ tree) → the install's activation tree is
+    base-only; the pack's seed file still installs (the two layerings are
+    independent)."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text('name = "dom"\norder = 10\n', encoding="utf-8")
+    (pack / "seed" / "audit_method.md").write_text("AUDIT\n", encoding="utf-8")
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        base_posture = (templates_root / "activation" / "posture.md").read_bytes()
+    _apply_with_packs(install, "claude-code", [pack])
+
+    assert (install / "activation" / "posture.md").read_bytes() == base_posture
+    assert (install / "seed" / "audit_method.md").read_text(encoding="utf-8") == "AUDIT\n"
+
+
+def test_activation_operator_edit_backed_up_against_winning_source(tmp_path: Path, monkeypatch):
+    """On a re-install, an operator-edited posture.md is backed up when it differs
+    from the WINNING (pack-overridden) version about to be written."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    pack = _make_activation_pack(
+        tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE v1\n"}
+    )
+    install = tmp_path / "install"
+    install.mkdir()
+    _apply_with_packs(install, "claude-code", [pack])          # lays down the pack's posture.md
+    (install / "activation" / "posture.md").write_text("OPERATOR EDIT\n", encoding="utf-8")
+    _apply_with_packs(install, "claude-code", [pack])          # re-install over the edit
+
+    assert (install / "activation" / "posture.md").read_text(encoding="utf-8") == "PACK POSTURE v1\n"
+    backups = list((install / ".levain" / "backups" / "activation").rglob("posture.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "OPERATOR EDIT\n"
+
+
+def test_activation_no_backup_when_current_matches_winning_pack(tmp_path: Path, monkeypatch):
+    """No spurious backup when the installed posture.md already matches the WINNING
+    pack override (even though it DIFFERS from base) — proves the backup compares
+    against the winning source, not base."""
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
+    pack = _make_activation_pack(
+        tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE\n"}
+    )
+    install = tmp_path / "install"
+    install.mkdir()
+    _apply_with_packs(install, "claude-code", [pack])          # installs pack posture.md
+    _apply_with_packs(install, "claude-code", [pack])          # re-install, no operator edit
+
+    backups = list((install / ".levain" / "backups" / "activation").rglob("posture.md"))
+    assert backups == []
+
+
+# --- Slice 4a hardening: _copy_activation_tree / _compose_activation_layers ----
+# Direct tests of the layer-composition guards the L3 apparatus (codex + L1 +
+# nemotron) surfaced: empty-composition refusal, fail-loud operator-edit
+# preservation (incl. the winning=None deletion case), hook override + nested-hook
+# substitution, empty-dir preservation, and per-component pyc exclusion.
+
+def _mk_layer(root: Path, files: dict[str, str]) -> Path:
+    """An activation-tree layer root; `files` maps relative posix path -> content."""
+    for rel, body in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    return root
+
+
+def test_copy_activation_empty_composition_raises(tmp_path: Path):
+    """An empty composition (missing/absent base activation tree) must FAIL LOUD
+    BEFORE wiping dst — never rmtree-then-write-nothing (codex/L1/nemotron HIGH)."""
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "posture.md").write_text("operator edit\n", encoding="utf-8")
+    missing = tmp_path / "nonexistent_base"  # not a dir → base contributes nothing
+    with pytest.raises(InitError, match="contributes no files"):
+        _copy_activation_tree([missing], dst, base_activation=missing)
+    # dst was NOT wiped — the operator's file survives (raise came before rmtree).
+    assert (dst / "posture.md").read_text(encoding="utf-8") == "operator edit\n"
+
+
+def test_copy_activation_winning_none_operator_file_backed_up(tmp_path: Path):
+    """An operator-editable file present at dst that NO layer provides (winning is
+    None → rmtree would DELETE it) is backed up before the wipe (nemotron HIGH-2)."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "BASE POSTURE\n"})  # no recency
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "posture.md").write_text("BASE POSTURE\n", encoding="utf-8")
+    (dst / "recency_directives.md").write_text("OPERATOR RECENCY\n", encoding="utf-8")
+    _copy_activation_tree([base], dst, base_activation=base)
+    # recency is gone from the install (no layer provides it) BUT preserved in backups.
+    assert not (dst / "recency_directives.md").exists()
+    backups = list((tmp_path / "install" / ".levain" / "backups" / "activation").rglob("recency_directives.md"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "OPERATOR RECENCY\n"
+
+
+def test_copy_activation_unbackuppable_operator_edit_raises(tmp_path: Path, monkeypatch):
+    """If an operator edit can't be backed up (copy2 fails), refuse — don't rmtree
+    over it (codex HIGH-2). Simulated by making shutil.copy2 raise during backup."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "NEW BASE POSTURE\n"})
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "posture.md").write_text("OPERATOR EDIT\n", encoding="utf-8")  # differs from winning
+
+    import shutil as _shutil
+    real_copy2 = _shutil.copy2
+
+    def _boom(src, d, *a, **k):
+        if str(d).endswith("posture.md") and "backups" in str(d):
+            raise OSError("disk full")
+        return real_copy2(src, d, *a, **k)
+
+    monkeypatch.setattr("levain.install.shutil.copy2", _boom)
+    with pytest.raises(InitError, match="could not be backed up"):
+        _copy_activation_tree([base], dst, base_activation=base)
+    # The operator's edit was NOT destroyed (raise came before rmtree).
+    assert (dst / "posture.md").read_text(encoding="utf-8") == "OPERATOR EDIT\n"
+
+
+def test_copy_activation_pack_overrides_base_hook(tmp_path: Path):
+    """A pack layer overriding a base hook .py wins (the docstring's explicit
+    claim — only posture.md override was exercised before; L1 test gap)."""
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n", "hooks/session_start.py": "BASE HOOK\n",
+    })
+    pack = _mk_layer(tmp_path / "pack" / "activation", {"hooks/session_start.py": "PACK HOOK\n"})
+    dst = tmp_path / "install" / "activation"
+    _copy_activation_tree([base, pack], dst, base_activation=base)  # pack later → wins
+    assert (dst / "hooks" / "session_start.py").read_text(encoding="utf-8") == "PACK HOOK\n"
+    assert (dst / "posture.md").read_text(encoding="utf-8") == "P\n"  # base survives
+
+
+def test_copy_activation_nested_hook_substituted(tmp_path: Path):
+    """{{ANNEAL_MEMORY}} substitution reaches a NESTED pack hook (recursive — the
+    composition supports nested subtrees, so the substitution must too; L1 MED)."""
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n",
+        "hooks/session_start.py": "anneal = '{{ANNEAL_MEMORY}}'\n",
+        "hooks/sub/nested.py": "anneal = '{{ANNEAL_MEMORY}}'\n",
+    })
+    dst = tmp_path / "install" / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/abs/anneal-memory")
+    assert "{{ANNEAL_MEMORY}}" not in (dst / "hooks" / "session_start.py").read_text(encoding="utf-8")
+    nested = (dst / "hooks" / "sub" / "nested.py").read_text(encoding="utf-8")
+    assert "{{ANNEAL_MEMORY}}" not in nested
+    assert "/abs/anneal-memory" in nested
+
+
+def test_copy_activation_preserves_empty_dir(tmp_path: Path):
+    """An empty directory in a layer is recreated in dst (copytree did — byte-for-
+    byte structural equivalence; nemotron/codex/L1 empty-dir finding)."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
+    (base / "hooks" / "extensions").mkdir(parents=True)  # intentionally empty
+    dst = tmp_path / "install" / "activation"
+    _copy_activation_tree([base], dst, base_activation=base)
+    assert (dst / "hooks" / "extensions").is_dir()
+
+
+def test_compose_excludes_pycache_and_pyc_dir(tmp_path: Path):
+    """Per-component exclusion matches copytree's ignore_patterns: a __pycache__
+    dir, a *.pyc file, AND a directory NAMED *.pyc are all excluded (codex LOW —
+    closer to copytree than the old file-suffix-only check)."""
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n",
+        "hooks/real.py": "x\n",
+        "hooks/__pycache__/real.cpython-312.pyc": "junk\n",
+        "stale.pyc/inside.txt": "junk\n",  # a DIR named *.pyc
+    })
+    composed = _compose_activation_layers([base])
+    assert "posture.md" in composed
+    assert "hooks/real.py" in composed
+    assert not any("__pycache__" in k for k in composed)
+    assert not any(k.endswith(".pyc") for k in composed)
+    assert "stale.pyc/inside.txt" not in composed  # the *.pyc DIR's contents excluded
+
+
+def test_copy_activation_staging_preserves_dst_on_build_failure(tmp_path: Path, monkeypatch):
+    """A mid-build failure (e.g. a source that vanishes between compose and copy)
+    leaves the EXISTING dst untouched — the atomic staging swap never leaves a
+    partial activation tree after the old one is gone (codex L3 re-verify HIGH).
+    Simulated by failing copy2 partway through the staged build."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "NEW\n", "hooks/h.py": "x\n"})
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "sentinel.md").write_text("PRE-EXISTING\n", encoding="utf-8")
+
+    import shutil as _shutil
+    real_copy2 = _shutil.copy2
+
+    def _boom(src, d, *a, **k):
+        if str(d).endswith("h.py"):  # fail PART-WAY through the build
+            raise OSError("simulated mid-build copy failure")
+        return real_copy2(src, d, *a, **k)
+
+    monkeypatch.setattr("levain.install.shutil.copy2", _boom)
+    with pytest.raises(OSError, match="simulated mid-build"):
+        _copy_activation_tree([base], dst, base_activation=base)
+    # dst was NOT replaced — the pre-existing tree survives intact (built in staging).
+    assert (dst / "sentinel.md").read_text(encoding="utf-8") == "PRE-EXISTING\n"
+    assert not (dst / "posture.md").exists()  # the half-built tree never swapped in
+    # the staging dir was cleaned up (no orphan under the install root).
+    assert not list(dst.parent.glob(".levain-activation-new-*"))
+
+
+def test_copy_activation_empty_base_masked_by_pack_raises(tmp_path: Path):
+    """An EMPTY base activation tree fails loud even when a pack contributes files
+    — the aggregate composition is non-empty but base contributes nothing, so a
+    pack must not mask it (codex L3 re-verify round-2 HIGH)."""
+    base = tmp_path / "base_activation"
+    base.mkdir()  # exists but EMPTY
+    pack = _mk_layer(tmp_path / "pack", {"posture.md": "PACK\n"})
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "sentinel.md").write_text("PRE\n", encoding="utf-8")
+    with pytest.raises(InitError, match="contributes no files"):
+        _copy_activation_tree([base, pack], dst, base_activation=base)
+    assert (dst / "sentinel.md").read_text(encoding="utf-8") == "PRE\n"  # untouched
+
+
+def test_copy_activation_swap_failure_restores_dst(tmp_path: Path, monkeypatch):
+    """If the atomic swap (new → dst) fails, the original tree is RESTORED — dst is
+    never left missing/partial (codex L3 re-verify round-2 MED rollback)."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "NEW\n"})
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "sentinel.md").write_text("ORIGINAL\n", encoding="utf-8")
+
+    import os as _os
+    real_replace = _os.replace
+
+    def _fail_new_into_place(src, d, *a, **k):
+        # fail only the new_tree → dst rename; let the move-aside + restore through.
+        if ".levain-activation-new-" in str(src):
+            raise OSError("simulated swap failure")
+        return real_replace(src, d, *a, **k)
+
+    monkeypatch.setattr("levain.install.os.replace", _fail_new_into_place)
+    with pytest.raises(OSError, match="simulated swap"):
+        _copy_activation_tree([base], dst, base_activation=base)
+    # original restored (not left missing); new tree never landed; no orphan dirs.
+    assert (dst / "sentinel.md").read_text(encoding="utf-8") == "ORIGINAL\n"
+    assert not (dst / "posture.md").exists()
+    assert not list(dst.parent.glob(".levain-activation-*"))
+
+
+def test_copy_activation_backup_cleaned_on_build_failure(tmp_path: Path, monkeypatch):
+    """A build failure after operator-edit backups were staged cleans those backups
+    — the originals still live in the untouched dst, so leftover backups would be
+    misleading (codex L3 re-verify round-2 LOW)."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "NEW\n", "hooks/h.py": "x\n"})
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "posture.md").write_text("OPERATOR EDIT\n", encoding="utf-8")  # differs → backed up
+
+    import shutil as _shutil
+    real_copy2 = _shutil.copy2
+
+    def _boom(src, d, *a, **k):
+        if str(d).endswith("h.py"):  # fail mid-build, AFTER the posture.md backup ran
+            raise OSError("mid-build fail")
+        return real_copy2(src, d, *a, **k)
+
+    monkeypatch.setattr("levain.install.shutil.copy2", _boom)
+    with pytest.raises(OSError, match="mid-build fail"):
+        _copy_activation_tree([base], dst, base_activation=base)
+    # operator edit preserved in the untouched dst; the misleading backup was cleaned.
+    assert (dst / "posture.md").read_text(encoding="utf-8") == "OPERATOR EDIT\n"
+    backups_root = dst.parent / ".levain" / "backups" / "activation"
+    assert not backups_root.exists() or not list(backups_root.iterdir())
+
+
+def test_copy_activation_cross_layer_file_dir_collision_fails_loud(tmp_path: Path):
+    """A path that is a FILE in one layer and a DIRECTORY in another fails loud (not
+    a silently malformed tree), and the staging keeps dst untouched (codex L3
+    re-verify round-3 MED)."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n", "x": "FILE\n"})
+    pack = _mk_layer(tmp_path / "pack", {"x/inner.txt": "DIR\n"})  # x is a DIR here
+    dst = tmp_path / "install" / "activation"
+    dst.mkdir(parents=True)
+    (dst / "sentinel.md").write_text("ORIGINAL\n", encoding="utf-8")
+    with pytest.raises(InitError, match="layer conflict"):
+        _copy_activation_tree([base, pack], dst, base_activation=base)
+    assert (dst / "sentinel.md").read_text(encoding="utf-8") == "ORIGINAL\n"  # untouched
+    assert not list(dst.parent.glob(".levain-activation-*"))  # staging cleaned
