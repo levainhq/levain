@@ -3,10 +3,12 @@
 Walks a stranger through standing up a new Levain install:
   1. Pick adapter — Claude Code or Codex (v1 = one adapter per install).
   2. Resolve environment-dependent placeholders.
-  3. Run the scripted interview to fill `world.md` + `origin.md`.
-  4. Render the templates into the install's `seed/` directory.
-  5. Copy the verbatim seed files (`partnership.md`, `memory.md`,
-     `spore_instructions.md`, the continuity scaffold, README).
+  3. Resolve the seed roster from the pack manifest (which seed files the
+     interview RENDERS vs are copied VERBATIM — see `levain/packs.py`).
+  4. Run the scripted interview to fill the render templates (`world.md` +
+     `origin.md` in the base pack) and render them into `seed/`.
+  5. Copy the verbatim seed files byte-exact (`partnership.md`, `memory.md`,
+     `spore_instructions.md`, the continuity scaffold, README in the base pack).
   6. Lay down the adapter's wiring (settings, MCP registration, hooks).
   7. Initialize the install-pinned anneal-memory store.
   8. Print next-steps banner.
@@ -27,12 +29,14 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from levain.packs import PackError, discover_roster, render_entries, verbatim_names
 
 if TYPE_CHECKING:
     from levain.interview import TemplateSpec
@@ -124,11 +128,17 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             print(f"FAIL: interview engine unavailable: {e}")
             return 1
 
-        spec_world = parse_template(templates_root / "seed" / "world.md")
-        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        try:
+            roster = discover_roster(templates_root)
+        except PackError as e:
+            print(f"FAIL: {e}")
+            return 1
+        render_specs = [parse_template(entry.path) for entry in render_entries(roster)]
+        verbatim = verbatim_names(roster)
 
+        rendered_names = ", ".join(s.path.name for s in render_specs)
         print("=" * 60)
-        print("Interview — fills the world.md and origin.md templates.")
+        print(f"Interview — fills the {rendered_names} templates.")
         print("=" * 60)
 
         # Resume from prior Ctrl+C if a checkpoint exists.
@@ -155,7 +165,7 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
         print("  Press Ctrl+C to interrupt — answers so far will be saved for resume.")
         try:
             answers = conduct_interview(
-                [spec_world, spec_origin],
+                render_specs,
                 answers=initial_answers,
                 checkpoint_fn=lambda a: _save_checkpoint(install, a),
             )
@@ -171,7 +181,8 @@ def run_init(path: Path, adapter: str | None, force: bool) -> int:
             templates_root,
             python_path,
             anneal_path,
-            [spec_world, spec_origin],
+            render_specs,
+            verbatim,
         )
 
     # Interview completed successfully — clear the checkpoint so the next
@@ -192,6 +203,7 @@ def apply_init(
     python_path: str,
     anneal_path: str,
     specs: list[TemplateSpec],
+    verbatim: Sequence[str],
     emit: Callable[[str], None] = print,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
@@ -216,9 +228,11 @@ def apply_init(
     covers the slots (the CLI via `conduct_interview`; the web via a form driven
     from `build_field_plan`).
 
-    `specs` is the list of templates to RENDER (world.md + origin.md today);
-    each is written to `install/seed/<spec.path.name>`. The verbatim
-    (non-rendered) seed files are copied separately below.
+    `specs` is the list of templates to RENDER (the roster's render entries,
+    parsed by the caller); each is written to `install/seed/<spec.path.name>`.
+    `verbatim` is the list of non-rendered seed filenames to copy byte-exact.
+    Both derive from one `packs.discover_roster` call in the caller, so render
+    and verbatim are the same partition the interview/form was built from.
 
     MUST be called inside a live `_templates_root()` context: the render/copy/
     adapter steps read from `templates_root`, which a zipped distribution
@@ -237,13 +251,7 @@ def apply_init(
             render_template(spec, answers), encoding="utf-8"
         )
 
-    for f in (
-        "partnership.md",
-        "memory.md",
-        "spore_instructions.md",
-        "continuity.md",
-        "README.md",
-    ):
+    for f in verbatim:
         src = templates_root / "seed" / f
         if src.is_file():
             shutil.copy2(src, install_seed / f)
@@ -475,16 +483,18 @@ class InitError(Exception):
 
 
 @contextmanager
-def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec]]]:
-    """Yield ``(templates_root, [world_spec, origin_spec])`` for an init run.
+def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[str]]]:
+    """Yield ``(templates_root, render_specs, verbatim)`` for an init run.
 
-    The shared templates-context + corruption preflight + parse, so a SECOND init
-    surface (the web POST) doesn't re-implement the ``with _templates_root()``
-    block, the missing-template check, and the two ``parse_template`` calls that
-    ``run_init`` does inline. MUST be consumed inside the ``with`` (the
-    materialized tempdir under a zipped distribution is cleaned up on exit, and
-    ``apply_init`` reads from ``templates_root``). Raises ``InitError`` (with a
-    ready-to-surface ``.message``) if the packaged templates are missing/corrupt.
+    The shared templates-context + corruption preflight + roster resolution, so a
+    SECOND init surface (the web POST) doesn't re-implement the ``with
+    _templates_root()`` block, the missing-template check, and the roster
+    discovery that ``run_init`` does inline. ``render_specs`` are the parsed
+    interview templates; ``verbatim`` is the list of non-rendered seed filenames
+    ``apply_init`` copies. MUST be consumed inside the ``with`` (the materialized
+    tempdir under a zipped distribution is cleaned up on exit, and ``apply_init``
+    reads from ``templates_root``). Raises ``InitError`` (with a ready-to-surface
+    ``.message``) if the packaged templates are missing/corrupt.
     """
     from levain.interview import parse_template
 
@@ -495,11 +505,13 @@ def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec]]]:
                 f"{templates_root}. The wheel may be corrupt; reinstall with "
                 f"`pip install --force-reinstall levain`."
             )
-        specs = [
-            parse_template(templates_root / "seed" / "world.md"),
-            parse_template(templates_root / "seed" / "origin.md"),
-        ]
-        yield templates_root, specs
+        try:
+            roster = discover_roster(templates_root)
+        except PackError as e:
+            raise InitError(str(e)) from e
+        specs = [parse_template(entry.path) for entry in render_entries(roster)]
+        verbatim = verbatim_names(roster)
+        yield templates_root, specs, verbatim
 
 
 def _install_adapter(
@@ -855,16 +867,8 @@ def _manifest_rows(
     rows: list[tuple[str, Path]] = []
 
     seed = install / "seed"
-    for name in (
-        "world.md",
-        "origin.md",
-        "partnership.md",
-        "memory.md",
-        "spore_instructions.md",
-        "continuity.md",
-        "README.md",
-    ):
-        rows.append(("seed", seed / name))
+    for f in sorted(seed.glob("*.md")):
+        rows.append(("seed", f))
 
     if adapter == "claude-code":
         rows.append(("adapter", install / "CLAUDE.md"))

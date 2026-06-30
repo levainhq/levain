@@ -759,6 +759,7 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
         result = apply_init(
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
         )
         # "Verbatim" means byte-identical to the template source — pin it.
         src_partnership = (templates_root / "seed" / "partnership.md").read_bytes()
@@ -801,6 +802,7 @@ def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
         result = apply_init(
             install, "claude-code", {}, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
         )
     assert result.store_ok is False
     assert result.complete is False
@@ -837,6 +839,7 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
         result = apply_init(
             install, "codex", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+            ["partnership.md", "memory.md", "spore_instructions.md", "continuity.md", "README.md"],
         )
 
     assert result.store_ok is True
@@ -850,3 +853,48 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
     # The redirected CODEX_HOME means the real ~/.codex was never touched.
     config = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert "mcp_servers.anneal_memory" in config
+
+
+def test_roster_to_apply_init_produces_byte_identical_seed(tmp_path: Path, monkeypatch):
+    """End-to-end behavior-preservation guard: discover_roster → apply_init must
+    produce a byte-identical seed — every verbatim file equal to its template
+    source, every render file slot-filled. The partition test (test_packs) plus
+    the apply_init byte-pin (above) together imply this; wiring them into ONE
+    test makes the byte-identity claim self-contained, so the exact regression
+    this roster refactor must never reintroduce is locked in a single place."""
+    from levain.interview import build_field_plan, parse_template
+    from levain.packs import discover_roster, render_entries, verbatim_names
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = discover_roster(templates_root)
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_names(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+        )
+        src = {
+            p.name: (templates_root / "seed" / p.name).read_bytes()
+            for p in (templates_root / "seed").glob("*.md")
+        }
+
+    seed = install / "seed"
+    # full partition installed
+    assert sorted(p.name for p in seed.glob("*.md")) == sorted(src)
+    # verbatim files byte-identical to their template source
+    for name in verbatim:
+        assert (seed / name).read_bytes() == src[name], f"{name} not byte-identical"
+    # render files slot-filled, no leftover placeholders
+    for entry in render_entries(roster):
+        text = (seed / entry.name).read_text(encoding="utf-8")
+        assert "{{" not in text and "VAL_" in text
