@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.3.4"
+version = "0.3.5"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -54,7 +54,13 @@ dependencies = [
     # `expect_disposition` to `SporeStore.descend` (the descend CAS added in 0.9.5). Same contract —
     # 0.9.4's `descend` has no such param, so the first compost/dismiss/remove would TypeError, not
     # refuse cleanly. (The tier CAS rides `update`'s expect_disposition, present since 0.9.1.)
-    "anneal-memory>=0.9.5,<0.10",
+    # `>=0.9.6` (spore-225 — the Chris release bundle): a RELEASE-GATE lockstep bump, NOT a new-API
+    # contract gate. 0.9.6 is the first PUBLIC 0.9.x on PyPI (AM-CONSOLIDATE-EFFERENT + the now-keyed
+    # AM-WRAP-GENERATED + the full 0.9.x stack); the compat-manifest's `pip_floor_verdict` release-gate
+    # requires this floor == `manifest.KNOWN_GOOD_ANNEAL` (also bumped to 0.9.6), so they move together
+    # or `levain doctor`'s `compat: pip-pin` check flags the skew. levain calls no 0.9.6-only API that
+    # 0.9.5 lacks — the floor is the published-known-good, not a runtime requirement.
+    "anneal-memory>=0.9.6,<0.10",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +83,16 @@ include = ["levain*"]
 
 [tool.setuptools.package-data]
 levain = ["templates/**/*"]
+
+# Never ship compiled bytecode in the wheel: the `templates/**/*` glob above would
+# otherwise pull in any `__pycache__/*.pyc` left in the working tree (cross-version
+# bytecode, e.g. cpython-314, to every adopter regardless of their interpreter).
+# `levain init` already strips these on copy, but the artifact itself must be clean.
+# Scoped GLOBALLY (not just under templates/) so a `__pycache__` at the package root
+# or in any subpackage can't leak into the wheel either — the sdist's MANIFEST.in
+# `global-exclude` covers the same, keeping wheel and sdist symmetric (L3 MED-3).
+[tool.setuptools.exclude-package-data]
+levain = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

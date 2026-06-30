@@ -1,4 +1,5 @@
 recursive-include levain/templates *
+global-exclude __pycache__/* *.pyc *.pyo
 include LICENSE
 include NOTICE
 include README.md

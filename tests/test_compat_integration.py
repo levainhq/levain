@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -23,8 +24,8 @@ def _store(tmp_path: Path) -> Path:
 
 
 def _inst(**kw) -> InstalledSet:
-    base = dict(levain="0.3.4", anneal="0.9.5", schema="partnership",
-                migrate_acked="0.9.5", pending_count=0)
+    base = dict(levain="0.3.4", anneal="0.9.6", schema="partnership",
+                migrate_acked="0.9.6", pending_count=0)
     base.update(kw)
     return InstalledSet(**base)
 
@@ -42,7 +43,7 @@ def test_doctor_compat_all_green_when_in_sync(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.5", "partnership"))
+                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
     results = doctor._check_compat_set(tmp_path)
     assert results and all(r.ok for r in results)
     assert any(r.name == "compat: pip-pin" for r in results)
@@ -66,7 +67,7 @@ def test_doctor_compat_pending_is_advisory_not_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(pending_count=6))
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.5", "partnership"))
+                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
     results = doctor._check_compat_set(tmp_path)
     migrate = next(r for r in results if r.name == "compat: migrate")
     assert migrate.ok                          # advisory, green
@@ -81,7 +82,7 @@ def test_doctor_compat_ahead_is_advisory_not_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(anneal="0.10.0"))
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.5", "partnership"))
+                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
     results = doctor._check_compat_set(tmp_path)
     anneal = next(r for r in results if r.name == "compat: anneal")
     assert anneal.ok
@@ -93,7 +94,7 @@ def test_doctor_pip_pin_unknown_does_not_red_operator(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.5", "partnership"))
+                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
     monkeypatch.setattr(manifest, "pip_floor_verdict",
                         lambda: AxisVerdict("pip-pin", "unknown", "metadata unreadable"))
     pin = next(r for r in doctor._check_compat_set(tmp_path) if r.name == "compat: pip-pin")
@@ -108,7 +109,7 @@ def test_doctor_pip_pin_is_advisory_never_fails_operator(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.5", "partnership"))
+                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
     monkeypatch.setattr(manifest, "pip_floor_verdict",
                         lambda: AxisVerdict("pip-pin", "drift", "KNOWN_GOOD != the pin"))
     pin = next(r for r in doctor._check_compat_set(tmp_path) if r.name == "compat: pip-pin")
@@ -155,7 +156,7 @@ def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
     lock = manifest.read_lock(tmp_path)
-    assert lock == CompatSet(manifest.declared_set().levain, "0.9.5", "partnership")
+    assert lock == CompatSet(manifest.declared_set().levain, "0.9.6", "partnership")
 
 
 def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypatch):
@@ -168,22 +169,56 @@ def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypat
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
-    target = manifest.template_ack_target("0.9.5")  # == TEMPLATES_RECONCILED_ANNEAL
+    target = manifest.template_ack_target("0.9.6")  # == TEMPLATES_RECONCILED_ANNEAL
     assert ["migrate", "ack", target] in calls
     assert manifest.read_lock(tmp_path) is not None
 
 
 def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
-    # A --force re-install over a store already acked HIGHER than the reconciled
-    # version must NOT be lowered (it would needlessly re-surface reviewed edits).
+    # A store whose marker is ALREADY ahead of the ack target must NOT be lowered.
+    # This fixture is the "marker ahead of the installed runtime" shape (acked 0.9.7
+    # over installed 0.9.6 — e.g. a prior newer/manual ack, then run under an older
+    # anneal): ack_target = min(reconciled 0.9.6, installed 0.9.6) = 0.9.6, acked 0.9.7
+    # > 0.9.6 -> no ack. The cleaner "--force over an already-reviewed higher store"
+    # shape is the companion test below.
     store = _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(migrate_acked="0.9.0"))
+                        lambda *a, **k: _inst(migrate_acked="0.9.7"))
     calls = []
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
     assert not any(a[:2] == ["migrate", "ack"] for a in calls)
+
+
+def test_record_compat_lock_ack_advance_only_force_reinstall(tmp_path, monkeypatch):
+    # The normal advance-only case (codex L3): a --force re-install over a store on a
+    # NEWER anneal already acked at that newer version. installed 0.10.0, acked 0.10.0,
+    # reconciled cap 0.9.6 -> ack_target = min(0.9.6, 0.10.0) = 0.9.6; acked 0.10.0 >
+    # 0.9.6 -> no ack (never lower an already-reviewed higher marker).
+    store = _store(tmp_path)
+    monkeypatch.setattr(manifest, "discover_installed_set",
+                        lambda *a, **k: _inst(anneal="0.10.0", migrate_acked="0.10.0"))
+    calls = []
+    monkeypatch.setattr(install, "_run_anneal_cmd",
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
+    install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
+    assert not any(a[:2] == ["migrate", "ack"] for a in calls)
+
+
+def test_record_compat_lock_acks_prerelease_to_exact_runtime(tmp_path, monkeypatch):
+    # A pre-release anneal runtime is tuple-equal to the cap (version_tuple collapses
+    # the suffix) but must be acked to its EXACT string, never substituted with the
+    # bare final cap label — a 0.9.6rc1 runtime acked as the final 0.9.6 would record
+    # a compose that did not happen (codex L3; init now mirrors update._ack_target).
+    store = _store(tmp_path)
+    monkeypatch.setattr(manifest, "discover_installed_set",
+                        lambda *a, **k: _inst(anneal="0.9.6rc1", migrate_acked=None))
+    calls = []
+    monkeypatch.setattr(install, "_run_anneal_cmd",
+                        lambda store, ap, args, **k: calls.append(args) or (True, "", []))
+    install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
+    assert ["migrate", "ack", "0.9.6rc1"] in calls
 
 
 def test_record_compat_lock_no_reack_at_target(tmp_path, monkeypatch):
@@ -222,8 +257,9 @@ def test_record_compat_lock_skips_write_on_unknown(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# spore-216: templates reconciled through 0.8.3 -> a fresh install's pending
-# drift drops to exactly the entries ABOVE the cap (uncovered, honestly surfaced)
+# spore-216/spore-218: templates reconciled through 0.9.6 -> a fresh install's
+# pending drift drops to exactly the entries ABOVE the cap (uncovered, honestly
+# surfaced)
 # --------------------------------------------------------------------------
 
 def test_templates_reconciled_constant_within_known_good():
@@ -235,13 +271,20 @@ def test_templates_reconciled_constant_within_known_good():
 
 def test_template_ack_target_caps_and_skips():
     # Reconciled target when installed is at/above it; capped at installed when
-    # older; skipped when unknown. Exercises the 0.8.3 boundary explicitly.
-    assert manifest.template_ack_target("0.9.5") == manifest.TEMPLATES_RECONCILED_ANNEAL
+    # older; skipped when unknown. Exercises the 0.9.6 boundary explicitly.
+    assert manifest.template_ack_target("0.10.0") == manifest.TEMPLATES_RECONCILED_ANNEAL
+    assert manifest.template_ack_target("0.9.7") == manifest.TEMPLATES_RECONCILED_ANNEAL  # just above -> cap
     assert manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL) == \
         manifest.TEMPLATES_RECONCILED_ANNEAL                  # exactly at the cap -> the cap
+    assert manifest.template_ack_target("0.9.5") == "0.9.5"   # the old known-good, now below the cap -> installed
     assert manifest.template_ack_target("0.8.2") == "0.8.2"   # just below the cap -> cap at installed
     assert manifest.template_ack_target("0.4.0") == "0.4.0"   # well below -> cap at installed
     assert manifest.template_ack_target(None) is None         # unknown -> skip the ack
+    # Pre-release / post / local label of the cap: version_tuple collapses the suffix
+    # so it compares EQUAL to the cap, but the ack records the EXACT runtime, never
+    # the bare final cap label (codex L3 — init must mirror update._ack_target).
+    assert manifest.template_ack_target("0.9.6rc1") == "0.9.6rc1"
+    assert manifest.template_ack_target("0.9.6.post1") == "0.9.6.post1"
 
 
 # Per-MANIFEST-ENTRY coverage sentinels: feature-code → a literal string that MUST
@@ -256,9 +299,21 @@ _COVERAGE_SENTINELS = {
     "AM-LINKGATE": "Co-citing 2+ episodes",             # co-citation, not single-id
 }
 # EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
-# sentinel" is a reviewed decision rather than an omission. (0.4.8 AM-PRESERVE-BARE-
-# PATH is a transparent engine fix — its own manifest suggested_edit says so.)
-_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH"}
+# sentinel" is a reviewed decision rather than an omission.
+# - AM-PRESERVE-BARE-PATH (0.4.8) is a transparent engine fix — its own manifest
+#   suggested_edit says so.
+# - AM-WRAP-GENERATED (0.9.6) is "disposition, not text" — it retires a static
+#   WRAP_PROTOCOL.md companion file. Levain's seed carries NO such companion, and
+#   memory.md's wrap guidance is already INLINE and points at `prepare_wrap` as the
+#   source of truth ("follow what it emits ... the package carries the authoritative
+#   contract") — exactly the inline-methodology end-state the entry asks for, so there
+#   is nothing to archive and no text to add. Reviewed no-edit (spore-218). UNLIKE the
+#   textless engine fix above, this entry HAS a checkable end-state, so it is NOT left
+#   to manual review: `test_am_wrap_generated_inline_end_state_is_structurally_guarded`
+#   enforces it every run (positive prepare_wrap pointer + negative no-companion-file),
+#   so a future seed edit that froze the wrap steps fails CI instead of silently making
+#   the init-ack dishonest (L1 MED-1).
+_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED"}
 
 
 def test_seed_templates_carry_the_reconciled_guidance():
@@ -297,12 +352,78 @@ def test_seed_templates_carry_the_reconciled_guidance():
             f"TEMPLATES_RECONCILED_ANNEAL."
         )
         checked += 1
-    # Non-vacuous: at the 0.8.3 cap we exercise spores + migrate-notify + crystal +
-    # mcp-crystal + linkgate (0.4.8 is allowlisted).
+    # Non-vacuous: at the 0.9.6 cap we exercise spores + migrate-notify + crystal +
+    # mcp-crystal + linkgate via sentinels (0.4.8 AM-PRESERVE-BARE-PATH and 0.9.6
+    # AM-WRAP-GENERATED are allowlisted no-edit, so they don't add to the count).
     assert checked >= 5
 
     # The linkgate example is co-citation, not a bare single-id (AM-LINKGATE detail).
     assert "[evidence: <id1>, <id2>" in seed_text
+
+
+def test_am_wrap_generated_inline_end_state_is_structurally_guarded():
+    # AM-WRAP-GENERATED (0.9.6) is allowlisted no-edit in `_NO_EDIT_REQUIRED`, so the
+    # generic coverage loop above skips it. But UNLIKE the textless engine-fix
+    # AM-PRESERVE-BARE-PATH, this entry HAS a checkable end-state: raising the cap to
+    # 0.9.6 makes `levain init` auto-ack it, and that is honest ONLY while the seed
+    # carries NO static WRAP_PROTOCOL.md companion AND its wrap guidance stays INLINE,
+    # pointing at `prepare_wrap` as the source of truth (the inline-methodology branch
+    # of the entry's suggested_edit). This guard enforces that end-state every run, so a
+    # future seed edit that froze the wrap mechanics into a companion file — or
+    # de-inlined memory.md and dropped the prepare_wrap pointer — fails CI instead of
+    # silently making the init-ack dishonest (L1 MED-1, spore-218).
+    templates_root = Path(install.__file__).parent / "templates"
+    memory_md = (templates_root / "seed" / "memory.md").read_text(encoding="utf-8")
+
+    # (1) Positive: the wrap guidance is inline and defers to `prepare_wrap` as the
+    #     authoritative source — not a frozen, drifting copy of the mechanics.
+    assert "prepare_wrap" in memory_md
+    assert "the package carries the authoritative contract" in memory_md, (
+        "seed/memory.md no longer points at `prepare_wrap` as the wrap-mechanics "
+        "source of truth — AM-WRAP-GENERATED's inline end-state is broken, so the "
+        "init-ack at the 0.9.6 cap would silently suppress a now-legitimate proposal."
+    )
+
+    # (2) Negative: no static WRAP_PROTOCOL.md-style companion file ANYWHERE in the
+    #     rendered templates (seed OR adapters), and nothing references/@imports one.
+    companion_files = [
+        p for p in templates_root.rglob("*")
+        if p.is_file() and re.search(r"wrap[_-]?protocol", p.name, re.IGNORECASE)
+    ]
+    assert not companion_files, (
+        f"a static wrap-protocol companion file appeared in the templates "
+        f"({[str(p) for p in companion_files]}) — AM-WRAP-GENERATED retires such a "
+        f"doc; it must not ship in the seed while the entry is allowlisted no-edit."
+    )
+    text_files = "\n".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted(templates_root.rglob("*"))
+        if p.is_file() and p.suffix in {".md", ".template", ".json", ".toml", ".py"}
+    )
+    assert not re.search(r"wrap[_-]?protocol\.md", text_files, re.IGNORECASE), (
+        "a template references a WRAP_PROTOCOL.md companion (a pointer or @import) — "
+        "retire the reference; `prepare_wrap` generates the wrap mechanics in-context."
+    )
+
+    # (3) Negative, defence-in-depth: the SEED is inline prose by design — it uses
+    #     Jinja only for variable substitution, never file composition. Assert it
+    #     carries NO include/extends/import directive, so a future edit that pulls a
+    #     (possibly variable-named, regex-evading) companion doc into the rendered
+    #     seed trips here rather than slipping past the filename scan above (L3 MED-2).
+    seed_text_all = "\n".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted((templates_root / "seed").rglob("*"))
+        if p.is_file()
+    )
+    composition_directive = re.search(
+        r"\{%-?\s*(?:include|extends|import|from)\s|@import\b", seed_text_all
+    )
+    assert composition_directive is None, (
+        "a seed template now uses a file-composition directive "
+        f"({composition_directive.group(0)!r}) — the seed is inline by design; a "
+        "composed-in companion could reintroduce a static, drifting wrap protocol "
+        "that the filename scan above would miss."
+    )
 
 
 @pytest.mark.skipif(
@@ -317,11 +438,13 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
     # reconciled cap). What stays pending is exactly the manifest entries ABOVE the
     # cap but <= the installed anneal — the entries the seed honestly does NOT yet
     # reconcile. We compute that expected count from the LIVE manifest so this stays
-    # correct as anneal ships entries above the cap (e.g. AM-WRAP-GENERATED at 0.9.5,
-    # spore-217): then this asserts 1, not a brittle 0. (A bare `== 0` was the
+    # correct as anneal ships entries above the cap: with the cap at 0.9.6 and an
+    # installed 0.9.6 nothing is above it, so this asserts 0; the moment anneal ships
+    # an entry above 0.9.6 it asserts 1 without a code change. (A bare `== 0` was the
     # off-by-one — it only held while the installed manifest topped out at the cap;
-    # codex/L3 + L1 caught it.) The cap is NOT raised to clear that pending — that
-    # would require the seed to actually reconcile the above-cap entry first.
+    # codex/L3 + L1 caught it. spore-218 raised the cap to 0.9.6 ONLY after the seed
+    # reconciled AM-WRAP-GENERATED — a no-edit disposition entry — never to silence a
+    # pending count.)
     store = tmp_path / ".levain" / "memory.db"
     store.parent.mkdir(parents=True)
     ap = shutil.which("anneal-memory") or "anneal-memory"
