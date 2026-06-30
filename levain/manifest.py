@@ -64,7 +64,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "0.9.5"
+KNOWN_GOOD_ANNEAL = "0.9.6"
 
 # The anneal store section-schema a partnership entity runs on (anneal
 # AM-INITSCHEMA). A store left on the default silently runs the 4-section ops
@@ -80,27 +80,35 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # version's manifest entries. Invariant (release-gate, test-locked): must be
 # <= KNOWN_GOOD_ANNEAL — you cannot reconcile templates to a version you don't ship.
 #
-# Reconciled through 0.8.3 (spore-216 — the crystal-recall slice). The seed now
-# genuinely incorporates every migration entry through this version: the spores
-# boundary (0.4.7 AM-SPORES-BOUNDARY), the `levain update` upgrade habit (0.4.7
-# AM-MIGRATE-NOTIFY), the bare-path demotion fix (0.4.8 AM-PRESERVE-BARE-PATH — a
-# transparent engine fix, no template edit required), the crystallized-pattern tier
-# (0.7.1 AM-CRYSTAL) and its MCP read surface (0.8.2 AM-MCP-CRYSTAL) — memory.md
-# describes crystallize-OUT, per-turn recall, wrap-time crystallization routing, and
-# the `crystal_recall` / `crystal_index` tools, and the activation hook NOW fires
-# per-turn crystal recall (that hook gap was exactly what the apparatus caught at
-# the old 0.4.8 cap: the claim was aspirational because the hook never recalled) —
-# and the co-citation/linkgate discipline (0.8.3 AM-LINKGATE). A fresh `levain
-# doctor` therefore shows no pending drift for any entry AT OR BELOW this version;
-# an entry ABOVE the cap (e.g. AM-WRAP-GENERATED at 0.9.5, landing via spore-217)
-# stays HONESTLY pending until a follow-up reconciles its guidance into the seed and
-# raises the cap — never pre-acked here. A reviewed release-checklist assertion:
-# bump it only when the seed templates are reconciled to that version's manifest
-# entries; the manifest-driven coverage test
-# (test_seed_templates_carry_the_reconciled_guidance) locks each entry's guidance so
-# a future template edit that DROPS it — or a new at/below-cap entry left unmapped —
-# fails the suite instead of silently making the init-ack dishonest.
-TEMPLATES_RECONCILED_ANNEAL = "0.8.3"
+# Reconciled through 0.9.6 (spore-218 — the AM-WRAP-GENERATED reconcile on the
+# spore-216 crystal-recall base). The seed genuinely incorporates every migration
+# entry through this version: the spores boundary (0.4.7 AM-SPORES-BOUNDARY), the
+# `levain update` upgrade habit (0.4.7 AM-MIGRATE-NOTIFY), the bare-path demotion
+# fix (0.4.8 AM-PRESERVE-BARE-PATH — a transparent engine fix, no template edit
+# required), the crystallized-pattern tier (0.7.1 AM-CRYSTAL) and its MCP read
+# surface (0.8.2 AM-MCP-CRYSTAL) — memory.md describes crystallize-OUT, per-turn
+# recall, wrap-time crystallization routing, and the `crystal_recall` /
+# `crystal_index` tools, and the activation hook fires per-turn crystal recall —
+# the co-citation/linkgate discipline (0.8.3 AM-LINKGATE), and the wrap-mechanics-
+# are-GENERATED disposition (0.9.6 AM-WRAP-GENERATED). That last entry is the first
+# that retires a methodology COMPANION FILE rather than reconciling a description of
+# a feature ("disposition, not text") — and it requires NO Levain template edit: the
+# seed carries no static WRAP_PROTOCOL.md companion to retire, and memory.md's wrap
+# guidance is already INLINE and points at `prepare_wrap` as the source of truth
+# ("follow what it emits ... the package carries the authoritative contract") rather
+# than freezing a copy of the steps — exactly the inline-methodology end-state the
+# entry asks for. It is therefore carried as a reviewed `_NO_EDIT_REQUIRED` allowlist
+# entry in the coverage test (the second member, after the 0.4.8 engine fix), not a
+# content sentinel. A fresh `levain doctor` therefore shows no pending drift for any
+# entry AT OR BELOW this version; an entry ABOVE the cap stays HONESTLY pending until
+# a follow-up reconciles its guidance into the seed and raises the cap — never
+# pre-acked here. A reviewed release-checklist assertion: bump it only when the seed
+# templates are reconciled to that version's manifest entries; the manifest-driven
+# coverage test (test_seed_templates_carry_the_reconciled_guidance) locks each
+# entry's guidance (or its no-edit allowlisting) so a future template edit that DROPS
+# it — or a new at/below-cap entry left unmapped — fails the suite instead of
+# silently making the init-ack dishonest.
+TEMPLATES_RECONCILED_ANNEAL = "0.9.6"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).
@@ -488,12 +496,24 @@ def template_ack_target(installed_anneal: str | None) -> str | None:
     CAPPED at the installed anneal (anneal refuses an ack ahead of the installed
     version). Returns ``None`` when the installed version is unknown — then skip
     the ack entirely (a missing read is UNKNOWN, never a default; and the cap is
-    unverifiable)."""
+    unverifiable).
+
+    Mirror ``update._ack_target``: NEVER ack past the exact runtime. When the
+    installed is strictly AHEAD of the cap, ack to the reconciled cap (the templates
+    only reconcile through it). When the installed is BEHIND, ack to it. When the
+    installed is tuple-EQUAL to the cap but the strings differ — a pre-release /
+    post / local label (``version_tuple`` collapses the non-numeric suffix, so e.g.
+    ``0.9.6rc1`` compares EQUAL to ``0.9.6``) — ack to the EXACT installed string,
+    never substituting the bare final cap label: a ``0.9.6rc1`` runtime must be
+    recorded as ``0.9.6rc1``, not as the final ``0.9.6`` it is not (codex L3). An
+    exact match returns the same value either way."""
     if installed_anneal is None:
         return None
-    if _cmp(installed_anneal, TEMPLATES_RECONCILED_ANNEAL) < 0:
-        return installed_anneal
-    return TEMPLATES_RECONCILED_ANNEAL
+    cmp = _cmp(installed_anneal, TEMPLATES_RECONCILED_ANNEAL)
+    if cmp > 0:
+        return TEMPLATES_RECONCILED_ANNEAL  # strictly ahead -> cap at the reconciled version
+    # behind OR tuple-equal -> ack to exactly what is installed (never past the runtime)
+    return installed_anneal
 
 
 # ---------------------------------------------------------------------------
