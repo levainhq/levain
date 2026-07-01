@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Levain — Operator Manual</title>
+  <link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <button id="nav-toggle" type="button" aria-expanded="false" aria-controls="toc">☰ Chapters</button>
+  <div id="layout">
+    <nav id="toc" aria-label="Manual contents">
+      <div class="toc-head">Operator Manual</div>
+      <ol id="toc-list"></ol>
+      <div class="toc-foot">Levain · local · read-only</div>
+    </nav>
+    <main id="content" tabindex="-1">
+      <p id="status" role="status">Loading the manual…</p>
+      <div id="chapters"></div>
+    </main>
+  </div>
+  <!-- The SHARED reviewed renderer (parity-locked with the dashboard) loads first,
+       exposing window.LevainMD; docs.js consumes it. Both same-origin (CSP). -->
+  <script src="/markdown.js"></script>
+  <script src="/docs.js"></script>
+</body>
+</html>

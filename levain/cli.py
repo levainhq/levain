@@ -321,6 +321,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     serve_p.set_defaults(func=_cmd_serve_app)
 
+    docs_p = subparsers.add_parser(
+        "docs",
+        help="Read the operator manual in the browser (base + installed pack chapters).",
+        description=(
+            "Serve the Levain operator manual as a local web page — the base "
+            "'Driving Your Partner' guide COMPOSED with any installed pack's own "
+            "chapters (the same multi-root layering as the seed roster). READ-ONLY "
+            "and loopback-only (127.0.0.1); your browser, your machine, no vendor "
+            "host, no CDN, no account. Base docs ship in the wheel; a pack's chapters "
+            "were copied into the install at `levain init --pack` time, so the "
+            "composed view is self-contained."
+        ),
+    )
+    docs_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    docs_p.add_argument(
+        "--port",
+        type=int,
+        default=7440,
+        help="Port to bind on localhost (default: 7440).",
+    )
+    docs_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Loopback address to bind (default: 127.0.0.1). `docs` is loopback-only: "
+            "the operator manual is a local read surface, refused off-box."
+        ),
+    )
+    docs_p.add_argument(
+        "--no-open",
+        action="store_true",
+        dest="no_open",
+        help="Do not open a browser tab on startup.",
+    )
+    docs_p.set_defaults(func=_cmd_docs)
+
     daemon_p = subparsers.add_parser(
         "daemon",
         help="Install/manage the always-on `serve` autostart (login-start, crash-survive).",
@@ -513,6 +554,17 @@ def _cmd_serve_app(args: argparse.Namespace) -> int:
     from levain.app_server import run_app_server
 
     return run_app_server(path=args.path)
+
+
+def _cmd_docs(args: argparse.Namespace) -> int:
+    from levain.docs_server import run_docs_web
+
+    return run_docs_web(
+        path=args.path,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+    )
 
 
 def _daemon_provider():

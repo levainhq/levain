@@ -40,9 +40,11 @@ from typing import TYPE_CHECKING
 from levain.packs import (
     BASE_IMPORT_ORDER,
     PackError,
+    PackManifest,
     SeedEntry,
     compose_roster,
     import_entries,
+    load_pack_manifest,
     order_activation_roots,
     render_entries,
     verbatim_entries,
@@ -73,6 +75,73 @@ class InitResult:
         return self.store_ok
 
 
+def _copy_pack_docs(install: Path, packs: Sequence[tuple[PackManifest, Path]]) -> list[str]:
+    """Copy each pack's ``docs/*.md`` into ``<install>/.levain/docs/<seq>-<pack>/``
+    so `levain docs` composes a SELF-CONTAINED view independent of the original
+    ``--pack`` directory (which may be gone by then). Returns the copied chapter
+    labels (for the install print).
+
+    ``packs`` is a sequence of ``(manifest, pack_dir)`` pairs — the manifests
+    ALREADY validated in ``run_init``'s pre-interview snapshot, threaded in rather
+    than re-read here. That (a) keeps the ONE-manifest-snapshot discipline
+    ``run_init`` uses for seed+activation (a pack.toml edited during the interview
+    can't make docs use a different order/name than the roster did), and (b) means
+    this function raises no ``PackError`` at copy time (L1 review).
+
+    The tree is DERIVED, not operator-edited, so it is rebuilt from scratch every
+    install — a ``--force`` reinstall with a changed pack set never strands a stale
+    chapter. A pack that ships no ``docs/`` (or an empty one) is skipped: pack docs
+    are optional. Base docs ship in the wheel and are NOT copied here.
+
+    Layer dirs are numbered by COMPOSITION RANK — the same ``(order, input-index)``
+    stable ordering ``packs.compose_roster`` uses — zero-padded, so `levain.docs`
+    reads layers in composition order by a plain lexical sort, AND two packs sharing
+    an ``order``/``name`` get DISTINCT dirs instead of silently merging (codex L3
+    MED). The resolved layer path is asserted to stay under the docs root as
+    defense-in-depth (``packs.load_pack_manifest`` already rejects path separators
+    in ``name``; codex L3 HIGH). If any copy fails mid-way, the whole derived tree
+    is removed before the error propagates, so the caller's "shows base only"
+    fallback is TRUE, never a half-copied manual (codex L3 LOW)."""
+    from levain.docs import INSTALL_DOCS_SUBPATH, PACK_DOCS_DIRNAME
+
+    dest_root = install.joinpath(*INSTALL_DOCS_SUBPATH)
+    if dest_root.exists():
+        shutil.rmtree(dest_root)
+
+    # Order by (manifest.order, input-index) — the same stable sort compose_roster
+    # uses — so the docs layer order matches the seed composition order even for
+    # equal `order` values (a lexical dir-name sort alone would reorder them).
+    ranked = sorted(
+        ((manifest, i, pack_dir) for i, (manifest, pack_dir) in enumerate(packs)),
+        key=lambda t: (t[0].order, t[1]),
+    )
+    dest_root_resolved = dest_root.resolve()
+    copied: list[str] = []
+    try:
+        for seq, (manifest, _idx, pack_dir) in enumerate(ranked):
+            src = pack_dir / PACK_DOCS_DIRNAME
+            if not src.is_dir():
+                continue
+            md_files = sorted((f for f in src.glob("*.md") if f.is_file()), key=lambda f: f.name)
+            if not md_files:
+                continue
+            layer = dest_root / f"{seq:03d}-{manifest.name}"
+            if not layer.resolve().is_relative_to(dest_root_resolved):
+                raise InitError(f"pack {manifest.name!r}: docs layer path escapes {dest_root}")
+            layer.mkdir(parents=True, exist_ok=True)
+            for f in md_files:
+                shutil.copy2(f, layer / f.name)
+                copied.append(f"{manifest.name}/{f.name}")
+    except BaseException:
+        # Any mid-copy failure (OSError, containment, KeyboardInterrupt) must not
+        # leave a PARTIAL manual behind — remove the whole derived tree so the
+        # caller's "base only" fallback is accurate, then re-raise.
+        if dest_root.exists():
+            shutil.rmtree(dest_root, ignore_errors=True)
+        raise
+    return copied
+
+
 def run_init(
     path: Path, adapter: str | None, force: bool, packs: list[Path] | None = None
 ) -> int:
@@ -82,6 +151,9 @@ def run_init(
     # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved
     # the same way as --path; a bad pack dir / missing pack.toml fails loud below.
     pack_dirs = [Path(str(p)).expanduser().resolve() for p in (packs or [])]
+    # Filled from the pre-interview snapshot below; initialized here so the
+    # post-interview docs-refresh always has a bound value (mypy flow-analysis).
+    pack_manifests: list[PackManifest] = []
 
     try:
         chosen = _resolve_adapter(adapter)
@@ -144,6 +216,11 @@ def run_init(
             return 1
 
         try:
+            # Validate + SNAPSHOT the pack manifests once, up-front (same discipline
+            # as the roster/activation snapshot below) — a PackError here fails clean
+            # BEFORE the interview, and the docs-copy step reuses this snapshot rather
+            # than re-reading a pack.toml that could be edited mid-interview.
+            pack_manifests = [load_pack_manifest(p) for p in pack_dirs]
             roster = compose_roster([templates_root, *pack_dirs])
             # Resolve the activation-tree layer stack HERE — from the same manifest
             # read as compose_roster, BEFORE the interview — so (a) a bad/mutated
@@ -221,6 +298,26 @@ def run_init(
     # Interview completed successfully — clear the checkpoint so the next
     # `levain init --force` doesn't offer to resume stale answers.
     _clear_checkpoint(install)
+
+    # ALWAYS refresh the persisted pack docs so `levain docs` renders a
+    # SELF-CONTAINED composed view — even with NO --pack this session. Calling it
+    # unconditionally is load-bearing: a --force reinstall that DROPS a pack must
+    # CLEAR that pack's stale (possibly company-private) chapters, not serve them
+    # forever — the exact IP-boundary failure class (complement L3 CRITICAL).
+    # `_copy_pack_docs` handles an empty pack list correctly (wipes .levain/docs,
+    # copies nothing). Base docs ship in the wheel; only pack docs copy. A copy
+    # failure must NOT fail an otherwise-good install (the manual is a read surface,
+    # not install-critical), so it warns and continues.
+    try:
+        copied_docs = _copy_pack_docs(install, list(zip(pack_manifests, pack_dirs)))
+    except (OSError, InitError) as e:
+        print(f"  note: could not refresh pack docs ({e}); `levain docs` shows base only.")
+        copied_docs = []
+    if copied_docs:
+        print(
+            f"  docs:      {len(copied_docs)} pack chapter(s) → .levain/docs/ "
+            f"(compose with `levain docs`)"
+        )
 
     store = install / ".levain" / "memory.db"
     _print_manifest(install, chosen, store, store_ok=result.store_ok)
