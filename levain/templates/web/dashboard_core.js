@@ -83,6 +83,13 @@
   // `pollJob` reads GET /job.json for the terminal result. Both null on a read-only port.
   let commitJob = null;
   let pollJob = null;
+  // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
+  // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
+  // off-box, exactly like /substrate.json). null → search falls back to a direct token-free fetch:
+  // the transport-agnostic-core SAFETY NET so the core never hard-requires the transport. The
+  // shipped web boot injects `recall` on EVERY surface (both render branches), so for `levain serve`
+  // that fallback is not a live path — off-box search always rides the token-carrying transport.
+  let recall = null;
   // Called when the LAST active job poll terminates → the boot layer flushes a board reload it
   // DEFERRED while a job was polling (so a sibling write — inbox/relay/edit — doesn't rebuild the
   // board and detach the live consult box mid-job; L3 codex MED). null on a read-only port.
@@ -160,6 +167,7 @@
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
+    recall = opts && typeof opts.recall === "function" ? opts.recall : null;
 
     const board = document.getElementById("board");
     if (!board) return;
@@ -744,9 +752,16 @@
       const mine = ++seq;
       status.textContent = "searching…";
       try {
-        const res = await fetch("/recall.json?keyword=" + encodeURIComponent(q), { cache: "no-store" });
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
+        // Route through the injected recall transport when present (it carries the off-box token —
+        // spore-220 gates /recall.json off-box); fall back to a direct token-free fetch otherwise.
+        let data;
+        if (recall) {
+          data = await recall(q);
+        } else {
+          const res = await fetch("/recall.json?keyword=" + encodeURIComponent(q), { cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          data = await res.json();
+        }
         if (mine !== seq) return;  // superseded by a newer query
         const rerr = data.errors && (data.errors.episodes || data.errors.server);
         if (rerr) {

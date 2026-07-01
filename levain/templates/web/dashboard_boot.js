@@ -50,17 +50,49 @@
   const WRITE_TOKEN_KEY = "levain_write_token";
   let writeTokenRequired = false;
 
+  // The device-held off-box token from localStorage ("" if none / private mode).
+  function storedToken() {
+    try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; }
+  }
+  // Prompt for + persist the off-box token; returns the entered token ("" if cancelled). The
+  // desktop-browser STOPGAP entry point (flowConnect's native shell injects the same header from
+  // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
+  function promptForToken() {
+    const tok = (window.prompt("Off-box token (shown on the bridge --write startup line):") || "").trim();
+    if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
+    return tok;
+  }
+  // Drop a stored token so the next attempt re-prompts (a mistyped / rotated token).
+  function dropToken() {
+    try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
+  }
+  // Headers for a READ (GET): attach the stored off-box token OPPORTUNISTICALLY if we hold one.
+  // Harmless on a loopback / read-only surface (the server skips the read gate there); REQUIRED on
+  // an off-box writable surface (spore-220 gates the substrate reads). No Content-Type — GET has no body.
+  function readHeaders() {
+    const h = {};
+    const tok = storedToken();
+    if (tok) h["X-Levain-Write-Token"] = tok;
+    return h;
+  }
+  // Headers for a WRITE (POST): Content-Type + the token when the surface requires it, PROMPTING if
+  // we don't hold one yet (the write path always knows writeTokenRequired by commit time).
   function writeHeaders() {
     const h = { "Content-Type": "application/json" };
     if (!writeTokenRequired) return h;
-    let tok = "";
-    try { tok = window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { /* private mode */ }
-    if (!tok) {
-      tok = (window.prompt("Off-box write token (shown on the bridge --write startup line):") || "").trim();
-      if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
-    }
+    let tok = storedToken();
+    if (!tok) tok = promptForToken();
     if (tok) h["X-Levain-Write-Token"] = tok;
     return h;
+  }
+  // True iff a 403 is the off-box token gate (JSON body w/ a token message) vs a Host / cross-site
+  // refusal (plain text). Consumes the body — the caller re-fetches on retry, so that's fine.
+  // NB (complement L3 FIND-4): this ``/token/i`` matcher is coupled to the kernel's literal token-403
+  // message ("missing or invalid write token") and is DUPLICATED in flow's fleetview_web.py — tighten
+  // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
+  async function isTokenReject(res) {
+    try { const d = await res.json(); return /token/i.test((d && d.message) || ""); }
+    catch (_) { return false; }
   }
 
   // The write transport for Slice-2a governed edits. POSTs the edit to /edit with a
@@ -91,9 +123,7 @@
       }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
-      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) {
-        try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
-      }
+      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();
       return {
         ok: false,
         error: data.error || "HTTP " + res.status,
@@ -132,26 +162,45 @@
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
       if (res.ok) { return { ok: true, job_id: data.job_id, status: data.status }; }
-      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) {
-        try { window.localStorage.removeItem(WRITE_TOKEN_KEY); } catch (_) { /* ignore */ }
-      }
+      if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();
       return { ok: false, error: data.error || "HTTP " + res.status, message: data.message || "HTTP " + res.status };
     } catch (e) {
       return { ok: false, error: "network", message: e && e.message ? e.message : String(e) };
     }
   }
 
-  // Poll an async job's status → { status, result?, error? }. A read-only GET (no write token —
-  // the read path, like /substrate.json). Throws on a non-OK response (incl. the fail-closed 500 a
-  // corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
-  async function pollJob(jobId) {
-    const res = await fetch("/job.json?id=" + encodeURIComponent(jobId), { cache: "no-store" });
+  // Fetch JSON from a READ route with the off-box token attached, running the SAME token-403
+  // bootstrap as load() — prompt once, retry, drop-on-fail — so a rotated/absent token doesn't WEDGE
+  // a read (job-poll / search) on repeated 403s until a full substrate reload happens to re-bootstrap
+  // (codex L3 LOW). Preserves the server's error message on a hard non-OK (e.g. the fail-closed 500 a
+  // corrupt job store returns); the caller surfaces it. The token-class 403 is handled here.
+  async function authedReadJson(url) {
+    let res = await fetch(url, { cache: "no-store", headers: readHeaders() });
+    if (res.status === 403 && await isTokenReject(res)) {
+      if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders() });
+      if (res.status === 403) { dropToken(); throw new Error("off-box token missing or invalid"); }
+    }
     if (!res.ok) {
       let m = "HTTP " + res.status;
       try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
       throw new Error(m);
     }
     return res.json();
+  }
+
+  // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
+  // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
+  // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
+  async function pollJob(jobId) {
+    return authedReadJson("/job.json?id=" + encodeURIComponent(jobId));
+  }
+
+  // Episode keyword search → GET /recall.json (the read-peer of pollJob, routed through the render
+  // transport seam so the core stays token-agnostic). Rides authedReadJson (off-box token + the
+  // token-403 bootstrap). Returns the parsed {episodes,count,errors} body; the core's search()
+  // surfaces a throw.
+  async function recall(keyword) {
+    return authedReadJson("/recall.json?keyword=" + encodeURIComponent(keyword));
   }
 
   // The render core calls this when the LAST active job poll terminates → flush a board reload a
@@ -196,7 +245,30 @@
     inflight = true;
     if (btn) btn.disabled = true;
     try {
-      const res = await fetch("/substrate.json", { cache: "no-store" });
+      let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
+      // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
+      // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
+      // substrate.json, the chicken-and-egg). A token-class 403 means "off-box surface, token needed":
+      // prompt once, store, retry. A read-only mesh surface never 403s here (its reads are token-free),
+      // so it never prompts — iPad VIEWING stays open. The token, once entered, also unlocks writes.
+      if (res.status === 403 && await isTokenReject(res)) {
+        // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
+        // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard
+        // below, so a background token-403 can't steal focus from in-progress text (complement L3
+        // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
+        // boot/save load (passive:false) re-prompts.
+        if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+        if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
+        if (res.status === 403) {
+          // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
+          // stored token so the next explicit refresh re-prompts, and surface it plainly. Scoped to
+          // the token-reject branch: a non-token 403 (Host/CSRF — plain-text body) never reaches here,
+          // so it falls through to the generic read-failed path below with the stored token intact.
+          dropToken();
+          status("read refused — off-box token missing or invalid");
+          return;
+        }
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
@@ -210,7 +282,9 @@
       // read-only source (no install root → POST /edit 422s) renders with no edit
       // affordances at all, matching the server. An older payload without
       // `writable` defaults to writable, so existing installs are unchanged.
-      window.LevainDashboard.render(view, view.writable === false ? {} : { commit, commitAction, commitJob, pollJob, onJobsIdle });
+      // `recall` (episode search) is a READ — injected in BOTH branches so search works on a
+      // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
+      window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
