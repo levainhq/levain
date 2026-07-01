@@ -19,6 +19,33 @@ from pathlib import Path
 from typing import Callable
 
 SLOT_RE = re.compile(r"\{\{(\w+)\}\}")
+# A `{{SLOT}}` written inside code formatting — an inline `` `...` `` span, a
+# ``` fenced ``` block, or an indented code block — is DOCUMENTATION about the
+# slot mechanism, NOT a fill-slot. A seed/pack author who writes `` `{{SLOTS}}` ``
+# in prose must not mint a phantom slot: the phantom is asked FIRST, eats the
+# operator's first answer, and desyncs the whole interview by one while `doctor`
+# stays green (it validates wiring, not content). `_code_regions` returns the
+# (start, end) offset ranges that are code; the SAME scan drives all three
+# phases so they agree by construction: section splitting (a `## ` inside a
+# fence is example content, not a heading), slot discovery (SKIP a `{{...}}`
+# whose offset is inside a region), and render (PRESERVE such a `{{...}}`
+# literally). Checking each occurrence's OWN offset — never blanking a region
+# then scanning — is load-bearing: a bare real slot near a stray/mispaired
+# backtick or fence marker is never dropped; only a slot that is itself
+# code-formatted is skipped. A fenced backtick opener's info string may not
+# contain a backtick (so inline ``` `x` ``` is not mistaken for a fence). An
+# indented block only counts as code after a blank line (CommonMark) so a real
+# slot indented under a list item / wrapped paragraph is NOT dropped; a leading
+# tab expands to a 4-column stop.
+#
+# Known, documented gaps (all fail toward a RECOVERABLE phantom — a visible
+# desync — never a silent drop, and none occur in the shipped base templates):
+# a fenced block nested inside a blockquote (`> ```` ``` ````), a genuinely
+# multi-line inline-code span (line-bounded by design: a stray backtick must
+# never reach across a newline and swallow a bare slot), and indented content
+# placed immediately after a closing fence with no blank line between (treated
+# as prose, not the continuation of a code block).
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 SECTION_SPLIT_RE = re.compile(r"(?m)^## ")
 OPTIONAL_RE = re.compile(r"<!--\s*optional\s*[:\s](.*?)-->", re.DOTALL)
 # Match the full `<!-- interview ... -->` comment body, parenthetical and all.
@@ -79,6 +106,12 @@ class Section:
     optional: bool
     optional_reason: str = ""
     explicit_style: str | None = None
+    # Absolute [start, end) offsets of this section's block in the source text
+    # (the `## ` marker through the char before the next real heading / EOF).
+    # Render deletes an empty optional section by these offsets, NOT by a
+    # title regex — a code-blind regex mis-cuts a fenced `## ` inside the body.
+    source_start: int = 0
+    source_end: int = 0
 
 
 @dataclass
@@ -135,14 +168,25 @@ def parse_template(path: Path) -> TemplateSpec:
     text = path.read_text(encoding="utf-8")
     sections: list[Section] = []
 
-    parts = SECTION_SPLIT_RE.split(text)
-    preamble = parts[0]
+    # Split into preamble + `## ` sections at heading markers OUTSIDE code
+    # regions — a `## ` inside a fenced example is content, not a heading. This
+    # ONE `_code_regions(text)` scan is shared with discovery and render, so the
+    # three phases agree by construction; a code-blind split would fragment a
+    # fence across sections and silently drop a real slot sitting after it.
+    regions = _code_regions(text)
+    heads = [
+        mo for mo in SECTION_SPLIT_RE.finditer(text)
+        if not _in_code(mo.start(), regions)
+    ]
+    preamble = text[: heads[0].start()] if heads else text
 
-    # Strip the onboarding-instructions blurb from preamble BEFORE slot
-    # extraction — its literal `{{SLOTS}}` reference is documentation, not
-    # an interview slot.
-    preamble_for_slots = _ONBOARDING_BLURB_RE.sub("", preamble)
-    preamble_slots = _unique_slots(preamble_for_slots)
+    # `_unique_slots` skips code-formatted `{{...}}`, so the onboarding blurb's
+    # documentation reference `` `{{SLOTS}}` `` mints no preamble slot on its own.
+    # Discovery is fed the WHOLE-DOC `regions` + each fragment's absolute offset
+    # (not a re-scan of the slice) so it classifies every slot at the SAME
+    # coordinate render does — no synthetic-blank drift, no silent drop.
+    preamble_end = heads[0].start() if heads else len(text)
+    preamble_slots = _unique_slots(preamble, regions=regions, base_offset=0)
     if preamble_slots:
         # The preamble can carry its own `<!-- interview ... -->` comment too
         # (origin.md has no `## ` sections — its entity fields live in the
@@ -156,10 +200,14 @@ def parse_template(path: Path) -> TemplateSpec:
                 hints=hints,
                 optional=False,
                 explicit_style=explicit_style,
+                source_start=0,
+                source_end=preamble_end,
             )
         )
 
-    for body in parts[1:]:
+    for i, mo in enumerate(heads):
+        end_of_block = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        body = text[mo.end() : end_of_block]  # after the "## " marker
         if "\n" in body:
             first_nl = body.index("\n")
             title = body[:first_nl].strip()
@@ -168,7 +216,12 @@ def parse_template(path: Path) -> TemplateSpec:
             title = body.strip()
             section_body = ""
 
-        slots = _unique_slots(section_body)
+        # Discover across the WHOLE block (heading title + body) at the block's
+        # absolute offset — a `{{SLOT}}` in the `## ` heading is substitutable by
+        # render, so discovery must see it too, else it is asked nowhere and
+        # rendered empty (a silent drop). Guidance/optional parsing stays scoped
+        # to the body.
+        slots = _unique_slots(body, regions=regions, base_offset=mo.end())
         if not slots:
             continue
 
@@ -188,6 +241,8 @@ def parse_template(path: Path) -> TemplateSpec:
                     else ""
                 ),
                 explicit_style=explicit_style,
+                source_start=mo.start(),
+                source_end=end_of_block,
             )
         )
 
@@ -253,11 +308,133 @@ def _warn_on_unsplittable_multislot_sections(spec: TemplateSpec) -> None:
         )
 
 
-def _unique_slots(text: str) -> list[str]:
-    """All slot names in `text`, in order of first occurrence, deduplicated."""
+def _inline_code_spans(line: str) -> list[tuple[int, int]]:
+    """(start, end) offsets of inline-code spans within a SINGLE line. A span
+    opens on a run of N backticks and closes on the next run of exactly N
+    backticks (CommonMark); runs of a different length between them are content.
+    Linear in the number of backtick runs — no regex backtracking, so a long
+    run of backticks can't trigger the O(n²) ReDoS the naive `` `+…`+ `` had.
+    Line-bounded by construction: a stray unpaired backtick can never let a span
+    reach across a newline and swallow a bare slot on another line."""
+    runs = [(m.start(), m.end()) for m in re.finditer(r"`+", line)]
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(runs):
+        o_start, o_end = runs[i]
+        o_len = o_end - o_start
+        j = i + 1
+        while j < len(runs) and (runs[j][1] - runs[j][0]) != o_len:
+            j += 1
+        if j < len(runs):
+            spans.append((o_start, runs[j][1]))  # whole span incl. delimiters
+            i = j + 1
+        else:
+            i += 1  # unpaired opener → not a code span
+    return spans
+
+
+def _leading_indent_width(line: str) -> int:
+    """Visual width of a line's leading whitespace, expanding tabs to the next
+    4-column stop (CommonMark). A lone leading tab is width 4, so a tab-indented
+    code line is recognized (a raw char count would score it 1 and miss it)."""
+    width = 0
+    for ch in line:
+        if ch == " ":
+            width += 1
+        elif ch == "\t":
+            width += 4 - (width % 4)
+        else:
+            break
+    return width
+
+
+def _code_regions(text: str) -> list[tuple[int, int]]:
+    """The (start, end) offset ranges of `text` that are code: fenced blocks
+    (```` ``` ````/``~~~``, closed by a same-char run of ≥ the opener's length,
+    or running to EOF if never closed — CommonMark), indented code blocks
+    (≥4-column indent AFTER a blank line, so a list/paragraph continuation is
+    NOT misread as code), and inline-code spans on ordinary lines. The ONE scan
+    behind section splitting, discovery, and render (see the module note). A
+    mis-classified region can only turn a real slot into a VISIBLE literal
+    `{{X}}`, never a silent drop."""
+    regions: list[tuple[int, int]] = []
+    offset = 0
+    fence: tuple[str, int, int] | None = None  # (char, opener_len, start_offset)
+    prev_blank = True  # doc start counts as after-a-blank (a leading indent is code)
+    in_indent_code = False
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        stripped = body.strip()
+        if fence is not None:
+            fchar, flen, fstart = fence
+            closes = (
+                bool(stripped)
+                and stripped == fchar * len(stripped)
+                and len(stripped) >= flen
+                and _leading_indent_width(body) <= 3
+            )
+            if closes:
+                regions.append((fstart, offset + len(line)))
+                fence = None
+            offset += len(line)
+            continue
+        if not stripped:  # blank line
+            prev_blank = True
+            offset += len(line)
+            continue
+        m = _FENCE_LINE_RE.match(body)
+        if m and (m.group(1)[0] == "~" or "`" not in m.group(2)):
+            fence = (m.group(1)[0], len(m.group(1)), offset)
+            in_indent_code = False
+            prev_blank = False
+            offset += len(line)
+            continue
+        if _leading_indent_width(line) >= 4 and (prev_blank or in_indent_code):
+            regions.append((offset, offset + len(body)))
+            in_indent_code = True
+        else:
+            in_indent_code = False
+            for s, e in _inline_code_spans(body):
+                regions.append((offset + s, offset + e))
+        prev_blank = False
+        offset += len(line)
+    if fence is not None:  # unterminated fence → code through EOF
+        regions.append((fence[2], offset))
+    return regions
+
+
+def _in_code(pos: int, regions: list[tuple[int, int]]) -> bool:
+    return any(s <= pos < e for s, e in regions)
+
+
+def _unique_slots(
+    text: str,
+    *,
+    regions: list[tuple[int, int]] | None = None,
+    base_offset: int = 0,
+) -> list[str]:
+    """Slot names in `text`, first-occurrence order, deduplicated — EXCLUDING
+    any occurrence inside a code region (inline `` `...` ``, fenced, or indented,
+    per `_code_regions`). A name is kept if it appears BARE at least once; a name
+    that only ever appears code-formatted is documentation, not a slot, and is
+    skipped. This is the layout-independent guard against a phantom slot
+    desyncing the interview.
+
+    `regions`/`base_offset`: `parse_template` passes the WHOLE-DOCUMENT region
+    set and each fragment's absolute offset so discovery classifies a slot at
+    the SAME coordinate render does — sharing the scan RESULT, not just the
+    scanner. Re-scanning a sliced fragment would give it a synthetic leading
+    blank (the heading's `\\n`) and misclassify a heading-adjacent indented slot
+    as code → a silent drop. Called bare (no `regions`), it scans `text` itself
+    (standalone/tests)."""
+    if regions is None:
+        regions = _code_regions(text)
+        base_offset = 0
     seen: dict[str, None] = {}
-    for name in SLOT_RE.findall(text):
-        seen.setdefault(name, None)
+    for m in SLOT_RE.finditer(text):
+        if _in_code(base_offset + m.start(), regions):
+            continue
+        seen.setdefault(m.group(1), None)
     return list(seen.keys())
 
 
@@ -654,15 +831,20 @@ def render_template(spec: TemplateSpec, answers: dict[str, str]) -> str:
     """Render: drop empty optional sections, substitute slots, strip comments."""
     text = spec.raw
 
-    for section in spec.sections:
-        if not (section.title and section.optional):
-            continue
-        if any(answers.get(s, "").strip() for s in section.slots):
-            continue
-        pattern = re.compile(
-            r"(?ms)^## " + re.escape(section.title) + r"\b.*?(?=^## |\Z)"
-        )
-        text = pattern.sub("", text)
+    # Drop empty optional sections by their stored source spans, HIGHEST offset
+    # first so earlier spans stay valid. Offset deletion (not a title regex)
+    # removes exactly the parsed block — a code-blind `^## {title}...` regex
+    # mis-cuts at a fenced `## ` inside the body (orphaning a fence that then
+    # corrupts later real slots) and is ambiguous across duplicate titles.
+    drop = [
+        s
+        for s in spec.sections
+        if s.title
+        and s.optional
+        and not any(answers.get(x, "").strip() for x in s.slots)
+    ]
+    for section in sorted(drop, key=lambda s: s.source_start, reverse=True):
+        text = text[: section.source_start] + text[section.source_end :]
 
     # Inline-optional cleanup: empty AGE in Identity leaves ". {{AGE}}. " —
     # collapse the slot AND its trailing period per the template's own
@@ -670,11 +852,43 @@ def render_template(spec: TemplateSpec, answers: dict[str, str]) -> str:
     # partially matched. Per-slot rule today; future inline-optional slots
     # add their own regex pair.
     if not answers.get("AGE", "").strip():
-        text = re.sub(r"\.\s*\{\{AGE\}\}\.", ".", text)
-        text = re.sub(r"\{\{AGE\}\}\.\s*", "", text)
+        # Collapse only a BARE inline-optional {{AGE}} — a code-formatted
+        # `{{AGE}}` is documentation and must survive verbatim, so skip any
+        # match inside a code region (regions recomputed after the first sub
+        # mutates the text).
+        # Horizontal whitespace only (`[^\S\r\n]*`, never `\s*`) — this inline
+        # collapse must not consume a NEWLINE, or it would join two lines into
+        # one inline-code span and flip a kept slot on the next line into code.
+        regs = _code_regions(text)
+        text = re.sub(
+            r"\.[^\S\r\n]*\{\{AGE\}\}\.",
+            lambda m: m.group(0) if _in_code(m.start(), regs) else ".",
+            text,
+        )
+        regs = _code_regions(text)
+        text = re.sub(
+            r"\{\{AGE\}\}\.[^\S\r\n]*",
+            lambda m: m.group(0) if _in_code(m.start(), regs) else "",
+            text,
+        )
 
-    for slot in SLOT_RE.findall(text):
-        text = text.replace(f"{{{{{slot}}}}}", answers.get(slot, ""))
+    # Substitute only slots OUTSIDE code regions — a code-formatted `{{X}}` is
+    # documentation and must survive VERBATIM (blanking it would corrupt the
+    # doc line, and a doc `` `{{OPERATOR_NAME}}` `` must not be filled with the
+    # operator's real value). Symmetric with `_unique_slots`: what discovery
+    # skips, render keeps literal. Offsets are taken on the post-cleanup text.
+    regions = _code_regions(text)
+    out: list[str] = []
+    last = 0
+    for m in SLOT_RE.finditer(text):
+        out.append(text[last:m.start()])
+        if _in_code(m.start(), regions):
+            out.append(m.group(0))  # code-formatted → keep literal
+        else:
+            out.append(answers.get(m.group(1), ""))
+        last = m.end()
+    out.append(text[last:])
+    text = "".join(out)
 
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = _ONBOARDING_BLURB_RE.sub("", text)

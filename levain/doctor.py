@@ -61,6 +61,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
 
     core: list[CheckResult] = []
     core.extend(_check_install_layout(install))
+    core.extend(_check_seed_content(install))
     core.extend(_check_runtime(install))
     core.extend(_check_store(install))
     core.extend(_check_compat_set(install))
@@ -137,6 +138,58 @@ _SEED_REQUIRED = ("origin.md", "partnership.md", "world.md", "memory.md")
 _SEED_EXPECTED = _SEED_REQUIRED + ("continuity.md", "README.md")
 _HOOK_REQUIRED = ("session_start.py", "user_prompt_submit.py", "_levain_hook.py")
 _ACTIVATION_FILES = ("posture.md", "recency_directives.md")
+
+# Base-pack seed files the interview RENDERS (fills). A surviving BARE `{{SLOT}}`
+# in one of these means the file was copied-not-rendered, or a slot was never
+# asked — the interview-desync class the wiring/layout checks stay green through
+# (Chip's Jul-1 rehearsal: the entity ends up not knowing its operator while
+# `doctor` reports healthy). VERBATIM seeds (README.md/continuity.md) legitimately
+# carry `{{...}}` documentation, so they are NOT content-checked. A pack that
+# adds render targets isn't covered here (no recorded roster at doctor time) —
+# these two base files carry the identity slots (OPERATOR_NAME/ENTITY_NAME) that
+# matter most, so it is the right minimum.
+_RENDER_TARGET_SEEDS = ("world.md", "origin.md")
+
+
+def _check_seed_content(install: Path) -> list[CheckResult]:
+    """Content sanity: a rendered base seed carries NO unfilled `{{SLOT}}`.
+    Reuses the interview's code-aware slot scan, so a code-formatted `` `{{X}}` ``
+    documentation reference is not mistaken for an unfilled slot."""
+    from levain.interview import _unique_slots
+
+    results: list[CheckResult] = []
+    seed = install / "seed"
+    for name in _RENDER_TARGET_SEEDS:
+        f = seed / name
+        if not f.is_file():
+            continue  # a missing required seed is the layout check's job
+        try:
+            content = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as e:
+            # A binary / invalid-UTF-8 seed is a corrupt install, not a crash —
+            # `read_text` raises UnicodeDecodeError (a UnicodeError, NOT OSError).
+            results.append(
+                CheckResult(f"seed content ({name})", False, f"unreadable: {e}")
+            )
+            continue
+        unfilled = _unique_slots(content)
+        if unfilled:
+            markers = ", ".join("{{" + s + "}}" for s in unfilled)
+            results.append(
+                CheckResult(
+                    f"seed content ({name})",
+                    False,
+                    f"unfilled placeholder(s): {markers}",
+                    "The interview did not fill this file — the operator's "
+                    "identity was not captured. Re-run `levain init` and answer "
+                    "every prompt.",
+                )
+            )
+        else:
+            results.append(
+                CheckResult(f"seed content ({name})", True, "no unfilled placeholders")
+            )
+    return results
 
 
 def _check_install_layout(install: Path) -> list[CheckResult]:
