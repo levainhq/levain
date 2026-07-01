@@ -92,6 +92,17 @@ def load_pack_manifest(pack_dir: Path) -> PackManifest:
     name = data.get("name")
     if not isinstance(name, str) or not name.strip():
         raise PackError(f"{manifest_path}: 'name' is required and must be a non-empty string")
+    # A pack name is an IDENTIFIER, and it is used as a filesystem path COMPONENT
+    # (the docs layer dir `<order>-<name>` in install._copy_pack_docs). A path
+    # separator or NUL in the name could traverse/escape the destination and
+    # overwrite files outside `.levain/docs` — so refuse it at the parse gate
+    # (fail-closed, structural; a malformed/hostile pack can't reach the copy).
+    # codex L3 HIGH.
+    if "/" in name or "\\" in name or "\x00" in name:
+        raise PackError(
+            f"{manifest_path}: 'name' must be a plain identifier with no path "
+            f"separators (got {name!r})"
+        )
 
     order = data.get("order", 0)
     if not isinstance(order, int) or isinstance(order, bool):
