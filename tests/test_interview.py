@@ -14,7 +14,9 @@ import pytest
 
 from levain.interview import (
     _BACK,
+    _code_regions,
     _detect_input_style,
+    _inline_code_spans,
     _prompt_for_slot,
     _split_guidance,
     _unique_slots,
@@ -50,6 +52,298 @@ def test_unique_slots_ignores_lowercase_and_partial_braces():
     captured = _unique_slots(text)
     assert "ALSO_OK" in captured
     assert "NOT_DOUBLE" not in captured
+
+
+def test_unique_slots_skips_inline_code_mustache():
+    # A `{{SLOTS}}` written in inline code is documentation about the slot
+    # mechanism, NOT a fill-slot — minting it desyncs the whole interview
+    # (Chip's Jul-1 rehearsal: the phantom is asked first, eats the operator's
+    # name, and `doctor` stays green). Real bare slots are unaffected.
+    text = "Onboarding fills the `{{SLOTS}}` below. {{OPERATOR_NAME}}. {{AGE}}."
+    assert _unique_slots(text) == ["OPERATOR_NAME", "AGE"]
+
+
+def test_unique_slots_skips_fenced_code_mustache():
+    text = "Example:\n\n```\n{{EXAMPLE}}\n```\n\nReal: {{NAME}}."
+    assert _unique_slots(text) == ["NAME"]
+
+
+def test_unique_slots_inline_code_does_not_swallow_bare_slot_on_other_line():
+    # A stray/odd backtick must not let an inline span cross a newline and eat a
+    # real bare slot on a later line — inline code is line-bounded.
+    text = "See `{{DOC}}` here.\nName: {{OPERATOR_NAME}}.\nAlso `{{OTHER_DOC}}`."
+    assert _unique_slots(text) == ["OPERATOR_NAME"]
+
+
+def test_unique_slots_keeps_bare_slot_alongside_code_span_same_line():
+    text = "Type `{{DOC}}` then {{REAL}} matters."
+    assert _unique_slots(text) == ["REAL"]
+
+
+# ---------- code-formatted mustache regression (Chip Jul-1 rehearsal) ----------
+
+# The base template's `_ONBOARDING_BLURB_RE` only matched its exact wording +
+# `>`-blockquote layout. A composed pack (or any reword/reflow) that kept the
+# backtick-quoted `{{SLOTS}}` in prose slipped past it and minted the phantom.
+# `_unique_slots` now strips code spans, so parse_template is layout-independent.
+_REFLOWED_BLURB_TEMPLATE = """# Who Your Operator Is
+
+> *Onboarding fills the `{{SLOTS}}` below from an interview. The `<!-- x -->` are stripped.*
+
+## Identity
+
+{{OPERATOR_NAME}}. {{AGE}}. {{LOCATION}}.
+
+<!-- interview: name; age; city -->
+"""
+
+
+def test_parse_template_ignores_code_formatted_blurb_regardless_of_layout(tmp_path: Path):
+    p = tmp_path / "world.md"
+    p.write_text(_REFLOWED_BLURB_TEMPLATE, encoding="utf-8")
+    spec = parse_template(p)
+    slots = [slot for section in spec.sections for slot in section.slots]
+    assert "SLOTS" not in slots  # no phantom
+    assert slots == ["OPERATOR_NAME", "AGE", "LOCATION"]  # correct order, no desync
+
+
+def test_packaged_world_template_has_no_phantom_slot():
+    # Guard the SHIPPED base seed against a regression that reintroduces a
+    # code-formatted-mustache phantom (the defect Chip's rehearsal caught).
+    world = Path(__file__).resolve().parent.parent / "levain/templates/seed/world.md"
+    spec = parse_template(world)
+    slots = [slot for section in spec.sections for slot in section.slots]
+    assert "SLOTS" not in slots
+    assert slots[0] == "OPERATOR_NAME"  # interview starts on the real first field
+
+
+def test_unique_slots_mispaired_fence_marker_does_not_drop_bare_slot():
+    # The invariant that killed the first cut of this fix: a stray/mispaired
+    # code-fence marker must NEVER blank a region that swallows a BARE real slot.
+    # `` ```{{EXAMPLE}}``` `` is inline code (its info string holds a backtick, so
+    # it is NOT a fence opener); the bare {{OPERATOR_NAME}} on the next line must
+    # survive even though a lone ``` follows it.
+    text = "```{{EXAMPLE}}```\n{{OPERATOR_NAME}}\n```"
+    assert _unique_slots(text) == ["OPERATOR_NAME"]
+
+
+def test_unique_slots_skips_indented_code_block_mustache():
+    # A 4-space-indented example line is a code block — its {{SLOTS}} is a
+    # phantom (L1's reproduced desync via an indented example).
+    text = "Fill these in:\n\n    Fill {{SLOTS}} from the interview.\n\nName: {{OPERATOR_NAME}}."
+    assert _unique_slots(text) == ["OPERATOR_NAME"]
+
+
+def test_unique_slots_skips_unclosed_fence_to_eof():
+    # An unterminated fence is code through EOF (CommonMark); a {{X}} after an
+    # unclosed ``` must not become a phantom.
+    text = "Real: {{NAME}}.\n\n```\n{{UNCLOSED}} never closes"
+    assert _unique_slots(text) == ["NAME"]
+
+
+def test_unique_slots_skips_fenced_block_with_info_string():
+    text = "```python\n{{EXAMPLE}}\n```\n\n{{NAME}}"
+    assert _unique_slots(text) == ["NAME"]
+
+
+def test_unique_slots_long_inline_backtick_run_is_bounded_and_safe():
+    # Regression against the O(n²) ReDoS the naive `` (`+)…(?P=ticks) `` inline
+    # regex had. The run is INLINE (prefixed by prose, so it is not a bare fence
+    # opener); an unpaired run forms no span, and the bare slot on the next line
+    # must survive. Must complete effectively instantly.
+    import time
+
+    text = "prefix " + "`" * 5000 + " suffix\n{{OPERATOR_NAME}}\n"
+    start = time.perf_counter()
+    slots = _unique_slots(text)
+    assert time.perf_counter() - start < 1.0
+    assert slots == ["OPERATOR_NAME"]
+
+
+def test_inline_code_spans_pairs_equal_length_runs():
+    # `` ``x`` `` (double) then `` `y` `` (single): two independent spans.
+    line = "a ``x`` b `y` c"
+    assert _inline_code_spans(line) == [(2, 7), (10, 13)]
+
+
+def test_code_regions_empty_for_plain_prose():
+    assert _code_regions("Just prose with {{SLOT}} and no code.") == []
+
+
+# ---------- render preserves code-formatted mustaches (L2 asymmetry fix) ----------
+
+def test_render_keeps_code_formatted_mustache_literal(tmp_path: Path):
+    # A code-formatted `{{X}}` is documentation and must render VERBATIM — never
+    # blanked to empty backticks, never filled. Symmetric with discovery.
+    template = tmp_path / "t.md"
+    template.write_text(
+        "# T\n\n## S\n\n<!-- interview: who -->\n\n"
+        "Docs say `{{SLOTS}}` here. Hello {{NAME}}.\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    rendered = render_template(spec, {"NAME": "Alex"})
+    assert "`{{SLOTS}}`" in rendered  # literal doc survives
+    assert "Hello Alex." in rendered  # bare slot filled
+
+
+def test_render_does_not_inject_operator_value_into_doc_slot(tmp_path: Path):
+    # The dangerous asymmetry L2 caught: a doc `` `{{OPERATOR_NAME}}` `` must NOT
+    # be filled with the operator's real value — it is syntax documentation.
+    template = tmp_path / "t.md"
+    template.write_text(
+        "# T\n\n## S\n\n<!-- interview: name -->\n\n"
+        "Reference the `{{OPERATOR_NAME}}` slot. I am {{OPERATOR_NAME}}.\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    rendered = render_template(spec, {"OPERATOR_NAME": "Chris"})
+    assert "`{{OPERATOR_NAME}}`" in rendered  # doc reference untouched
+    assert "I am Chris." in rendered  # bare occurrence filled
+
+
+# ---------- L3 cross-substrate round: three-phase agreement + indent/AGE ----------
+
+_FENCE_WITH_HEADING = """# Title — {{ENTITY_NAME}}
+
+## RealSection
+
+<!-- interview: entity name; operator name -->
+
+Example of a template section:
+
+```
+## FakeHeader
+fake content
+```
+
+{{OPERATOR_NAME}}
+"""
+
+
+def test_section_split_is_fence_aware_no_silent_drop(tmp_path: Path):
+    # CONSENSUS HIGH (complement + codex): a `## ` inside a fenced example must
+    # not split the section — a code-blind split fragments the fence and SILENTLY
+    # drops the bare {{OPERATOR_NAME}} that follows it. Discovery must find it.
+    p = tmp_path / "world.md"
+    p.write_text(_FENCE_WITH_HEADING, encoding="utf-8")
+    spec = parse_template(p)
+    slots = [slot for section in spec.sections for slot in section.slots]
+    titles = [section.title for section in spec.sections]
+    assert "OPERATOR_NAME" in slots  # not silently dropped
+    assert "FakeHeader" not in titles  # the fenced `## ` is not a real section
+    # And render agrees — the real slot fills, the fenced heading stays literal.
+    rendered = render_template(spec, {"ENTITY_NAME": "Bot", "OPERATOR_NAME": "Chris"})
+    assert "Chris" in rendered
+    assert "## FakeHeader" in rendered  # fenced example preserved verbatim
+
+
+def test_unique_slots_keeps_list_continuation_indented_slot():
+    # A real slot indented ≥4 under a list item / paragraph (NO preceding blank)
+    # is a continuation, not an indented code block — it must NOT be dropped.
+    assert _unique_slots("- Identity:\n    {{OPERATOR_NAME}}\n") == ["OPERATOR_NAME"]
+    assert _unique_slots("A wrapped line\n    {{OPERATOR_NAME}} continues it.") == [
+        "OPERATOR_NAME"
+    ]
+
+
+def test_unique_slots_skips_indented_code_block_only_after_blank():
+    # A ≥4-indent block AFTER a blank line IS a code block (CommonMark) → its
+    # {{X}} is documentation. Tabs expand to a 4-column stop.
+    assert _unique_slots("Docs:\n\n    {{SLOTS}} example\n\nName: {{NAME}}.") == [
+        "NAME"
+    ]
+    assert _unique_slots("Docs:\n\n\t{{SLOTS}} example\n\nName: {{NAME}}.") == ["NAME"]
+
+
+def test_leading_indent_width_expands_tabs():
+    from levain.interview import _leading_indent_width
+
+    assert _leading_indent_width("\tx") == 4
+    assert _leading_indent_width("  \tx") == 4  # 2 spaces then tab → next stop
+    assert _leading_indent_width("    x") == 4
+    assert _leading_indent_width("no indent") == 0
+
+
+def test_render_age_cleanup_preserves_code_formatted_age(tmp_path: Path):
+    # codex MED: the empty-AGE inline-optional cleanup ran before the code-aware
+    # substitution and blanked a doc `{{AGE}}` to empty backticks. It must now
+    # leave a code-formatted `{{AGE}}` intact while still filling the bare slot.
+    template = tmp_path / "t.md"
+    template.write_text(
+        "# T\n\n## S\n\n<!-- interview: name -->\n\n"
+        "Docs say `{{AGE}}.` is optional syntax. I am {{OPERATOR_NAME}}.\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+    rendered = render_template(spec, {"OPERATOR_NAME": "Chris"})  # AGE empty
+    assert "`{{AGE}}.`" in rendered  # doc syntax untouched, not blanked to ``
+    assert "``" not in rendered  # no empty-backtick corruption
+    assert "I am Chris." in rendered
+
+
+# ---------- L3 round-2: share the scan RESULT (whole-doc coordinates) ----------
+
+def test_heading_adjacent_indented_slot_not_dropped(tmp_path: Path):
+    # L3 round-2 CONSENSUS (codex HIGH / complement CRITICAL): discovery must
+    # classify a slot at the SAME coordinate render does. A slot on a ≥4-indent
+    # line RIGHT AFTER a heading (no blank between) is NOT an indented code block
+    # (the heading is non-blank before it); re-scanning the sliced section body
+    # gave it a synthetic leading blank and silently dropped it.
+    p = tmp_path / "world.md"
+    p.write_text("## Sec\n    {{REAL}}\nend\n", encoding="utf-8")
+    spec = parse_template(p)
+    slots = [slot for section in spec.sections for slot in section.slots]
+    assert slots == ["REAL"]  # discovered, not silently dropped
+    rendered = render_template(spec, {"REAL": "value"})
+    assert "value" in rendered and "{{REAL}}" not in rendered
+
+
+def test_optional_section_with_fenced_heading_deletes_cleanly(tmp_path: Path):
+    # L3 round-2 codex HIGH: an empty optional section whose body contains a
+    # fenced `## Fake` must delete by source-span, not a code-blind title regex
+    # that stops at the fenced heading and orphans the fence — corrupting a
+    # later real slot.
+    template = (
+        "## Maybe\n\n<!-- optional: test -->\n<!-- interview: maybe -->\n\n"
+        "```\n## Fake\n{{DOC}}\n```\n\n{{MAYBE}}\n\n"
+        "## Next\n\n<!-- interview: next -->\n\n{{NEXT}}\n"
+    )
+    p = tmp_path / "t.md"
+    p.write_text(template, encoding="utf-8")
+    spec = parse_template(p)
+    rendered = render_template(spec, {"MAYBE": "", "NEXT": "filled-next"})
+    assert "## Maybe" not in rendered  # optional section gone
+    assert "{{NEXT}}" not in rendered  # later real slot NOT corrupted
+    assert "filled-next" in rendered  # ...it was substituted
+
+
+def test_slot_in_section_heading_is_discovered(tmp_path: Path):
+    # L3 round-3 codex HIGH: a `{{SLOT}}` in a `## ` heading is substitutable by
+    # render, so discovery must scan the whole block (title + body), not just the
+    # body — else the heading slot is asked nowhere and rendered empty.
+    p = tmp_path / "t.md"
+    p.write_text("## Sec {{A}}\n<!-- interview: a; b -->\nBody {{B}}\n", encoding="utf-8")
+    spec = parse_template(p)
+    slots = [slot for section in spec.sections for slot in section.slots]
+    assert slots == ["A", "B"]  # heading slot A not dropped
+    rendered = render_template(spec, {"A": "Alpha", "B": "Beta"})
+    assert "## Sec Alpha" in rendered and "Body Beta" in rendered
+
+
+def test_age_cleanup_does_not_join_lines(tmp_path: Path):
+    # L3 round-3 codex MED: the empty-AGE inline collapse must consume only
+    # horizontal whitespace — never a newline — or it merges lines and can flip
+    # a slot on the following line into a code span, discarding its answer.
+    p = tmp_path / "t.md"
+    p.write_text(
+        "# T\n\n## S\n<!-- interview: age; b -->\n\nStart. {{AGE}}.\n{{B}} follows.\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(p)
+    rendered = render_template(spec, {"AGE": "", "B": "Beta"})  # AGE empty
+    assert "Beta follows." in rendered  # next line intact, B filled
+    assert "{{B}}" not in rendered  # not flipped into a code span
 
 
 # ---------- _split_guidance ----------
