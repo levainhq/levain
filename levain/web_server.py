@@ -672,13 +672,29 @@ class _Handler(BaseHTTPRequestHandler):
         return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     def _write_token_required(self) -> bool:
-        """True iff a write to this surface must carry ``X-Levain-Write-Token`` — i.e. the
-        surface is writable AND bound off-loopback (spore-129). Mirrors do_POST's gate
-        EXACTLY (off-loopback ⟹ token required) so the frontend signal can never disagree
-        with the server's actual enforcement. Loopback-bound or read-only → False."""
+        """True iff this surface requires the ``X-Levain-Write-Token`` — i.e. it is writable AND
+        bound off-loopback. The off-box governance factor that replaces loopback-is-auth once the
+        surface leaves the machine now gates BOTH the substrate-bearing READS (spore-220) and the
+        writes (spore-129), so a read can never be served under weaker auth than a write. Mirrors
+        the do_POST + _route gates EXACTLY, so the frontend ``write_token_required`` signal can
+        never disagree with the server's enforcement. Loopback-bound or read-only → False (a
+        read-only mesh bind stays token-free — iPad/iPhone VIEWING is unauthenticated by design)."""
         return (
             not self.server.is_loopback_bind
             and self.server.levain_source.write_scope is not None
+        )
+
+    def _off_box_token_valid(self) -> bool:
+        """True iff the request carries the correct off-box token (constant-time compare against the
+        token ``make_server`` was given). The SINGLE compare shared by the read gate (``_route``) and
+        the write gate (``do_POST``) so the two can never diverge on the auth check
+        (``structural_invariants_beat_discipline``). Only meaningful when ``_write_token_required()``
+        — the callers check that first; a missing server token (``write_token=None``) or an empty
+        supplied token fails CLOSED (``bool(expected)`` gates before the compare)."""
+        expected = self.server.write_token or ""
+        supplied = self.headers.get(_WRITE_TOKEN_HEADER, "")
+        return bool(expected) and hmac.compare_digest(
+            supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
     def _route(self, *, head: bool) -> None:
@@ -702,6 +718,39 @@ class _Handler(BaseHTTPRequestHandler):
 
         # Strip any query string; route on the bare path against the allowlist.
         path = self.path.split("?", 1)[0]
+
+        # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
+        # token the writes do WHEN this surface is writable AND bound off-loopback — else any tailnet
+        # node reads the full store (``/substrate.json`` / ``/recall.json`` / ``/job.json`` / a
+        # downstream ``extra_json`` view) token-free over plain HTTP. Same predicate + constant-time
+        # compare as ``do_POST`` (the two shared helpers), so a read is never served under weaker auth
+        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind
+        # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
+        # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
+        # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
+        # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
+        # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
+        if (
+            self._write_token_required()
+            and path not in _ASSETS
+            and path not in self.server.extra_assets
+            and not self._off_box_token_valid()
+        ):
+            # JSON body carrying a token message so the frontend distinguishes a token-403 from a
+            # Host/cross-site-403 (plain text) and prompts for the token — mirroring the write path's
+            # 403-retry (dashboard_boot.js). Served via _send (GET has no unread body to drain).
+            # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + flow's fleetview_web.py) match
+            # ``/token/i`` on this "token" wording to trigger the prompt — keep the word "token" here
+            # AND in do_POST's identical message if ever reworded (spore-129/220, two repos).
+            self._send(
+                json.dumps(
+                    {"error": "forbidden", "message": "missing or invalid write token"}
+                ).encode("utf-8"),
+                "application/json; charset=utf-8",
+                status=403,
+                head=head,
+            )
+            return
 
         if path == "/substrate.json":
             # Bound concurrent store reads (the expensive route); past the cap → 503.
@@ -893,22 +942,17 @@ class _Handler(BaseHTTPRequestHandler):
         sfs = self.headers.get("Sec-Fetch-Site")
         if sfs is not None and sfs != _WRITE_SEC_FETCH_ALLOWED:
             return self._reject(403, "forbidden", "cross-origin write refused")
-        # OFF-BOX write governance factor (spore-129): when this surface is bound off-loopback,
-        # loopback-is-auth no longer holds, so the write MUST carry the shared device-held token.
-        # Constant-time compare against the token make_server was given. Fail CLOSED if the
-        # server is off-loopback yet somehow has no token (make_server refuses to bind a writable
-        # off-loopback source WITHOUT one, so reaching here token-less is defense-in-depth). A
-        # loopback bind skips this entirely — the localhost-sovereign token-free path is unchanged.
-        # The gate also requires write_scope (writability): a READ-ONLY off-box surface has no
-        # write path, so it falls through to the 422 'read_only' refusal below (NOT a token-403)
-        # — which keeps this gate MIRRORING `_write_token_required` exactly [codex L3 LOW].
-        if not self.server.is_loopback_bind and self.server.levain_source.write_scope is not None:
-            expected = self.server.write_token or ""
-            supplied = self.headers.get(_WRITE_TOKEN_HEADER, "")
-            if not expected or not hmac.compare_digest(
-                supplied.encode("utf-8"), expected.encode("utf-8")
-            ):
-                return self._reject(403, "forbidden", "missing or invalid write token")
+        # OFF-BOX governance factor (spore-129 writes / spore-220 reads): when this surface is bound
+        # off-loopback, loopback-is-auth no longer holds, so the write MUST carry the shared device-
+        # held token. SAME predicate + constant-time compare as the read gate in _route, factored
+        # into the two shared helpers so a write can never be served under weaker auth than a read
+        # (or vice-versa). Fail CLOSED if off-loopback yet token-less (make_server refuses to bind a
+        # writable off-loopback source WITHOUT a token, so reaching here token-less is defense-in-
+        # depth). A loopback bind skips this — the localhost-sovereign token-free path is unchanged.
+        # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
+        # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
+        if self._write_token_required() and not self._off_box_token_valid():
+            return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
         ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
@@ -1021,7 +1065,11 @@ def make_server(
     + ``/fleet.json`` (live) here rather than standing up a second server that would
     re-implement (and could drift from) the bind-refusal contract
     (``structural_invariants_beat_discipline``). ``extra_assets`` maps a path →
-    ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets);
+    ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets); ⚠ SECURITY
+    (spore-220): an ``extra_asset`` is served TOKEN-FREE even on an off-box writable bind (it is the
+    app shell — the browser must load it to supply the off-box token on the data fetches), so it MUST
+    NOT carry substrate data — put any per-request substrate behind ``extra_json``, which the off-box
+    read gate covers. This is a REGISTRANT contract the kernel can't enforce on static bytes.
     ``extra_json`` maps a path → a zero-arg builder called per request under the gate
     (like ``/substrate.json``), its body served as ``application/json``. Both are
     GET/HEAD-only: Levain dispatches them ONLY from the read path and has no POST handler

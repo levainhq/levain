@@ -81,6 +81,18 @@ def _request(url: str, *, method: str = "GET", headers: dict | None = None):
         return r.status, dict(r.headers), r.read()
 
 
+def _get_h(url: str, *, headers: dict | None = None, method: str = "GET"):
+    """GET/HEAD → (status, body_bytes), carrying request headers (the off-box token) and TOLERATING a
+    403 (returns its code + body) — the read-gate harness (spore-220); plain ``_get`` raises. Python's
+    http.client knows a HEAD response carries no body regardless of Content-Length, so HEAD won't hang."""
+    req = urllib.request.Request(url, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:  # noqa: S310
+        return e.code, e.read()
+
+
 # --- the data endpoint: shape parity with the SubstrateView ----------------
 
 class TestSubstrateJson:
@@ -453,7 +465,7 @@ class TestAssets:
         boot = load_web_asset("dashboard_boot.js")
         # boot: a dedicated /action transport, the peer of commit's /edit, injected into render
         assert "function commitAction" in boot and '"/action"' in boot
-        assert "{ commit, commitAction, commitJob, pollJob, onJobsIdle }" in boot
+        assert "{ commit, commitAction, commitJob, pollJob, onJobsIdle, recall }" in boot
         # core: the compose box + its gate, the pure coercion, and commitAction stored from opts
         for token in ("function buildActionBox", "function collectActionParams",
                       "ACTION-EXTRACT-START", "opts.commitAction",
@@ -1590,13 +1602,98 @@ class TestOffBoxWriteToken:
             _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
             assert resp.get("message") != "missing or invalid write token"
 
-    def test_offbox_substrate_json_flags_token_required(self, tmp_path: Path) -> None:
-        # Simulate an off-box bind (is_loopback_bind False + a token): the JSON tells the
-        # frontend to attach the token. The predicate mirrors do_POST exactly.
+    def test_offbox_substrate_json_requires_token(self, tmp_path: Path) -> None:
+        # spore-220: an off-box WRITABLE bind gates the substrate-bearing READS too — the exact
+        # read-exposure the spore closes (any tailnet node could read the full store token-free).
+        # Tokenless / wrong token → 403; correct token → 200 carrying write_token_required:True (the
+        # frontend keeps attaching it). The predicate + compare mirror do_POST via the shared helpers.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
             httpd.write_token = "s3cret"
-            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is True
+            assert _get_h(base + "/substrate.json")[0] == 403
+            assert _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "wrong"})[0] == 403
+            st, body = _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "s3cret"})
+            assert st == 200
+            assert json.loads(body)["write_token_required"] is True
+
+    def test_offbox_head_request_is_gated(self, tmp_path: Path) -> None:
+        # spore-220: HEAD rides the SAME _route gate as GET (do_HEAD → _route). A tokenless off-box
+        # HEAD → 403 (no substrate framing leaked); WITH the token it reaches the route → 200.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            assert _get_h(base + "/substrate.json", method="HEAD")[0] == 403
+            assert _get_h(base + "/substrate.json", method="HEAD",
+                          headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
+
+    def test_offbox_recall_json_requires_token(self, tmp_path: Path) -> None:
+        # spore-220: /recall.json (episode keyword search = substrate content) is gated identically.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            assert _get_h(base + "/recall.json?keyword=x")[0] == 403
+            assert _get_h(base + "/recall.json?keyword=x",
+                          headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
+
+    def test_offbox_job_json_requires_token(self, tmp_path: Path) -> None:
+        # spore-220: /job.json (async action-verb results) is gated the same. The gate fires BEFORE
+        # the handler, so it 403s regardless of a job runtime; WITH the token it reaches the handler
+        # (no runtime → 'unknown', still 200).
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            assert _get_h(base + "/job.json?id=x")[0] == 403
+            assert _get_h(base + "/job.json?id=x",
+                          headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
+
+    def test_offbox_static_assets_stay_token_free(self, tmp_path: Path) -> None:
+        # The APP SHELL (html/css/js) must load token-free even off-box — the browser needs it to
+        # bootstrap and THEN supply the token on the data fetches. It carries NO substrate data.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            for path in ("/", "/dashboard.css", "/dashboard_core.js", "/dashboard_boot.js"):
+                assert _get_h(base + path)[0] == 200, path
+
+    def test_offbox_read_token_403_carries_json_token_message(self, tmp_path: Path) -> None:
+        # The read token-403 body is JSON with a token message so the frontend distinguishes it from
+        # a Host/cross-site 403 (plain text) and prompts + retries (dashboard_boot.js), rather than
+        # treating it as a hard read failure.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            st, body = _get_h(base + "/substrate.json")
+            assert st == 403
+            assert json.loads(body)["message"] == "missing or invalid write token"
+
+    def test_readonly_offbox_reads_stay_token_free(self, tmp_path: Path) -> None:
+        # spore-220 CARVE-OUT (the iPad-viewing property, L4's second half): a READ-ONLY mesh bind
+        # (write_scope None) serves reads token-free — _write_token_required() is False, so the gate
+        # is skipped. Breaking this would break open iPad/iPhone viewing, the whole point of a
+        # read-only mesh serve.
+        with _serving(_store_with_data(tmp_path)) as (base, httpd):  # write_scope=None
+            httpd.is_loopback_bind = False
+            assert httpd.write_token is None
+            assert _get_h(base + "/substrate.json")[0] == 200
+            assert _get_h(base + "/recall.json?keyword=x")[0] == 200
+
+    def test_offbox_extra_json_gated_but_extra_asset_free(self, tmp_path: Path) -> None:
+        # spore-220: a downstream extra_json view (the Bridge's /fleet.json = flow's fleet topology)
+        # rides the SAME off-box gate — the kernel owns the security envelope for EVERY read route it
+        # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset
+        # (the /fleet app shell) stays token-free like the built-in assets (bootstrap, no data).
+        src = self._writable_noinstall(tmp_path)
+        with _serving_extra(
+            src,
+            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>fleet</title>")},
+            extra_json={"/fleet.json": lambda: b'{"fleet":[]}'},
+        ) as (base, httpd):
+            httpd.is_loopback_bind = False
+            httpd.write_token = "s3cret"
+            assert _get_h(base + "/fleet.json")[0] == 403
+            assert _get_h(base + "/fleet.json",
+                          headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
+            assert _get_h(base + "/fleet")[0] == 200  # app shell token-free
 
     def test_offbox_write_requires_correct_token(self, tmp_path: Path) -> None:
         # The enforcement: off-box, POST /edit demands X-Levain-Write-Token == the server's
