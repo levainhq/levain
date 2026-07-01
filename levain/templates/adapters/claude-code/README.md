@@ -103,8 +103,9 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 ## Prerequisites
 
 - **`anneal-memory`** installed (`pip install anneal-memory`). Both the MCP
-  server and the hooks' Layer D wrap-check invoke it. v1 is built against
-  anneal-memory v0.3.x; the shipped Levain package will pin a compatible range.
+  server and the hooks' Layer D wrap-check invoke it. The shipped Levain package
+  pins a compatible anneal-memory range (see `pyproject.toml`); `levain doctor`
+  verifies the installed version against Levain's known-good set.
 - **Python 3** available. The hook commands invoke it (`{{PYTHON}}`). If no
   working interpreter is wired, the hooks silently do not run and the posture
   mechanism is off — verify with `python3 --version` first. On a fresh macOS
