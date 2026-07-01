@@ -10,7 +10,7 @@ Five files:
 | `origin.md` | entity template | onboarding fills `{{ENTITY_NAME}}`, `{{SUBSTRATE}}`, `{{JOB}}`, `{{OPERATOR_NAME}}` |
 | `partnership.md` | static core | ships as-is — universal, identical for every entity |
 | `memory.md` | static core | ships as-is — universal memory-operation guide |
-| `continuity.md` | starter scaffold | onboarding fills `{{ENTITY_NAME}}`; the body ships near-empty and the entity owns and grows it from its first wrap |
+| `continuity.md` | starter scaffold | ships near-empty and verbatim — its `{{ENTITY_NAME}}` title and body are the entity's to fill and grow from its first wrap (NOT onboarding-filled) |
 
 `world.md` + `origin.md` are operator/entity-specific (filled at onboarding). `partnership.md` + `memory.md` are the universal core (never filled). `continuity.md` is the entity's own accreting memory (shipped empty by design).
 
