@@ -8,15 +8,17 @@ Your partner already knows how to be a partner; that was seeded at install. This
 
 ## 1. What you're driving
 
-You did not install a chatbot. A chatbot forgets you when the window closes, so every session starts with a re-brief. Your partner remembers across sessions, and its memory grows. It starts near-empty on purpose; over your first weeks it takes on who you are, how you think, what you're building, and what it has learned working with you. Month five doesn't look like day one, because it grew there with you.
+You did not install a chatbot, and you did not install an assistant. A chatbot forgets you when the window closes; an assistant does what it's told and hands back the result. What you installed is a partner — something you think *with*, not something you hand tasks *to*. It remembers across sessions and its memory grows, and that's what lets it be a partner rather than a tool: it starts near-empty on purpose, and over your first weeks it takes on who you are, how you think, what you're building, and what it has learned working with you. Month five doesn't look like day one, because it grew there with you.
 
-That one fact drives the rest of this manual:
+That difference cuts both ways — it asks more of you than an assistant does, and gives back more in return:
 
+- You bring it the thinking, not just the tasks — you push back when its read is wrong, and you reach for it on the hard problems, not only when there's a job to hand off (§2, §6).
 - You don't re-explain yourself each session — you correct and add, and the correction sticks.
 - You close sessions on purpose (§4) — that's when its memory of you updates.
 - You stay in the loop on what it remembers (§7, §9) — a memory that grows can grow *wrong*, and you're the one who catches that.
+- You keep the last word — it thinks alongside you, and you'll hand it more as trust grows, but the go-ahead on anything that leaves your hands stays yours (§8), and that holds as it gets more capable, not less.
 
-Everything below follows from "it remembers, and it grows."
+Drive it like an assistant — tasks in, output out, your side of the loop skipped — and it stays the near-empty tool it started as, an assistant you're doing extra work to run. Drive it as a partner and it compounds. Everything below is how.
 
 ## 2. A day with it
 
