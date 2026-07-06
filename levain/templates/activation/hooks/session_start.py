@@ -68,6 +68,17 @@ def main() -> int:
         if identity:
             sections.append(identity)
 
+        # 2c. Live focus — the operator's declared "what I'm on now", surfaced at
+        #     primacy so the partner orients to their frame. The cockpit/CLI SET the
+        #     focus (.levain/context.json); this is the READ that makes the partner
+        #     SEE it (was write-only into the render — a set focus never reached the
+        #     session). Always-fire like posture (it's every-session orienting
+        #     context); self-silent when no focus is set, and freshness-flagged so a
+        #     stale one prompts a re-confirm rather than being trusted as current.
+        focus = hook.focus_notice()
+        if focus:
+            sections.append(focus)
+
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work.
         #    NOTE: the `source` vocabulary (startup / resume / clear / compact)
