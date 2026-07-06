@@ -136,26 +136,38 @@
   function renderFocus(focus) {
     const fEl = document.getElementById("focus");
     if (!fEl) return;
+    // Skip a rebuild while an edit is OPEN, so a background/passive render (a job poll)
+    // can't nuke the half-typed focus — EXCEPT the authoritative SAVE render (marked
+    // data-saving="1" by doSave), which MUST rebuild to replace the editor with the just-
+    // committed focus. Without that exception the guard fires on the save reload too and
+    // the editor strands frozen on "saving…" forever (codex/complement/nemotron L3, all
+    // three; deterministic). Passive reloads ALSO defer at the load() level via
+    // hasUnsavedEdit(".focus-editor") — this guard is the belt to that suspenders.
+    const openEditor = fEl.querySelector(".focus-editor");
+    if (openEditor && openEditor.dataset.saving !== "1") return;
     fEl.replaceChildren();
     fEl.classList.remove("unset", "stale");
-    if (!focus) { fEl.hidden = true; return; }  // no live-context source
+    if (!focus) { fEl.hidden = true; return; }  // no live-context source → no line, no affordance
     fEl.hidden = false;
     if (!focus.text) {
       fEl.classList.add("unset");
       fEl.appendChild(el("span", "ftext", "no focus set"));
-      return;
+    } else {
+      fEl.appendChild(el("span", "ftext", focus.text));
+      if (focus.freshness === "unknown") {
+        // age can't be established (missing/unparseable/future stamp) — say so, dimmed;
+        // unknown ≠ fresh, so it must NOT render like a current focus.
+        fEl.appendChild(el("span", "fage", "· age unknown"));
+        fEl.classList.add("stale");
+      } else if (focus.age_label) {
+        fEl.appendChild(el("span", "fage",
+          focus.age_label + (focus.stale ? " · still live?" : "")));
+        if (focus.stale) fEl.classList.add("stale");
+      }
     }
-    fEl.appendChild(el("span", "ftext", focus.text));
-    if (focus.freshness === "unknown") {
-      // age can't be established (missing/unparseable/future stamp) — say so, dimmed;
-      // unknown ≠ fresh, so it must NOT render like a current focus.
-      fEl.appendChild(el("span", "fage", "· age unknown"));
-      fEl.classList.add("stale");
-    } else if (focus.age_label) {
-      fEl.appendChild(el("span", "fage",
-        focus.age_label + (focus.stale ? " · still live?" : "")));
-      if (focus.stale) fEl.classList.add("stale");
-    }
+    // Class-A inline edit affordance (commit-gated) — set/edit "what I'm on now" IN the
+    // cockpit, not only via `levain focus` / the app. A read-only port shows none (NO THEATER).
+    wireFocusEdit(fEl, focus);
   }
 
   // ---------------------------------------------------------------- render ----
@@ -2104,6 +2116,70 @@
     });
   }
 
+  // The masthead focus line's Class-A inline edit (commit-gated). The operator sets
+  // "what I'm on now" IN the cockpit — a SECOND set-path alongside `levain focus` / the
+  // companion app (last-writer-wins). Mirrors wireEntityName: a small control swaps the
+  // line for an input; save → POST /edit {kind:"focus"}; a blank value CLEARS it. A
+  // read-only port (no commit) shows no affordance.
+  function wireFocusEdit(fEl, focus) {
+    if (!commit) return;
+    const has = !!(focus && focus.text);
+    const btn = el("button", "focus-edit", has ? "edit" : "set");
+    btn.type = "button";
+    btn.title = has ? "edit your focus" : "set your focus";
+    btn.setAttribute("aria-label", has ? "edit focus" : "set focus");
+    btn.addEventListener("click", () => enterFocusEdit(fEl, focus, btn));
+    fEl.appendChild(btn);
+  }
+
+  function enterFocusEdit(fEl, focus, btn) {
+    const current = (focus && focus.text) || "";
+    const editor = el("div", "focus-editor");
+    const input = el("input", "focus-input");
+    input.type = "text"; input.value = current; input.maxLength = 500;
+    input.placeholder = "what you're on now — blank to clear";
+    const save = el("button", "edit-save", "save");
+    const cancel = el("button", "edit-cancel", "cancel");
+    save.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    editor.append(input, save, cancel, msg);
+    // Hide the line's current content + the trigger; the editor replaces them in place.
+    const prior = Array.from(fEl.children);
+    for (const n of prior) n.style.display = "none";
+    fEl.appendChild(editor);
+    input.focus(); input.select();
+
+    const restore = () => {
+      editor.remove();
+      for (const n of prior) n.style.display = "";
+    };
+    const doSave = async () => {
+      save.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "saving…";
+      // Mark the editor "saving" so the SUCCESS reload's renderFocus rebuilds PAST the
+      // in-progress guard (replacing this editor with the committed focus) instead of
+      // bailing and stranding it frozen on "saving…" (the L1 + codex/complement/nemotron
+      // L3 HIGH, reproduced end-to-end).
+      editor.dataset.saving = "1";
+      // No `expected`/optimistic lock: focus is live-state, last-writer-wins (a foreign
+      // sensor writer may have touched the file — an optimistic lock would false-409). A
+      // blank value clears (the server reads an empty focus as unset). `source` is omitted
+      // → the server stamps "web" (the honest HTTP default; a client shouldn't self-declare).
+      const res = await commit({ kind: "focus", text: input.value });
+      if (res && res.ok) return;  // reloaded — the save render rebuilt #focus, removing this editor
+      delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
+      msg.className = "edit-msg err";
+      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      save.disabled = false; cancel.disabled = false;
+    };
+    cancel.addEventListener("click", restore);
+    save.addEventListener("click", doSave);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); doSave(); }
+      else if (ev.key === "Escape") { ev.preventDefault(); restore(); }
+    });
+  }
+
   function renderErrors(view) {
     const p = panel({ title: "Degraded tiers", zone: "mind", edit_class: "" }, true);
     // ALWAYS visible — a tier can fault in any zone, so the degradation summary must
@@ -2358,6 +2434,11 @@
     // discard the polling box + its pending result mid-consult (the job keeps running server-side,
     // but the operator loses the handle). Defer the rebuild until the poll terminates.
     if (_activeJobs.size > 0) return true;
+    // An open masthead focus editor is unsaved work — a passive reload must defer (not
+    // rebuild #focus out from under the half-typed input). The authoritative SAVE reload
+    // is passive:false, so it is NOT gated here and still refreshes (see load() in the boot
+    // layer + the renderFocus data-saving exception).
+    if (document.querySelector(".focus-editor")) return true;
     for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta")) {
       if (ta.value !== ta.dataset.orig) return true;
     }

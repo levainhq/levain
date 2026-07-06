@@ -601,16 +601,27 @@ def write_focus(context_json: Path, text: str, *, source: str = "cli") -> None:
 
     MERGE-preserving: reads the existing object and updates ONLY the three focus
     keys, so a file that carries other keys (a sensor app's superset) keeps them.
-    Live-state, last-writer-wins — a plain ATOMIC write (temp + ``os.replace``), NO
-    CAS / lock. This is the SINGLE-WRITER-per-file path: the only writer of a generic
-    adopter's ``.levain/context.json`` is the operator's own ``levain focus`` (a
-    re-set IS the re-confirm). It does NOT serialize against a FOREIGN concurrent
-    writer of the same file (a sensor app owns + writes ITS OWN superset file and is
-    never pointed here) — the read-merge-write would lose a sibling key written
-    between the read and the swap; that hazard is out of scope by construction, not
-    handled. An all-blank ``text`` CLEARS the focus (``_read_focus`` then reads it as
-    unset). The parent dir is created if absent. A corrupt/unreadable existing file
-    is replaced rather than failing the set (the operator's intent to set wins)."""
+    Live-state, last-writer-wins — a plain ATOMIC write (temp + ``os.replace``, so a
+    reader never sees a torn/half-written file), NO CAS / lock.
+
+    CONCURRENCY (honest scope): for a GENERIC adopter this is a SINGLE-WRITER-per-file
+    path — the only writer of ``.levain/context.json`` is the operator's own ``levain
+    focus`` (a re-set IS the re-confirm), so the read-merge-write is race-free. flow's
+    N-of-1 DELIBERATELY points this at the sensor-written SUPERSET
+    ``state/context_state.json`` (see ``WriteScope.context_json`` + the bridge), which
+    IS foreign-multi-writer. There, ``os.replace`` still prevents a torn read, but the
+    read→merge→replace WINDOW is a genuine lost-update race: a concurrent whole-object
+    writer (e.g. the perception sweep) holding a snapshot from BEFORE this write will
+    revert the just-set focus on its own swap. Unlike resampled sensor keys
+    (body/battery), focus is NOT resampled → NO self-heal; a clobbered focus stays lost
+    until re-set. Accepted as low-stakes for flow (a focus set is rare, the window is
+    ~ms–seconds, re-set is one keystroke, and this is the SAME race flow's pre-existing
+    focus channel already carries) — the proper fix is a shared cross-process lock/CAS on
+    ``context_state.json`` across all its writers (tracked separately), NOT the continuity
+    lock. An all-blank ``text`` CLEARS the focus by POPPING all three keys (matching the
+    CLI/sensor clear shape; ``_read_focus`` reads the absence as unset). The parent dir is
+    created if absent. A corrupt/unreadable existing file is replaced rather than failing
+    the set (the operator's intent to set wins)."""
     text = " ".join(text.split())  # collapse whitespace; "" → clear
     data: dict[str, Any] = {}
     try:
@@ -620,9 +631,20 @@ def write_focus(context_json: Path, text: str, *, source: str = "cli") -> None:
                 data = existing
     except (OSError, ValueError):
         data = {}  # corrupt → start fresh; don't fail the operator's set
-    data["focus"] = text
-    data["focus_set_at"] = datetime.now(timezone.utc).isoformat()
-    data["focus_source"] = source
+    if text:
+        data["focus"] = text
+        data["focus_set_at"] = datetime.now(timezone.utc).isoformat()
+        data["focus_source"] = source
+    else:
+        # CLEAR: POP all three keys — the exact shape the CLI/sensor clear writes
+        # (drain_context_signals / perception_sweep pop, they don't leave a focus="" +
+        # a fresh live stamp). One on-disk contract for "unset", not two: an empty-string
+        # tombstone carrying a current focus_source/focus_set_at is misleading to any raw-JSON
+        # reader that doesn't replicate the truthiness-gate (codex/nemotron L3). `_read_focus`
+        # already reads BOTH a missing key and "" as unset, so this is read-invisible.
+        data.pop("focus", None)
+        data.pop("focus_set_at", None)
+        data.pop("focus_source", None)
     # Write THROUGH a symlink to its target (don't clobber the link with a regular
     # file), and keep os.replace atomic by putting the temp in the TARGET's dir.
     target = Path(os.path.realpath(context_json)) if context_json.is_symlink() else context_json
