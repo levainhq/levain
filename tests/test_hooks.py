@@ -299,6 +299,8 @@ _PORTED_FNS = (
     "crystal_recall", "format_crystal_recall",
     # entity-name coherence surface — byte-identical across both copies
     "config_entity_name", "origin_birth_name", "entity_name_notice",
+    # live-focus reader surface — byte-identical across both copies
+    "_humanize_focus_age", "_focus_freshness", "_read_focus_fields", "focus_notice",
 )
 
 
@@ -319,6 +321,31 @@ class TestCodexParity:
 
     def test_tray_disposition_vocab_matches(self):
         assert codex_hook._NON_COGNITION_DISPOSITIONS == hook._NON_COGNITION_DISPOSITIONS
+
+    def test_focus_stale_bound_matches(self):
+        # the byte-identity guard covers the 4 focus FUNCTIONS but not the module-level
+        # constants they read — pin the codex copies to the shared hook (and thus the
+        # kernel, which the freshness/length parity tests lock the shared hook to) so a
+        # codex-only edit can't silently diverge a bound (L1 note).
+        assert codex_hook._FOCUS_STALE_AFTER_HOURS == hook._FOCUS_STALE_AFTER_HOURS
+        assert codex_hook._MAX_FOCUS_TEXT_LEN == hook._MAX_FOCUS_TEXT_LEN
+
+    def test_codex_focus_surface_works(self, tmp_path, monkeypatch):
+        # The Codex copy actually imports + runs the focus surface — guards a codex-only
+        # missing module-level dep (import timezone / _FOCUS_STALE_AFTER_HOURS /
+        # _MAX_FOCUS_TEXT_LEN) that the source-identity parity test wouldn't catch (codex L3).
+        import json
+        from datetime import datetime, timezone, timedelta
+        monkeypatch.setattr(codex_hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        (tmp_path / ".levain" / "context.json").write_text(
+            json.dumps({"focus": "shipping the release",
+                        "focus_set_at": (datetime.now(timezone.utc)
+                                         - timedelta(hours=1)).isoformat()}),
+            encoding="utf-8")
+        out = codex_hook.focus_notice()
+        assert out is not None and out.startswith("[focus]")
+        assert "shipping the release" in out and "1h ago" in out
 
     def test_codex_collision_surface_works(self):
         # Not just identical text — the Codex module actually imports and runs
@@ -581,3 +608,103 @@ class TestEntityNameNotice:
         self._install(tmp_path, config={"entity_name": "Minerva"},
                       origin_h1="# Who You Are — Athena")
         assert hook.entity_name_notice().startswith("[identity]")
+
+
+class TestFocusNotice:
+    """The live-focus reader (0.3.11): the cockpit/CLI SET the focus into
+    .levain/context.json; this surfaces it to the partner at session start, freshness-
+    flagged, mirroring the kernel's dashboard._read_focus so the entity sees the same
+    freshness the cockpit renders. Fail-open; self-silent when no focus is set."""
+
+    def _ctx(self, tmp_path, **keys):
+        import json
+        (tmp_path / ".levain").mkdir(exist_ok=True)
+        (tmp_path / ".levain" / "context.json").write_text(
+            json.dumps(keys), encoding="utf-8")
+
+    def _iso(self, hours_ago):
+        # a tz-aware ISO stamp `hours_ago` in the past — no wall-clock literal
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+    def test_silent_when_no_context_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook.focus_notice() is None
+
+    def test_silent_when_no_focus_key(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, body=4, mind=5)  # a sensor superset with no focus
+        assert hook.focus_notice() is None
+
+    def test_fresh_focus_fires_orient(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, focus="migrating Autostraddle off VIP",
+                  focus_set_at=self._iso(1), focus_source="web")
+        out = hook.focus_notice()
+        assert out is not None and out.startswith("[focus]")
+        assert "migrating Autostraddle off VIP" in out
+        assert "Orient to it" in out and "1h ago" in out
+
+    def test_stale_focus_flags_reconfirm(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, focus="last week's thing", focus_set_at=self._iso(48))
+        out = hook.focus_notice()
+        assert out is not None
+        assert "may be out of date" in out and "2d ago" in out
+
+    def test_unknown_age_flags_reconfirm(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, focus="no stamp", focus_set_at=None)
+        out = hook.focus_notice()
+        assert out is not None and "age unknown" in out and "may be out of date" in out
+
+    def test_future_stamp_is_unknown_not_fresh(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, focus="clock skew", focus_set_at=self._iso(-3))  # 3h future
+        out = hook.focus_notice()
+        assert out is not None and "age unknown" in out  # never render as current
+
+    def test_focus_whitespace_collapsed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._ctx(tmp_path, focus="line one\nline two", focus_set_at=self._iso(1))
+        out = hook.focus_notice()
+        assert out is not None and "line one line two" in out and "\n" not in out.split(":")[-1]
+
+    def test_fail_open_on_malformed_context(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        (tmp_path / ".levain" / "context.json").write_text("{bad", encoding="utf-8")
+        assert hook.focus_notice() is None  # never raises
+
+    def test_over_cap_focus_is_absent(self, tmp_path, monkeypatch):
+        # A focus over the write seam's MAX_FOCUS_TEXT_LEN (a hand-edited / foreign
+        # context file the governed edit would refuse) must not flood primacy context —
+        # treat as absent (codex L3). The cap is mirrored from writes.MAX_FOCUS_TEXT_LEN.
+        from levain.writes import MAX_FOCUS_TEXT_LEN
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook._MAX_FOCUS_TEXT_LEN == MAX_FOCUS_TEXT_LEN  # bound pinned to the writer
+        self._ctx(tmp_path, focus="A" * (MAX_FOCUS_TEXT_LEN + 1),
+                  focus_set_at=self._iso(1))
+        assert hook.focus_notice() is None
+        # at the cap it still fires (the seam accepts exactly MAX_FOCUS_TEXT_LEN)
+        self._ctx(tmp_path, focus="A" * MAX_FOCUS_TEXT_LEN, focus_set_at=self._iso(1))
+        out = hook.focus_notice()
+        assert out is not None and ("A" * MAX_FOCUS_TEXT_LEN) in out
+
+    def test_freshness_mirrors_kernel_read_focus(self, tmp_path, monkeypatch):
+        # Exact-parity guard: the hook's (freshness, age_label) must match the kernel's
+        # dashboard._read_focus for the same stamp, so the entity sees the SAME freshness
+        # the cockpit renders. Drift here = the two disagree on "stale". Both take the
+        # SAME injected `now` + now-relative stamps → deterministic across the 18h boundary.
+        from datetime import datetime, timezone, timedelta
+        from levain.dashboard import _read_focus, FOCUS_STALE_AFTER_HOURS
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook._FOCUS_STALE_AFTER_HOURS == FOCUS_STALE_AFTER_HOURS  # bound pinned
+        now = datetime.now(timezone.utc)
+        for hours in (0.0, 0.5, 3.0, 17.9, 18.0, 48.0):
+            set_at = (now - timedelta(hours=hours)).isoformat()
+            self._ctx(tmp_path, focus="x", focus_set_at=set_at)
+            k = _read_focus(tmp_path / ".levain" / "context.json", now)
+            h_fresh, h_age = hook._focus_freshness(set_at, now=now)
+            assert h_fresh == k.freshness, (hours, h_fresh, k.freshness)
+            assert h_age == k.age_label, (hours, h_age, k.age_label)

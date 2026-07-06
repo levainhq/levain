@@ -46,7 +46,7 @@ import subprocess
 import sys
 import unicodedata
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -330,6 +330,121 @@ def entity_name_notice() -> str | None:
     return (
         f'[identity] Your operator calls you "{config}" (set in .levain/config.json). '
         f'"{config}" is the name you go by; who you become under it is yours.'
+    )
+
+
+# ---- Live focus — the operator's declared "what I'm on now" reaches the partner ----
+# The cockpit (levain serve --write) + `levain focus` CLI SET the focus into the
+# live-context contract .levain/context.json {focus, focus_set_at, focus_source}, but
+# until 0.3.11 NOTHING read it into the partner's session — it was surfaced only in the
+# cockpit/TUI render, so a set focus never reached the entity (the writer→store→reader
+# loop had no reader; caught cross-machine by Chip on the 0.3.10 focus edit). These
+# readers mirror the kernel's dashboard._read_focus + _humanize_focus_age +
+# FOCUS_STALE_AFTER_HOURS, so the entity sees the SAME freshness the cockpit renders
+# (and agrees with flow's session_init, which mirrors the same kernel bound). A control
+# plane that REDIRECTS context_json (flow's Bridge → state/context_state.json) owns its
+# own reader; this reads the bare-install default. Stdlib only.
+_FOCUS_STALE_AFTER_HOURS = 18  # mirror dashboard.FOCUS_STALE_AFTER_HOURS
+# a focus the governed write seam would REJECT (over the cap) must not reach primacy —
+# mirror writes.MAX_FOCUS_TEXT_LEN so the reader enforces the same bound as the writer.
+_MAX_FOCUS_TEXT_LEN = 500  # mirror writes.MAX_FOCUS_TEXT_LEN
+
+
+def _humanize_focus_age(delta_seconds: float) -> str:
+    """'set just now' / 'set 12m ago' / 'set 3h ago' / 'set 2d ago' — byte-parity with
+    the kernel's _humanize_focus_age. A negative (future) delta → '' (never a fabricated
+    freshness)."""
+    if delta_seconds < 0:
+        return ""
+    s = int(delta_seconds)
+    if s < 90:
+        return "set just now"
+    if s < 3600:
+        return f"set {s // 60}m ago"
+    if s < 86400:
+        return f"set {s // 3600}h ago"
+    return f"set {s // 86400}d ago"
+
+
+def _focus_freshness(set_at: str | None, now: datetime | None = None) -> tuple[str, str]:
+    """(freshness, age_label) for a focus stamp, mirroring dashboard._read_focus against
+    FOCUS_STALE_AFTER_HOURS: 'fresh'|'stale'|'unknown' + 'set 3h ago'/''. An absent /
+    unparseable / future stamp → ('unknown', '') so an unknown-age focus is never
+    rendered as current (the honesty floor: unknown ≠ fresh). `now` is injectable for
+    testing (parity with the kernel's _read_focus, which takes `now`); default = now."""
+    if not isinstance(set_at, str) or not set_at.strip():
+        return "unknown", ""
+    try:
+        ts = datetime.fromisoformat(set_at)
+    except (ValueError, TypeError):
+        return "unknown", ""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    try:
+        delta = (now - ts).total_seconds()
+    except (TypeError, OverflowError, ValueError):
+        return "unknown", ""
+    if delta < 0:
+        return "unknown", ""
+    stale = delta >= _FOCUS_STALE_AFTER_HOURS * 3600
+    return ("stale" if stale else "fresh"), _humanize_focus_age(delta)
+
+
+def _read_focus_fields() -> tuple[str | None, str | None]:
+    """(focus text, focus_set_at) from the live-context contract .levain/context.json —
+    the READ half of dashboard._read_focus (superset-tolerant: only the focus keys are
+    read, so a sensor app's richer file satisfies the same contract). Fail-soft:
+    missing / unreadable / malformed / non-dict → (None, None). Internal whitespace in
+    the focus is collapsed (a newline would split the single-line render), matching
+    _read_focus + write_focus."""
+    try:
+        raw = (install_root() / ".levain" / "context.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    rt = data.get("focus")
+    text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
+    # Enforce the write seam's cap on READ too: a focus over MAX_FOCUS_TEXT_LEN (a hand-
+    # edited / foreign / sensor-app context file the governed edit would refuse) must not
+    # flood primacy model context — the reader is a prompt-construction boundary, not a UI
+    # render the cockpit can visually clamp (codex L3). Over-cap → treat as absent.
+    if text is not None and len(text) > _MAX_FOCUS_TEXT_LEN:
+        text = None
+    ra = data.get("focus_set_at")
+    set_at = ra if isinstance(ra, str) and ra.strip() else None
+    return text, set_at
+
+
+def focus_notice() -> str | None:
+    """The operator's live declared focus ('what I'm on now') at primacy, so the partner
+    orients to the operator's OWN frame — the READ that closes the cockpit focus edit's
+    writer→store→reader loop (0.3.11). Pure-echo operator self-report: no machine
+    interpretation, no deference-risk (you cannot defer to your own input). None when no
+    focus is set. A stale focus (past FOCUS_STALE_AFTER_HOURS) or one whose age can't be
+    established is FLAGGED to re-confirm, never trusted as current (operator-reports-
+    first: a nudge, not a verdict — the honesty floor the cockpit render already applies)."""
+    text, set_at = _read_focus_fields()
+    if not text:
+        return None
+    freshness, age_label = _focus_freshness(set_at)
+    age = f" ({age_label})" if age_label else " (age unknown)"
+    if freshness == "fresh":
+        return (
+            f'[focus] The operator\'s current declared focus{age} — their own words for '
+            f'"what I\'m on now": "{text}". Orient to it; it is their frame for this '
+            f'session, reflected back (not a machine read).'
+        )
+    # stale OR unknown age — never present an old / unverifiable focus as current
+    return (
+        f'[focus] The operator\'s last declared focus{age} — their own words for "what '
+        f'I\'m on now": "{text}". It may be out of date: take it as a prompt to confirm '
+        f'what they\'re on now, not a settled fact.'
     )
 
 
