@@ -893,3 +893,73 @@ def test_active_verbs_episodes_offers_tombstone():
     kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "episodes", read_only=False))]
     assert kinds == ["episode_tombstone"]
     assert _tui_curses._active_verbs(_model_on(v, "episodes", read_only=True)) == []
+
+
+# --- the global focus edit ('f') — set/edit the masthead "what I'm on now" ----
+def _model_with_focus(text):
+    """A writable model whose view carries a Focus (text=None → unset)."""
+    import dataclasses
+
+    from levain.dashboard import Focus
+    focus = Focus(text=text, set_at=None, source=None) if text is not None else None
+    return tui.TuiModel(view=dataclasses.replace(_view(), focus=focus), read_only=False)
+
+
+def test_edit_focus_builds_the_focus_request(monkeypatch):
+    from levain import _tui_curses
+
+    captured = {}
+    monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda *a, **k: "shipping 247\n")
+    monkeypatch.setattr(_tui_curses, "_apply",
+                        lambda m, s, req, ok: captured.update(req=req, ok=ok) or m)
+    _tui_curses._edit_focus(None, _model_with_focus(None), object())  # unset → set
+    assert captured["req"] == {"kind": "focus", "text": "shipping 247", "source": "tui"}
+    assert captured["ok"] == "focus set"
+
+
+def test_edit_focus_clear_when_editor_emptied(monkeypatch):
+    from levain import _tui_curses
+
+    captured = {}
+    monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda *a, **k: "")
+    monkeypatch.setattr(_tui_curses, "_apply",
+                        lambda m, s, req, ok: captured.update(req=req, ok=ok) or m)
+    _tui_curses._edit_focus(None, _model_with_focus("old"), object())
+    assert captured["req"]["text"] == "" and captured["ok"] == "focus cleared"
+
+
+def test_edit_focus_no_change_skips_apply(monkeypatch):
+    from levain import _tui_curses
+
+    called = []
+    monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda *a, **k: "same  focus")
+    monkeypatch.setattr(_tui_curses, "_apply", lambda *a, **k: called.append(a) or a[0])
+    result = _tui_curses._edit_focus(None, _model_with_focus("same focus"), object())
+    assert called == []  # whitespace-collapsed equal → no write
+    assert "no change" in result.status
+
+
+def test_edit_focus_editor_failed_skips_apply(monkeypatch):
+    from levain import _tui_curses
+
+    called = []
+    monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda *a, **k: None)
+    monkeypatch.setattr(_tui_curses, "_apply", lambda *a, **k: called.append(a) or a[0])
+    result = _tui_curses._edit_focus(None, _model_with_focus("x"), object())
+    assert called == [] and "EDITOR" in result.status
+
+
+def test_edit_focus_read_only_backstop(monkeypatch):
+    # defense-in-depth: the 'f' keybind is gated on `not read_only`, but even if reached,
+    # the _apply chokepoint refuses BEFORE apply_edit (mirrors test_apply_backstop).
+    import dataclasses
+
+    from levain import _tui_curses
+    from levain.dashboard import Focus
+
+    reached = []
+    monkeypatch.setattr(_tui_curses, "_edit_via_editor", lambda *a, **k: "new")
+    monkeypatch.setattr(_tui_curses, "apply_edit", lambda *a, **k: reached.append(a))
+    view = dataclasses.replace(_view(), focus=Focus(text="old", set_at=None, source=None))
+    result = _tui_curses._edit_focus(None, tui.TuiModel(view=view, read_only=True), None)
+    assert reached == [] and "read-only" in result.status

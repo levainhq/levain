@@ -144,6 +144,10 @@ def _loop(
             model = move_in_panel(model, +10_000)
         elif ch == ord("r"):
             model = _rebuild(model, source, "refreshed")
+        elif ch == ord("f") and not model.read_only:
+            # Global write: set/edit the masthead focus (not a row-scoped verb — focus
+            # isn't a selectable panel). Read-only cockpit → 'f' falls through to a no-op.
+            model = _edit_focus(stdscr, model, source)
         else:
             # Verb keys — fire only if the SELECTED panel+row affords that verb
             # (the same set the footer advertised). An unbound key does nothing.
@@ -610,6 +614,29 @@ def _edit_via_editor(stdscr: "curses.window", initial_text: str) -> str | None:
             pass
 
 
+def _edit_focus(
+    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
+) -> TuiModel:
+    """Set / edit the operator's live focus — the masthead 'what I'm on now'. A GLOBAL
+    write ('f'), NOT a row-scoped verb: focus isn't a selectable panel, so it can't ride
+    ``_active_verbs``. Opens ``$EDITOR`` seeded with the current focus (the TUI's edit
+    idiom); an empty buffer CLEARS it (distinct from an editor crash → ``None`` → no-op).
+    Live-state, last-writer-wins — routed through the same governed ``apply_edit`` seam
+    (``kind='focus'``) every write funnels through. The 'f' keybind is gated on
+    ``not model.read_only``; ``_apply`` is the un-bypassable read-only backstop."""
+    view = model.view
+    focus = getattr(view, "focus", None) if view is not None else None
+    current = focus.text if (focus is not None and focus.text) else ""
+    edited = _edit_via_editor(stdscr, current)
+    if edited is None:
+        return replace(model, status="⚠ focus unchanged — $EDITOR is missing or exited non-zero")
+    new = " ".join(edited.split())  # single line (write_focus collapses on write too)
+    if new == current:
+        return replace(model, status="focus — no change")
+    ok = "focus cleared" if new == "" else "focus set"
+    return _apply(model, source, {"kind": "focus", "text": new, "source": "tui"}, ok)
+
+
 # ---------------------------------------------------------------------------
 # Painting.
 # ---------------------------------------------------------------------------
@@ -769,6 +796,7 @@ _HELP_LINES = [
     "    j / k          move (select item in a list panel, else scroll)",
     "    PgDn / PgUp    page · g / G  first / last (or top / bottom)",
     "    r              refresh (rebuild the substrate view)",
+    "    f              set / edit your focus — 'what I'm on now' (writable cockpit)",
     "    q / Esc        quit · ?  this help (any key dismisses)",
     "",
     "  verbs (only where the SELECTED panel + row affords them)",

@@ -720,6 +720,35 @@
     box-shadow: inset 0 2px 6px rgba(0,0,0,.45); outline: none;
   }
   .name-input:focus { border-color: color-mix(in srgb, var(--mind) 55%, var(--line-hot)); box-shadow: inset 0 2px 6px rgba(0,0,0,.45), 0 0 12px -4px var(--mind); }
+  /* the masthead focus line's inline edit — operate-amber (the operator's OWN frame, the
+     .focusline hue), the prose sibling of the entity-name's uppercase .name-edit/.name-input. */
+  .focus-edit {
+    font: 700 9px/1 var(--label); letter-spacing: .12em; text-transform: uppercase;
+    color: color-mix(in srgb, var(--operate) 80%, var(--dim));
+    background: linear-gradient(180deg, #1e1a12, #15110b);
+    border: 1px solid color-mix(in srgb, var(--operate) 30%, var(--line)); border-bottom-width: 2px;
+    border-radius: 3px; padding: 3px 8px; cursor: pointer; transition: all .13s ease; align-self: center;
+  }
+  .focus-edit::before { content: "✎ "; }
+  .focus-edit:hover { color: #120c06; background: var(--operate); box-shadow: 0 0 14px -4px var(--operate); }
+  .focus-edit:active { transform: translateY(1px); }
+  /* THE MASTHEAD lives OUTSIDE any .panel[data-zone] — which is where `--accent` gets
+     defined (per zone) for the shared .edit-save/.edit-cancel gradient + border + shadow.
+     Unset here, those `var(--accent)` refs are INVALID → the save button renders with a
+     transparent background + near-black text on the dark masthead = INVISIBLE (a real
+     DevTools catch). Define it to the focus line's own operate-amber so the shared buttons
+     resolve AND read on-theme. */
+  .focus-editor { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; --accent: var(--operate); }
+  .focus-input {
+    font-family: inherit; font-size: 12.5px; letter-spacing: .02em; color: var(--ink);
+    background: #0a0f0e; flex: 1 1 24ch; min-width: 16ch; max-width: 60vw;
+    border: 1px solid var(--line-hot); border-radius: 4px; padding: 4px 9px;
+    box-shadow: inset 0 2px 6px rgba(0,0,0,.45); outline: none;
+  }
+  /* the buttons never shrink below their label so a growing input can't squeeze them
+     (scoped to .focus-editor so the shared .edit-save/.edit-cancel elsewhere are untouched). */
+  .focus-editor .edit-save, .focus-editor .edit-cancel { flex: 0 0 auto; }
+  .focus-input:focus { border-color: color-mix(in srgb, var(--operate) 55%, var(--line-hot)); box-shadow: inset 0 2px 6px rgba(0,0,0,.45), 0 0 12px -4px var(--operate); }
 
   /* the edit log / undo surface — Operate-zone rows; undo is a real reversal verb */
   .edit-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: baseline; padding: 5px 0;
@@ -907,7 +936,7 @@
 
     .verb-btn { padding: 8px 12px; font-size: 10px; }
     .undo-btn { padding: 8px 12px; font-size: 10px; }
-    .edit-btn, .name-edit { padding: 8px 12px; font-size: 10px; }
+    .edit-btn, .name-edit, .focus-edit { padding: 8px 12px; font-size: 10px; }
     .verb-confirm, .verb-cancel { padding: 8px 13px; }
     .scope-tb { padding: 8px 13px; font-size: 11px; }
     .scope-ch { padding: 7px 10px; font-size: 10px; }
@@ -922,11 +951,12 @@
     .edit-ta,
     .verb-ref,
     .verb-kind,
+    .focus-input,
     .ep-search-input { font-size: 16px; }
     /* tap-target floor on the focusable fields. .name-input (the masthead rename)
        is 18px so it needs no zoom-fix, but its base height is ~30px — under the
        floor — so it gets min-height here for a consistent thumb target (L3: complement). */
-    .name-input, .verb-kind, .verb-ref, .ep-search-input { min-height: 38px; }
+    .name-input, .focus-input, .verb-kind, .verb-ref, .ep-search-input { min-height: 38px; }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
 

@@ -14,12 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from datetime import datetime, timezone
+
 from levain.dashboard import (
     CLASS_A,
     CLASS_C,
     STATE_HEADING,
     SubstrateSource,
     _read_config_docs,
+    _read_focus,
     _read_levain_config,
     _section_edit_class,
     _split_sections,
@@ -1820,3 +1823,112 @@ class TestExplicitPathsScope:
         undo = apply_edit(scope, {"kind": "undo", "edit_id": res["id"]})
         assert undo["ok"]
         assert scope.anneal.continuity_md.read_text(encoding="utf-8") == before
+
+
+# --- the Class-A `focus` edit (live operator-context, last-writer-wins) -------
+# Distinct from the State edit: no lock/backup/undo, targets scope.context_json,
+# merge-preserving (a sensor superset survives), blank clears, source-stamped.
+class TestFocusEdit:
+    def _ctx(self, install: Path) -> Path:
+        return WriteScope.from_install_root(install).context_json
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def test_set_writes_the_three_keys(self, install: Path) -> None:
+        res = apply_edit(_scope(install), {"kind": "focus", "text": "Pressable arch review"})
+        assert res == {"ok": True, "kind": "focus", "cleared": False}
+        data = json.loads(self._ctx(install).read_text(encoding="utf-8"))
+        assert data["focus"] == "Pressable arch review"
+        assert data["focus_source"] == "web"          # HTTP default (no source sent)
+        assert isinstance(data["focus_set_at"], str) and data["focus_set_at"]
+        # round-trips through the read layer as a live, set focus
+        f = _read_focus(self._ctx(install), self._now())
+        assert f is not None and f.text == "Pressable arch review"
+
+    def test_source_tui_is_honored(self, install: Path) -> None:
+        apply_edit(_scope(install), {"kind": "focus", "text": "x", "source": "tui"})
+        assert json.loads(self._ctx(install).read_text())["focus_source"] == "tui"
+
+    def test_spoofed_source_falls_back_to_web(self, install: Path) -> None:
+        apply_edit(_scope(install), {"kind": "focus", "text": "x", "source": "evil"})
+        assert json.loads(self._ctx(install).read_text())["focus_source"] == "web"
+
+    def test_blank_text_clears(self, install: Path) -> None:
+        apply_edit(_scope(install), {"kind": "focus", "text": "something"})
+        res = apply_edit(_scope(install), {"kind": "focus", "text": "   "})
+        assert res["cleared"] is True
+        # an empty focus reads back as UNSET (not the literal "")
+        assert _read_focus(self._ctx(install), self._now()).text is None
+        # and the three keys are POPPED (not a focus="" tombstone) — matches CLI/sensor clear
+        data = json.loads(self._ctx(install).read_text())
+        assert not ({"focus", "focus_set_at", "focus_source"} & data.keys())
+
+    def test_omitted_text_clears(self, install: Path) -> None:
+        apply_edit(_scope(install), {"kind": "focus", "text": "something"})
+        res = apply_edit(_scope(install), {"kind": "focus"})
+        assert res["cleared"] is True
+        assert _read_focus(self._ctx(install), self._now()).text is None
+
+    def test_clear_pops_focus_keys_but_keeps_siblings(self, install: Path) -> None:
+        ctx = self._ctx(install)
+        ctx.write_text(json.dumps({"location": "home", "focus": "old", "focus_source": "web"}),
+                       encoding="utf-8")
+        apply_edit(_scope(install), {"kind": "focus", "text": ""})
+        data = json.loads(ctx.read_text(encoding="utf-8"))
+        assert data == {"location": "home"}  # focus keys popped, sibling untouched
+
+    def test_whitespace_is_collapsed(self, install: Path) -> None:
+        apply_edit(_scope(install), {"kind": "focus", "text": "a\n  b\t c"})
+        assert json.loads(self._ctx(install).read_text())["focus"] == "a b c"
+
+    def test_too_long_refused(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "focus", "text": "x" * 501})
+        assert ei.value.code == "focus_too_long" and ei.value.http_status == 422
+
+    def test_at_cap_allowed(self, install: Path) -> None:
+        res = apply_edit(_scope(install), {"kind": "focus", "text": "y" * 500})
+        assert res["ok"] and res["cleared"] is False
+
+    def test_non_string_refused(self, install: Path) -> None:
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {"kind": "focus", "text": 123})
+        assert ei.value.code == "bad_focus" and ei.value.http_status == 400
+
+    def test_no_context_json_target_refused(self, install: Path) -> None:
+        # a scope with no writable operator-context (read-only-ish / no context file)
+        scope = WriteScope.from_install_root(install)
+        scope = WriteScope(anneal=scope.anneal, ledger_root=scope.ledger_root,
+                           install_root=scope.install_root, context_json=None)
+        with pytest.raises(EditError) as ei:
+            apply_edit(scope, {"kind": "focus", "text": "x"})
+        assert ei.value.code == "no_focus_target" and ei.value.http_status == 422
+
+    def test_merge_preserves_sensor_superset(self, install: Path) -> None:
+        # flow's N-of-1: the context file is a sensor-written SUPERSET; a focus set must
+        # keep the sibling keys (write_focus is merge-preserving).
+        ctx = self._ctx(install)
+        ctx.write_text(json.dumps({
+            "location": "home", "body": 4, "battery_level": 88,
+            "focus": "old", "focus_source": "flowconnect",
+        }), encoding="utf-8")
+        apply_edit(_scope(install), {"kind": "focus", "text": "new", "source": "web"})
+        data = json.loads(ctx.read_text(encoding="utf-8"))
+        assert data["focus"] == "new" and data["focus_source"] == "web"
+        assert data["location"] == "home" and data["body"] == 4 and data["battery_level"] == 88
+
+    def test_focus_is_not_audited_or_backed_up(self, install: Path) -> None:
+        # focus is ephemeral live-state (last-writer-wins) — it must NOT land in the
+        # Class-A undo/audit trail (that's for reversible consolidated-cognition edits).
+        apply_edit(_scope(install), {"kind": "focus", "text": "ephemeral"})
+        assert recent_edits(_scope(install).ledger_root) == []
+
+    def test_read_and_write_context_paths_agree(self, tmp_path: Path) -> None:
+        # the read field (SubstrateSource.context_json) and the write field
+        # (WriteScope.context_json) are independently set — lock that the two
+        # from_install_root factories derive the SAME path, so a rename can't silently
+        # split "render focus from A / write focus to B" (codex/nemotron/L1 L3 LOW).
+        root = _make_install(tmp_path)
+        assert (SubstrateSource.local(root).context_json
+                == WriteScope.from_install_root(root).context_json)
