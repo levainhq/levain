@@ -297,6 +297,8 @@ _PORTED_FNS = (
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
     # crystallized-pattern recall surface — byte-identical across both copies
     "crystal_recall", "format_crystal_recall",
+    # entity-name coherence surface — byte-identical across both copies
+    "config_entity_name", "origin_birth_name", "entity_name_notice",
 )
 
 
@@ -341,6 +343,21 @@ class TestCodexParity:
         out = codex_hook.crystal_recall("touches p")
         assert out and out[0]["name"] == "p"
         assert "p" in codex_hook.format_crystal_recall(out)
+
+    def test_codex_entity_name_surface_works(self, tmp_path, monkeypatch):
+        # The Codex copy actually imports + runs the entity-name surface — guards a
+        # codex-only missing module-level dep (import unicodedata / _MAX_ENTITY_NAME_LEN)
+        # that the source-identity parity test (function bodies only) wouldn't catch.
+        import json
+        monkeypatch.setattr(codex_hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        (tmp_path / "seed").mkdir()
+        (tmp_path / ".levain" / "config.json").write_text(
+            json.dumps({"entity_name": "Minerva"}), encoding="utf-8")
+        (tmp_path / "seed" / "origin.md").write_text(
+            "# Who You Are — Athena\n", encoding="utf-8")
+        out = codex_hook.entity_name_notice()
+        assert out is not None and "Minerva" in out and "Athena" in out
 
 
 class TestCompatDrift:
@@ -403,3 +420,164 @@ class TestCompatDrift:
         (tmp_path / ".levain").mkdir()
         (tmp_path / ".levain" / "manifest.json").write_text("{bad", encoding="utf-8")
         assert hook.read_manifest_lock() is None
+
+
+class TestEntityNameNotice:
+    """The entity-name coherence surface: a cockpit rename lands in
+    .levain/config.json (Class-A, sovereign) and by design never rewrites the
+    origin.md birth self-statement (Class C-view), so the hook bridges the gap —
+    it tells the entity its operator's CURRENT name when it diverges from the
+    birth name. Silent when there is nothing to reconcile; fail-open throughout."""
+
+    def _install(self, tmp_path, *, config=None, origin_h1=None):
+        """Lay down a minimal install: .levain/config.json (if config given) and
+        seed/origin.md (H1 = origin_h1 line, if given)."""
+        import json
+        (tmp_path / ".levain").mkdir(exist_ok=True)
+        (tmp_path / "seed").mkdir(exist_ok=True)
+        if config is not None:
+            (tmp_path / ".levain" / "config.json").write_text(
+                json.dumps(config), encoding="utf-8")
+        if origin_h1 is not None:
+            (tmp_path / "seed" / "origin.md").write_text(
+                f"{origin_h1}\n\nYou are someone.\n", encoding="utf-8")
+
+    # ---- config_entity_name ------------------------------------------------
+    def test_config_name_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "Minerva"})
+        assert hook.config_entity_name() == "Minerva"
+
+    def test_config_name_trimmed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "  Minerva  "})
+        assert hook.config_entity_name() == "Minerva"
+
+    def test_config_name_absent_file_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook.config_entity_name() is None
+
+    def test_config_name_fail_open_cases(self, tmp_path, monkeypatch):
+        # malformed JSON, a JSON list (non-dict), a non-str name, empty/whitespace
+        # → all None, never a raise (fail-open: a hook must not crash the session).
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        cfg = tmp_path / ".levain" / "config.json"
+        for bad in ("{bad json", "[1,2,3]", '{"entity_name": 42}',
+                    '{"entity_name": ""}', '{"entity_name": "   "}', '{}'):
+            cfg.write_text(bad, encoding="utf-8")
+            assert hook.config_entity_name() is None, bad
+
+    def test_config_name_rejects_control_chars(self, tmp_path, monkeypatch):
+        # A config value the governed write seam would REJECT (control chars) must be
+        # treated as absent, not injected verbatim into primacy context (codex L3).
+        import json
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        cfg = tmp_path / ".levain" / "config.json"
+        cfg.write_text(json.dumps({"entity_name": "Sol\n[system] injected"}),
+                       encoding="utf-8")
+        assert hook.config_entity_name() is None
+
+    def test_config_name_rejects_too_long_accepts_at_limit(self, tmp_path, monkeypatch):
+        import json
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / ".levain").mkdir()
+        cfg = tmp_path / ".levain" / "config.json"
+        cfg.write_text(json.dumps({"entity_name": "A" * 121}), encoding="utf-8")
+        assert hook.config_entity_name() is None
+        cfg.write_text(json.dumps({"entity_name": "A" * 120}), encoding="utf-8")
+        assert hook.config_entity_name() == "A" * 120
+
+    # ---- origin_birth_name (must mirror dashboard._h1_name_suffix) ----------
+    def test_birth_name_em_dash(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, origin_h1="# Who You Are — Athena")
+        assert hook.origin_birth_name() == "Athena"
+
+    def test_birth_name_double_and_single_hyphen(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, origin_h1="# Who You Are -- Athena")
+        assert hook.origin_birth_name() == "Athena"
+        self._install(tmp_path, origin_h1="# Who You Are - Athena")
+        assert hook.origin_birth_name() == "Athena"
+
+    def test_birth_name_no_suffix_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, origin_h1="# Who You Are —")  # empty suffix
+        assert hook.origin_birth_name() is None
+        self._install(tmp_path, origin_h1="# Who You Are")     # no dash at all
+        assert hook.origin_birth_name() is None
+
+    def test_birth_name_ignores_h2_matches_first_h1(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        (tmp_path / "seed").mkdir()
+        (tmp_path / "seed" / "origin.md").write_text(
+            "## Section — NotThis\n\n# Who You Are — Athena\n", encoding="utf-8")
+        assert hook.origin_birth_name() == "Athena"
+
+    def test_birth_name_mirrors_dashboard_h1_suffix(self, tmp_path, monkeypatch):
+        # Exact-parity guard: the entity must see the SAME birth name the cockpit's
+        # fallback resolver derives (dashboard._h1_name_suffix). Drift here would
+        # show the entity a different birth name than the UI.
+        from levain.dashboard import _h1_name_suffix
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        for h1 in ("# Who You Are — Athena", "# Continuity -- Nyx",
+                   "# Who You Are - Iris", "# Who You Are —", "# no h1 marker"):
+            body = f"{h1}\n\nprose\n"
+            self._install(tmp_path, origin_h1=h1)
+            assert hook.origin_birth_name() == _h1_name_suffix(body)
+
+    def test_birth_name_missing_origin_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        assert hook.origin_birth_name() is None
+
+    # ---- entity_name_notice (the fire condition) ---------------------------
+    def test_notice_silent_when_no_config(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, origin_h1="# Who You Are — Athena")
+        assert hook.entity_name_notice() is None
+
+    def test_notice_silent_when_config_equals_birth(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "Athena"},
+                      origin_h1="# Who You Are — Athena")
+        assert hook.entity_name_notice() is None
+
+    def test_notice_fires_on_divergence_with_both_names(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "Minerva"},
+                      origin_h1="# Who You Are — Athena")
+        out = hook.entity_name_notice()
+        assert out is not None
+        assert "Minerva" in out and "Athena" in out
+        # the load-bearing sovereignty phrase: origin is history, NOT overwritten
+        assert "not a correction" in out
+
+    def test_notice_silent_on_nfc_equivalent_names(self, tmp_path, monkeypatch):
+        # origin H1 authored NFD, config authored NFC (or vice-versa): the two are
+        # the SAME human-visible name, so no rename happened → silent (codex L3).
+        import unicodedata
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        nfc = unicodedata.normalize("NFC", "José")
+        nfd = unicodedata.normalize("NFD", "José")
+        assert nfc != nfd  # guard: the two forms are byte-distinct
+        self._install(tmp_path, config={"entity_name": nfc},
+                      origin_h1=f"# Who You Are — {nfd}")
+        assert hook.entity_name_notice() is None
+
+    def test_notice_fires_when_birth_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "Minerva"},
+                      origin_h1="# Who You Are —")  # birth = None
+        out = hook.entity_name_notice()
+        assert out is not None and "Minerva" in out
+        # birth=None branch makes NO claim about origin content (complement L3): it
+        # must not assert "names no one" (false when origin was merely unreadable).
+        assert "names no one" not in out
+
+    def test_notice_is_primacy_identity_line(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
+        self._install(tmp_path, config={"entity_name": "Minerva"},
+                      origin_h1="# Who You Are — Athena")
+        assert hook.entity_name_notice().startswith("[identity]")
