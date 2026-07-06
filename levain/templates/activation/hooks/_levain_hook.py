@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -226,6 +227,106 @@ def read_manifest_lock() -> dict | None:
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+# ---- Entity-name coherence — the operator's CURRENT label reaches the entity ----
+# The entity's always-loaded context imports seed/origin.md, so it always reads its
+# BIRTH name. A cockpit/tool rename lands in .levain/config.json (Class-A, sovereign)
+# and — by design — never rewrites origin.md (Class C-view: the operator cannot
+# overwrite the entity's own birth self-statement). Without a bridge the rename never
+# reaches the entity: the cockpit shows the new name while the entity still
+# self-identifies by the old one. These readers mirror the dashboard's
+# _read_levain_config / _h1_name_suffix — the same two surfaces (config = current
+# label, origin H1 = birth/fallback). The hook DIFFS them to narrate the rename;
+# the dashboard instead PREFERS config over the origin fallback — but both read the
+# same values, so the entity and the cockpit never disagree on the current name.
+# Stdlib only — the hook never imports the levain package.
+
+# Mirror the write seam's scalar contract (writes.py: MAX_NAME_LEN + control-char
+# reject): a value the governed rename would REFUSE must not slip past this fail-soft
+# reader into primacy model context — a hand-edited config with an embedded newline
+# could otherwise inject a fake line into the [identity] surface (codex L3).
+_MAX_ENTITY_NAME_LEN = 120
+
+
+def config_entity_name() -> str | None:
+    """The operator-set entity name from ``.levain/config.json`` (Slice-2 §9: the
+    name is operator-set + sovereign). Returns the trimmed name, or None when
+    unset/absent/unreadable/malformed, OR when the value violates the write seam's
+    contract (too long / control chars) — the latter treated as absent so a config
+    the governed rename would reject can't reach the entity's context."""
+    try:
+        raw = (install_root() / ".levain" / "config.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    name = data.get("entity_name") if isinstance(data, dict) else None
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if not name or len(name) > _MAX_ENTITY_NAME_LEN:
+        return None
+    if any(ord(c) < 32 for c in name):  # no control chars into primacy context
+        return None
+    return name
+
+
+def origin_birth_name() -> str | None:
+    """The entity's BIRTH name — the ``— <name>`` suffix baked into seed/origin.md's
+    H1 at ``levain init`` (``# Who You Are — <name>``). Returns the suffix, or None
+    when origin is unreadable or its H1 carries no ``— <name>`` form (a seed that
+    "names nothing"). Mirrors the dashboard's ``_h1_name_suffix`` exactly."""
+    try:
+        text = (install_root() / "seed" / "origin.md").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            head = s[2:].strip()
+            for sep in (" — ", " -- ", " - "):
+                if sep in head:
+                    return head.split(sep, 1)[1].strip() or None
+            return None  # an H1 without a "— name" suffix carries no name
+    return None
+
+
+def entity_name_notice() -> str | None:
+    """A primacy-position line telling the entity the name its operator CURRENTLY
+    uses, when that differs from the birth name in its origin seed — or None when
+    there is nothing to reconcile (config names nothing, or the two already agree,
+    so origin alone already tells the entity the right name).
+
+    This INFORMS, it never overwrites: origin.md stays the sovereign birth record;
+    this is the operator's current label surfaced as growth ("born X, called Y
+    now"), matching origin.md's own "a seed is not the plant — become someone."
+    Without it, a renamed entity keeps introducing itself by its birth name."""
+    config = config_entity_name()
+    if not config:
+        return None
+    birth = origin_birth_name()
+    # NFC-normalized compare so an accented name authored NFC in config vs NFD in the
+    # origin H1 (or vice-versa) is NOT read as a rename that never happened — compare
+    # normalized, but EMIT the original spelling (codex L3).
+    if birth is not None and (
+        unicodedata.normalize("NFC", birth) == unicodedata.normalize("NFC", config)
+    ):
+        return None
+    if birth:
+        return (
+            f'[identity] Your operator now calls you "{config}". Your origin '
+            f'(seed/origin.md) still records "{birth}" — your birth name, kept as '
+            f'history, not a correction. "{config}" is the name you go by now; who '
+            f'you become under it is yours.'
+        )
+    # birth is None — origin either names no one OR was unreadable this session. Make
+    # NO claim about origin's content: a false "names no one yet" when origin was
+    # merely unreadable would itself violate "origin is the sovereign truth"
+    # (complement L3). Just state the current name; the entity reads origin.md itself.
+    return (
+        f'[identity] Your operator calls you "{config}" (set in .levain/config.json). '
+        f'"{config}" is the name you go by; who you become under it is yours.'
+    )
 
 
 def _is_migrate_check(data: object) -> bool:

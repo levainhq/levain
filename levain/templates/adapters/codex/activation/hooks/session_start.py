@@ -61,6 +61,17 @@ def main() -> int:
         # 2. Temporal orientation.
         sections.append(f"[session orientation] {hook.temporal()}")
 
+        # 2b. Identity — the operator's CURRENT name for this entity, surfaced
+        #     when it differs from the birth name baked into origin.md. A rename
+        #     lands in .levain/config.json (Class-A, sovereign) and never rewrites
+        #     the origin self-statement (Class C-view), so the entity — which reads
+        #     only origin.md in its always-loaded context — would otherwise never
+        #     learn it was renamed. Always-fire (identity is every-session context,
+        #     like posture); self-silent when there is nothing to reconcile.
+        identity = hook.entity_name_notice()
+        if identity:
+            sections.append(identity)
+
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work,
         #    not a missed wrap. (`compact` is the most important re-injection

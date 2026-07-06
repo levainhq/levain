@@ -712,7 +712,12 @@
   .name-edit::before { content: "✎ "; }
   .name-edit:hover { color: #06120c; background: var(--mind); box-shadow: 0 0 14px -4px var(--mind); }
   .name-edit:active { transform: translateY(1px); }
-  .name-editor { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  /* THE MASTHEAD lives OUTSIDE any .panel[data-zone] — where `--accent` gets defined per zone
+     for the shared .edit-save/.edit-cancel gradient + border + shadow. Unset here, those
+     `var(--accent)` refs are INVALID → the save button renders transparent + near-black on the
+     dark masthead = INVISIBLE (spore-280, the twin of the .focus-editor catch below). Define it
+     to the entity-name's own cognition-green so the shared buttons resolve AND read on-theme. */
+  .name-editor { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; --accent: var(--mind); }
   .name-input {
     font-family: var(--label); font-weight: 700; font-size: 18px; letter-spacing: .04em;
     color: var(--ink); text-transform: uppercase; background: #0a0f0e; max-width: 42vw;
@@ -720,6 +725,11 @@
     box-shadow: inset 0 2px 6px rgba(0,0,0,.45); outline: none;
   }
   .name-input:focus { border-color: color-mix(in srgb, var(--mind) 55%, var(--line-hot)); box-shadow: inset 0 2px 6px rgba(0,0,0,.45), 0 0 12px -4px var(--mind); }
+  /* keep the save/cancel at full label width — twin-parity with .focus-editor (css below). The
+     .name-input doesn't flex-grow (unlike .focus-input), so a squeeze is unlikely, but a long name
+     in a narrow masthead could still compress them before .name-editor wraps; scoped so the shared
+     .edit-save/.edit-cancel elsewhere are untouched. */
+  .name-editor .edit-save, .name-editor .edit-cancel { flex: 0 0 auto; }
   /* the masthead focus line's inline edit — operate-amber (the operator's OWN frame, the
      .focusline hue), the prose sibling of the entity-name's uppercase .name-edit/.name-input. */
   .focus-edit {

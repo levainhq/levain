@@ -196,8 +196,35 @@
     if (storeEl) storeEl.textContent = paths.episodic_db || "(store path unknown)";
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
-      entityEl.textContent = view.entity_name || stem.replace(/\.db$/, "");
-      wireEntityName(entityEl, view);  // Class-A rename affordance (Slice 2a; commit-gated)
+      // A rename editor open in the masthead (spore-280 — the pre-existing twin of the 247
+      // focus stranding). Unlike renderFocus (which replaceChildren-rebuilds #focus and so
+      // tears its editor down for free), the entity name toggles #entity's display + hangs a
+      // sibling .name-editor on .unit — so the teardown must be EXPLICIT here or a successful
+      // rename strands the editor frozen with #entity hidden behind it. Mirrors renderFocus's
+      // data-saving exception: a passive render that slipped past the hasUnsavedEdit gate must
+      // NOT tear a still-being-typed editor down (that drops the half-typed name) — skip the
+      // rebuild and leave it intact. The authoritative SAVE render marks the editor
+      // data-saving="1" (doSave) and DOES rebuild: drop the stranded editor + its hidden
+      // trigger, un-hide #entity, and let wireEntityName re-add a fresh, visible rename button.
+      const displayName = view.entity_name || stem.replace(/\.db$/, "");
+      const unit = entityEl.parentElement;
+      const openNameEditor = unit && unit.querySelector(".name-editor");
+      if (openNameEditor && openNameEditor.dataset.saving !== "1") {
+        // Editor open & NOT saving → a passive/other-write render. Don't tear it down (that drops
+        // the half-typed name), BUT still refresh the HIDDEN #entity text so a later Cancel/Escape
+        // reveals the latest name, not a stale one — #entity is display:none behind the editor, so
+        // this can't clobber the input (codex L3 LOW: an external rename during an open edit).
+        entityEl.textContent = displayName;
+      } else {
+        if (openNameEditor) {  // authoritative SAVE render (data-saving="1") — tear the editor down
+          openNameEditor.remove();
+          const staleBtn = unit.querySelector(".name-edit");  // hidden (display:none) by enterNameEdit
+          if (staleBtn) staleBtn.remove();                    // drop it → wireEntityName re-adds a visible one
+          entityEl.style.display = "";
+        }
+        entityEl.textContent = displayName;
+        wireEntityName(entityEl, view);  // Class-A rename affordance (Slice 2a; commit-gated)
+      }
     }
     // Masthead branding override (the surface's identity) — applied ONLY when the payload
     // carries it, so a bare Levain install keeps the HTML-default wordmark/model chrome.
@@ -2099,11 +2126,18 @@
     const doSave = async () => {
       save.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
+      // Mark the editor "saving" so the SUCCESS reload's render() tears it down + restores the
+      // entity line to the committed name, instead of the (passive-defer) guard leaving it
+      // stranded frozen on "saving…" (spore-280 — the twin of the 247 focus stranding). A
+      // passive reload defers via hasUnsavedEdit(".name-editor"); only this save's passive:false
+      // reload rebuilds #entity.
+      editor.dataset.saving = "1";
       // no `expected` sent: the displayed name may come from the origin.md H1 fallback
       // (≠ the config field the server stale-checks), so an optimistic lock here would
       // false-409 the first rename. The name is a single trivial field — last-writer-wins.
       const res = await commit({ kind: "entity_name", value: input.value });
-      if (res && res.ok) return;  // reloaded
+      if (res && res.ok) return;  // reloaded — the save render tore this editor down
+      delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
       msg.className = "edit-msg err";
       msg.textContent = (res && (res.message || res.error)) || "save failed";
       save.disabled = false; cancel.disabled = false;
@@ -2424,9 +2458,10 @@
   //   - `.verb-date` (schedule picker): a date is a 2-click re-pick (low loss) AND it's
   //     PREFILLED from an existing `next:`, so a non-empty check would false-positive on
   //     an untouched form — not worth a `data-orig` stamp for the stakes;
-  //   - the masthead rename (`.name-input`): lives OUTSIDE `#board` and `wireEntityName`
-  //     early-returns while its editor is open, so it already SURVIVES the rebuild — gating
-  //     it would only block a non-destructive refresh.
+  //   (the masthead rename `.name-editor` USED to be excluded here — it survives a board
+  //   rebuild since it lives outside `#board` — but render() now TEARS a data-saving editor
+  //   down to close the rename, so a passive reload firing mid-save could strip it early and
+  //   flash the OLD name; it is gated below with `.focus-editor`, spore-280.)
   // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
   // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
   function hasUnsavedEdit() {
@@ -2439,6 +2474,11 @@
     // is passive:false, so it is NOT gated here and still refreshes (see load() in the boot
     // layer + the renderFocus data-saving exception).
     if (document.querySelector(".focus-editor")) return true;
+    // An open masthead RENAME editor is unsaved work too, and for the same reason render()
+    // now tears a saving one down: a passive reload must defer or it could strip the editor
+    // mid-save and flash the old name (or drop the half-typed one). The authoritative SAVE
+    // reload is passive:false → NOT gated here → still rebuilds #entity (spore-280).
+    if (document.querySelector(".name-editor")) return true;
     for (const ta of document.querySelectorAll(".edit-ta, .verb-edit-ta")) {
       if (ta.value !== ta.dataset.orig) return true;
     }
