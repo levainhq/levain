@@ -19,6 +19,14 @@ RENDERS is an *authored decision*, declared in ``pack.toml``; every other
     order  = 0                    # optional int (default 0); higher = later = wins
     render = ["world.md", ...]    # optional ordered list (default []); the interview
                                   # sequence — order is significant, NOT glob order
+    version = "1.2"               # optional str; drift-notice sugar (see PackManifest)
+    [brand]                       # optional table; white-label the operator surfaces
+    surface_name = "Acme Harness" #   the wordmark / masthead / browser-title name
+    subtitle     = "…"            #   the tagline line under the wordmark
+
+Unknown top-level keys (and unknown ``[brand]`` sub-keys) are IGNORED, not
+rejected — a pack authored against a newer Levain (extra keys) still parses on an
+older one (forward-compat), the same leniency the per-key ``data.get`` reads give.
 
 Slice 1 is single-root discovery (the base pack) replacing the hard-coded roster
 in ``install.py``; multi-root layering composes ``discover_roster`` over an
@@ -34,12 +42,41 @@ from pathlib import Path
 
 PACK_MANIFEST_NAME = "pack.toml"
 
+# Cap on a brand string (surface_name / subtitle). Matches writes.MAX_NAME_LEN (120)
+# — the operator's entity_name cap — because both feed the same masthead render path.
+_MAX_BRAND_LEN = 120
+
 
 class PackError(Exception):
     """A pack manifest is missing, malformed, or references a missing seed file.
 
     Carries a ready-to-surface ``.args[0]`` message so install surfaces can print
     it directly (mirrors ``install.InitError``)."""
+
+
+@dataclass(frozen=True)
+class PackBrand:
+    """Pack-authored white-label overrides for the operator-facing render surfaces.
+
+    A pack MAY declare a ``[brand]`` table in its ``pack.toml`` to override the
+    verbiage an operator sees on the dashboard / TUI / serve cockpit — so a domain
+    pack's install reads as *its* tool, not generic Levain chrome. Every field is
+    OPTIONAL; an unset field falls back to the Levain default at the render site.
+
+    Build-time only here: at install time the RESOLVED brand (composed across the
+    pack stack, :func:`compose_brand`) is baked into the install's operator-facing
+    ``.levain/config.json`` — the SAME runtime channel ``entity_name`` travels
+    (``dashboard._read_levain_config`` → ``build_substrate_view``). ``surface_name``
+    maps onto the view's ``brand_wordmark`` (the masthead/wordmark/title name),
+    ``subtitle`` onto ``brand_model`` (the tagline line)."""
+
+    surface_name: str | None = None
+    subtitle: str | None = None
+
+    def is_empty(self) -> bool:
+        """True when the table sets nothing — a bare/empty ``[brand]`` is a no-op,
+        not an override (so it never clobbers a lower layer with all-None)."""
+        return self.surface_name is None and self.subtitle is None
 
 
 @dataclass(frozen=True)
@@ -55,6 +92,10 @@ class PackManifest:
     # DETECTION is hash-based, so a pack needs no version for `levain update` to
     # reconcile it.
     version: str | None = None
+    # Optional white-label brand (the `[brand]` table). None → no override (the
+    # renderers' Levain default chrome). Composed across the pack stack by
+    # `compose_brand` (field-level last-wins), then baked into `.levain/config.json`.
+    brand: PackBrand | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +169,53 @@ def load_pack_manifest(pack_dir: Path) -> PackManifest:
             f"(got {version!r})"
         )
 
-    return PackManifest(name=name, order=order, render=tuple(render_raw), version=version)
+    brand = _parse_brand(data.get("brand"), manifest_path)
+
+    return PackManifest(
+        name=name, order=order, render=tuple(render_raw), version=version, brand=brand
+    )
+
+
+def _parse_brand(raw: object, manifest_path: Path) -> PackBrand | None:
+    """Parse the optional ``[brand]`` table into a :class:`PackBrand` (or ``None``).
+
+    Strict on the TYPE of a value that IS present (a non-string ``surface_name`` is
+    a malformed manifest — fail loud), lenient on MEMBERSHIP (an unknown sub-key is
+    ignored, not rejected — forward-compat with a newer Levain's brand fields, the
+    same leniency ``load_pack_manifest`` gives unknown top-level keys). An empty /
+    all-unset table resolves to ``None`` (a no-op, never an all-None override)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise PackError(f"{manifest_path}: 'brand', if present, must be a table (got {raw!r})")
+
+    def _brand_str(key: str) -> str | None:
+        val = raw.get(key)
+        if val is None:
+            return None
+        if not (isinstance(val, str) and val.strip()):
+            raise PackError(
+                f"{manifest_path}: brand.{key}, if present, must be a non-empty "
+                f"string (got {val!r})"
+            )
+        # Sanitize at the parse gate: a brand string is baked into config.json and
+        # feeds the SAME masthead render path as the operator's entity_name (curses
+        # addstr / text renderers), but that channel isn't governed by
+        # writes._apply_entity_name's checks — so mirror them HERE (control chars can
+        # corrupt the TUI masthead row; an unbounded name blows the header). Fail loud
+        # at install, not a silently-mangled masthead. [complement L3.]
+        if any(ord(c) < 32 for c in val):
+            raise PackError(
+                f"{manifest_path}: brand.{key} may not contain control characters"
+            )
+        if len(val) > _MAX_BRAND_LEN:
+            raise PackError(
+                f"{manifest_path}: brand.{key} exceeds {_MAX_BRAND_LEN} chars"
+            )
+        return val
+
+    brand = PackBrand(surface_name=_brand_str("surface_name"), subtitle=_brand_str("subtitle"))
+    return None if brand.is_empty() else brand
 
 
 def _scan_seed_layer(pack_dir: Path, manifest: PackManifest) -> dict[str, Path]:
@@ -218,6 +305,36 @@ def discover_roster(pack_dir: Path) -> list[SeedEntry]:
     entry with no matching ``seed/<name>`` raises; only ``.md`` seed files are
     supported (a non-.md file raises rather than being silently dropped)."""
     return compose_roster([pack_dir])
+
+
+def compose_brand(manifests: Sequence[PackManifest]) -> PackBrand | None:
+    """Resolve the white-label brand across an ordered pack stack.
+
+    Field-level, last-wins by ``order`` — the brand peer of :func:`compose_roster`'s
+    per-file override: each brand field is taken from the HIGHEST-order manifest
+    that sets it, so a domain pack can override just ``surface_name`` while
+    inheriting a lower layer's ``subtitle``. Equal ``order`` keeps input order
+    (later input wins), matching ``compose_roster``'s stable-sort semantics.
+
+    Takes already-LOADED manifests (not dirs) so the caller composes from its
+    up-front pack snapshot — never a ``pack.toml`` re-read a mid-interview edit
+    could mutate (the discipline ``run_init`` enforces for the roster). Brand is a
+    PACK override: the base templates carry none, so a base-only install resolves to
+    ``None`` (the renderers' Levain default). Returns ``None`` if no layer sets any
+    field."""
+    ordered = sorted(manifests, key=lambda m: m.order)
+    surface_name: str | None = None
+    subtitle: str | None = None
+    for m in ordered:
+        if m.brand is None:
+            continue
+        if m.brand.surface_name is not None:
+            surface_name = m.brand.surface_name
+        if m.brand.subtitle is not None:
+            subtitle = m.brand.subtitle
+    if surface_name is None and subtitle is None:
+        return None
+    return PackBrand(surface_name=surface_name, subtitle=subtitle)
 
 
 def order_activation_roots(

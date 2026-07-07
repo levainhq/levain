@@ -641,6 +641,16 @@ def _edit_focus(
 # Painting.
 # ---------------------------------------------------------------------------
 
+def _masthead_line(view: SubstrateView) -> str:
+    """The row-0 masthead: the pack white-label wordmark (``view.brand_wordmark``,
+    baked from ``.levain/config.json``) else the Levain default, then the entity
+    title. Pure so it's unit-testable without a curses terminal — ``_paint`` uses
+    it for BOTH the paint and the store-path right-align width (one source, they
+    can't disagree)."""
+    title = view.entity_name or view.paths.episodic_db.stem
+    return f" {view.brand_wordmark or 'Levain'} — {title}"
+
+
 def _safe_addstr(stdscr: "curses.window", y: int, x: int, text: str, attr: int = 0) -> None:
     """Write clipped to the window width, swallowing the curses error from the
     bottom-right cell. curses raises if you write the last cell or past the edge —
@@ -667,12 +677,12 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         return model
 
     view = model.view
-    title = view.entity_name or view.paths.episodic_db.stem
+    header = _masthead_line(view)
 
     # Header (row 0): entity + store path, right-aligned store.
-    _safe_addstr(stdscr, 0, 0, f" Levain — {title}", curses.A_BOLD)
+    _safe_addstr(stdscr, 0, 0, header, curses.A_BOLD)
     store = str(view.paths.episodic_db)
-    sx = max(len(f" Levain — {title}") + 2, w - len(store) - 1)
+    sx = max(len(header) + 2, w - len(store) - 1)
     _safe_addstr(stdscr, 0, sx, store, curses.A_DIM)
 
     # Zone tabs (row 1): the active zone reversed.

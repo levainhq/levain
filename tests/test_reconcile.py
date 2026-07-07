@@ -424,3 +424,56 @@ class TestProvenanceAdvance:
         assert review
         assert "{{" not in (inst / "seed" / "r.md").read_text()  # not blank-rendered
         assert "X: " not in (inst / "seed" / "r.md").read_text()  # untouched original
+
+
+# ---------- brand re-bake on `levain update` (pack.toml [brand] edit = drift) ----------
+
+def _write_branded_pack(root: Path, *, brand_toml: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "seed").mkdir()
+    (root / "seed" / "doctrine.md").write_text("DOCTRINE\n", encoding="utf-8")
+    (root / "pack.toml").write_text(f'name = "dom"\norder = 10\n{brand_toml}', encoding="utf-8")
+    return root
+
+
+class TestBrandRebakeOnUpdate:
+    """A pack.toml [brand] edit IS drift (pack.toml is in the hashed set), so `levain
+    update` must re-bake it — else the config brand goes stale while `update` prints a
+    confident 'reconciled'. The IP-boundary parity with _copy_pack_docs, made real."""
+
+    @staticmethod
+    def _seed_config(install: Path, cfg: dict) -> None:
+        import json
+
+        (install / ".levain" / "config.json").write_text(json.dumps(cfg) + "\n", encoding="utf-8")
+
+    def _read_config(self, install: Path) -> dict:
+        import json
+
+        return json.loads((install / ".levain" / "config.json").read_text(encoding="utf-8"))
+
+    def test_update_rebakes_changed_brand_preserving_entity_name(self, tmp_path: Path):
+        pack = _write_branded_pack(tmp_path / "pack", brand_toml='[brand]\nsurface_name = "Old Co"\n')
+        install = _install_from_pack(tmp_path, pack, {})
+        self._seed_config(install, {"entity_name": "Athena", "surface_name": "Old Co"})
+        # Rebrand in pack.toml → pack.toml hash changes → drift.
+        (pack / "pack.toml").write_text(
+            'name = "dom"\norder = 10\n[brand]\nsurface_name = "New Co"\n', encoding="utf-8"
+        )
+        _out, _prov, drifted, _review = _reconcile(install, prompter=ANSWER)
+        assert drifted
+        cfg = self._read_config(install)
+        assert cfg["surface_name"] == "New Co"  # re-baked from the new pack.toml
+        assert cfg["entity_name"] == "Athena"  # operator rename preserved
+
+    def test_update_clears_dropped_brand_preserving_entity_name(self, tmp_path: Path):
+        pack = _write_branded_pack(tmp_path / "pack", brand_toml='[brand]\nsurface_name = "Old Co"\n')
+        install = _install_from_pack(tmp_path, pack, {})
+        self._seed_config(install, {"entity_name": "Athena", "surface_name": "Old Co"})
+        # Remove the [brand] table entirely → still a pack.toml change → drift.
+        (pack / "pack.toml").write_text('name = "dom"\norder = 10\n', encoding="utf-8")
+        _out, _prov, drifted, _review = _reconcile(install, prompter=ANSWER)
+        assert drifted
+        cfg = self._read_config(install)
+        assert "surface_name" not in cfg  # stale company chrome cleared (IP-boundary)
+        assert cfg["entity_name"] == "Athena"  # operator rename preserved

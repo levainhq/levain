@@ -40,9 +40,11 @@ from typing import TYPE_CHECKING
 
 from levain.packs import (
     BASE_IMPORT_ORDER,
+    PackBrand,
     PackError,
     PackManifest,
     SeedEntry,
+    compose_brand,
     compose_roster,
     import_entries,
     load_pack_manifest,
@@ -451,10 +453,119 @@ def apply_init(
     # re-prompt for only NEW slots, instead of losing them (the render-slot reconcile
     # root-cause fix). Best-effort — never fails the install.
     write_answers(install, answers, emit)
+    # Bake the resolved pack white-label into the operator-facing .levain/config.json
+    # (build-time pack.toml [brand] → the runtime channel entity_name travels). Runs
+    # BEFORE the store init so it lands even on a store-init failure (it's chrome, not
+    # store-dependent). Composed from the up-front pack snapshot, not a re-read.
+    _write_brand_config(install, compose_brand([mf for mf, _ in packs]), emit)
     store_ok = _init_store(store, anneal_path, emit=emit)
     if store_ok:
         _record_compat_lock(install, store, anneal_path, packs=packs, emit=emit)
     return InitResult(install=install, adapter=chosen, store_ok=store_ok)
+
+
+def _atomic_write_text(target: Path, payload: str) -> None:
+    """Atomically replace ``target`` with ``payload`` — a UNIQUE temp (``mkstemp``)
+    + fsync + ``os.replace`` + parent-dir fsync, mirroring ``write_answers`` /
+    ``manifest.write_lock``. A torn write (Ctrl+C / ENOSPC / crash) never leaves the
+    target truncated: the old bytes stay until the atomic rename. Raises ``OSError``
+    on failure (caller decides fatal-vs-best-effort). [codex L3: config.json is the
+    SHARED operator file — a plain write_text could blank entity_name on a torn write.]"""
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:  # dir fsync so the rename itself survives power-loss (parity with write_lock)
+        dfd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def _write_brand_config(
+    install: Path, brand: PackBrand | None, emit: Callable[[str], None]
+) -> None:
+    """Bake the resolved pack white-label into the operator-facing
+    ``.levain/config.json`` — build-time ``pack.toml [brand]`` → the runtime channel
+    ``entity_name`` already travels (``dashboard._read_levain_config`` →
+    ``build_substrate_view``).
+
+    Called from BOTH ``apply_init`` (init) AND ``reconcile.run_pack_reconcile``
+    (``levain update``), the exact two events ``_copy_pack_docs`` runs on — so the
+    IP-boundary parity below is REAL, not init-only: a ``pack.toml [brand]`` edit is
+    drift (it is in the hashed set), so update re-bakes it, and a dropped ``[brand]``
+    clears the stale chrome on the same update the docs are wiped on.
+
+    MERGE, never clobber: a ``--force`` reinstall / an update preserves an
+    operator-set ``entity_name`` (and any future config key) — only the brand keys
+    are touched (the same key-preserving merge ``writes._apply_entity_name`` does in
+    reverse). CLEAR-on-drop: no brand (dropped pack / dropped ``[brand]``) removes the
+    stale brand keys, so company chrome never outlives its pack — the same IP-boundary
+    discipline ``_copy_pack_docs`` follows when it wipes dropped-pack chapters. A no-op
+    change writes nothing (no spurious mtime churn).
+
+    Two-writer note (accepted): this shares ``.levain/config.json`` with the runtime
+    ``writes._apply_entity_name`` rename, in a DIFFERENT process, with no cross-process
+    lock — so an ``init --force`` concurrent with a live-dashboard rename is an
+    unprotected lost-update (last atomic write wins on its own keys). The write is
+    atomic (``_atomic_write_text``), so a reader never sees a torn file; the residual
+    race is a rare lost-update inherent to config.json's design (the rename writer is
+    likewise not cross-process serialized — reinstall-while-serving is the pathological
+    case), NOT this feature's introduction. Fixing it fully = a config.json file lock,
+    disproportionate for chrome. [codex/kimi/complement L3.]
+
+    Best-effort: a config-write failure never fails an otherwise-good install (the
+    brand is chrome, not install-critical) — it warns through ``emit`` and returns."""
+    from levain.dashboard import LEVAIN_CONFIG_REL, _read_levain_config
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    # Refuse to clobber an UNREADABLE-but-present config. `_read_levain_config` fails
+    # soft to `{}` for BOTH absent AND corrupt; merging brand onto `{}` and writing
+    # would ERASE an `entity_name` we merely couldn't parse (a hand-edit JSON typo).
+    # Absent = safe to create; present-but-unparseable = bail (fix it, then re-run) —
+    # so the "never clobber entity_name" guarantee holds even against a pre-corrupt
+    # file, not just a torn write (the atomic write closes the torn-write half). [L1]
+    if config_path.is_file():
+        try:
+            json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            emit("  note: .levain/config.json is unreadable — brand NOT written (refusing to "
+                 "overwrite possibly-recoverable config; fix it, then re-run).")
+            return
+
+    current = _read_levain_config(install)
+    new_config = dict(current)
+    for key, value in (
+        ("surface_name", brand.surface_name if brand else None),
+        ("subtitle", brand.subtitle if brand else None),
+    ):
+        if value is not None:
+            new_config[key] = value
+        else:
+            new_config.pop(key, None)  # clear-on-drop: no stale chrome across re-install
+    if new_config == current:
+        return  # nothing to write (no brand now, none before) — avoid mtime churn
+    try:
+        _atomic_write_text(
+            config_path, json.dumps(new_config, indent=2, ensure_ascii=False) + "\n"
+        )
+    except OSError as e:
+        emit(f"  note: could not write brand config ({e}); surfaces show default Levain chrome.")
+        return
+    if brand is not None:
+        emit(f"  brand:     {brand.surface_name or '(subtitle only)'} → .levain/config.json")
 
 
 def write_answers(
