@@ -39,6 +39,7 @@ that raises is caught there.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -492,6 +493,89 @@ def compat_drift(timeout: float = 5.0) -> str | None:
         "[compatibility] " + "; ".join(signals) + ". Run `levain update` (or "
         "`levain doctor`) to reconcile the version set — a substrate change can "
         "otherwise land a new feature as a conflict with stale instructions."
+    )
+
+
+# ---- Pack-drift surface (the DOWNSTREAM pack axis) ----
+# A session-start nudge when a pulled pack SOURCE changed since this install was
+# composed. The hash algorithm is byte-identical to levain.manifest.hash_pack_source
+# (a test locks that parity) so the notice never false-positives on a hashing
+# mismatch. Stdlib only — the hook never imports the levain package.
+_PACK_SUBTREES = ("seed", "activation", "docs")
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_pack_source(pack_dir: Path) -> dict:
+    """{posix_relpath: sha256} over a pack's pack.toml + seed/ activation/ docs/.
+    MUST match levain.manifest.hash_pack_source exactly (a mismatch would report a
+    false drift). A missing dir yields {} (read by the caller as source-missing)."""
+    out: dict = {}
+    if not pack_dir.is_dir():
+        return out
+    manifest = pack_dir / "pack.toml"
+    if manifest.is_file():
+        out["pack.toml"] = _sha256_file(manifest)
+    for sub in _PACK_SUBTREES:
+        root = pack_dir / sub
+        if not root.is_dir():
+            continue
+        for f in sorted(root.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(pack_dir).as_posix()
+            parts = rel.split("/")
+            if ("__pycache__" in parts or parts[-1].endswith((".pyc", ".pyo"))
+                    or parts[-1] == ".DS_Store"):
+                continue
+            out[rel] = _sha256_file(f)
+    return out
+
+
+def pack_drift() -> str | None:
+    """A terse pack-drift line for session start, or None when every recorded pack
+    source is unchanged. Reads the lock's pack provenance, re-hashes each pack
+    SOURCE, and reports the ones the operator pulled an update into (or that
+    vanished). `levain update` reconciles it. Stdlib only."""
+    lock = read_manifest_lock()
+    if not isinstance(lock, dict):
+        return None
+    packs = lock.get("packs")
+    if not isinstance(packs, list) or not packs:
+        return None
+    changed: list[str] = []
+    missing: list[str] = []
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        name = p.get("name")
+        source = p.get("source")
+        files = p.get("files")
+        if not (isinstance(name, str) and name and isinstance(source, str)
+                and isinstance(files, dict)):
+            continue
+        current = _hash_pack_source(Path(source))
+        if not current:
+            missing.append(name)
+        elif current != files:
+            ver = p.get("version")
+            changed.append(f"{name} (v{ver})" if isinstance(ver, str) and ver else name)
+    if not changed and not missing:
+        return None
+    parts: list[str] = []
+    if changed:
+        parts.append("updated at source: " + ", ".join(changed))
+    if missing:
+        parts.append("source now missing: " + ", ".join(missing))
+    return (
+        "[pack drift] " + "; ".join(parts) + ". Your partner's doctrine changed at the "
+        "pack source — run `levain update` to reconcile it into this install."
     )
 
 

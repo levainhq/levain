@@ -295,6 +295,8 @@ _PORTED_FNS = (
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
+    # pack-drift surface — byte-identical across both copies AND vs levain.manifest
+    "_sha256_file", "_hash_pack_source", "pack_drift",
     # crystallized-pattern recall surface — byte-identical across both copies
     "crystal_recall", "format_crystal_recall",
     # entity-name coherence surface — byte-identical across both copies
@@ -316,6 +318,36 @@ class TestCodexParity:
 
     def test_tokenizer_constants_match(self):
         assert codex_hook._STOPWORDS == hook._STOPWORDS
+
+    def test_pack_hash_constants_match(self):
+        # The pack-hash functions reference this — it must match across both copies
+        # (getsource checks the bodies, not the module constants they close over). The
+        # exclusion logic is inlined in _hash_pack_source and covered by the
+        # output-parity test below (test_hook_pack_hash_matches_manifest).
+        assert codex_hook._PACK_SUBTREES == hook._PACK_SUBTREES
+
+    def test_hook_pack_hash_matches_manifest(self, tmp_path):
+        # The hook's _hash_pack_source (stdlib, no levain import) MUST produce the
+        # SAME map as levain.manifest.hash_pack_source (the recorder) — else the
+        # session-start pack-drift notice false-positives on every session.
+        from levain import manifest
+        pack = tmp_path / "p"
+        (pack / "seed").mkdir(parents=True)
+        (pack / "activation").mkdir()
+        (pack / "docs").mkdir()
+        (pack / "pack.toml").write_text('name = "p"\norder = 5\nrender = ["w.md"]\n')
+        (pack / "seed" / "w.md").write_text("# W\n\n{{X}}\n")
+        (pack / "seed" / "d.md").write_text("# D\n\ndoctrine\n")
+        (pack / "seed" / "notes.pyo.md").write_text("legit — .pyo in NAME, must be kept\n")
+        (pack / "activation" / "posture.md").write_text("posture\n")
+        (pack / "docs" / "ch.md").write_text("# Chapter\n")
+        (pack / "seed" / "__pycache__").mkdir()
+        (pack / "seed" / "__pycache__" / "x.pyc").write_text("junk")  # must be excluded
+        result = manifest.hash_pack_source(pack)
+        assert "seed/notes.pyo.md" in result  # precise-match fix (L1 #4), not substring
+        assert not any("__pycache__" in k for k in result)  # derived dir excluded
+        assert hook._hash_pack_source(pack) == result
+        assert codex_hook._hash_pack_source(pack) == result
         assert codex_hook._WORD_RE.pattern == hook._WORD_RE.pattern
         assert codex_hook._MAX_TOKENIZE_CHARS == hook._MAX_TOKENIZE_CHARS
 

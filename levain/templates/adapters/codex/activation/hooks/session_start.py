@@ -118,6 +118,13 @@ def main() -> int:
             if drift:
                 sections.append(drift)
 
+            # Pack drift — a pulled pack SOURCE changed since this install was
+            # composed. Same fail-silent nudge toward `levain update`, for the
+            # DOWNSTREAM pack axis (the operator's doctrine, not the engine).
+            pack = hook.pack_drift()
+            if pack:
+                sections.append(pack)
+
         if sections:
             hook.emit("\n\n".join(sections), "SessionStart")
     except Exception:
