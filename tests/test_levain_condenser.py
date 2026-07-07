@@ -5,17 +5,13 @@ consume-once, the async path, serialization-safety, the fork-downgrade warning, 
 re-anchor rides at recency as an excluded-from-capture system event. One gated integration test
 proves the planted re-anchor REACHES + STEERS the model on the recovery turn (the moat check).
 
-Guarded on the ``openhands`` extra (openhands-sdk + vagus[openhands]) — skips cleanly where the
-extra is absent (e.g. levain's own core .venv).
+Guarded on the ``openhands`` extra (openhands-sdk) — skips cleanly where it's absent (e.g. levain's
+own core .venv, which has no openhands-sdk). With the vagus→Levain fold-in, the firing adapter lives
+in ``levain.firing`` — there is NO vagus dependency; the extra needs only openhands-sdk + anneal.
 
-RUNNING THESE: vagus is not pip-installed in its dev venv (it runs via PYTHONPATH, like the vagus
-daemon plist), so a BARE ``pytest`` in that venv imports-skips this whole file with a misleading
-"not installed" (it's "not importable"). Run with vagus ON THE PATH:
-
-    PYTHONPATH=/path/to/vagus  <vagus-venv>/bin/python -m pytest tests/test_levain_condenser.py -p no:libtmux
+    <venv-with-openhands>/bin/python -m pytest tests/test_levain_condenser.py -p no:libtmux
 
 (``-p no:libtmux`` disables the pytest-8-incompatible libtmux plugin openhands-tools pulls in.)
-The skip reasons below name the real cause (import failure), not "extra not installed".
 """
 from __future__ import annotations
 
@@ -30,8 +26,8 @@ import pytest
 
 pytest.importorskip("openhands.sdk", reason="openhands.sdk not importable (openhands extra absent)")
 pytest.importorskip(
-    "vagus.adapters.openhands",
-    reason="vagus.adapters.openhands not importable (install vagus[openhands] or put vagus on PYTHONPATH)",
+    "levain.firing.openhands",
+    reason="levain.firing.openhands not importable (install levain[openhands] for openhands-sdk)",
 )
 
 from openhands.sdk import (  # noqa: E402
@@ -47,7 +43,7 @@ from openhands.sdk.context.view.view import View  # noqa: E402
 from openhands.sdk.event.condenser import Condensation  # noqa: E402
 from pydantic import PrivateAttr  # noqa: E402
 
-from vagus.firing import StubFiring  # noqa: E402
+from levain.firing import StubFiring  # noqa: E402
 
 from levain.firing import ReanchorRequest, StubPresence, register_presence  # noqa: E402
 from levain.firing.openhands import LevainCondenser  # noqa: E402
@@ -58,14 +54,14 @@ from levain.firing.openhands import LevainCondenser  # noqa: E402
 _A_CONDENSATION = dict(source="agent", forgotten_event_ids=[], summary="s", llm_response_id="r")
 
 
-class _ViewInner(CondenserBase):
+class _LViewInner(CondenserBase):
     """Passes the view through unchanged (no compaction)."""
 
     def condense(self, view: View, agent_llm: LLM | None = None) -> View:
         return view
 
 
-class _CondInner(CondenserBase):
+class _LCondInner(CondenserBase):
     """Always signals a compaction (returns a Condensation)."""
 
     def condense(self, view: View, agent_llm: LLM | None = None) -> Condensation:
@@ -156,7 +152,7 @@ def test_both_handles_built_on_construction():
     """LevainCondenser adds ``_ensure_presence`` (mode=after) alongside the INHERITED
     ``_ensure_firing`` — both must run, so a fresh condenser has both live handles. This locks the
     pydantic validator-inheritance assumption the whole design rests on."""
-    cond = LevainCondenser(inner=_ViewInner())
+    cond = LevainCondenser(inner=_LViewInner())
     assert cond._firing is not None  # inherited VagusCondenser validator ran
     assert cond._presence is not None  # this class's validator ran
 
@@ -165,7 +161,7 @@ def test_both_handles_built_on_construction():
 
 
 def test_normal_turn_injects_firing_only_no_reanchor():
-    cond = LevainCondenser.build(inner=_ViewInner(), presence=StubPresence(reanchor_text="RE"))
+    cond = LevainCondenser.build(inner=_LViewInner(), presence=StubPresence(reanchor_text="RE"))
     out = cond.condense(_user_view())
     assert isinstance(out, View)
     # exactly ONE event added (the firing inject) — no compaction, so no re-anchor
@@ -175,7 +171,7 @@ def test_normal_turn_injects_firing_only_no_reanchor():
 
 
 def test_compaction_turn_passes_through_and_arms_reanchor():
-    cond = LevainCondenser.build(inner=_CondInner(), presence=StubPresence())
+    cond = LevainCondenser.build(inner=_LCondInner(), presence=StubPresence())
     out = cond.condense(_user_view())
     assert isinstance(out, Condensation)  # passthrough, no inject
     assert cond.pending_reanchor is True  # armed for the recovery turn
@@ -248,7 +244,7 @@ def test_reanchor_excluded_from_capture_via_render_turn():
     dropped by vagus's actual capture renderer, so it can never be written to episodic memory and
     re-recalled (no memory-eats-its-own-tail loop). Uses the real render_turn, not an assertion on
     the source string."""
-    from vagus.adapters.openhands import render_turn  # the real capture renderer
+    from levain.firing.openhands import render_turn  # the real capture renderer
 
     cond = LevainCondenser.build(
         inner=_NCondenseThenView(n=1), presence=StubPresence(reanchor_text="SECRET-REANCHOR")
@@ -344,11 +340,11 @@ def test_pending_reanchor_survives_serialization():
     miss at the exact boundary the adapter exists for). Arm it, round-trip, and the restored
     condenser fires the surviving re-anchor on its next recovery View."""
     register_presence("_surv_presence", lambda: _MarkerPresence("SURVIVED"))
-    armed = LevainCondenser.build(inner=_ViewInner(), presence_kind="_surv_presence")
+    armed = LevainCondenser.build(inner=_LViewInner(), presence_kind="_surv_presence")
     armed.pending_reanchor = True  # arm, as if a compaction just happened before the fork
     restored = LevainCondenser.model_validate(armed.model_dump())
     assert restored.pending_reanchor is True  # THE FIX: survives (was a PrivateAttr → reset to False)
-    out = restored.condense(_user_view())  # _ViewInner → recovery View → fires the surviving re-anchor
+    out = restored.condense(_user_view())  # _LViewInner → recovery View → fires the surviving re-anchor
     assert "SURVIVED" in _last_text(out)
     assert restored.pending_reanchor is False  # consumed after firing
 
@@ -424,12 +420,12 @@ def test_build_warns_on_non_stub_live_presence_with_default_kind():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        LevainCondenser.build(inner=_ViewInner(), presence=_MarkerPresence("live"))
+        LevainCondenser.build(inner=_LViewInner(), presence=_MarkerPresence("live"))
     assert any("will NOT survive fork" in str(w.message) and "presence" in str(w.message) for w in caught)
 
     with warnings.catch_warnings(record=True) as caught2:
         warnings.simplefilter("always")
-        LevainCondenser.build(inner=_ViewInner(), presence=StubPresence())
+        LevainCondenser.build(inner=_LViewInner(), presence=StubPresence())
     assert not any("survive fork" in str(w.message) for w in caught2)
 
 
@@ -438,7 +434,7 @@ def test_build_warns_on_non_stub_live_presence_with_default_kind():
 
 def test_inherited_firing_directive_still_rotates():
     """Subclassing must not break the inherited per-turn firing inject / directive rotation."""
-    cond = LevainCondenser.build(inner=_ViewInner())
+    cond = LevainCondenser.build(inner=_LViewInner())
     first = _last_text(cond.condense(_user_view()))
     second = _last_text(cond.condense(_user_view()))
     assert first != second  # the inherited drift-defense directive rotates

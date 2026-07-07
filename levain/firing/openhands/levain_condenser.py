@@ -1,9 +1,9 @@
 """levain.firing.openhands — the ``LevainCondenser``: the full flow-presence adapter.
 
-Requires the ``openhands`` extra (``pip install 'levain[openhands]'`` → pulls
-``vagus[openhands]``). The harness-neutral presence seam (``levain.firing``) carries NO
-OpenHands import; this module is the OpenHands binding — the mirror of
-``vagus.adapters.openhands`` one altitude up.
+Requires the ``openhands`` extra (``pip install 'levain[openhands]'`` → openhands-sdk; the firing
+adapter is self-contained in ``levain.firing``, no vagus dependency). The harness-neutral seams
+(``levain.firing`` — the firing contract + the presence seam) carry NO OpenHands import; this
+subpackage is the OpenHands binding.
 
 ``LevainCondenser`` **subclasses ``VagusCondenser``** and inherits its whole codex-hardened
 lifecycle (compression-first inner, per-turn ``role=system`` recall + rotating directive at
@@ -45,10 +45,9 @@ from openhands.sdk.context.view.view import View
 from openhands.sdk.event.condenser import Condensation
 from pydantic import PrivateAttr, model_validator
 
-from vagus.adapters.openhands import VagusCondenser  # type: ignore[import-untyped]  # vagus ships no py.typed (v0.x)
-from vagus.firing import StubFiring  # type: ignore[import-untyped]
-
-from levain.firing import PresenceSource, ReanchorRequest, StubPresence, build_presence
+from levain.firing.contract import FiringContract, StubFiring
+from levain.firing.openhands.condenser import VagusCondenser
+from levain.firing.presence import PresenceSource, ReanchorRequest, StubPresence, build_presence
 
 _log = logging.getLogger("levain.firing.openhands")
 
@@ -104,15 +103,17 @@ class LevainCondenser(VagusCondenser):
     def build(
         cls,
         inner: CondenserBase,
-        *,
-        firing=None,
+        firing: FiringContract | None = None,
         firing_kind: str = "stub",
         presence: PresenceSource | None = None,
         presence_kind: str = "stub",
     ) -> "LevainCondenser":
         """Construct with both serializable kinds, then apply any live handles (test doubles /
         in-process handles). A live handle does NOT survive fork — production passes a non-stub
-        KIND, never a live override with the default kind (see the fork-downgrade warning)."""
+        KIND, never a live override with the default kind (see the fork-downgrade warning).
+
+        Signature keeps ``firing``/``firing_kind`` positional to match ``VagusCondenser.build`` (LSP);
+        ``presence``/``presence_kind`` are trailing optionals a subclass may add."""
         obj = cls(inner=inner, firing_kind=firing_kind, presence_kind=presence_kind)
         if firing is not None:
             _warn_live_override_wont_survive_fork(firing, firing_kind, StubFiring, "firing")
