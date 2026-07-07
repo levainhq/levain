@@ -68,6 +68,14 @@ dependencies = [
 # core install + `levain dashboard` CLI stay lean; only pulled when an operator
 # wants the in-host render. The UI loads its client lib from a CDN — no Node.
 app = ["mcp>=1.27,<2"]
+# The OpenHands presence adapter (`levain.firing.openhands.LevainCondenser`). EXPERIMENTAL /
+# v0.x — it composes `vagus[openhands]` (the firing adapter), and **vagus is currently
+# UNPUBLISHED** (v0.0.1, dev-editable only — the whole firing-adapter leg stays v0.x/unpublished
+# until validated across all three adapters, per the loop-operator plan). So this extra is NOT
+# yet PyPI-resolvable; it documents the dependency contract and installs against an editable local
+# vagus in the dev env. The harness-neutral seam `levain.firing` imports NO OpenHands and NO
+# vagus, so a plain `pip install levain` never pulls any of this (the leaf stays isolated).
+openhands = ["vagus[openhands]"]
 dev = ["pytest>=7.4", "mcp>=1.27,<2"]
 
 [project.scripts]
