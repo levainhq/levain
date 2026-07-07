@@ -15,8 +15,11 @@ import pytest
 
 from levain.install import _templates_root
 from levain.packs import (
+    PackBrand,
     PackError,
+    PackManifest,
     SeedEntry,
+    compose_brand,
     compose_roster,
     discover_roster,
     import_entries,
@@ -480,3 +483,115 @@ def test_order_activation_roots_tracks_base_order_like_compose_roster(tmp_path: 
     # activation layering must AGREE: base wins → base_act is LAST in winning order.
     roots = order_activation_roots(base_pack, base_act, [pack])
     assert roots[-1] == base_act
+
+
+# ---------- brand: pack.toml [brand] parsing (Slice: pack white-labeling) ----------
+
+def test_brand_table_parses(tmp_path: Path):
+    _write_pack(
+        tmp_path,
+        'name = "p"\norder = 10\n[brand]\n'
+        'surface_name = "Pressable Solutions Harness"\nsubtitle = "your team\'s memory"\n',
+        {"x.md": "x"},
+    )
+    m = load_pack_manifest(tmp_path)
+    assert m.brand == PackBrand(
+        surface_name="Pressable Solutions Harness", subtitle="your team's memory"
+    )
+
+
+def test_no_brand_table_is_none(tmp_path: Path):
+    _write_pack(tmp_path, 'name = "p"\n', {"x.md": "x"})
+    assert load_pack_manifest(tmp_path).brand is None
+
+
+def test_empty_brand_table_resolves_to_none(tmp_path: Path):
+    # A bare [brand] with no fields is a no-op, never an all-None override.
+    _write_pack(tmp_path, 'name = "p"\n[brand]\n', {"x.md": "x"})
+    assert load_pack_manifest(tmp_path).brand is None
+
+
+def test_brand_partial_only_one_field(tmp_path: Path):
+    _write_pack(tmp_path, 'name = "p"\n[brand]\nsurface_name = "Acme"\n', {"x.md": "x"})
+    assert load_pack_manifest(tmp_path).brand == PackBrand(surface_name="Acme", subtitle=None)
+
+
+def test_brand_unknown_subkey_is_ignored_forward_compat(tmp_path: Path):
+    # Lenient on membership (forward-compat with a newer Levain's brand fields) —
+    # the same leniency load_pack_manifest gives unknown top-level keys.
+    _write_pack(
+        tmp_path,
+        'name = "p"\n[brand]\nsurface_name = "Acme"\nbinary_name = "acme"\nlogo = "x.png"\n',
+        {"x.md": "x"},
+    )
+    assert load_pack_manifest(tmp_path).brand == PackBrand(surface_name="Acme", subtitle=None)
+
+
+def test_brand_non_table_raises(tmp_path: Path):
+    _write_pack(tmp_path, 'name = "p"\nbrand = "nope"\n', {"x.md": "x"})
+    with pytest.raises(PackError, match="brand.*must be a table"):
+        load_pack_manifest(tmp_path)
+
+
+def test_brand_non_string_field_raises(tmp_path: Path):
+    _write_pack(tmp_path, 'name = "p"\n[brand]\nsurface_name = 42\n', {"x.md": "x"})
+    with pytest.raises(PackError, match="brand.surface_name.*non-empty string"):
+        load_pack_manifest(tmp_path)
+
+
+def test_brand_blank_field_raises(tmp_path: Path):
+    _write_pack(tmp_path, 'name = "p"\n[brand]\nsurface_name = "   "\n', {"x.md": "x"})
+    with pytest.raises(PackError, match="brand.surface_name.*non-empty string"):
+        load_pack_manifest(tmp_path)
+
+
+# ---------- compose_brand: field-level last-wins by order ----------
+
+def test_compose_brand_none_when_no_layer_sets_it():
+    assert compose_brand([PackManifest(name="base", order=0)]) is None
+
+
+def test_compose_brand_higher_order_wins():
+    base = PackManifest(name="base", order=0)
+    dom = PackManifest(
+        name="dom", order=10, brand=PackBrand(surface_name="Acme", subtitle="tag")
+    )
+    assert compose_brand([base, dom]) == PackBrand(surface_name="Acme", subtitle="tag")
+
+
+def test_compose_brand_field_level_merge():
+    # low sets subtitle, high overrides surface_name only → both survive.
+    low = PackManifest(name="low", order=1, brand=PackBrand(subtitle="base tag"))
+    high = PackManifest(name="high", order=2, brand=PackBrand(surface_name="Acme"))
+    # input order shuffled — compose sorts by order, so high wins surface_name.
+    assert compose_brand([high, low]) == PackBrand(surface_name="Acme", subtitle="base tag")
+
+
+def test_compose_brand_equal_order_later_input_wins():
+    a = PackManifest(name="a", order=5, brand=PackBrand(surface_name="A"))
+    b = PackManifest(name="b", order=5, brand=PackBrand(surface_name="B"))
+    assert compose_brand([a, b]).surface_name == "B"  # stable sort → later input wins
+
+
+def test_brand_rejects_control_characters(tmp_path: Path):
+    # surface_name feeds the same masthead render path as entity_name (curses addstr);
+    # a control char could corrupt the masthead row → reject at the parse gate.
+    _write_pack(tmp_path, 'name = "p"\n[brand]\nsurface_name = "Acme\\nHarness"\n', {"x.md": "x"})
+    with pytest.raises(PackError, match="control characters"):
+        load_pack_manifest(tmp_path)
+
+
+def test_brand_rejects_overlong_value(tmp_path: Path):
+    long = "A" * 200
+    _write_pack(tmp_path, f'name = "p"\n[brand]\nsurface_name = "{long}"\n', {"x.md": "x"})
+    with pytest.raises(PackError, match="exceeds"):
+        load_pack_manifest(tmp_path)
+
+
+def test_brand_accepts_normal_punctuation_and_unicode(tmp_path: Path):
+    # Not over-strict: normal display strings (spaces, punctuation, unicode) pass.
+    _write_pack(
+        tmp_path, 'name = "p"\n[brand]\nsurface_name = "Pressable — Solutions Harness ™"\n',
+        {"x.md": "x"},
+    )
+    assert load_pack_manifest(tmp_path).brand.surface_name == "Pressable — Solutions Harness ™"

@@ -35,6 +35,7 @@ from levain.install import (
     InitError,
     _copy_pack_docs,
     _timestamped_backup_path,
+    _write_brand_config,
     read_answers,
     write_answers,
 )
@@ -45,7 +46,7 @@ from levain.manifest import (
     compute_pack_drift,
     read_pack_locks_status,
 )
-from levain.packs import PackError, load_pack_manifest
+from levain.packs import PackError, PackManifest, compose_brand, load_pack_manifest
 
 # A prompter asks the operator for the pack's NEWLY-ADDED render slots. It returns
 # ``{slot: answer}`` for the given InterviewFields, or ``None`` when it cannot prompt
@@ -503,14 +504,25 @@ def run_pack_reconcile(
              "last-composed manual) until it is restored or removed.")
     else:
         pairs: list[tuple[object, Path]] = []
+        manifests: list[PackManifest] = []
         for d in drifts:
             src = Path(d.source)
             try:
-                pairs.append((load_pack_manifest(src), src))
+                mf = load_pack_manifest(src)
             except PackError:
                 continue
+            pairs.append((mf, src))
+            manifests.append(mf)
         try:
             _copy_pack_docs(install, pairs)  # type: ignore[arg-type]
+            # Re-bake the white-label alongside the docs rebuild — brand tracks docs on
+            # EVERY drift event, not just init (a pack.toml `[brand]` edit IS drift; it is
+            # in the hashed set — manifest._pack_source_hashes). Same IP-boundary discipline
+            # as the docs wipe: a changed brand re-bakes, a REMOVED `[brand]` clears the
+            # stale chrome (compose_brand → None → _write_brand_config clears). Without this
+            # the docstring's "same discipline as _copy_pack_docs" parity was a false claim —
+            # the config brand would go stale on update (kimi/complement L2). Best-effort.
+            _write_brand_config(install, compose_brand(manifests), emit)
             docs_ok = True
         except (OSError, InitError) as e:
             emit(f"  note: could not rebuild pack docs ({e}); `levain docs` may be stale "

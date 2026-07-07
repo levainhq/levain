@@ -963,3 +963,30 @@ def test_edit_focus_read_only_backstop(monkeypatch):
     view = dataclasses.replace(_view(), focus=Focus(text="old", set_at=None, source=None))
     result = _tui_curses._edit_focus(None, tui.TuiModel(view=view, read_only=True), None)
     assert reached == [] and "read-only" in result.status
+
+
+# ---------- masthead white-label (pack brand → TUI header) ----------
+
+def test_masthead_line_uses_brand_wordmark():
+    from levain._tui_curses import _masthead_line
+
+    v = SubstrateView(
+        paths=AnnealPaths.from_db(Path("/x/memory.db")),
+        entity_name="Athena",
+        brand_wordmark="Pressable Solutions Harness",
+    )
+    assert _masthead_line(v) == " Pressable Solutions Harness — Athena"
+
+
+def test_masthead_line_defaults_to_levain():
+    from levain._tui_curses import _masthead_line
+
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")), entity_name="Athena")
+    assert _masthead_line(v) == " Levain — Athena"
+
+
+def test_masthead_line_falls_back_to_db_stem():
+    from levain._tui_curses import _masthead_line
+
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
+    assert _masthead_line(v) == " Levain — memory"

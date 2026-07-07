@@ -232,6 +232,10 @@
     if (view.brand_wordmark) {
       const wm = document.querySelector(".brand .wordmark");
       if (wm) wm.textContent = view.brand_wordmark;
+      // The browser tab / <title> too — the HTML ships "Levain · substrate control"
+      // hardcoded and JS is the only override seam (the static template can't know
+      // the brand). Keep the " · substrate control" suffix; swap only the wordmark.
+      document.title = view.brand_wordmark + " · substrate control";
     }
     if (view.brand_model) {
       const md = document.querySelector(".brand .model");

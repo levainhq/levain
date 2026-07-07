@@ -1314,3 +1314,85 @@ class TestFocusReviewFixes:
         assert rc == 0
         err = capsys.readouterr().err
         assert "no Levain store" in err
+
+
+# --- pack white-labeling: config brand → view → render surfaces --------------
+
+class TestBrandWhiteLabel:
+    @staticmethod
+    def _make_branded_install(tmp_path: Path, brand: dict) -> Path:
+        import json
+
+        from anneal_memory import Store
+
+        lev = tmp_path / ".levain"
+        lev.mkdir()
+        with Store(lev / "memory.db") as store:
+            store.record("decided X because Y", "decision")
+        (lev / "memory.continuity.md").write_text(
+            "## State\nfocus\n\n## Active Threads\n- t1\n", encoding="utf-8"
+        )
+        (lev / "config.json").write_text(json.dumps(brand) + "\n", encoding="utf-8")
+        return tmp_path
+
+    def test_config_brand_populates_view(self, tmp_path: Path) -> None:
+        from levain.dashboard import SubstrateSource
+
+        root = self._make_branded_install(
+            tmp_path,
+            {"surface_name": "Pressable Solutions Harness", "subtitle": "team memory"},
+        )
+        view = SubstrateSource.local(root).build()
+        assert view.brand_wordmark == "Pressable Solutions Harness"
+        assert view.brand_model == "team memory"
+        # what /substrate.json ships to the web JS (wordmark + document.title override)
+        assert view.to_dict()["brand_wordmark"] == "Pressable Solutions Harness"
+
+    def test_text_masthead_shows_brand(self, tmp_path: Path, capsys) -> None:
+        from levain.dashboard import run_dashboard
+
+        root = self._make_branded_install(
+            tmp_path, {"entity_name": "Athena", "surface_name": "Pressable Solutions Harness"}
+        )
+        rc = run_dashboard(root)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.splitlines()[0] == "Pressable Solutions Harness — Athena"
+        assert "Levain substrate" not in out.splitlines()[0]
+
+    def test_masthead_is_the_wordmark_not_the_subtitle(self, tmp_path: Path) -> None:
+        # The masthead is the NAME (brand_wordmark), never the subtitle (brand_model):
+        # a subtitle-only brand shows the Levain default here, consistent with the
+        # TUI/web wordmark (all three key the name off brand_wordmark). [L1 #3]
+        from levain.dashboard import AnnealPaths, SubstrateView, render_summary, render_text
+
+        paths = AnnealPaths.from_db(tmp_path / "x.db")
+        v = SubstrateView(paths=paths, brand_wordmark="Wordmark Co", brand_model="a subtitle")
+        assert render_text(v).splitlines()[0].startswith("Wordmark Co —")
+        assert render_summary(v).splitlines()[0].startswith("Wordmark Co —")
+        # subtitle-only → the subtitle is NOT promoted to the masthead name.
+        v2 = SubstrateView(paths=paths, brand_model="a subtitle")
+        assert render_text(v2).splitlines()[0].startswith("Levain substrate —")
+
+    def test_source_brand_override_wins_over_config(self, tmp_path: Path) -> None:
+        # The bridge flow-brands its cockpit programmatically — that override must
+        # WIN over an install's config brand (build() copies it on top).
+        import dataclasses
+
+        from levain.dashboard import SubstrateSource
+
+        root = self._make_branded_install(tmp_path, {"surface_name": "Install Brand"})
+        src = dataclasses.replace(SubstrateSource.local(root), brand_wordmark="Bridge Cockpit")
+        assert src.build().brand_wordmark == "Bridge Cockpit"
+
+    def test_no_config_brand_leaves_view_default(self, tmp_path: Path) -> None:
+        from anneal_memory import Store
+
+        from levain.dashboard import SubstrateSource
+
+        lev = tmp_path / ".levain"
+        lev.mkdir()
+        with Store(lev / "memory.db") as store:
+            store.record("x", "decision")
+        view = SubstrateSource.local(tmp_path).build()
+        assert view.brand_wordmark is None and view.brand_model is None

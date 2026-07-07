@@ -1522,6 +1522,17 @@ def build_substrate_view(
                 name = _h1_name_suffix(origin_doc.body) if origin_doc else None
             if name:
                 view.entity_name = name.strip()
+            # Pack white-label — the SAME config channel as entity_name (install baked
+            # it from pack.toml [brand]). surface_name → the masthead/wordmark/title
+            # name; subtitle → the tagline line. A programmatic SubstrateSource
+            # override (the bridge flow-branding its cockpit) still WINS: build()
+            # copies its non-None brand fields ON TOP of these after build returns.
+            surface_name = config.get("surface_name")
+            if isinstance(surface_name, str) and surface_name.strip():
+                view.brand_wordmark = surface_name.strip()
+            subtitle = config.get("subtitle")
+            if isinstance(subtitle, str) and subtitle.strip():
+                view.brand_model = subtitle.strip()
             # the operator's Class-A edit log (Slice 2a). recent_edits is fail-soft
             # (returns [] on any read fault) so it never propagates an error here.
             from levain.writes import recent_edits  # lazy: writes↔dashboard cycle
@@ -1575,7 +1586,10 @@ def render_text(view: SubstrateView) -> str:
     the seed/config surface — from outside a session. Degraded tiers are named at
     the bottom, never silently dropped."""
     title = view.entity_name or view.paths.episodic_db.stem
-    masthead = view.brand_model or "Levain substrate"
+    # The masthead is the tool's NAME → the wordmark (brand_wordmark), never the
+    # subtitle (brand_model): a subtitle-only brand shows the Levain default here,
+    # consistent with the TUI/web wordmark (which also key off brand_wordmark). [L1]
+    masthead = view.brand_wordmark or "Levain substrate"
     out: list[str] = [f"{masthead} — {title}", f"  store: {view.paths.episodic_db}"]
     if view.focus is not None and view.focus.text:
         if view.focus.freshness == "unknown":
@@ -1704,7 +1718,10 @@ def render_summary(view: SubstrateView) -> str:
     content/structuredContent split exists to prevent). Also the text-only
     fallback for hosts without MCP-Apps support."""
     title = view.entity_name or view.paths.episodic_db.stem
-    masthead = view.brand_model or "Levain substrate"
+    # The masthead is the tool's NAME → the wordmark (brand_wordmark), never the
+    # subtitle (brand_model): a subtitle-only brand shows the Levain default here,
+    # consistent with the TUI/web wordmark (which also key off brand_wordmark). [L1]
+    masthead = view.brand_wordmark or "Levain substrate"
     lines: list[str] = [f"{masthead} — {title}"]
     # The operator's live focus, FIRST — for a generic MCP adopter the partner IS the
     # model and reasons over THIS digest, so the "every session orients to the

@@ -31,11 +31,14 @@ from levain.install import (
     _save_checkpoint,
     _substitute_hook_placeholders,
     _templates_root,
+    _write_brand_config,
     apply_init,
 )
 from levain.packs import (
+    PackBrand,
     SeedEntry,
     compose_roster,
+    load_pack_manifest,
     order_activation_roots,
     render_entries,
     verbatim_entries,
@@ -1699,3 +1702,126 @@ def test_copy_activation_cross_layer_file_dir_collision_fails_loud(tmp_path: Pat
         _copy_activation_tree([base, pack], dst, base_activation=base)
     assert (dst / "sentinel.md").read_text(encoding="utf-8") == "ORIGINAL\n"  # untouched
     assert not list(dst.parent.glob(".levain-activation-*"))  # staging cleaned
+
+
+# ---------- pack white-labeling: brand → .levain/config.json (build→runtime) ----------
+
+def _read_config(install: Path) -> dict:
+    return json.loads((install / ".levain" / "config.json").read_text(encoding="utf-8"))
+
+
+def test_write_brand_config_bakes_brand(tmp_path: Path):
+    (tmp_path / ".levain").mkdir()
+    _write_brand_config(
+        tmp_path, PackBrand(surface_name="Acme Harness", subtitle="the tagline"), lambda m: None
+    )
+    assert _read_config(tmp_path) == {"surface_name": "Acme Harness", "subtitle": "the tagline"}
+
+
+def test_write_brand_config_merges_preserving_entity_name(tmp_path: Path):
+    # An operator-set entity_name (a governed rename) must survive a brand write.
+    lev = tmp_path / ".levain"
+    lev.mkdir()
+    (lev / "config.json").write_text('{"entity_name": "Athena"}\n', encoding="utf-8")
+    _write_brand_config(tmp_path, PackBrand(surface_name="Acme"), lambda m: None)
+    assert _read_config(tmp_path) == {"entity_name": "Athena", "surface_name": "Acme"}
+
+
+def test_write_brand_config_clear_on_drop_preserves_entity_name(tmp_path: Path):
+    # A re-install WITHOUT a brand (brand=None) clears stale brand keys but keeps
+    # the operator's entity_name — the IP-boundary discipline _copy_pack_docs follows.
+    lev = tmp_path / ".levain"
+    lev.mkdir()
+    (lev / "config.json").write_text(
+        '{"entity_name": "Athena", "surface_name": "Old Co", "subtitle": "stale"}\n',
+        encoding="utf-8",
+    )
+    _write_brand_config(tmp_path, None, lambda m: None)
+    assert _read_config(tmp_path) == {"entity_name": "Athena"}
+
+
+def test_write_brand_config_noop_writes_nothing(tmp_path: Path):
+    # No brand now, none before → no file created (no spurious mtime churn).
+    (tmp_path / ".levain").mkdir()
+    _write_brand_config(tmp_path, None, lambda m: None)
+    assert not (tmp_path / ".levain" / "config.json").exists()
+
+
+def test_apply_init_bakes_pack_brand_into_config(tmp_path: Path, monkeypatch):
+    """End-to-end (both install entry points share apply_init): a pack's
+    pack.toml [brand] lands in the operator-facing .levain/config.json, the same
+    runtime channel entity_name travels."""
+    from levain.interview import build_field_plan, parse_template
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text(
+        'name = "dom"\norder = 10\n[brand]\n'
+        'surface_name = "Pressable Solutions Harness"\nsubtitle = "your team\'s memory"\n',
+        encoding="utf-8",
+    )
+    (pack / "seed" / "doctrine.md").write_text("DOCTRINE\n", encoding="utf-8")
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root, pack])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim,
+            packs=[(load_pack_manifest(pack), pack)],
+        )
+    assert _read_config(install) == {
+        "surface_name": "Pressable Solutions Harness",
+        "subtitle": "your team's memory",
+    }
+
+
+def test_apply_init_no_pack_writes_no_brand_config(tmp_path: Path, monkeypatch):
+    # A base-only install (no --pack) leaves no brand config — surfaces show the
+    # Levain default. (No config.json is created for a fresh brand-less install.)
+    from levain.interview import build_field_plan, parse_template
+
+    class _OK:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OK())
+
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        roster = compose_roster([templates_root])
+        specs = [parse_template(e.path) for e in render_entries(roster)]
+        verbatim = verbatim_entries(roster)
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", specs, verbatim, packs=[],
+        )
+    assert not (install / ".levain" / "config.json").exists()
+
+
+def test_write_brand_config_refuses_to_clobber_unreadable_config(tmp_path: Path):
+    # A pre-corrupt config.json (hand-edit typo) fails soft to {} on read; writing
+    # brand onto {} would ERASE a recoverable entity_name. Refuse to overwrite it.
+    lev = tmp_path / ".levain"
+    lev.mkdir()
+    corrupt = '{"entity_name": "Athena", BROKEN'
+    (lev / "config.json").write_text(corrupt, encoding="utf-8")
+    notes: list[str] = []
+    _write_brand_config(tmp_path, PackBrand(surface_name="Acme"), notes.append)
+    # untouched — the operator's entity_name stays recoverable by hand
+    assert (lev / "config.json").read_text(encoding="utf-8") == corrupt
+    assert any("unreadable" in n for n in notes)
