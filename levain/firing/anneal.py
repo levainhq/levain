@@ -25,6 +25,12 @@ import os
 from pathlib import Path
 
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
+from levain.firing.isolation import (
+    LEVAIN_ENTITY_DIR_ENV,
+    assert_entity_isolated,
+    entity_store_paths,
+    resolve_entity_dir,
+)
 
 _log = logging.getLogger("levain.firing.anneal")
 
@@ -41,12 +47,42 @@ MAX_PATTERNS = 3  # precision bias — matches the flow recall hook's per-prompt
 DEFAULT_WRAP_NUDGE_THRESHOLD = 12
 
 
-def _resolve_crystal_path() -> Path:
+def _entity_env_path(which: str) -> Path | None:
+    """When an entity is bound (``$LEVAIN_ENTITY_DIR`` set), the DEFAULT (``"anneal"``-kind) store
+    resolution is entity-isolated and RE-GUARDED **per op** — never a cached bind-time path (closes
+    the post-bind ``.levain`` symlink-swap TOCTOU, apparatus codex round-2). So a stray bare
+    ``vagus_run`` / ``wrap_nudge`` in an entity process resolves to the ENTITY store, guarded at USE
+    time, not flow's. No entity bound → ``None`` (the normal ``$VAGUS_*`` / default resolution).
+
+    Raises :class:`~levain.firing.isolation.IsolationError` if the bound entity's store escapes — its
+    callers (``_recall`` / ``capture`` / ``wrap_nudge``) wrap resolution in their fail-soft boundary,
+    so it degrades to no-recall / no-nudge, NEVER a leak. ``resolve_entity_dir`` is intentionally NOT
+    used here (it RAISES when unbound; this must return ``None`` to fall through to normal resolution)."""
+    raw = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
+    if not raw:
+        return None
+    entity_dir = Path(raw).expanduser()
+    crystal, episodic = entity_store_paths(entity_dir)
+    assert_entity_isolated(crystal, episodic, entity_dir=entity_dir)
+    return crystal if which == "crystal" else episodic
+
+
+def _env_crystal_path() -> Path:
+    """The default crystal path for the ``"anneal"`` kind. When an entity is bound it resolves under
+    the entity's ``.levain/`` (re-guarded per op — :func:`_entity_env_path`); otherwise
+    ``$VAGUS_CRYSTAL_PATH`` override, else flow's laptop store. (``AnnealEntityFiring`` never falls
+    through here — it resolves via its own ``_entity_paths``.)"""
+    entity = _entity_env_path("crystal")
+    if entity is not None:
+        return entity
     env = os.environ.get("VAGUS_CRYSTAL_PATH", "").strip()
     return Path(env) if env else DEFAULT_CRYSTAL_PATH
 
 
-def _resolve_episodic_path() -> Path:
+def _env_episodic_path() -> Path:
+    entity = _entity_env_path("episodic")
+    if entity is not None:
+        return entity
     env = os.environ.get("VAGUS_EPISODIC_PATH", "").strip()
     return Path(env) if env else DEFAULT_EPISODIC_PATH
 
@@ -80,7 +116,7 @@ def wrap_nudge(episodic_path: Path | None = None, threshold: int | None = None) 
     try:
         from anneal_memory import Store
 
-        path = episodic_path or _resolve_episodic_path()
+        path = episodic_path or _env_episodic_path()
         if not Path(path).exists():
             return None
         with Store(path, read_only=True) as store:
@@ -123,6 +159,17 @@ class AnnealFiring:
         self._max_patterns = max_patterns
         self._episodic_path = episodic_path  # None → resolve per-capture (env / default)
 
+    # Per-op path resolution as METHODS (not the module functions directly) so an isolated
+    # subclass (``AnnealEntityFiring``) can override WHERE the store lives without touching the
+    # inject/capture bodies. ``_recall`` / ``capture`` call ``self._resolve_*`` — the one seam an
+    # entity firing redirects. An explicit ``crystal_path``/``episodic_path`` (tests / in-process)
+    # wins; else the env/default resolution.
+    def _resolve_crystal_path(self) -> Path:
+        return self._crystal_path or _env_crystal_path()
+
+    def _resolve_episodic_path(self) -> Path:
+        return self._episodic_path or _env_episodic_path()
+
     def inject(self, req: InjectRequest) -> str:
         # session_start → the static constitution alone (the adapter sets it once into its
         # persistent trusted surface). per_turn → dynamic recall + the rotating directive;
@@ -142,7 +189,7 @@ class AnnealFiring:
             from anneal_memory.crystal import CrystalStore
             from anneal_memory.retrieval import retrieve_patterns
 
-            path = self._crystal_path or _resolve_crystal_path()
+            path = self._resolve_crystal_path()
             if not path.exists():
                 return "[recall: (no crystal store)]"
             patterns = retrieve_patterns(
@@ -197,7 +244,7 @@ class AnnealFiring:
             if req.session_id:
                 meta.setdefault("vagus_session_id", req.session_id)
 
-            path = self._episodic_path or _resolve_episodic_path()
+            path = self._resolve_episodic_path()
             # A per-capture open → record → commit → close. ``audit=False`` is REQUIRED: anneal's
             # audit sidecar is single-writer (concurrent AuditTrail instances read the same
             # prev_hash and append incompatible hash-chain entries → corruption), and the vagus is
@@ -221,4 +268,54 @@ class AnnealFiring:
             return False
 
 
+class AnnealEntityFiring(AnnealFiring):
+    """An ISOLATED entity firing (kind ``"anneal_entity"``): resolves its crystal + episodic stores
+    ONLY under the bound entity dir (``$LEVAIN_ENTITY_DIR`` / an explicit ``entity_dir``), behind
+    the fail-closed sovereignty guard. It has NO ``~/.anneal-memory/`` fallback — the operator-
+    laptop leak is structurally IMPOSSIBLE for this kind (``structural_invariants_beat_discipline``).
+
+    Why the KIND carries isolation (not just env): ``firing_kind`` is a SERIALIZED field, so a
+    ``fork()`` / reload rebuilds this as ``AnnealEntityFiring`` — never the laptop-defaulting
+    ``AnnealFiring``. The entity DIR rides ``$LEVAIN_ENTITY_DIR`` (re-read per op, never frozen) —
+    the one channel that survives a zero-arg registry rebuild (the same mechanism the legacy
+    ``VAGUS_CRYSTAL_PATH`` override used). So even after a fork the contract holds by construction.
+
+    FAIL-CLOSED-TO-SAFE at runtime: if no entity is bound (env unset) or the guard trips, the
+    resolver RAISES — and because ``_recall`` / ``capture`` wrap resolution in the fail-soft
+    boundary, that degrades to no-recall / a loud lost-capture, NEVER a silent read of the wrong
+    store. The loud build-time guard (``build_entity_agent``) surfaces a misconfig before the REPL;
+    this resolver is the fork/runtime backstop.
+    """
+
+    def __init__(self, entity_dir: Path | str | None = None, **kwargs: object) -> None:
+        # ``entity_dir`` is for in-process / test construction; None → resolve per-op from
+        # ``$LEVAIN_ENTITY_DIR`` (the fork-safe path). It is NOT frozen into crystal_path/
+        # episodic_path — those must RE-resolve so a fork (zero-arg rebuild) still finds the entity
+        # via env. Passing a crystal_path/episodic_path override to an entity firing is refused
+        # (an explicit path could point at flow's store — the exact leak); the entity dir is the
+        # single source of truth.
+        if kwargs.get("crystal_path") is not None or kwargs.get("episodic_path") is not None:
+            raise ValueError(
+                "AnnealEntityFiring does not accept crystal_path/episodic_path — an isolated "
+                "entity's stores are derived from its entity_dir only (a raw path override could "
+                "escape the sovereign dir)."
+            )
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._entity_dir = Path(entity_dir).expanduser() if entity_dir is not None else None
+
+    def _entity_paths(self) -> tuple[Path, Path]:
+        """Resolve + GUARD the entity's stores. Raises IsolationError if unbound or escaping."""
+        entity_dir = resolve_entity_dir(self._entity_dir)
+        crystal, episodic = entity_store_paths(entity_dir)
+        assert_entity_isolated(crystal, episodic, entity_dir=entity_dir)
+        return crystal, episodic
+
+    def _resolve_crystal_path(self) -> Path:
+        return self._entity_paths()[0]
+
+    def _resolve_episodic_path(self) -> Path:
+        return self._entity_paths()[1]
+
+
 register_firing("anneal", AnnealFiring)
+register_firing("anneal_entity", AnnealEntityFiring)

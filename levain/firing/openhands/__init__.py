@@ -14,6 +14,12 @@ from levain.firing.anneal import wrap_nudge  # SessionEnd→wrap-nudge (harness-
 from levain.firing.openhands.agent import vagus_agent_context
 from levain.firing.openhands.capture import render_turn, vagus_run
 from levain.firing.openhands.condenser import VagusCondenser
+from levain.firing.openhands.entity import (
+    ENTITY_FIRING_KIND,
+    EntityBinding,
+    bind_entity,
+    build_entity_agent,
+)
 from levain.firing.openhands.levain_condenser import LevainCondenser
 
 __all__ = [
@@ -23,4 +29,9 @@ __all__ = [
     "vagus_run",
     "render_turn",
     "wrap_nudge",
+    # the isolated-entity agent chokepoint (spore-277)
+    "build_entity_agent",
+    "bind_entity",
+    "EntityBinding",
+    "ENTITY_FIRING_KIND",
 ]
