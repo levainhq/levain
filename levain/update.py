@@ -28,10 +28,11 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Callable
 
-from levain import manifest
+from levain import manifest, reconcile
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
 Emit = Callable[[str], None]
@@ -68,6 +69,12 @@ def run_update(
     lock = manifest.read_lock(install)
     drift = manifest.compute_drift(declared, installed, lock)
 
+    # The SECOND drift axis: pack-layer drift (a pulled pack source changed). Cheap
+    # (hash the recorded sources); factored into the branch conditions below so a
+    # pack-only drift still triggers a reconcile even when the engine is in sync.
+    pack_recorded = manifest.read_pack_locks(install)
+    packs_drifted = any(d.drifted for d in manifest.compute_pack_drift(pack_recorded))
+
     emit(f"levain update — reconciling {install} to the known-good set\n")
     emit(_format_set("declared known-good", declared))
     emit(_format_installed("installed now", installed))
@@ -77,6 +84,8 @@ def run_update(
     emit("drift:")
     for v in drift.verdicts:
         emit(_format_verdict(v))
+    if pack_recorded:
+        emit(f"    packs: {'DRIFT — a pulled source changed' if packs_drifted else 'in sync'}")
     emit("")
 
     # --dry-run short-circuits FIRST, BEFORE any write — including the lock
@@ -84,7 +93,10 @@ def run_update(
     # early-return ran before this check, so a dry-run on a clean install wrote
     # the lockfile, violating "a plan is not a result").
     if dry_run:
-        if not drift.has_actionable_drift and not drift.has_unknown:
+        engine_clean = not drift.has_actionable_drift and not drift.has_unknown
+        if packs_drifted:
+            reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
+        if engine_clean and not packs_drifted:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
         emit("--dry-run: the plan above is what `levain update` WOULD do. "
@@ -93,7 +105,7 @@ def run_update(
         # unverified read is not a clean bill of health.
         return 1
 
-    if not drift.has_actionable_drift and not drift.has_unknown:
+    if not drift.has_actionable_drift and not drift.has_unknown and not packs_drifted:
         if drift.in_sync:
             emit("Already at the known-good set — nothing to reconcile.")
         else:
@@ -188,8 +200,17 @@ def run_update(
         emit("\n• --ack: no migration proposals to acknowledge "
              "(none pending, or they could not be read) — marker unchanged.")
 
-    # -- 4. record the lock (reality after reconcile) --
-    lock_written = _record_lock(install, installed, emit)
+    # -- 3.5 pack-layer drift (the DOWNSTREAM axis) — reconcile a pulled pack source
+    #    into the install: verbatim doctrine fast-forwarded (operator edits backed up),
+    #    docs rebuilt, render/activation/manifest changes surfaced for review. --
+    pack_provenance, _pack_drifted, pack_needs_review = reconcile.run_pack_reconcile(
+        install, dry_run=False, emit=emit
+    )
+
+    # -- 4. record the lock (reality after reconcile) — carry the updated pack
+    #    provenance so a reconciled pack stops re-drifting; write_lock always writes
+    #    the `packs` key, so this must be handed the set to keep. --
+    lock_written = _record_lock(install, installed, emit, packs=pack_provenance)
 
     # -- final verdict --
     final = manifest.compute_drift(
@@ -214,6 +235,14 @@ def run_update(
         # (a write fault) — don't claim full success on a missing lock (codex L3).
         emit("Runtime reconciled, but the compatibility lock could NOT be "
              "recorded — re-run `levain update` so the baseline is written.")
+        return 1
+    if pack_needs_review:
+        # Engine is at known-good, but a pulled pack carried changes that can't
+        # auto-reconcile (render / activation / manifest / seed-set). Non-zero so it
+        # composes with pipelines, like actionable engine drift.
+        emit("Pack changes need your review (render / activation / manifest / "
+             "seed-set) — re-onboard (`levain init`) or reconcile by hand, then "
+             "re-run `levain update`.")
         return 1
     if final.in_sync:
         emit("Set reconciled to known-good.")
@@ -259,7 +288,12 @@ def _reconcile_anneal(
         emit(f"  pip FAILED:\n{_indent(tail)}\n    Run it yourself: {printable}")
 
 
-def _record_lock(install: Path, installed: InstalledSet, emit: Emit) -> bool:
+def _record_lock(
+    install: Path,
+    installed: InstalledSet,
+    emit: Emit,
+    packs: Sequence[manifest.PackProvenance] | None = None,
+) -> bool:
     """Write the lock from the actually-installed values; return True iff a
     VERIFIED lock was written.
 
@@ -267,7 +301,12 @@ def _record_lock(install: Path, installed: InstalledSet, emit: Emit) -> bool:
     rather than record an unverified baseline — a poisoned lock would read as a
     clean compose next session (honesty floor, L1 HIGH) — and return False. A
     write fault (OSError) also returns False so the caller can refuse to claim
-    full success on a missing baseline (codex L3). `levain` is always known."""
+    full success on a missing baseline (codex L3). `levain` is always known.
+
+    ``packs`` is the pack provenance to persist — the reconcile-phase's updated set
+    when packs drifted, else the EXISTING recorded provenance (read here) so an
+    engine-only update never WIPES the pack baseline (write_lock always writes the
+    `packs` key, so it must be handed the packs to keep)."""
     if installed.anneal is None or installed.schema is None:
         emit("\n• could not verify the installed set (anneal/schema unread) — "
              "lock NOT written (a lock must record a verified compose).")
@@ -277,8 +316,22 @@ def _record_lock(install: Path, installed: InstalledSet, emit: Emit) -> bool:
         anneal=installed.anneal,
         schema=installed.schema,
     )
+    if packs is None:
+        # Preserving the EXISTING pack provenance (engine-only update, or a corrupt
+        # reconcile that returned None). Read via the three-way status: if the pack
+        # section is UNREADABLE, REFUSE to write — rewriting with empty packs would
+        # erase the drift baseline whose only source of truth is this file (complement
+        # L3 CRITICAL — the honesty floor the engine axis already enforces).
+        keep_packs, pack_status = manifest.read_pack_locks_status(install)
+        if pack_status == "corrupt":
+            emit("\n• the lock's pack provenance is UNREADABLE — NOT rewriting the lock "
+                 "(that would erase the pack-drift baseline). Restore "
+                 ".levain/manifest.json or re-onboard (`levain init`).")
+            return False
+    else:
+        keep_packs = list(packs)
     try:
-        manifest.write_lock(install, composed)
+        manifest.write_lock(install, composed, packs=keep_packs)
         emit(f"\n• recorded the composed set -> {manifest.lock_path(install)}")
         return True
     except OSError as exc:

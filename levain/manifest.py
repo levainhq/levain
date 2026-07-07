@@ -42,12 +42,14 @@ The honesty floor is load-bearing throughout: a discovery that FAILS yields an
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -650,13 +652,21 @@ def read_lock(install: Path) -> CompatSet | None:
     return value
 
 
-def write_lock(install: Path, composed: CompatSet) -> None:
+def write_lock(
+    install: Path, composed: CompatSet, packs: Sequence[PackProvenance] = ()
+) -> None:
     """Atomically record the composed set to ``.levain/manifest.json``.
 
     Unique-tmp + file fsync + ``os.replace`` + directory fsync — the full
     atomic-write invariant anneal's marker / spore stores use, so a concurrent
     writer or a crash mid-write cannot leave a torn lock. Stamps ``recorded_at``
-    (UTC ISO-8601) for provenance."""
+    (UTC ISO-8601) for provenance.
+
+    ``packs`` (default empty) records the composed pack layers' PROVENANCE — each
+    pack's source dir + per-file source hashes — so a later ``levain update`` can
+    detect PACK drift (the pulled source changed) and reconcile it. An empty list
+    is the base-only case; the key is always written so "no packs" (explicit) is
+    distinguishable from an old pre-pack lock (the key absent)."""
     path = lock_path(install)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(
@@ -664,6 +674,7 @@ def write_lock(install: Path, composed: CompatSet) -> None:
             "levain": composed.levain,
             "anneal": composed.anneal,
             "schema": composed.schema,
+            "packs": [_pack_to_json(p) for p in packs],
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         },
         indent=2,
@@ -700,3 +711,278 @@ def _fsync_dir(dir_path: Path) -> None:
             os.close(fd)
     except OSError:
         pass
+
+
+# ===========================================================================
+# Pack-layer provenance — the SECOND drift axis.
+#
+# A pack is UPSTREAM (the operator pulls updates into its source dir); the install
+# is DOWNSTREAM (it grows independently). `levain init --pack` records each composed
+# pack's per-file SOURCE hashes into the lock; `levain update` re-hashes the source
+# to detect PACK drift and reconcile it into the install — the compat-manifest
+# pattern (engine drift) extended to pack drift. Detection is HASH-based, so it
+# works with NO version stamp on the pack (a pack's optional `version` is recorded
+# only as human-readable sugar for the drift notice). Keep this hash algorithm
+# stable and stdlib-only: the standalone session-start hook re-implements
+# `hash_pack_source` byte-identically to notify on drift without importing levain.
+# ===========================================================================
+
+# The source subtrees a pack contributes, relative to its dir. `pack.toml` is
+# recorded (a manifest change = drift) but is metadata, not installed; seed/
+# activation/ docs/ map INTO the install.
+_PACK_SUBTREES = ("seed", "activation", "docs")
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _pack_hash_excluded(rel: str) -> bool:
+    """Exclude derived files (non-deterministic / rebuilt) from the fingerprint —
+    matched PRECISELY (a path part is __pycache__, or the basename is a .pyc/.pyo /
+    .DS_Store) rather than by substring, so a legit file like ``seed/notes.pyo.md``
+    is NOT silently dropped from drift tracking (L1 #4)."""
+    parts = rel.split("/")
+    return (
+        "__pycache__" in parts
+        or parts[-1].endswith((".pyc", ".pyo"))
+        or parts[-1] == ".DS_Store"
+    )
+
+
+def hash_pack_source(pack_dir: Path) -> dict[str, str]:
+    """Map a pack's source files to content hashes: ``{posix_relpath: sha256}``.
+
+    Covers ``pack.toml`` plus every file under ``seed/`` ``activation/`` ``docs/``,
+    keyed by POSIX relpath within the pack (``"seed/world.md"``,
+    ``"activation/posture.md"``, ``"pack.toml"``) — the reconcile maps those to
+    install locations. Deterministic (the caller sorts); skips ``__pycache__`` /
+    ``*.pyc`` (derived). A missing pack dir yields ``{}`` (the caller treats it as
+    ``source_missing`` — the honesty floor, not a silent "unchanged")."""
+    out: dict[str, str] = {}
+    if not pack_dir.is_dir():
+        return out
+    manifest = pack_dir / "pack.toml"
+    if manifest.is_file():
+        out["pack.toml"] = _sha256_file(manifest)
+    for sub in _PACK_SUBTREES:
+        root = pack_dir / sub
+        if not root.is_dir():
+            continue
+        for f in sorted(root.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(pack_dir).as_posix()
+            if _pack_hash_excluded(rel):
+                continue
+            out[rel] = _sha256_file(f)
+    return out
+
+
+@dataclass(frozen=True)
+class PackProvenance:
+    """The recorded composed state of one pack layer: its source dir, optional
+    version, a per-file SOURCE-hash map, and (for the pack's RENDER seed files) the
+    RENDERED-output hash the install had right after init. The reconcile baseline.
+
+    ``files`` keys are pack-source relpaths (``"seed/world.md"``) → the SOURCE
+    (template) hash; ``rendered`` keys are the same relpaths but map to the hash of
+    the INSTALLED, rendered file (``install/seed/world.md``) — so the reconcile can
+    tell a render template changed (``files`` drift) apart from the operator editing
+    the rendered copy (``rendered`` mismatch), which a source hash alone can't do
+    (a render file's install copy never equals its template)."""
+
+    name: str
+    source: str
+    version: str | None
+    files: dict[str, str]
+    rendered: dict[str, str] = field(default_factory=dict)
+    # The pack's render-seed filenames at record time — so the reconcile can detect a
+    # render-MEMBERSHIP flip (a file goes verbatim<->render via pack.toml `render`,
+    # with UNCHANGED seed bytes), which a source-hash diff alone misses (codex L3 #1).
+    render: tuple[str, ...] = ()
+
+    @property
+    def fingerprint(self) -> str:
+        """A single stable hash over the file map — the cheap 'did this pack change
+        at all' signal (order-independent)."""
+        h = hashlib.sha256()
+        for rel in sorted(self.files):
+            h.update(rel.encode("utf-8"))
+            h.update(b"\0")
+            h.update(self.files[rel].encode("utf-8"))
+            h.update(b"\n")
+        return h.hexdigest()
+
+
+def rendered_hashes(install: Path, render_relpaths: Sequence[str]) -> dict[str, str]:
+    """Hash the INSTALLED, rendered copy of each render seed (``"seed/<name>"`` ->
+    ``sha256(install/seed/<name>)``), skipping any not on disk. The operator-edit
+    baseline for a pack's render files."""
+    out: dict[str, str] = {}
+    for rel in render_relpaths:
+        f = install / rel
+        if f.is_file():
+            out[rel] = _sha256_file(f)
+    return out
+
+
+def pack_provenance(
+    name: str,
+    source: Path,
+    version: str | None,
+    rendered: Mapping[str, str] | None = None,
+    render: Sequence[str] = (),
+) -> PackProvenance:
+    """Snapshot a pack source dir's provenance (name + source + version + source
+    hashes + the render files' rendered-output hashes + the render membership)."""
+    return PackProvenance(
+        name=name,
+        source=str(source),
+        version=version,
+        files=hash_pack_source(source),
+        rendered=dict(rendered or {}),
+        render=tuple(render),
+    )
+
+
+def _pack_to_json(p: PackProvenance) -> dict[str, object]:
+    return {
+        "name": p.name, "source": p.source, "version": p.version,
+        "files": p.files, "rendered": p.rendered, "render": list(p.render),
+    }
+
+
+PackLockStatus = Literal["absent", "ok", "corrupt"]
+
+
+def read_pack_locks_status(install: Path) -> tuple[list[PackProvenance], PackLockStatus]:
+    """The recorded pack provenance PLUS a three-way state — the honesty floor the
+    engine axis (:func:`read_lock_status`) already enforces, applied to the pack axis
+    (complement L3): a WRITE path must never turn a failed READ into a written empty
+    baseline. States:
+
+    - ``([], "absent")`` — no lock file, OR the lock has no ``packs`` key (a base-only
+      / pre-pack install). Safe: there genuinely are no packs.
+    - ``(list, "ok")`` — the ``packs`` list parsed AND every entry validated.
+    - ``([], "corrupt")`` — the file exists but is unreadable / not-JSON / not a dict,
+      OR ``packs`` is present-but-not-a-list, OR ANY entry is malformed. NOT the same
+      as absent: a caller must NOT overwrite the lock with empty packs on this (it
+      would erase the drift baseline whose only source of truth is this file)."""
+    path = lock_path(install)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], "absent"
+    except OSError:
+        return [], "corrupt"
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return [], "corrupt"
+    if not isinstance(data, dict):
+        return [], "corrupt"
+    if "packs" not in data:
+        return [], "absent"  # a base-only / pre-pack lock — genuinely no packs
+    raw_packs = data.get("packs")
+    if not isinstance(raw_packs, list):
+        return [], "corrupt"
+    out: list[PackProvenance] = []
+    for entry in raw_packs:
+        if not isinstance(entry, dict):
+            return [], "corrupt"  # a malformed entry -> corrupt, never silently dropped
+        name = entry.get("name")
+        source = entry.get("source")
+        files = entry.get("files")
+        version = entry.get("version")
+        rendered = entry.get("rendered")
+        # A missing/invalid REQUIRED field (name / source / files) means the entry is
+        # malformed -> corrupt, never silently dropped (that drop is what let a rewrite
+        # erase it). version/rendered/render are OPTIONAL (forward-compat) and default.
+        if not (isinstance(name, str) and name and isinstance(source, str) and source):
+            return [], "corrupt"
+        if not isinstance(files, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in files.items()
+        ):
+            return [], "corrupt"
+        if version is not None and not isinstance(version, str):
+            version = None
+        if not isinstance(rendered, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in rendered.items()
+        ):
+            rendered = {}  # absent/malformed rendered map -> empty (a pre-render-track lock)
+        render = entry.get("render")
+        if not isinstance(render, list) or not all(isinstance(x, str) for x in render):
+            render = []
+        out.append(PackProvenance(
+            name=name, source=source, version=version,
+            files=dict(files), rendered=dict(rendered), render=tuple(render),
+        ))
+    return out, "ok"
+
+
+def read_pack_locks(install: Path) -> list[PackProvenance]:
+    """The recorded pack provenance (``[]`` if absent OR corrupt). A thin wrapper over
+    :func:`read_pack_locks_status` for read-only callers (drift compute, the hook)
+    that only need the values; the WRITE paths use the status form so they never
+    rewrite an empty baseline over an unreadable one."""
+    return read_pack_locks_status(install)[0]
+
+
+PackDriftStatus = Literal["unchanged", "changed", "source_missing"]
+
+
+@dataclass(frozen=True)
+class PackDrift:
+    """Per-pack drift verdict: the recorded provenance vs the CURRENT source. When
+    ``status == "changed"``, ``added`` / ``modified`` / ``removed`` name the source
+    relpaths that differ (what the reconcile acts on)."""
+
+    name: str
+    source: str
+    status: PackDriftStatus
+    recorded: PackProvenance
+    current_files: dict[str, str] | None  # None iff source_missing
+    added: tuple[str, ...] = ()
+    modified: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+
+    @property
+    def drifted(self) -> bool:
+        return self.status != "unchanged"
+
+
+def _diff_files(
+    recorded: Mapping[str, str], current: Mapping[str, str]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    added = tuple(sorted(k for k in current if k not in recorded))
+    removed = tuple(sorted(k for k in recorded if k not in current))
+    modified = tuple(sorted(k for k in current if k in recorded and current[k] != recorded[k]))
+    return added, modified, removed
+
+
+def compute_pack_drift(recorded: Sequence[PackProvenance]) -> list[PackDrift]:
+    """Re-hash each recorded pack's source and classify drift. A source dir that no
+    longer exists (or is empty) is ``source_missing`` (honesty floor — never a
+    silent "unchanged"); any file added/modified/removed is ``changed``; else
+    ``unchanged``."""
+    out: list[PackDrift] = []
+    for p in recorded:
+        current = hash_pack_source(Path(p.source))
+        if not current:
+            out.append(
+                PackDrift(name=p.name, source=p.source, status="source_missing",
+                          recorded=p, current_files=None)
+            )
+            continue
+        added, modified, removed = _diff_files(p.files, current)
+        status: PackDriftStatus = "changed" if (added or modified or removed) else "unchanged"
+        out.append(
+            PackDrift(name=p.name, source=p.source, status=status, recorded=p,
+                      current_files=current, added=added, modified=modified, removed=removed)
+        )
+    return out

@@ -49,6 +49,12 @@ class PackManifest:
     name: str
     order: int = 0
     render: tuple[str, ...] = field(default_factory=tuple)
+    # Optional human-readable version (semver, no enforced format). NOT used for
+    # composition; recorded into the install's pack provenance purely as sugar for
+    # the drift NOTICE ("v1.2 -> v1.3" reads nicer than "content changed"). Drift
+    # DETECTION is hash-based, so a pack needs no version for `levain update` to
+    # reconcile it.
+    version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +121,14 @@ def load_pack_manifest(pack_dir: Path) -> PackManifest:
         dupes = sorted({x for x in render_raw if render_raw.count(x) > 1})
         raise PackError(f"{manifest_path}: 'render' has duplicate entries: {dupes}")
 
-    return PackManifest(name=name, order=order, render=tuple(render_raw))
+    version = data.get("version")
+    if version is not None and not (isinstance(version, str) and version.strip()):
+        raise PackError(
+            f"{manifest_path}: 'version', if present, must be a non-empty string "
+            f"(got {version!r})"
+        )
+
+    return PackManifest(name=name, order=order, render=tuple(render_raw), version=version)
 
 
 def _scan_seed_layer(pack_dir: Path, manifest: PackManifest) -> dict[str, Path]:

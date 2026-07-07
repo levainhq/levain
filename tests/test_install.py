@@ -798,6 +798,42 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
     assert (install / ".mcp.json").is_file()
 
 
+def test_apply_init_persists_answers_json(tmp_path: Path, monkeypatch):
+    """init persists the interview answers to .levain/answers.json (gitignored) so a
+    later `levain update` can re-render a changed pack render-template with the same
+    answers — the render-slot reconcile root-cause fix. Written unconditionally
+    (best-effort), independent of store success."""
+    import json as _json
+
+    from levain.install import read_answers
+    from levain.interview import build_field_plan, parse_template
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Result())
+    install = tmp_path / "install"
+    install.mkdir()
+    with _templates_root() as templates_root:
+        spec_world = parse_template(templates_root / "seed" / "world.md")
+        spec_origin = parse_template(templates_root / "seed" / "origin.md")
+        answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan([spec_world, spec_origin])}
+        apply_init(
+            install, "claude-code", answers, templates_root,
+            "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
+            [SeedEntry(n, templates_root / "seed" / n, "verbatim")
+             for n in ("partnership.md", "memory.md", "spore_instructions.md",
+                       "continuity.md", "README.md")],
+        )
+    stored = _json.loads((install / ".levain" / "answers.json").read_text(encoding="utf-8"))
+    assert stored == answers
+    assert read_answers(install) == answers
+    # the operator's personal answers must be gitignored
+    assert "answers.json" in (install / ".levain" / ".gitignore").read_text(encoding="utf-8")
+
+
 def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
     """Store-init failure propagates as the return value (run_init maps it to a
     non-zero exit; the web POST will surface it as an error)."""

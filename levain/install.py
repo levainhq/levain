@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -286,6 +287,7 @@ def run_init(
                 render_specs,
                 verbatim,
                 activation_roots=activation_roots,
+                packs=list(zip(pack_manifests, pack_dirs)),
             )
         except InitError as e:
             # The write-half fails loud (a corrupt-wheel activation tree, an
@@ -336,6 +338,7 @@ def apply_init(
     verbatim: Sequence[SeedEntry],
     *,
     activation_roots: Sequence[Path] | None = None,
+    packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
 ) -> InitResult:
     """The shared WRITE-HALF of init: render each interview template from
@@ -443,14 +446,97 @@ def apply_init(
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
+    # Persist the interview answers (operator-private) so a later `levain update` can
+    # RE-RENDER a changed pack render-template with the SAME answers + a targeted
+    # re-prompt for only NEW slots, instead of losing them (the render-slot reconcile
+    # root-cause fix). Best-effort — never fails the install.
+    write_answers(install, answers, emit)
     store_ok = _init_store(store, anneal_path, emit=emit)
     if store_ok:
-        _record_compat_lock(install, store, anneal_path, emit=emit)
+        _record_compat_lock(install, store, anneal_path, packs=packs, emit=emit)
     return InitResult(install=install, adapter=chosen, store_ok=store_ok)
 
 
+def write_answers(
+    install: Path, answers: dict[str, str], emit: Callable[[str], None]
+) -> bool:
+    """Persist the interview answers to ``.levain/answers.json`` (operator-private,
+    gitignored) — the render-slot reconcile re-render input. Returns True iff it
+    persisted; the reconcile REQUIRES a True return before advancing provenance after
+    answering new slots (codex L3 #3 — else a failed write leaves the manifest advanced
+    while the only answer source lacks the new slot).
+
+    ATOMIC + concurrency-safe: a UNIQUE temp (``mkstemp``) + fsync + ``os.replace`` — a
+    torn write (Ctrl+C / ENOSPC) never leaves it truncated, and two concurrent
+    ``levain update`` runs can't clobber each other's temp (the fixed ``.json.tmp``
+    path raced — codex L3 #4). Mirrors ``manifest.write_lock``."""
+    levain_dir = install / ".levain"
+    levain_dir.mkdir(parents=True, exist_ok=True)
+    target = levain_dir / "answers.json"
+    payload = json.dumps(answers, indent=2, sort_keys=True) + "\n"
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix="answers.", suffix=".json.tmp", dir=str(levain_dir))
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        # Directory fsync so the rename itself is durable on power-loss — parity with
+        # write_lock, for equally-irreplaceable operator data (complement L3 #5).
+        try:
+            dfd = os.open(str(levain_dir), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+        _ensure_gitignored(levain_dir, "answers.json")
+        return True
+    except OSError as e:
+        emit(f"  note: could not persist interview answers ({e}); a future pack "
+             f"render-template change will need a re-onboard, not a targeted re-prompt.")
+        return False
+
+
+def _ensure_gitignored(levain_dir: Path, name: str) -> None:
+    """Ensure ``name`` is listed in ``.levain/.gitignore`` (the operator's private
+    answers must never be committed). Creates or appends; best-effort."""
+    gi = levain_dir / ".gitignore"
+    try:
+        existing = gi.read_text(encoding="utf-8").splitlines() if gi.is_file() else []
+        if name not in existing:
+            with open(gi, "a", encoding="utf-8") as fh:
+                if existing and existing[-1].strip():
+                    fh.write("\n")
+                fh.write(name + "\n")
+    except OSError:
+        pass
+
+
+def read_answers(install: Path) -> dict[str, str]:
+    """The persisted interview answers (``{}`` if absent/unreadable — the reconcile
+    then falls back to surfacing a render change for re-onboard, never blank-fill)."""
+    try:
+        data = json.loads((install / ".levain" / "answers.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
 def _record_compat_lock(
-    install: Path, store: Path, anneal_path: str, emit: Callable[[str], None] = print
+    install: Path,
+    store: Path,
+    anneal_path: str,
+    packs: Sequence[tuple[PackManifest, Path]] = (),
+    emit: Callable[[str], None] = print,
 ) -> None:
     """Record the composed known-good set to ``.levain/manifest.json`` (the drift
     baseline) AND ack a fresh install's migrate marker up to the version the seed
@@ -490,10 +576,26 @@ def _record_compat_lock(
         anneal=installed.anneal,
         schema=installed.schema,
     )
+    # Snapshot each composed pack's source provenance (per-file hashes) so a later
+    # `levain update` can detect PACK drift (the pulled source changed) and
+    # reconcile it — the compat-manifest pattern extended to the pack axis. Version
+    # is optional pack.toml sugar for the notice; detection is hash-based. The
+    # `rendered` map records each render seed's INSTALLED-file hash so the reconcile
+    # can tell an operator edit from a template change (a render file's install copy
+    # never equals its source template).
+    pack_provenance = [
+        manifest.pack_provenance(
+            mf.name, pack_dir, mf.version,
+            rendered=manifest.rendered_hashes(install, [f"seed/{n}" for n in mf.render]),
+            render=mf.render,
+        )
+        for mf, pack_dir in packs
+    ]
     try:
-        manifest.write_lock(install, composed)
+        manifest.write_lock(install, composed, packs=pack_provenance)
+        pack_note = f" + {len(pack_provenance)} pack(s)" if pack_provenance else ""
         emit(f"  Recorded the known-good set (anneal {composed.anneal} / "
-             f"schema {composed.schema}).")
+             f"schema {composed.schema}{pack_note}).")
     except OSError:
         pass
 

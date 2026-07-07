@@ -452,6 +452,13 @@ class _InitHandler(BaseHTTPRequestHandler):
                     else None
                 )
 
+                # The composed pack (manifest, dir) pairs — threaded to apply_init so
+                # init records each pack's source provenance into the lock (the
+                # pack-drift reconcile baseline). load_pack_manifest can't raise here
+                # (the roster compose above already validated it); a mid-request
+                # pack.toml corruption would surface as the pre-write PackError.
+                pack_pairs = [(load_pack_manifest(p), p) for p in pack_dirs]
+
                 # Capture the write-half's progress + remediation so it reaches the
                 # browser, not just the server console (messages is hoisted above).
                 # apply_init WRITES (seeds, adapter, store) and can raise InitError
@@ -473,6 +480,7 @@ class _InitHandler(BaseHTTPRequestHandler):
                         specs,
                         verbatim,
                         activation_roots=activation_roots,
+                        packs=pack_pairs,
                         emit=messages.append,
                     )
                 except InitError as exc:
