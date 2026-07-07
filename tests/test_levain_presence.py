@@ -25,13 +25,14 @@ from levain.firing import (
 # --- dependency isolation (the leaf invariant) --------------------------------------
 
 
-def test_presence_leaf_imports_without_openhands_or_vagus():
-    """A fresh interpreter importing only ``levain.firing`` must NOT pull OpenHands or vagus into
-    sys.modules — the dependency-isolated-leaf invariant (the OpenHands adapter is the sibling
-    ``levain.firing.openhands``, behind the extra). A runtime check, not a source grep."""
+def test_presence_leaf_imports_without_openhands_or_anneal():
+    """A fresh interpreter importing only ``levain.firing`` must NOT pull OpenHands OR anneal_memory
+    into sys.modules — the dependency-isolated-leaf invariant. The OpenHands adapter is the sibling
+    ``levain.firing.openhands`` (behind the extra); anneal is the lazy ``levain.firing.anneal`` leaf
+    (deferred to recall time). A runtime check, not a source grep."""
     code = (
         "import sys; import levain.firing; "
-        "leaked = sorted(m for m in sys.modules if m.split('.')[0] in {'openhands', 'vagus'}); "
+        "leaked = sorted(m for m in sys.modules if m.split('.')[0] in {'openhands', 'anneal_memory'}); "
         "assert not leaked, leaked"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
