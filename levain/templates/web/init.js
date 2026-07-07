@@ -28,6 +28,7 @@
   var statusEl = document.getElementById("status");
   var bannerEl = document.getElementById("target-banner");
   var targetEl = document.getElementById("target");
+  var packsNoteEl = document.getElementById("packs-note");
   var adaptersEl = document.getElementById("adapters");
   var sectionsEl = document.getElementById("sections");
   var submitBtn = document.getElementById("submit");
@@ -86,6 +87,14 @@
   // ---- target-dir banner ----
   function renderBanner(p) {
     targetEl.textContent = p.install;
+    // Composed pack layers (base excluded) — so the operator SEES the doctrine
+    // that will load, not just the base fields. Hidden when base-only.
+    if (Array.isArray(p.packs) && p.packs.length) {
+      packsNoteEl.textContent = "composing packs: " + p.packs.join(", ");
+      packsNoteEl.hidden = false;
+    } else {
+      packsNoteEl.hidden = true;
+    }
     var st = p.target_status;
     if (st === "nonempty" && !p.force) {
       bannerEl.className = "banner bad";
