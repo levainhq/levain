@@ -97,6 +97,12 @@ html, body {
   color: var(--ink-faint);
   margin: 4px 0 16px;
 }
+.packs-note {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+  margin: 4px 0 0;
+}
 
 /* ---- target banner ---- */
 .banner {

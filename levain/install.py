@@ -666,7 +666,9 @@ class InitError(Exception):
 
 
 @contextmanager
-def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[SeedEntry]]]:
+def open_init_templates(
+    pack_dirs: Sequence[Path] = (),
+) -> Iterator[tuple[Path, list[TemplateSpec], list[SeedEntry]]]:
     """Yield ``(templates_root, render_specs, verbatim)`` for an init run.
 
     The shared templates-context + corruption preflight + roster resolution, so a
@@ -674,11 +676,18 @@ def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[SeedE
     _templates_root()`` block, the missing-template check, and the roster
     discovery that ``run_init`` does inline. ``render_specs`` are the parsed
     interview templates; ``verbatim`` is the list of non-rendered seed ENTRIES
-    ``apply_init`` copies. The web onboarding path is base-only (no pack layers);
-    pack composition is a CLI capability. MUST be consumed inside the ``with``
-    (the materialized tempdir under a zipped distribution is cleaned up on exit,
-    and ``apply_init`` reads from ``templates_root``). Raises ``InitError`` (with
-    a ready-to-surface ``.message``) if the packaged templates are missing/corrupt.
+    ``apply_init`` copies.
+
+    ``pack_dirs`` (default empty = base-only) are pack-layer directories composed
+    ON TOP of the base templates (base = pack #0), the same ``compose_roster``
+    stack ``run_init`` builds — so the web onboarding surface composes packs
+    identically to the CLI (the ``--web --pack`` path), never a second composition
+    implementation. A ``PackError`` (missing/malformed manifest, render-lists a
+    missing file, non-.md asset) surfaces as ``InitError`` so the caller renders
+    it directly. MUST be consumed inside the ``with`` (the materialized tempdir
+    under a zipped distribution is cleaned up on exit, and ``apply_init`` reads
+    from ``templates_root``). Raises ``InitError`` (with a ready-to-surface
+    ``.message``) if the packaged templates are missing/corrupt.
     """
     from levain.interview import parse_template
 
@@ -690,7 +699,7 @@ def open_init_templates() -> Iterator[tuple[Path, list[TemplateSpec], list[SeedE
                 f"`pip install --force-reinstall levain`."
             )
         try:
-            roster = compose_roster([templates_root])
+            roster = compose_roster([templates_root, *pack_dirs])
         except PackError as e:
             raise InitError(str(e)) from e
         specs = [parse_template(entry.path) for entry in render_entries(roster)]

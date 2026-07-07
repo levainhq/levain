@@ -30,6 +30,7 @@ import json
 import shutil
 import sys
 import threading
+from collections.abc import Sequence
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +38,8 @@ from typing import Any
 
 from levain.install import (
     InitError,
+    _base_activation_root,
+    _copy_pack_docs,
     _is_safe_install_target,
     _manifest_rows,
     _next_steps_lines,
@@ -44,6 +47,7 @@ from levain.install import (
     open_init_templates,
 )
 from levain.interview import build_field_plan
+from levain.packs import PackError, load_pack_manifest, order_activation_roots
 from levain.web_server import (
     _CSP,
     _LOOPBACK_HOSTS,
@@ -107,6 +111,17 @@ class _InitServer(ThreadingHTTPServer):
     default_adapter: str | None
     python_path: str
     anneal_path: str
+    # Pack-layer dirs composed ON TOP of the base templates (base = pack #0),
+    # server-FIXED from the CLI flags exactly like install/force — a browser POST
+    # never supplies them, so a page can no more inject a pack than redirect the
+    # install target. Empty = base-only (the pre-`--web --pack` behavior). Validated
+    # composable once at server start (fail-clean before bind). Every per-request
+    # read (roster, activation, docs) re-reads pack.toml LIVE so they stay mutually
+    # consistent — the CLI's one-snapshot discipline reduces to a live read here
+    # since the request re-opens the templates context anyway. pack_names is the
+    # start-time manifest-name snapshot for the CLI banner + form "composing" readout.
+    pack_dirs: list[Path]
+    pack_names: list[str]
     assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
@@ -223,7 +238,7 @@ class _InitHandler(BaseHTTPRequestHandler):
         adapter choices, the FIXED install path + force flag, and the live
         target-dir status the form warns on. Pure read — parses the packaged
         templates; writes nothing."""
-        with open_init_templates() as (_templates_root, specs, _verbatim):
+        with open_init_templates(self.server.pack_dirs) as (_templates_root, specs, _verbatim):
             fields = build_field_plan(specs)
         payload = {
             "fields": [asdict(f) for f in fields],
@@ -232,6 +247,10 @@ class _InitHandler(BaseHTTPRequestHandler):
             "install": str(self.server.install),
             "force": self.server.force,
             "target_status": _target_status(self.server.install),
+            # The composed pack layers (manifest names, base excluded) — the form's
+            # "composing" readout so the operator SEES the doctrine that will load,
+            # not just the base fields. Empty = base-only onboarding.
+            "packs": list(self.server.pack_names),
         }
         return json.dumps(payload).encode("utf-8")
 
@@ -366,12 +385,15 @@ class _InitHandler(BaseHTTPRequestHandler):
             )
             return
 
+        pack_dirs = self.server.pack_dirs
         try:
-            with open_init_templates() as (templates_root, specs, verbatim):
+            with open_init_templates(pack_dirs) as (templates_root, specs, verbatim):
                 # Drive validation from the shared field plan: render_template
                 # silently renders a MISSING slot to "" and ignores an UNKNOWN one,
                 # so reject any answer key that isn't a real slot at the boundary
-                # (a stale/forged form, never a silent partial render).
+                # (a stale/forged form, never a silent partial render). With packs
+                # composed, `specs` now includes any pack render override (e.g. a
+                # role pack's world.md), so its slots are accepted here too.
                 valid_slots = {f.slot for f in build_field_plan(specs)}
                 unknown = sorted(k for k in answers if k not in valid_slots)
                 if unknown:
@@ -383,7 +405,10 @@ class _InitHandler(BaseHTTPRequestHandler):
 
                 install = self.server.install
                 # Fail-closed safe-target gate at the WRITE boundary (the form's
-                # target_status is only a hint — re-check here authoritatively).
+                # target_status is only a hint — re-check here authoritatively). The
+                # dir gate is the more fundamental precondition, so it runs BEFORE the
+                # form-completeness gate below — matching the CLI, which checks the
+                # install target before the interview even starts.
                 if not _is_safe_install_target(install) and not self.server.force:
                     self._send_json(
                         {"error": "not_empty",
@@ -391,32 +416,137 @@ class _InitHandler(BaseHTTPRequestHandler):
                         409,
                     )
                     return
+
+                # The form POSTs EVERY current slot (blank as "" — collectAnswers
+                # iterates all field controls), so a slot that is valid-but-ABSENT
+                # means a STALE/forged form: the pack set gained a render slot since
+                # the page loaded. render_template would silently fill it "" — the
+                # 0.3.7 phantom-slot desync class (the entity never learns it while
+                # `doctor` stays green) — so reject loud and tell the operator to
+                # reload (codex + complement L3). Blank values stay valid; only a
+                # MISSING key fails, so skipping a field on the form is unaffected.
+                stale = sorted(valid_slots - set(answers))
+                if stale:
+                    self._send_json(
+                        {"error": "stale_form",
+                         "message": (f"the form is missing current field(s): {stale} — "
+                                     f"reload the page (its fields changed since it loaded)")},
+                        400,
+                    )
+                    return
                 install.mkdir(parents=True, exist_ok=True)
+
+                # Resolve the activation-tree layer stack from the SAME pack set as
+                # the seed roster (the peer of compose_roster). None = base-only —
+                # the pre-pack behavior, byte-identical — so no-pack installs are
+                # unchanged; with packs, a pack's activation/posture.md overrides
+                # base exactly as its seed/world.md does (Slice 4 parity with the
+                # CLI --pack path).
+                activation_roots = (
+                    order_activation_roots(
+                        templates_root,
+                        _base_activation_root(chosen, templates_root),
+                        pack_dirs,
+                    )
+                    if pack_dirs
+                    else None
+                )
 
                 # Capture the write-half's progress + remediation so it reaches the
                 # browser, not just the server console (messages is hoisted above).
-                result = apply_init(
-                    install,
-                    chosen,
-                    answers,
-                    templates_root,
-                    self.server.python_path,
-                    self.server.anneal_path,
-                    specs,
-                    verbatim,
-                    emit=messages.append,
-                )
+                # apply_init WRITES (seeds, adapter, store) and can raise InitError
+                # AFTER some of those writes (base-seed guard, adapter install, an
+                # activation layer-conflict, a non-preservable operator edit) — so its
+                # failure is a PARTIAL install (files on disk, no rollback; codex also
+                # touches global ~/.codex). Report it as partial + the captured
+                # progress, NOT the clean "templates" shape a pre-write compose fault
+                # uses (L1 #4 / L2 Point 4: the old handler mislabeled a half-written
+                # install as a wheel-corruption "templates" error with no progress).
+                try:
+                    result = apply_init(
+                        install,
+                        chosen,
+                        answers,
+                        templates_root,
+                        self.server.python_path,
+                        self.server.anneal_path,
+                        specs,
+                        verbatim,
+                        activation_roots=activation_roots,
+                        emit=messages.append,
+                    )
+                except InitError as exc:
+                    self._send_json(
+                        {"error": "install_failed", "message": exc.message,
+                         "partial": True, "messages": messages}, 500
+                    )
+                    return
+
+                # Refresh the persisted pack docs so `levain docs` renders a
+                # SELF-CONTAINED composed view — ALWAYS (even base-only), so a
+                # --force reinstall that DROPS a pack CLEARS that pack's stale
+                # (possibly company-private) chapters rather than serving them
+                # forever (the IP-boundary class run_init guards, complement L3
+                # CRITICAL). Manifests are re-read LIVE here (consistent with the
+                # roster/activation read live above — no stale start-time snapshot,
+                # L1 #2 / L2 Point 3); a re-read can raise PackError if a pack.toml
+                # changed since the compose ms ago, so catch it too. A copy failure
+                # is non-fatal — the manual is a read surface, not install-critical —
+                # so it warns into the log and the install still reports success.
+                try:
+                    copied_docs = _copy_pack_docs(
+                        install, [(load_pack_manifest(p), p) for p in pack_dirs]
+                    )
+                except (OSError, InitError, PackError) as doc_exc:
+                    # HONEST message (complement L3): a failed refresh may have cleared
+                    # only PART of a prior pack's chapters, so do NOT claim "base only"
+                    # — any prior (possibly proprietary) chapters MAY remain. Tell the
+                    # operator to verify. Non-fatal: the install itself still succeeded.
+                    messages.append(
+                        f"note: could not refresh pack docs ({doc_exc}) — any prior "
+                        f"pack chapters may remain; verify with `levain docs`."
+                    )
+                    copied_docs = []
+                if copied_docs:
+                    messages.append(
+                        f"docs: {len(copied_docs)} pack chapter(s) → .levain/docs/ "
+                        f"(compose with `levain docs`)"
+                    )
+
+                # The install SUCCEEDED (apply_init returned). Shaping the response
+                # manifest does post-success filesystem I/O (_manifest_rows globs the
+                # seed/activation trees), so a fault HERE must not flip a good install
+                # to "failed" via the generic outer handler — the same misreport class
+                # the docs step guards, one function later (complement L3 MED). Degrade
+                # the manifest, keep ok/partial sourced from result.store_ok.
                 store = install / ".levain" / "memory.db"
-                rows = _manifest_rows(install, chosen, store, result.store_ok)
-                next_steps = _next_steps_lines(install, chosen, result.store_ok)
+                try:
+                    rows = _manifest_rows(install, chosen, store, result.store_ok)
+                    next_steps = _next_steps_lines(install, chosen, result.store_ok)
+                except OSError as shape_exc:
+                    messages.append(
+                        f"note: install complete, but could not build the file "
+                        f"manifest ({shape_exc})."
+                    )
+                    rows = []
+                    next_steps = []
         except InitError as exc:
+            # PRE-write compose fault: open_init_templates raised at the `with` entry
+            # (corrupt/missing base templates, or a pack that no longer composes) —
+            # nothing landed on disk, so a clean "templates" 500 with no partial.
             self._send_json({"error": "templates", "message": exc.message}, 500)
             return
+        except PackError as exc:
+            # PRE-write pack/activation resolution fault (order_activation_roots: a
+            # corrupt-wheel missing base activation tree, or a pack.toml changed
+            # mid-session). Fires BEFORE apply_init writes → clean 500, no spurious
+            # partial (L1 #3: the pack branch previously fell through to the generic
+            # handler and mislabeled this pre-write fault as partial:True).
+            self._send_json({"error": "pack", "message": str(exc)}, 500)
+            return
         except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
-            # A mid-install fault: files may already be on disk (no rollback; codex
-            # installs touch global ~/.codex). Report it as a partial install, and
-            # INCLUDE the captured progress so the operator can see how far it got
-            # (the renderError surface shows messages) — L1 review.
+            # An unexpected pre-apply_init fault (apply_init's own partial state is
+            # reported by its inner handler above). Surface progress conservatively.
             self._send_json(
                 {"error": "install_failed",
                  "message": f"{type(exc).__name__}: {exc}",
@@ -454,6 +584,7 @@ def make_init_server(
     *,
     adapter: str | None = None,
     force: bool = False,
+    packs: Sequence[Path] = (),
     host: str = DEFAULT_INIT_HOST,
     port: int = DEFAULT_INIT_PORT,
 ) -> _InitServer:
@@ -462,10 +593,15 @@ def make_init_server(
     LOOPBACK-ONLY: a non-loopback ``host`` is refused before binding — onboarding
     writes operator-private seed/config (and mutates global ~/.codex for codex),
     so it must never be reachable off the machine. The install ``path`` + ``force``
-    are fixed HERE (from the CLI), not from any browser request. Raises
-    ``ValueError`` on a non-loopback host; ``OSError`` if the bind fails. Separated
-    from ``run_init_web`` so tests can drive a real bound server without the
-    print/browser/serve_forever wrapper."""
+    + ``packs`` are fixed HERE (from the CLI), not from any browser request — a
+    page can no more inject a pack than redirect the install target. ``packs`` are
+    pack-layer dirs composed on top of the base templates (the ``--web --pack``
+    path); an empty default is base-only onboarding. Raises ``ValueError`` on a
+    non-loopback host, an unknown adapter, or a pack set that does not compose
+    (validated BEFORE the bind, so a bad pack fails clean with no dangling port —
+    the same fail-before-interview discipline ``run_init`` uses); ``OSError`` if
+    the bind fails. Separated from ``run_init_web`` so tests can drive a real
+    bound server without the print/browser/serve_forever wrapper."""
     if not _is_loopback_host(host):
         raise ValueError(
             f"refusing to bind {host!r}: `levain init --web` is loopback-only "
@@ -475,11 +611,34 @@ def make_init_server(
     if adapter is not None and adapter not in _ADAPTERS:
         raise ValueError(f"unknown adapter {adapter!r}: must be one of {list(_ADAPTERS)}")
 
+    # Resolve + validate the pack set BEFORE binding. `--path` expansion semantics
+    # (argparse does not expand `~`), then a full compose (manifests + seed rosters
+    # + render-file presence) so a malformed pack fails clean here rather than 500-ing
+    # the first request. The manifest-name snapshot (for the form's readout) cannot
+    # raise once the compose succeeded — the manifests were just validated.
+    resolved_packs = [Path(str(p)).expanduser().resolve() for p in packs]
+    pack_names: list[str] = []
+    if resolved_packs:
+        try:
+            with open_init_templates(resolved_packs):
+                pass
+            # Read the names INSIDE the try: a TOCTOU pack.toml removal/edit between
+            # the compose-validate above and this read must still surface as the
+            # documented clean pre-bind ValueError, never an escaping PackError
+            # traceback (codex L3 LOW). Used only for the start-time readout; the
+            # per-install docs-copy re-reads live so it stays consistent with the
+            # live roster (never a stale snapshot).
+            pack_names = [load_pack_manifest(p).name for p in resolved_packs]
+        except (InitError, PackError) as exc:
+            raise ValueError(f"pack composition failed: {exc}") from exc
+
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _InitServer((host, port), _InitHandler)
     httpd.install = install
     httpd.force = force
     httpd.default_adapter = adapter
+    httpd.pack_dirs = resolved_packs
+    httpd.pack_names = pack_names
     httpd.python_path = sys.executable
     httpd.anneal_path = shutil.which("anneal-memory") or "anneal-memory"
     httpd.assets = assets
@@ -506,15 +665,22 @@ def run_init_web(
     *,
     adapter: str | None = None,
     force: bool = False,
+    packs: Sequence[Path] | None = None,
     host: str = DEFAULT_INIT_HOST,
     port: int = DEFAULT_INIT_PORT,
     open_browser: bool = True,
 ) -> int:
     """``levain init --web`` entry point — serve the onboarding form on localhost.
 
-    Returns nonzero only if the bind fails or the host is refused; the install
-    itself happens per-POST and reports inline. Blocks in ``serve_forever`` until
-    interrupted (Ctrl+C → clean exit 0)."""
+    ``packs`` (from CLI ``--pack``, repeatable) are pack-layer dirs composed on
+    top of the base templates — the ``--web --pack`` path, so the browser
+    interview + pack composition run in ONE flow (the CLI ``--pack`` interview
+    with a browser form). Validated composable before the bind; a bad pack returns
+    nonzero here rather than 500-ing a request.
+
+    Returns nonzero only if the bind fails, the host is refused, or the pack set
+    does not compose; the install itself happens per-POST and reports inline.
+    Blocks in ``serve_forever`` until interrupted (Ctrl+C → clean exit 0)."""
     install = Path(str(path)).expanduser().resolve()
     if install.exists() and not install.is_dir():
         print(
@@ -525,7 +691,9 @@ def run_init_web(
         return 1
 
     try:
-        httpd = make_init_server(install, adapter=adapter, force=force, host=host, port=port)
+        httpd = make_init_server(
+            install, adapter=adapter, force=force, packs=packs or (), host=host, port=port
+        )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -551,6 +719,8 @@ def run_init_web(
     url = f"http://{host_for_url}:{bound_port}/"
     print(f"Levain init → {url}")
     print(f"  install target: {install}{'  (--force)' if force else ''}")
+    if httpd.pack_names:
+        print(f"  composing packs: {', '.join(httpd.pack_names)}")
     print("  loopback-only · governed · Ctrl+C to stop")
 
     if open_browser:

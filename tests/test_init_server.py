@@ -24,6 +24,7 @@ import pytest
 
 import levain.install as install_mod
 from levain.init_server import DEFAULT_INIT_PORT, make_init_server, run_init_web
+from levain.packs import PackError
 
 
 class _OK:
@@ -39,11 +40,11 @@ class _Fail:
 
 
 @contextmanager
-def _serving(install: Path, *, adapter=None, force=False, result=_OK):
+def _serving(install: Path, *, adapter=None, force=False, packs=(), result=_OK):
     """A real init server on an ephemeral loopback port, with the anneal store
     subprocess mocked to ``result``. Yields ``(base_url, port)``."""
     with mock.patch.object(install_mod.subprocess, "run", lambda *a, **k: result()):
-        httpd = make_init_server(install, adapter=adapter, force=force, port=0)
+        httpd = make_init_server(install, adapter=adapter, force=force, packs=packs, port=0)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         host, port = httpd.server_address[0], httpd.server_address[1]
@@ -78,6 +79,38 @@ def _post(url: str, payload, *, headers: dict | None = None, content_type="appli
 
 def _all_answers(plan: dict) -> dict[str, str]:
     return {f["slot"]: f"VAL_{f['slot']}" for f in plan["fields"]}
+
+
+def _write_pack(
+    root: Path,
+    *,
+    name: str,
+    order: int = 10,
+    render: list[str] | None = None,
+    seed_files: dict[str, str],
+    activation_files: dict[str, str] | None = None,
+    docs_files: dict[str, str] | None = None,
+) -> Path:
+    """Write a minimal pack-layer (pack.toml + seed/ [+ activation/] [+ docs/]) at
+    ``root``. Mirrors the pack convention the CLI --pack path consumes, so the web
+    onboarding server composes a REAL pack, not a stub."""
+    render_line = f"render = {render!r}\n" if render else ""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pack.toml").write_text(
+        f'name = "{name}"\norder = {order}\n{render_line}', encoding="utf-8"
+    )
+    seed = root / "seed"
+    seed.mkdir(parents=True, exist_ok=True)
+    for fname, content in seed_files.items():
+        (seed / fname).write_text(content, encoding="utf-8")
+    for subdir, files in (("activation", activation_files), ("docs", docs_files)):
+        if not files:
+            continue
+        for fname, content in files.items():
+            dest = root / subdir / fname
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+    return root
 
 
 # --------------------------------------------------------------------------
@@ -207,11 +240,12 @@ class TestSecurity:
         # same-origin is the one allowed Sec-Fetch-Site value — it must pass the CSRF gate
         # (reaching validation), not be refused like cross-site.
         with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
             status, _body = _post(
-                base + "/init", {"adapter": "claude-code", "answers": {}},
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)},
                 headers={"Sec-Fetch-Site": "same-origin"},
             )
-            assert status == 200  # empty install dir → install runs
+            assert status == 200  # empty install dir + complete answers → install runs
 
     def test_post_bad_host_rejected(self, tmp_path: Path) -> None:
         with _serving(tmp_path / "i") as (base, _port):
@@ -296,7 +330,10 @@ class TestValidation:
         d.mkdir()
         (d / "x").write_text("y", encoding="utf-8")
         with _serving(d, force=True) as (base, _port):
-            status, body = _post(base + "/init", {"adapter": "claude-code", "answers": {}})
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+            )
             assert status == 200
 
 
@@ -486,3 +523,233 @@ class TestApparatusFixes:
             # first_in_section marks exactly the start of each run
             firsts = [f["section_index"] for f in plan["fields"] if f["first_in_section"]]
             assert firsts == runs
+
+
+class TestPackCompose:
+    """`levain init --web --pack …` — the browser interview composes packs, the
+    parity path to the CLI `--pack` interview (the gap Chris's install surfaced)."""
+
+    def test_bad_pack_rejected_at_server_start(self, tmp_path: Path) -> None:
+        # A pack that does not compose (no pack.toml) is refused BEFORE the bind —
+        # ValueError, no dangling port, no 500 on the first request.
+        with pytest.raises(ValueError, match="pack composition failed"):
+            make_init_server(tmp_path / "i", packs=[tmp_path / "no-such-pack"], port=0)
+
+    def test_base_only_plan_has_empty_packs(self, tmp_path: Path) -> None:
+        # No --pack → the readout list is empty (base-only onboarding, unchanged).
+        with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+        assert plan["packs"] == []
+
+    def test_plan_composes_pack_render_field_and_names(self, tmp_path: Path) -> None:
+        # A pack that ADDS a render file surfaces its slot in the form's field plan,
+        # and the pack's manifest name reaches the "composing" readout.
+        pack = _write_pack(
+            tmp_path / "pdomain",
+            name="pdomain",
+            render=["role.md"],
+            seed_files={
+                "role.md": "# Role\n\nFocus: {{ROLE_FOCUS}}\n",
+                "domain.md": "# Domain\n\nHosting + audit doctrine.\n",
+            },
+        )
+        with _serving(tmp_path / "i", packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+        assert plan["packs"] == ["pdomain"]
+        assert any(f["slot"] == "ROLE_FOCUS" for f in plan["fields"])
+
+    def test_install_composes_pack_seed_and_import(self, tmp_path: Path) -> None:
+        # The write-half composes the pack: its verbatim seed lands byte-exact, its
+        # render file renders from the browser answers, and BOTH load into the
+        # adapter @import block (Slice-3) — i.e. the doctrine actually loads, the
+        # STOP-TIME-BAR observable, not just files-on-disk.
+        pack = _write_pack(
+            tmp_path / "pdomain",
+            name="pdomain",
+            render=["role.md"],
+            seed_files={
+                "role.md": "# Role\n\nFocus: {{ROLE_FOCUS}}\n",
+                "domain.md": "# Domain\n\nHosting + audit doctrine.\n",
+            },
+        )
+        install = tmp_path / "newentity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+            )
+        assert status == 200
+        assert body["ok"] is True
+        # verbatim pack seed composed byte-exact
+        assert (install / "seed" / "domain.md").read_text(encoding="utf-8") == (
+            "# Domain\n\nHosting + audit doctrine.\n"
+        )
+        # pack render file rendered from the browser answers
+        role = (install / "seed" / "role.md").read_text(encoding="utf-8")
+        assert "{{" not in role
+        assert "VAL_ROLE_FOCUS" in role
+        # both pack seeds LOAD (the adapter @import block references them)
+        claude_md = (install / "CLAUDE.md").read_text(encoding="utf-8")
+        assert "seed/domain.md" in claude_md
+        assert "seed/role.md" in claude_md
+
+    def test_install_composes_pack_activation_override(self, tmp_path: Path) -> None:
+        # A pack's activation/posture.md overrides base through the web path too —
+        # proving activation_roots is threaded (Slice-4 parity with the CLI).
+        pack = _write_pack(
+            tmp_path / "pact",
+            name="pact",
+            seed_files={"extra.md": "# Extra\n\ndoctrine\n"},
+            activation_files={"posture.md": "PACK POSTURE OVERRIDE\n"},
+        )
+        install = tmp_path / "newentity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+            )
+        assert status == 200
+        assert body["ok"] is True
+        posture = (install / "activation" / "posture.md").read_text(encoding="utf-8")
+        assert "PACK POSTURE OVERRIDE" in posture
+
+    def test_install_composes_pack_docs(self, tmp_path: Path) -> None:
+        # A pack shipping docs/*.md composes them into .levain/docs/ so `levain docs`
+        # renders a self-contained composed manual (the web path calls _copy_pack_docs
+        # like the CLI). L1 #1: this integration was untested.
+        pack = _write_pack(
+            tmp_path / "pdocs",
+            name="pdocs",
+            seed_files={"extra.md": "# Extra\n\ndoctrine\n"},
+            docs_files={"chapter.md": "# Pack Chapter\n\nthe operator manual chapter\n"},
+        )
+        install = tmp_path / "newentity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+            )
+        assert status == 200 and body["ok"] is True
+        docs_root = install / ".levain" / "docs"
+        assert any(p.name == "chapter.md" for p in docs_root.rglob("*.md"))
+        assert any("pack chapter" in m for m in body["messages"])
+
+    def test_docs_copy_failure_is_nonfatal(self, tmp_path: Path) -> None:
+        # A docs-copy failure AFTER a successful install must NOT report the install as
+        # failed — the manual is a read surface. ok:true, partial:false, note in the log
+        # (L1 #1: the riskiest seam, previously unexercised).
+        pack = _write_pack(
+            tmp_path / "pdocs",
+            name="pdocs",
+            seed_files={"extra.md": "# Extra\n\ndoctrine\n"},
+            docs_files={"chapter.md": "# Ch\n\nx\n"},
+        )
+        install = tmp_path / "newentity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            with mock.patch(
+                "levain.init_server._copy_pack_docs", side_effect=OSError("disk full")
+            ):
+                status, body = _post(
+                    base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+                )
+        assert status == 200
+        assert body["ok"] is True
+        assert body["partial"] is False
+        assert any("could not refresh pack docs" in m for m in body["messages"])
+        assert (install / "CLAUDE.md").is_file()  # the install itself really landed
+
+    def test_force_reinstall_dropping_pack_clears_stale_docs(self, tmp_path: Path) -> None:
+        # The IP-boundary guard: a --force reinstall that DROPS a pack must CLEAR that
+        # pack's stale (possibly company-private) chapters — _copy_pack_docs runs even
+        # base-only. (complement L3 CRITICAL on the CLI path; verify the web path too.)
+        pack = _write_pack(
+            tmp_path / "pdocs",
+            name="pdocs",
+            seed_files={"extra.md": "# Extra\n\ndoctrine\n"},
+            docs_files={"chapter.md": "# Ch\n\nx\n"},
+        )
+        install = tmp_path / "entity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            _post(base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+        assert (install / ".levain" / "docs").exists()  # pack chapters landed
+        # Re-onboard base-only with --force → the dropped pack's docs are cleared.
+        with _serving(install, force=True) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+            )
+        assert status == 200 and body["ok"] is True
+        assert not (install / ".levain" / "docs").exists()
+
+    def test_packs_body_key_is_rejected(self, tmp_path: Path) -> None:
+        # The browser can no more inject a pack than redirect the install target: a
+        # `packs` key in the POST body is refused at the unknown-top-level-key boundary,
+        # and nothing composes it (L1 #5 / L2 point 1 — make the invariant explicit).
+        pack = _write_pack(
+            tmp_path / "evil",
+            name="evil",
+            seed_files={"evil.md": "# Evil\n\ninjected doctrine\n"},
+        )
+        install = tmp_path / "entity"
+        with _serving(install) as (base, _port):  # server started base-only
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(base + "/init", {
+                "adapter": "claude-code",
+                "answers": _all_answers(plan),
+                "packs": [str(pack)],
+            })
+        assert status == 400
+        assert body["error"] == "unknown_field"
+        assert not (install / "seed" / "evil.md").exists()
+
+    def test_missing_slot_rejected_as_stale_form(self, tmp_path: Path) -> None:
+        # The form POSTs every current slot (blank as ""); a valid-but-ABSENT slot
+        # means a stale/forged form whose field set predates a pack's render slot.
+        # Reject 400 rather than silently render it "" — the 0.3.7 phantom-slot
+        # desync class (entity never learns it, doctor stays green). codex L3 HIGH.
+        pack = _write_pack(
+            tmp_path / "prole",
+            name="prole",
+            render=["role.md"],
+            seed_files={"role.md": "# Role\n\nFocus: {{ROLE_FOCUS}}\n"},
+        )
+        install = tmp_path / "entity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            answers = _all_answers(plan)
+            answers.pop("ROLE_FOCUS")  # a stale form that predates the pack's slot
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": answers}
+            )
+        assert status == 400
+        assert body["error"] == "stale_form"
+        assert "ROLE_FOCUS" in body["message"]
+        assert not (install / "seed" / "role.md").exists()  # nothing rendered
+
+    def test_post_time_pack_error_reports_clean_pack_500(self, tmp_path: Path) -> None:
+        # order_activation_roots raising PackError mid-POST (e.g. a pack's activation
+        # tree vanishing after bind) is a PRE-write fault → a clean 500 error:"pack"
+        # with NO spurious partial flag (the L1 #3 branch; complement L3 flagged it
+        # as untested — the bind-time path was covered but not the POST-time one).
+        pack = _write_pack(
+            tmp_path / "pact2",
+            name="pact2",
+            seed_files={"extra.md": "# Extra\n\nx\n"},
+            activation_files={"posture.md": "override\n"},
+        )
+        install = tmp_path / "entity"
+        with _serving(install, packs=[pack]) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            with mock.patch(
+                "levain.init_server.order_activation_roots",
+                side_effect=PackError("activation tree vanished"),
+            ):
+                status, body = _post(
+                    base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)}
+                )
+        assert status == 500
+        assert body["error"] == "pack"
+        assert "partial" not in body  # pre-write fault → no partial leak
+        assert not (install / "CLAUDE.md").exists()  # nothing written

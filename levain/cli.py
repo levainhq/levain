@@ -76,7 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Pack-layer directory (pack.toml + seed/) to compose ON TOP of the "
             "base templates. Repeatable; higher pack `order` wins on a filename "
-            "collision. CLI-only (the --web onboarding installs base templates only)."
+            "collision. Works with --web (the browser interview composes the pack "
+            "too) and the terminal interview alike."
         ),
     )
     init_p.add_argument(
@@ -483,12 +484,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    if args.web and args.pack:
-        print(
-            "FAIL: --pack is not supported with --web. Web onboarding installs the "
-            "base templates only; use the terminal interview (drop --web) for pack layers."
-        )
-        return 1
     if args.web:
         from levain.init_server import run_init_web
 
@@ -496,6 +491,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
             path=args.path,
             adapter=args.adapter,
             force=args.force,
+            packs=args.pack,
             host=args.host,
             port=args.port,
             open_browser=not args.no_open,
