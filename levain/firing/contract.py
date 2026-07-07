@@ -141,7 +141,13 @@ def register_firing(kind: str, factory: Callable[[], FiringContract]) -> None:
 # import: a crafted/typo kind ("__init__", "anneal.extra", an arbitrary submodule) can never
 # trigger an import of an unintended module — it just falls through to the clean "unknown kind"
 # error. Each optional leaf self-registers on import (apparatus L3 codex LOW: governed > clever).
-_LAZY_FIRING_MODULES: dict[str, str] = {"anneal": "levain.firing.anneal"}
+_LAZY_FIRING_MODULES: dict[str, str] = {
+    "anneal": "levain.firing.anneal",
+    # The ISOLATED entity firing lives in the SAME leaf module (both self-register on its import),
+    # so an isolated entity reconstructed cold via fork/reload lazily imports the anneal leaf and
+    # finds ``anneal_entity`` registered. (levain.firing.isolation — the sovereignty guard.)
+    "anneal_entity": "levain.firing.anneal",
+}
 
 
 def build_firing(kind: str) -> FiringContract:
