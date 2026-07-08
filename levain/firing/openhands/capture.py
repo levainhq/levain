@@ -30,7 +30,21 @@ from __future__ import annotations
 
 from openhands.sdk import MessageEvent
 
+from levain.firing.agent_reply import (
+    finish_message,
+    is_corrective_nudge,
+    message_event_text,
+)
 from levain.firing.contract import CaptureRequest, FiringContract, build_firing
+
+# The agent's FINAL answer to a no-tool (conversational) turn does NOT arrive as a
+# MessageEvent — the SDK routes it through the built-in ``finish`` tool as an
+# ``ActionEvent(FinishAction)`` carrying ``.message`` (verified 2026-07-08, minimax-m3 on
+# OpenHands 1.26). Capturing only MessageEvents would drop the reply on the COMMON
+# conversational shape — a silent memory no-op for a `levain run` entity. The extraction
+# (``finish_message`` — real tool actions stay excluded) + the synthetic-nudge guard
+# (``is_corrective_nudge``) live in ``levain.firing.agent_reply``, shared with the REPL's
+# display extractor so capture and screen never diverge.
 
 # Roles whose text forms the raw captured turn. We deliberately EXCLUDE ``system`` (the vagus
 # firing inject is a system-role MessageEvent — capturing our own injected recall would be a
@@ -40,6 +54,9 @@ from levain.firing.contract import CaptureRequest, FiringContract, build_firing
 # mis-key the boundary onto hook feedback. ``source == "user"`` is the genuine human turn; a real
 # agent response is ``source == "agent"``. Everything else (environment / system / the vagus
 # inject, which is source="environment") is excluded from both the boundary and the render.
+# The ONE ``source == "user"`` event that is NOT a genuine human turn is the SDK's corrective
+# nudge (``is_corrective_nudge``) — excluded from the boundary + the render, or a weak-model
+# turn would capture the nudge as the human question and drop the real one.
 _GENUINE_SOURCES = ("user", "agent")
 
 # The idempotency marker lives in the persisted ``conversation.state.agent_state`` dict — NOT an
@@ -53,7 +70,11 @@ def _turn_marker(events) -> str | None:
     message. Two ``vagus_run`` calls with no intervening user turn see the same marker, so the
     second is a no-op (the duplicate-capture guard). ``None`` when there is no genuine user turn."""
     for e in reversed(list(events)):
-        if isinstance(e, MessageEvent) and getattr(e, "source", None) == "user":
+        if (
+            isinstance(e, MessageEvent)
+            and getattr(e, "source", None) == "user"
+            and not is_corrective_nudge(e)  # the SDK nudge is not a genuine turn start
+        ):
             return getattr(e, "id", None)
     return None
 
@@ -68,11 +89,16 @@ def render_turn(events) -> str | None:
     not a full event-by-event transcript (a deliberate signal/noise choice for episodic memory).
     """
     evs = list(events)
-    # Find the last GENUINE user message (source == "user") — the start of the latest turn.
+    # Find the last GENUINE user message (source == "user", NOT the SDK's corrective nudge)
+    # — the start of the latest turn.
     last_user = None
     for i in range(len(evs) - 1, -1, -1):
         e = evs[i]
-        if isinstance(e, MessageEvent) and getattr(e, "source", None) == "user":
+        if (
+            isinstance(e, MessageEvent)
+            and getattr(e, "source", None) == "user"
+            and not is_corrective_nudge(e)
+        ):
             last_user = i
             break
     if last_user is None:
@@ -80,15 +106,23 @@ def render_turn(events) -> str | None:
 
     lines: list[str] = []
     for e in evs[last_user:]:
-        if not isinstance(e, MessageEvent) or getattr(e, "source", None) not in _GENUINE_SOURCES:
+        if getattr(e, "source", None) not in _GENUINE_SOURCES:
             continue  # excludes environment/system/vagus-injected synthetic messages
-        msg = e.llm_message
-        role = getattr(msg, "role", None)
-        text = " ".join(
-            c.text for c in (getattr(msg, "content", None) or []) if getattr(c, "text", None)
-        ).strip()
-        if text:
-            lines.append(f"[{role}] {text}")
+        if is_corrective_nudge(e):
+            continue  # the SDK nudge is synthetic — never render it as a [user] line
+        if isinstance(e, MessageEvent):
+            role = getattr(e.llm_message, "role", None)
+            text = message_event_text(e)
+            if text:
+                lines.append(f"[{role}] {text}")
+            continue
+        # Not a MessageEvent: the agent's final answer via the built-in `finish` tool
+        # (an ActionEvent(FinishAction)) IS assistant text; real tool actions render None.
+        # Dedup a finish message that merely echoes the assistant's prior MessageEvent text
+        # (some models emit both) so the episode isn't doubled.
+        finish = finish_message(e)
+        if finish and f"[assistant] {finish}" not in lines:
+            lines.append(f"[assistant] {finish}")
 
     # A capturable turn needs the agent to have RESPONDED — a lone user message (no assistant
     # reply yet) is mid-turn, not a completed turn. Capturing it would write a noise episode.

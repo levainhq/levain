@@ -29,6 +29,7 @@ from levain.firing.isolation import (
     LEVAIN_ENTITY_DIR_ENV,
     IsolationError,
     assert_entity_isolated,
+    assert_workspace_isolated,
     entity_store_paths,
     flow_store_dir,
     resolve_entity_dir,
@@ -61,6 +62,37 @@ def _fake_pattern(name: str) -> RelevantPattern:
         score=5.0,
         source="keyword",
     )
+
+
+# --- assert_workspace_isolated (the FILE-authority fence for `levain run`) ------------
+
+
+def test_workspace_in_tree_passes(tmp_path: Path):
+    entity = _entity(tmp_path)
+    # The normal case: <entity>/workspace, not yet created — resolves in-tree, passes.
+    assert_workspace_isolated(entity / "workspace", entity_dir=entity)
+
+
+def test_workspace_symlink_escape_to_home_refused(tmp_path: Path):
+    entity = _entity(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ws = entity / "workspace"
+    ws.symlink_to(outside)  # a workspace symlink escaping the entity tree
+    with pytest.raises(IsolationError):
+        assert_workspace_isolated(ws, entity_dir=entity)
+
+
+def test_workspace_symlink_into_flow_store_refused(tmp_path: Path, monkeypatch):
+    # Repoint the flow store under tmp so we can build a symlink into it without touching $HOME.
+    fake_home = tmp_path / "home"
+    (fake_home / ".anneal-memory").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    entity = _entity(tmp_path)
+    ws = entity / "workspace"
+    ws.symlink_to(fake_home / ".anneal-memory")
+    with pytest.raises(IsolationError):
+        assert_workspace_isolated(ws, entity_dir=entity)
 
 
 # --- the pure guard: derivation -----------------------------------------------------

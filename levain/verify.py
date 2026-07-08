@@ -84,6 +84,19 @@ def run_verify_hooks(path: Path) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain verify-hooks — testing {install}\n")
 
+    # A clean hookless entity (openhands) has no activation hooks — verifying them is N/A,
+    # not a FAIL. Use the SHARED `effective_adapter` classifier (the same one doctor + run
+    # use, so all three agree) where hosted files dominate a possibly-stale marker: an
+    # openhands marker sitting on top of a stray hook tree from a `--force` adapter switch is
+    # NOT a clean hookless entity, so it falls through and the real hooks get verified.
+    from levain.install import effective_adapter
+
+    if effective_adapter(install) == "openhands":
+        print("  openhands: a hookless adapter — its activation is the runtime condenser,")
+        print("  so there are no activation hooks to smoke-test. Run it with `levain run`.")
+        print("\nNothing to verify (0 hooks).")
+        return 0
+
     hooks_dir = install / "activation" / "hooks"
     if not hooks_dir.is_dir():
         miss = VerifyResult(

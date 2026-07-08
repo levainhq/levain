@@ -16,6 +16,7 @@ pytest.importorskip("openhands.sdk", reason="openhands extra not installed")
 from openhands.sdk import Message, MessageEvent, TextContent
 
 from levain.firing import CaptureRequest, StubFiring
+from levain.firing.agent_reply import CORRECTIVE_NUDGE_MARKER, finish_message
 from levain.firing.openhands import render_turn, vagus_run
 
 
@@ -25,12 +26,91 @@ def _msg(role: str, text: str, sender: str | None = None, source: str | None = N
     return MessageEvent(source=src, llm_message=Message(role=role, content=[TextContent(text=text)]), **kw)
 
 
+class _FinishAction:
+    def __init__(self, message):
+        self.kind = "FinishAction"
+        self.message = message
+
+
+class _ToolAction:
+    def __init__(self, kind):
+        self.kind = kind
+        self.message = "not-a-reply"
+
+
+class _ActionEvent:
+    """An ActionEvent stand-in (source=agent, carries .action). NOT a MessageEvent, so
+    render_turn takes its else-branch — the FinishAction path that carries the no-tool reply."""
+
+    def __init__(self, action, source: str = "agent"):
+        self.source = source
+        self.action = action
+
+
 # --- render_turn ---------------------------------------------------------------------
 
 
 def test_render_turn_renders_user_and_assistant():
     out = render_turn([_msg("user", "build the thing"), _msg("assistant", "built it")])
     assert out == "[user] build the thing\n[assistant] built it"
+
+
+def test_render_turn_captures_finish_action_reply():
+    # The no-tool conversational answer arrives as an ActionEvent(FinishAction), NOT a
+    # MessageEvent. render_turn MUST capture it, or the entity's memory silently drops
+    # the reply on the common shape (the L4 finding, 2026-07-08).
+    out = render_turn([_msg("user", "say pong"), _ActionEvent(_FinishAction("PONG"))])
+    assert out == "[user] say pong\n[assistant] PONG"
+
+
+def test_render_turn_ignores_non_finish_tool_actions():
+    # A real tool action (bash/file) is NOT assistant text — so a turn with only a tool
+    # action and no finish/message has no assistant line → not a capturable turn.
+    out = render_turn([_msg("user", "do it"), _ActionEvent(_ToolAction("ExecuteBashAction"))])
+    assert out is None
+
+
+def test_finish_message_only_matches_finish_actions():
+    assert finish_message(_ActionEvent(_FinishAction("hi"))) == "hi"
+    assert finish_message(_ActionEvent(_ToolAction("ExecuteBashAction"))) is None
+    assert finish_message(_ActionEvent(_FinishAction("   "))) is None  # blank → None
+    assert finish_message(_msg("assistant", "text")) is None  # no .action → None
+
+
+def test_render_turn_excludes_sdk_corrective_nudge():
+    # The SDK injects a synthetic MessageEvent(source="user") nudge when a weak model returns
+    # an empty/reasoning-only response. It must NOT become the captured [user] line, or the
+    # real question is dropped and the episode fabricates the nudge as the human turn.
+    nudge = _msg("user", "Your last response " + CORRECTIVE_NUDGE_MARKER + ". Please use a tool.")
+    events = [_msg("user", "who are you?"), nudge, _ActionEvent(_FinishAction("I am Coyote."))]
+    out = render_turn(events)
+    assert out == "[user] who are you?\n[assistant] I am Coyote."
+    assert CORRECTIVE_NUDGE_MARKER not in out  # the nudge text is nowhere in the episode
+
+
+def test_render_turn_dedups_message_and_finish_echo():
+    # A model that emits the answer as a MessageEvent AND echoes it in the finish message
+    # must not double the assistant line in the captured episode.
+    events = [_msg("user", "q"), _msg("assistant", "the answer"),
+              _ActionEvent(_FinishAction("the answer"))]
+    out = render_turn(events)
+    assert out == "[user] q\n[assistant] the answer"
+
+
+def test_corrective_nudge_marker_matches_installed_sdk():
+    # DRIFT GUARD: if a future SDK bump changes the nudge text, this fails LOUDLY instead of
+    # silently regressing the exclusion above to a no-op. Check the COMPILED string constants
+    # (adjacent literals concatenate at compile time) — the source text splits the string
+    # across lines, so the runtime string, not the source, is the truth.
+    pytest.importorskip("openhands.sdk")
+    from openhands.sdk.agent.response_dispatch import ResponseDispatchMixin
+
+    consts = ResponseDispatchMixin._send_corrective_nudge.__code__.co_consts
+    joined = " ".join(c for c in consts if isinstance(c, str))
+    assert CORRECTIVE_NUDGE_MARKER in joined, (
+        "the SDK's corrective-nudge text changed — update CORRECTIVE_NUDGE_MARKER in "
+        "levain.firing.agent_reply or the nudge exclusion silently stops working"
+    )
 
 
 def test_render_turn_takes_only_the_latest_turn():

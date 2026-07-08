@@ -64,7 +64,9 @@ DEFAULT_INIT_HOST = "127.0.0.1"
 # `levain serve` cockpit and a `levain init --web` onboarding at once.
 DEFAULT_INIT_PORT = 7430
 
-# The two adapters a v1 install supports (mirrors install.py `_resolve_adapter`).
+# The adapters the WEB onboarding surface supports. Deliberately the two HOOKED adapters
+# only — a hookless openhands entity is scaffolded from the terminal (`levain init --adapter
+# openhands`), so this is intentionally a subset of install.py's KNOWN_ADAPTERS, not a mirror.
 _ADAPTERS = ("claude-code", "codex")
 
 # Cap the POST body. The answers payload is seed prose (a few KB total at most);
