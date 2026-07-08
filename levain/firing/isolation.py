@@ -44,6 +44,7 @@ __all__ = [
     "entity_store_paths",
     "resolve_entity_dir",
     "assert_entity_isolated",
+    "assert_workspace_isolated",
     "bind_entity",
 ]
 
@@ -166,6 +167,33 @@ def assert_entity_isolated(*paths: Path, entity_dir: Path | str) -> None:
         raise IsolationError(
             f"isolation violation: the entity store dir {sovereign} escapes the entity root {root} "
             "(a symlinked .levain must not relocate the store outside the entity tree)."
+        )
+
+
+def assert_workspace_isolated(workspace: Path | str, *, entity_dir: Path | str) -> None:
+    """FAIL-CLOSED fence for a run's FILE authority (the OpenHands workspace at
+    ``<entity>/workspace/``). The RESOLVED workspace must stay UNDER the entity dir and NEVER
+    under the flow store — so a ``<entity>/workspace`` symlink escaping to ``$HOME`` (or the
+    flow store) is refused BEFORE any tool can write there.
+
+    This extends the capability-minting discipline from the STORE (``assert_entity_isolated``,
+    re-guarded per op) to the FILE surface: with zero executor tools the workspace is inert,
+    but the fence must EXIST before the tool surface arrives, so ``levain run``'s "confined to
+    ``<entity>/workspace/``" is an enforced invariant, not an unenforced comment. Distinct from
+    :func:`assert_entity_isolated`, which fences the STORE under ``.levain/``; the workspace is
+    a SIBLING of ``.levain/``, so its containment root is the entity dir itself. Pass the
+    workspace path BEFORE creating it (``resolve()`` follows an existing escaping symlink; a
+    not-yet-created path resolves to its intended in-tree location and passes)."""
+    root = Path(entity_dir).expanduser().resolve()
+    ws = Path(workspace).expanduser().resolve()
+    if _is_within_ci(ws, flow_store_dir().resolve()):
+        raise IsolationError(
+            f"workspace {ws} is under the operator-laptop flow store {flow_store_dir()} — refused."
+        )
+    if not _is_within(ws, root):
+        raise IsolationError(
+            f"workspace {ws} escapes the entity dir {root} (a symlinked workspace must not "
+            "relocate the run's file authority outside the entity tree)."
         )
 
 

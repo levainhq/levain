@@ -57,6 +57,56 @@ if TYPE_CHECKING:
     from levain.interview import TemplateSpec
 
 
+# Adapters that have NO trusted harness hook surface: they lay down the seed + store but
+# no activation tree, no hooks, no MCP registration — their "activation" is a Python
+# condenser wired at RUNTIME (`levain run`), not files installed here. `openhands` is the
+# first. A predicate, not scattered name-checks, so the install/doctor/verify paths branch
+# on the CAPABILITY (has-hooks) rather than re-enumerating adapter names.
+HOOKLESS_ADAPTERS = frozenset({"openhands"})
+
+# Every adapter the CLI accepts (the interactive prompt + `--adapter` resolution).
+KNOWN_ADAPTERS = ("claude-code", "codex", "openhands")
+
+
+def _adapter_has_hooks(adapter: str) -> bool:
+    """True if the adapter installs a hook/MCP activation tree (claude-code, codex);
+    False for a hookless adapter (openhands) whose activation is the runtime condenser."""
+    return adapter not in HOOKLESS_ADAPTERS
+
+
+# The hosted-harness artifacts a claude-code / codex install lays down. Their PRESENCE means
+# an install carries hooks and is NOT cleanly hookless, regardless of the config marker.
+_HOSTED_ARTIFACTS = ("CLAUDE.md", "AGENTS.md", "activation", ".claude", ".mcp.json")
+
+
+def hosted_artifacts(install: Path) -> list[str]:
+    """The hosted-harness files/dirs present in ``install`` (tag-files, activation tree, MCP
+    config). Non-empty → the install carries hooks and is not cleanly hookless."""
+    return [name for name in _HOSTED_ARTIFACTS if (install / name).exists()]
+
+
+def effective_adapter(install: Path) -> str | None:
+    """The adapter identity the INSTALL actually attests — the SINGLE source of truth shared
+    by ``doctor`` / ``verify-hooks`` / ``run`` so they cannot diverge on adapter identity.
+
+    Hosted tag-files DOMINATE a possibly-stale ``.levain/config.json`` marker (a ``--force``
+    adapter switch leaves the OLD marker, and no hosted installer clears it — so the FILES are
+    ground truth, not the marker): ``CLAUDE.md`` → ``claude-code``, ``AGENTS.md`` → ``codex``.
+    A hookless (openhands) identity is honored ONLY when its marker is present AND no hosted
+    residue exists — otherwise the install is a hosted or incoherent one, never a clean
+    sovereign entity. ``None`` when nothing coherent is installed."""
+    from levain.dashboard import installed_adapter
+
+    if (install / "CLAUDE.md").is_file():
+        return "claude-code"
+    if (install / "AGENTS.md").is_file():
+        return "codex"
+    marker = installed_adapter(install)
+    if marker is not None and not _adapter_has_hooks(marker) and not hosted_artifacts(install):
+        return marker
+    return None
+
+
 @dataclass
 class InitResult:
     """The structured outcome of `apply_init` — the write-half's full status,
@@ -231,8 +281,17 @@ def run_init(
             # write-half), and (b) seed and activation layering share ONE manifest
             # snapshot (a pack mutated mid-interview can't make seed use the old
             # order while activation uses the new one). codex + L2 + nemotron L3.
-            activation_roots = order_activation_roots(
-                templates_root, _base_activation_root(chosen, templates_root), pack_dirs
+            # Hookless adapters (openhands) have NO activation tree to layer — skip the
+            # activation-root resolution entirely (it would raise on the missing base
+            # tree, or silently borrow claude's). The seed roster above STILL composes
+            # (a pack can carry entity seed); only the activation tree is skipped, and
+            # `_install_adapter` installs seed + store only. `[]` = no activation.
+            activation_roots = (
+                order_activation_roots(
+                    templates_root, _base_activation_root(chosen, templates_root), pack_dirs
+                )
+                if _adapter_has_hooks(chosen)
+                else []
             )
         except PackError as e:
             print(f"FAIL: {e}")
@@ -434,13 +493,17 @@ def apply_init(
             f"`pip install --force-reinstall levain`."
         )
 
-    # Base-only (activation_roots is None) = just the adapter's own base activation
-    # tree — the web onboarding path, which never composes packs.
-    roots = (
-        list(activation_roots)
-        if activation_roots is not None
-        else [_base_activation_root(chosen, templates_root)]
-    )
+    # Hookless adapters (openhands) have NO activation tree — force empty roots even when
+    # apply_init is called directly with activation_roots=None (the openhands install branch
+    # ignores roots, but computing claude's base tree here for a hookless adapter is the
+    # exact latent trap codex L3 flagged: inert only by coincidence). Base-only
+    # (activation_roots is None) = the adapter's own base tree — the web onboarding path.
+    if not _adapter_has_hooks(chosen):
+        roots: list[Path] = []
+    elif activation_roots is not None:
+        roots = list(activation_roots)
+    else:
+        roots = [_base_activation_root(chosen, templates_root)]
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         activation_roots=roots, emit=emit,
@@ -809,7 +872,7 @@ class _UserCancelled(Exception):
 
 
 def _resolve_adapter(arg: str | None) -> str:
-    if arg in ("claude-code", "codex"):
+    if arg in KNOWN_ADAPTERS:
         return arg
     return _prompt_adapter()
 
@@ -818,18 +881,22 @@ def _prompt_adapter() -> str:
     print("Which harness adapter do you want to install?")
     print("  1) Claude Code")
     print("  2) Codex CLI")
+    print("  3) OpenHands — a sovereign, runnable entity (no hooks; drive it with")
+    print("        `levain run`, on an open model, with its own memory)")
     print()
     print("  (v1 installs one adapter per install. To use both harnesses,")
     print("   create two separate installs.)")
     while True:
         try:
-            choice = input("Enter 1 or 2: ").strip().lower()
+            choice = input("Enter 1, 2, or 3: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             raise _UserCancelled
         if choice in ("1", "claude", "claude-code"):
             return "claude-code"
         if choice in ("2", "codex"):
             return "codex"
+        if choice in ("3", "openhands"):
+            return "openhands"
         print(f"  Unrecognized: {choice!r}. Try again.")
 
 
@@ -955,6 +1022,15 @@ def _install_adapter(
             install, adapter_root, python_path, anneal_path, import_seed,
             activation_roots=activation_roots, emit=emit,
         )
+        return
+
+    if name == "openhands":
+        # Hookless: seed + store only (both already written around this call). No
+        # activation tree, no hooks, no MCP — the condenser is the runtime activation.
+        # `activation_roots` / `import_seed` are ignored (there is no @import context
+        # file); we only stamp the adapter marker so doctor/verify can identify the
+        # install without a tag-file (openhands lays down no CLAUDE.md/AGENTS.md).
+        _install_openhands(install, emit=emit)
         return
 
     raise ValueError(f"unknown adapter: {name}")  # pragma: no cover
@@ -1137,6 +1213,53 @@ def _install_codex(
     _merge_codex_config(codex_home / "config.toml", mcp_fragment)
 
     emit("  Codex adapter installed.")
+
+
+def _install_openhands(install: Path, *, emit: Callable[[str], None] = print) -> None:
+    """Install the hookless OpenHands adapter: stamp the adapter marker, nothing else.
+
+    Unlike claude-code/codex, an OpenHands entity has no trusted hook surface — its
+    activation is the `LevainCondenser` wired at runtime by `levain run`, not files laid
+    down here. The seed (`seed/*.md`) and the store (`.levain/`) are written by `apply_init`
+    around this call; all this does is record `adapter = "openhands"` in `.levain/config.json`
+    so `doctor` / `verify-hooks` can identify a hookless install (there is no CLAUDE.md /
+    AGENTS.md tag-file to detect it by). Idempotent + config-preserving (merge, never
+    clobber a brand/entity_name already present)."""
+    _write_adapter_marker(install, "openhands", emit)
+    emit("  OpenHands entity scaffolded (no hooks — drive it with `levain run`).")
+
+
+def _write_adapter_marker(
+    install: Path, adapter: str, emit: Callable[[str], None] = print
+) -> None:
+    """Record `adapter` in `.levain/config.json` (the doctor/verify detection channel for
+    a hookless install). MERGE, never clobber: preserve any `entity_name` / brand keys
+    already written; refuse to overwrite an unreadable-but-present config (same honesty
+    floor as `_write_brand_config` — a parse failure must not blank a recoverable config).
+    Atomic write. Best-effort: a failure warns and returns (the marker is detection chrome,
+    not install-critical — a store-backed install is still usable)."""
+    from levain.dashboard import LEVAIN_CONFIG_REL
+
+    config_path = install.joinpath(*LEVAIN_CONFIG_REL)
+    existing: dict = {}
+    if config_path.is_file():
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            emit("  note: .levain/config.json is unreadable — adapter marker NOT written "
+                 "(refusing to overwrite possibly-recoverable config; fix it, then re-run).")
+            return
+        if not isinstance(existing, dict):
+            existing = {}
+    if existing.get("adapter") == adapter:
+        return  # idempotent — no spurious mtime churn
+    merged = {**existing, "adapter": adapter}
+    try:
+        _atomic_write_text(
+            config_path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+        )
+    except OSError as e:
+        emit(f"  note: could not write the adapter marker to .levain/config.json ({e}).")
 
 
 def _timestamped_backup_path(target: Path) -> Path:
@@ -1573,6 +1696,9 @@ def _manifest_rows(
         codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
         rows.append(("codex (global)", codex_home / "hooks.json"))
         rows.append(("codex (global)", codex_home / "config.toml"))
+    elif adapter == "openhands":
+        # Hookless: no context file / hooks / MCP — just the adapter marker in config.
+        rows.append(("adapter", install.joinpath(".levain", "config.json")))
 
     activation = install / "activation"
     if activation.is_dir():
@@ -1633,6 +1759,16 @@ def _next_steps_lines(install: Path, adapter: str, store_ok: bool = True) -> lis
         lines.append("    so Codex can prompt to trust the hook scripts. Editing the")
         lines.append("    hook scripts invalidates trust until re-approved interactively.")
         lines.append(f"        cd {install} && codex")
+    if adapter == "openhands":
+        # Hookless: no verify-hooks (there are none) — the activation is the runtime
+        # condenser, so the "smoke-test the hooks" guidance would be misleading.
+        lines.append("  - Run it (needs the OpenHands runtime — pip install 'levain[openhands]'):")
+        lines.append(f"        levain run {install}")
+        lines.append("  - Sovereign by construction: it runs on an open model, keeps its OWN")
+        lines.append("    memory under .levain/, and never touches your flow store.")
+        lines.append(f"  - Verify the install (loud):  levain doctor --path {install}")
+        lines.append("")
+        return lines
     lines.append(f"  - Verify the install (loud):  levain doctor --path {install}")
     lines.append(f"  - Smoke-test the hooks:       levain verify-hooks --path {install}")
     lines.append("  - (`doctor` static-checks wiring; `verify-hooks` actually invokes the")

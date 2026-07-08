@@ -1,11 +1,15 @@
 """`levain doctor` — loud, in-environment health check of a Levain install.
 
 What it checks:
-  - Install layout: `seed/`, `activation/`, hook scripts present and parse.
+  - Install layout: `seed/`, and (for a HOOKED adapter) `activation/` + hook
+    scripts present and parse. A HOOKLESS adapter (openhands — detected by the
+    `.levain/config.json` `adapter` marker + the absence of hosted-harness files)
+    has no activation tree; that check is skipped for it, since its activation is
+    the runtime condenser, not installed files.
   - Runtime: Python interpreter; `anneal-memory` available as CLI or module.
   - Store: `.levain/memory.db` opens cleanly via sqlite3.
   - Per detected adapter (Claude Code if `CLAUDE.md` + `.claude/`; Codex if
-    `AGENTS.md`):
+    `AGENTS.md`; openhands via the marker with no residue):
       * Config files parse.
       * Hooks wired (and, for Codex, wired to THIS install).
       * MCP server registered under `anneal_memory` with the install's store
@@ -59,8 +63,19 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain doctor — checking {install}\n")
 
+    # Detect the adapter via `effective_adapter` — the SHARED classifier (doctor/verify/run
+    # all use it, so they can't diverge) where hosted files DOMINATE a possibly-stale config
+    # marker. So an install is HOOKLESS only when it is a clean openhands entity (marker +
+    # no hosted residue): a `--force` adapter switch is read by its files, not the stale
+    # marker — a healthy claude reinstall is never false-FAILed as "hookless", and an
+    # openhands marker on top of a hook tree is never green-lit (its activation IS checked).
+    # (Lazy import to match this module's no-top-level-levain-imports discipline.)
+    from levain.install import effective_adapter
+
+    hookless = effective_adapter(install) == "openhands"
+
     core: list[CheckResult] = []
-    core.extend(_check_install_layout(install))
+    core.extend(_check_install_layout(install, expect_hooks=not hookless))
     core.extend(_check_seed_content(install))
     core.extend(_check_runtime(install))
     core.extend(_check_store(install))
@@ -68,14 +83,18 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     for r in core:
         _emit(r)
 
-    # Adapter detection: presence of the harness tag-file in the install root.
-    # Wiring is checked downstream — a tagged install with missing wiring
+    # Adapter detection. A hookless install (openhands) is identified by its config
+    # marker (it lays down no CLAUDE.md/AGENTS.md tag-file); a hosted-harness install by
+    # its tag-file. Wiring is checked downstream — a tagged install with missing wiring
     # surfaces as a wiring FAIL, not "no adapter."
     adapter_results: dict[str, list[CheckResult]] = {}
-    if (install / "CLAUDE.md").is_file():
-        adapter_results["claude-code"] = _check_claude_code(install)
-    if (install / "AGENTS.md").is_file():
-        adapter_results["codex"] = _check_codex(install)
+    if hookless:
+        adapter_results["openhands"] = _check_openhands(install)
+    else:
+        if (install / "CLAUDE.md").is_file():
+            adapter_results["claude-code"] = _check_claude_code(install)
+        if (install / "AGENTS.md").is_file():
+            adapter_results["codex"] = _check_codex(install)
 
     if not adapter_results:
         no_adapter = CheckResult(
@@ -116,7 +135,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
         print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
         print("All checks passed.")
-    if not invoke:
+    if not invoke and not hookless:
+        # A hookless install has no activation hooks — the verify-hooks nudge would mislead.
         print(
             "  Note: doctor is static — it does NOT invoke the activation hooks.\n"
             "        For the actual firing test, run `levain verify-hooks`\n"
@@ -192,7 +212,11 @@ def _check_seed_content(install: Path) -> list[CheckResult]:
     return results
 
 
-def _check_install_layout(install: Path) -> list[CheckResult]:
+def _check_install_layout(install: Path, expect_hooks: bool = True) -> list[CheckResult]:
+    """Static layout check. ``expect_hooks=False`` (a hookless adapter, e.g. openhands)
+    checks the seed but SKIPS the activation-tree + hook-script requirement entirely —
+    those files do not exist for an adapter whose activation is the runtime condenser, so
+    demanding them would FAIL a perfectly healthy sovereign entity."""
     results: list[CheckResult] = []
 
     if not install.is_dir():
@@ -236,6 +260,18 @@ def _check_install_layout(install: Path) -> list[CheckResult]:
                     f"{len(present)} files present ({', '.join(present)})",
                 )
             )
+
+    if not expect_hooks:
+        # Hookless adapter (openhands): no activation tree — the condenser is the runtime
+        # activation. Report it as an informational PASS, not a missing-tree FAIL.
+        results.append(
+            CheckResult(
+                "activation/",
+                True,
+                "n/a — hookless adapter (activation is the runtime condenser)",
+            )
+        )
+        return results
 
     activation = install / "activation"
     if not activation.is_dir():
@@ -557,6 +593,22 @@ def _hook_command_targets(
         except OSError:
             continue
     return False
+
+
+def _check_openhands(install: Path) -> list[CheckResult]:
+    """The hookless (openhands) adapter check — reached only when the marker says openhands
+    AND no hosted-harness residue is present (the `hookless` gate in `run_doctor` already
+    guarantees the latter via `_hosted_artifacts`). So this is a clean sovereign-entity PASS;
+    the seed + store + runtime health are covered by the core checks, and a hookless entity
+    has no hooks/MCP to verify. (A stray hook tree makes the install non-hookless at the gate,
+    routing it to the normal tag-file detection / no-adapter FAIL instead.)"""
+    return [
+        CheckResult(
+            "adapter",
+            True,
+            "openhands — sovereign entity (no hooks; run it with `levain run`)",
+        )
+    ]
 
 
 def _check_claude_code(install: Path) -> list[CheckResult]:

@@ -51,11 +51,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     init_p.add_argument(
         "--adapter",
-        choices=["claude-code", "codex"],
+        choices=["claude-code", "codex", "openhands"],
         help=(
-            "Harness adapter to install. Prompts if omitted. "
-            "v1 installs one adapter per install — to use both harnesses on "
-            "the same machine, create two separate installs."
+            "Harness adapter to install. Prompts if omitted. `claude-code` and "
+            "`codex` wire a hosted harness via hooks; `openhands` scaffolds a "
+            "sovereign, runnable entity (its own store + seed, NO hooks — the "
+            "condenser is the activation) that you drive with `levain run`. "
+            "v1 installs one adapter per install — to use both, create two "
+            "separate installs."
         ),
     )
     init_p.add_argument(
@@ -246,6 +249,50 @@ def main(argv: list[str] | None = None) -> int:
         help="Provenance tag for who set it (default: cli).",
     )
     focus_p.set_defaults(func=_cmd_focus)
+
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run a sovereign entity as an interactive partner on an open model.",
+        description=(
+            "Talk to an ISOLATED Levain entity (created with `levain init "
+            "--adapter openhands`) as an interactive REPL — 'use it like Claude "
+            "Code, but sovereign': it runs on an open model (Ollama by default), "
+            "carries its OWN memory, and NEVER touches this laptop's flow store "
+            "(the sovereignty guard fail-closes before the first turn). This first "
+            "slice is a conversational partner (no executor tools); the file "
+            "workspace is confined to <entity>/workspace/. Needs the OpenHands "
+            "runtime: pip install 'levain[openhands]'."
+        ),
+    )
+    run_p.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=Path.cwd(),
+        help="The entity directory to run (default: cwd).",
+    )
+    run_p.add_argument(
+        "--model",
+        default="minimax-m3:cloud",
+        help=(
+            "The model to run on (default: minimax-m3:cloud). A bare name is routed "
+            "through Ollama (ollama/<name>); a provider-prefixed name (ollama/…, "
+            "openai/…) is used as-is."
+        ),
+    )
+    run_p.add_argument(
+        "--base-url",
+        default="http://localhost:11434",
+        dest="base_url",
+        help="The model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    run_p.add_argument(
+        "--api-key",
+        default=None,
+        dest="api_key",
+        help="API key for the endpoint, if it needs one (local Ollama does not).",
+    )
+    run_p.set_defaults(func=_cmd_run)
 
     web_p = subparsers.add_parser(
         "serve",
@@ -484,6 +531,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    if args.web and args.adapter == "openhands":
+        # The browser onboarding surface (init_server) is claude-code/codex only for
+        # now; a sovereign-entity scaffold is a terminal-only path this slice. Fail
+        # clean rather than letting init_server reject it with a generic bad_adapter.
+        print(
+            "levain init: --web onboarding does not support --adapter openhands yet.\n"
+            "  Run it in the terminal:  levain init --adapter openhands "
+            f"--path {args.path}"
+        )
+        return 1
     if args.web:
         from levain.init_server import run_init_web
 
@@ -531,6 +588,17 @@ def _cmd_focus(args: argparse.Namespace) -> int:
 
     return run_focus(
         path=args.path, text=args.text, source=args.source, clear=args.clear
+    )
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    from levain.run import run_entity
+
+    return run_entity(
+        path=args.path,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
     )
 
 

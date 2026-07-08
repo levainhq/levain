@@ -946,6 +946,18 @@ def _read_levain_config(install_root: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def installed_adapter(install_root: Path) -> str | None:
+    """The adapter recorded in ``.levain/config.json`` (``"openhands"``), or ``None``.
+
+    The detection channel for a HOOKLESS install (openhands lays down no CLAUDE.md /
+    AGENTS.md tag-file, so ``doctor`` / ``verify-hooks`` can't detect it by file
+    presence). Only the hookless installer stamps this today; a hosted-harness install
+    returns ``None`` here and is detected by its tag-file, unchanged. Fail-soft (rides
+    ``_read_levain_config``)."""
+    adapter = _read_levain_config(install_root).get("adapter")
+    return adapter if isinstance(adapter, str) else None
+
+
 # The constitution files an entity carries (read-only view), with display names.
 # The seed ``continuity.md`` is intentionally NOT here: it is the near-empty SCHEMA
 # template (just the six section headings), and the operator's LIVE neocortex
