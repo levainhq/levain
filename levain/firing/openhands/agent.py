@@ -44,9 +44,10 @@ def vagus_agent_context(
     *,
     firing: FiringContract | None = None,
     base: AgentContext | None = None,
+    constitution: str | None = None,
 ) -> AgentContext:
-    """Build (or extend) an ``AgentContext`` carrying the firing's constitution as the
-    set-once ``system_message_suffix``.
+    """Build (or extend) an ``AgentContext`` carrying the constitution as the set-once
+    ``system_message_suffix``.
 
     Args:
         firing_kind: the serializable firing kind whose ``session_start`` inject supplies the
@@ -58,17 +59,25 @@ def vagus_agent_context(
         base: an existing ``AgentContext`` (the adopter's own skills / suffixes). The
             constitution is APPENDED to any existing ``system_message_suffix`` (never
             clobbered) and all other base fields are preserved.
+        constitution: an explicit constitution string (the entity-seed frame, step 4). When
+            given it is used VERBATIM as the suffix — the firing is not consulted for it. This
+            is fork-safe for the SAME reason the firing path is: the suffix is a string baked
+            into the AgentContext once, not rebuilt from a kind. ``None`` (default) falls back
+            to the firing's ``session_start`` constitution — the pre-step-4 behavior.
 
     Returns:
         an ``AgentContext`` whose ``system_message_suffix`` ends with the constitution.
     """
-    f = firing if firing is not None else build_firing(firing_kind)
-    # session_start is static: no recall query, no rotation index.
-    constitution = f.inject(InjectRequest(lifecycle_point="session_start")).strip()
+    if constitution is not None:
+        text = constitution.strip()
+    else:
+        f = firing if firing is not None else build_firing(firing_kind)
+        # session_start is static: no recall query, no rotation index.
+        text = f.inject(InjectRequest(lifecycle_point="session_start")).strip()
 
     existing = (base.system_message_suffix if base is not None else None) or ""
     # Append (don't clobber) the adopter's framing — two trusted blocks, theirs then ours.
-    merged = f"{existing.rstrip()}\n\n{constitution}".strip() if existing.strip() else constitution
+    merged = f"{existing.rstrip()}\n\n{text}".strip() if existing.strip() else text
 
     if base is not None:
         return base.model_copy(update={"system_message_suffix": merged})

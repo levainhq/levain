@@ -80,12 +80,21 @@ class PresenceSource(Protocol):
 # The condenser identifies its presence source by a serializable ``presence_kind`` (not a live
 # handle) so ``fork()`` / reload rebuild the right source — the same reason ``vagus.firing`` uses a
 # kind registry (a live handle in a ``PrivateAttr`` is silently dropped on the serialize→validate
-# round-trip fork performs). Real presence kinds (a future flow/seed source) self-register on
-# import; a blessed-lazy-leaf allowlist mirrors ``vagus.firing._LAZY_FIRING_MODULES`` and is added
-# WHEN the first optional leaf exists (Slice 4) — Slice 1 has only the stdlib ``StubPresence``, so
-# no lazy import is needed yet and none is offered (governed > clever: no arbitrary-module import).
+# round-trip fork performs). Real presence kinds (the seed source) self-register on import; the
+# blessed-lazy-leaf allowlist below mirrors ``levain.firing.contract._LAZY_FIRING_MODULES``.
 
 _PRESENCE_REGISTRY: dict[str, Callable[[], PresenceSource]] = {}
+
+# Explicit allowlist of lazily-importable presence leaves (kind → module), mirroring
+# ``levain.firing.contract._LAZY_FIRING_MODULES``. The first optional leaf (step 4) is the seed
+# source: importing it stays optional (it is not pulled by ``import levain.firing``), and a cold
+# fork/reload that reaches ``build_presence("entity_seed")`` without the leaf yet imported can
+# recover. An EXPLICIT map (not ``import_module(f"…{kind}")``) governs which modules may be
+# imported — a crafted/typo kind can never trigger an unintended import; it falls through to the
+# clean "unknown kind" error (apparatus: governed > clever, matching the firing side).
+_LAZY_PRESENCE_MODULES: dict[str, str] = {
+    "entity_seed": "levain.firing.seed",
+}
 
 
 def register_presence(kind: str, factory: Callable[[], PresenceSource]) -> None:
@@ -96,13 +105,22 @@ def register_presence(kind: str, factory: Callable[[], PresenceSource]) -> None:
 def build_presence(kind: str) -> PresenceSource:
     """Rebuild a ``PresenceSource`` from its registered kind (used on fork / reload).
 
-    Serialization-safe: fork/reload reconstruct from the kind ALONE. An unknown kind raises a
-    clear error rather than silently degrading (a typo'd presence kind should surface, not
-    vanish into a no-re-anchor). Real content kinds live in optional leaves that self-register
-    on import; when the first such leaf ships (Slice 4) a blessed-lazy-import allowlist joins
-    here, mirroring ``vagus.firing.build_firing``.
+    Serialization-safe: fork/reload reconstruct from the kind ALONE. A kind may live in an OPTIONAL
+    leaf that self-registers on import (:data:`_LAZY_PRESENCE_MODULES`); if it isn't registered yet
+    but IS a blessed leaf, lazily import it and retry — so the core seam never eagerly pulls an
+    optional leaf's closure, and reconstruction stays fork-safe from the kind alone. A blessed
+    leaf's own import errors propagate (surface a broken leaf); an unknown/unblessed kind raises a
+    clear error rather than silently degrading (a typo'd presence kind should surface, not vanish
+    into a no-re-anchor). Mirrors ``levain.firing.contract.build_firing``.
     """
     factory = _PRESENCE_REGISTRY.get(kind)
+    if factory is None:
+        module = _LAZY_PRESENCE_MODULES.get(kind)
+        if module is not None:
+            import importlib
+
+            importlib.import_module(module)  # blessed leaf — its own import errors propagate
+        factory = _PRESENCE_REGISTRY.get(kind)
     if factory is None:
         raise ValueError(
             f"unknown presence kind {kind!r}; registered: {sorted(_PRESENCE_REGISTRY)}"

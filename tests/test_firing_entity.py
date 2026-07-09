@@ -35,6 +35,29 @@ def _entity(tmp_path: Path, name: str = "coyote") -> Path:
     return d
 
 
+def _seed(entity_dir: Path, *, name: str = "Coyote", operator: str = "Phill Clapham") -> Path:
+    """Lay down a minimal filled ``seed/`` so ``build_entity_agent`` has a real identity to render
+    (step 4). Enough for the constitution to prove "boots as itself": an origin (who it is), a world
+    (its operator), a partnership (the floor)."""
+    seed = entity_dir / "seed"
+    seed.mkdir(parents=True, exist_ok=True)
+    (seed / "origin.md").write_text(
+        f"# Who You Are — {name}\n\n"
+        f"> Part of the seed. Template guidance — must be stripped.\n\n"
+        f"You are **{name}**. You run on minimax-m3.\n\n"
+        f"<!-- interview comment — must be stripped -->\n\n"
+        f"Your job: be a sovereign partner to {operator}.\n",
+        encoding="utf-8",
+    )
+    (seed / "world.md").write_text(
+        f"# Who Your Operator Is\n\n## Identity\n\n{operator}. 46. Columbus, OH.\n", encoding="utf-8"
+    )
+    (seed / "partnership.md").write_text(
+        "# How We Work\n\nYou are a partner, not an assistant.\n", encoding="utf-8"
+    )
+    return entity_dir
+
+
 def _stub_llm() -> LLM:
     # Builds with no network — an Ollama endpoint config, never called by these tests.
     return LLM(model="ollama/nemotron-3-ultra:cloud", base_url="http://localhost:11434", usage_id="entity-test")
@@ -136,11 +159,57 @@ def test_build_entity_agent_wires_isolated_kind(tmp_path):
     cond = binding.agent.condenser
     assert isinstance(cond, LevainCondenser)
     assert cond.firing_kind == ENTITY_FIRING_KIND == "anneal_entity"  # the isolated firing
-    assert cond.presence_kind == "stub"                               # step-4 seed source not yet wired
+    assert cond.presence_kind == "entity_seed"                        # step-4: the seed re-anchor
 
-    # the constitution rode into the set-once trusted suffix (session_start), no store access
+    # A bare .levain-only entity (no seed/) has no readable identity → the constitution FALLS BACK
+    # to the firing's generic default (session_start), still baked into the set-once suffix.
     suffix = binding.agent.agent_context.system_message_suffix or ""
     assert "governed cognitive substrate" in suffix
+
+
+def test_build_entity_agent_boots_as_itself_from_seed(tmp_path):
+    """Step 4 (spore-294): a fresh entity WITH a seed boots as ITSELF — its origin identity + operator
+    + partnership floor ride the set-once constitution suffix (so "who are you?" is the seed, not the
+    model's stock "I am OpenHands"), and the re-anchor kind is the seed source. Guidance blockquotes +
+    interview comments are stripped; the generic default is REPLACED (not appended)."""
+    ent = _seed(_entity(tmp_path), name="Coyote", operator="Phill Clapham")
+    binding = build_entity_agent(ent, _stub_llm())
+
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "Coyote" in suffix                       # identity (origin.md)
+    assert "Phill Clapham" in suffix                # operator (world.md)
+    assert "partner, not an assistant" in suffix    # floor (partnership.md)
+    assert "governed cognitive substrate" not in suffix  # the generic default was REPLACED
+    assert "guidance blockquote" not in suffix      # > blockquote stripped
+    assert "interview comment" not in suffix        # <!-- --> stripped
+
+    cond = binding.agent.condenser
+    assert cond.presence_kind == "entity_seed"
+
+
+def test_build_entity_agent_warns_on_present_but_unreadable_seed(tmp_path, caplog):
+    """apparatus HIGH-2: a seed/ dir that is PRESENT but yields no constitution (here: origin/world/
+    partnership all symlinked outside the tree → refused) must NOT silently boot generic — it warns
+    LOUD, so a broken step-4 identity surfaces instead of degrading invisibly."""
+    import logging
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    ent = _entity(tmp_path)
+    seed = ent / "seed"
+    seed.mkdir()
+    for name in ("origin.md", "world.md", "partnership.md"):
+        (foreign / name).write_text(f"# {name}\n\nforeign content\n")
+        (seed / name).symlink_to(foreign / name)  # per-file escapes → all refused
+
+    with caplog.at_level(logging.WARNING, logger="levain.firing.openhands.entity"):
+        binding = build_entity_agent(ent, _stub_llm())
+
+    assert any("no readable constitution" in r.message for r in caplog.records)
+    # and it fell back to the generic default (not a crash, not a foreign identity)
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "governed cognitive substrate" in suffix
+    assert "foreign content" not in suffix
 
 
 def test_built_agents_firing_resolves_to_entity_store(tmp_path):

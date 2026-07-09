@@ -28,6 +28,7 @@ BEFORE any UX rides on it").
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,9 @@ from levain.firing.isolation import (
 )
 from levain.firing.openhands.agent import vagus_agent_context
 from levain.firing.openhands.levain_condenser import LevainCondenser
+from levain.firing.seed import SEED_SUBDIR, EntitySeed
+
+_log = logging.getLogger("levain.firing.openhands.entity")
 
 # The isolated firing kind — the ONE this module ever wires. Its resolver has no laptop-store
 # fallback (see levain.firing.anneal.AnnealEntityFiring), so the whole agent stays sovereign.
@@ -99,7 +103,7 @@ def build_entity_agent(
     inner: CondenserBase | None = None,
     max_size: int = 120,
     keep_first: int = 4,
-    presence_kind: str = "stub",
+    presence_kind: str = "entity_seed",
 ) -> EntityBinding:
     """Build an isolated OpenHands ``Agent`` for the entity at ``entity_dir``, running on ``llm``.
 
@@ -110,18 +114,51 @@ def build_entity_agent(
 
     ``inner`` defaults to an ``LLMSummarizingCondenser`` (compression-first, so the afferent inject
     is never summarized away or counted toward the size threshold — the shipped VagusCondenser
-    contract). ``presence_kind`` stays ``"stub"`` until the real entity-seed presence source ships
-    (roadmap step 4); the compaction re-anchor is a stub re-assertion for now."""
+    contract).
+
+    IDENTITY (step 4 — spore-294): the entity boots as ITSELF, sourced from its OWN ``seed/``:
+      - the **constitution** (session_start) is rendered from ``<entity>/seed/*.md``
+        (:class:`~levain.firing.seed.EntitySeed`) — ``origin`` (who it is) + ``world`` (its operator)
+        + ``partnership`` (how it works) — and baked into the set-once ``system_message_suffix``, so a
+        fresh "who are you?" answers with the seed identity, not the model's stock "I am OpenHands". A
+        bare ``.levain``-only entity (no seed) falls back to the firing's generic default constitution.
+      - the **re-anchor** (``presence_kind="entity_seed"``, the default) re-asserts that identity at
+        recency on the post-compaction recovery turn (``SeedPresence``, resolved per-op from the bound
+        ``$LEVAIN_ENTITY_DIR`` — fork-safe like the store). Pass ``presence_kind="stub"`` to opt out.
+
+    The constitution rides a STRING baked into the AgentContext (fork-safe as data, so the per-turn
+    firing kind need not carry it); the re-anchor rides the serializable ``presence_kind`` (rebuilt on
+    fork). Both read only the ENTITY's own seed — never flow's fossil (isolation applies to the seed)."""
     ed, crystal, episodic = bind_entity(entity_dir)
     resolved_inner = (
         inner
         if inner is not None
         else LLMSummarizingCondenser(llm=llm, max_size=max_size, keep_first=keep_first)
     )
+    # Seed-sourced constitution → the set-once suffix. ``None`` (no readable seed) falls through to
+    # the firing's generic default (``vagus_agent_context`` consults ``ENTITY_FIRING_KIND``).
+    seed = EntitySeed(ed)
+    seed_constitution = seed.constitution()
+    if seed_constitution is None and seed.seed_dir_present():
+        # DISTINGUISH the two None cases (apparatus HIGH-2): a bare entity with NO seed/ booting
+        # generic is expected + silent; a seed/ dir that is PRESENT but yielded no constitution
+        # (unreadable / non-UTF-8 / a symlink refused by the isolation guard) is a step-4 FAILURE —
+        # the entity boots as a generic substrate instead of itself, so surface it LOUD rather than
+        # let the identity silently degrade with no signal.
+        _log.warning(
+            "entity %s has a %s/ directory but no readable constitution — booting with the GENERIC "
+            "default identity, not the seed. Its %s/origin.md is missing, unreadable, escaping the "
+            "entity tree, or has no identity body.",
+            ed,
+            SEED_SUBDIR,
+            SEED_SUBDIR,
+        )
     agent = Agent(
         llm=llm,
         tools=tools if tools is not None else [],
-        agent_context=vagus_agent_context(firing_kind=ENTITY_FIRING_KIND),
+        agent_context=vagus_agent_context(
+            firing_kind=ENTITY_FIRING_KIND, constitution=seed_constitution
+        ),
         condenser=LevainCondenser.build(
             inner=resolved_inner,
             firing_kind=ENTITY_FIRING_KIND,
