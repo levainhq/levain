@@ -322,6 +322,17 @@ def test_presence_survives_serialization_roundtrip():
     assert out.events[-1].llm_message.role == "system"
 
 
+def test_entity_seed_presence_kind_survives_serialization():
+    """The PRODUCTION kind (step 4): presence_kind='entity_seed' rebuilds a SeedPresence from the
+    serialized dump via the blessed lazy allowlist — never a live handle, so it survives fork()."""
+    from levain.firing.seed import SeedPresence
+
+    orig = LevainCondenser(inner=NoOpCondenser(), firing_kind="anneal_entity", presence_kind="entity_seed")
+    restored = LevainCondenser.model_validate(orig.model_dump())
+    assert restored.presence_kind == "entity_seed"
+    assert isinstance(restored._presence, SeedPresence)
+
+
 def test_fold_works_after_serialization_with_registered_kind():
     """A registered presence kind rebuilds from the serialized dump, and the fold fires post-restore
     — proving presence_kind (not a live handle) is what survives fork."""
