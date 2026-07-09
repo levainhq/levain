@@ -32,6 +32,7 @@ from openhands.sdk import MessageEvent
 
 from levain.firing.agent_reply import (
     finish_message,
+    humanize_finish_json,
     is_corrective_nudge,
     message_event_text,
 )
@@ -114,6 +115,8 @@ def render_turn(events) -> str | None:
             role = getattr(e.llm_message, "role", None)
             text = message_event_text(e)
             if text:
+                if role != "user":  # spore-297: capture the reply, not a finish/think-as-JSON blob
+                    text = humanize_finish_json(text)
                 lines.append(f"[{role}] {text}")
             continue
         # Not a MessageEvent: the agent's final answer via the built-in `finish` tool
