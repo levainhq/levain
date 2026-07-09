@@ -29,6 +29,7 @@ from levain.firing.isolation import (
     LEVAIN_ENTITY_DIR_ENV,
     IsolationError,
     assert_entity_isolated,
+    assert_path_within_workspace,
     assert_workspace_isolated,
     entity_store_paths,
     flow_store_dir,
@@ -93,6 +94,84 @@ def test_workspace_symlink_into_flow_store_refused(tmp_path: Path, monkeypatch):
     ws.symlink_to(fake_home / ".anneal-memory")
     with pytest.raises(IsolationError):
         assert_workspace_isolated(ws, entity_dir=entity)
+
+
+# --- assert_path_within_workspace (the per-OP FILE fence for the confined executor tools) --------
+
+
+def _workspace(tmp_path: Path) -> Path:
+    ws = _entity(tmp_path) / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+def test_path_in_workspace_passes(tmp_path: Path):
+    ws = _workspace(tmp_path)
+    (ws / "plan.md").write_text("hi")
+    assert_path_within_workspace(ws / "plan.md", workspace_root=ws)
+
+
+def test_path_not_yet_created_in_workspace_passes(tmp_path: Path):
+    # `create` targets a path that does not exist yet — non-strict resolve keeps it in-tree.
+    ws = _workspace(tmp_path)
+    assert_path_within_workspace(ws / "new" / "file.md", workspace_root=ws)
+
+
+def test_path_absolute_outside_workspace_refused(tmp_path: Path):
+    ws = _workspace(tmp_path)
+    with pytest.raises(IsolationError):
+        assert_path_within_workspace(tmp_path / "elsewhere.txt", workspace_root=ws)
+
+
+def test_path_dotdot_escape_refused(tmp_path: Path):
+    # `..` traversal resolves OUT of the workspace → refused (structural, not a `..` string-match).
+    ws = _workspace(tmp_path)
+    with pytest.raises(IsolationError):
+        assert_path_within_workspace(ws / ".." / ".." / "etc_evil", workspace_root=ws)
+
+
+def test_path_into_flow_store_refused(tmp_path: Path, monkeypatch):
+    # A path resolving into ~/.anneal-memory/ is named explicitly (isolation leak, even for a read).
+    fake_home = tmp_path / "home"
+    (fake_home / ".anneal-memory").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    ws = _workspace(tmp_path)
+    with pytest.raises(IsolationError, match="flow store"):
+        assert_path_within_workspace(
+            fake_home / ".anneal-memory" / "memory.db", workspace_root=ws
+        )
+
+
+def test_path_via_symlink_out_of_workspace_refused(tmp_path: Path):
+    # The moat check: a symlink PLANTED inside the workspace pointing out is caught by its RESOLVED
+    # target (resolve-then-check), not by inspecting the literal path — structural, not discipline.
+    ws = _workspace(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leak")
+    (ws / "link").symlink_to(outside)
+    with pytest.raises(IsolationError):
+        assert_path_within_workspace(ws / "link" / "secret.txt", workspace_root=ws)
+
+
+def test_path_symlink_into_flow_store_refused(tmp_path: Path, monkeypatch):
+    fake_home = tmp_path / "home"
+    (fake_home / ".anneal-memory").mkdir(parents=True)
+    (fake_home / ".anneal-memory" / "memory.db").write_text("flow")
+    monkeypatch.setenv("HOME", str(fake_home))
+    ws = _workspace(tmp_path)
+    (ws / "leak").symlink_to(fake_home / ".anneal-memory")
+    with pytest.raises(IsolationError, match="flow store"):
+        assert_path_within_workspace(ws / "leak" / "memory.db", workspace_root=ws)
+
+
+def test_malformed_path_fails_closed_as_isolation_error(tmp_path: Path):
+    # An embedded-NUL path (an LLM CAN emit this in a tool-call `path`) makes `.resolve()` raise
+    # ValueError — the fence must convert it to a fail-CLOSED IsolationError, never leak a raw
+    # ValueError that would crash the turn (apparatus L2 finding #4).
+    ws = _workspace(tmp_path)
+    with pytest.raises(IsolationError):
+        assert_path_within_workspace("in\x00jected", workspace_root=ws)
 
 
 # --- the pure guard: derivation -----------------------------------------------------

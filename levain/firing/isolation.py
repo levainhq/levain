@@ -45,6 +45,7 @@ __all__ = [
     "resolve_entity_dir",
     "assert_entity_isolated",
     "assert_workspace_isolated",
+    "assert_path_within_workspace",
     "bind_entity",
 ]
 
@@ -194,6 +195,59 @@ def assert_workspace_isolated(workspace: Path | str, *, entity_dir: Path | str) 
         raise IsolationError(
             f"workspace {ws} escapes the entity dir {root} (a symlinked workspace must not "
             "relocate the run's file authority outside the entity tree)."
+        )
+
+
+def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str) -> None:
+    """FAIL-CLOSED per-OPERATION file fence for an executor tool: raise :class:`IsolationError`
+    unless ``path`` (RESOLVED, symlink-followed) stays under ``workspace_root`` and never reaches
+    the operator-laptop flow store.
+
+    This is the STRUCTURAL confinement the OpenHands file tools LACK. The shipped ``FileEditorTool``
+    does not confine at all: its ``workspace_root`` is cosmetic (path-SUGGESTION text only) and
+    ``FileEditor.validate_path`` has no containment check, so a stock editor would happily
+    ``view ~/.anneal-memory/`` (reading flow's identity) or ``create /etc/...``. The confined
+    executor (``levain.firing.openhands.tools``) calls this on EVERY command — reads (``view``)
+    INCLUDED, because a view of the flow store is an isolation LEAK (it pulls flow's memory into the
+    entity's context), not merely an unsafe write. String-inspecting the path for ``..`` / absolute
+    prefixes would be discipline (bypassable via symlink); resolve-then-check is structural — a
+    symlink planted inside the workspace that points out is caught by its RESOLVED target, exactly as
+    :func:`assert_entity_isolated` guards the store.
+
+    Distinct from :func:`assert_workspace_isolated`, which fences the workspace DIR itself in-tree
+    ONCE before the conversation starts; this fences each individual tool PATH against that dir,
+    per op — the point-of-use invariant for the file surface (the ⚛️ physicist minting discipline
+    applied to executor tools: authority is minted + enforced at USE, never certified once).
+
+    STRUCTURAL LIMIT (welded here so it's not silently assumed away): this is a resolve-then-check
+    fence, which confines a symlink (``.resolve()`` follows it) but CANNOT see a **hardlink** (no
+    link to follow — it resolves in-tree) and does not police the SDK's own directory-listing walk
+    (a ``view`` of a dir the SDK enumerates 2 levels deep following child symlinks). A file-editor-
+    only entity cannot reach those (it has no symlink/hardlink primitive and no concurrency), so
+    they are out of THIS slice's threat model — but they go live the moment bash hands or an
+    untrusted party can pre-populate the workspace, and THAT is why bash is a dedicated OS-sandbox
+    slice (an in-process fence is not sufficient once the workspace is writable by anything but this
+    entity). See ``levain.firing.openhands.tools`` for the full caveat."""
+    try:
+        root = Path(workspace_root).expanduser().resolve()
+        resolved = Path(path).expanduser().resolve()
+    except (ValueError, OSError) as exc:
+        # A malformed path (embedded NUL, over-long, un-stat-able) can't be proven in-workspace →
+        # FAIL CLOSED as an isolation refusal (`structural_invariants_beat_discipline`): every caller
+        # of the fence gets the fail-closed guarantee, so a hostile path the LLM can emit (a NUL in
+        # the tool-call `path`) is a REFUSAL, not a raw ValueError crashing the turn/REPL.
+        raise IsolationError(
+            f"file path {path!r} could not be safely resolved ({exc}) — refused."
+        ) from exc
+    if _is_within_ci(resolved, flow_store_dir().resolve()):
+        raise IsolationError(
+            f"file path {resolved} is under the operator-laptop flow store {flow_store_dir()} — "
+            "an entity's file authority must never touch flow's memory."
+        )
+    if not _is_within(resolved, root):
+        raise IsolationError(
+            f"file path {resolved} escapes the entity workspace {root} — the entity's file "
+            "authority is confined to its own workspace/."
         )
 
 

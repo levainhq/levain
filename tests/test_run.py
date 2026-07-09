@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from levain.run import _latest_agent_text, _resolve_model, run_entity
+from levain.firing.agent_reply import humanize_finish_json, tool_action_summary
+from levain.run import (
+    _latest_agent_text,
+    _resolve_model,
+    _turn_tool_activity,
+    run_entity,
+)
 
 
 def _openhands_entity(tmp_path: Path, name: str = "ent") -> Path:
@@ -113,6 +119,110 @@ def test_latest_agent_text_none_on_empty():
     assert _latest_agent_text([]) is None
 
 
+# ---------- spore-297: finish/think-as-JSON-text reply (observed live on minimax-m3) ----------
+
+# The EXACT shape observed live (2026-07-09): the model emits its think + finish tool calls as
+# concatenated JSON TEXT in a MessageEvent instead of structured tool calls.
+_FINISH_JSON_REPLY = (
+    '{"name": "think", "arguments": {"summary": "s", "thought": "the scratchpad"}}\n'
+    '{"name": "finish", "arguments": {"summary": "s", "message": "Can\'t do it, Phill — straight up."}}'
+)
+
+
+def test_humanize_finish_json_extracts_message_and_drops_think():
+    assert humanize_finish_json(_FINISH_JSON_REPLY) == "Can't do it, Phill — straight up."
+
+
+def test_humanize_finish_json_single_finish_object():
+    blob = '{"name": "finish", "arguments": {"message": "hello there"}}'
+    assert humanize_finish_json(blob) == "hello there"
+
+
+def test_humanize_finish_json_leaves_normal_reply_untouched():
+    assert humanize_finish_json("Done. Created hello.txt in your workspace.") == (
+        "Done. Created hello.txt in your workspace."
+    )
+
+
+def test_humanize_finish_json_leaves_json_with_trailing_prose_untouched():
+    # A legit reply that merely CONTAINS a JSON snippet (trailing prose) is never mangled.
+    text = '{"answer": 42} is the JSON you asked for.'
+    assert humanize_finish_json(text) == text
+
+
+def test_humanize_finish_json_leaves_non_finish_json_untouched():
+    # A pure JSON answer that is not a finish tool call is preserved as-is (not eaten).
+    text = '{"answer": 42}'
+    assert humanize_finish_json(text) == text
+
+
+def test_latest_agent_text_unwraps_finish_json_reply():
+    # The fix reaches the display path: an agent MessageEvent carrying the JSON blob renders the
+    # finish message, not raw JSON.
+    events = [_Event("user", ["read ../notes"]), _Event("agent", [_FINISH_JSON_REPLY])]
+    assert _latest_agent_text(events) == "Can't do it, Phill — straight up."
+
+
+# ---------- tool-activity render (step 6 — the entity's hands are visible) ----------
+
+
+class _FileAction:
+    def __init__(self, command, path, kind="FileEditorAction"):
+        self.command = command
+        self.path = path
+        self.kind = kind
+
+
+class _ActionEvent:
+    """An ActionEvent stand-in — a real tool call (tool_name + action), not a message."""
+
+    def __init__(self, tool_name, action, source="agent"):
+        self.source = source
+        self.tool_name = tool_name
+        self.action = action
+        self.llm_message = None
+
+
+def test_tool_action_summary_reads_command_and_path():
+    ev = _ActionEvent("file_editor", _FileAction("create", "/ws/plan.md"))
+    assert tool_action_summary(ev) == ("file_editor", "create /ws/plan.md")
+
+
+def test_tool_action_summary_ignores_finish():
+    # The finish IS the reply (surfaced by finish_message), not tool activity.
+    assert tool_action_summary(_FinishEvent("done")) is None
+
+
+def test_tool_action_summary_ignores_message_event():
+    assert tool_action_summary(_Event("agent", ["just talking"])) is None
+
+
+def test_tool_action_summary_ignores_think_builtin():
+    # The SDK auto-adds `think` to EVERY agent (even tools=None) — it's the model's scratchpad, not
+    # workspace activity. Rendering it would spam `⚙ think: ThinkAction` and, in --no-tools, would
+    # contradict the "tools: none" banner (apparatus L1 note #3).
+    assert tool_action_summary(_ActionEvent("think", _FileAction("", "", kind="ThinkAction"))) is None
+
+
+def test_turn_tool_activity_shows_this_turns_ops_workspace_relative(tmp_path):
+    ws = tmp_path / "ws"
+    events = [
+        _Event("user", ["earlier"]),
+        _ActionEvent("file_editor", _FileAction("create", f"{ws}/old.md")),
+        _Event("user", ["now edit it"]),  # the latest turn starts here
+        _ActionEvent("file_editor", _FileAction("str_replace", f"{ws}/plan.md")),
+        _FinishEvent("done"),
+    ]
+    lines = _turn_tool_activity(events, ws)
+    # Only THIS turn's action, path shown relative to the workspace, the finish excluded.
+    assert lines == ["⚙ file_editor: str_replace plan.md"]
+
+
+def test_turn_tool_activity_empty_for_a_pure_conversation_turn(tmp_path):
+    events = [_Event("user", ["hi"]), _FinishEvent("hello")]
+    assert _turn_tool_activity(events, tmp_path / "ws") == []
+
+
 # ---------- pre-flight guards (run BEFORE the openhands import) ----------
 
 def test_run_entity_refuses_non_entity_dir(tmp_path: Path, capsys):
@@ -196,3 +306,42 @@ def test_run_entity_returns_2_on_isolation_refusal(
     rc = run_entity(entity)
     assert rc == 2
     assert "sovereignty guard REFUSED" in capsys.readouterr().out
+
+
+def _spy_build_entity_agent(monkeypatch, captured):
+    """Spy `build_entity_agent` to capture the `tools=` it was handed, then bail out early (raise
+    IsolationError → run_entity returns 2), so we assert the tool-building branch WITHOUT a live
+    model."""
+    from levain.firing.isolation import IsolationError
+
+    def _spy(entity_dir, llm, *, tools=None, **_kw):
+        captured["tools"] = tools
+        raise IsolationError("captured — stop here")
+
+    monkeypatch.setattr("levain.firing.openhands.entity.build_entity_agent", _spy)
+
+
+def test_run_entity_passes_confined_tools_by_default(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    rc = run_entity(entity, with_tools=True)
+    assert rc == 2
+    # The default entity gets the confined file-editor bundle (WARNING-2 plumbing guard).
+    assert captured["tools"] is not None
+    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+
+
+def test_run_entity_no_tools_passes_none(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    rc = run_entity(entity, with_tools=False)
+    assert rc == 2
+    assert captured["tools"] is None  # --no-tools → a pure conversational partner

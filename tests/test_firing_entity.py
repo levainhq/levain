@@ -148,6 +148,34 @@ def test_bind_entity_rejects_dir_inside_flow_store(tmp_path, monkeypatch):
 # --- build_entity_agent: the isolated agent -----------------------------------------
 
 
+def test_confined_file_tool_lands_on_the_built_agent(tmp_path):
+    """The #1 confinement invariant, end-to-end (apparatus L1 WARNING-1 regression guard): a REAL
+    built agent, once initialized, resolves ``file_editor`` to the CONFINED executor — not the stock
+    unconfined one. The whole moat rests on three SDK behaviors (the registry resolves the spec via
+    ``.create``, ``set_executor`` sticks, ``tools_map`` keys on the resolved ``.name``); a future SDK
+    bump could silently break any one and hand the entity the UNCONFINED editor with every unit test
+    still green. This asserts the resolved runtime tool, so that regression fails LOUD."""
+    from openhands.sdk import Conversation
+
+    from levain.firing.openhands.tools import (
+        WorkspaceConfinedFileEditorExecutor,
+        build_entity_tools,
+    )
+
+    ent = _seed(_entity(tmp_path))
+    ws = ent / "workspace"
+    ws.mkdir()
+    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    conv = Conversation(binding.agent, workspace=str(ws), visualizer=None)
+    try:
+        conv.agent.init_state(conv._state, on_event=lambda _e: None)  # resolves tools, no LLM call
+        tool = conv.agent.tools_map["file_editor"]  # the LLM-visible name (not the spec key)
+        assert isinstance(tool.executor, WorkspaceConfinedFileEditorExecutor)
+        assert tool.executor._confine_root == str(ws)
+    finally:
+        conv.close()
+
+
 def test_build_entity_agent_wires_isolated_kind(tmp_path):
     ent = _entity(tmp_path)
     binding = build_entity_agent(ent, _stub_llm())

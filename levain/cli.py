@@ -258,9 +258,9 @@ def main(argv: list[str] | None = None) -> int:
             "--adapter openhands`) as an interactive REPL — 'use it like Claude "
             "Code, but sovereign': it runs on an open model (Ollama by default), "
             "carries its OWN memory, and NEVER touches this laptop's flow store "
-            "(the sovereignty guard fail-closes before the first turn). This first "
-            "slice is a conversational partner (no executor tools); the file "
-            "workspace is confined to <entity>/workspace/. Needs the OpenHands "
+            "(the sovereignty guard fail-closes before the first turn). It has "
+            "confined file-editor HANDS, structurally fenced to <entity>/workspace/ "
+            "(--no-tools for a pure conversational partner). Needs the OpenHands "
             "runtime: pip install 'levain[openhands]'."
         ),
     )
@@ -291,6 +291,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="api_key",
         help="API key for the endpoint, if it needs one (local Ollama does not).",
+    )
+    run_p.add_argument(
+        "--no-tools",
+        action="store_false",
+        dest="with_tools",
+        help=(
+            "Run as a pure conversational partner (no executor tools). Default: the entity gets "
+            "confined file-editor hands, structurally fenced to its own workspace/."
+        ),
     )
     run_p.set_defaults(func=_cmd_run)
 
@@ -675,6 +684,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
+        with_tools=args.with_tools,
     )
 
 

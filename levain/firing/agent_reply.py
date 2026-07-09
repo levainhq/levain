@@ -18,8 +18,17 @@ Two SDK realities it encodes (verified against OpenHands 1.26.0, 2026-07-08):
 """
 from __future__ import annotations
 
+import json
+
 # The discriminator of the built-in ``finish`` tool's action (a stable pydantic ``.kind``).
 FINISH_ACTION_KIND = "FinishAction"
+
+# The built-in SDK actions that are NOT executor/workspace tool calls: ``finish`` is the assistant's
+# reply (surfaced by ``finish_message``), ``think`` is the model's private scratchpad — the SDK adds
+# BOTH to every agent (``think`` is present even with ``tools=None``). Neither is workspace activity,
+# so the REPL's tool-activity render skips them; without the ``think`` skip, ``--no-tools`` would
+# render ``⚙ think: ThinkAction`` every turn, contradicting the "tools: none" banner.
+_BUILTIN_ACTION_KINDS = frozenset({FINISH_ACTION_KIND, "ThinkAction"})
 
 # A stable, SPAN-of-two-sentences fragment of the SDK's corrective-nudge text
 # (agent/response_dispatch.py). Long enough that a real human is vanishingly unlikely to type
@@ -55,6 +64,68 @@ def finish_message(event) -> str | None:
         return None
     message = getattr(action, "message", None)
     return message.strip() if isinstance(message, str) and message.strip() else None
+
+
+def tool_action_summary(event) -> tuple[str, str] | None:
+    """``(tool_name, detail)`` for an agent ActionEvent that is a REAL tool call, else ``None``.
+
+    Duck-typed (no ``openhands`` import), so the REPL's tool-activity render stays in the SDK-free
+    test tier. Returns ``None`` for a non-action event, a message event, or a built-in control action
+    (``finish`` — surfaced as the reply by :func:`finish_message`; ``think`` — the model's private
+    scratchpad, on every agent even ``tools=None``); neither is workspace activity. ``detail`` is
+    a compact ``"<command> <path>"`` for a file-editor action, else the action ``kind`` — enough for
+    the operator to SEE what the entity DID to its workspace (a file op must never be invisible)."""
+    tool_name = getattr(event, "tool_name", None)
+    action = getattr(event, "action", None)
+    if not tool_name or action is None:
+        return None
+    if getattr(action, "kind", None) in _BUILTIN_ACTION_KINDS:
+        return None  # finish is the reply; think is the model's scratchpad — neither is workspace activity
+    command = getattr(action, "command", None)
+    path = getattr(action, "path", None)
+    if command and path:
+        return tool_name, f"{command} {path}"
+    return tool_name, str(getattr(action, "kind", "") or "")
+
+
+def humanize_finish_json(text: str) -> str:
+    """spore-297: a weak open model (minimax-m3, verified live 2026-07-09) sometimes emits its tool
+    calls as JSON TEXT instead of structured tool calls — e.g.::
+
+        {"name": "think", "arguments": {"summary": "...", "thought": "..."}}
+        {"name": "finish", "arguments": {"summary": "...", "message": "the real reply"}}
+
+    — so the REPL (and the captured episode) would show raw JSON instead of the reply. If ``text`` is
+    one-or-more CONCATENATED tool-call JSON objects, return the ``finish`` call's ``arguments.message``
+    (the human reply), dropping ``think`` (the scratchpad). Otherwise return ``text`` UNCHANGED — a
+    normal reply that merely contains a brace or a JSON snippet is never mangled: trailing prose after
+    a JSON object, a non-dict, or a JSON object that is not a ``finish`` tool call all leave it as-is.
+    Conservative by design — it only unwraps a clean, entirely-tool-call-JSON payload that carries a
+    ``finish`` message, so it fixes the observed failure without ever eating a legitimate answer."""
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return text
+    decoder = json.JSONDecoder()
+    objs: list[dict] = []
+    idx, n = 0, len(stripped)
+    while idx < n:
+        while idx < n and stripped[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, idx = decoder.raw_decode(stripped, idx)
+        except ValueError:
+            return text  # not a clean, entirely-JSON tool-call payload → leave untouched
+        if not isinstance(obj, dict):
+            return text
+        objs.append(obj)
+    for obj in objs:
+        if obj.get("name") == "finish":
+            message = (obj.get("arguments") or {}).get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+    return text  # no finish message found → don't fabricate a reply from the scratchpad
 
 
 def is_corrective_nudge(event) -> bool:

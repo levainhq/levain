@@ -17,12 +17,14 @@ use"):
     it). Nothing added here.
   - **files** — the OpenHands ``workspace`` is confined to ``<entity>/workspace/``, NEVER
     the operator's cwd or ``$HOME``. ENFORCED (not merely documented) by
-    ``assert_workspace_isolated`` before the workspace is created, so a symlink escape is
-    refused and file authority is bounded the moment executor tools arrive.
-  - **tools** — this first slice runs with NO executor tools (``build_entity_agent``
-    defaults ``tools=[]``): a sovereign conversational partner with memory. Executor
-    tools are the explicit NEXT slice, added under the same per-run minting discipline
-    (a confined ``{bash, file}`` bundle), NOT an ambient grant.
+    ``assert_workspace_isolated`` before the workspace is created (a symlink escape of the
+    workspace DIR is refused), AND per-op by the confined file tool below (every tool path is
+    resolved + fenced to the workspace before it touches the filesystem).
+  - **tools** — STEP 6: the entity now gets confined HANDS — a file-editor tool structurally
+    fenced to ``<entity>/workspace/`` (``levain.firing.openhands.tools.build_entity_tools``),
+    so it moves from conversation to agency without ever reaching the flow store. bash is a
+    later OS-sandbox slice (a persistent host shell can't be confined in-process). Pass
+    ``with_tools=False`` (``levain run --no-tools``) for a pure conversational partner.
   - **relay** — none wired.
 
 Requires the ``openhands`` extra (``pip install 'levain[openhands]'``). The heavy imports
@@ -40,8 +42,10 @@ from typing import Any
 
 from levain.firing.agent_reply import (
     finish_message,
+    humanize_finish_json,
     is_corrective_nudge,
     message_event_text,
+    tool_action_summary,
 )
 from levain.install import effective_adapter
 from levain.firing.isolation import (
@@ -86,8 +90,10 @@ def _latest_agent_text(events) -> str | None:
         if getattr(e, "source", None) != "agent":
             continue
         text = message_event_text(e) or finish_message(e)
-        if text and text not in parts:  # dedup a finish echoing a prior MessageEvent
-            parts.append(text)
+        if text:
+            text = humanize_finish_json(text)  # spore-297: unwrap finish/think-as-JSON-text
+            if text not in parts:  # dedup a finish echoing a prior MessageEvent
+                parts.append(text)
     return "\n".join(parts) if parts else None
 
 
@@ -130,8 +136,12 @@ def run_entity(
     model: str = "minimax-m3:cloud",
     base_url: str = "http://localhost:11434",
     api_key: str | None = None,
+    with_tools: bool = True,
 ) -> int:
     """Run the interactive REPL for the isolated entity at ``path``.
+
+    ``with_tools`` (default True, STEP 6) grants the entity its confined file-editor hands (fenced
+    to ``<entity>/workspace/``); ``False`` (``--no-tools``) runs a pure conversational partner.
 
     Returns a process exit code: 0 on a clean session, 2 for a usage/environment error
     (missing extra, not an initialized entity, isolation refusal) surfaced BEFORE the loop.
@@ -154,6 +164,7 @@ def run_entity(
         from openhands.sdk import LLM, Conversation
 
         from levain.firing.openhands.entity import build_entity_agent
+        from levain.firing.openhands.tools import build_entity_tools
     except ImportError as exc:
         print(
             "levain run: the OpenHands runtime is not installed.\n"
@@ -177,16 +188,22 @@ def run_entity(
     try:
         llm = LLM(model=_resolve_model(model), base_url=base_url, api_key=api_key,
                   usage_id="levain-run")
-        binding = build_entity_agent(entity_dir, llm)
+        # STEP 6: the confined file-editor bundle (structurally fenced to <entity>/workspace/) —
+        # the entity's hands. `build_entity_tools` is the ONLY blessed file-tool builder, confined
+        # by construction; `None` (--no-tools) = a pure conversational partner.
+        entity_tools = build_entity_tools() if with_tools else None
+        binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
         workspace = entity_dir / _WORKSPACE_SUBDIR
         assert_workspace_isolated(workspace, entity_dir=entity_dir)
         workspace.mkdir(parents=True, exist_ok=True)
         # Re-guard AFTER mkdir, right before use (codex L3 TOCTOU): mkdir(exist_ok=True)
         # follows a symlink swapped in after the first assert, so re-assert at the point of
-        # use — the invariant fires at USE, not once at validation.
+        # use — the invariant fires at USE, not once at validation. (The confined file tool ALSO
+        # re-guards every path per op, so this is the workspace-DIR fence; the tool is the per-file
+        # fence — defense-in-depth, both structural.)
         assert_workspace_isolated(workspace, entity_dir=entity_dir)
-        # visualizer=None: the REPL owns all output (with zero tools the only event worth
-        # showing is the assistant reply, which we render). `Any`: the SDK types
+        # visualizer=None: the REPL owns all output (it renders the turn's tool activity + the
+        # assistant reply itself, so the SDK's own visualizer would double-print). `Any`: the SDK types
         # `Conversation(...)` as the abstract `BaseConversation`, which under-declares the
         # concrete `send_message` / `state` surface (shipped `capture.vagus_run` sidesteps
         # this by leaving its conversation param untyped).
@@ -203,7 +220,7 @@ def run_entity(
         )
         return 2
 
-    _print_banner(entity_dir, binding, model=_resolve_model(model))
+    _print_banner(entity_dir, binding, model=_resolve_model(model), with_tools=with_tools)
 
     interrupted = False
     try:
@@ -241,8 +258,7 @@ def run_entity(
                 interrupted = True
                 break
 
-            reply = _latest_agent_text(conversation.state.events)
-            print(f"\n\033[1m{_entity_label(binding)} ›\033[0m {reply or '(no reply)'}")
+            _render_turn(conversation, binding, workspace)
     finally:
         _close_quietly(conversation)
 
@@ -250,10 +266,46 @@ def run_entity(
     return 0
 
 
+def _turn_tool_activity(events, workspace: Path) -> list[str]:
+    """The tool actions the entity ran THIS turn (since the last genuine user message), as compact
+    display lines — so a workspace file op is VISIBLE, never silent (with hands, a turn is no longer
+    just a reply). Paths are shown workspace-relative for readability; the boundary skips the SDK's
+    synthetic corrective nudge exactly as ``_latest_agent_text`` does, so activity keys on the real
+    turn."""
+    evs = list(events)
+    last_user = None
+    for i in range(len(evs) - 1, -1, -1):
+        if getattr(evs[i], "source", None) == "user" and not is_corrective_nudge(evs[i]):
+            last_user = i
+            break
+    start = 0 if last_user is None else last_user
+    prefix = str(workspace).rstrip(os.sep) + os.sep
+    lines: list[str] = []
+    for e in evs[start:]:
+        if getattr(e, "source", None) != "agent":
+            continue
+        summary = tool_action_summary(e)
+        if summary is None:
+            continue
+        tool_name, detail = summary
+        lines.append(f"⚙ {tool_name}: {detail.replace(prefix, '')}")
+    return lines
+
+
+def _render_turn(conversation: Any, binding, workspace: Path) -> None:
+    """Print the turn: the entity's tool ACTIVITY (what it did to its workspace) then its reply."""
+    events = conversation.state.events
+    for line in _turn_tool_activity(events, workspace):
+        print(f"  \033[2m{line}\033[0m")  # dim — activity is context, the reply is the message
+    reply = _latest_agent_text(events)
+    print(f"\n\033[1m{_entity_label(binding)} ›\033[0m {reply or '(no reply)'}")
+
+
 def _close_quietly(conversation: Any) -> None:
-    """Release the SDK conversation's resources (a no-op with zero tools — atexit also calls
-    close() — but the REPL owns one session per process, and executor tools next slice hold
-    subprocesses that close() frees, so close deterministically here)."""
+    """Release the SDK conversation's resources (atexit also calls close(), but the REPL owns one
+    session per process, so close deterministically here). The file executor is in-process and holds
+    no subprocess; the future bash slice's OS-sandbox process is what will make this teardown
+    load-bearing."""
     try:
         conversation.close()
     except Exception:  # noqa: BLE001 — teardown must never raise
@@ -265,9 +317,9 @@ def _entity_label(binding) -> str:
     return binding.entity_dir.name
 
 
-def _print_banner(entity_dir: Path, binding, *, model: str) -> None:
+def _print_banner(entity_dir: Path, binding, *, model: str, with_tools: bool) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores
-    this entity reads/writes, so sovereignty is VISIBLE, not merely asserted."""
+    this entity reads/writes AND what hands it has, so sovereignty is VISIBLE, not merely asserted."""
     print("=" * 66)
     print(f"  levain run — {entity_dir.name}  (sovereign entity)")
     print("=" * 66)
@@ -275,7 +327,10 @@ def _print_banner(entity_dir: Path, binding, *, model: str) -> None:
     print(f"  memory:    {binding.episodic_path}")
     print(f"             {binding.crystal_path}")
     print(f"  workspace: {entity_dir / _WORKSPACE_SUBDIR}")
-    print("  tools:     none (conversational partner; executor tools are a later slice)")
+    if with_tools:
+        print("  tools:     file_editor (confined to workspace/ — cannot reach the flow store)")
+    else:
+        print("  tools:     none (conversational partner; --no-tools)")
     print()
     print("  Talk to it. It recalls its OWN memory and captures each turn there.")
     print("  :quit (or Ctrl-D) to end the session.")
