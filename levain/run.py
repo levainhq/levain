@@ -50,7 +50,7 @@ from levain.firing.isolation import (
     assert_workspace_isolated,
 )
 
-__all__ = ["run_entity"]
+__all__ = ["run_entity", "require_openhands_entity"]
 
 # The confined file-authority root for a run: a sibling of the sovereign store, NEVER the
 # operator's cwd/$HOME. With zero tools it stays inert, but the fence is structural so
@@ -101,6 +101,29 @@ def _resolve_model(model: str) -> str:
     return model if "/" in model else f"ollama/{model}"
 
 
+def require_openhands_entity(entity_dir: Path) -> str | None:
+    """Return an error message if ``entity_dir`` is not a clean, initialized OpenHands entity,
+    else ``None``.
+
+    Shared by ``levain run`` and ``levain wrap`` so both agree on EXACTLY what a runnable /
+    wrappable sovereign entity is: an initialized ``.levain/`` store AND a CLEAN openhands adapter
+    (hosted files dominate a possibly-stale marker, via :func:`~levain.install.effective_adapter` —
+    so a claude-code/codex store or a residue-bearing mixed install is refused, not silently driven).
+    The caller prefixes its own ``levain run:`` / ``levain wrap:`` label and prints; this returns the
+    bare reason + fix so the two commands can't drift on the definition."""
+    if not (entity_dir / ENTITY_STORE_SUBDIR).is_dir():
+        return (
+            f"{entity_dir} is not an initialized Levain entity (no {ENTITY_STORE_SUBDIR}/).\n"
+            f"  Create one first:  levain init --adapter openhands --path {entity_dir}"
+        )
+    if effective_adapter(entity_dir) != "openhands":
+        return (
+            f"{entity_dir} is a Levain store, but not a clean OpenHands entity.\n"
+            f"  Re-scaffold it as one:  levain init --adapter openhands --path {entity_dir}"
+        )
+    return None
+
+
 def run_entity(
     path: Path,
     *,
@@ -115,24 +138,13 @@ def run_entity(
     """
     entity_dir = Path(str(path)).expanduser().resolve()
 
-    if not (entity_dir / ENTITY_STORE_SUBDIR).is_dir():
-        print(
-            f"levain run: {entity_dir} is not an initialized Levain entity "
-            f"(no {ENTITY_STORE_SUBDIR}/).\n"
-            f"  Create one first:  levain init --adapter openhands --path {entity_dir}"
-        )
-        return 2
-
-    # This command drives an OpenHands entity — require it to be a CLEAN openhands entity via
-    # the shared `effective_adapter` classifier (the same one doctor + verify use, so all
-    # three agree). Hosted files dominate a stale marker, so we never start an OpenHands agent
-    # against a claude-code/codex store or a residue-bearing mixed install — a bare .levain/
-    # store, or an openhands marker sitting on top of hosted-harness files, is not enough.
-    if effective_adapter(entity_dir) != "openhands":
-        print(
-            f"levain run: {entity_dir} is a Levain store, but not a clean OpenHands entity.\n"
-            f"  Re-scaffold it as one:  levain init --adapter openhands --path {entity_dir}"
-        )
+    # This command drives an OpenHands entity — require an initialized, CLEAN openhands entity
+    # (shared with `levain wrap` so both agree on the definition; `effective_adapter` lets hosted
+    # files dominate a stale marker, so a claude-code/codex or residue-bearing mixed install is
+    # refused, not silently driven).
+    err = require_openhands_entity(entity_dir)
+    if err:
+        print(f"levain run: {err}")
         return 2
 
     # Lazy — the entity chokepoint imports the OpenHands SDK at module level; keep it out

@@ -294,6 +294,82 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.set_defaults(func=_cmd_run)
 
+    wrap_p = subparsers.add_parser(
+        "wrap",
+        help="Consolidate a sovereign entity's memory — metabolize its episodes into felt memory.",
+        description=(
+            "Run the human-gated CONSOLIDATE for an ISOLATED entity (created with `levain init "
+            "--adapter openhands`): metabolize the raw episodes it captured while you talked to it "
+            "into its lasting 6-section memory, so its identity COMPOUNDS across sessions. The "
+            "entity's firing captures every turn but is forbidden to consolidate on its own — this "
+            "command is the explicit operator gate that does it. The compose step runs on the "
+            "entity's OWN open model by default (sovereign — it metabolizes its own memory with its "
+            "own mind); --composer points that step at a stronger model for a higher-quality wrap. "
+            "Reads/writes ONLY the entity's own store; NEVER touches this laptop's flow store. Needs "
+            "the OpenHands runtime: pip install 'levain[openhands]'."
+        ),
+    )
+    wrap_p.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=Path.cwd(),
+        help="The entity directory to consolidate (default: cwd).",
+    )
+    wrap_p.add_argument(
+        "--composer",
+        default="minimax-m3:cloud",
+        help=(
+            "The model that composes the consolidated memory (default: minimax-m3:cloud — the "
+            "sovereign default, the entity's own model). Point it at a stronger model (e.g. "
+            "--composer glm-5:cloud) for a higher-quality wrap. A bare name routes through Ollama "
+            "(ollama/<name>); a provider-prefixed name is used as-is."
+        ),
+    )
+    wrap_p.add_argument(
+        "--base-url",
+        default="http://localhost:11434",
+        dest="base_url",
+        help="The compose-model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    wrap_p.add_argument(
+        "--api-key",
+        default=None,
+        dest="api_key",
+        help="API key for the endpoint, if it needs one (local Ollama does not).",
+    )
+    wrap_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show the consolidation package (what WOULD be composed) and change nothing.",
+    )
+    wrap_p.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Discard a prior wrap left in progress by a crashed consolidate, then wrap fresh. Your "
+            "captured episodes are safe (they return to the next wrap)."
+        ),
+    )
+    wrap_p.add_argument(
+        "--affect-tag",
+        default=None,
+        dest="affect_tag",
+        help=(
+            "Optional emergent affective state during this consolidation (free-text, e.g. "
+            "'engaged') — tags the Hebbian associations formed this wrap. Omit for no modulation."
+        ),
+    )
+    wrap_p.add_argument(
+        "--affect-intensity",
+        type=float,
+        default=0.5,
+        dest="affect_intensity",
+        help="How strongly the --affect-tag state was felt, 0.0-1.0 (default 0.5). Ignored without --affect-tag.",
+    )
+    wrap_p.set_defaults(func=_cmd_wrap)
+
     web_p = subparsers.add_parser(
         "serve",
         help="Serve the substrate dashboard as a local web-app (localhost).",
@@ -599,6 +675,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
         model=args.model,
         base_url=args.base_url,
         api_key=args.api_key,
+    )
+
+
+def _cmd_wrap(args: argparse.Namespace) -> int:
+    from levain.wrap import wrap_entity
+
+    return wrap_entity(
+        path=args.path,
+        composer=args.composer,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        dry_run=args.dry_run,
+        reset=args.reset,
+        affect_tag=args.affect_tag,
+        affect_intensity=args.affect_intensity,
     )
 
 
