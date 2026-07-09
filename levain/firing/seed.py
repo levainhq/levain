@@ -133,10 +133,23 @@ _GUIDANCE_MARKERS: tuple[str, ...] = (
 
 def _is_guidance_blockquote(line: str) -> bool:
     """True iff a ``>`` line opens a TEMPLATE guidance blockquote (not an operator epigraph). ``line``
-    is already ``lstrip``ed and starts with ``>``; strip the marker + markdown emphasis and match a
-    known guidance opener (case-insensitive)."""
-    body = line.lstrip(">").strip().lstrip("*").strip().lower()
+    is already ``lstrip``ed and starts with ``>``; strip the marker + markdown emphasis (``*`` or ``_``)
+    and match a known guidance opener (case-insensitive)."""
+    body = line.lstrip(">").strip().lstrip("*_").strip().lower()
     return any(body.startswith(m) for m in _GUIDANCE_MARKERS)
+
+
+def _fence_marker(stripped: str) -> tuple[str, int] | None:
+    """``(fence_char, run_length)`` if ``stripped`` (an already-``lstrip``ed line) opens or closes a
+    code fence (≥3 leading ``` ``` ``` or ``~~~``), else ``None``. Markdown closes a fence only with
+    the SAME char and a run at least as long as the opener — tracking ``(char, length)`` (not a bare
+    ``in_fence`` bool) keeps a ``~~~`` line inside a ``` ``` ``` block, or a 3-backtick line inside a
+    4-backtick block, as fenced CONTENT rather than a spurious close (apparatus codex — the
+    fence-delimiter parser-state catch: "inside a fence" is not enough state)."""
+    for ch in ("`", "~"):
+        if stripped.startswith(ch * 3):
+            return ch, len(stripped) - len(stripped.lstrip(ch))
+    return None
 
 
 def _has_body(text: str) -> bool:
@@ -172,23 +185,37 @@ def _clean(text: str) -> str:
         (``> I am the space between signal and noise``) is KEPT. Position alone used to decide this,
         which silently ate leading epigraphs; content-matching fixes that and fails SAFE.
 
+    Guidance-block extent (apparatus codex, documented behavior): once a leading blockquote's FIRST
+    line is recognized guidance, the WHOLE contiguous ``>`` run is dropped — because a contiguous
+    ``>`` run IS one markdown blockquote, and the templates' guidance is multi-line (world.md:
+    ``> **Seed material`` / ``>`` / ``> **No fast-moving``; stopping at the first non-marker line
+    would LEAK the continuation). Consequence: an operator epigraph glued DIRECTLY onto a guidance
+    line with no blank separator is part of that same blockquote and is consumed — a blank line (a
+    separate blockquote) preserves it. That is the intended markdown-correct rule, not a gap.
+
     Unfilled ``{{SLOTS}}`` are left as-is: a properly onboarded entity has none (``doctor`` flags a
     raw seed), and blindly stripping them would mangle any real content that legitimately contains
     braces."""
     kept: list[str] = []
-    in_fence = False
+    fence: tuple[str, int] | None = None  # (char, run-length) of the OPEN code fence, or None
     in_comment = False  # inside a multi-line <!-- --> that opened on an earlier (non-fenced) line
     in_leading = True  # leading region: only headings / blanks / (skipped) guidance seen so far
     skipping_guidance = False  # consuming the rest of a recognized leading guidance blockquote block
     for raw in text.splitlines():
         stripped = raw.lstrip()
-        # A fence marker toggles the fence UNLESS we're mid-comment (then it's comment text).
-        if not in_comment and stripped.startswith(("```", "~~~")):
-            in_fence = not in_fence
+        # A fence marker opens/closes ONLY on the matching delimiter (same char, run >= opener) —
+        # and never mid-comment (then it is comment text). A mismatched marker inside a fence is
+        # fenced content.
+        marker = None if in_comment else _fence_marker(stripped)
+        if marker is not None:
+            if fence is None:
+                fence = marker  # open
+            elif marker[0] == fence[0] and marker[1] >= fence[1]:
+                fence = None  # close
             in_leading = skipping_guidance = False  # a code fence is body — past any leading guidance
             kept.append(raw)
             continue
-        if in_fence:
+        if fence is not None:
             kept.append(raw)  # never touch fenced content (comments included)
             continue
         ln, in_comment = _strip_html_comments(raw, in_comment)

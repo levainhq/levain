@@ -395,6 +395,70 @@ def test_seed_dir_present_is_fail_soft_on_permission_error(tmp_path):
         os.chmod(ent, 0o755)
 
 
+def test_mismatched_fence_marker_is_fenced_content(tmp_path):
+    """apparatus codex (final verify): a ~~~ line inside a ``` fence — or a 3-backtick inside a
+    4-backtick fence — is fenced CONTENT, not a spurious close. So a literal <!-- --> after it, still
+    inside the fence, survives (the 'fenced code untouched' guarantee holds with (char,len) tracking)."""
+    bt, bt4 = "`" * 3, "`" * 4
+    ent = _seed_entity(tmp_path, files=("world.md", "partnership.md"))
+    (ent / SEED_SUBDIR / "origin.md").write_text(
+        f"# Who You Are — Z\n\nYou are **Z**.\n\n{bt}\n"
+        f"~~~ not a closing fence\n<!-- literal comment stays -->\n{bt}\n\n"
+        f"{bt4}\n{bt}\ninner three-backticks\n{bt}\n{bt4}\n",
+        encoding="utf-8",
+    )
+    c = EntitySeed(ent).constitution() or ""
+    assert "~~~ not a closing fence" in c
+    assert "<!-- literal comment stays -->" in c
+    assert "inner three-backticks" in c
+
+
+def test_multiline_contiguous_guidance_is_fully_stripped(tmp_path):
+    """The world.md guidance is a MULTI-line blockquote; stripping only the first line would leak the
+    continuation. The whole contiguous `>` run (opened by a guidance marker) is dropped."""
+    ent = _seed_entity(tmp_path, files=("origin.md", "partnership.md"))
+    (ent / SEED_SUBDIR / "world.md").write_text(
+        "# Who Your Operator Is\n\n"
+        "> **Seed material — operator template.** blah blah.\n"
+        ">\n"
+        "> **No fast-moving state.** more guidance text.\n\n"
+        "## Identity\n\nPhill Clapham. Columbus.\n",
+        encoding="utf-8",
+    )
+    c = EntitySeed(ent).constitution() or ""
+    assert "Seed material" not in c and "No fast-moving" not in c  # whole block gone
+    assert "Phill Clapham" in c  # real content survives
+
+
+def test_glued_epigraph_consumed_but_blank_separated_survives(tmp_path):
+    """Documented behavior (apparatus codex): a contiguous `>` run IS one blockquote — an epigraph
+    glued onto a guidance line (no blank) is part of that block and consumed; a blank-separated
+    epigraph is a SEPARATE block and survives."""
+    ent = _seed_entity(tmp_path, files=("world.md", "partnership.md"))
+    # glued (no blank between) → consumed with the guidance
+    (ent / SEED_SUBDIR / "origin.md").write_text(
+        "# Who You Are — Z\n\n"
+        "> Part of the seed. strip this.\n"
+        "> glued epigraph with no blank line\n\n"
+        "You are **Z**.\n",
+        encoding="utf-8",
+    )
+    glued = EntitySeed(ent).constitution() or ""
+    assert "glued epigraph" not in glued and "You are **Z**" in glued
+
+    # blank-separated → a separate blockquote, survives
+    ent2 = _seed_entity(tmp_path / "e2", files=("world.md", "partnership.md"))
+    (ent2 / SEED_SUBDIR / "origin.md").write_text(
+        "# Who You Are — Z\n\n"
+        "> Part of the seed. strip this.\n\n"
+        "> a real epigraph, blank-separated\n\n"
+        "You are **Z**.\n",
+        encoding="utf-8",
+    )
+    sep = EntitySeed(ent2).constitution() or ""
+    assert "a real epigraph, blank-separated" in sep and "strip this" not in sep
+
+
 def test_has_body_excludes_rules_and_fence_markers(tmp_path):
     """apparatus codex low-med: a file that cleans to headings + a horizontal rule / bare fence is
     still hollow (no substantive identity body)."""
