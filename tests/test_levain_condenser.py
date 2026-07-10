@@ -161,12 +161,17 @@ def test_both_handles_built_on_construction():
 
 
 def test_normal_turn_injects_firing_only_no_reanchor():
-    cond = LevainCondenser.build(inner=_LViewInner(), presence=StubPresence(reanchor_text="RE"))
+    # A DISTINCTIVE sentinel (the sibling tests use "REANCHOR-MARK" / "ONCE"): a 2-char "RE" now
+    # collides with the firing directive's own "[RECENCY …]" text, so absence-of-re-anchor needs a
+    # marker that can't appear in real recall/directive content.
+    cond = LevainCondenser.build(
+        inner=_LViewInner(), presence=StubPresence(reanchor_text="REANCHOR-SENTINEL")
+    )
     out = cond.condense(_user_view())
     assert isinstance(out, View)
     # exactly ONE event added (the firing inject) — no compaction, so no re-anchor
     assert len(out.events) == len(_user_view().events) + 1
-    assert "RE" not in _last_text(out)
+    assert "REANCHOR-SENTINEL" not in _last_text(out)
     assert out.events[-1].llm_message.role == "system"
 
 

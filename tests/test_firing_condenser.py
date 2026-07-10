@@ -396,12 +396,21 @@ def test_anneal_directive_advances_through_condenser_with_constant_view():
     cond = VagusCondenser.build(
         inner=_ViewInner(), firing=AnnealFiring(crystal_path=Path("/no/such/store"))
     )
-    directives = [
-        cond.condense(_user_view()).events[-1].llm_message.content[0].text.rsplit("\n", 1)[-1]
+    injected = [
+        cond.condense(_user_view()).events[-1].llm_message.content[0].text
         for _ in range(3)
     ]
-    assert directives == [select_directive(1), select_directive(2), select_directive(3)]
-    assert len(set(directives)) == 3  # all differ — rotation lives
+    expected = [select_directive(1), select_directive(2), select_directive(3)]
+    # The directive is injected at the TAIL (``f"{recall}\n{directive}"``). Directives are now
+    # MULTI-LINE (the full recency bodies), so match the whole directive by suffix — a last-line
+    # heuristic (the prior ``rsplit("\n", 1)[-1]``) would compare only its final line.
+    assert [t.endswith(e) for t, e in zip(injected, expected)] == [True, True, True]
+    assert len(set(injected)) == 3  # all differ — rotation lives
+
+
+# NB: the pure-constant drift-lock tests (directive parity + operator-neutrality) live in the
+# base-lane ``test_firing_contract.py`` — NOT here — because this module is
+# ``pytest.importorskip("openhands.sdk")``-gated and the drift-lock must run without the extra.
 
 
 @pytest.mark.skipif(

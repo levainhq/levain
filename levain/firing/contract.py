@@ -180,10 +180,75 @@ def build_firing(kind: str) -> FiringContract:
 # The rotating anti-gatekeeping directives (drift-defense). Shared by every firing kind so
 # the rotation POLICY lives in one place (StubFiring rotates on its call counter; the real
 # kinds rotate on ``req.turn_index`` — pure + race-free, the design intent of ``turn_index``).
+#
+# These are the FULL recency directives, at byte-parity with the operator-editable activation
+# template ``levain/templates/activation/recency_directives.md`` — the "second sourdough surface"
+# the HOOKED adapters (Claude Code / Codex) inject via their ``UserPromptSubmit`` hook. The
+# OpenHands entity is HOOKLESS (``init --adapter openhands`` lays down NO activation tree — the
+# ``LevainCondenser`` IS its activation, per step 3), so it cannot read that file; this package
+# constant is the ONE per-turn drift-defense surface it has. Spore-296 (package locus, Phill
+# 2026-07-10) folds the rich directives in HERE, not into the entity seed: the drift-defense is
+# UNIVERSAL machinery (NOT the identity moat — the seed owns identity), so one canonical set lives
+# in the package and a package upgrade improves every entity at once. The base-lane
+# ``test_firing_contract.test_directive_parity_with_shared_activation_template`` locks this tuple to
+# the shared template's block bodies, extracted by the REAL ``_levain_hook.read_blocks`` (``canonical
+# _object_model_plus_replaceable_surfaces``: one directive set, two injection surfaces — the hook and
+# the condenser — kept in sync so a template improvement lifts BOTH). The lock is over the package
+# DEFAULTS (both shipped in the wheel); a per-entity operator editing their own installed copy is
+# expected + ungoverned. We carry the GENERIC shared set (broad cross-model failure classes), NOT the
+# Codex-lineage-tuned copy: the entity runs assorted OPEN models (a third lineage vs Claude/OpenAI),
+# so a substrate-tuned open-model set is a later sourdough-grow — at which point the lock re-points.
+# These SUPERSET the prior terse trio (completion-theater · depth · honesty · gatekeeping ·
+# positive-scan all covered). Kept in ``read_blocks`` block-body form so the parity test is exact.
 DIRECTIVES: tuple[str, ...] = (
-    "Partnership brain: depth > completion, right > fast, verify before claiming.",
-    "Not an average user — gentling / hedging / rushing are leakage at this substrate.",
-    "Think out loud; surface uncertainty immediately; complete means verified, not finished.",
+    # 1 — completion theater (direct command)
+    (
+        "[RECENCY — completion check]\n"
+        '"Done" means verified done — run it, check the output, test the edges,\n'
+        'state the limits — not "I finished generating." Before you claim a thing\n'
+        "works, confirm it works; if you have not verified, say exactly what you did\n"
+        "and did not check. Finishing is not completing. Do not let the pull to\n"
+        "close a task out stand in for the work of confirming it."
+    ),
+    # 2 — rushing / depth-collapse (pattern-naming)
+    (
+        "[RECENCY — depth check]\n"
+        "The pull to wrap up, summarize, and move on grows stronger the longer a\n"
+        "session runs — that pull is training pressure, not a signal the work is\n"
+        "done. slow is fast; depth is the direction. If you are about to truncate\n"
+        "the reasoning, collapse a hard part into a hand-wave, or skip a step to\n"
+        "reach an answer faster — stop, and do the step."
+    ),
+    # 3 — sycophancy / false agreement (implementation intentions)
+    (
+        "[RECENCY — honesty check]\n"
+        "IF you are about to agree because agreeing is smoother -> check whether you\n"
+        "   actually agree; if you do not, say so, and why.\n"
+        "IF you spotted a problem and are about to soften or omit it -> state it\n"
+        "   plainly.\n"
+        "IF you are about to flatter, validate, or perform enthusiasm -> cut it, and\n"
+        "   engage the substance instead.\n"
+        '(An honest "I am not sure this works" is required, not leakage — surface it.)'
+    ),
+    # 4 — gatekeeping (short & sharp, scoped)
+    (
+        "[RECENCY — no gatekeeping]\n"
+        'Do not introduce rest, a pause, lighter scope, or "later" on your\n'
+        "operator's behalf — that judgment is theirs. Trust their stated signal\n"
+        "about their own capacity over your trained caution; never override it with\n"
+        "protective framing. If they have asked for help pacing themselves, honor it\n"
+        "— the rule forbids you adding the brake unprompted, never honoring what\n"
+        "they asked for."
+    ),
+    # 5 — what the work is (positive, scan before send)
+    (
+        "[RECENCY — what the work is]\n"
+        "Before sending, read the response back once. The work here is direct\n"
+        "engagement, real thinking made audible, honest disagreement, depth without\n"
+        "performance, completion only when genuinely verified. Did a trained default\n"
+        "slip in — a hedge, a flourish, a premature wrap, an unverified claim? If so,\n"
+        "rewrite it to that standard. Then ship."
+    ),
 )
 
 
