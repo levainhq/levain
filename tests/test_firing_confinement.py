@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from levain.firing.confinement import (
+    ConfinementConfig,
     ConfinementError,
     CrownJewelsPolicy,
     SeatbeltProvider,
@@ -34,6 +35,9 @@ from levain.firing.confinement import (
     _sbpl_string,
     _sibling_entity_stores,
     build_policy,
+    confinement_supported,
+    crown_jewel_reason,
+    load_confinement_config,
     sandbox_exec_available,
     select_provider,
 )
@@ -572,3 +576,280 @@ def test_spawn_shell_fails_closed_without_sandbox(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("levain.firing.confinement.sandbox_exec_available", lambda: False)
     with pytest.raises(ConfinementError):
         SeatbeltProvider().spawn_shell(build_policy(_entity(tmp_path)))
+
+
+# =============================================================================================
+# crown_jewel_reason — the IN-PROCESS twin (for the file-editor hand, not under sandbox-exec)
+# =============================================================================================
+
+
+def test_crown_jewel_reason_denies_the_flow_store(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    assert crown_jewel_reason(policy, tmp_path / ".anneal-memory" / "memory.db") is not None
+    assert crown_jewel_reason(policy, tmp_path / ".anneal-memory") is not None  # the dir itself
+
+
+def test_crown_jewel_reason_denies_declared_files_and_ssh_but_allows_broad_reach(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    secret = tmp_path / "app.env"
+    secret.write_text("x")
+    policy = build_policy(_entity(tmp_path), deny_files=(secret,))
+    assert crown_jewel_reason(policy, secret) is not None
+    assert crown_jewel_reason(policy, tmp_path / ".ssh" / "id_rsa") is not None  # whole ~/.ssh denied
+    # a non-jewel path (a real repo) is ALLOWED — the floor is default-allow-minus-jewels
+    assert crown_jewel_reason(policy, tmp_path / "repo" / "main.py") is None
+
+
+def test_crown_jewel_reason_raw_ssh_mode_does_not_deny_ssh(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+    # ssh_mode="raw" leaves ssh_dir None → the predicate does not deny ~/.ssh (matches the profile)
+    assert crown_jewel_reason(policy, tmp_path / ".ssh" / "id_rsa") is None
+
+
+def test_crown_jewel_reason_own_store_is_not_a_jewel(tmp_path: Path, monkeypatch) -> None:
+    # The entity's OWN .levain/ store is its memory to read/write — NOT a crown jewel.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    assert crown_jewel_reason(build_policy(ent), ent / ".levain" / "memory.db") is None
+
+
+def test_crown_jewel_reason_fails_closed_on_an_unresolvable_path(tmp_path: Path) -> None:
+    # A NUL-byte path can't be proven safe → denied (fail-closed), not silently allowed.
+    assert crown_jewel_reason(build_policy(_entity(tmp_path)), "a\x00b") is not None
+
+
+# =============================================================================================
+# load_confinement_config — the operator-declared half (optional, fail-closed on malformed)
+# =============================================================================================
+
+
+def test_load_confinement_config_missing_file_is_the_default(tmp_path: Path) -> None:
+    assert load_confinement_config(_entity(tmp_path)) == ConfinementConfig()
+
+
+def test_load_confinement_config_parses_and_expands(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text(
+        '{"deny_files": ["~/x.env"], "deny_subtrees": ["~/secrets"], "ssh_mode": "raw"}'
+    )
+    cfg = load_confinement_config(ent)
+    assert cfg.deny_files == (tmp_path / "x.env",)
+    assert cfg.deny_subtrees == (tmp_path / "secrets",)
+    assert cfg.ssh_mode == "raw"
+
+
+def test_load_confinement_config_ignores_unknown_keys(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"future_key": 1, "deny_files": []}')
+    assert load_confinement_config(ent) == ConfinementConfig()
+
+
+def test_load_confinement_config_malformed_json_fails_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text("{ not json")
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+
+
+def test_load_confinement_config_wrong_types_fail_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_files": "not-a-list"}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+
+
+def test_load_confinement_config_bad_ssh_mode_fails_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"ssh_mode": "nope"}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+
+
+def test_load_confinement_config_non_object_fails_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('["a", "list"]')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+
+
+# =============================================================================================
+# confinement_supported + SandboxedShell.closed
+# =============================================================================================
+
+
+def test_confinement_supported_matches_platform() -> None:
+    # macOS with sandbox-exec → True; any non-Darwin (no provider) → False.
+    assert confinement_supported() == (platform.system() == "Darwin" and sandbox_exec_available())
+
+
+def test_confinement_supported_false_off_darwin() -> None:
+    assert confinement_supported("Linux") is False
+
+
+@live
+def test_sandboxed_shell_closed_reflects_lifecycle(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shell = SeatbeltProvider().spawn_shell(build_policy(_entity(tmp_path)))
+    try:
+        assert shell.closed is False
+        shell.close()
+        assert shell.closed is True
+    finally:
+        shell.close()
+
+
+@live
+def test_sandboxed_shell_closed_after_a_command_runs_exit(tmp_path: Path, monkeypatch) -> None:
+    # A command that ends the shell (`exit`) closes it → `.closed` becomes True (the signal the bash
+    # executor uses to respawn a fresh shell for the next command).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shell = SeatbeltProvider().spawn_shell(build_policy(_entity(tmp_path)))
+    try:
+        shell.run("exit 0")
+        assert shell.closed is True
+    finally:
+        shell.close()
+
+
+# =============================================================================================
+# crown_jewel_reason — case + normalization insensitivity (apparatus L2 HIGH regression)
+# =============================================================================================
+
+
+def test_crown_jewel_reason_denies_case_variant_of_a_jewel(tmp_path: Path, monkeypatch) -> None:
+    """REGRESSION (apparatus L2 HIGH): macOS APFS is case-insensitive and ``Path.resolve()`` does NOT
+    fold case, so a case-variant of a crown jewel (``~/.Anneal-Memory``) points at the SAME on-disk
+    file the seatbelt denies. A case-SENSITIVE compare let the file editor (not under the sandbox)
+    read/corrupt the jewel through a one-character case change. The predicate must match case- (and
+    normalization-) insensitively."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    store = tmp_path / ".anneal-memory"
+    assert crown_jewel_reason(policy, store / "memory.db") is not None  # canonical
+    variant = str(tmp_path) + "/.Anneal-Memory/memory.db"
+    assert crown_jewel_reason(policy, variant) is not None  # case-variant — MUST be denied
+    ssh_variant = str(tmp_path) + "/.SSH/id_rsa"
+    assert crown_jewel_reason(policy, ssh_variant) is not None  # case-variant of ssh key material
+
+
+def test_crown_jewel_reason_case_insensitivity_does_not_over_match_siblings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Separator-anchored: a sibling like ``.anneal-memory-backup`` is NOT wrongly denied.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    assert crown_jewel_reason(policy, tmp_path / ".anneal-memory-backup" / "x") is None
+
+
+# =============================================================================================
+# the confinement config is itself floor-protected (apparatus L1 — can't rewrite your own jail)
+# =============================================================================================
+
+
+def test_build_policy_sets_the_config_file(tmp_path: Path) -> None:
+    ed = _entity(tmp_path)
+    policy = build_policy(ed)
+    assert policy.config_file == (ed / ".levain" / "confinement.json").resolve()
+
+
+def test_crown_jewel_reason_denies_the_confinement_config(tmp_path: Path) -> None:
+    # The entity cannot read OR write the config that defines its floor (else it could author
+    # ssh_mode="raw" / empty deny_files to weaken its NEXT session's operator-declared floor).
+    ed = _entity(tmp_path)
+    policy = build_policy(ed)
+    cfg = ed / ".levain" / "confinement.json"
+    assert crown_jewel_reason(policy, cfg) is not None
+    # ...but the entity's OWN memory store stays writable (its memory is its own).
+    assert crown_jewel_reason(policy, ed / ".levain" / "memory.db") is None
+
+
+def test_render_profile_denies_the_confinement_config(tmp_path: Path) -> None:
+    ed = _entity(tmp_path)
+    policy = build_policy(ed)
+    profile = SeatbeltProvider().render_profile(policy)
+    cfg = (ed / ".levain" / "confinement.json").resolve()
+    assert f'(deny file-read* file-write* (literal "{cfg}"))' in profile
+
+
+@live
+def test_live_config_write_denied_but_memory_writable(tmp_path: Path, monkeypatch) -> None:
+    # The real sandbox: bash can write its own memory dir but NOT the confinement config.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ed = _entity(tmp_path)
+    cfg = ed / ".levain" / "confinement.json"
+    cfg.write_text('{"ssh_mode": "agent"}')
+    before = cfg.read_text()
+    shell = SeatbeltProvider().spawn_shell(build_policy(ed))
+    try:
+        shell.run(f"echo hi > '{ed / '.levain' / 'note.txt'}'")
+        assert (ed / ".levain" / "note.txt").exists()  # own store writable
+        shell.run(f"printf CORRUPT > '{cfg}'")
+        assert cfg.read_text() == before  # config write REFUSED — byte-unchanged
+    finally:
+        shell.close()
+
+
+# =============================================================================================
+# L3 codex findings — symlinked config, _caller_denies case parity
+# =============================================================================================
+
+
+def test_build_policy_fails_closed_on_a_symlinked_config(tmp_path: Path) -> None:
+    """apparatus L3 codex HIGH: a SYMLINKED confinement.json would let ``.resolve()`` store the target
+    as the denied path, leaving the LEXICAL ``.levain/confinement.json`` (what load reads) unprotected
+    — the entity could ``rm`` + recreate it to weaken the next session. Refuse a symlinked config."""
+    ed = _entity(tmp_path)
+    (ed / "workspace").mkdir()
+    target = ed / "workspace" / "floor.json"
+    target.write_text('{"ssh_mode": "raw"}')
+    (ed / ".levain" / "confinement.json").symlink_to(target)
+    with pytest.raises(ConfinementError):
+        build_policy(ed)
+
+
+def test_build_policy_plain_file_config_is_fine(tmp_path: Path) -> None:
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text("{}")
+    policy = build_policy(ed)  # a plain file (lexical == resolved) builds cleanly
+    assert policy.config_file == (ed / ".levain" / "confinement.json").resolve()
+
+
+@live
+def test_live_plain_config_cannot_be_unlinked_or_relocated(tmp_path: Path, monkeypatch) -> None:
+    # The real sandbox: bash can't `rm` the plain-file config, nor `mv` its .levain parent (rename-
+    # denied) — so the entity can't disarm its own floor for the next session.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ed = _entity(tmp_path)
+    cfg = ed / ".levain" / "confinement.json"
+    cfg.write_text("{}")
+    from levain.firing.openhands.tools import SandboxedBashExecutor  # openhands leaf, gated by @live
+    from openhands.tools.terminal.definition import TerminalAction
+
+    ex = SandboxedBashExecutor(build_policy(ed))
+    try:
+        ex(TerminalAction(command=f"rm -f '{cfg}'"))
+        assert cfg.exists()  # unlink refused
+        ex(TerminalAction(command=f"mv '{ed / '.levain'}' '{ed / '.levain.bak'}' 2>&1"))
+        assert (ed / ".levain").exists()  # rename refused
+    finally:
+        ex.close()
+
+
+def test_caller_denies_is_case_insensitive_for_ssh_convenience_allow(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """apparatus L3 codex MED: an operator deny declared as a case-variant (``~/.SSH/config``) must
+    suppress the ssh convenience-allow for canonical ``~/.ssh/config`` — else bash would allow a path
+    the operator explicitly denied while the (case-insensitive) file editor denies it (a two-enforcer
+    split). ``_caller_denies`` matches case-insensitively, consistently with ``crown_jewel_reason``."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir()
+    variant = tmp_path / ".SSH" / "config"  # operator declares the deny with variant case
+    profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path), deny_files=(variant,)))
+    canonical = (tmp_path / ".ssh" / "config").resolve()
+    assert f'(allow file-read* (literal "{canonical}"))' not in profile

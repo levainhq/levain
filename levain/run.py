@@ -20,11 +20,15 @@ use"):
     ``assert_workspace_isolated`` before the workspace is created (a symlink escape of the
     workspace DIR is refused), AND per-op by the confined file tool below (every tool path is
     resolved + fenced to the workspace before it touches the filesystem).
-  - **tools** — STEP 6: the entity now gets confined HANDS — a file-editor tool structurally
-    fenced to ``<entity>/workspace/`` (``levain.firing.openhands.tools.build_entity_tools``),
-    so it moves from conversation to agency without ever reaching the flow store. bash is a
-    later OS-sandbox slice (a persistent host shell can't be confined in-process). Pass
-    ``with_tools=False`` (``levain run --no-tools``) for a pure conversational partner.
+  - **tools** — the entity gets confined HANDS (``levain.firing.openhands.tools.build_entity_tools``):
+    a file-editor tool AND (spore-311 slice 2) a persistent OS-sandboxed bash, BOTH fenced to the
+    shared crown-jewels FLOOR — they work like CC/Codex on the operator's real repos while
+    ``~/.anneal-memory/`` (flow's store), sibling entity stores, and ``~/.ssh`` key material stay
+    structurally off-limits (plus the operator's declared creds from ``.levain/confinement.json``).
+    bash rides ``sandbox-exec`` (a persistent host shell can't be confined in-process); on a platform
+    with no OS sandbox the entity keeps its file-editor hand and bash is dropped (honesty floor, NEVER
+    an unconfined fallback). Pass ``with_tools=False`` (``levain run --no-tools``) for a pure
+    conversational partner.
   - **relay** — none wired.
 
 Requires the ``openhands`` extra (``pip install 'levain[openhands]'``). The heavy imports
@@ -48,6 +52,11 @@ from levain.firing.agent_reply import (
     tool_action_summary,
 )
 from levain.install import effective_adapter
+from levain.firing.confinement import (
+    ConfinementError,
+    confinement_supported,
+    load_confinement_config,
+)
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -140,8 +149,10 @@ def run_entity(
 ) -> int:
     """Run the interactive REPL for the isolated entity at ``path``.
 
-    ``with_tools`` (default True, STEP 6) grants the entity its confined file-editor hands (fenced
-    to ``<entity>/workspace/``); ``False`` (``--no-tools``) runs a pure conversational partner.
+    ``with_tools`` (default True) grants the entity its confined HANDS — a file editor plus, where an
+    OS confinement floor exists (macOS ``sandbox-exec``), a persistent sandboxed bash — both fenced to
+    the shared crown-jewels floor; ``False`` (``--no-tools``) runs a pure conversational partner. On a
+    platform with no OS sandbox, bash is dropped and only the file editor is granted (honesty floor).
 
     Returns a process exit code: 0 on a clean session, 2 for a usage/environment error
     (missing extra, not an initialized entity, isolation refusal) surfaced BEFORE the loop.
@@ -188,10 +199,18 @@ def run_entity(
     try:
         llm = LLM(model=_resolve_model(model), base_url=base_url, api_key=api_key,
                   usage_id="levain-run")
-        # STEP 6: the confined file-editor bundle (structurally fenced to <entity>/workspace/) —
-        # the entity's hands. `build_entity_tools` is the ONLY blessed file-tool builder, confined
-        # by construction; `None` (--no-tools) = a pure conversational partner.
-        entity_tools = build_entity_tools() if with_tools else None
+        # The confined executor-tool bundle (file editor + sandboxed bash, both fenced to the shared
+        # crown-jewels floor) — the entity's hands. `build_entity_tools` is the ONLY blessed builder,
+        # confined by construction; `None` (--no-tools) = a pure conversational partner. bash is
+        # granted only where an OS confinement floor exists (fail-closed: no sandbox → no bash, never
+        # an unconfined shell) — the honesty floor the banner then displays.
+        bash_ok = confinement_supported()
+        # Validate .levain/confinement.json EARLY (fail-closed BEFORE the banner, so a config typo is a
+        # clean startup error — not a stack trace on the first turn when a tool resolves the config),
+        # and read ssh_mode so the honesty-floor banner reflects the ACTUAL floor (a static "~/.ssh
+        # protected" line would LIE under ssh_mode="raw" — apparatus L1).
+        ssh_mode = load_confinement_config(entity_dir).ssh_mode if with_tools else "agent"
+        entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
         binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
         workspace = entity_dir / _WORKSPACE_SUBDIR
         assert_workspace_isolated(workspace, entity_dir=entity_dir)
@@ -213,6 +232,12 @@ def run_entity(
     except IsolationError as exc:
         print(f"levain run: sovereignty guard REFUSED to start the entity:\n  {exc}")
         return 2
+    except ConfinementError as exc:
+        print(
+            f"levain run: the confinement config is invalid — fix it and retry:\n  {exc}\n"
+            f"  ({entity_dir / ENTITY_STORE_SUBDIR / 'confinement.json'})"
+        )
+        return 2
     except Exception as exc:  # noqa: BLE001 — a bad model/endpoint config is a usage error
         print(
             f"levain run: could not start the entity ({exc}).\n"
@@ -220,7 +245,10 @@ def run_entity(
         )
         return 2
 
-    _print_banner(entity_dir, binding, model=_resolve_model(model), with_tools=with_tools)
+    _print_banner(
+        entity_dir, binding, model=_resolve_model(model),
+        with_tools=with_tools, bash_ok=with_tools and bash_ok, ssh_mode=ssh_mode,
+    )
 
     interrupted = False
     try:
@@ -317,9 +345,14 @@ def _entity_label(binding) -> str:
     return binding.entity_dir.name
 
 
-def _print_banner(entity_dir: Path, binding, *, model: str, with_tools: bool) -> None:
+def _print_banner(
+    entity_dir: Path, binding, *, model: str, with_tools: bool, bash_ok: bool,
+    ssh_mode: str = "agent",
+) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores
-    this entity reads/writes AND what hands it has, so sovereignty is VISIBLE, not merely asserted."""
+    this entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
+    sovereignty is VISIBLE, not merely asserted. The floor lines are rendered from the ACTUAL config
+    (``ssh_mode``), never a static string that could invert under a real setting (apparatus L1)."""
     print("=" * 66)
     print(f"  levain run — {entity_dir.name}  (sovereign entity)")
     print("=" * 66)
@@ -327,10 +360,19 @@ def _print_banner(entity_dir: Path, binding, *, model: str, with_tools: bool) ->
     print(f"  memory:    {binding.episodic_path}")
     print(f"             {binding.crystal_path}")
     print(f"  workspace: {entity_dir / _WORKSPACE_SUBDIR}")
-    if with_tools:
-        print("  tools:     file_editor (confined to workspace/ — cannot reach the flow store)")
-    else:
+    if not with_tools:
         print("  tools:     none (conversational partner; --no-tools)")
+    else:
+        hands = "file_editor + terminal (bash)" if bash_ok else "file_editor"
+        print(f"  tools:     {hands} — confined to the crown-jewels floor")
+        if not bash_ok:
+            print("             (bash dropped: no OS sandbox on this platform — file editor only)")
+        print("  floor:     DENIES ~/.anneal-memory/ (flow store) · sibling entity stores ·")
+        print("             operator creds + the confinement config (.levain/confinement.json)")
+        if ssh_mode == "agent":
+            print("             ~/.ssh key material (agent-auth only — keys usable, not readable)")
+        else:
+            print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED)")
     print()
     print("  Talk to it. It recalls its OWN memory and captures each turn there.")
     print("  :quit (or Ctrl-D) to end the session.")
