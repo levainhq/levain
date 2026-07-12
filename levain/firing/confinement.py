@@ -58,6 +58,12 @@ three).
   - RESOURCE EXHAUSTION (fork bomb, disk fill) is a self-DoS on the operator's own Mac, not a
     confinement breach — seatbelt doesn't cap CPU/mem/disk. Cheap defense (``ulimit`` in the shell
     wrapper) is a later polish, not a floor concern.
+  - DAEMONIZED SURVIVOR (apparatus L3 codex): a child that ``setsid``/``nohup``/double-forks into a NEW
+    session escapes the shell's process-group teardown (:meth:`SandboxedShell.close`) and outlives the
+    run — the same behavior a normal shell / CC / Codex has. It stays SANDBOX-CONFINED (crown jewels
+    remain off-limits), so it is not a confinement breach, but it is unattended code with network +
+    broad non-jewel authority. Human-in-the-loop bounds it now; the threshold membrane (network gating)
+    is the unattended-operation answer.
   - NETWORK EXFIL of non-crown-jewel data: default-allow network + broad read means anything not
     crown-jeweled is exfiltratable — the SAME risk profile as CC. Mitigation is human-in-the-loop now
     + the threshold membrane (spore-295) gating network ops before unattended operation later.
@@ -93,6 +99,7 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import json
 import os
 import platform
 import queue
@@ -102,6 +109,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,12 +121,16 @@ __all__ = [
     "SshMode",
     "CrownJewelsPolicy",
     "build_policy",
+    "crown_jewel_reason",
+    "ConfinementConfig",
+    "load_confinement_config",
     "ShellResult",
     "SandboxedShell",
     "ConfinementProvider",
     "SeatbeltProvider",
     "select_provider",
     "sandbox_exec_available",
+    "confinement_supported",
 ]
 
 # The macOS seatbelt driver. An ABSOLUTE path (never a PATH lookup — a confined child must resolve
@@ -161,6 +173,10 @@ class CrownJewelsPolicy:
     deny_write_dirs: tuple[Path, ...]   # ancestor DIRS write-denied → block rename-relocation (L2)
     ssh_dir: Path | None                # ~/.ssh to key-confine (ssh_mode="agent"); None = "raw" mode
     ssh_mode: SshMode = "agent"
+    config_file: Path | None = None     # <entity>/.levain/confinement.json — the config that DEFINES
+    # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
+    # (apparatus L1 — confinement.json lives in the entity-writable .levain/; a self-authored
+    # ssh_mode="raw" / emptied deny_files would weaken the NEXT session's operator-declared floor).
     # NOTE: network is default-ALLOWED (a CC replacement hits the network); there is deliberately NO
     # `allow_network` knob — an unwired boolean would be false security (the exact claim>enforcement
     # gap this module refuses). Network POLICY is a slice-3 / threshold-membrane concern.
@@ -278,9 +294,30 @@ def build_policy(
 
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
-    # Ancestor write-denies for BOTH the subtree jewels and the file jewels (both relocate the same
-    # way). The ssh_dir is guarded as a subtree below, so its ancestors are covered too.
-    all_jewels = list(deny_read_write) + list(deny_files_t)
+    # The confinement config that DEFINES the floor is itself floor-protected (read+write denied): the
+    # entity can't rewrite its own jail. It lives in the entity-writable ``.levain/`` (deliberately NOT
+    # a crown jewel — the entity's memory is its own), so without this a self-authored ``ssh_mode="raw"``
+    # / emptied ``deny_files`` would weaken the NEXT session's operator-declared floor (apparatus L1).
+    # ``load_confinement_config`` runs in the HOST process (not the sandbox), so denying the entity's
+    # HANDS from touching it does not stop the host from reading it to BUILD this policy.
+    #
+    # FAIL-CLOSED on a SYMLINKED config (apparatus L3 codex HIGH): if ``confinement.json`` (or its
+    # ``.levain`` parent) is a symlink, ``.resolve()`` would store the symlink's TARGET as the denied
+    # path — leaving the LEXICAL ``.levain/confinement.json`` (the path ``load_confinement_config`` reads)
+    # unprotected, so the entity could ``rm`` + recreate it (``.levain`` is writable) to weaken the next
+    # session. Requiring a plain file (lexical == resolved) makes the read+write+unlink deny cover the
+    # exact path load reads, and keeps the file-editor's resolve-then-check in agreement.
+    config_lexical = ed / ".levain" / _CONFINEMENT_CONFIG_NAME
+    config_file = config_lexical.resolve()
+    if config_file != config_lexical:
+        raise ConfinementError(
+            f"the confinement config {config_lexical} is a symlink (resolves to {config_file}) — "
+            "refusing to grant confined hands. A symlinked config could be unlinked and rewritten to "
+            "weaken the next session's floor; make it a plain file inside .levain/."
+        )
+    # Ancestor write-denies for the subtree jewels, file jewels, AND the config file (all relocate the
+    # same way). The ssh_dir is guarded as a subtree below, so its ancestors are covered too.
+    all_jewels = list(deny_read_write) + list(deny_files_t) + [config_file]
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
     write_dirs = _write_deny_ancestors(all_jewels)
@@ -292,6 +329,144 @@ def build_policy(
         deny_files=deny_files_t,
         deny_write_dirs=write_dirs,
         ssh_dir=ssh_dir,
+        ssh_mode=ssh_mode,
+        config_file=config_file,
+    )
+
+
+def _canon(path: str) -> str:
+    """Canonicalize a path string for comparison on a case- AND Unicode-normalization-insensitive
+    volume (macOS APFS / Windows). ``Path.resolve()`` folds NEITHER, so ``~/.Anneal-Memory`` and an
+    NFD/NFC variant of a path both point at the SAME on-disk file the kernel denies, yet compare
+    UNEQUAL to the stored (canonical-case) jewel under a plain ``==``/``is_relative_to``."""
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def _ci_within(path: Path, root: Path) -> bool:
+    """True iff ``path`` is ``root`` or lives under it, matched case- AND normalization-insensitively.
+
+    A case-sensitive compare would let a case-variant of a crown jewel (``~/.Anneal-Memory``) or a
+    Unicode-normalization variant slip past this IN-PROCESS check while the kernel (and the bash-side
+    seatbelt) treat it as the SAME file — the exact ``claim > enforcement`` gap the sibling
+    ``isolation._is_within_ci`` guards for the store forbidden-zone (apparatus L2 HIGH, and a
+    regression: the step-6 ``assert_path_within_workspace`` predecessor used the CI compare and this
+    predicate initially dropped it). Separator-anchored so it never false-matches a sibling like
+    ``.anneal-memory-backup``. Over-matching here is FAIL-CLOSED (refuse a variant of a crown jewel) —
+    ``crown_jewel_reason`` is a pure denylist, so there is no legitimate path this wrongly rejects."""
+    p = _canon(str(path))
+    r = _canon(str(root))
+    return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
+    """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
+
+    This is the IN-PROCESS twin of the seatbelt profile (:meth:`SeatbeltProvider.render_profile`),
+    for a hand that is NOT under ``sandbox-exec`` — the relaxed file editor, which runs as ordinary
+    in-process Python and so cannot ride the OS sandbox that fences bash. ONE policy, TWO enforcers:
+    bash rides the rendered profile, the file editor calls this — so both hands enforce the SAME
+    denylist and there is no ``claim > enforcement`` gap between them (``structural_invariants_beat_
+    discipline``). FAIL-CLOSED: an unresolvable path (embedded NUL, un-stat-able) is treated as denied
+    rather than silently allowed. Matching is case- AND normalization-insensitive (:func:`_ci_within`)
+    so a macOS case-variant of a jewel can't slip past this while the kernel treats it as the same file.
+
+    It denies: the crown-jewel SUBTREES (flow store + sibling ``.levain/`` stores + operator-declared
+    extra subtrees), the crown-jewel credential FILES, the confinement CONFIG file (the entity can't
+    rewrite its own floor), and — when ``ssh_mode="agent"`` — the WHOLE ``~/.ssh`` subtree. NOTE the ssh
+    deny is stricter than the seatbelt's (which re-allows ``known_hosts`` r+w + ``config`` r so the
+    SHELL's ssh can record host keys): the file editor has no legitimate need to touch ssh files (that
+    is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
+    polarity subtlety. Ancestor write-dirs are NOT checked — they exist to block ``mv``-relocation of a
+    jewel, and the file editor has no rename primitive (its commands are ``view``/``create``/
+    ``str_replace``/``insert``/``undo_edit``). The entity's OWN ``<entity>/.levain/`` store is
+    deliberately NOT a crown jewel (its memory is its own); the firing's ``assert_entity_isolated``
+    moat, not this predicate, is what keeps recall/capture off flow's store."""
+    try:
+        p = Path(path).expanduser().resolve()
+    except (ValueError, OSError) as exc:
+        return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
+    for sub in policy.deny_read_write:
+        if _ci_within(p, sub):
+            return f"{p} is under the crown-jewel store {sub}"
+    for f in policy.deny_files:
+        if _ci_within(p, f):
+            return f"{p} is a crown-jewel credential file"
+    if policy.config_file is not None and _ci_within(p, policy.config_file):
+        return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
+    if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
+        return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
+    return None
+
+
+# --- the operator-declared confinement config (optional, per-entity) -------------------------
+
+@dataclass(frozen=True)
+class ConfinementConfig:
+    """The operator-declared half of the crown-jewels floor, read from
+    ``<entity>/.levain/confinement.json``. The UNIVERSAL floor (flow store + sibling stores + ssh key
+    material) is always applied by :func:`build_policy` regardless; this config only ADDS the
+    operator's app-specific secrets, because this generic, operator-neutral module deliberately does
+    NOT guess where an operator's credentials live (guessing a path is FALSE SECURITY — it "protects"
+    a path the secret isn't at while missing the real one)."""
+
+    deny_files: tuple[Path, ...] = ()      # credential FILES (literal): e.g. ~/Documents/flow/.env.flow
+    deny_subtrees: tuple[Path, ...] = ()   # additional crown-jewel SUBTREES: a secrets dir, another store
+    ssh_mode: SshMode = "agent"
+
+
+_CONFINEMENT_CONFIG_NAME = "confinement.json"
+
+
+def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
+    """Load ``<entity>/.levain/confinement.json`` if present, else the default (universal floor only).
+
+    Schema (all fields optional)::
+
+        {"deny_files": ["~/Documents/flow/.env.flow"],
+         "deny_subtrees": ["~/some/secrets"],
+         "ssh_mode": "agent"}
+
+    ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
+    the default (empty declarations, ``ssh_mode="agent"``) — the universal floor still protects the
+    structurally-knowable crown jewels. A PRESENT-but-MALFORMED file (bad JSON, wrong types, an invalid
+    ``ssh_mode``) raises :class:`ConfinementError` — FAIL-CLOSED: a broken crown-jewels declaration must
+    not silently drop the operator's secrets and hand the entity a floor with holes; the caller refuses
+    to grant confined hands and surfaces the error, so the operator fixes the config."""
+    base = Path(entity_dir).expanduser() / ".levain" / _CONFINEMENT_CONFIG_NAME
+    try:
+        raw = base.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ConfinementConfig()
+    except OSError as exc:
+        raise ConfinementError(f"could not read {base} ({exc}) — fail-closed.") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfinementError(
+            f"{base} is not valid JSON ({exc}) — fail-closed (refusing to grant hands on a broken "
+            "crown-jewels declaration)."
+        ) from exc
+    if not isinstance(data, dict):
+        raise ConfinementError(f"{base} must be a JSON object, got {type(data).__name__} — fail-closed.")
+
+    def _paths(key: str) -> tuple[Path, ...]:
+        value = data.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfinementError(
+                f"{base}: {key!r} must be a list of path strings — fail-closed."
+            )
+        return tuple(Path(v).expanduser() for v in value)
+
+    ssh_mode = data.get("ssh_mode", "agent")
+    if ssh_mode not in ("agent", "raw"):
+        raise ConfinementError(
+            f"{base}: ssh_mode must be \"agent\" or \"raw\", got {ssh_mode!r} — fail-closed."
+        )
+
+    return ConfinementConfig(
+        deny_files=_paths("deny_files"),
+        deny_subtrees=_paths("deny_subtrees"),
         ssh_mode=ssh_mode,
     )
 
@@ -384,6 +559,14 @@ class SandboxedShell:
         self._pending = 0
 
     # -- lifecycle -----------------------------------------------------------------------------
+
+    @property
+    def closed(self) -> bool:
+        """True once this shell has been closed — either explicitly (:meth:`close`) or because a
+        command ended it (an ``exit`` gives EOF → :meth:`run` self-closes). A consumer that reuses one
+        shell across commands checks this to RESPAWN a fresh shell after the entity ran ``exit``,
+        rather than handing the next command a dead channel (which would raise ``ConfinementError``)."""
+        return self._closed
 
     def start(self) -> "SandboxedShell":
         """Spawn the sandboxed bash and its stdout reader thread. Returns self (chainable)."""
@@ -658,9 +841,17 @@ class SandboxedShell:
         self._signal_group(signal.SIGINT)
 
     def close(self) -> None:
-        """Terminate the shell + EVERY child it spawned, then release resources. Idempotent, never
-        raises. Signals the process GROUP (SIGTERM → SIGKILL) so a timed-out/backgrounded child is
-        reaped, not orphaned to init."""
+        """Terminate the shell + its process GROUP, then release resources. Idempotent, never raises.
+        Signals the group (SIGTERM → SIGKILL) so a timed-out / backgrounded child in the shell's pgid
+        is reaped, not orphaned to init.
+
+        LIMIT (apparatus L3 codex, welded not hidden): a child that DAEMONIZES into a NEW session/pgid
+        (``setsid`` / ``nohup`` / a double-fork) escapes ``killpg`` and SURVIVES close — the same
+        behavior a normal shell (and CC/Codex) has. The survivor stays SANDBOX-CONFINED (the seatbelt
+        is inherited, so crown jewels remain off-limits), but it is unattended code with network + broad
+        non-jewel authority after the operator thinks the run ended. Reaping arbitrary setsid escapees
+        is racy and out of scope here; the human-in-the-loop v1 posture + the crown-jewels floor bound
+        it, and the threshold membrane (network gating) is the real answer for unattended operation."""
         self._closed = True
         proc = self._proc
         if self._cmd_w is not None:
@@ -758,11 +949,16 @@ def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
     """True if the CALLER explicitly made ``path`` a crown jewel (in ``deny_files``, or under a
     ``deny_read_write`` subtree). Used so the ssh convenience re-allow of ``known_hosts`` / ``config``
     never SILENTLY overrides an operator's explicit deny of that same path (apparatus L3 consensus —
-    everywhere else a caller-declared jewel is final; this keeps ssh consistent)."""
+    everywhere else a caller-declared jewel is final; this keeps ssh consistent).
+
+    Matched case- AND normalization-insensitively (:func:`_ci_within`), consistently with
+    ``crown_jewel_reason`` (apparatus L3 codex MED): a case-sensitive compare here would let the ssh
+    convenience-allow override an operator deny declared as a case/Unicode variant (e.g. ``~/.SSH/
+    config``) for the bash hand while the file editor still denies it — a two-enforcer split."""
     p = path.resolve()
-    if p in policy.deny_files:
+    if any(_ci_within(p, f) for f in policy.deny_files):
         return True
-    return any(p.is_relative_to(sub) for sub in policy.deny_read_write)
+    return any(_ci_within(p, sub) for sub in policy.deny_read_write)
 
 
 class SeatbeltProvider(ConfinementProvider):
@@ -800,6 +996,15 @@ class SeatbeltProvider(ConfinementProvider):
             for p in policy.deny_files:
                 lines.append(f'    (literal "{_sbpl_string(str(p))}")')
             lines.append(")")
+            lines.append("")
+
+        if policy.config_file is not None:
+            lines.append(";; the confinement CONFIG that defines the floor is floor-protected (read+")
+            lines.append(";; write) — the entity cannot rewrite its own jail. The host reads it un-")
+            lines.append(";; sandboxed to BUILD this policy, so this only fences the entity's HANDS.")
+            lines.append(
+                f'(deny file-read* file-write* (literal "{_sbpl_string(str(policy.config_file))}"))'
+            )
             lines.append("")
 
         if policy.deny_write_dirs:
@@ -938,6 +1143,22 @@ def sandbox_exec_available() -> bool:
     check this and REFUSE to grant bash hands if False, rather than fall through to an unconfined
     host shell."""
     return os.path.isfile(SANDBOX_EXEC) and os.access(SANDBOX_EXEC, os.X_OK)
+
+
+def confinement_supported(system: str | None = None) -> bool:
+    """True iff an OS confinement floor can actually be established on this platform RIGHT NOW —
+    a provider exists for the OS AND its sandbox driver is present + executable.
+
+    The honest gate for granting bash hands: ``levain run`` calls this to decide whether to offer the
+    bash tool at all (macOS with a working ``sandbox-exec``), rather than wire a tool whose first
+    command would fail-closed. On any non-macOS platform (no provider yet) or a macOS box missing
+    ``sandbox-exec``, returns False — the entity gets its file-editor hand but no bash, and the banner
+    says so (honesty floor). NEVER grants an unconfined shell as a fallback."""
+    try:
+        select_provider(system)
+    except ConfinementError:
+        return False
+    return sandbox_exec_available()
 
 
 def select_provider(system: str | None = None) -> ConfinementProvider:

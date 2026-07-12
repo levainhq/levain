@@ -156,6 +156,15 @@ def build_entity_agent(
     agent = Agent(
         llm=llm,
         tools=tools if tools is not None else [],
+        # Serialize tool calls STRUCTURALLY (apparatus L2 MED — do not rely on the SDK default). The
+        # file editor's crown-jewels check resolves a path, then the stock editor re-resolves it at
+        # open(); with bash now granting a symlink primitive (`ln -s`), a CONCURRENT file-editor +
+        # bash batch could swap a symlink component between the two resolves (TOCTOU) to read a jewel
+        # through the un-sandboxed editor. Pinning to 1 makes the entity single-threaded across tool
+        # calls (the file editor's `file:` lock and bash's `terminal:session` lock are disjoint, so
+        # nothing else serializes them), closing that window by construction rather than by an SDK
+        # default that a future bump could raise.
+        tool_concurrency_limit=1,
         agent_context=vagus_agent_context(
             firing_kind=ENTITY_FIRING_KIND, constitution=seed_constitution
         ),

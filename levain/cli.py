@@ -259,9 +259,11 @@ def main(argv: list[str] | None = None) -> int:
             "Code, but sovereign': it runs on an open model (Ollama by default), "
             "carries its OWN memory, and NEVER touches this laptop's flow store "
             "(the sovereignty guard fail-closes before the first turn). It has "
-            "confined file-editor HANDS, structurally fenced to <entity>/workspace/ "
-            "(--no-tools for a pure conversational partner). Needs the OpenHands "
-            "runtime: pip install 'levain[openhands]'."
+            "confined HANDS — a file editor plus (where an OS sandbox exists) a "
+            "persistent bash — both fenced to a crown-jewels floor: they work on "
+            "your real repos while ~/.anneal-memory/, sibling stores, and ~/.ssh "
+            "key material stay off-limits (--no-tools for a pure conversational "
+            "partner). Needs the OpenHands runtime: pip install 'levain[openhands]'."
         ),
     )
     run_p.add_argument(
@@ -298,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         dest="with_tools",
         help=(
             "Run as a pure conversational partner (no executor tools). Default: the entity gets "
-            "confined file-editor hands, structurally fenced to its own workspace/."
+            "confined hands (file editor + sandboxed bash) fenced to the crown-jewels floor."
         ),
     )
     run_p.set_defaults(func=_cmd_run)

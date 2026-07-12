@@ -326,12 +326,29 @@ def test_run_entity_passes_confined_tools_by_default(
 ):
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
     entity = _openhands_entity(tmp_path)
+    # Force the OS-floor-present branch so this is platform-independent — the entity gets BOTH confined
+    # hands (file editor + sandboxed bash).
+    monkeypatch.setattr("levain.run.confinement_supported", lambda: True)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)
     assert rc == 2
-    # The default entity gets the confined file-editor bundle (WARNING-2 plumbing guard).
     assert captured["tools"] is not None
+    assert [t.name for t in captured["tools"]] == ["levain_file_editor", "levain_bash"]
+
+
+def test_run_entity_drops_bash_without_an_os_sandbox(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    # No OS confinement floor → bash is dropped, the file-editor hand stays (honesty floor: NEVER an
+    # unconfined shell as a fallback).
+    monkeypatch.setattr("levain.run.confinement_supported", lambda: False)
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    rc = run_entity(entity, with_tools=True)
+    assert rc == 2
     assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
 
 
@@ -345,3 +362,68 @@ def test_run_entity_no_tools_passes_none(
     rc = run_entity(entity, with_tools=False)
     assert rc == 2
     assert captured["tools"] is None  # --no-tools → a pure conversational partner
+
+
+# ---------- the honesty-floor banner ----------
+
+
+class _FakeBinding:
+    def __init__(self, tmp_path: Path) -> None:
+        self.episodic_path = tmp_path / ".levain" / "memory.db"
+        self.crystal_path = tmp_path / ".levain" / "memory.crystal.json"
+
+
+def test_banner_shows_both_hands_and_the_crown_jewels_floor(tmp_path: Path, capsys):
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/minimax-m3:cloud",
+        with_tools=True, bash_ok=True, ssh_mode="agent",
+    )
+    out = capsys.readouterr().out
+    assert "file_editor + terminal (bash)" in out
+    assert "crown-jewels floor" in out
+    # the honesty floor names exactly what it denies
+    assert ".anneal-memory/" in out and "flow store" in out
+    assert "~/.ssh key material" in out       # agent mode → keys usable, not readable
+    assert "confinement.json" in out
+
+
+def test_banner_ssh_line_reflects_raw_mode_not_a_static_lie(tmp_path: Path, capsys):
+    # apparatus L1: under ssh_mode="raw" the floor does NOT protect ~/.ssh — the banner (the operator's
+    # ground truth) must SAY so, not statically claim protection.
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/minimax-m3:cloud",
+        with_tools=True, bash_ok=True, ssh_mode="raw",
+    )
+    out = capsys.readouterr().out
+    assert "ssh_mode=raw" in out and "NOT confined" in out
+    assert "key material (agent-auth" not in out  # the protective claim is NOT shown under raw
+
+
+def test_banner_says_bash_dropped_without_a_sandbox(tmp_path: Path, capsys):
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/minimax-m3:cloud",
+        with_tools=True, bash_ok=False, ssh_mode="agent",
+    )
+    out = capsys.readouterr().out
+    assert "bash dropped" in out
+    assert "terminal (bash)" not in out  # not offered when there's no floor
+    assert "crown-jewels floor" in out   # the file editor still rides the floor
+
+
+def test_run_entity_rejects_a_malformed_confinement_config(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    # apparatus L1/L2: a malformed .levain/confinement.json fails CLOSED at startup with a clear,
+    # crown-jewels-specific message (not a stack trace on the first turn).
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    (entity / ".levain" / "confinement.json").write_text("{ not json")
+    rc = run_entity(entity, with_tools=True)
+    assert rc == 2
+    assert "confinement config is invalid" in capsys.readouterr().out

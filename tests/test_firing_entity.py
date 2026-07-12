@@ -158,7 +158,7 @@ def test_confined_file_tool_lands_on_the_built_agent(tmp_path):
     from openhands.sdk import Conversation
 
     from levain.firing.openhands.tools import (
-        WorkspaceConfinedFileEditorExecutor,
+        CrownJewelsFileEditorExecutor,
         build_entity_tools,
     )
 
@@ -170,8 +170,9 @@ def test_confined_file_tool_lands_on_the_built_agent(tmp_path):
     try:
         conv.agent.init_state(conv._state, on_event=lambda _e: None)  # resolves tools, no LLM call
         tool = conv.agent.tools_map["file_editor"]  # the LLM-visible name (not the spec key)
-        assert isinstance(tool.executor, WorkspaceConfinedFileEditorExecutor)
-        assert tool.executor._confine_root == str(ws)
+        assert isinstance(tool.executor, CrownJewelsFileEditorExecutor)
+        # the floored executor's policy fences the run's workspace to the crown-jewels floor
+        assert tool.executor._policy.workspace == ws.resolve()
     finally:
         conv.close()
 
@@ -188,6 +189,11 @@ def test_build_entity_agent_wires_isolated_kind(tmp_path):
     assert isinstance(cond, LevainCondenser)
     assert cond.firing_kind == ENTITY_FIRING_KIND == "anneal_entity"  # the isolated firing
     assert cond.presence_kind == "entity_seed"                        # step-4: the seed re-anchor
+
+    # apparatus L2 MED: tool calls are serialized STRUCTURALLY (pinned, not the SDK default) so a
+    # concurrent bash+file-editor batch can't TOCTOU-swap a symlink between the crown-jewels check and
+    # the un-sandboxed editor's open().
+    assert binding.agent.tool_concurrency_limit == 1
 
     # A bare .levain-only entity (no seed/) has no readable identity → the constitution FALLS BACK
     # to the firing's generic default (session_start), still baked into the set-once suffix.
