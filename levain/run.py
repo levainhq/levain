@@ -207,9 +207,12 @@ def run_entity(
         bash_ok = confinement_supported()
         # Validate .levain/confinement.json EARLY (fail-closed BEFORE the banner, so a config typo is a
         # clean startup error — not a stack trace on the first turn when a tool resolves the config),
-        # and read ssh_mode so the honesty-floor banner reflects the ACTUAL floor (a static "~/.ssh
-        # protected" line would LIE under ssh_mode="raw" — apparatus L1).
-        ssh_mode = load_confinement_config(entity_dir).ssh_mode if with_tools else "agent"
+        # and read the floor-shaping fields so the honesty-floor banner reflects the ACTUAL floor (a
+        # static "~/.ssh protected" line would LIE under ssh_mode="raw"; a static floor list would omit
+        # the opted-in standard cred stores — apparatus L1).
+        _cfg = load_confinement_config(entity_dir) if with_tools else None
+        ssh_mode = _cfg.ssh_mode if _cfg is not None else "agent"
+        deny_standard_creds = _cfg.deny_standard_creds if _cfg is not None else False
         entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
         binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
         workspace = entity_dir / _WORKSPACE_SUBDIR
@@ -248,6 +251,7 @@ def run_entity(
     _print_banner(
         entity_dir, binding, model=_resolve_model(model),
         with_tools=with_tools, bash_ok=with_tools and bash_ok, ssh_mode=ssh_mode,
+        deny_standard_creds=deny_standard_creds,
     )
 
     interrupted = False
@@ -347,7 +351,7 @@ def _entity_label(binding) -> str:
 
 def _print_banner(
     entity_dir: Path, binding, *, model: str, with_tools: bool, bash_ok: bool,
-    ssh_mode: str = "agent",
+    ssh_mode: str = "agent", deny_standard_creds: bool = False,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores
     this entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -372,7 +376,10 @@ def _print_banner(
         if ssh_mode == "agent":
             print("             ~/.ssh key material (agent-auth only — keys usable, not readable)")
         else:
-            print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED)")
+            print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED;")
+            print("               ssh authorized_keys/config/rc WRITE denied; other writes are NOT)")
+        if deny_standard_creds:
+            print("             standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
     print()
     print("  Talk to it. It recalls its OWN memory and captures each turn there.")
     print("  :quit (or Ctrl-D) to end the session.")

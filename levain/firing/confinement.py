@@ -24,7 +24,19 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
     to authenticate, but may not READ raw key material to exfil it — so ALL of ``~/.ssh`` is read+
     write-denied EXCEPT ``known_hosts`` (r+w, so ssh can record new host keys) and ``config`` (r).
     This is location-based, not name-based: it catches ``deploy_key`` / per-host keys, not just
-    ``id_*`` (apparatus L2). ``ssh_mode="raw"`` is the fallback (allow raw ``~/.ssh`` read).
+    ``id_*`` (apparatus L2). ``ssh_mode="raw"`` is the fallback (allow raw ``~/.ssh`` read) — a live
+    agent-mode round-trip 2026-07-12 (real ``ssh -T git@github.com`` auth + ``git ls-remote``, raw key
+    read denied) confirmed agent-mode is tight AND functional, so raw is genuinely only a fallback.
+  - the ssh persistence/exec vectors ``~/.ssh/{authorized_keys,authorized_keys2,config,rc}`` WRITE —
+    denied in BOTH ssh_modes (slice 3, spore-322): a planted key (sshd honours it), a ``ProxyCommand``/
+    ``Match exec`` in ``config`` (the operator's next ssh runs it), or an ``rc`` hook (sshd runs it on
+    login) is code the operator/sshd runs LATER — a persistent backdoor, zero legit entity use. Rendered
+    write-ONLY (raw-mode ~/.ssh reads still work), AND ~/.ssh's dir anchor — the LEXICAL path, so even a
+    PRE-EXISTING ~/.ssh symlink can't be re-pointed — is pinned in ``deny_write_dirs`` so it can't be
+    RELOCATED to dodge the literal (apparatus L3 codex, TWO rounds — a raw-mode ``mv ~/.ssh`` /
+    symlink-anchor bypass, VERIFIED LIVE). The standard cred stores (``~/.config/gh`` / ``~/.aws/
+    credentials`` / ``~/.netrc`` / ``~/.git-credentials``) are an OPT-IN (``deny_standard_creds``,
+    default OFF — denying their read would break the entity's own gh/aws/curl use).
   - **ancestor-write-deny (apparatus L2 CRITICAL):** each crown jewel is pinned to an ABSOLUTE path,
     so under ``(allow default)`` the entity could ``mv`` a non-denied ANCESTOR directory of a jewel
     to relocate it out from under its deny string, then read it. So every ancestor dir of every jewel
@@ -54,7 +66,29 @@ three).
   - A PRE-POPULATED HARDLINK whose inode is a crown-jewel file, dropped by an untrusted party, could
     read through (seatbelt matches the path STRING; a hardlink has no path to the crown jewel). The
     entity itself cannot create one (it can't reference the out-of-tree target). Out of the single-
-    operator threat model; named.
+    operator threat model; named. (Slice 3 broadened this limit's surface to the WRITE direction too: a
+    third-party pre-planted hardlink to a write-only vector at a writable path lets the entity write
+    through — same out-of-model class.)
+  - CUSTOM ``AuthorizedKeysFile`` (apparatus L3 complement): the ssh write-floor covers sshd's DEFAULT
+    key files (``~/.ssh/authorized_keys`` + ``authorized_keys2``). An operator whose ``sshd_config``
+    sets a non-default ``AuthorizedKeysFile`` (or an ``AuthorizedKeysCommand``) has a persistence path
+    the floor does not name — pin it via ``deny_files``. Narrow (needs Remote Login on AND a customized
+    sshd), but named rather than silently uncovered.
+  - SEATBELT ``link()``/``rename()`` SOURCE-CHECK COUPLING (apparatus L3 complement, verified live): the
+    write-floor's integrity rests on seatbelt applying ``file-write*`` to the SOURCE path of a hardlink/
+    rename (so a write-denied file can't be relocated OUT), which held on Darwin 25.5 but is undocumented
+    Apple behaviour on a deprecated tool. The ``ConfinementProvider`` seam is the hedge; the eventual
+    Linux ``bwrap`` / container backend MUST re-prove "cannot hardlink/rename a write-denied file out" as
+    a first-class provider-contract test — a ``--ro-bind`` on one file does not obviously give it.
+  - REPLACEABLE LEXICAL HOME-CHAIN ANCESTOR (apparatus L3 codex round-3, the generalized class): the
+    slice-3 fix pins the lexical ``~/.ssh`` anchor, but the pin is ``home.resolve() / ".ssh"`` — so if
+    ``HOME`` ITSELF (or a lexical ancestor of it) is a USER-WRITABLE symlink (e.g. ``HOME=/tmp/linkhome``
+    where ``linkhome -> /tmp/realhome``), the entity could ``rm /tmp/linkhome; ln -s /tmp/evilhome
+    /tmp/linkhome`` to re-point the whole home, dodging every RESOLVED jewel deny. Out of the normal
+    single-operator model (a real ``$HOME`` is ``/Users/<u>`` under root-owned ``/Users``, non-
+    replaceable by the entity), so NOT fixed here — but named. This is the general "resolved jewel with
+    a replaceable lexical ancestor" pattern; the real fix (if it ever matters) is to pin every writable
+    symlink COMPONENT of every protected path's lexical chain, a cross-jewel pass, not an ssh one-off.
   - RESOURCE EXHAUSTION (fork bomb, disk fill) is a self-DoS on the operator's own Mac, not a
     confinement breach — seatbelt doesn't cap CPU/mem/disk. Cheap defense (``ulimit`` in the shell
     wrapper) is a later polish, not a floor concern.
@@ -76,12 +110,14 @@ three).
   - CROWN-JEWEL DIRECTORY NAMES leak: ``ls ~`` lists ``.anneal-memory`` as a NAME (the parent's
     metadata is allowed; the subtree's CONTENTS + the jewel dir's own stat are denied). Names are
     already public; informational.
-  - The v1 floor is the Phill-RATIFIED set; it does NOT include other credential stores that
-    default-allow leaves readable — ``~/.config/gh`` (a GitHub token = repo push), ``~/.aws/
-    credentials``, ``~/.netrc``, ``~/.ssh/authorized_keys`` write. Those are ≥ the ssh key in impact;
-    whether to fold them into the floor (vs. leaving them to ``deny_files`` wiring) is a Phill policy
-    call (spore-311), deliberately NOT auto-decided here — adding them could break the entity's own
-    legit gh/aws usage.
+  - FLOOR-EXPANSION (spore-322, Phill-ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
+    the UNIVERSAL floor (:data:`_SSH_AUTHORIZED_KEYS`, both ssh_modes — a persistence backdoor with zero
+    legit use, so it is folded unconditionally). The other default-allow-readable standard cred stores
+    — ``~/.config/gh`` (a GitHub token = repo push/admin), ``~/.aws/credentials``, ``~/.netrc`` — are ≥
+    the ssh key in impact, but denying their READ breaks the entity's own gh/aws/curl use, so they are
+    an explicit OPT-IN (``deny_standard_creds`` in confinement.json, default OFF; :data:`_STANDARD_CRED_
+    SUBTREES` / :data:`_STANDARD_CRED_FILES`) rather than always-on — operational-fit over purity. A
+    caller can still pin any of them ad-hoc via ``deny_files`` / ``extra_deny_read_write``.
 
 **Gating (v1 REALITY, load-bearing honesty).** This floor protects the crown jewels and NOTHING else.
 With default-allow and no threshold membrane (a SPEC, not code — spore-295) and no permission prompts
@@ -144,6 +180,43 @@ SshMode = Literal["agent", "raw"]
 _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then truncate + mark)
 _MAX_QUEUE_LINES = 200_000            # reader-queue depth; oldest dropped past this (runaway only)
 
+# The ssh files WRITE-denied in EVERY ssh_mode — the persistence/exec-vector floor (slice 3, Phill-
+# ratified 2026-07-12; expanded from authorized_keys-only after apparatus L1 caught the config/rc gap +
+# the banner overclaim). Writing ANY of these grants code the operator or sshd runs LATER, with ZERO
+# legit entity use — a strictly worse vector than reading a key (a read exfils; a write grants standing
+# execution):
+#   - ``authorized_keys`` / ``authorized_keys2`` — sshd honours a planted INBOUND key (standing access);
+#   - ``config`` — the operator's OUTBOUND ssh runs ``ProxyCommand`` / ``LocalCommand`` / ``Match exec``
+#     from it, so a written ssh config is RCE on the operator's NEXT ``ssh``/``git`` (the strongest one);
+#   - ``rc`` — sshd runs ``~/.ssh/rc`` on INBOUND login.
+# In ``ssh_mode="agent"`` the whole ``~/.ssh`` subtree is already denied (``config`` there is re-allowed
+# READ-only, so its WRITE stays denied — consistent); in ``ssh_mode="raw"`` (raw ``~/.ssh`` reads
+# allowed) these literal write-denies are the SOLE guard on the exec vectors — the raw-mode gap a live
+# round-trip confirmed (a bare ``authorized_keys`` append succeeded). NOT exhaustive of ALL persistence
+# (a ``~/.zshrc`` plant is equally possible in BOTH modes — the human-in-the-loop / non-crown-jewel-write
+# limit documented in "Gating"); these are the ssh-specific zero-legit vectors, closed because the
+# module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
+_SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
+
+# Standard, tool-CANONICAL credential locations. Folding these into the floor is an OPT-IN
+# (``deny_standard_creds`` in ``confinement.json``, default OFF), never automatic, for two reasons:
+# (1) unlike an app secret (``.env.flow``), these ARE structurally knowable — gh / aws / curl look
+# here BY DEFINITION, so naming them is not the FALSE-SECURITY guessing the module otherwise refuses;
+# (2) denying their READ breaks the entity's OWN legitimate ``gh`` / ``aws`` / netrc-``curl`` use, so a
+# CC-replacement's hands must not lose them by default (operational-fit). They are >= the ssh key in
+# impact under default-allow (a gh token = repo push/admin; aws creds = infra/$), so the operator who
+# does NOT need those tools flips ONE config line to fold them in. ``~/.config/gh`` is a DIR (the token
+# lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
+_STANDARD_CRED_SUBTREES = ("~/.config/gh",)   # gh OAuth token (hosts.yml) → repo push/admin
+_STANDARD_CRED_FILES = (
+    "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
+                                    # profile / SSO the entity legitimately needs; an operator whose
+                                    # ~/.aws/config carries a secret pins it ad-hoc via deny_files.
+    "~/.netrc",                     # netrc PAT / http creds (git-https, curl)
+    "~/.git-credentials",           # git HTTPS PAT store (same class as ~/.netrc — apparatus L1)
+    "~/.config/git/credentials",    # XDG-path git credential store
+)
+
 
 class ConfinementError(RuntimeError):
     """The confinement could not be established or is unavailable on this platform. FAIL-CLOSED:
@@ -173,6 +246,13 @@ class CrownJewelsPolicy:
     deny_write_dirs: tuple[Path, ...]   # ancestor DIRS write-denied → block rename-relocation (L2)
     ssh_dir: Path | None                # ~/.ssh to key-confine (ssh_mode="agent"); None = "raw" mode
     ssh_mode: SshMode = "agent"
+    deny_write_files: tuple[Path, ...] = ()   # WRITE-only denied ssh FILES (authorized_keys*, config,
+    # rc — the persistence/exec vectors) applied in BOTH ssh_modes: they block PLANTING a key / a
+    # ProxyCommand config / an rc hook (code the operator or sshd runs later). Rendered as write-only
+    # literals (read stays allowed on the seatbelt hand → raw-mode ~/.ssh reads work), AND their ancestor
+    # ~/.ssh is pinned in deny_write_dirs (build_policy adds them to all_jewels) so the dir can't be
+    # relocated to dodge the literal — the codex raw-mode bypass. Distinct from deny_files (read+write);
+    # the in-process file-editor twin denies them outright (read included, stricter-on-ssh).
     config_file: Path | None = None     # <entity>/.levain/confinement.json — the config that DEFINES
     # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
     # (apparatus L1 — confinement.json lives in the entity-writable .levain/; a self-authored
@@ -240,6 +320,7 @@ def build_policy(
     ssh_mode: SshMode = "agent",
     deny_files: tuple[Path | str, ...] = (),
     extra_deny_read_write: tuple[Path | str, ...] = (),
+    deny_standard_creds: bool = False,
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -251,10 +332,21 @@ def build_policy(
         memory;
       - ``~/.ssh/id_*`` private keys (read-denied when ``ssh_mode="agent"``): the entity authenticates
         via the agent socket but can't READ raw key material to exfil it. ``ssh_mode="raw"`` omits this
-        (the fallback when agent-only proves too tight — a build-session settle).
+        (the fallback — a live round-trip 2026-07-12 confirmed ``ssh_mode="agent"`` is tight AND
+        functional, so raw is genuinely only a fallback);
+      - ``~/.ssh/authorized_keys`` (+ ``authorized_keys2``) WRITE — denied in BOTH ssh_modes: planting
+        a key is a persistent SSH backdoor with zero legit entity use (in agent-mode the whole ~/.ssh
+        subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
+        expanded), so raw-mode keeps ~/.ssh otherwise writable.
+
+    **Operator OPT-IN (``deny_standard_creds=True``):** fold the standard tool-canonical cred stores
+    (``~/.config/gh`` subtree, ``~/.aws/credentials``, ``~/.netrc``) into the floor. These are knowable
+    locations (not the false-security guessing the module refuses), but denying their READ breaks the
+    entity's own gh/aws/curl use, so it is OFF by default — the operator enables it when the entity
+    does not need those tools. Wired from ``confinement.json`` via :func:`policy_for_conv_state`.
 
     **Operator-declared crown jewels (the caller MUST pass — this generic, operator-neutral module
-    deliberately does NOT guess where an operator's secrets live):**
+    deliberately does NOT guess where an operator's app-specific secrets live):**
       - ``deny_files`` — credential FILES (e.g. flow's ``~/Documents/flow/.env.flow``). Denied by
         ``literal`` so a same-named file elsewhere is unaffected. NOTE: guessing a filename like
         ``~/.env.flow`` is worse than useless — it is FALSE SECURITY (it "protects" a path the secret
@@ -279,7 +371,30 @@ def build_policy(
 
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
+    # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
+    # locations, not a guess — but denying their READ breaks the entity's own gh/aws/curl hands, so the
+    # operator enables this only when the entity does not need those tools (``deny_standard_creds`` in
+    # confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
+    # write-deny), so no separate rendering path is needed.
+    if deny_standard_creds:
+        subtrees.extend(Path(s).expanduser().resolve() for s in _STANDARD_CRED_SUBTREES)
+        files.extend(Path(f).expanduser().resolve() for f in _STANDARD_CRED_FILES)
+
     ssh_dir = (home / ".ssh").resolve() if ssh_mode == "agent" else None
+
+    # The ssh persistence/exec vectors (~/.ssh/authorized_keys*, config, rc — ``_SSH_WRITE_DENIED``) are
+    # WRITE-denied in EVERY ssh_mode. TWO-PART enforcement (part 2 added after apparatus L3 codex, non-
+    # replaceable, found a real raw-mode bypass in the literal-only first cut):
+    #   (1) the FILES render as write-ONLY denies — read stays allowed on the seatbelt hand so raw-mode
+    #       ~/.ssh reads still work (the in-process file-editor twin denies them outright); AND
+    #   (2) the files are added to ``all_jewels`` below, so ~/.ssh (their ancestor DIR) is write-denied.
+    #       WITHOUT (2), raw-mode leaves ~/.ssh renameable: ``mv ~/.ssh ~/.ssh.bak; ln -s ~/evil ~/.ssh``
+    #       relocates the directory ANCHOR, so a key planted at ~/evil/authorized_keys is NOT the denied
+    #       literal yet sshd's ``realpath()`` honours it (codex; VERIFIED LIVE — the bypass planted an
+    #       attacker key). Write-denying the ~/.ssh dir LITERAL blocks renaming/replacing it while STILL
+    #       allowing file creation/reads INSIDE it (a child-path write-check), so raw-mode is NOT re-jailed.
+    ssh_home = home / ".ssh"
+    deny_write_files_l = [(ssh_home / n).resolve() for n in _SSH_WRITE_DENIED]
 
     # De-dup while preserving order (a sibling could coincide with an extra); resolved paths compare
     # exactly, so a simple seen-set is sound.
@@ -294,6 +409,7 @@ def build_policy(
 
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
+    deny_write_files_t = _dedup(deny_write_files_l)
     # The confinement config that DEFINES the floor is itself floor-protected (read+write denied): the
     # entity can't rewrite its own jail. It lives in the entity-writable ``.levain/`` (deliberately NOT
     # a crown jewel — the entity's memory is its own), so without this a self-authored ``ssh_mode="raw"``
@@ -315,12 +431,23 @@ def build_policy(
             "refusing to grant confined hands. A symlinked config could be unlinked and rewritten to "
             "weaken the next session's floor; make it a plain file inside .levain/."
         )
-    # Ancestor write-denies for the subtree jewels, file jewels, AND the config file (all relocate the
-    # same way). The ssh_dir is guarded as a subtree below, so its ancestors are covered too.
-    all_jewels = list(deny_read_write) + list(deny_files_t) + [config_file]
+    # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, AND the
+    # config file (all relocate the same way). Including ``deny_write_files_t`` here write-denies ~/.ssh
+    # (the persistence-vector dir anchor) so it can't be renamed/replaced to relocate the protected
+    # literal — the raw-mode bypass codex found. The ssh_dir is guarded as a subtree below (agent mode),
+    # so its ancestors are covered too; in raw mode this is the only thing that pins ~/.ssh's anchor.
+    all_jewels = list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t) + [config_file]
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
-    write_dirs = _write_deny_ancestors(all_jewels)
+    # Pin the LEXICAL ~/.ssh anchor too (apparatus L3 codex re-verify HIGH — "resolved jewel vs lexical
+    # anchor are different objects"). ``deny_write_files_l`` uses ``.resolve()`` for CONTENT protection
+    # (it must deny the real write TARGET, even through a symlink) — but that FOLLOWS a pre-existing
+    # ``~/.ssh -> ~/realssh`` symlink, so ancestor-deny pins ~/realssh, leaving lexical ~/.ssh replaceable
+    # (``rm ~/.ssh; ln -s ~/evil ~/.ssh`` → the planted key at ~/evil dodges the resolved-target deny).
+    # Deny the lexical dir path (resolved HOME + un-deref'd ``.ssh``) so ``rm``/``mv``/replace of ~/.ssh
+    # ITSELF is blocked; child reads/writes still resolve through it, so raw mode is not re-jailed.
+    ssh_anchor = home.resolve() / ".ssh"
+    write_dirs = _dedup(list(_write_deny_ancestors(all_jewels)) + [ssh_anchor])
 
     return CrownJewelsPolicy(
         entity_dir=ed,
@@ -331,6 +458,7 @@ def build_policy(
         ssh_dir=ssh_dir,
         ssh_mode=ssh_mode,
         config_file=config_file,
+        deny_write_files=deny_write_files_t,
     )
 
 
@@ -371,8 +499,12 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     so a macOS case-variant of a jewel can't slip past this while the kernel treats it as the same file.
 
     It denies: the crown-jewel SUBTREES (flow store + sibling ``.levain/`` stores + operator-declared
-    extra subtrees), the crown-jewel credential FILES, the confinement CONFIG file (the entity can't
-    rewrite its own floor), and — when ``ssh_mode="agent"`` — the WHOLE ``~/.ssh`` subtree. NOTE the ssh
+    extra subtrees + the opt-in standard cred stores), the crown-jewel credential FILES, the confinement
+    CONFIG file (the entity can't rewrite its own floor), the ``deny_write_files`` (``~/.ssh/authorized_
+    keys*`` — denied to the file editor OUTRIGHT in BOTH ssh_modes, read included: the file editor has
+    no legit reason to touch ssh files at all, so this is fail-closed and consistent with the stricter-
+    on-ssh stance; the seatbelt hand allows the READ in raw-mode, and denying both hands the WRITE is
+    what matters), and — when ``ssh_mode="agent"`` — the WHOLE ``~/.ssh`` subtree. NOTE the ssh
     deny is stricter than the seatbelt's (which re-allows ``known_hosts`` r+w + ``config`` r so the
     SHELL's ssh can record host keys): the file editor has no legitimate need to touch ssh files (that
     is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
@@ -395,6 +527,9 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
     if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
         return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
+    for wf in policy.deny_write_files:
+        if _ci_within(p, wf):
+            return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     return None
 
 
@@ -412,6 +547,8 @@ class ConfinementConfig:
     deny_files: tuple[Path, ...] = ()      # credential FILES (literal): e.g. ~/Documents/flow/.env.flow
     deny_subtrees: tuple[Path, ...] = ()   # additional crown-jewel SUBTREES: a secrets dir, another store
     ssh_mode: SshMode = "agent"
+    deny_standard_creds: bool = False      # OPT-IN: fold ~/.config/gh + ~/.aws/credentials + ~/.netrc
+    # into the floor (default OFF — denying their READ breaks the entity's own gh/aws/curl use).
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -424,7 +561,8 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
 
         {"deny_files": ["~/Documents/flow/.env.flow"],
          "deny_subtrees": ["~/some/secrets"],
-         "ssh_mode": "agent"}
+         "ssh_mode": "agent",
+         "deny_standard_creds": false}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
     the default (empty declarations, ``ssh_mode="agent"``) — the universal floor still protects the
@@ -464,10 +602,20 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"{base}: ssh_mode must be \"agent\" or \"raw\", got {ssh_mode!r} — fail-closed."
         )
 
+    deny_standard_creds = data.get("deny_standard_creds", False)
+    # ``isinstance(True, int)`` is True, so guard against a JSON number sneaking in as a bool — require
+    # a real bool (fail-closed: an ambiguous cred-floor declaration must not silently mis-parse).
+    if not isinstance(deny_standard_creds, bool):
+        raise ConfinementError(
+            f"{base}: deny_standard_creds must be true or false, got "
+            f"{deny_standard_creds!r} — fail-closed."
+        )
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
         ssh_mode=ssh_mode,
+        deny_standard_creds=deny_standard_creds,
     )
 
 
@@ -1034,6 +1182,22 @@ class SeatbeltProvider(ConfinementProvider):
                 )
             if not _caller_denies(config, policy):
                 lines.append(f'(allow file-read* (literal "{_sbpl_string(str(config))}"))')
+            lines.append("")
+
+        if policy.deny_write_files:
+            # LAST deny block (after the ssh block) so last-match-wins keeps it denied. WRITE-only (read
+            # stays allowed → raw-mode ~/.ssh reads still work); the FILES are literal here, while their
+            # dir anchor ~/.ssh is pinned against relocation by ``deny_write_dirs`` (build_policy adds
+            # these to ``all_jewels`` — the codex raw-mode-bypass fix). In agent-mode the whole ~/.ssh
+            # subtree already denies these (redundant-but-explicit); rendering in both modes makes the
+            # persistence-vector floor ssh_mode-independent and self-documenting.
+            lines.append(";; ssh persistence/exec vectors (authorized_keys*, config, rc) — ALWAYS write-")
+            lines.append(";; denied (both ssh_modes): a planted key / ProxyCommand config / rc is code the")
+            lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
+            lines.append("(deny file-write*")
+            for p in policy.deny_write_files:
+                lines.append(f'    (literal "{_sbpl_string(str(p))}")')
+            lines.append(")")
             lines.append("")
 
         return "\n".join(lines).rstrip() + "\n"

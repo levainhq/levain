@@ -25,10 +25,13 @@ on every path — the same denylist, so there is no ``claim > enforcement`` gap 
 
 **The crown-jewels floor (structural, never).** ``~/.anneal-memory/`` (flow's memory — the identity
 moat in file terms), sibling entities' ``.levain/`` stores, ``~/.ssh`` key material (``ssh_mode=
-"agent"`` — the entity authenticates via the agent socket but can't read/exfil raw keys), plus the
-operator-declared credential files/subtrees from ``confinement.json``. The entity's OWN
-``<entity>/.levain/`` store is deliberately NOT a jewel (its memory is its own); the firing's
-``assert_entity_isolated`` moat, not these tools, keeps recall/capture off flow's store.
+"agent"`` — the entity authenticates via the agent socket but can't read/exfil raw keys),
+``~/.ssh/authorized_keys`` WRITE (both ssh_modes — no key can be planted as a persistence backdoor),
+plus the operator-declared credential files/subtrees from ``confinement.json`` and — when the operator
+opts in (``deny_standard_creds``) — the standard cred stores (``~/.config/gh`` / ``~/.aws/credentials``
+/ ``~/.netrc``). The entity's OWN ``<entity>/.levain/`` store is deliberately NOT a jewel (its memory
+is its own); the firing's ``assert_entity_isolated`` moat, not these tools, keeps recall/capture off
+flow's store.
 
 **Gating (v1 REALITY, load-bearing honesty).** The floor protects the crown jewels and NOTHING else.
 With default-allow, no threshold membrane (a SPEC — spore-295), and no permission prompts (Phill:
@@ -124,6 +127,7 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         ssh_mode=cfg.ssh_mode,
         deny_files=cfg.deny_files,
         extra_deny_read_write=cfg.deny_subtrees,
+        deny_standard_creds=cfg.deny_standard_creds,
     )
 
 
