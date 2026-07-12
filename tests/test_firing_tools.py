@@ -30,6 +30,7 @@ from levain.firing.confinement import (  # noqa: E402
     ConfinementError,
     build_policy,
     confinement_supported,
+    crown_jewel_reason,
 )
 from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV  # noqa: E402
 from levain.firing.openhands.tools import (  # noqa: E402
@@ -123,6 +124,25 @@ def test_policy_for_conv_state_prefers_env_then_workspace_parent(tmp_path: Path,
     monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(other))
     pol2 = policy_for_conv_state(_FakeConvState(ws))
     assert pol2.entity_dir == other.resolve()
+
+
+def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
+    """The confinement.json ``deny_standard_creds`` opt-in threads through policy_for_conv_state into
+    the built policy (apparatus L1/complement: nothing pinned this end-to-end wiring — a dropped
+    pass-through in tools.py would silently lose the opt-in while every other test still passed)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent, ws = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
+    pol = policy_for_conv_state(_FakeConvState(ws))
+    assert crown_jewel_reason(pol, tmp_path / ".config" / "gh" / "hosts.yml") is not None
+    # a DIFFERENT entity with no confinement.json does NOT fold them in (default OFF — gh hands intact)
+    ent2 = tmp_path / "e2"
+    (ent2 / ".levain").mkdir(parents=True)
+    ws2 = ent2 / "workspace"
+    ws2.mkdir()
+    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent2))
+    pol2 = policy_for_conv_state(_FakeConvState(ws2))
+    assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
 
 
 # --- the file-editor hand: create + declared_resources + the floor ---------------------------

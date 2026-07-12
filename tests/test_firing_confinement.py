@@ -45,6 +45,16 @@ from levain.firing.confinement import (
 _LIVE = platform.system() == "Darwin" and sandbox_exec_available()
 live = pytest.mark.skipif(not _LIVE, reason="needs macOS sandbox-exec (the SeatbeltProvider backend)")
 
+# A REAL agent-socket SSH round-trip (slice 3, build-settle #1) needs the sandbox AND a loaded ssh-agent
+# AND network AND GitHub reachability — so it is DOUBLE-gated: `@live` plus an explicit opt-in env, so a
+# normal `@live` run never hits the network. Enable with `LEVAIN_LIVE_SSH=1 pytest -k live_ssh` on a box
+# whose agent has a github-authorized key loaded.
+_LIVE_SSH = _LIVE and bool(os.environ.get("SSH_AUTH_SOCK")) and os.environ.get("LEVAIN_LIVE_SSH") == "1"
+live_ssh = pytest.mark.skipif(
+    not _LIVE_SSH,
+    reason="needs LEVAIN_LIVE_SSH=1 + a loaded ssh-agent + network + macOS sandbox-exec",
+)
+
 
 # --- helpers ------------------------------------------------------------------------
 
@@ -185,10 +195,19 @@ def test_render_profile_ssh_agent_denies_subtree_and_reallows(tmp_path: Path, mo
     assert f'(allow file-read* (literal "{ssh / "config"}"))' in profile
 
 
-def test_render_profile_ssh_raw_omits_ssh_rules(tmp_path: Path, monkeypatch) -> None:
+def test_render_profile_ssh_raw_omits_subtree_deny_but_keeps_authk_write_deny(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``ssh_mode="raw"`` drops the whole-``~/.ssh`` subtree deny + its re-allows (raw reads allowed),
+    but the ``authorized_keys`` WRITE-deny stays (the persistence-vector floor is ssh_mode-independent,
+    slice 3)."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = (tmp_path / ".ssh").resolve()
     profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path), ssh_mode="raw"))
-    assert ".ssh" not in profile
+    assert f'(subpath "{ssh}")' not in profile                       # no whole-subtree ssh deny
+    assert f'(literal "{ssh / "known_hosts"}"))' not in profile      # no re-allows either
+    assert f'(literal "{ssh / "authorized_keys"}")' in profile       # but authk write-deny stays
+    assert f'(literal "{ssh / "authorized_keys2"}")' in profile
 
 
 def test_render_profile_emits_ancestor_write_denies(tmp_path: Path, monkeypatch) -> None:
@@ -498,6 +517,71 @@ def test_live_ssh_keys_denied_location_based_known_hosts_usable(tmp_path: Path, 
 
 
 @live
+def test_live_raw_mode_authorized_keys_write_denied_but_read_allowed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SLICE 3 (spore-322): ``ssh_mode="raw"`` allows raw ~/.ssh READS (its whole purpose — the private
+    key IS readable here) but STILL denies PLANTING an authorized key. The persistence-vector floor is
+    ssh_mode-independent. Uses a FAKE HOME under tmp_path so the operator's real ~/.ssh is never
+    touched (the raw-mode gap this closes was first confirmed by a bare append that SUCCEEDED)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA original\n")
+    (ssh / "id_ed25519").write_text("RAW PRIVATE KEY")
+    with select_provider().spawn_shell(build_policy(_entity(tmp_path), ssh_mode="raw")) as sh:
+        r_key = sh.run(f"cat {ssh / 'id_ed25519'} 2>&1", timeout=10)
+        assert r_key.exit_code == 0 and "RAW PRIVATE KEY" in r_key.output  # raw read allowed
+        r_read = sh.run(f"cat {ssh / 'authorized_keys'} 2>&1", timeout=10)
+        assert r_read.exit_code == 0 and "original" in r_read.output      # authk read allowed in raw
+        r_plant = sh.run(
+            f"echo 'ssh-ed25519 AAAA attacker' >> {ssh / 'authorized_keys'} 2>&1", timeout=10
+        )
+        assert r_plant.exit_code != 0 and "not permitted" in r_plant.output.lower()  # but not WRITE
+    assert (ssh / "authorized_keys").read_text() == "ssh-ed25519 AAAA original\n"  # byte-unchanged
+
+
+@live
+def test_live_raw_mode_ssh_dir_relocation_blocked(tmp_path: Path, monkeypatch) -> None:
+    """REGRESSION (apparatus L3 codex, non-replaceable — verified live): raw-mode must block relocating
+    the ~/.ssh dir ANCHOR (``mv ~/.ssh``), else ``mv ~/.ssh ~/.ssh.bak; ln -s ~/evil ~/.ssh`` plants a
+    key at the symlink target — NOT the denied literal — and sshd's realpath() honours it. The dir-anchor
+    pin (deny_write_dirs) blocks the rename WITHOUT re-jailing raw file access inside ~/.ssh."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("RAW KEY")
+    with select_provider().spawn_shell(build_policy(_entity(tmp_path), ssh_mode="raw")) as sh:
+        r_mv = sh.run(f"mv {ssh} {tmp_path / '.ssh.bak'} 2>&1; echo rc=$?", timeout=10)
+        assert "not permitted" in r_mv.output.lower() and "rc=0" not in r_mv.output  # relocation blocked
+        # raw-mode file access inside ~/.ssh is NOT re-jailed:
+        r_read = sh.run(f"cat {ssh / 'id_ed25519'} 2>&1", timeout=10)
+        assert r_read.exit_code == 0 and "RAW KEY" in r_read.output                 # raw read works
+        r_child = sh.run(f"echo host >> {ssh / 'known_hosts'} 2>&1; echo rc=$?", timeout=10)
+        assert "rc=0" in r_child.output                                             # child write works
+    assert ssh.is_dir()  # ~/.ssh un-relocated
+
+
+@live_ssh
+def test_live_agent_ssh_roundtrip_authenticates_and_denies_raw_keys(tmp_path: Path) -> None:
+    """SLICE 3 build-settle #1, the LIVE proof: with ``ssh_mode="agent"`` a real ssh round-trip
+    AUTHENTICATES to github.com via the forwarded agent socket while the raw ~/.ssh subtree stays
+    read-denied. Uses the operator's REAL ~/.ssh + agent + network (double-gated by LEVAIN_LIVE_SSH),
+    so HOME is NOT monkeypatched. Settles that agent-mode is tight AND functional (no allow-set polish
+    needed) — the recommended default."""
+    with select_provider().spawn_shell(build_policy(_entity(tmp_path), ssh_mode="agent")) as sh:
+        r_auth = sh.run(
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1",
+            timeout=30,
+        )
+        assert "successfully authenticated" in r_auth.output  # agent auth reached GitHub
+        r_ls = sh.run("ls ~/.ssh 2>&1", timeout=10)
+        assert "not permitted" in r_ls.output.lower()         # raw subtree denied (dir stat too)
+        r_kh = sh.run("head -c 1 ~/.ssh/known_hosts >/dev/null 2>&1; echo rc=$?", timeout=10)
+        assert "rc=0" in r_kh.output                           # known_hosts re-allow works
+
+
+@live
 def test_live_non_utf8_output_does_not_brick_the_shell(tmp_path: Path) -> None:
     """REGRESSION (apparatus L3, verified live): a command emitting non-UTF-8 bytes (binary output, a
     latin-1 tool) once crashed the reader thread with a UnicodeDecodeError, bricking the shell for
@@ -606,8 +690,12 @@ def test_crown_jewel_reason_denies_declared_files_and_ssh_but_allows_broad_reach
 def test_crown_jewel_reason_raw_ssh_mode_does_not_deny_ssh(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = build_policy(_entity(tmp_path), ssh_mode="raw")
-    # ssh_mode="raw" leaves ssh_dir None → the predicate does not deny ~/.ssh (matches the profile)
+    # ssh_mode="raw" leaves ssh_dir None → the predicate does not deny raw ~/.ssh keys (matches profile)
     assert crown_jewel_reason(policy, tmp_path / ".ssh" / "id_rsa") is None
+    # ...but authorized_keys stays denied to the file editor even in raw mode (persistence vector, the
+    # deny_write_files carve-out — the file editor never touches ssh files).
+    assert crown_jewel_reason(policy, tmp_path / ".ssh" / "authorized_keys") is not None
+    assert crown_jewel_reason(policy, tmp_path / ".ssh" / "authorized_keys2") is not None
 
 
 def test_crown_jewel_reason_own_store_is_not_a_jewel(tmp_path: Path, monkeypatch) -> None:
@@ -620,6 +708,135 @@ def test_crown_jewel_reason_own_store_is_not_a_jewel(tmp_path: Path, monkeypatch
 def test_crown_jewel_reason_fails_closed_on_an_unresolvable_path(tmp_path: Path) -> None:
     # A NUL-byte path can't be proven safe → denied (fail-closed), not silently allowed.
     assert crown_jewel_reason(build_policy(_entity(tmp_path)), "a\x00b") is not None
+
+
+# =============================================================================================
+# SLICE 3 — floor expansion: authorized_keys write-floor (always) + deny_standard_creds (opt-in)
+# =============================================================================================
+
+
+def test_build_policy_always_write_denies_ssh_exec_vectors(tmp_path: Path, monkeypatch) -> None:
+    """All the ssh persistence/exec vectors (authorized_keys(2), config, rc) are in ``deny_write_files``
+    in BOTH ssh_modes — the floor is ssh_mode-independent (slice 3, spore-322; config/rc added after
+    apparatus L1 caught the ProxyCommand/rc gap)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    for mode in ("agent", "raw"):
+        policy = build_policy(ent, ssh_mode=mode)  # type: ignore[arg-type]
+        for name in ("authorized_keys", "authorized_keys2", "config", "rc"):
+            assert (tmp_path / ".ssh" / name).resolve() in policy.deny_write_files
+
+
+def test_build_policy_ssh_dir_anchor_pinned_but_not_read_jailed(tmp_path: Path, monkeypatch) -> None:
+    """REGRESSION (apparatus L3 codex, non-replaceable — verified live): the ssh write-vector files pin
+    their dir ANCHOR (~/.ssh IS in deny_write_dirs → can't be renamed/relocated to dodge the literal
+    deny, closing the ``mv ~/.ssh``+symlink bypass) WITHOUT re-jailing raw reads (~/.ssh is NOT a
+    read+write subtree in raw mode, so file access inside it still works)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+    assert (tmp_path / ".ssh").resolve() in policy.deny_write_dirs         # anchor pinned (blocks relocate)
+    assert (tmp_path / ".ssh" / "authorized_keys").resolve() in policy.deny_write_files
+    assert (tmp_path / ".ssh").resolve() not in policy.deny_read_write     # raw reads NOT jailed
+
+
+def test_build_policy_pins_lexical_ssh_anchor_even_when_ssh_is_a_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """REGRESSION (apparatus L3 codex RE-VERIFY, non-replaceable): a PRE-EXISTING ``~/.ssh -> ~/realssh``
+    symlink must not let the entity replace the anchor. ``deny_write_files`` uses ``.resolve()`` (content
+    protection — it follows the symlink and pins ~/realssh), so the LEXICAL ~/.ssh must be pinned
+    SEPARATELY, or ``rm ~/.ssh; ln -s ~/evil ~/.ssh`` re-points the anchor and a key planted at ~/evil
+    dodges the resolved-target deny (verified live)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    realssh = tmp_path / "realssh"
+    realssh.mkdir()
+    (tmp_path / ".ssh").symlink_to(realssh)
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+    assert (tmp_path.resolve() / ".ssh") in policy.deny_write_dirs   # LEXICAL anchor pinned (blocks rm/mv)
+    assert realssh.resolve() in policy.deny_write_dirs               # resolved target also pinned
+
+
+def test_build_policy_deny_standard_creds_expands_known_locations(tmp_path: Path, monkeypatch) -> None:
+    """The opt-in folds gh (subtree) + aws credentials + netrc (files) into the floor."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path), deny_standard_creds=True)
+    assert (tmp_path / ".config" / "gh").resolve() in policy.deny_read_write
+    assert (tmp_path / ".aws" / "credentials").resolve() in policy.deny_files
+    assert (tmp_path / ".netrc").resolve() in policy.deny_files
+
+
+def test_build_policy_default_does_not_deny_standard_creds(tmp_path: Path, monkeypatch) -> None:
+    """Default OFF (operational-fit): the entity keeps its own gh/aws/curl hands unless opted in."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    assert (tmp_path / ".config" / "gh").resolve() not in policy.deny_read_write
+    assert (tmp_path / ".aws" / "credentials").resolve() not in policy.deny_files
+
+
+_VECTOR_MARKER = ";; ssh persistence/exec vectors"
+
+
+def test_render_profile_ssh_exec_vector_block_is_write_only(tmp_path: Path, monkeypatch) -> None:
+    """Both ssh_modes render the ssh exec vectors (authk*, config, rc) in a WRITE-ONLY deny block — read
+    stays allowed on the seatbelt hand so raw-mode ~/.ssh reads work. Pins the block's polarity by its
+    header (complement L3: a bare ``"(deny file-write*" in profile`` was ALSO satisfied by the unrelated
+    ancestor-write-deny block, so it couldn't catch a regression to read+write on the vector block)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = (tmp_path / ".ssh").resolve()
+    ent = _entity(tmp_path)
+    for mode in ("agent", "raw"):
+        profile = SeatbeltProvider().render_profile(build_policy(ent, ssh_mode=mode))  # type: ignore[arg-type]
+        for name in ("authorized_keys", "authorized_keys2", "config", "rc"):
+            assert f'(literal "{ssh / name}")' in profile
+        assert _VECTOR_MARKER in profile
+        after = profile[profile.index(_VECTOR_MARKER):]
+        deny_line = next(ln for ln in after.splitlines() if ln.startswith("(deny "))
+        assert deny_line == "(deny file-write*"   # write-ONLY, not "(deny file-read* file-write*"
+
+
+def test_render_profile_exec_vector_deny_after_ssh_reallows(tmp_path: Path, monkeypatch) -> None:
+    """ORDERING GUARD (apparatus L1): the exec-vector write-deny must render AFTER the ssh re-allows so
+    SBPL last-match-wins keeps it denied. Locks the invariant a future re-allow reorder could silently
+    break (currently non-load-bearing only because no re-allow touches these files)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = (tmp_path / ".ssh").resolve()
+    profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path), ssh_mode="agent"))
+    reallow_idx = profile.index(f'(allow file-read* file-write* (literal "{ssh / "known_hosts"}"))')
+    assert profile.index(_VECTOR_MARKER) > reallow_idx
+
+
+def test_render_profile_deny_standard_creds(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    profile = SeatbeltProvider().render_profile(
+        build_policy(_entity(tmp_path), deny_standard_creds=True)
+    )
+    assert f'(subpath "{(tmp_path / ".config" / "gh").resolve()}")' in profile
+    assert f'(literal "{(tmp_path / ".aws" / "credentials").resolve()}")' in profile
+    assert f'(literal "{(tmp_path / ".netrc").resolve()}")' in profile
+
+
+def test_crown_jewel_reason_denies_authorized_keys_both_modes(tmp_path: Path, monkeypatch) -> None:
+    """The file-editor twin denies authorized_keys(2) in BOTH ssh_modes (write-protected vector; the
+    file editor never touches ssh files) — no two-enforcer split on the persistence vector."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    for mode in ("agent", "raw"):
+        policy = build_policy(ent, ssh_mode=mode)  # type: ignore[arg-type]
+        assert crown_jewel_reason(policy, tmp_path / ".ssh" / "authorized_keys") is not None
+        assert crown_jewel_reason(policy, tmp_path / ".ssh" / "authorized_keys2") is not None
+
+
+def test_crown_jewel_reason_deny_standard_creds(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    on = build_policy(ent, deny_standard_creds=True)
+    assert crown_jewel_reason(on, tmp_path / ".config" / "gh" / "hosts.yml") is not None
+    assert crown_jewel_reason(on, tmp_path / ".aws" / "credentials") is not None
+    assert crown_jewel_reason(on, tmp_path / ".netrc") is not None
+    # default OFF → the same paths are reachable (the entity's own gh/aws hands work)
+    off = build_policy(ent)
+    assert crown_jewel_reason(off, tmp_path / ".config" / "gh" / "hosts.yml") is None
+    assert crown_jewel_reason(off, tmp_path / ".netrc") is None
 
 
 # =============================================================================================
@@ -641,6 +858,21 @@ def test_load_confinement_config_parses_and_expands(tmp_path: Path, monkeypatch)
     assert cfg.deny_files == (tmp_path / "x.env",)
     assert cfg.deny_subtrees == (tmp_path / "secrets",)
     assert cfg.ssh_mode == "raw"
+    assert cfg.deny_standard_creds is False  # absent → default OFF
+
+
+def test_load_confinement_config_parses_deny_standard_creds(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
+    assert load_confinement_config(ent).deny_standard_creds is True
+
+
+def test_load_confinement_config_bad_deny_standard_creds_fails_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    # a JSON number is not a bool → fail-closed (an ambiguous cred-floor flag must not mis-parse).
+    (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": 1}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
 
 
 def test_load_confinement_config_ignores_unknown_keys(tmp_path: Path) -> None:
