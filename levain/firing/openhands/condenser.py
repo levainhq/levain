@@ -25,6 +25,7 @@ from openhands.sdk.context.view.view import View
 from openhands.sdk.event.condenser import Condensation
 from pydantic import PrivateAttr, model_validator
 
+from levain.firing.agent_reply import is_corrective_nudge
 from levain.firing.contract import FiringContract, InjectRequest, StubFiring, build_firing
 
 
@@ -39,6 +40,9 @@ def _recent_user_text(view: View) -> str:
     for event in reversed(view.events):
         if not isinstance(event, MessageEvent):
             continue
+        if is_corrective_nudge(event):
+            continue  # a synthetic nudge (the SDK's, or levain's act-now) is not the human's intent —
+            # skip it so recall on the re-run keys on the real task, not "…issue the tool calls" (L2).
         msg = event.llm_message
         if msg is None:
             continue

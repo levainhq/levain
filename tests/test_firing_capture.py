@@ -244,6 +244,52 @@ def test_vagus_run_stores_marker_in_agent_state():
     assert "vagus_last_captured_turn" in conv.state.agent_state
 
 
+def test_vagus_run_single_capture_after_a_nudge_records_the_work():
+    """Narrate-without-act backstop memory fix (L1+L2 review 2026-07-17): capturing ONCE after the full
+    nudge cycle — ``[user task][assistant PLAN][user NUDGE][assistant WORK]`` — records the completed
+    WORK, not the abandoned plan. This is what the run.py loop now does (run turn 1, nudge, run turn 2,
+    then a single capture_turn)."""
+    from levain.firing.agent_reply import LEVAIN_ACT_NUDGE
+
+    firing = StubFiring()
+    conv = _FakeConversation([
+        _msg("user", "fix the bug in calc.py"),
+        _msg("assistant", "I'll run the tests first."),                 # the stall (plan)
+        _msg("user", LEVAIN_ACT_NUDGE),                                 # synthetic nudge (source=user)
+        _msg("assistant", "Fixed the parity bug; all 3 tests pass."),   # the rescued work
+    ])
+    vagus_run(conv, firing=firing)
+    assert len(firing.captured) == 1
+    content = firing.captured[0].content
+    assert "Fixed the parity bug; all 3 tests pass." in content        # the WORK is captured
+    assert LEVAIN_ACT_NUDGE not in content                             # the nudge is not a [user] line
+
+
+def test_vagus_run_double_capture_across_a_nudge_drops_the_work():
+    """WHY the fix captures once, not once-per-run: capturing after the PLAN (turn 1) sets the turn
+    marker to the real user-message id; a second capture after NUDGE+WORK computes the SAME id (the
+    nudge is skipped by `is_corrective_nudge`) and no-ops — so the old two-capture pattern kept only
+    the stall and dropped the work. This locks that idempotency behavior in so the loop must never
+    revert to capturing before the nudge cycle settles."""
+    from levain.firing.agent_reply import LEVAIN_ACT_NUDGE
+
+    firing = StubFiring()
+    conv = _FakeConversation([
+        _msg("user", "fix the bug in calc.py"),
+        _msg("assistant", "I'll run the tests first."),
+    ])
+    vagus_run(conv, firing=firing)  # eager capture after the PLAN (the OLD behavior)
+    conv._state.events = [
+        *conv._state.events,
+        _msg("user", LEVAIN_ACT_NUDGE),
+        _msg("assistant", "Fixed; all pass."),
+    ]
+    vagus_run(conv, firing=firing)  # capture after the WORK — NO-OPS (same turn id)
+    assert len(firing.captured) == 1
+    assert "I'll run the tests first." in firing.captured[0].content
+    assert "Fixed; all pass." not in firing.captured[0].content  # the work was dropped — the bug
+
+
 def test_vagus_run_failed_capture_stays_retryable():
     """codex MED-3: a fail-soft-swallowed write (capture()->False) must NOT set the dedup marker,
     so the turn is retried on the next vagus_run instead of being silently lost."""

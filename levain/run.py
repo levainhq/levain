@@ -45,10 +45,12 @@ from pathlib import Path
 from typing import Any
 
 from levain.firing.agent_reply import (
+    LEVAIN_ACT_NUDGE,
     finish_message,
     humanize_finish_json,
     is_corrective_nudge,
     message_event_text,
+    planned_without_acting,
     tool_action_summary,
 )
 from levain.install import effective_adapter
@@ -296,6 +298,26 @@ def run_entity(
 
             try:
                 conversation.send_message(line)
+                conversation.run()
+                # Narrate-without-act backstop (spore-358 follow-through, harness-agnosticism): a weak
+                # open model often ENDS a turn by describing its plan ("I'll run the tests…") with no
+                # tool call — OpenHands reads that plan as a valid answer and stops, task untouched (the
+                # DOMINANT failure across glm-5.2 / kimi in the 2026-07-17 bake-off; an act-first prompt
+                # lifted glm 2/3 -> 3/3). Nudge ONCE to execute, then re-run — the structural equivalent
+                # of that prompt, applied to WHATEVER model is driving. Capped at 1 (never loops);
+                # tools-only (a --no-tools partner has nothing to execute); the nudge is a synthetic
+                # user turn filtered by `is_corrective_nudge`, so it never shows on screen nor in memory.
+                # The SDK's own nudge covers the no-message case; this covers plan-as-message.
+                if with_tools and planned_without_acting(conversation.state.events):
+                    conversation.send_message(LEVAIN_ACT_NUDGE)
+                    conversation.run()
+                # Capture the turn ONCE, AFTER the (possible) nudge cycle — so the episode reflects the
+                # completed WORK, not the abandoned plan. Capturing before the nudge (the first cut)
+                # tripped vagus_run's turn-id idempotency: the post-nudge capture no-oped on the
+                # unchanged user-turn id and memory kept only the stall while the screen showed the work
+                # — the exact capture-vs-display divergence agent_reply exists to forbid (L1+L2 review
+                # 2026-07-17). One turn -> one episode -> final state; capture_turn's own run() is a
+                # no-op now (the turn already ran), it just performs the single capture.
                 binding.capture_turn(conversation)
             except KeyboardInterrupt:
                 print("\n  (turn interrupted — exiting)")
