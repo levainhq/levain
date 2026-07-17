@@ -558,6 +558,6 @@ def _report(saved: Mapping[str, object], entity_dir: Path) -> None:
         f"{saved.get('associations_strengthened')} strengthened"
     )
     print(
-        f"\n  {entity_dir.name}'s identity compounded — a fresh `levain run` now recalls "
-        "these patterns."
+        f"\n  {entity_dir.name}'s memory consolidated — a fresh `levain run` now boots on this "
+        "State/Context and recalls any crystallized patterns as they graduate."
     )

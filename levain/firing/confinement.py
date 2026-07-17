@@ -198,6 +198,23 @@ _MAX_QUEUE_LINES = 200_000            # reader-queue depth; oldest dropped past 
 # module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
 _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 
+# The entity's OWN store files under ``<entity>/.levain/``, WRITE-denied to its confined hands (read
+# stays allowed). anneal writes these IN THE HOST PROCESS (capture/wrap), never through the sandboxed
+# shell, so the deny fences only the entity's own hands — not the legitimate composer. Load-bearing
+# because spore-359 folds ``memory.continuity.md`` into the always-loaded system suffix and per-turn
+# recall reads ``memory.crystal.json``; ``memory.db`` is the episodic source the wrap consolidates FROM.
+# A raw self-write to any of them is a poison-the-next-session vector that bypasses the human-gated wrap.
+# The SQLite sidecars (``-wal``/``-shm``/``-journal``) are included because anneal opens the store in
+# WAL mode (``PRAGMA journal_mode=WAL``): in WAL mode the logical DB is ``memory.db`` PLUS ``memory.db-
+# wal`` — committed frames live in the WAL, so denying only the main file leaves the episodic source
+# corruptible/poisonable through the sidecar (L3 codex, verified live: the sidecars were writable). The
+# host writer is unaffected (it is not under the sandbox); a sandboxed ``sqlite3`` inspection that needs
+# ``-shm`` write is the accepted tradeoff — the entity has no legit reason to write its own store.
+_OWN_MEMORY_FILENAMES = (
+    "memory.continuity.md", "memory.crystal.json", "memory.db",
+    "memory.db-wal", "memory.db-shm", "memory.db-journal",
+)
+
 # Standard, tool-CANONICAL credential locations. Folding these into the floor is an OPT-IN
 # (``deny_standard_creds`` in ``confinement.json``, default OFF), never automatic, for two reasons:
 # (1) unlike an app secret (``.env.flow``), these ARE structurally knowable — gh / aws / curl look
@@ -257,6 +274,16 @@ class CrownJewelsPolicy:
     # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
     # (apparatus L1 — confinement.json lives in the entity-writable .levain/; a self-authored
     # ssh_mode="raw" / emptied deny_files would weaken the NEXT session's operator-declared floor).
+    own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
+    # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
+    # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
+    # memory.continuity.md into the always-loaded system_message_suffix and per-turn recall reads
+    # memory.crystal.json — so a raw file-write by the entity's OWN confined hands would poison the
+    # highest-trust surface on a FUTURE session, BYPASSING the human-gated `levain wrap`. Only the
+    # HOST-process capture/wrap (anneal in-process, NOT the sandboxed shell) may compose them; write-
+    # denying the sandboxed hands makes "only wrap composes the always-loaded memory" a STRUCTURAL
+    # invariant, not a docstring (L2 domain review, 2026-07-17). Distinct from config_file (read+write
+    # denied — the entity may not even READ its jail definition); here read is intentionally allowed.
     # NOTE: network is default-ALLOWED (a CC replacement hits the network); there is deliberately NO
     # `allow_network` knob — an unwired boolean would be false security (the exact claim>enforcement
     # gap this module refuses). Network POLICY is a slice-3 / threshold-membrane concern.
@@ -431,12 +458,36 @@ def build_policy(
             "refusing to grant confined hands. A symlinked config could be unlinked and rewritten to "
             "weaken the next session's floor; make it a plain file inside .levain/."
         )
-    # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, AND the
-    # config file (all relocate the same way). Including ``deny_write_files_t`` here write-denies ~/.ssh
-    # (the persistence-vector dir anchor) so it can't be renamed/replaced to relocate the protected
-    # literal — the raw-mode bypass codex found. The ssh_dir is guarded as a subtree below (agent mode),
-    # so its ancestors are covered too; in raw mode this is the only thing that pins ~/.ssh's anchor.
-    all_jewels = list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t) + [config_file]
+    # spore-359 safety (L2 domain review, 2026-07-17): WRITE-deny the entity's OWN store files so its
+    # confined hands cannot compose the always-loaded memory — only the host-process wrap/capture may.
+    # LEXICAL paths (the path the hands would write / anneal writes), so a CREATE of a not-yet-existing
+    # file (pre-first-wrap pre-planting) is denied too. Fail-CLOSED on a symlinked store file (same
+    # reasoning as the config above: a symlink lets `rm`+recreate at the lexical path dodge a resolved-
+    # target deny, and .levain is entity-writable) — anneal writes these as plain files, so a symlink
+    # is anomalous. ``.levain`` is already an ancestor-write-dir via ``config_file`` below; these ride
+    # the same anchor pin.
+    own_memory_files_l: list[Path] = []
+    for _name in _OWN_MEMORY_FILENAMES:
+        _lexical = ed / ".levain" / _name
+        if _lexical.is_symlink():  # catches broken symlinks too (is_symlink is True regardless of target)
+            raise ConfinementError(
+                f"the entity's own memory file {_lexical} is a symlink — refusing to grant confined "
+                "hands. A symlinked store file could be unlinked and rewritten to poison the next "
+                "session's always-loaded memory; keep it a plain file inside .levain/."
+            )
+        own_memory_files_l.append(_lexical)
+    own_memory_files_t = _dedup(own_memory_files_l)
+
+    # Ancestor write-denies for the subtree jewels, file jewels, the write-only ssh files, the entity's
+    # own store files, AND the config file (all relocate the same way). Including ``deny_write_files_t``
+    # here write-denies ~/.ssh (the persistence-vector dir anchor) so it can't be renamed/replaced to
+    # relocate the protected literal — the raw-mode bypass codex found. The ssh_dir is guarded as a
+    # subtree below (agent mode), so its ancestors are covered too; in raw mode this is the only thing
+    # that pins ~/.ssh's anchor.
+    all_jewels = (
+        list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t)
+        + list(own_memory_files_t) + [config_file]
+    )
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
     # Pin the LEXICAL ~/.ssh anchor too (apparatus L3 codex re-verify HIGH — "resolved jewel vs lexical
@@ -459,6 +510,7 @@ def build_policy(
         ssh_mode=ssh_mode,
         config_file=config_file,
         deny_write_files=deny_write_files_t,
+        own_memory_files=own_memory_files_t,
     )
 
 
@@ -510,8 +562,12 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
     polarity subtlety. Ancestor write-dirs are NOT checked — they exist to block ``mv``-relocation of a
     jewel, and the file editor has no rename primitive (its commands are ``view``/``create``/
-    ``str_replace``/``insert``/``undo_edit``). The entity's OWN ``<entity>/.levain/`` store is
-    deliberately NOT a crown jewel (its memory is its own); the firing's ``assert_entity_isolated``
+    ``str_replace``/``insert``/``undo_edit``). Also denies the entity's OWN memory STORE files
+    (``own_memory_files`` — continuity/crystal/db + sidecars): the file editor has no rename primitive
+    and no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
+    here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
+    write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
+    is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
     moat, not this predicate, is what keeps recall/capture off flow's store."""
     try:
         p = Path(path).expanduser().resolve()
@@ -530,6 +586,14 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     for wf in policy.deny_write_files:
         if _ci_within(p, wf):
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
+    for mf in policy.own_memory_files:
+        # The file editor has no rename primitive and no legit reason to touch the entity's own store
+        # (its memory is composed by the host-process wrap, never edited by hand) → denied OUTRIGHT
+        # here (read included), same fail-closed stance as the ssh write-files. The SEATBELT hand still
+        # allows the READ (bash may `cat` it); denying both hands the WRITE is what closes the poison-
+        # the-always-loaded-memory vector (spore-359 / L2 review).
+        if _ci_within(p, mf):
+            return f"{p} is the entity's own memory store — only `levain wrap` composes it, not the hands"
     return None
 
 
@@ -1196,6 +1260,21 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
             lines.append("(deny file-write*")
             for p in policy.deny_write_files:
+                lines.append(f'    (literal "{_sbpl_string(str(p))}")')
+            lines.append(")")
+            lines.append("")
+
+        if policy.own_memory_files:
+            # The entity's OWN store (memory.continuity.md / crystal.json / db) — WRITE-only denied so a
+            # confined-hands write can't poison the always-loaded memory that spore-359 injects, bypassing
+            # the human-gated wrap. READ stays allowed (bash may `cat` its own memory). anneal composes
+            # these in the HOST process (not this sandbox), so the wrap/capture writer is untouched. LAST
+            # deny block so last-match-wins keeps it denied; nothing re-allows these.
+            lines.append(";; the entity's OWN memory store (continuity/crystal/episodic) — WRITE-denied:")
+            lines.append(";; only the host-process `levain wrap`/capture composes it, never the hands, so")
+            lines.append(";; a self-write can't poison the next session's always-loaded frame (spore-359).")
+            lines.append("(deny file-write*")
+            for p in policy.own_memory_files:
                 lines.append(f'    (literal "{_sbpl_string(str(p))}")')
             lines.append(")")
             lines.append("")
