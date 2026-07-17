@@ -170,9 +170,14 @@ def is_corrective_nudge(event) -> bool:
     if getattr(event, "source", None) != "user":
         return False
     text = message_event_text(event)
-    return text is not None and (
-        CORRECTIVE_NUDGE_MARKER in text or LEVAIN_ACT_NUDGE_MARKER in text
-    )
+    if text is None:
+        return False
+    # levain's OWN nudge is a fixed string we emit verbatim — match it by PREFIX, not substring, so a
+    # genuine user message that merely QUOTES the marker ("why did [levain:act-now] show up?") is NOT
+    # silently reclassified as synthetic and dropped from the turn boundary / capture / recall (codex +
+    # gpt-oss L3 2026-07-17). The SDK fragment stays substring-matched: it is the SDK's own long,
+    # distinctive text placed mid-message, not ours to reshape.
+    return CORRECTIVE_NUDGE_MARKER in text or text.lstrip().startswith(LEVAIN_ACT_NUDGE_MARKER)
 
 
 def planned_without_acting(events) -> bool:
@@ -198,10 +203,15 @@ def planned_without_acting(events) -> bool:
         if getattr(e, "source", None) != "agent":
             continue
         if tool_action_summary(e) is not None:
-            return False  # it DID act this turn — not a stall
-        text = message_event_text(e) or finish_message(e)
-        if text:
-            reply = text  # keep the LAST agent text of the turn
+            return False  # it DID act this turn — not a stall (checked for EVERY agent event)
+        if reply is None:
+            text = message_event_text(e) or finish_message(e)
+            if text:
+                reply = text  # keep the FIRST agent text — a stall is signaled by how the turn OPENS
+                # (its opening move is a plan). Keeping the LAST text missed a plan-opener trailed by a
+                # filler line ("I'll run the tests." then "One moment.") — a real zero-tool stall the
+                # detector let slip (codex L3 2026-07-17). The tool early-return above still scans ALL
+                # agent events, so a later real action still cancels the stall.
     if not reply:
         return False
     reply = humanize_finish_json(reply)  # parity with the other consumers — unwrap a JSON-wrapped plan

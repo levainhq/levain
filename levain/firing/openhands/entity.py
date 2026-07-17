@@ -273,12 +273,20 @@ def build_entity_agent(
     # it then is wasted I/O + a wasted guard (L1 review). Short-circuit keeps the seedless path clean.
     memory_block = _entity_continuity_block(ed) if seed_constitution is not None else None
     constitution = _compose_constitution(seed_constitution, memory_block)
+    agent_ctx = vagus_agent_context(
+        firing_kind=ENTITY_FIRING_KIND, constitution=constitution
+    )
     # Pre-emptive act-first directive (bake-off 2026-07-17): bake the proven act-first prompt into the
     # system message so a task turn STARTS with a tool call instead of a plan-as-prose stall — the
-    # primary half of the harness-agnosticism fix (the run-loop backstop is the safety net). Tools-only
-    # (nothing to act with otherwise); augments a real constitution (a seedless entity boots generic).
-    if constitution is not None and tools:
-        constitution = f"{constitution}\n\n{_ACT_FIRST_DIRECTIVE}"
+    # primary half of the harness-agnosticism fix (the run-loop backstop is the safety net). Appended to
+    # the RESOLVED context, so it rides BOTH a seeded constitution AND the generic default a
+    # seedless-but-tooled entity boots with — the directive is about TOOL USE, not identity, so it
+    # belongs wherever there are tools, not only where there is a seed (codex L3 2026-07-17: the old
+    # `constitution is not None` gate silently skipped seedless+tooled runs). Tools-only: a --no-tools
+    # partner (`tools` None/empty → falsy) has nothing to act with.
+    if tools:
+        suffix = f"{(agent_ctx.system_message_suffix or '').rstrip()}\n\n{_ACT_FIRST_DIRECTIVE}".strip()
+        agent_ctx = agent_ctx.model_copy(update={"system_message_suffix": suffix})
     agent = Agent(
         llm=llm,
         tools=tools if tools is not None else [],
@@ -291,9 +299,7 @@ def build_entity_agent(
         # nothing else serializes them), closing that window by construction rather than by an SDK
         # default that a future bump could raise.
         tool_concurrency_limit=1,
-        agent_context=vagus_agent_context(
-            firing_kind=ENTITY_FIRING_KIND, constitution=constitution
-        ),
+        agent_context=agent_ctx,
         condenser=LevainCondenser.build(
             inner=resolved_inner,
             firing_kind=ENTITY_FIRING_KIND,

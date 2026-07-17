@@ -242,6 +242,29 @@ def test_is_corrective_nudge_matches_both_sdk_and_levain_markers():
     assert is_corrective_nudge(_Event("user", ["a real human question"])) is False
 
 
+def test_is_corrective_nudge_matches_the_levain_marker_only_as_a_prefix():
+    # codex + gpt-oss L3 2026-07-17: the levain nudge is a fixed string WE emit — match it by prefix,
+    # not substring, so a genuine user turn that merely QUOTES the marker (a support question, a pasted
+    # transcript) is not reclassified as synthetic and silently dropped from the boundary / capture /
+    # recall / display. The SDK fragment stays substring-matched (its own long distinctive text).
+    from levain.firing.agent_reply import LEVAIN_ACT_NUDGE_MARKER, is_corrective_nudge
+    quoted = f"Why did {LEVAIN_ACT_NUDGE_MARKER} appear in my transcript?"
+    assert is_corrective_nudge(_Event("user", [quoted])) is False
+
+
+def test_planned_without_acting_fires_on_a_plan_opener_then_a_filler_line():
+    # codex L3 2026-07-17 (unique catch): a zero-tool turn that OPENS with a plan and TRAILS a filler
+    # line is still the narrate-without-act stall. The detector must key on the turn's OPENING move —
+    # keying on the LAST text fragment ("One moment.") let this real stall slip past the backstop.
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["fix calc.py"]),
+        _Event("agent", ["I'll run the tests first to see the failure."]),  # opening move: a plan
+        _Event("agent", ["One moment."]),                                   # filler, still no action
+    ]
+    assert planned_without_acting(events) is True
+
+
 def test_planned_without_acting_ignores_a_prior_levain_nudge_as_boundary():
     # A levain act-nudge in the history is synthetic — the boundary must skip it so the detector keys
     # on the real user turn (else a post-nudge acted turn could be mis-read).

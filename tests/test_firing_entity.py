@@ -374,6 +374,19 @@ def test_act_first_directive_absent_for_a_no_tools_partner(tmp_path):
     assert "ACT, don't narrate" not in suffix
 
 
+def test_act_first_directive_injected_for_a_seedless_but_tooled_entity(tmp_path):
+    """codex L3 2026-07-17: the directive is about TOOL USE, not identity — a seedless entity that
+    still has tools (it boots the generic default constitution) must get it too. The old
+    `constitution is not None` gate skipped this path, so a seedless+tooled run silently lost the
+    pre-emptive half of the fix and leaned on the run-loop backstop alone."""
+    from levain.firing.openhands.tools import build_entity_tools
+
+    ent = _entity(tmp_path)  # .levain but NO seed/ → generic default constitution
+    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "ACT, don't narrate" in suffix
+
+
 def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_path):
     """F5c + the seedless policy: a seedless entity (no origin.md) with a neocortex present still boots
     the GENERIC default — memory augments a real seed only, never appears without identity framing (and
