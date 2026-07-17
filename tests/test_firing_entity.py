@@ -354,6 +354,26 @@ def test_neocortex_injection_fail_soft_on_non_utf8(tmp_path):
     assert "Your Memory — carried from your prior sessions" not in suffix
 
 
+def test_act_first_directive_injected_when_the_entity_has_tools(tmp_path):
+    """Pre-emptive act-first fix (bake-off 2026-07-17): a tool-having entity's system message carries
+    the act-first directive, so a task turn starts with a tool call, not a plan-as-prose stall."""
+    from levain.firing.openhands.tools import build_entity_tools
+
+    ent = _seed(_entity(tmp_path))
+    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "ACT, don't narrate" in suffix
+    assert "Coyote" in suffix  # …still after the seed identity, not replacing it
+
+
+def test_act_first_directive_absent_for_a_no_tools_partner(tmp_path):
+    """A --no-tools conversational partner (tools=None) has nothing to act with — no directive."""
+    ent = _seed(_entity(tmp_path))
+    binding = build_entity_agent(ent, _stub_llm())  # tools defaults to None
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "ACT, don't narrate" not in suffix
+
+
 def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_path):
     """F5c + the seedless policy: a seedless entity (no origin.md) with a neocortex present still boots
     the GENERIC default — memory augments a real seed only, never appears without identity framing (and

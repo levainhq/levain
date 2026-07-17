@@ -77,6 +77,25 @@ class _FinishEvent:
         self.action = _Action(kind, message)
 
 
+class _ToolAction:
+    def __init__(self, kind, command, path):
+        self.kind = kind
+        self.command = command
+        self.path = path
+
+
+class _ToolEvent:
+    """An agent ActionEvent that is a REAL tool call — has ``tool_name`` + a non-builtin action kind,
+    so ``tool_action_summary`` returns non-None (the "it DID act this turn" signal)."""
+
+    def __init__(self, tool_name="terminal", kind="ExecuteBashAction",
+                 command="python3 test.py", path=None, source="agent"):
+        self.source = source
+        self.tool_name = tool_name
+        self.llm_message = None
+        self.action = _ToolAction(kind, command, path)
+
+
 def test_latest_agent_text_joins_agent_messages_of_latest_turn():
     events = [
         _Event("user", ["earlier"]),
@@ -117,6 +136,125 @@ def test_latest_agent_text_none_when_no_agent_reply_yet():
 
 def test_latest_agent_text_none_on_empty():
     assert _latest_agent_text([]) is None
+
+
+# ---------- narrate-without-act backstop (spore-358 follow-through) ----------
+
+def test_planned_without_acting_fires_on_a_zero_tool_plan_finish():
+    # The dominant weak-model stall: the agent "finishes" with a plan and takes no action.
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["Fix the bug in calc.py so all tests pass."]),
+        _FinishEvent("I'll run the tests and read the source file to diagnose the bug."),
+    ]
+    assert planned_without_acting(events) is True
+
+
+def test_planned_without_acting_fires_on_a_zero_tool_plan_message():
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["Fix the bug."]),
+        _Event("agent", ["Let me start by running the tests, then read the code and fix it."]),
+    ]
+    assert planned_without_acting(events) is True
+
+
+def test_planned_without_acting_fires_on_a_curly_apostrophe_plan():
+    # Measured: kimi-k2.7-code writes "I’ll" with U+2019, not a straight "'"; the detector must
+    # normalize it or the backstop silently misses the stall (bake-off 2026-07-17).
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["Fix the bug."]),
+        _FinishEvent("I’ll run the tests first to see the failure, then inspect the source file."),
+    ]
+    assert planned_without_acting(events) is True
+
+
+def test_planned_without_acting_false_when_the_agent_actually_acted():
+    # It ran a tool this turn → not a stall, even if the final message reads plan-ish.
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["Fix the bug."]),
+        _ToolEvent(tool_name="terminal", command="python3 test_calc.py"),
+        _FinishEvent("All tests pass now. The bug was a parity error; I'll note the float edge too."),
+    ]
+    assert planned_without_acting(events) is False
+
+
+def test_planned_without_acting_false_on_a_plain_answer():
+    # A genuine no-tool ANSWER (no forward-intent opener) must not be nudged.
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["Who are you?"]),
+        _FinishEvent("I'm Ember, your sovereign coding partner running on an open model."),
+    ]
+    assert planned_without_acting(events) is False
+
+
+def test_planned_without_acting_false_on_conversational_and_clarifying_replies():
+    """L1+L2 false-positive fix: a conceptual answer or a clarifying question (zero tools, opening with
+    a bare 'let me'/'I'll'/'I need to') must NOT be nudged — the markers require a tool-like ACTION
+    verb, and any reply containing a '?' is treated as a legitimate pause. Nudging a clarifying
+    question would override the agent's correct decision to wait for the human."""
+    from levain.firing.agent_reply import planned_without_acting
+    cases = [
+        "Let me explain how the median function works.",
+        "Let me know if you'd like anything else changed.",
+        "Let me clarify — do you mean calc.py or calc_utils.py?",   # clarifying question
+        "I need to know which file you mean. Which one?",           # clarifying question
+        "I'll be happy to help whenever you're ready.",
+        "I'll summarize the architecture: it has three layers.",
+        "Let's see — the answer to your question is 42.",
+    ]
+    for reply in cases:
+        events = [_Event("user", ["a task"]), _FinishEvent(reply)]
+        assert planned_without_acting(events) is False, reply
+
+
+def test_planned_without_acting_false_when_no_reply_yet():
+    from levain.firing.agent_reply import planned_without_acting
+    assert planned_without_acting([_Event("user", ["fix it"])]) is False
+
+
+def test_planned_without_acting_keys_on_the_current_turn_only():
+    # A tool action in a PRIOR turn does not suppress a stall in the current one.
+    from levain.firing.agent_reply import planned_without_acting
+    events = [
+        _Event("user", ["earlier task"]),
+        _ToolEvent(tool_name="terminal"),
+        _FinishEvent("done earlier."),
+        _Event("user", ["now fix calc.py"]),
+        _FinishEvent("I'll run the tests and read the file."),
+    ]
+    assert planned_without_acting(events) is True
+
+
+def test_is_corrective_nudge_matches_both_sdk_and_levain_markers():
+    from levain.firing.agent_reply import (
+        CORRECTIVE_NUDGE_MARKER,
+        LEVAIN_ACT_NUDGE,
+        is_corrective_nudge,
+    )
+    assert is_corrective_nudge(_Event("user", [LEVAIN_ACT_NUDGE])) is True
+    assert is_corrective_nudge(
+        _Event("user", [f"...{CORRECTIVE_NUDGE_MARKER}..."])
+    ) is True
+    assert is_corrective_nudge(_Event("user", ["a real human question"])) is False
+
+
+def test_planned_without_acting_ignores_a_prior_levain_nudge_as_boundary():
+    # A levain act-nudge in the history is synthetic — the boundary must skip it so the detector keys
+    # on the real user turn (else a post-nudge acted turn could be mis-read).
+    from levain.firing.agent_reply import LEVAIN_ACT_NUDGE, planned_without_acting
+    events = [
+        _Event("user", ["fix calc.py"]),
+        _FinishEvent("I'll run the tests first."),        # stall
+        _Event("user", [LEVAIN_ACT_NUDGE]),               # synthetic nudge (source=user)
+        _ToolEvent(tool_name="terminal"),                 # then it acted
+        _FinishEvent("All tests pass."),
+    ]
+    # boundary = the real user msg; the turn as a whole DID act → not a stall.
+    assert planned_without_acting(events) is False
 
 
 # ---------- spore-297: finish/think-as-JSON-text reply (observed live on minimax-m3) ----------

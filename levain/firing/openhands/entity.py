@@ -120,6 +120,24 @@ _CONTINUITY_PREAMBLE = (
 )
 
 
+# The act-first operating directive — the PRE-EMPTIVE half of the harness-agnosticism fix (bake-off
+# 2026-07-17). Weak open models (glm-5.2 / kimi) tend to OPEN a task turn by narrating their plan in
+# prose with no tool call; OpenHands reads that as a finished answer and ends the turn, task untouched.
+# An act-first PROMPT measured glm 2/3 -> 3/3 by PREVENTING the narration; this bakes that prompt into
+# the entity's system message so every model driving the harness gets it up front. The narrate-without-
+# act backstop (levain.run) stays as the safety net for the residual. Only injected when the entity has
+# tools — a --no-tools conversational partner has nothing to act with. Wording mirrors the proven prompt.
+_ACT_FIRST_DIRECTIVE = (
+    "# Working a task — ACT, don't narrate the plan\n\n"
+    "When your operator hands you a task, your FIRST move is a TOOL CALL, not prose. Do NOT open by "
+    "describing what you are about to do (\"I'll run the tests, then read the file…\") — a turn that "
+    "only describes a plan ends with nothing done and stalls the work. Immediately issue the tool "
+    "calls that carry the task out: run the commands, view the files, make the edits, re-run to "
+    "verify. Use prose only for your FINDINGS and the RESULT, AFTER you have acted. Think by DOING, "
+    "not by announcing. (This is about task execution; in open conversation, talk freely.)"
+)
+
+
 def _entity_continuity_block(entity_dir: Path) -> str | None:
     """The entity's own consolidated neocortex, framed as a session-start block — or ``None`` when
     there is no readable continuity yet (a never-wrapped entity → seed-only boot, the correct
@@ -255,6 +273,12 @@ def build_entity_agent(
     # it then is wasted I/O + a wasted guard (L1 review). Short-circuit keeps the seedless path clean.
     memory_block = _entity_continuity_block(ed) if seed_constitution is not None else None
     constitution = _compose_constitution(seed_constitution, memory_block)
+    # Pre-emptive act-first directive (bake-off 2026-07-17): bake the proven act-first prompt into the
+    # system message so a task turn STARTS with a tool call instead of a plan-as-prose stall — the
+    # primary half of the harness-agnosticism fix (the run-loop backstop is the safety net). Tools-only
+    # (nothing to act with otherwise); augments a real constitution (a seedless entity boots generic).
+    if constitution is not None and tools:
+        constitution = f"{constitution}\n\n{_ACT_FIRST_DIRECTIVE}"
     agent = Agent(
         llm=llm,
         tools=tools if tools is not None else [],
