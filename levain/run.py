@@ -197,8 +197,31 @@ def run_entity(
     #     in place before any future executor tool can write (the physicist minting discipline);
     #   - a bad --model/--base-url is a usage error → clean exit 2, not a raw traceback.
     try:
-        llm = LLM(model=_resolve_model(model), base_url=base_url, api_key=api_key,
-                  usage_id="levain-run")
+        # Tool-calling mode (spore-358 + L2 review 2026-07-17). `levain run` targets OPEN models via
+        # Ollama, whose NATIVE (provider) function-calling is unreliable: mid-task they emit the next
+        # call as text instead of a structured `tool_calls` entry (or narrate with no call), and
+        # OpenHands treats the first assistant message WITHOUT a structured call as "agent finished"
+        # → a multi-step task terminates after 1-2 actions (dogfood: minimax-m3 / gpt-oss / glm all
+        # stalled the median-calc fix under native mode). PROMPT mode instead injects the tool schema
+        # + an in-context example and parses calls out of the `<function=NAME>…</function>` TEXT
+        # format the model is told to emit — which weak models follow far more reliably (minimax-m3
+        # then completed the task end-to-end). It does NOT rescue a pure narration with no call at all
+        # (no `<function=` match → content response → the turn still finishes); it fixes the models
+        # that DO emit a call, just not through the flaky native channel.
+        #   Scope it to Ollama: an advanced operator can point --model at a strong native-FC model
+        # (`openai/…`, `anthropic/…` — `_resolve_model` passes a provider-prefixed name through),
+        # where forcing prompt mode would be strictly worse (schema+example token cost every turn, no
+        # parallel calls, a reliable structured channel swapped for regex). So default prompt mode
+        # ONLY for the `ollama/` path; keep native for a capable caller.
+        #   Known tradeoff (L2 F3): prompt mode can raise `FunctionCallConversionError` on a
+        # pathological parse, which ends the turn CLEANLY (memory intact, re-run to continue) rather
+        # than nudging — rare (STOP_WORDS suppresses the common trailing-text case for these models),
+        # it fails closed, and it beats the far-more-common native-mode stall. Tool EXECUTION is
+        # unchanged either way (confined editor + sandboxed bash); only the CALL channel differs.
+        resolved_model = _resolve_model(model)
+        use_native_tools = not resolved_model.startswith("ollama/")
+        llm = LLM(model=resolved_model, base_url=base_url, api_key=api_key,
+                  native_tool_calling=use_native_tools, usage_id="levain-run")
         # The confined executor-tool bundle (file editor + sandboxed bash, both fenced to the shared
         # crown-jewels floor) — the entity's hands. `build_entity_tools` is the ONLY blessed builder,
         # confined by construction; `None` (--no-tools) = a pure conversational partner. bash is
@@ -380,6 +403,8 @@ def _print_banner(
             print("               ssh authorized_keys/config/rc WRITE denied; other writes are NOT)")
         if deny_standard_creds:
             print("             standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
+        print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
+        print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
     print()
     print("  Talk to it. It recalls its OWN memory and captures each turn there.")
     print("  :quit (or Ctrl-D) to end the session.")

@@ -698,11 +698,18 @@ def test_crown_jewel_reason_raw_ssh_mode_does_not_deny_ssh(tmp_path: Path, monke
     assert crown_jewel_reason(policy, tmp_path / ".ssh" / "authorized_keys2") is not None
 
 
-def test_crown_jewel_reason_own_store_is_not_a_jewel(tmp_path: Path, monkeypatch) -> None:
-    # The entity's OWN .levain/ store is its memory to read/write — NOT a crown jewel.
+def test_crown_jewel_reason_own_store_writable_except_memory_files(tmp_path: Path, monkeypatch) -> None:
+    # The entity's OWN .levain/ is its working space — NOT a crown jewel — EXCEPT the three store files
+    # (memory.continuity.md / crystal.json / db), which are write-protected from the HANDS since spore-359
+    # folds the neocortex into the always-loaded frame (only the host-process wrap composes them).
     monkeypatch.setenv("HOME", str(tmp_path))
     ent = _entity(tmp_path)
-    assert crown_jewel_reason(build_policy(ent), ent / ".levain" / "memory.db") is None
+    policy = build_policy(ent)
+    # a scratch file in .levain is still the entity's own to touch
+    assert crown_jewel_reason(policy, ent / ".levain" / "scratch.txt") is None
+    # the three store files are now write-protected (the poison-the-always-loaded-memory floor)
+    for name in ("memory.continuity.md", "memory.crystal.json", "memory.db"):
+        assert crown_jewel_reason(policy, ent / ".levain" / name) is not None
 
 
 def test_crown_jewel_reason_fails_closed_on_an_unresolvable_path(tmp_path: Path) -> None:
@@ -996,8 +1003,10 @@ def test_crown_jewel_reason_denies_the_confinement_config(tmp_path: Path) -> Non
     policy = build_policy(ed)
     cfg = ed / ".levain" / "confinement.json"
     assert crown_jewel_reason(policy, cfg) is not None
-    # ...but the entity's OWN memory store stays writable (its memory is its own).
-    assert crown_jewel_reason(policy, ed / ".levain" / "memory.db") is None
+    # ...and since spore-359 the entity's own MEMORY store files are write-protected too (only the
+    # host-process wrap composes them); a non-store .levain file stays the entity's own.
+    assert crown_jewel_reason(policy, ed / ".levain" / "memory.db") is not None
+    assert crown_jewel_reason(policy, ed / ".levain" / "scratch.txt") is None
 
 
 def test_render_profile_denies_the_confinement_config(tmp_path: Path) -> None:
@@ -1006,6 +1015,45 @@ def test_render_profile_denies_the_confinement_config(tmp_path: Path) -> None:
     profile = SeatbeltProvider().render_profile(policy)
     cfg = (ed / ".levain" / "confinement.json").resolve()
     assert f'(deny file-read* file-write* (literal "{cfg}"))' in profile
+
+
+def test_build_policy_write_denies_own_memory_store(tmp_path: Path, monkeypatch) -> None:
+    """spore-359 floor: the entity's own continuity/crystal/episodic files are in ``own_memory_files``
+    (write-denied to the hands) so a self-write can't poison the always-loaded memory the wrap alone
+    composes."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    assert {p.name for p in policy.own_memory_files} == {
+        "memory.continuity.md", "memory.crystal.json", "memory.db",
+        "memory.db-wal", "memory.db-shm", "memory.db-journal",  # WAL sidecars (L3 codex)
+    }
+    levain_dir = (tmp_path / "coyote" / ".levain").resolve()
+    assert all(p.parent == levain_dir for p in policy.own_memory_files)
+    # the WAL sidecar is denied too: in WAL mode committed frames live in memory.db-wal, so denying
+    # only the main file would leave the episodic source corruptible/poisonable through it (L3 codex).
+    assert crown_jewel_reason(policy, tmp_path / "coyote" / ".levain" / "memory.db-wal") is not None
+
+
+def test_render_profile_write_denies_own_memory_but_allows_read(tmp_path: Path, monkeypatch) -> None:
+    """The store files render as WRITE-only denies (bash may still ``cat`` its own memory) — NOT the
+    read+write deny the config gets. Read stays allowed so spore-359's build-time read + the entity's
+    own inspection work."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    profile = SeatbeltProvider().render_profile(policy)
+    cont = next(p for p in policy.own_memory_files if p.name == "memory.continuity.md")
+    assert f'(literal "{cont}")' in profile                                    # denied…
+    assert f'(deny file-read* file-write* (literal "{cont}"))' not in profile  # …but NOT read-denied
+
+
+def test_build_policy_fails_closed_on_symlinked_own_memory_file(tmp_path: Path, monkeypatch) -> None:
+    """A symlinked store file is anomalous (anneal writes plain files) and an `rm`+recreate swap vector
+    — refuse to grant hands rather than deny a resolved target while the lexical path stays writable."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "memory.continuity.md").symlink_to(tmp_path / "elsewhere.md")
+    with pytest.raises(ConfinementError, match="symlink"):
+        build_policy(ent)
 
 
 @live

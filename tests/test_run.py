@@ -316,6 +316,7 @@ def _spy_build_entity_agent(monkeypatch, captured):
 
     def _spy(entity_dir, llm, *, tools=None, **_kw):
         captured["tools"] = tools
+        captured["llm"] = llm
         raise IsolationError("captured — stop here")
 
     monkeypatch.setattr("levain.firing.openhands.entity.build_entity_agent", _spy)
@@ -362,6 +363,35 @@ def test_run_entity_no_tools_passes_none(
     rc = run_entity(entity, with_tools=False)
     assert rc == 2
     assert captured["tools"] is None  # --no-tools → a pure conversational partner
+
+
+def test_run_entity_uses_prompt_tool_calling_for_ollama(
+    tmp_path: Path, monkeypatch, _clean_entity_env
+):
+    """spore-358: the default (Ollama) path forces PROMPT-based tool calling — native fn-calling is
+    unreliable on open models and stalls a multi-step task after 1-2 actions. Pins the flag against
+    silent SDK drift: `LLM.model_config` is `extra: ignore`, so a future rename would swallow the
+    kwarg unnoticed and revert to the broken native mode (L1 review F2)."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    assert run_entity(entity) == 2  # default model minimax-m3:cloud → ollama/ → prompt mode
+    assert captured["llm"].native_tool_calling is False
+
+
+def test_run_entity_keeps_native_tool_calling_for_a_provider_model(
+    tmp_path: Path, monkeypatch, _clean_entity_env
+):
+    """A strong native-FC model an operator points --model at (openai/…, anthropic/…) keeps its
+    structured tool-call channel — prompt mode is scoped to the Ollama weakness, not forced on a
+    capable caller (L2 review F2)."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    assert run_entity(entity, model="openai/gpt-5.5") == 2
+    assert captured["llm"].native_tool_calling is True
 
 
 # ---------- the honesty-floor banner ----------

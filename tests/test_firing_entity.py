@@ -246,6 +246,129 @@ def test_build_entity_agent_warns_on_present_but_unreadable_seed(tmp_path, caplo
     assert "foreign content" not in suffix
 
 
+_NEOCORTEX = (
+    "## State\nMidway through the PARITY_BUG_FIX; even-length median is wrong.\n\n"
+    "## Active Threads\n- mediancalc bugfix\n\n## Patterns\n- parallelize_reads | 1x\n\n"
+    "## Decisions\n- start with small repos\n\n## Context\nFirst real session with Phill.\n\n"
+    "## Understanding\nEarly — the seed is planted.\n"
+)
+
+
+def test_build_entity_agent_folds_neocortex_into_the_constitution(tmp_path):
+    """spore-359: a fresh run boots on the entity's OWN consolidated memory, not only crystal recall.
+    With a seed AND a written neocortex, the set-once session_start suffix carries BOTH the static seed
+    identity AND the dynamic neocortex (State/Context…), under the memory preamble that marks it as
+    lived memory — the seed (birth) precedes the memory (life)."""
+    ent = _seed(_entity(tmp_path), name="Coyote", operator="Phill Clapham")
+    (ent / ".levain" / "memory.continuity.md").write_text(_NEOCORTEX, encoding="utf-8")
+
+    binding = build_entity_agent(ent, _stub_llm())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+
+    assert "Coyote" in suffix                                   # seed identity still present
+    assert "partner, not an assistant" in suffix               # …and the floor
+    assert "Your Memory — carried from your prior sessions" in suffix  # the memory preamble marker
+    assert "PARITY_BUG_FIX" in suffix                          # State surfaced
+    assert "First real session with Phill" in suffix           # Context surfaced
+    assert suffix.index("Coyote") < suffix.index("Your Memory — carried")  # seed before memory
+
+
+def test_build_entity_agent_seed_only_when_never_wrapped(tmp_path):
+    """A never-wrapped entity (no .levain/memory.continuity.md) boots on the seed alone — the memory
+    preamble is absent, no crash. The expected young-entity path (fail-soft on an absent neocortex)."""
+    ent = _seed(_entity(tmp_path))
+    assert not (ent / ".levain" / "memory.continuity.md").exists()
+
+    binding = build_entity_agent(ent, _stub_llm())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "Coyote" in suffix
+    assert "Your Memory — carried from your prior sessions" not in suffix
+
+
+def test_neocortex_injection_refuses_symlink_escape(tmp_path, caplog):
+    """The neocortex read is re-guarded at the point of use: a .levain/memory.continuity.md symlinked
+    OUTSIDE the entity tree is refused — never read into the always-loaded context — and the entity
+    boots seed-only with a loud warning (the same afferent read-leak floor the store + seed guards
+    close)."""
+    import logging
+
+    foreign = tmp_path / "foreign_memory.md"
+    foreign.write_text("## State\nFOREIGN_LEAK_MARKER\n", encoding="utf-8")
+    ent = _seed(_entity(tmp_path))
+    (ent / ".levain" / "memory.continuity.md").symlink_to(foreign)
+
+    with caplog.at_level(logging.WARNING, logger="levain.firing.openhands.entity"):
+        binding = build_entity_agent(ent, _stub_llm())
+
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "FOREIGN_LEAK_MARKER" not in suffix                  # NOT read into context
+    assert "Your Memory — carried from your prior sessions" not in suffix
+    assert "Coyote" in suffix                                   # seed still boots
+    assert any("resolves outside the entity tree" in r.message for r in caplog.records)
+
+
+def test_compose_constitution_memory_augments_a_real_seed_only(tmp_path):
+    """_compose_constitution: memory augments a REAL seed only. A None seed stays None (the generic
+    firing default), never a bare memory block that would lack the identity framing."""
+    from levain.firing.openhands.entity import _compose_constitution
+
+    assert _compose_constitution(None, "## State\nx") is None    # seedless → generic, no memory
+    assert _compose_constitution("SEED", None) == "SEED"          # no memory → seed unchanged
+    assert _compose_constitution("SEED", "MEM") == "SEED\n\nMEM"  # both → seed then memory
+
+
+def test_neocortex_injection_fail_soft_on_symlink_loop(tmp_path, caplog):
+    """A symlink LOOP at .levain/memory.continuity.md must NOT crash the boot — `assert_entity_isolated`
+    `.resolve()`s internally and raises `RuntimeError` (not `IsolationError`) on a loop; the guard call
+    catches it and degrades to seed-only (L1 review F1: this used to hard-crash the REPL boot)."""
+    import logging
+
+    ent = _seed(_entity(tmp_path))
+    loop = ent / ".levain" / "memory.continuity.md"
+    loop.symlink_to(loop)  # self-referential → RuntimeError on resolve()
+    with caplog.at_level(logging.WARNING, logger="levain.firing.openhands.entity"):
+        binding = build_entity_agent(ent, _stub_llm())  # must not raise
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "Coyote" in suffix
+    assert "Your Memory — carried from your prior sessions" not in suffix
+    assert any("could not be resolved" in r.message for r in caplog.records)
+
+
+def test_neocortex_injection_fail_soft_on_empty_neocortex(tmp_path):
+    """An empty / whitespace-only neocortex → no memory block (seed-only boot), no crash."""
+    ent = _seed(_entity(tmp_path))
+    (ent / ".levain" / "memory.continuity.md").write_text("   \n\n  ", encoding="utf-8")
+    binding = build_entity_agent(ent, _stub_llm())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "Coyote" in suffix
+    assert "Your Memory — carried from your prior sessions" not in suffix
+
+
+def test_neocortex_injection_fail_soft_on_non_utf8(tmp_path):
+    """A non-UTF-8 neocortex (a bad byte) → no memory block, never a UnicodeDecodeError into build."""
+    ent = _seed(_entity(tmp_path))
+    (ent / ".levain" / "memory.continuity.md").write_bytes(b"## State\n\xff\xfe bad bytes\n")
+    binding = build_entity_agent(ent, _stub_llm())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "Coyote" in suffix
+    assert "Your Memory — carried from your prior sessions" not in suffix
+
+
+def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_path):
+    """F5c + the seedless policy: a seedless entity (no origin.md) with a neocortex present still boots
+    the GENERIC default — memory augments a real seed only, never appears without identity framing (and
+    the read is short-circuited, not even attempted)."""
+    ent = _entity(tmp_path)  # .levain but NO seed/
+    (ent / ".levain" / "memory.continuity.md").write_text(
+        "## State\nSEEDLESS_MEMORY_MARKER\n", encoding="utf-8"
+    )
+    binding = build_entity_agent(ent, _stub_llm())
+    suffix = binding.agent.agent_context.system_message_suffix or ""
+    assert "governed cognitive substrate" in suffix    # the generic default (no seed)
+    assert "SEEDLESS_MEMORY_MARKER" not in suffix       # memory NOT injected without a seed
+    assert "Your Memory — carried from your prior sessions" not in suffix
+
+
 def test_built_agents_firing_resolves_to_entity_store(tmp_path):
     """The isolation carries THROUGH the built agent: with the binding env set, the agent's firing
     kind rebuilds (as a fork would) to an AnnealEntityFiring resolving to the ENTITY crystal — never
