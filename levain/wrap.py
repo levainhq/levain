@@ -52,7 +52,7 @@ from levain.firing.isolation import (
     assert_entity_isolated,
     entity_store_paths,
 )
-from levain.run import _resolve_model, require_openhands_entity
+from levain.run import _resolve_llm_kwargs, _resolve_model, require_openhands_entity
 
 __all__ = ["wrap_entity"]
 
@@ -62,9 +62,19 @@ _log = logging.getLogger("levain.wrap")
 _ANOTHER_WRAP_RUNNING = object()
 
 # The default compose model — the sovereign default, the SAME open model `levain run` boots the
-# entity on. `--composer <model>` overrides it (e.g. to a stronger model for a higher-quality wrap)
-# without surrendering the sovereign default.
-DEFAULT_COMPOSE_MODEL = "minimax-m3:cloud"
+# entity on (an entity wraps its OWN memory with its OWN mind). `--composer <model>` overrides it
+# (e.g. to a stronger model for a higher-quality wrap) without surrendering the sovereign default.
+DEFAULT_COMPOSE_MODEL = "glm-5.2:cloud"
+
+# Compose runs through the same /v1 native route as `levain run` (`_resolve_llm_kwargs`), so the wrap
+# model matches the run model — not the `ollama/` provider, which returns EMPTY content for glm (the
+# completion-mode sibling of the tool-call route bug). A REASONING model (glm-5.2) spends output tokens
+# on its chain-of-thought BEFORE emitting the answer to `content`; a low cap starves the answer (glm
+# returned empty content until the budget was raised). This generous ceiling leaves room for the CoT
+# PLUS the full neocortex — it is a cap, not a target (the model stops when done), and a truncated
+# compose still fails CLOSED at `validated_save_continuity`, never saving a partial. (bench 2026-07-17:
+# glm composed a clean 6-section neocortex via /v1 at this budget; the `ollama/` route gave 0 chars.)
+_COMPOSE_MAX_OUTPUT_TOKENS = 16384
 
 
 class _ComposeUnavailable(RuntimeError):
@@ -331,10 +341,9 @@ def wrap_entity(
             print(package_text)
             return 0
 
-        model = _resolve_model(composer)
         print(
             f"levain wrap: consolidating {episode_count} episode(s) into "
-            f"{entity_dir.name}'s memory with {model} …"
+            f"{entity_dir.name}'s memory with {_resolve_model(composer)} …"
         )
 
         # COMPOSE — the entity's own mind (or the --composer override) metabolizes its episodes.
@@ -342,7 +351,7 @@ def wrap_entity(
             neocortex = _compose(
                 package_text,
                 _entity_constitution(entity_dir),
-                model=model,
+                composer=composer,
                 base_url=base_url,
                 api_key=api_key,
             )
@@ -462,15 +471,18 @@ def _compose(
     package_text: str,
     constitution: str | None,
     *,
-    model: str,
+    composer: str,
     base_url: str,
     api_key: str | None,
 ) -> str:
     """Run the single-shot compose completion on the entity's model and return the neocortex text.
 
     A plain LLM text-transform: no OpenHands Conversation, no tools, no store access (the store I/O
-    is anneal's, on the guarded isolated handles). Raises :class:`_ComposeUnavailable` if the
-    ``openhands`` runtime is absent; any other failure propagates for the caller to fail-clean."""
+    is anneal's, on the guarded isolated handles). Routes through the same /v1 native path as
+    ``levain run`` (``_resolve_llm_kwargs``) with a generous output-token budget so a reasoning model
+    (glm) has room for its CoT plus the neocortex — see ``_COMPOSE_MAX_OUTPUT_TOKENS``. Raises
+    :class:`_ComposeUnavailable` if the ``openhands`` runtime is absent; any other failure propagates
+    for the caller to fail-clean."""
     try:
         from openhands.sdk import LLM, Message, TextContent
     except ImportError as exc:
@@ -484,7 +496,14 @@ def _compose(
     for noisy in ("openhands", "LiteLLM", "litellm"):
         logging.getLogger(noisy).setLevel(logging.ERROR)
 
-    llm = LLM(model=model, base_url=base_url, api_key=api_key, usage_id="levain-wrap")
+    # Same /v1 native route as `levain run` (`native_tool_calling` is inert for this toolless
+    # completion — the route + the token budget are what matter). The generous output cap gives a
+    # reasoning model room to finish its CoT AND emit the answer to `content`.
+    llm = LLM(
+        usage_id="levain-wrap",
+        max_output_tokens=_COMPOSE_MAX_OUTPUT_TOKENS,
+        **_resolve_llm_kwargs(composer, base_url, api_key),
+    )
     system = (constitution + "\n\n---\n\n" if constitution else "") + _COMPOSE_INSTRUCTIONS
     response = llm.completion(
         messages=[

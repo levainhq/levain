@@ -109,12 +109,14 @@ def _latest_agent_text(events) -> str | None:
 
 
 def _resolve_model(model: str) -> str:
-    """Prefix a bare model name with the Ollama provider for litellm.
+    """Prefix a bare model name with the Ollama provider — for the operator-facing BANNER label only.
+    The LLM route itself is `_resolve_llm_kwargs` (open models go via the OpenAI-compatible /v1
+    endpoint); this keeps the banner showing the plain ``ollama/<name>`` identity the operator thinks
+    in, not the litellm ``openai/…`` protocol detail.
 
-    ``minimax-m3:cloud`` → ``ollama/minimax-m3:cloud`` (the default sovereign path — an
-    open model through the local Ollama endpoint). A name that already carries a
-    ``provider/`` prefix (``ollama/…``, ``openai/…``) is passed through untouched, so an
-    advanced operator can point at any litellm-routable model."""
+    ``glm-5.2:cloud`` → ``ollama/glm-5.2:cloud`` (an open model served by the local Ollama endpoint).
+    A name that already carries a ``provider/`` prefix (``ollama/…``, ``openai/…``) is passed through
+    untouched, so an advanced operator can point at any litellm-routable model."""
     return model if "/" in model else f"ollama/{model}"
 
 
@@ -180,7 +182,7 @@ def require_openhands_entity(entity_dir: Path) -> str | None:
 def run_entity(
     path: Path,
     *,
-    model: str = "minimax-m3:cloud",
+    model: str = "glm-5.2:cloud",
     base_url: str = "http://localhost:11434",
     api_key: str | None = None,
     with_tools: bool = True,
