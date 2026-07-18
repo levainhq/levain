@@ -277,9 +277,9 @@ def main(argv: list[str] | None = None) -> int:
         "--model",
         default="minimax-m3:cloud",
         help=(
-            "The model to run on (default: minimax-m3:cloud). A bare name is routed "
-            "through Ollama (ollama/<name>); a provider-prefixed name (ollama/…, "
-            "openai/…) is used as-is."
+            "The model to run on (default: minimax-m3:cloud). A bare or ollama/<name> name "
+            "is served by local Ollama via its OpenAI-compatible /v1 endpoint with native "
+            "tool-calling; a non-Ollama provider name (openai/…, anthropic/…) is used as-is."
         ),
     )
     run_p.add_argument(

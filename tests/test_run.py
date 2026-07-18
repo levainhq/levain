@@ -16,6 +16,7 @@ import pytest
 from levain.firing.agent_reply import humanize_finish_json, tool_action_summary
 from levain.run import (
     _latest_agent_text,
+    _resolve_llm_kwargs,
     _resolve_model,
     _turn_tool_activity,
     run_entity,
@@ -40,6 +41,61 @@ def test_resolve_model_prefixes_bare_name_with_ollama():
 def test_resolve_model_passes_through_provider_prefixed():
     assert _resolve_model("ollama/kimi-k2.6:cloud") == "ollama/kimi-k2.6:cloud"
     assert _resolve_model("openai/gpt-4o") == "openai/gpt-4o"
+
+
+def test_resolve_llm_kwargs_routes_bare_ollama_via_v1_native():
+    # Bake-off 2026-07-17: a bare (Ollama) model routes through the OpenAI-compatible /v1 endpoint with
+    # NATIVE tool-calling — the exact config the harness proved reliable (glm/kimi/minimax 10/10).
+    kw = _resolve_llm_kwargs("glm-5.2:cloud", "http://localhost:11434", None)
+    assert kw == {
+        "model": "openai/glm-5.2:cloud",
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "ollama",
+        "native_tool_calling": True,
+    }
+
+
+def test_resolve_llm_kwargs_reroutes_an_explicit_ollama_prefix():
+    # An explicit `ollama/…` name is the SAME open path — strip the prefix and route via /v1 (a bare
+    # `ollama/` provider call is exactly the JSON-text-stall route we are leaving).
+    kw = _resolve_llm_kwargs("ollama/kimi-k2.7-code:cloud", "http://localhost:11434", None)
+    assert kw["model"] == "openai/kimi-k2.7-code:cloud"
+    assert kw["base_url"].endswith("/v1")
+    assert kw["native_tool_calling"] is True
+
+
+def test_resolve_llm_kwargs_honors_a_provider_model_as_is():
+    # A capable native-FC caller (openai/…, anthropic/…) is honored verbatim — NOT re-prefixed, NOT
+    # /v1-rerouted, and its base_url/api_key pass through untouched.
+    kw = _resolve_llm_kwargs("anthropic/claude-opus-4-8", "http://localhost:11434", "sk-xyz")
+    assert kw == {
+        "model": "anthropic/claude-opus-4-8",
+        "base_url": "http://localhost:11434",
+        "api_key": "sk-xyz",
+        "native_tool_calling": True,
+    }
+
+
+def test_resolve_llm_kwargs_does_not_double_suffix_v1():
+    # An operator base_url that already ends in /v1 is not doubled.
+    kw = _resolve_llm_kwargs("minimax-m3:cloud", "http://host:11434/v1", None)
+    assert kw["base_url"] == "http://host:11434/v1"
+
+
+def test_resolve_llm_kwargs_rejects_a_prefix_only_or_empty_model():
+    # L3 2026-07-17: a prefix-only ("ollama/") or empty --model would resolve to "openai/" — invalid,
+    # failing on the first turn. Fail CLOSED at resolution (run_entity's except → clean exit 2).
+    import pytest as _pytest
+    for bad in ("ollama/", "", "  "):
+        with _pytest.raises(ValueError, match="must name a model"):
+            _resolve_llm_kwargs(bad, "http://localhost:11434", None)
+
+
+def test_resolve_llm_kwargs_keeps_an_explicit_empty_api_key():
+    # `api_key is not None` (not truthiness): a deliberately-empty key is preserved; only an UNSET
+    # key falls back to the Ollama sentinel.
+    assert _resolve_llm_kwargs("glm-5.2:cloud", "http://localhost:11434", "")["api_key"] == ""
+    assert _resolve_llm_kwargs("glm-5.2:cloud", "http://localhost:11434", None)["api_key"] == "ollama"
 
 
 class _Content:
@@ -526,33 +582,52 @@ def test_run_entity_no_tools_passes_none(
     assert captured["tools"] is None  # --no-tools → a pure conversational partner
 
 
-def test_run_entity_uses_prompt_tool_calling_for_ollama(
+def test_run_entity_routes_ollama_via_v1_native_tool_calling(
     tmp_path: Path, monkeypatch, _clean_entity_env
 ):
-    """spore-358: the default (Ollama) path forces PROMPT-based tool calling — native fn-calling is
-    unreliable on open models and stalls a multi-step task after 1-2 actions. Pins the flag against
-    silent SDK drift: `LLM.model_config` is `extra: ignore`, so a future rename would swallow the
-    kwarg unnoticed and revert to the broken native mode (L1 review F2)."""
+    """Bake-off 2026-07-17: the default (Ollama) path now routes through Ollama's OpenAI-compatible
+    /v1 endpoint with NATIVE tool-calling — the `ollama/` litellm provider dropped glm/kimi tool-calls
+    to JSON-text (turn ends), a ROUTE artifact the /v1 endpoint fixes (structured tool_calls; glm/kimi/
+    minimax all 10/10). Pins the flag against silent SDK drift (`LLM.model_config` is `extra: ignore`,
+    so a rename would swallow the kwarg unnoticed) AND the route (a regression to `ollama/` reverts the
+    JSON-text stall)."""
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
     entity = _openhands_entity(tmp_path)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
-    assert run_entity(entity) == 2  # default model minimax-m3:cloud → ollama/ → prompt mode
-    assert captured["llm"].native_tool_calling is False
+    assert run_entity(entity) == 2  # default model minimax-m3:cloud → openai/…:cloud via /v1, native
+    llm = captured["llm"]
+    assert llm.native_tool_calling is True
+    assert llm.model == "openai/minimax-m3:cloud"           # /v1 OpenAI-compat route, not ollama/
+    assert str(llm.base_url).rstrip("/").endswith("/v1")     # the /v1 endpoint, not the bare host
+
+
+def test_run_entity_prefix_only_model_exits_2_cleanly(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    """A prefix-only --model (`ollama/`) fails CLOSED at startup: `_resolve_llm_kwargs` raises, the
+    construction guard converts it to a clean exit 2 with the --model hint — not a first-turn crash."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    rc = run_entity(entity, model="ollama/")
+    assert rc == 2
+    assert "could not start the entity" in capsys.readouterr().out
 
 
 def test_run_entity_keeps_native_tool_calling_for_a_provider_model(
     tmp_path: Path, monkeypatch, _clean_entity_env
 ):
-    """A strong native-FC model an operator points --model at (openai/…, anthropic/…) keeps its
-    structured tool-call channel — prompt mode is scoped to the Ollama weakness, not forced on a
-    capable caller (L2 review F2)."""
+    """A strong native-FC model an operator points --model at (openai/…, anthropic/…) is honored
+    as-is with native FC — the Ollama /v1 reroute is scoped to bare/ollama models, never forced on a
+    capable provider caller (L2 review F2)."""
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
     entity = _openhands_entity(tmp_path)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, model="openai/gpt-5.5") == 2
-    assert captured["llm"].native_tool_calling is True
+    llm = captured["llm"]
+    assert llm.native_tool_calling is True
+    assert llm.model == "openai/gpt-5.5"  # honored as-is — not re-prefixed, not /v1-rerouted
 
 
 # ---------- the honesty-floor banner ----------
