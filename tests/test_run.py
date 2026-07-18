@@ -595,10 +595,10 @@ def test_run_entity_routes_ollama_via_v1_native_tool_calling(
     entity = _openhands_entity(tmp_path)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
-    assert run_entity(entity) == 2  # default model minimax-m3:cloud → openai/…:cloud via /v1, native
+    assert run_entity(entity) == 2  # default model glm-5.2:cloud → openai/…:cloud via /v1, native
     llm = captured["llm"]
     assert llm.native_tool_calling is True
-    assert llm.model == "openai/minimax-m3:cloud"           # /v1 OpenAI-compat route, not ollama/
+    assert llm.model == "openai/glm-5.2:cloud"              # /v1 OpenAI-compat route, not ollama/
     assert str(llm.base_url).rstrip("/").endswith("/v1")     # the /v1 endpoint, not the bare host
 
 

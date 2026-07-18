@@ -10,8 +10,10 @@ Two tiers, both runnable WITHOUT the openhands extra:
 from __future__ import annotations
 
 import json
+import types
 from pathlib import Path
 
+import pytest
 from anneal_memory import DEFAULT_SCHEMA, FLOW_SCHEMA, Store
 from levain import wrap as wrapmod
 from levain.wrap import _completion_text, _extract_neocortex, wrap_entity
@@ -324,3 +326,38 @@ def test_wrap_compose_crash_leaves_no_orphan(tmp_path, capsys, monkeypatch):
     assert "compose model failed" in capsys.readouterr().out
     with Store(str(db), section_schema=None) as store:
         assert store.get_wrap_started_at() is None  # self-cleaned; episodes safe for next wrap
+
+
+def test_compose_routes_via_v1_native_with_reasoning_token_headroom(monkeypatch):
+    """glm-wrap fix 2026-07-17: `_compose` must build its LLM through the /v1 native route
+    (`_resolve_llm_kwargs`) — NOT the `ollama/` provider, which returns EMPTY content for glm — AND set
+    a generous output-token budget so a REASONING model has room for its CoT plus the neocortex. Pins
+    both against regression (either revert silently re-breaks glm-wrap: empty content or a starved
+    answer)."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    import openhands.sdk as sdk
+
+    captured: dict = {}
+    resp = types.SimpleNamespace(
+        message=types.SimpleNamespace(
+            content=[types.SimpleNamespace(text="## State\nok\n## Context\nok")],
+            reasoning_content="",
+        )
+    )
+
+    class _FakeLLM:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+        def completion(self, **_k):
+            return resp
+
+    monkeypatch.setattr(sdk, "LLM", _FakeLLM)
+    out = wrapmod._compose(
+        "pkg", None, composer="glm-5.2:cloud", base_url="http://localhost:11434", api_key=None
+    )
+    assert captured["model"] == "openai/glm-5.2:cloud"          # /v1 OpenAI-compat route, not ollama/
+    assert str(captured["base_url"]).rstrip("/").endswith("/v1")
+    assert captured["native_tool_calling"] is True
+    assert captured["max_output_tokens"] >= 8000                # reasoning-model headroom
+    assert "## State" in out

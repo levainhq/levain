@@ -275,9 +275,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.add_argument(
         "--model",
-        default="minimax-m3:cloud",
+        default="glm-5.2:cloud",
         help=(
-            "The model to run on (default: minimax-m3:cloud). A bare or ollama/<name> name "
+            "The model to run on (default: glm-5.2:cloud). A bare or ollama/<name> name "
             "is served by local Ollama via its OpenAI-compatible /v1 endpoint with native "
             "tool-calling; a non-Ollama provider name (openai/…, anthropic/…) is used as-is."
         ),
@@ -329,12 +329,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     wrap_p.add_argument(
         "--composer",
-        default="minimax-m3:cloud",
+        default="glm-5.2:cloud",
         help=(
-            "The model that composes the consolidated memory (default: minimax-m3:cloud — the "
-            "sovereign default, the entity's own model). Point it at a stronger model (e.g. "
-            "--composer glm-5:cloud) for a higher-quality wrap. A bare name routes through Ollama "
-            "(ollama/<name>); a provider-prefixed name is used as-is."
+            "The model that composes the consolidated memory (default: glm-5.2:cloud — the "
+            "sovereign default, the entity's own model). Point it at a stronger model for a "
+            "higher-quality wrap. A bare or ollama/<name> name is served by local Ollama via its "
+            "OpenAI-compatible /v1 endpoint; a non-Ollama provider name is used as-is."
         ),
     )
     wrap_p.add_argument(
