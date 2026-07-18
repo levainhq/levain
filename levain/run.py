@@ -118,6 +118,42 @@ def _resolve_model(model: str) -> str:
     return model if "/" in model else f"ollama/{model}"
 
 
+def _resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
+    """LLM kwargs for ``levain run`` — route OPEN (Ollama) models through Ollama's OpenAI-compatible
+    ``/v1`` endpoint with NATIVE tool-calling.
+
+    This REPLACES the spore-358 default (the ``ollama/`` litellm provider + PROMPT-mode tool-calling).
+    That default existed because the ``ollama/`` provider drops glm/kimi tool-calls to JSON-TEXT — the
+    model emits a well-formed call, but not as a structured ``tool_calls`` entry, so OpenHands sees a
+    plain message and ends the turn, task untouched. The fix was mis-attributed to model tier; it is
+    the ROUTE. The ``/v1`` endpoint returns structured ``tool_calls``, so native FC works and prompt
+    mode's schema+example+regex tax disappears. Bake-off 2026-07-17 (multi-file coding task, n=10):
+      glm  — ollama/native 0/5 · ollama/prompt 10/10 (63s) · /v1-native 10/10 (35s)
+      kimi —                     ollama/prompt  9/10 (106s) · /v1-native 10/10 (12s)
+      minimax (the default) unaffected: /v1-native 10/10 — no regression. All /v1-native: 0 backstop
+      nudges. Structured calls are also 2–9x faster (no per-turn schema/example tokens, no regex parse).
+    A provider-prefixed model an advanced operator passes (``openai/…``, ``anthropic/…``) is honored
+    as-is with native FC — a capable native-FC caller; the Ollama ``/v1`` reroute would be wrong for it.
+    """
+    if "/" in model and not model.startswith("ollama/"):
+        return {"model": model, "base_url": base_url, "api_key": api_key,
+                "native_tool_calling": True}
+    bare = model.split("/", 1)[1] if model.startswith("ollama/") else model
+    if not bare.strip():
+        # A prefix-only (`ollama/`) or empty --model would resolve to `openai/` — an invalid model
+        # that fails on the FIRST turn, not at startup. Fail CLOSED here (run_entity's except → a
+        # clean exit 2 with the --model hint), matching the entity's startup-validation discipline
+        # (codex + gpt-oss L3 2026-07-17).
+        raise ValueError(f"--model must name a model, not just a provider prefix (got {model!r})")
+    host = base_url.rstrip("/")
+    v1 = host if host.endswith("/v1") else f"{host}/v1"
+    # `api_key is not None` (not truthiness): an operator who deliberately passes an EMPTY key keeps
+    # it — only an UNSET key falls back to the Ollama sentinel (codex + gpt-oss L3 2026-07-17).
+    return {"model": f"openai/{bare}", "base_url": v1,
+            "api_key": api_key if api_key is not None else "ollama",
+            "native_tool_calling": True}
+
+
 def require_openhands_entity(entity_dir: Path) -> str | None:
     """Return an error message if ``entity_dir`` is not a clean, initialized OpenHands entity,
     else ``None``.
@@ -200,30 +236,16 @@ def run_entity(
     #   - a bad --model/--base-url is a usage error → clean exit 2, not a raw traceback.
     try:
         # Tool-calling mode (spore-358 + L2 review 2026-07-17). `levain run` targets OPEN models via
-        # Ollama, whose NATIVE (provider) function-calling is unreliable: mid-task they emit the next
-        # call as text instead of a structured `tool_calls` entry (or narrate with no call), and
-        # OpenHands treats the first assistant message WITHOUT a structured call as "agent finished"
-        # → a multi-step task terminates after 1-2 actions (dogfood: minimax-m3 / gpt-oss / glm all
-        # stalled the median-calc fix under native mode). PROMPT mode instead injects the tool schema
-        # + an in-context example and parses calls out of the `<function=NAME>…</function>` TEXT
-        # format the model is told to emit — which weak models follow far more reliably (minimax-m3
-        # then completed the task end-to-end). It does NOT rescue a pure narration with no call at all
-        # (no `<function=` match → content response → the turn still finishes); it fixes the models
-        # that DO emit a call, just not through the flaky native channel.
-        #   Scope it to Ollama: an advanced operator can point --model at a strong native-FC model
-        # (`openai/…`, `anthropic/…` — `_resolve_model` passes a provider-prefixed name through),
-        # where forcing prompt mode would be strictly worse (schema+example token cost every turn, no
-        # parallel calls, a reliable structured channel swapped for regex). So default prompt mode
-        # ONLY for the `ollama/` path; keep native for a capable caller.
-        #   Known tradeoff (L2 F3): prompt mode can raise `FunctionCallConversionError` on a
-        # pathological parse, which ends the turn CLEANLY (memory intact, re-run to continue) rather
-        # than nudging — rare (STOP_WORDS suppresses the common trailing-text case for these models),
-        # it fails closed, and it beats the far-more-common native-mode stall. Tool EXECUTION is
-        # unchanged either way (confined editor + sandboxed bash); only the CALL channel differs.
-        resolved_model = _resolve_model(model)
-        use_native_tools = not resolved_model.startswith("ollama/")
-        llm = LLM(model=resolved_model, base_url=base_url, api_key=api_key,
-                  native_tool_calling=use_native_tools, usage_id="levain-run")
+        # Ollama, via its OpenAI-compatible /v1 endpoint with NATIVE tool-calling (`_resolve_llm_kwargs`).
+        # The prior default (spore-358) forced PROMPT-mode on the `ollama/` litellm provider because that
+        # provider drops glm/kimi tool-calls to JSON-TEXT (no structured `tool_calls` → OpenHands ends the
+        # turn). The bake-off (2026-07-17) proved that a ROUTE artifact, not a model limit: the /v1 endpoint
+        # returns structured tool_calls, so native FC completes multi-step tasks reliably (glm 10/10, kimi
+        # 9/10→10/10, minimax unaffected 10/10) and 2–9x faster than prompt-mode's schema+example+regex. The
+        # act-first directive + narrate-without-act backstop remain as belt-and-suspenders (0 nudges needed
+        # under /v1-native). Tool EXECUTION is unchanged (confined editor + sandboxed bash); only the CALL
+        # channel differs. Full data + the repeatable harness: `bench/entity_bakeoff.py`.
+        llm = LLM(usage_id="levain-run", **_resolve_llm_kwargs(model, base_url, api_key))
         # The confined executor-tool bundle (file editor + sandboxed bash, both fenced to the shared
         # crown-jewels floor) — the entity's hands. `build_entity_tools` is the ONLY blessed builder,
         # confined by construction; `None` (--no-tools) = a pure conversational partner. bash is
