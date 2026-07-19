@@ -367,6 +367,18 @@ def _resolve_install_python(install: Path) -> str:
     return sys.executable
 
 
+# Claude Code's settings.template.json writes the hook command with a RUNTIME
+# harness placeholder, `${CLAUDE_PROJECT_DIR}`, that Claude Code substitutes at
+# fire time — NOT an install-time placeholder like {{PYTHON}}. So the
+# settings.json on disk literally contains the string
+# `${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py`. To match that
+# against this install's hooks dir we substitute it ourselves — the same
+# substitution doctor.py makes (see _hook_command_targets). Kept as a named
+# constant so the two surfaces stay in lock-step; if a second harness grows its
+# own placeholder, centralize here rather than scatter literal .replace calls.
+_CLAUDE_PROJECT_DIR_PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
+
+
 def _python_from_hooks_config(path: Path, install: Path) -> str | None:
     """Walk a hooks-config JSON file and return the python for a hook
     targeting `install/activation/hooks/`. Skip commands targeting other
@@ -375,6 +387,26 @@ def _python_from_hooks_config(path: Path, install: Path) -> str | None:
     Shared between Claude Code's `.claude/settings.json` and Codex's
     `CODEX_HOME/hooks.json` because both use the same nested shape:
         {"hooks": {<event>: [{"hooks": [{"command": "..."}, ...]}]}}
+
+    The script-path token may carry a RUNTIME harness placeholder
+    (`${CLAUDE_PROJECT_DIR}`) rather than a literal install path — Claude Code's
+    template ships that shape and `levain init` does not rewrite it (the harness
+    substitutes it at fire time). We substitute it here so the foreign-hook
+    filter can still locate the script inside THIS install. Without this the
+    filter would reject every Claude Code install's command as "foreign" and
+    verify-hooks would silently fall back to its own interpreter — testing the
+    wrong Python entirely.
+
+    The script path is not guaranteed to be tokens[1] — a command may carry
+    flags between the interpreter and the script (`python -X dev <script>`).
+    We scan EVERY token after the interpreter and accept the command if ANY of
+    them, after placeholder substitution, resolves into this install's hooks
+    dir. The interpreter (tokens[0]) is returned as-is: it uses the install-time
+    {{PYTHON}} placeholder which install.py has already baked to a literal, so
+    no runtime substitution applies to it. If a foreign interpreter is wired
+    to this install's script, returning it is correct — the harness will
+    genuinely invoke it, and verify-hooks should smoke-test exactly that (and
+    likely go red, which is the right outcome, not a false green).
     """
     if not path.is_file():
         return None
@@ -405,15 +437,41 @@ def _python_from_hooks_config(path: Path, install: Path) -> str | None:
                     continue
                 if len(tokens) < 2:
                     continue
-                # Filter foreign hooks: command must target a script inside
-                # THIS install's activation/hooks/ dir.
-                try:
-                    script_path = Path(tokens[1]).resolve()
-                except (OSError, ValueError):
-                    continue
-                try:
-                    script_path.relative_to(install_hooks_dir)
-                except ValueError:
-                    continue
-                return tokens[0]
+                # Filter foreign hooks: the command must target a script inside
+                # THIS install's activation/hooks/ dir. The script token may sit
+                # at any position after the interpreter (flags may come between,
+                # e.g. `python -X dev <script>`), so we scan EVERY token after
+                # tokens[0]. Each candidate carries the runtime harness
+                # placeholder ${CLAUDE_PROJECT_DIR} (see
+                # _CLAUDE_PROJECT_DIR_PLACEHOLDER) substituted to this install
+                # before resolving — matching doctor.py:_hook_command_targets.
+                # The interpreter (tokens[0]) is returned verbatim: it uses the
+                # install-time {{PYTHON}} placeholder, already baked to a
+                # literal by install.py, so no runtime substitution applies.
+                #
+                # A token "targets" the hooks dir iff it resolves to an EXISTING
+                # file under it — not merely a path that sits under it. The
+                # existence gate is load-bearing: Path.resolve() is relative to
+                # cwd, so a bare flag token (`-X`) run with cwd inside the hooks
+                # dir would resolve under it and pass a plain relative_to check,
+                # falsely donating a foreign interpreter to verify-hooks. Flags
+                # never resolve to files, so is_file() closes that hole while
+                # still accepting a foreign interpreter genuinely wired to OUR
+                # script (correct — the harness will invoke it; verify-hooks
+                # should smoke-test exactly that and likely go red).
+                for tok in tokens[1:]:
+                    candidate = tok.replace(
+                        _CLAUDE_PROJECT_DIR_PLACEHOLDER, str(install)
+                    )
+                    try:
+                        script_path = Path(candidate).resolve()
+                    except (OSError, ValueError):
+                        continue
+                    if not script_path.is_file():
+                        continue
+                    try:
+                        script_path.relative_to(install_hooks_dir)
+                    except ValueError:
+                        continue
+                    return tokens[0]
     return None
