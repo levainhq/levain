@@ -433,6 +433,200 @@ def test_resolve_install_python_skips_foreign_hooks(tmp_path: Path):
     assert _resolve_install_python(tmp_path) == "/levain/python"
 
 
+def test_resolve_install_python_handles_claude_project_dir_placeholder(tmp_path: Path):
+    """The Claude Code settings template writes the hook command with a
+    RUNTIME harness placeholder, ${CLAUDE_PROJECT_DIR}, that Claude Code
+    substitutes at fire time — NOT an install-time placeholder. So
+    settings.json on disk literally contains the string
+    "${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py". verify-hooks
+    must resolve that to the install's own hooks dir (mirroring doctor.py's
+    ${CLAUDE_PROJECT_DIR} substitution), not treat it as a foreign hook and
+    silently fall back to sys.executable. Regression guard: the existing
+    resolver tests all used literal script paths, so they green-lit this bug.
+    """
+    from levain.verify import _resolve_install_python
+    (tmp_path / "CLAUDE.md").write_text("claude", encoding="utf-8")
+    # Seed a real script at the path the placeholder resolves to.
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    # The EXACT command shape the template renders — quoted python + literal
+    # ${CLAUDE_PROJECT_DIR} (matches settings.template.json in the repo).
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [{
+                    "type": "command",
+                    "command": '"/wired/venv/bin/python" "${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py"',
+                }],
+            }],
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": '"/wired/venv/bin/python" "${CLAUDE_PROJECT_DIR}/activation/hooks/user_prompt_submit.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    assert _resolve_install_python(tmp_path) == "/wired/venv/bin/python"
+
+
+def test_resolve_install_python_placeholder_foreign_still_skipped(tmp_path: Path):
+    """The ${CLAUDE_PROJECT_DIR} substitution must not weaken the anti-foreign-hook
+    filter: a command whose post-substitution script path resolves OUTSIDE the
+    install's hooks dir is still skipped. Guards against an over-broad fix that
+    strips the placeholder and accepts anything."""
+    from levain.verify import _resolve_install_python
+    (tmp_path / "CLAUDE.md").write_text("claude", encoding="utf-8")
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    (tmp_path / ".claude").mkdir()
+    # Foreign hook using the SAME ${CLAUDE_PROJECT_DIR} placeholder but pointing
+    # at a sibling path that resolves OUTSIDE this install's hooks dir.
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": '"/foreign/python" "${CLAUDE_PROJECT_DIR}/../foreign-install/activation/hooks/session_start.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    # No Levain hook present — falls through to sys.executable (NOT foreign python).
+    assert _resolve_install_python(tmp_path) == sys.executable
+
+
+def test_python_from_hooks_config_resolves_claude_project_dir_placeholder(tmp_path: Path):
+    """_python_from_hooks_config must return the wired interpreter when the
+    hook command ships the LITERAL runtime placeholder ${CLAUDE_PROJECT_DIR}
+    (the exact shape settings.template.json renders and install.py leaves
+    untouched on disk). Asserts on the walker directly, not _resolve_install_python,
+    so a red proves the walker itself discards the install's own hook as
+    "foreign" and returns None — the mechanism that produces the false
+    all-clear via the sys.executable fallback upstream.
+    """
+    from levain.verify import _python_from_hooks_config
+    # The script the placeholder resolves to must exist on disk so the
+    # resolve()+relative_to(install_hooks_dir) locate check can pass.
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    # EXACT command shape the template emits: quoted python + literal
+    # ${CLAUDE_PROJECT_DIR} (matches levain/templates/adapters/claude-code/
+    # settings.template.json). Distinctive fake interpreter so a None return
+    # or a sys.executable fallback cannot accidentally satisfy the assert.
+    wired = "/distinctive/wired/python-interpreter-7"
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [{
+                    "type": "command",
+                    "command": f'"{wired}" "${{CLAUDE_PROJECT_DIR}}/activation/hooks/session_start.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    assert _python_from_hooks_config(settings_dir / "settings.json", tmp_path) == wired
+
+
+def test_python_from_hooks_config_finds_script_in_any_token_after_first(tmp_path: Path):
+    """The script-path token is not guaranteed to be tokens[1] — a hook command
+    may carry flags between the interpreter and the script (e.g.
+    `python -X dev <script>`). The walker must scan EVERY token after the
+    interpreter, not only tokens[1], or it discards the hook as foreign and
+    verify-hooks falls back to sys.executable. Uses the literal
+    ${CLAUDE_PROJECT_DIR} placeholder shape the real template emits.
+    """
+    from levain.verify import _python_from_hooks_config
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    wired = "/distinctive/wired/python-interpreter-7"
+    # Flag (-X dev) sits between the interpreter and the script — script is
+    # tokens[3], not tokens[1].
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [{
+                    "type": "command",
+                    "command": f'"{wired}" -X dev "${{CLAUDE_PROJECT_DIR}}/activation/hooks/session_start.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    assert _python_from_hooks_config(settings_dir / "settings.json", tmp_path) == wired
+
+
+def test_python_from_hooks_config_rejects_hook_pointing_outside_install(tmp_path: Path):
+    """Foreign-hook filter must still hold after the placeholder substitution
+    AND the every-token scan: a command whose every script token resolves
+    OUTSIDE this install's hooks dir is rejected (returns None), so its
+    interpreter is NOT donated to verify-hooks. Guards against an over-broad
+    fix that substitutes the placeholder and accepts any command.
+    """
+    from levain.verify import _python_from_hooks_config
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    # Every script token resolves OUTSIDE this install (sibling foreign install
+    # reached via ${CLAUDE_PROJECT_DIR}/.., plus an unrelated absolute path).
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": '"/foreign/python" "${CLAUDE_PROJECT_DIR}/../foreign-install/activation/hooks/session_start.py" "/elsewhere/hooks/other.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    assert _python_from_hooks_config(settings_dir / "settings.json", tmp_path) is None
+
+
+def test_python_from_hooks_config_bare_flag_not_accepted_under_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The every-token scan widened a latent surface: Path.resolve() is
+    relative to cwd, so a bare flag token (`-X`) run with cwd INSIDE the
+    install's hooks dir would resolve under it and pass a plain relative_to
+    containment check — falsely donating a foreign interpreter to
+    verify-hooks. The existence gate (is_file()) closes that: a flag never
+    resolves to an existing file, so the foreign hook is rejected.
+    """
+    from levain.verify import _python_from_hooks_config
+    hooks_dir = tmp_path / "activation" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "session_start.py").write_text("# dummy\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    # Foreign interpreter + bare flag + foreign script (all outside this
+    # install). Even with cwd inside hooks_dir, the bare flag `-X` must not be
+    # accepted as the script token.
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": '"/foreign/python" "-X" "/elsewhere/hooks/foreign.py"',
+                }],
+            }],
+        },
+    }), encoding="utf-8")
+    monkeypatch.chdir(hooks_dir)
+    assert _python_from_hooks_config(settings_dir / "settings.json", tmp_path) is None
+
+
 def test_session_start_sources_constant_covers_all_four():
     from levain.verify import SESSION_START_SOURCES
     assert set(SESSION_START_SOURCES) == {"startup", "resume", "clear", "compact"}
