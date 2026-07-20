@@ -64,6 +64,7 @@ from levain.firing.isolation import (
     IsolationError,
     assert_workspace_isolated,
 )
+from levain.turn_input import TurnReader
 
 __all__ = ["run_entity", "require_openhands_entity"]
 
@@ -73,8 +74,11 @@ __all__ = ["run_entity", "require_openhands_entity"]
 # discipline — bound the authority BEFORE the tool can spend it).
 _WORKSPACE_SUBDIR = "workspace"
 
-# The REPL exit tokens (typed at the prompt). EOF (Ctrl-D) also exits.
-_QUIT_TOKENS = frozenset({":quit", ":q", ":exit"})
+# The REPL exit tokens + the multi-line affordances live in `levain.turn_input` — the module
+# that owns WHAT CONSTITUTES ONE TURN. That boundary is not a display detail: reading one LINE
+# as one TURN is what let an entity read its own pasted specification as a dialogue and
+# consolidate the misreading into permanent memory (see turn_input's docstring). Keeping the
+# rule in one place means the REPL cannot drift from it.
 
 
 def _latest_agent_text(events) -> str | None:
@@ -303,25 +307,34 @@ def run_entity(
         deny_standard_creds=deny_standard_creds,
     )
 
+    reader = TurnReader()
     interrupted = False
     try:
         while True:
             try:
-                line = input("\n\033[1myou ›\033[0m ").strip()
-            except EOFError:
-                print()
-                break
+                # ONE turn — a typed line, a whole pasted block, an explicit `:paste`…`:end`
+                # block, or (on a pipe/heredoc) the whole stream. `None` = session over.
+                message = reader.read_turn("\n\033[1myou ›\033[0m ")
             except KeyboardInterrupt:
-                print("\n  (type :quit to exit)")
+                # Ctrl-C cancels the message being composed — including a `:paste` block in
+                # progress and the rest of a paste already read into the reader (leaving it
+                # queued would deliver the tail of a cancelled block as the next turn). SAY how
+                # much was dropped: a silently discarded three-paragraph block looks identical
+                # to a no-op, and the operator has no other way to learn their text is gone.
+                dropped = reader.cancelled_lines
+                if dropped:
+                    print(f"\n  (cancelled — {dropped} line(s) discarded; :quit to exit)")
+                else:
+                    print("\n  (type :quit to exit)")
                 continue
 
-            if not line:
-                continue
-            if line.lower() in _QUIT_TOKENS:
+            if message is None:
                 break
+            if not message:
+                continue
 
             try:
-                conversation.send_message(line)
+                conversation.send_message(message)
                 conversation.run()
                 # Narrate-without-act backstop (spore-358 follow-through, harness-agnosticism): a weak
                 # open model often ENDS a turn by describing its plan ("I'll run the tests…") with no
@@ -453,6 +466,7 @@ def _print_banner(
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
     print()
     print("  Talk to it. It recalls its OWN memory and captures each turn there.")
+    print("  A pasted block is ONE message — or :paste … :end to be explicit.")
     print("  :quit (or Ctrl-D) to end the session.")
 
 

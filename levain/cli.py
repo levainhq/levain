@@ -263,7 +263,13 @@ def main(argv: list[str] | None = None) -> int:
             "persistent bash — both fenced to a crown-jewels floor: they work on "
             "your real repos while ~/.anneal-memory/, sibling stores, and ~/.ssh "
             "key material stay off-limits (--no-tools for a pure conversational "
-            "partner). Needs the OpenHands runtime: pip install 'levain[openhands]'."
+            "partner). Multi-line input is ONE message: a pasted block is kept "
+            "whole, :paste … :end brackets a block explicitly, and piped/heredoc "
+            "stdin is a single turn unless it uses :send separators — note that "
+            "piped stdin is read to EOF, so a driver holding the pipe open waits, "
+            "and that a terminal discards any single line over ~1023 characters "
+            "before any program sees it (an OS limit, unchanged by this). "
+            "Needs the OpenHands runtime: pip install 'levain[openhands]'."
         ),
     )
     run_p.add_argument(

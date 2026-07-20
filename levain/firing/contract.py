@@ -77,6 +77,22 @@ class CaptureRequest:
     episodes and is persisted into the episode ``metadata`` as ``vagus_session_id`` (anneal's
     ``Store.record`` has no session_id parameter — the store derives its own); ``metadata`` is
     optional JSON-serializable provenance.
+
+    **The encoding shield fires HERE, at construction.** Upstream of levain (the Ollama ``/v1``
+    -> litellm -> OpenHands streaming chain) has been observed splitting a multi-byte character
+    across two chunks and mis-decoding it, so mojibake arrives PRE-BROKEN at levain's capture
+    boundary — verified in a real entity's stored ``memory.db`` BYTES, 2026-07-19. levain owns
+    none of that decode path and therefore cannot fix it; what it owns is whether it STORES the
+    damage silently. ``__post_init__`` runs :func:`levain.firing.encoding.scan_text`: it repairs
+    only PROVABLY double-encoded spans (gated on a four-character lead set — read
+    ``encoding._REPAIR_LEADS`` before changing anything there; the byte-structural checks alone
+    rewrite ordinary typography), leaves everything else byte-for-byte untouched, and attaches a
+    receipt (:data:`~levain.firing.encoding.RECEIPT_KEY`) to ``metadata`` when either happened. Placing it on the shared value object rather than inside one firing's ``capture()``
+    is deliberate: every adapter — present and future — reaches a store write through this
+    object, so no capture path can write unscanned text
+    (``structural_invariants_beat_discipline``). The receipt is the point for a product whose
+    pitch is "a memory you can trust because you can SEE what is in it": a repair stays
+    auditable, and unrepairable damage is LABELLED rather than laundered by a guess.
     """
 
     content: str
@@ -84,6 +100,30 @@ class CaptureRequest:
     source: str = "vagus"
     session_id: str | None = None
     metadata: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        from levain.firing.encoding import RECEIPT_KEY, scan_text
+
+        scan = scan_text(self.content or "")
+        if scan.clean:
+            # The overwhelmingly common capture — untouched, no receipt noise. One exception:
+            # strip a receipt describing content this request no longer holds.
+            # ``dataclasses.replace(req, content=...)`` re-runs __post_init__ but COPIES the
+            # old metadata, so a clean replacement would otherwise inherit a receipt claiming
+            # a repair that is not in its text. No caller does this today; a value object whose
+            # invariant survives only while nobody uses the stdlib on it does not have an
+            # invariant.
+            if self.metadata and RECEIPT_KEY in self.metadata:
+                pruned = {k: v for k, v in self.metadata.items() if k != RECEIPT_KEY}
+                object.__setattr__(self, "metadata", pruned or None)
+            return
+        meta = dict(self.metadata or {})
+        meta[RECEIPT_KEY] = scan.receipt()
+        # A frozen dataclass normalizes through object.__setattr__ (the documented escape
+        # hatch) — frozen protects callers from MUTATING a request after the fact, which this
+        # is not: it is the value object refusing to exist in an unscanned state.
+        object.__setattr__(self, "content", scan.text)
+        object.__setattr__(self, "metadata", meta)
 
 
 @runtime_checkable

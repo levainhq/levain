@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
+from levain.firing.encoding import RECEIPT_KEY as _ENCODING_RECEIPT_KEY
 from levain.firing.isolation import (
     LEVAIN_ENTITY_DIR_ENV,
     assert_entity_isolated,
@@ -220,6 +221,22 @@ class AnnealFiring:
         content = (req.content or "").strip()
         if not content:
             return False  # nothing to capture is a no-op, not a loss — never write an empty episode
+
+        # The encoding shield already RAN (``CaptureRequest.__post_init__`` — it cannot be
+        # skipped); this is the LOUD half. A silent repair would be its own trust problem for a
+        # memory store, so surface it: the receipt rides the episode's metadata into the store,
+        # and this warning puts it in front of the operator in the same session. `levain run`
+        # installs no handler for this logger, so it reaches stderr via logging's lastResort.
+        receipt = (req.metadata or {}).get(_ENCODING_RECEIPT_KEY)
+        if receipt:
+            _log.warning(
+                "levain capture: upstream delivered mis-decoded text — %d span(s) repaired, "
+                "%d left untouched and flagged (levain does not own the streaming decode path; "
+                "this is a shield, not a cure). Receipt: %s",
+                receipt.get("repaired", 0),
+                len(receipt.get("suspect") or ()),
+                {k: receipt[k] for k in ("repairs", "suspect") if k in receipt},
+            )
 
         try:
             from anneal_memory import Store

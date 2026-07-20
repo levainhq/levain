@@ -9,6 +9,11 @@ Splits into two tiers:
 from __future__ import annotations
 
 import json
+import os
+import pty
+import threading
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -693,3 +698,141 @@ def test_run_entity_rejects_a_malformed_confinement_config(
     rc = run_entity(entity, with_tools=True)
     assert rc == 2
     assert "confinement config is invalid" in capsys.readouterr().out
+
+
+# ---------- the REPL's turn boundary, end-to-end (spore-373 blocker [1]) ----------
+#
+# `levain.turn_input` is unit-tested against real pipes and a real pty; these two drive the
+# ACTUAL `run_entity` loop over a pty, because the defect was never in a helper — it was in
+# what the REPL treated as one message. The claim under test is exactly the one that failed on
+# ember: an 11-line specification handed to the REPL must reach the model as ONE turn, so it
+# cannot be read back as a dialogue and consolidated into memory as one.
+
+
+class _ReplBinding:
+    """A binding that records captures without a store or a model."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.entity_dir = tmp_path
+        self.agent = object()
+        self.episodic_path = tmp_path / ".levain" / "memory.db"
+        self.crystal_path = tmp_path / ".levain" / "memory.crystal.json"
+        self.captures = 0
+
+    def capture_turn(self, _conversation) -> None:
+        self.captures += 1
+
+    def wrap_nudge(self):
+        return None
+
+
+class _ReplConversation:
+    """A stand-in for the SDK Conversation that records every message it is SENT."""
+
+    sent: list = []
+
+    def __init__(self, _agent, workspace=None, visualizer=None) -> None:
+        self.id = "conv-test"
+        self.state = types.SimpleNamespace(events=[], agent_state={})
+
+    def send_message(self, message) -> None:
+        type(self).sent.append(message)
+
+    def run(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _drive_repl(tmp_path: Path, monkeypatch, keystrokes: bytes, *, quit_after: float = 0.4):
+    """Run the real `run_entity` REPL with stdin bound to a pty, feed it ``keystrokes``, then
+    send `:quit` on a timer so the loop exits on its own."""
+    entity = _openhands_entity(tmp_path)
+    binding = _ReplBinding(entity)
+    _ReplConversation.sent = []
+
+    monkeypatch.setattr(
+        "levain.firing.openhands.entity.build_entity_agent",
+        lambda *_a, **_k: binding,
+    )
+    monkeypatch.setattr("openhands.sdk.Conversation", _ReplConversation)
+
+    master, slave = pty.openpty()
+    saved_stdin = os.dup(0)
+    timer = threading.Timer(quit_after, lambda: os.write(master, b":quit\n"))
+    try:
+        os.dup2(slave, 0)  # the REPL reads fd 0 — bind it to the terminal we control
+        os.write(master, keystrokes)
+        timer.start()
+        rc = run_entity(entity, with_tools=False)
+    finally:
+        timer.cancel()
+        os.dup2(saved_stdin, 0)
+        for fd in (saved_stdin, master, slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return rc, binding, list(_ReplConversation.sent)
+
+
+REPL_SPEC = (
+    "Fix the failing test in tests/test_hooks.py.\n"
+    "The hook walker only resolves the first token of a hook command.\n"
+    "It must resolve ${CLAUDE_PROJECT_DIR} in every token.\n"
+    "Run the test suite when you are done.\n"
+    "Commit the work, but do not push."
+)
+
+
+def test_repl_sends_a_pasted_spec_as_ONE_turn(tmp_path: Path, monkeypatch, _clean_entity_env):
+    """THE REGRESSION, at the seam that actually broke: five pasted lines, ONE send_message,
+    ONE captured episode. Before the fix this was five messages and five episodes — which the
+    entity then read as the operator correcting it four times."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    rc, binding, sent = _drive_repl(tmp_path, monkeypatch, REPL_SPEC.encode() + b"\n")
+    assert rc == 0
+    assert sent == [REPL_SPEC]
+    assert binding.captures == 1
+
+
+def test_repl_still_sends_typed_lines_as_separate_turns(
+    tmp_path: Path, monkeypatch, _clean_entity_env
+):
+    """The other half of the invariant: the fix must not merge genuinely separate questions.
+    Without this, `sent == [everything]` would pass the test above for the wrong reason."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    binding = _ReplBinding(entity)
+    _ReplConversation.sent = []
+    monkeypatch.setattr(
+        "levain.firing.openhands.entity.build_entity_agent", lambda *_a, **_k: binding
+    )
+    monkeypatch.setattr("openhands.sdk.Conversation", _ReplConversation)
+
+    master, slave = pty.openpty()
+    saved_stdin = os.dup(0)
+
+    def _type():
+        for line in (b"first question\n", b"second question\n", b":quit\n"):
+            time.sleep(0.3)  # a real gap — this is what typing looks like to the reader
+            os.write(master, line)
+
+    typist = threading.Thread(target=_type, daemon=True)
+    try:
+        os.dup2(slave, 0)
+        typist.start()
+        rc = run_entity(entity, with_tools=False)
+    finally:
+        typist.join(timeout=3)
+        os.dup2(saved_stdin, 0)
+        for fd in (saved_stdin, master, slave):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    assert rc == 0
+    assert _ReplConversation.sent == ["first question", "second question"]
+    assert binding.captures == 2
