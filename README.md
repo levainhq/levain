@@ -8,7 +8,7 @@ pip install levain
 
 Levain gives your AI partner a memory that persists across sessions, and keeps that memory **yours**. It lives on your machine, in a store you own and can read, inspect, and edit from outside any session. Nothing reaches long-term memory except through a path you govern. Every governed change is recorded, and a failed read shows up as *unknown* instead of a false all-clear. It's a memory you can trust because you can see what's in it and how it got there.
 
-Apache 2.0 · Python 3.12+ · Claude Code and Codex CLI.
+Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
 
 ---
 
@@ -26,7 +26,7 @@ It packages four things that work together:
 
 4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, or a browser form with `--web`.
 
-The kit runs under Claude Code or Codex CLI. Both are first-class.
+The kit runs under Claude Code or Codex CLI — both first-class, both wired via hooks. A third adapter, `openhands`, is also accepted by `levain init --adapter`: it is hookless, and instead of wiring a hosted harness it scaffolds a sovereign, runnable entity with its own store and seed.
 
 ## Why a seed, not a finished methodology
 
@@ -127,7 +127,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 ## Boundaries, kept honest
 
-- **Harnesses:** Claude Code and Codex CLI. One adapter per install — two installs if you need both.
+- **Harnesses:** Claude Code and Codex CLI (hook-wired), plus `openhands` (hookless, scaffolds a sovereign entity). One adapter per install — separate installs if you need more than one.
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
 - **Always-on daemon:** macOS today; Linux and Windows are planned.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
