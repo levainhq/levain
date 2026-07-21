@@ -77,7 +77,9 @@ that failure mode.
 
 ### 1. Activation hooks — the posture mechanism
 
-See `../../activation_spec.md` for the full design.
+The shipped activation content lives in `../../activation/` (`posture.md`,
+`recency_directives.md`, `hooks/`). The layers this adapter wires are
+described below.
 
 - **`session_start.py`** → `SessionStart` (Layer A). Injects, at primacy
   position: the posture string from `activation/posture.md`, and the current

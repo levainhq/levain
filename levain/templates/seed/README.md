@@ -1,6 +1,6 @@
 # Levain Seed — Methodology-Core
 
-The seed is what a new install lays down to bootstrap a cognitive-partnership entity. It is layer 3 of Levain (the methodology-core) plus the layer-2 continuity scaffold.
+The seed is what a new install lays down to bootstrap a cognitive-partnership entity: Levain's **methodology-core**, plus the **continuity scaffold** the entity's memory accretes into.
 
 Five files:
 
@@ -16,9 +16,9 @@ Five files:
 
 **No proper nouns appear in the five always-loaded entity files.** `world.md`, `origin.md`, `partnership.md`, `memory.md`, `continuity.md` are pure second-person instruction — the entity is *inside* the method, it never points *at* it. One necessary exception: `partnership.md` and `memory.md` name `anneal-memory`, the memory system the entity operates — that is naming a tool the entity uses, not a provenance breadcrumb. Naming the kit itself (Levain, and its provenance) lives one layer out — in this README and the kit docs, never in the always-loaded seed.
 
-Seed files cross-reference each other by **section title** (*How We Work*, *Who Your Operator Is*, *Your Memory*), never by filename — titles survive both separate-file placement and concatenation into one harness context file (see `../activation_spec.md`, adapter invariant).
+Seed files cross-reference each other by **section title** (*How We Work*, *Who Your Operator Is*, *Your Memory*), never by filename — titles survive both separate-file placement and concatenation into one harness context file. That is the adapter invariant: an adapter may split or concatenate the seed however its harness wants, and the cross-references still resolve.
 
-A harness adapter places these files in a specific harness's context-file format and wires the activation hooks — see `../activation_spec.md` for the activation contract and `../next.md` for the build plan.
+A harness adapter places these files in a specific harness's context-file format and wires the activation hooks. The shipped activation templates live alongside this seed in `../activation/`; each adapter's own README documents how that adapter wires them.
 
 ---
 
