@@ -24,7 +24,7 @@ It packages four things that work together:
 
 3. **An activation layer.** Instructions that prime your session at open, sharpen each prompt turn, and shape how sessions close. Wired through your harness's hooks, so it happens on its own, not when you remember to ask.
 
-4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, or a browser form with `--web`.
+4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
 
 The kit runs under Claude Code or Codex CLI — both first-class, both wired via hooks. A third adapter, `openhands`, is also accepted by `levain init --adapter`: it is hookless, and instead of wiring a hosted harness it scaffolds a sovereign, runnable entity with its own store and seed.
 
@@ -68,6 +68,33 @@ levain init --web                    # fill the same interview in a browser form
 ```
 
 One adapter per install. To run both Claude Code and Codex, make two installs.
+
+### Installing without a terminal in front of you
+
+The interview can be answered from a file instead of typed — which is how you
+provision more than one install, or any install that has to come up unattended.
+
+```
+levain init --answers-template > answers.json   # every question, blank, ready to fill
+levain init --adapter openhands --answers answers.json --path ./seat-1
+```
+
+The answer file is a JSON object **keyed by slot name**, never an ordered list, so
+you never have to know or match the order the interview happens to ask in:
+
+```json
+{ "OPERATOR_NAME": "Chris", "ENTITY_NAME": "Ada", "LOCATION": "Ohio" }
+```
+
+`--answers-template` writes the blank file to stdout and a guide to *what each
+question is asking* to stderr — so the redirect above gives you valid JSON and you
+still get to read the questions. Every slot must be present; `""` is a real answer
+meaning "skip this," exactly as pressing enter does in the terminal — except for
+your name and your partner's, which an entity is not allowed to be missing.
+
+`--answers` requires `--adapter`, and it never prompts for anything. If a field is
+missing, unknown, or has plainly landed in the wrong slot, it says so and installs
+nothing — rather than writing a half-captured partner and reporting success.
 
 ## Keep it in sync — `doctor` and `update`
 
