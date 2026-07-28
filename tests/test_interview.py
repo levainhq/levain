@@ -373,11 +373,21 @@ def test_split_guidance_fallback_when_too_few_semicolons():
     assert _split_guidance("one clause for two slots", ["A", "B"]) == {}
 
 
-def test_split_guidance_more_parts_than_slots_uses_first_n():
-    # Extra trailing clauses get dropped — pair sub-clauses with slots in
-    # order, ignore the tail.
-    result = _split_guidance("a; b; c; d", ["X", "Y"])
-    assert result == {"X": "a", "Y": "b"}
+def test_split_guidance_more_parts_than_slots_falls_back():
+    """SUPERSEDES `..._uses_first_n` (which asserted `{"X": "a", "Y": "b"}`).
+
+    That contract assumed an extra clause is always TRAILING, so dropping the tail
+    was harmless. The shipped origin.md preamble broke the assumption: its extra
+    clause was INTERNAL (a `;` inside the SUBSTRATE clause), and "first N" then
+    handed every later slot its neighbour's sub-question — `JOB` got "Your own
+    name", which belongs to OPERATOR_NAME.
+
+    Nothing can distinguish a trailing extra from an internal split, so pairing at
+    all is a GUESS, and a wrong guess mislabels a field with someone else's
+    question — silently, since the terminal walk prints only the whole section
+    guidance. Falling back costs the per-slot clause and keeps the paragraph.
+    """
+    assert _split_guidance("a; b; c; d", ["X", "Y"]) == {}
 
 
 def test_split_guidance_handles_unbalanced_parens_gracefully():
@@ -1189,10 +1199,15 @@ def test_preamble_interview_guidance_extracted(tmp_path: Path):
     # carry its own `<!-- interview -->` comment, parsed exactly like a section's,
     # so its title-less slots get guidance instead of a bare slot name.
     template = tmp_path / "origin.md"
+    # Clause count MATCHES slot count (2/2). It previously carried a third,
+    # slot-less "Your job" clause and still paired, because the engine dropped
+    # extras; per-slot pairing is now refused on any count mismatch, so a fixture
+    # for the preamble-guidance feature must be well-formed to test that feature
+    # rather than the (separately tested) fallback.
     template.write_text(
         "# Who You Are — {{ENTITY_NAME}}\n\n"
         "You run on {{SUBSTRATE}}.\n\n"
-        "<!-- interview: The name; The model it runs on; Your job -->\n",
+        "<!-- interview: The name; The model it runs on -->\n",
         encoding="utf-8",
     )
     spec = parse_template(template)
@@ -1230,3 +1245,56 @@ def test_real_world_template_is_second_person(tmp_path: Path):
     assert by["OPERATOR_NAME"].guidance == "Your full name"
     assert by["ROLES"].style == "bullet"        # style keyword preserved
     assert by["AGE"].style == "optional-line"   # style keyword preserved
+
+
+# --- guidance split: positional pairing must not misalign --------------------
+
+
+def test_guidance_split_refuses_to_pair_when_a_clause_holds_its_own_semicolon(tmp_path):
+    """Too MANY clauses is the dangerous direction, and it used to zip anyway.
+
+    `_split_guidance` guarded `len(parts) < len(slots)` but not `>`. A clause
+    containing its own un-parenthesized `;` therefore shifted every later slot onto
+    its NEIGHBOUR's sub-question — the shipped origin.md preamble did exactly this,
+    handing `JOB` the clause "Your own name" (which belongs to OPERATOR_NAME).
+    Invisible in the terminal (it prints the whole section guidance), visible in the
+    web init form and `--answers-template`'s field guide, which render per-slot.
+
+    On any count mismatch the alignment is underivable, so the split must return {}
+    and let callers fall back to the full guidance: showing the whole paragraph is a
+    smaller failure than labelling a field with someone else's question.
+    """
+    from levain.interview import _split_guidance
+
+    slots = ["A", "B", "C"]
+    # 4 top-level clauses for 3 slots (B's clause carries an internal ';').
+    guidance = "first; second part one; second part two; third"
+    assert _split_guidance(guidance, slots) == {}
+
+    # Exact match still pairs positionally, as before.
+    assert _split_guidance("first; second; third", slots) == {
+        "A": "first", "B": "second", "C": "third"
+    }
+    # Too few still falls back, as before.
+    assert _split_guidance("first; second", slots) == {}
+
+
+def test_shipped_origin_template_gives_every_slot_its_own_question():
+    """The template authoring half of the same bug, pinned against the real file.
+
+    The fallback above keeps a mismatch SAFE; this keeps the shipped base seed
+    CORRECT, so a real operator gets per-slot guidance rather than the paragraph.
+    """
+    from pathlib import Path
+
+    from levain.interview import build_field_plan, parse_template
+
+    root = Path(__file__).resolve().parents[1] / "levain" / "templates" / "seed"
+    plan = build_field_plan([parse_template(root / "world.md"), parse_template(root / "origin.md")])
+    guidance = {f.slot: f.guidance for f in plan}
+
+    assert guidance["ENTITY_NAME"].startswith("The name you'll call this entity")
+    assert guidance["SUBSTRATE"].startswith("The model it runs on")
+    # The regression: JOB used to inherit OPERATOR_NAME's "Your own name".
+    assert guidance["JOB"].startswith("What this entity starts out doing")
+    assert guidance["OPERATOR_NAME"] == "Your full name"

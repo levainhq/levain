@@ -46,6 +46,7 @@ from levain.install import (
     apply_init,
     open_init_templates,
 )
+from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
 from levain.web_server import (
@@ -433,6 +434,28 @@ class _InitHandler(BaseHTTPRequestHandler):
                         {"error": "stale_form",
                          "message": (f"the form is missing current field(s): {stale} — "
                                      f"reload the page (its fields changed since it loaded)")},
+                        400,
+                    )
+                    return
+
+                # THE SAME CONTENT GATE THE `--answers` CLI PATH USES. `apply_init`
+                # explicitly does NOT validate its answers — it says so in its own
+                # docstring — so the invariant is only as strong as its weakest
+                # CALLER, and this one was it: unknown + missing keys were rejected
+                # above, but a blank identity field or a value that could not have
+                # come from its own control (a forged POST, or any client that is not
+                # this form) went straight to disk. Found at L3 by codex, which read
+                # this file while the other reviewer could only assume about it.
+                #
+                # Deliberately NOT a full strict-completeness gate: blank answers
+                # stay legal here, exactly as the stale-form note above intends and
+                # as the terminal interview allows. Only the two failures that are
+                # about CORRUPTION rather than terseness are rejected.
+                content_errors = validate_answers(build_field_plan(specs), answers)
+                if content_errors:
+                    self._send_json(
+                        {"error": "bad_answers",
+                         "message": "; ".join(content_errors)},
                         400,
                     )
                     return
