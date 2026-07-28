@@ -551,7 +551,7 @@ def test_run_entity_passes_confined_tools_by_default(
     entity = _openhands_entity(tmp_path)
     # Force the OS-floor-present branch so this is platform-independent — the entity gets BOTH confined
     # hands (file editor + sandboxed bash).
-    monkeypatch.setattr("levain.run.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)
@@ -567,7 +567,7 @@ def test_run_entity_drops_bash_without_an_os_sandbox(
     entity = _openhands_entity(tmp_path)
     # No OS confinement floor → bash is dropped, the file-editor hand stays (honesty floor: NEVER an
     # unconfined shell as a fallback).
-    monkeypatch.setattr("levain.run.confinement_supported", lambda: False)
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: False)
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)

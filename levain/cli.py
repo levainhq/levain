@@ -309,6 +309,37 @@ def main(argv: list[str] | None = None) -> int:
             "confined hands (file editor + sandboxed bash) fenced to the crown-jewels floor."
         ),
     )
+    run_p.add_argument(
+        "--task",
+        default=None,
+        help=(
+            "Run ONE task non-interactively and exit (no REPL, no tty needed) — the headless "
+            "runner. Tool activity streams as it happens; the reply goes to stdout. The EXIT "
+            "CODE reports what the harness observed, never what the agent claimed: 0 replied, "
+            "1 completed with no reply, 2 startup/usage error, 3 the turn raised. It does NOT "
+            "assert the task succeeded — verify that against the world (run the tests, read "
+            "the diff), because a confined entity cannot truthfully report on its own "
+            "environment."
+        ),
+    )
+    run_p.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "With --task: print ONLY the entity's reply on stdout (no banner, no activity "
+            "stream) — for piping the reply as a payload. Errors still go to stderr."
+        ),
+    )
+    run_p.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        dest="max_iterations",
+        help=(
+            "With --task: bound the turn to at most N agent steps, so an unattended run "
+            "cannot spend forever on one message. Default: the SDK's own limit."
+        ),
+    )
     run_p.set_defaults(func=_cmd_run)
 
     wrap_p = subparsers.add_parser(
@@ -685,6 +716,24 @@ def _cmd_focus(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    # Two drivers over ONE session (the K1 seam, `levain.session`): `--task` is the
+    # non-interactive runner (one spec, exit-when-done, an exit code a caller can branch on);
+    # without it, the interactive REPL. `--quiet`/`--max-iterations` only shape a task run.
+    task = getattr(args, "task", None)
+    if task is not None:
+        from levain.run import run_task
+
+        return run_task(
+            path=args.path,
+            task=task,
+            model=args.model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            with_tools=args.with_tools,
+            quiet=getattr(args, "quiet", False),
+            max_iterations=getattr(args, "max_iterations", None),
+        )
+
     from levain.run import run_entity
 
     return run_entity(
