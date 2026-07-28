@@ -283,10 +283,12 @@ def _warn_on_unsplittable_multislot_sections(spec: TemplateSpec) -> None:
     """Surface multi-slot interview sections whose guidance would silently
     fall back to applying the entire guidance to each slot.
 
-    `_split_guidance` returns `{}` (the fallback signal) when a multi-slot
-    section's guidance has fewer top-level semicolons than slots-1. That's
-    almost always an authoring mistake — the seed-template author wrote
-    multiple slots intending per-slot guidance but forgot the separators.
+    `_split_guidance` returns `{}` (the fallback signal) whenever a multi-slot
+    section's top-level `;`-separated clause count does not EQUAL its slot
+    count — in either direction, and both directions are authoring mistakes:
+    too FEW clauses means the separators were never written; too MANY means a
+    clause contains its own un-parenthesized `;`, which used to shift every
+    later slot onto its neighbour's sub-question instead of falling back.
     Warn at parse time so template authors catch it before an operator
     hits the interview. Emits to stderr; never raises.
     """
@@ -299,11 +301,12 @@ def _warn_on_unsplittable_multislot_sections(spec: TemplateSpec) -> None:
         slot_list = ", ".join(section.slots)
         print(
             f"WARN: {spec.path.name}: section {title!r} has "
-            f"{len(section.slots)} slots [{slot_list}] but interview "
-            f"guidance is missing the `;` separators needed to split it "
-            f"per-slot. Each slot will receive the full guidance text. "
-            f"Add semicolons between per-slot clauses if that's not "
-            f"intended.",
+            f"{len(section.slots)} slots [{slot_list}] but its interview "
+            f"guidance does not split into exactly {len(section.slots)} "
+            f"top-level `;`-separated clauses, so per-slot guidance cannot be "
+            f"aligned and each slot receives the full guidance text. Use one "
+            f"`;` BETWEEN clauses and none inside them (parenthesize or reword "
+            f"an internal semicolon).",
             file=sys.stderr,
         )
 
@@ -697,7 +700,20 @@ def _split_guidance(guidance: str, slots: list[str]) -> dict[str, str]:
     if tail:
         parts.append(tail)
 
-    if len(parts) < len(slots):
+    # The pairing is POSITIONAL, so it is only trustworthy when the counts match
+    # exactly. Too FEW parts is the obvious failure; too MANY is the dangerous one —
+    # it happens when a clause contains its own un-parenthesized `;` (origin.md's
+    # SUBSTRATE clause does), and zipping then shifts every later slot onto its
+    # neighbour's sub-question: `JOB` inherited "Your own name", which belongs to
+    # OPERATOR_NAME. That misalignment is invisible in the terminal walk (which
+    # prints the WHOLE section guidance) and surfaces wherever per-slot guidance is
+    # actually rendered — the web init form, and `--answers-template`'s field guide.
+    #
+    # On ANY count mismatch the convention does not hold, so the alignment is not
+    # merely unknown-to-us, it is underivable — return {} and let callers fall back
+    # to the full section guidance. Showing the whole paragraph is a smaller failure
+    # than confidently labelling a field with someone else's question.
+    if len(parts) != len(slots):
         return {}
 
     return {slot: parts[i] for i, slot in enumerate(slots)}

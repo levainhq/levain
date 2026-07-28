@@ -77,6 +77,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core: list[CheckResult] = []
     core.extend(_check_install_layout(install, expect_hooks=not hookless))
     core.extend(_check_seed_content(install))
+    core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_store(install))
     core.extend(_check_compat_set(install))
@@ -209,6 +210,266 @@ def _check_seed_content(install: Path) -> list[CheckResult]:
             results.append(
                 CheckResult(f"seed content ({name})", True, "no unfilled placeholders")
             )
+    return results
+
+
+def _check_recorded_answers(install: Path) -> list[CheckResult]:
+    """CONTENT, as distinct from WIRING — the check `doctor` did not have.
+
+    The gap this closes, stated exactly: `_check_seed_content` above proves no
+    `{{SLOT}}` SURVIVED, which proves the render RAN. It cannot see whether the
+    render ran over the right values. A seed whose answers were shifted by one slot
+    has no surviving placeholder, no missing file, no broken hook — every wiring
+    check passes and `doctor` prints green over an entity that does not know who its
+    operator is. That is the one failure class Levain's own pitch says cannot happen
+    here, so it is the one `doctor` must be able to see.
+
+    Three checks over the recorded interview (`.levain/answers.json`, the same map
+    `levain update` re-renders from):
+
+      1. THE RECORD EXISTS. Absent, it fails — it does not pass quietly. An install
+         whose content cannot be verified is not an install verified as good, and
+         rendering "unable to check" as a green tick is the precise habit this
+         function exists to break.
+      2. REQUIRED ANSWERS ARE NON-EMPTY. An empty required slot renders to nothing
+         and leaves no placeholder behind, so it is invisible to every other check.
+      3. THE SEED ON DISK STILL MATCHES THE RECORD — REPORTED, NOT FAILED.
+         `render_template` substitutes values VERBATIM, so a recorded answer that is
+         missing from its seed file means the seed was edited after init. That is an
+         invited action, not a defect (see the note at the check itself), so it is
+         surfaced as information about a future re-render, never as a failure.
+
+    Plus `shape_violations`, which is where a slot-shift actually gets CAUGHT rather
+    than merely being possible to catch.
+
+    KNOWN, DELIBERATE LIMITS — none of these are bugs, and pretending otherwise
+    would make this check a worse liar than the one it replaces:
+      - A semantically WRONG answer that is well-formed is undetectable, here or
+        anywhere. No mechanism can know whether "Chris" is your name.
+      - Check 3 is a SUBSTRING match over the whole file, not a slot-anchored one,
+        so a short or common value ("a", "CEO") can match incidentally elsewhere in
+        the seed. It is reliable for the long, distinctive values (names, bios) and
+        weak for terse ones — acceptable precisely because it only ever INFORMS.
+      - Only slots in BOTH the base field plan and the record are checked. A `--pack`
+        layer may add or replace render templates and no roster is recorded at
+        doctor time (the same Slice-3 deferral `_SEED_REQUIRED` notes), so pack
+        slots are passed over rather than guessed at — a false FAIL on a healthy
+        packed install would teach operators to ignore this check, which costs more
+        than the coverage gained.
+    """
+    from levain.answers import (
+        SHAPE_IMPOSSIBLE,
+        is_required,
+        shape_violations,
+    )
+    from levain.install import _templates_root, read_answers
+
+    answers = read_answers(install)
+    if not answers:
+        return [
+            CheckResult(
+                "seed content (recorded answers)",
+                False,
+                "no recorded interview at .levain/answers.json — seed CONTENT "
+                "cannot be verified",
+                "Wiring checks alone cannot tell a filled seed from a scrambled "
+                "one. Installs created before answers were recorded show this; "
+                "re-run `levain init --force --path <install>` (the store is "
+                "preserved) to record the interview and restore content checking.",
+            )
+        ]
+
+    try:
+        from levain.interview import build_field_plan, parse_template
+
+        with _templates_root() as troot:
+            specs = [
+                parse_template(troot / "seed" / name)
+                for name in _RENDER_TARGET_SEEDS
+                if (troot / "seed" / name).is_file()
+            ]
+            fields = [f for f in build_field_plan(specs) if f.slot in answers]
+    except Exception as e:  # noqa: BLE001 — an unreadable template must not crash doctor
+        return [
+            CheckResult(
+                "seed content (recorded answers)",
+                False,
+                f"could not read the base interview templates to check content: {e}",
+                "Reinstall the package: `pip install --force-reinstall levain`.",
+            )
+        ]
+
+    if not fields:
+        # A record that shares NOT ONE slot with the base seed is not a record of
+        # this install's interview. The previous shape of this branch returned a
+        # cheerful OK here and called it "pack-layered" — which meant a record
+        # holding only `{"OPERATOR_NMAE": "Chris"}` (one typo, nothing else) passed
+        # doctor green, reopening the exact "the record proves nothing" hole this
+        # function exists to close. Caught at L3 by codex.
+        #
+        # A pack CAN legitimately reach here by replacing BOTH base render templates
+        # with its own slots, so the message names that possibility instead of
+        # accusing — but it still reports UNVERIFIED, because "we could not check"
+        # and "we checked and it is fine" must never print the same badge.
+        return [
+            CheckResult(
+                "seed content (recorded answers)",
+                False,
+                f"the recorded interview ({len(answers)} answer(s)) shares no fields "
+                f"with the base seed, so its content cannot be verified",
+                "Either a pack replaced both base seed templates (expected — there "
+                "is nothing here to check, and doctor records no roster to tell), or "
+                "this .levain/answers.json does not belong to this install. Compare "
+                "it against `levain init --answers-template`.",
+            )
+        ]
+
+    results: list[CheckResult] = []
+
+    # TWO TIERS, because a blank is not one kind of problem.
+    #
+    # The terminal interview and the web form BOTH accept a blank answer for a
+    # non-optional field (blank = skip). Failing every such install would condemn
+    # people for using the product exactly as its own surfaces let them — so a blank
+    # elsewhere is REPORTED, and only IDENTITY is fatal. That line is not arbitrary:
+    # a thin seed still supports a working partnership, while an entity with no name
+    # for itself or its operator is the failure the pitch says cannot happen.
+    # `levain.answers.IDENTITY_SLOTS` is the same constant the `--answers` gate uses,
+    # so the two surfaces cannot drift into two different rules.
+    from levain.answers import IDENTITY_SLOTS
+
+    empty_identity = sorted(
+        f.slot for f in fields if f.slot in IDENTITY_SLOTS and not answers[f.slot].strip()
+    )
+    empty_other = sorted(
+        f.slot
+        for f in fields
+        if f.slot not in IDENTITY_SLOTS and is_required(f) and not answers[f.slot].strip()
+    )
+    if empty_identity:
+        results.append(
+            CheckResult(
+                "seed content (answers present)",
+                False,
+                f"identity field(s) recorded EMPTY: {', '.join(empty_identity)}",
+                "The seed renders with nothing here and leaves no placeholder "
+                "behind, so the entity does not know who it is partnering with "
+                "while every other check passes. Re-run `levain init --force` and "
+                "answer them, or supply them via --answers.",
+            )
+        )
+    elif empty_other:
+        results.append(
+            CheckResult(
+                "seed content (answers present)",
+                True,
+                f"{len(fields)} recorded field(s); identity present; left blank: "
+                f"{', '.join(empty_other)} (a thinner seed, not a broken one)",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                "seed content (answers present)",
+                True,
+                f"{len(fields)} recorded field(s), none empty",
+            )
+        )
+
+    # Every recorded answer must appear VERBATIM in the seed file its slot fills.
+    # Two value shapes are skipped rather than mis-reported: one containing `<!--`
+    # (render strips template comments AFTER substitution, so such a value can be
+    # legitimately altered on its way to disk) and one containing `{{` (it would be
+    # indistinguishable from an unfilled slot, which is check 1's job anyway).
+    seed_cache: dict[str, str | None] = {}
+
+    def _seed_text(name: str) -> str | None:
+        if name not in seed_cache:
+            f = install / "seed" / name
+            try:
+                seed_cache[name] = f.read_text(encoding="utf-8") if f.is_file() else None
+            except (OSError, UnicodeError):
+                seed_cache[name] = None
+        return seed_cache[name]
+
+    diverged: list[str] = []
+    skipped: list[str] = []
+    for f in fields:
+        value = answers[f.slot].strip()
+        if not value:
+            continue
+        if "<!--" in value or "{{" in value:
+            # Not checkable: render strips template comments AFTER substitution, and
+            # a `{{` in a value is indistinguishable from an unfilled slot. COUNTED,
+            # not silently dropped — reporting "carries every recorded answer" while
+            # having quietly declined to look at some of them is the same
+            # unverified-as-verified move this whole function objects to.
+            skipped.append(f.slot)
+            continue
+        text = _seed_text(f.spec_name)
+        if text is None:
+            continue  # a missing/unreadable seed is the layout check's job
+        if value not in text:
+            diverged.append(f"{f.slot} (in {f.spec_name})")
+    if diverged:
+        # REPORTED, NEVER FAILED — and the reason is a correction, not a softening.
+        # The install banner explicitly invites this: "Files created (you can
+        # hand-edit any of these)" (`install.py` `_print_manifest`) lists the seed.
+        # Failing here would condemn an install for doing exactly what the product
+        # told the operator to do, with no way back — `levain update` "fixes" the
+        # FAIL by re-rendering from the record, i.e. by destroying the edit.
+        #
+        # It is also not a corruption in the first place: THE ENTITY READS THE SEED.
+        # A hand-edited seed is the operator's intent, correctly delivered; the
+        # record is only the re-render INPUT. So the real and only consequence is
+        # forward-looking — a later re-render would overwrite these edits — and that
+        # is a thing to be TOLD, not condemned for.
+        results.append(
+            CheckResult(
+                "seed content (seed matches record)",
+                True,
+                f"seed edited since init for: {', '.join(sorted(diverged))} — the "
+                f"seed is what the entity reads, so this is fine; note only that "
+                f"a re-render (`levain update`) would restore the recorded answers "
+                f"over these edits",
+            )
+        )
+    else:
+        detail = "rendered seed carries every recorded answer"
+        if skipped:
+            detail += (
+                f" (not checkable, contains template syntax: {', '.join(sorted(skipped))})"
+            )
+        results.append(CheckResult("seed content (seed matches record)", True, detail))
+
+    shapes = shape_violations(fields, answers)
+    impossible = [m for sev, m in shapes if sev == SHAPE_IMPOSSIBLE]
+    unusual = [m for sev, m in shapes if sev != SHAPE_IMPOSSIBLE]
+    if impossible:
+        results.append(
+            CheckResult(
+                "seed content (answer shapes)",
+                False,
+                "; ".join(impossible),
+                "A single-line field cannot hold a multi-line value if it was "
+                "answered at its own prompt — this is the signature of answers "
+                "landing in the wrong slots. Check the seed reads correctly, then "
+                "re-run init with a slot-keyed --answers file.",
+            )
+        )
+    elif unusual:
+        results.append(
+            CheckResult(
+                "seed content (answer shapes)",
+                True,
+                f"plausible; {len(unusual)} note(s): " + "; ".join(unusual),
+            )
+        )
+    else:
+        results.append(
+            CheckResult("seed content (answer shapes)", True, "consistent with each field")
+        )
+
     return results
 
 

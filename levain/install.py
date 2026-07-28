@@ -38,6 +38,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from levain.answers import AnswersError
 from levain.packs import (
     BASE_IMPORT_ORDER,
     PackBrand,
@@ -195,8 +196,73 @@ def _copy_pack_docs(install: Path, packs: Sequence[tuple[PackManifest, Path]]) -
     return copied
 
 
+def _refuse_input(prompt: str = "") -> str:
+    """The `input_fn` a non-interactive init hands the interview engine.
+
+    A STRUCTURAL invariant, not a belt-and-braces nicety: the first scripted
+    `levain init` attempt did not fail, it HUNG — the engine reached an
+    undiscoverable `Skip this section? [y/N]` gate and blocked forever on a pipe
+    that would never answer, after silently checkpointing four answers. "Validate
+    the answers first so nothing can prompt" is a discipline; refusing to read a
+    prompt at all is a guarantee. If this ever fires, a slot escaped validation —
+    the correct outcome is a loud, named failure, never a hang.
+    """
+    raise AnswersError(
+        f"non-interactive init tried to prompt for input ({prompt.strip()!r}). "
+        f"Every field must be supplied by --answers; regenerate the skeleton with "
+        f"`levain init --answers-template`."
+    )
+
+
+def run_answers_template(packs: list[Path] | None = None) -> int:
+    """`levain init --answers-template` — emit a blank answer file for this install's
+    interview (composed with any `--pack` layers, which add their own slots).
+
+    JSON skeleton to STDOUT, the human field guide to STDERR, so the obvious
+    invocation just works::
+
+        levain init --answers-template > answers.json
+
+    Read-only by construction: resolves no adapter, creates no directory, writes
+    nothing. Discovering what an install will ask must never be a step that alters
+    anything.
+    """
+    from levain.answers import answers_template_json, field_guide
+
+    pack_dirs = [Path(str(p)).expanduser().resolve() for p in (packs or [])]
+    with _templates_root() as templates_root:
+        if not (templates_root / "seed" / "world.md").is_file():
+            print(
+                f"FAIL: Levain templates not found in installed package at "
+                f"{templates_root}. The wheel may be corrupt; reinstall with "
+                f"`pip install --force-reinstall levain`.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            from levain.interview import build_field_plan, parse_template
+
+            roster = compose_roster([templates_root, *pack_dirs])
+            specs = [parse_template(entry.path) for entry in render_entries(roster)]
+        except PackError as e:
+            print(f"FAIL: {e}", file=sys.stderr)
+            return 1
+        except Exception as e:  # noqa: BLE001 — a malformed template surfaces, never crashes
+            print(f"FAIL: could not read the interview templates: {e}", file=sys.stderr)
+            return 1
+        fields = build_field_plan(specs)
+
+    print(field_guide(fields), file=sys.stderr)
+    sys.stdout.write(answers_template_json(fields))
+    return 0
+
+
 def run_init(
-    path: Path, adapter: str | None, force: bool, packs: list[Path] | None = None
+    path: Path,
+    adapter: str | None,
+    force: bool,
+    packs: list[Path] | None = None,
+    answers_file: Path | None = None,
 ) -> int:
     # expanduser first: argparse's `type=Path` does not expand `~`, but operators
     # passing `--path ~/levain-install` reasonably expect shell semantics.
@@ -207,6 +273,36 @@ def run_init(
     # Filled from the pre-interview snapshot below; initialized here so the
     # post-interview docs-refresh always has a bound value (mypy flow-analysis).
     pack_manifests: list[PackManifest] = []
+
+    # NON-INTERACTIVE MODE. `--answers` is a promise that no human is present, so
+    # every prompt in this function has to be either satisfied up-front or refused
+    # — a "mostly non-interactive" init is just an init that hangs somewhere less
+    # obvious. The three prompts are: the adapter menu (required below), the
+    # checkpoint-resume question (skipped below), and the interview itself
+    # (satisfied by the validated answer file, and refused by `_refuse_input`).
+    non_interactive = answers_file is not None
+    file_answers: dict[str, str] = {}
+    if answers_file is not None:
+        from levain.answers import load_answers_file
+
+        if adapter not in KNOWN_ADAPTERS:
+            print(
+                f"FAIL: --answers requires --adapter (one of "
+                f"{', '.join(KNOWN_ADAPTERS)}).\n"
+                f"      Without it the adapter menu would prompt, and there is no "
+                f"one to answer it."
+            )
+            return 1
+        try:
+            # READ here, before the install directory is created, so a typo'd path
+            # or malformed JSON fails with nothing made. (The against-the-plan
+            # VALIDATION cannot happen this early — it needs the composed roster —
+            # so a plan mismatch can leave an EMPTY install dir behind. Harmless:
+            # an empty dir is a safe install target, so the retry needs no --force.)
+            file_answers = load_answers_file(Path(str(answers_file)).expanduser())
+        except AnswersError as e:
+            print(f"FAIL: {e}")
+            return 1
 
     try:
         chosen = _resolve_adapter(adapter)
@@ -304,36 +400,88 @@ def run_init(
         print(f"Interview — fills the {rendered_names} templates.")
         print("=" * 60)
 
-        # Resume from prior Ctrl+C if a checkpoint exists.
         initial_answers: dict[str, str] = {}
-        checkpoint = _load_checkpoint(install)
-        if checkpoint:
-            n = len(checkpoint)
-            try:
-                response = input(
-                    f"  Found interview checkpoint with {n} answer(s) from "
-                    f"a prior interrupted run.\n"
-                    f"  Resume from checkpoint? [Y/n] "
-                ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\n  Cancelled before resume decision.")
-                return 1
-            if response in ("", "y", "yes"):
-                initial_answers = checkpoint
-                print(f"  Resuming — {n} answer(s) restored. Continuing where you left off.")
-            else:
-                _clear_checkpoint(install)
-                print("  Discarded checkpoint. Starting fresh.")
+        if non_interactive:
+            # VALIDATE AGAINST THE COMPOSED PLAN, NOT THE BASE TEMPLATES — the plan
+            # is derived from THIS run's roster, so a `--pack` layer's extra slots are
+            # required here exactly as the terminal interview would ask them, and a
+            # base-only answer file against a packed install fails LOUD instead of
+            # rendering the pack's slots empty.
+            from levain.answers import (
+                SHAPE_IMPOSSIBLE,
+                shape_violations,
+                validate_answers,
+            )
+            from levain.interview import build_field_plan
 
-        print("  Press Ctrl+C to interrupt — answers so far will be saved for resume.")
+            plan = build_field_plan(render_specs)
+            errors = validate_answers(plan, file_answers)
+            if errors:
+                print("FAIL: the --answers file does not match this install's interview:")
+                for err in errors:
+                    print(f"  - {err}")
+                pack_flags = "".join(f" --pack {p}" for p in pack_dirs)
+                print(
+                    f"      Regenerate a blank skeleton with:\n"
+                    f"        levain init --answers-template{pack_flags} > answers.json"
+                )
+                return 1
+            initial_answers = file_answers
+            print(f"  Non-interactive — {len(file_answers)} answer(s) from {answers_file}.")
+            # Only the JUDGMENT-CALL shape findings reach here: the
+            # can't-have-happened ones are hard errors inside `validate_answers`
+            # above, so a fleet never reads exit 0 over a scrambled file. What is
+            # left warns and continues — a heuristic gets to raise its hand, never
+            # to overrule the operator about their own answers.
+            for sev, note in shape_violations(plan, file_answers):
+                if sev != SHAPE_IMPOSSIBLE:
+                    print(f"  note: {note}")
+        else:
+            # Resume from prior Ctrl+C if a checkpoint exists.
+            checkpoint = _load_checkpoint(install)
+            if checkpoint:
+                n = len(checkpoint)
+                try:
+                    response = input(
+                        f"  Found interview checkpoint with {n} answer(s) from "
+                        f"a prior interrupted run.\n"
+                        f"  Resume from checkpoint? [Y/n] "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  Cancelled before resume decision.")
+                    return 1
+                if response in ("", "y", "yes"):
+                    initial_answers = checkpoint
+                    print(
+                        f"  Resuming — {n} answer(s) restored. Continuing where you left off."
+                    )
+                else:
+                    _clear_checkpoint(install)
+                    print("  Discarded checkpoint. Starting fresh.")
+
+            print("  Press Ctrl+C to interrupt — answers so far will be saved for resume.")
+
         try:
+            # Non-interactive: the validated file already fills every planned slot, so
+            # the engine's walk is empty and it returns without asking anything.
+            # `_refuse_input` makes that a GUARANTEE rather than an expectation, and no
+            # checkpoint is written because nothing is asked (a checkpoint from a run
+            # that prompts for nothing is just a stale file for the next run to offer).
             answers = conduct_interview(
                 render_specs,
                 answers=initial_answers,
-                checkpoint_fn=lambda a: _save_checkpoint(install, a),
+                input_fn=_refuse_input if non_interactive else input,
+                checkpoint_fn=(
+                    None if non_interactive else (lambda a: _save_checkpoint(install, a))
+                ),
             )
         except (KeyboardInterrupt, EOFError):
             print("\nInterview interrupted.")
+            _report_partial_state(install)
+            return 1
+        except AnswersError as e:
+            # `_refuse_input` fired — a slot escaped validation. Loud, named, no hang.
+            print(f"FAIL: {e}")
             _report_partial_state(install)
             return 1
 
@@ -515,7 +663,19 @@ def apply_init(
     # RE-RENDER a changed pack render-template with the SAME answers + a targeted
     # re-prompt for only NEW slots, instead of losing them (the render-slot reconcile
     # root-cause fix). Best-effort — never fails the install.
-    write_answers(install, answers, emit)
+    #
+    # STILL best-effort, but no longer SILENT about the second thing it costs. The
+    # record is now also what `doctor` content-checks against, so a failed write
+    # produces a genuinely healthy install that `doctor` nonetheless reports as
+    # unverifiable — and `write_answers`'s own note only mentions pack re-renders,
+    # which sends the operator hunting the wrong problem. Name both consequences at
+    # the moment it fails; the install itself is fine and must not be torn down.
+    if not write_answers(install, answers, emit):
+        emit(
+            "  note: the interview was NOT recorded, so `levain doctor` will report "
+            "seed content as unverifiable. The install itself is fine — re-run "
+            "`levain init --force` on this path to record it (your store is kept)."
+        )
     # Bake the resolved pack white-label into the operator-facing .levain/config.json
     # (build-time pack.toml [brand] → the runtime channel entity_name travels). Runs
     # BEFORE the store init so it lands even on a store-init failure (it's chrome, not

@@ -113,6 +113,33 @@ def main(argv: list[str] | None = None) -> int:
         dest="no_open",
         help="With `--web`, do not open a browser tab on startup.",
     )
+    init_p.add_argument(
+        "--answers",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Run the interview NON-INTERACTIVELY from a JSON answer file: an "
+            "object keyed by SLOT NAME (never an ordered list — answers are "
+            "matched by name, so field order is not something you have to know). "
+            "Requires --adapter, since the adapter menu would otherwise prompt. "
+            "Every slot must be present; \"\" is allowed only for an optional "
+            "section (equivalent to answering the terminal's `Skip this section?` "
+            "with y) or an optional-line field. Get a blank one with "
+            "--answers-template."
+        ),
+    )
+    init_p.add_argument(
+        "--answers-template",
+        action="store_true",
+        dest="answers_template",
+        help=(
+            "Print a blank --answers file (every slot this install's interview "
+            "asks, mapped to \"\") to STDOUT, and the field guide to STDERR, then "
+            "exit without writing anything. Composes with --pack. Usage: "
+            "`levain init --answers-template > answers.json`."
+        ),
+    )
     init_p.set_defaults(func=_cmd_init)
 
     doc_p = subparsers.add_parser(
@@ -655,6 +682,34 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    if args.answers_template:
+        # A pure read: emit what this install WOULD ask and exit. Refuse the flag
+        # combinations that would imply it also installs something, rather than
+        # silently ignoring them — a flag that is quietly dropped is how an
+        # operator ends up believing an install happened.
+        if args.answers is not None:
+            print(
+                "levain init: --answers-template and --answers are mutually "
+                "exclusive (one emits a blank file, the other consumes a filled one)."
+            )
+            return 1
+        if args.web:
+            print("levain init: --answers-template cannot be combined with --web.")
+            return 1
+        from levain.install import run_answers_template
+
+        return run_answers_template(packs=args.pack)
+
+    if args.answers is not None and args.web:
+        # --web IS the interactive onboarding surface; pairing it with a file that
+        # exists to avoid interaction is a contradiction, not a preference to resolve.
+        print(
+            "levain init: --answers cannot be combined with --web (--web runs the "
+            "browser interview; --answers runs no interview at all).\n"
+            "  Drop --web to install non-interactively."
+        )
+        return 1
+
     if args.web and args.adapter == "openhands":
         # The browser onboarding surface (init_server) is claude-code/codex only for
         # now; a sovereign-entity scaffold is a terminal-only path this slice. Fail
@@ -680,7 +735,13 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     from levain.install import run_init
 
-    return run_init(path=args.path, adapter=args.adapter, force=args.force, packs=args.pack)
+    return run_init(
+        path=args.path,
+        adapter=args.adapter,
+        force=args.force,
+        packs=args.pack,
+        answers_file=args.answers,
+    )
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
