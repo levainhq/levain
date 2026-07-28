@@ -273,9 +273,12 @@ def _check_recorded_answers(install: Path) -> list[CheckResult]:
                 "no recorded interview at .levain/answers.json — seed CONTENT "
                 "cannot be verified",
                 "Wiring checks alone cannot tell a filled seed from a scrambled "
-                "one. Installs created before answers were recorded show this; "
-                "re-run `levain init --force --path <install>` (the store is "
-                "preserved) to record the interview and restore content checking.",
+                "one. This means the install predates answer recording (levain "
+                "0.3.13, 2026-07-07) — anything installed since records it "
+                "automatically, so a NEW install never sees this. To fix an older "
+                "one, re-run `levain init --force --path <install>` and answer the "
+                "interview again: your anneal store, and everything the entity has "
+                "learned, is preserved — only the seed is re-rendered.",
             )
         ]
 
