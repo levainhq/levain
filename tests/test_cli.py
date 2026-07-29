@@ -210,3 +210,43 @@ def test_cli_daemon_defaults_match_the_daemon_module():
     with mock.patch("levain.cli._cmd_daemon_install", side_effect=capture):
         main(["daemon", "install"])
     assert seen["label"] == daemon.DEFAULT_LABEL
+
+
+def test_run_refuses_unattended_without_task(tmp_path, capsys: pytest.CaptureFixture[str]):
+    """`--unattended` is a security-relevant DECLARATION (no human in the loop → the standard cred
+    stores join the floor). A REPL is definitionally attended, so honouring it there is impossible
+    — and dropping it silently would leave the operator believing a posture they did not get."""
+    rc = main(["run", str(tmp_path), "--unattended"])
+    assert rc == 2
+    assert "--unattended requires --task" in capsys.readouterr().err
+
+
+def test_install_seat_reports_the_RESOLVED_cred_floor(tmp_path, capsys):
+    """The banner used to carry one RESOLVED line (the gate) directly above one STATIC line (the
+    floor), answering the same operator question — and that asymmetry was the bug that let a
+    ratified cred decision be true in the plan and absent from the run."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider") as sel, \
+         mock.patch("levain.firing.confinement.load_confinement_config") as cfg:
+        sel.return_value.install.return_value = "installed"
+        cfg.return_value = mock.Mock(efferent_gate="auto", deny_standard_creds=None)
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "cred floor" in out and "DENIED" in out
+    assert "the default for an unattended seat" in out
+
+
+def test_install_seat_warns_LOUDLY_when_creds_are_opted_back_in(tmp_path, capsys):
+    """An explicit false is legal and must keep working — but a seat that can read the operator's
+    gh/aws credentials unattended is exactly what the default exists to prevent, so the override
+    has to be VISIBLE at install rather than discoverable only by reading confinement.json."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider") as sel, \
+         mock.patch("levain.firing.confinement.load_confinement_config") as cfg:
+        sel.return_value.install.return_value = "installed"
+        cfg.return_value = mock.Mock(efferent_gate="auto", deny_standard_creds=False)
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "READABLE by this" in out and "OVERRIDDEN" in out

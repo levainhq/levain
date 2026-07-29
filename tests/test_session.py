@@ -332,15 +332,36 @@ def _patch_open(monkeypatch, session_or_exc):
 
 
 def test_run_task_declares_no_human_is_driving(tmp_path: Path, monkeypatch, capsys):
-    """The headless driver must open with ``human_present=False`` — that is what makes the
+    """The headless driver must open in a mode with NO human driving — that is what makes the
     default ``efferent_gate: "auto"`` resolve GATED for a scheduler or an unattended seat, which
     is the entire case K3 exists to serve."""
+    from levain.firing.drive import human_present
     from levain.run import run_task
 
     sess = _FakeSession(tmp_path, TurnResult(reply="done", tool_activity=[]))
     _patch_open(monkeypatch, sess)
     run_task(tmp_path, "do it")
-    assert sess.opened_with.get("human_present") is False
+    assert sess.opened_with.get("mode") == "headless"
+    assert human_present(sess.opened_with["mode"]) is False
+
+
+def test_run_task_unattended_is_a_DISTINCT_mode_from_plain_headless(tmp_path: Path, monkeypatch,
+                                                                    capsys):
+    """K4a: `--task` typed by a human and a scheduled seat are NOT the same drive.
+
+    The gate rightly treats them alike (neither has anyone to fan an action in to). The crown-
+    jewels CRED floor must not: a human running `--task "open a PR"` legitimately needs `gh`,
+    while a seat's silent credential read can compound into always-loaded memory with nobody in
+    the loop. Collapsing them is the bug this mode exists to prevent — so pin that they differ,
+    AND that both still deny a human."""
+    from levain.firing.drive import human_present
+    from levain.run import run_task
+
+    sess = _FakeSession(tmp_path, TurnResult(reply="done", tool_activity=[]))
+    _patch_open(monkeypatch, sess)
+    run_task(tmp_path, "do it", unattended=True)
+    assert sess.opened_with.get("mode") == "unattended"
+    assert human_present(sess.opened_with["mode"]) is False
 
 
 def test_run_entity_declares_that_a_human_IS_driving(tmp_path: Path, monkeypatch, capsys):
@@ -352,7 +373,9 @@ def test_run_entity_declares_that_a_human_IS_driving(tmp_path: Path, monkeypatch
     _patch_open(monkeypatch, sess)
     monkeypatch.setattr("levain.run.TurnReader", lambda: _EOFReader())
     run_entity(tmp_path)
-    assert sess.opened_with.get("human_present") is True
+    assert sess.opened_with.get("mode") == "interactive"
+    from levain.firing.drive import human_present
+    assert human_present(sess.opened_with["mode"]) is True
 
 
 class _EOFReader:
@@ -662,3 +685,49 @@ def test_cli_run_help_documents_the_exit_code_contract(capsys):
         assert token in run_help, f"exit-code contract missing from --help: {token!r}"
     assert "never what the agent claimed" in run_help
     assert "verify that against the world" in run_help
+
+
+# --- the drive policy step (extracted from EntitySession.open so it is TESTABLE) ---------------
+#
+# NOTE worth keeping: no test in this suite runs the real `EntitySession.open` — it is stubbed
+# everywhere — so its body had NO unit coverage, and two mutations against the cred-floor wiring
+# survived a full mutation pass because of it. The policy decision is extracted precisely so the
+# security-relevant half can be pinned without a live session.
+
+class _Cfg:
+    def __init__(self, deny):
+        self.deny_standard_creds = deny
+
+
+def test_apply_drive_policy_binds_the_fork_safe_channel(monkeypatch):
+    """Bind WITHOUT resolve and bash gets the wrong floor; resolve WITHOUT bind and the FILE
+    EDITOR does — and the file editor is the `view` path. Pin that the bind actually happens."""
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV, current_drive_mode
+    from levain.session import _apply_drive_policy
+
+    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
+    _apply_drive_policy(_Cfg(None), "interactive")
+    assert current_drive_mode() == "interactive"
+    _apply_drive_policy(_Cfg(None), "unattended")
+    assert current_drive_mode() == "unattended"
+
+
+def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(monkeypatch):
+    """`deny_standard_creds` is a TRI-STATE whose None means "derive". Reading it raw treats an
+    undeclared entity as opted-OUT — the exact hole this closes."""
+    from levain.session import _apply_drive_policy
+
+    assert _apply_drive_policy(_Cfg(None), "unattended") is True     # absent + seat → DENY
+    assert _apply_drive_policy(_Cfg(None), "headless") is False      # absent + human → allow
+    assert _apply_drive_policy(_Cfg(False), "unattended") is False   # explicit opt-IN survives
+    assert _apply_drive_policy(_Cfg(True), "interactive") is True    # explicit pin survives
+
+
+def test_apply_drive_policy_handles_a_toolless_session(monkeypatch):
+    """`cfg` is None when the session runs with --no-tools. It must still bind the mode (nothing
+    else will) and must not crash resolving a floor for hands that do not exist."""
+    from levain.firing.drive import current_drive_mode
+    from levain.session import _apply_drive_policy
+
+    assert _apply_drive_policy(None, "unattended") is True
+    assert current_drive_mode() == "unattended"

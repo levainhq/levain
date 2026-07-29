@@ -262,7 +262,12 @@ def build_seat_spec(
     """
     entity_path = entity_path.expanduser().resolve()
     invocation = _levain_invocation()
-    argv = [*invocation, "run", str(entity_path), "--task", task]
+    # `--unattended` is EMITTED, not inferred, so the seat's governance posture is auditable in
+    # the unit file itself: anyone reading the plist sees that this drive declares no human in the
+    # loop, and therefore that the standard credential stores are denied by default. Inferring it
+    # from "is there a StartInterval" would put the security-relevant fact somewhere an auditor of
+    # the argv cannot see.
+    argv = [*invocation, "run", str(entity_path), "--task", task, "--unattended"]
     if model:
         argv += ["--model", model]
     if max_iterations is not None:

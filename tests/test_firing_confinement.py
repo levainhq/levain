@@ -865,7 +865,10 @@ def test_load_confinement_config_parses_and_expands(tmp_path: Path, monkeypatch)
     assert cfg.deny_files == (tmp_path / "x.env",)
     assert cfg.deny_subtrees == (tmp_path / "secrets",)
     assert cfg.ssh_mode == "raw"
-    assert cfg.deny_standard_creds is False  # absent → default OFF
+    # ABSENT is now its OWN state (K4a): None means "derive from the drive mode", which is what
+    # lets an unattended seat default to denied while an explicit `false` stays an operator
+    # opt-IN. Collapsing absent into False here is precisely what made that impossible.
+    assert cfg.deny_standard_creds is None  # absent → derive from the drive
 
 
 def test_load_confinement_config_parses_deny_standard_creds(tmp_path: Path) -> None:

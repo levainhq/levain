@@ -88,6 +88,7 @@ from levain.firing.confinement import (
     load_confinement_config,
     select_provider,
 )
+from levain.firing.drive import current_drive_mode, resolve_cred_floor
 from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
 
 if TYPE_CHECKING:
@@ -138,7 +139,15 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         ssh_mode=cfg.ssh_mode,
         deny_files=cfg.deny_files,
         extra_deny_read_write=cfg.deny_subtrees,
-        deny_standard_creds=cfg.deny_standard_creds,
+        # RESOLVED, never the raw config value. `deny_standard_creds` is a TRI-STATE whose
+        # `None` means "derive from the drive mode", and this policy is rebuilt per call outside
+        # the session object — so it reads the mode from the fork-safe channel. Passing the raw
+        # value here would let the FILE EDITOR allow the standard cred stores on an unattended
+        # seat while the bash seatbelt denied them: one policy, two enforcers, disagreeing — and
+        # the file editor is the `view` path the unattended cred floor exists to close.
+        deny_standard_creds=resolve_cred_floor(
+            cfg.deny_standard_creds, mode=current_drive_mode()
+        ),
     )
 
 
