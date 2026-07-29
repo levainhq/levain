@@ -61,6 +61,7 @@ from typing import Literal
 
 __all__ = [
     "DRIVE_MODES",
+    "DriveModeConflict",
     "LEVAIN_DRIVE_MODE_ENV",
     "DriveMode",
     "bind_drive_mode",
@@ -72,10 +73,11 @@ __all__ = [
 LEVAIN_DRIVE_MODE_ENV = "LEVAIN_DRIVE_MODE"
 """The fork-safe channel carrying the drive mode to policy built OUTSIDE the session object.
 
-The crown-jewels floor has **one policy and two enforcers**: bash rides a rendered seatbelt profile
-built at session start, while the file editor's policy is rebuilt PER CALL from
-``$LEVAIN_ENTITY_DIR`` + ``confinement.json`` (deliberately — it has to survive ``fork()``, so it
-cannot close over session state). Without a fork-safe channel for the mode, those two enforcers
+The crown-jewels floor has **one policy and two enforcers**, and each builds its own from
+``$LEVAIN_ENTITY_DIR`` + ``confinement.json`` at TOOL-CREATION time (not per call — the executors
+cache the policy they were constructed with; the earlier "rebuilt per call" wording here was simply
+wrong, codex+glm L3). Neither can close over session state, because ``create()`` is a classmethod
+reached through a process-global tool registry — there is no per-session channel to close over. Without a fork-safe channel for the mode, those two enforcers
 resolve the SAME field differently: bash would deny the standard cred stores on an unattended seat
 while the file editor allowed them — and the file editor is the ``view`` path, i.e. exactly the
 afferent read this floor exists to stop. Same idiom as ``$LEVAIN_ENTITY_DIR``: bound once at session
@@ -125,14 +127,52 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     """
     if setting is not None:
         return setting
-    return mode == "unattended"
+    # An UNRECOGNIZED mode denies, exactly as `current_drive_mode` maps garbage to "unattended".
+    # Both halves of the authority must fail the same way: if only the env reader failed closed,
+    # a direct library caller passing a typo'd mode would get "allowed" from this function and
+    # "denied" from the tool policy — one authority reporting two answers. (codex L3 LOW.)
+    return mode not in ("interactive", "headless")
+
+
+class DriveModeConflict(RuntimeError):
+    """A second session tried to rebind the drive mode in a way that would WIDEN the floor."""
 
 
 def bind_drive_mode(mode: DriveMode) -> None:
-    """Publish ``mode`` on the fork-safe channel for policy built outside the session object.
+    """Publish ``mode`` on the fork-safe channel, **refusing any rebind that would WIDEN the floor**.
 
-    Called once by :meth:`levain.session.EntitySession.open`, beside the ``$LEVAIN_ENTITY_DIR``
-    binding it mirrors."""
+    Called by :meth:`levain.session.EntitySession.open`, beside the ``$LEVAIN_ENTITY_DIR`` binding
+    it mirrors — and it mirrors that binding's REFUSAL too, for the same reason
+    (``bind_entity``: *"a silent rebind would swap the first agent's store on its next turn"*).
+
+    **The race this closes (codex L3 HIGH ×2).** This channel is PROCESS-GLOBAL, and the two floor
+    enforcers read it at DIFFERENT moments: the bash seatbelt and the file editor each call
+    ``policy_for_conv_state`` from their own ``create()``, both AFTER the session resolved its own
+    value. In any multi-session process a second session could flip the env between those points,
+    so an unattended session's tools would be built with an interactive floor — while its banner,
+    resolved earlier, still claimed the credentials were denied. Worse, a second session that
+    later FAILS to start still poisons the env, because the bind happens before those failures.
+
+    Refusing the widening direction makes the race harmless rather than merely unlikely: a rebind
+    may TIGHTEN the floor (nothing is exposed by denying more) and may never LOOSEN it, so whatever
+    interleaving occurs, no session's credentials become readable because of another session's
+    mode. It is expressed as a comparison over the resolved FLOOR rather than over the mode names,
+    because the floor is the thing that must not weaken.
+
+    **This is a guard, not the architecture.** The real fix is codex's own diagnosis — the mode
+    should travel in the CONVERSATION state being resolved, not in mutable ambient process state —
+    and that is a hard prerequisite for K1 part 2, whose server holds many sessions in one process.
+    Until then this refusal converts a silent widening into a loud failure, which is the same trade
+    ``bind_entity`` makes ("one process hosts one entity — start a new process").
+    """
+    current = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
+    if current in DRIVE_MODES and current != mode:
+        if resolve_cred_floor(None, mode=current) and not resolve_cred_floor(None, mode=mode):
+            raise DriveModeConflict(
+                f"this process is already bound to drive mode {current!r}, whose credential floor "
+                f"is STRICTER than {mode!r}; refusing to rebind and widen it. One process hosts "
+                f"one drive mode — start a new process."
+            )
     os.environ[LEVAIN_DRIVE_MODE_ENV] = str(mode)
 
 

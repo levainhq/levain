@@ -439,8 +439,16 @@ def _print_banner(
         else:
             print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED;")
             print("               ssh authorized_keys/config/rc WRITE denied; other writes are NOT)")
+        # Say it in BOTH directions. The line above names "operator creds" (the ones DECLARED in
+        # confinement.json), which an operator can read as covering the standard stores too — so
+        # when those are READABLE the banner has to say so out loud, or it claims a floor it does
+        # not enforce. install-seat already warns on this; the run banner must not be quieter than
+        # the installer about the same fact (codex L3 MEDIUM).
         if deny_standard_creds:
             print("             standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
+        else:
+            print("             ⚠ standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
+            print("               are READABLE by this entity (deny_standard_creds is off)")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —

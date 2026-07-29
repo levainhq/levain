@@ -989,6 +989,17 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # unattended drive, so the output below states what will actually happen (see the print block).
     # Fail-safe: an unreadable/…invalid config must not silently produce a "governed" claim.
     try:
+        spec = daemon.build_seat_spec(
+            entity_path=entity, task=args.task, interval=args.interval,
+            label=args.label, model=args.model, max_iterations=max_iters,
+        )
+    except ValueError as exc:      # an incoherent schedule (e.g. --interval 0)
+        print(f"levain daemon install-seat: {exc}", file=sys.stderr)
+        return 2
+
+    # Resolve the seat's GOVERNANCE POSTURE — after the spec, because the drive mode is read off
+    # the spec's own argv rather than assumed.
+    try:
         from levain.firing.confinement import load_confinement_config
         from levain.firing.drive import resolve_cred_floor
         from levain.firing.gate import resolve_gate_mode
@@ -1001,21 +1012,38 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         gate_mode: str = resolve_gate_mode(declared_gate, human_present=False)
         # The FLOOR posture, resolved the same way and for the same reason. Until K4a the banner
         # carried one RESOLVED line (the gate) directly above one STATIC line (the floor),
-        # answering the same operator question — what may this entity do to the world — and THAT
-        # ASYMMETRY WAS THE BUG: a decision to deny creds unattended could be true in the plan and
-        # absent from the run with nothing saying so.
-        cred_floor: bool | None = resolve_cred_floor(_cfg.deny_standard_creds, mode="unattended")
+        # answering the same operator question — and THAT ASYMMETRY WAS THE BUG.
+        # DERIVED from the spec, never hardcoded: build_seat_spec emits --unattended today, but a
+        # hardcoded "unattended" would keep claiming the strict floor for any future seat shape
+        # that does not (glm L3 LOW) — a claim outliving its enforcement.
+        # ⚠ NOT COVERED BY A TEST, deliberately: `build_seat_spec` always emits `--unattended`, so
+        # hardcoding it here is presently INDISTINGUISHABLE from deriving it, and a mutation of
+        # this line survives the suite. Recorded rather than papered over with a test that fakes a
+        # second seat shape — the day one exists, that test becomes real.
+        _seat_mode = "unattended" if "--unattended" in spec.argv else "headless"
+        cred_floor: bool | None = resolve_cred_floor(_cfg.deny_standard_creds, mode=_seat_mode)
         cred_declared: bool | None = _cfg.deny_standard_creds
-    except Exception as exc:  # noqa: BLE001 — never let a config read failure fake a green claim
+    except (OSError, ValueError, RuntimeError) as exc:
+        # NARROW on purpose. A bare `except Exception` here caught a NameError from a mis-ordered
+        # reference in this very function and reported it as "governance posture unknown" — a
+        # coding error wearing a config error's clothes, which would have made the next typo
+        # silently permanent. Config-read failures are OSError/ValueError (the loader raises
+        # ConfinementError, a RuntimeError); a programming error must crash loudly instead.
         declared_gate, gate_mode = f"unreadable ({type(exc).__name__})", "unknown"
         cred_floor, cred_declared = None, None
-    try:
-        spec = daemon.build_seat_spec(
-            entity_path=entity, task=args.task, interval=args.interval,
-            label=args.label, model=args.model, max_iterations=max_iters,
+
+    if gate_mode == "unknown":
+        # The runtime loads this same config fail-closed, so a seat installed now would REFUSE to
+        # start on every single interval — turning one config typo into recurring scheduled noise
+        # in a log nobody is watching. Refuse at install, where a human is present to read it
+        # (codex L3 LOW).
+        print(
+            f"levain daemon install-seat: cannot read this entity's confinement config "
+            f"({declared_gate}). The runtime loads it fail-closed, so a seat installed now would "
+            f"fail every {args.interval}s forever. Fix .levain/confinement.json (check it with "
+            f"`levain doctor --path {entity}`) and re-run.",
+            file=sys.stderr,
         )
-    except ValueError as exc:      # an incoherent schedule (e.g. --interval 0)
-        print(f"levain daemon install-seat: {exc}", file=sys.stderr)
         return 2
 
     if args.dry_run:

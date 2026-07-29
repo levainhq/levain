@@ -378,6 +378,15 @@ def build_policy(
     ssh_mode: SshMode = "agent",
     deny_files: tuple[Path | str, ...] = (),
     extra_deny_read_write: tuple[Path | str, ...] = (),
+    # The DEFAULT stays permissive on purpose, and it is NOT the security decision (glm L3
+    # raised it as fail-open). This function is the MECHANISM — build a floor from explicit
+    # inputs. The POLICY (what an undeclared entity should get) lives one layer up in
+    # `levain.firing.drive.resolve_cred_floor`, which is drive-aware; teaching this default
+    # to be opinionated would put the same policy in two places that can disagree, and it
+    # would reverse a deliberate operational-fit decision (denying these reads breaks the
+    # entity's own gh/aws/curl use) at the wrong altitude. The real risk glm named — a FUTURE
+    # PRODUCTION caller that forgets — is guarded structurally instead, by a source-level
+    # test asserting every production call site passes this explicitly.
     deny_standard_creds: bool = False,
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.

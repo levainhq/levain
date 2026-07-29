@@ -140,8 +140,9 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         deny_files=cfg.deny_files,
         extra_deny_read_write=cfg.deny_subtrees,
         # RESOLVED, never the raw config value. `deny_standard_creds` is a TRI-STATE whose
-        # `None` means "derive from the drive mode", and this policy is rebuilt per call outside
-        # the session object — so it reads the mode from the fork-safe channel. Passing the raw
+        # `None` means "derive from the drive mode", and this policy is built OUTSIDE the session
+        # object (at tool-creation time, then cached on the executor) — so it reads the mode from
+        # the process channel rather than closing over session state. Passing the raw
         # value here would let the FILE EDITOR allow the standard cred stores on an unattended
         # seat while the bash seatbelt denied them: one policy, two enforcers, disagreeing — and
         # the file editor is the `view` path the unattended cred floor exists to close.

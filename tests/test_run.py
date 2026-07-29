@@ -836,3 +836,29 @@ def test_repl_still_sends_typed_lines_as_separate_turns(
     assert rc == 0
     assert _ReplConversation.sent == ["first question", "second question"]
     assert binding.captures == 2
+
+
+def test_banner_names_readable_standard_creds(capsys) -> None:
+    """The floor line names "operator creds", which an operator can read as covering the standard
+    stores too — so when those are READABLE the banner must say so out loud, or it claims a floor
+    it does not enforce. install-seat warns on this; the run banner must not be quieter about the
+    same fact (codex L3 MEDIUM)."""
+    from levain.run import _print_banner
+
+    class _B:
+        crystal_path = Path("/tmp/c")
+        episodic_path = Path("/tmp/d")
+
+    _print_banner(
+        Path("/tmp/e"), _B(), model="m", with_tools=True, bash_ok=True,
+        gate_mode="gated", ssh_mode="agent", deny_standard_creds=False, task="t",
+    )
+    out = capsys.readouterr().out
+    assert "READABLE by this entity" in out
+
+    _print_banner(
+        Path("/tmp/e"), _B(), model="m", with_tools=True, bash_ok=True,
+        gate_mode="gated", ssh_mode="agent", deny_standard_creds=True, task="t",
+    )
+    out2 = capsys.readouterr().out
+    assert "READABLE by this entity" not in out2   # and honest in the other direction
