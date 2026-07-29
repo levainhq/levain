@@ -38,6 +38,22 @@ from pathlib import Path
 DEFAULT_LABEL = "com.levainhq.levain"
 DEFAULT_PORT = 7420
 
+# --- scheduled governed seat (K4a) ---
+# A distinct label PREFIX from the cockpit's: a seat and the cockpit are different units with
+# different lifecycles, and colliding on one label would have `daemon install` silently replace
+# one with the other.
+DEFAULT_SEAT_LABEL = "com.levainhq.levain.seat"
+# Hourly. A cadence, not a claim about the right cadence — the useful interval is a property of
+# the seat's job, and the first real seat is what teaches it.
+DEFAULT_SEAT_INTERVAL = 3600
+# A STARTING step bound for an unattended turn (see build_seat_spec). Deliberately finite: the
+# alternative is the SDK's own limit, which nobody chose for this purpose. Calibrate against a
+# seat that has actually run rather than reasoning about it (`derive_dont_invent`).
+DEFAULT_SEAT_MAX_ITERATIONS = 40
+# launchd's default minimum respawn spacing (`man launchd.plist` → ThrottleInterval). A
+# StartInterval below this is silently throttled up to it unless ThrottleInterval is lowered too.
+_LAUNCHD_DEFAULT_THROTTLE = 10
+
 # The base PATH the daemon needs: a login-launched supervisor (launchd/systemd) hands the
 # process a MINIMAL PATH, so a thin process dies silently when it shells out (the flowbridge
 # launchd lesson). We prepend the dir holding the resolved levain/python bin + the user-local
@@ -52,9 +68,19 @@ class DaemonError(RuntimeError):
 
 @dataclass(frozen=True)
 class DaemonSpec:
-    """OS-agnostic description of the always-on serve. A :class:`DaemonProvider` renders this
-    into the platform's native unit (plist / systemd unit / scheduled task). Construct it with
-    :func:`build_spec`, never by hand — the path/bin/env resolution is shared across OSes."""
+    """OS-agnostic description of a supervised Levain process. A :class:`DaemonProvider` renders
+    this into the platform's native unit (plist / systemd unit / scheduled task). Construct it with
+    :func:`build_spec` (the always-on cockpit) or :func:`build_seat_spec` (a scheduled governed
+    seat), never by hand — the path/bin/env resolution is shared across OSes.
+
+    **TWO SHAPES, and they are not interchangeable (K4a).** A *resident* service (the cockpit)
+    runs forever and must be relaunched when it dies — ``keep_alive=True``, no interval. A
+    *periodic* seat runs ONE bounded turn and EXITS — ``start_interval=<seconds>``, and it must
+    NOT keep-alive. That exclusion is enforced in :meth:`__post_init__` rather than documented,
+    because the failure is silent and severe: launchd relaunches a ``KeepAlive`` job immediately
+    on exit, so a periodic job that also keeps alive runs CONTINUOUSLY — the unit would render
+    cleanly, install cleanly, and lie about its own cadence, burning tokens on a hot loop with
+    nothing in the output saying so (``absence_of_signal_rendered_as_health``)."""
 
     label: str
     argv: list[str]            # full exec: [levain_bin, "serve", "--write", "--no-open", ...]
@@ -64,6 +90,23 @@ class DaemonSpec:
     stderr_log: Path
     run_at_login: bool = True
     keep_alive: bool = True
+    # Periodic cadence in SECONDS for a scheduled seat; None = a resident service. Mutually
+    # exclusive with keep_alive (see the class docstring).
+    start_interval: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.start_interval is None:
+            return
+        if self.start_interval <= 0:
+            raise ValueError(
+                f"start_interval must be a positive number of seconds, got {self.start_interval!r}"
+            )
+        if self.keep_alive:
+            raise ValueError(
+                "a periodic spec (start_interval set) must have keep_alive=False — a KeepAlive job "
+                "is relaunched the instant it exits, so the interval would be ignored and the seat "
+                "would run continuously instead of on its schedule. Use build_seat_spec()."
+            )
 
 
 @dataclass(frozen=True)
@@ -180,6 +223,64 @@ def build_spec(
     )
 
 
+def build_seat_spec(
+    *,
+    entity_path: Path,
+    task: str,
+    interval: int = DEFAULT_SEAT_INTERVAL,
+    label: str = DEFAULT_SEAT_LABEL,
+    model: str | None = None,
+    max_iterations: int | None = DEFAULT_SEAT_MAX_ITERATIONS,
+    log_dir: Path | None = None,
+) -> DaemonSpec:
+    """Build the OS-agnostic spec for a **scheduled governed seat** (K4a) — ONE sovereign entity
+    that runs a bounded task unattended, on a cadence, and exits.
+
+    This is the PERIODIC sibling of :func:`build_spec`: ``start_interval`` set, ``keep_alive``
+    off, and ``run_at_login`` off (installing a *schedule* is not a request to spend a real model
+    turn the instant you install it — the first run happens on the cadence, or on demand via
+    ``levain daemon restart``).
+
+    Three argv choices that are deliberate, because each looks like an obvious flag to flip:
+
+    - **NO ``--quiet``.** It prints only the final reply and suppresses the tool-activity stream —
+      but for an *unattended* seat that stream IS the operator's fan-in surface: the record of what
+      the entity actually did, including a K3 gated halt. Quieting it would throw away exactly the
+      evidence the human is supposed to review, and leave a log that cannot distinguish "did
+      nothing" from "was stopped" (``absence_of_signal_rendered_as_health``).
+    - **``--max-iterations`` defaults ON.** "Time-bounded" is part of K4a's definition, and an
+      unattended turn with no step bound can spend indefinitely with nobody watching. The default
+      is a STARTING bound to be calibrated against a seat that has actually run — not a derived
+      number (``derive_dont_invent``). Pass ``None`` to fall back to the SDK's own limit.
+    - **The entity path is POSITIONAL** (``levain run <path>``), not ``--path``. Resolved absolute,
+      because a login-launched unit has no stable cwd.
+
+    NOTE: this does not validate that ``entity_path`` is a real OpenHands entity — ``daemon.py`` is
+    a stdlib-only leaf and must not import the run/confinement layer. The CLI validates before
+    installing; an unvalidated seat would otherwise fail identically every interval, forever, into
+    a log nobody is watching.
+    """
+    entity_path = entity_path.expanduser().resolve()
+    invocation = _levain_invocation()
+    argv = [*invocation, "run", str(entity_path), "--task", task]
+    if model:
+        argv += ["--model", model]
+    if max_iterations is not None:
+        argv += ["--max-iterations", str(max_iterations)]
+    logs = (log_dir or _default_log_dir()).expanduser().resolve()
+    return DaemonSpec(
+        label=label,
+        argv=argv,
+        working_dir=entity_path,
+        env=_daemon_env(invocation),
+        stdout_log=logs / f"{label}.log",
+        stderr_log=logs / f"{label}.err",
+        run_at_login=False,
+        keep_alive=False,
+        start_interval=interval,
+    )
+
+
 # --- the provider interface ------------------------------------------------------------------
 
 class DaemonProvider(ABC):
@@ -263,6 +364,19 @@ class LaunchdProvider(DaemonProvider):
             "StandardOutPath": str(spec.stdout_log),
             "StandardErrorPath": str(spec.stderr_log),
         }
+        if spec.start_interval is not None:
+            # A PERIODIC seat (K4a): launchd re-runs the job every N seconds and the process is
+            # expected to EXIT each time. `KeepAlive` is already False here — DaemonSpec refuses to
+            # construct a periodic spec that keeps alive, because the two together silently collapse
+            # the interval into a hot loop.
+            doc["StartInterval"] = spec.start_interval
+            if spec.start_interval < _LAUNCHD_DEFAULT_THROTTLE:
+                # launchd will not spawn a job more than once every 10s by DEFAULT
+                # (`man launchd.plist`, ThrottleInterval). Without this, a sub-10s interval
+                # installs happily and REPORTS its requested cadence while launchd silently
+                # enforces ~10s — the unit lying about itself again, one level down. Lower the
+                # throttle to match so the reported cadence is TRUE. (codex L3 MEDIUM.)
+                doc["ThrottleInterval"] = spec.start_interval
         return plistlib.dumps(doc).decode("utf-8")
 
     @staticmethod
@@ -322,17 +436,41 @@ class LaunchdProvider(DaemonProvider):
                 raise DaemonError(
                     f"bootstrap of the new unit failed: {failure} — rolled back to the prior installed "
                     f"unit at {plist_path}")
+            # The self-heal story DIFFERS by shape, and stating the wrong one sends the operator
+            # to wait for a run that will never happen. A resident unit has RunAtLoad=True and
+            # genuinely retries at next login; a SEAT has RunAtLoad=False (installing a schedule
+            # is not a request to run now), so login does nothing for it — it needs the unit
+            # loaded, after which the timer fires. (glm L3 MEDIUM.)
+            heal = ("macOS RunAtLoad will retry it at next login" if spec.run_at_login else
+                    f"NOTE: this seat has RunAtLoad=False, so logging in will NOT start it — "
+                    f"re-run the install (or `launchctl bootstrap`) to load it, after which the "
+                    f"{spec.start_interval}s timer fires")
             raise DaemonError(
-                f"bootstrap failed: {failure} — the unit is KEPT at {plist_path} (it is valid; macOS "
-                f"RunAtLoad will retry it at next login). A valid unit is not deleted on a transient/"
-                f"no-domain failure.")
-        # kickstart so it's running NOW (bootstrap + RunAtLoad starts it at next login otherwise).
-        _run(["launchctl", "kickstart", "-k", f"{domain}/{spec.label}"], check=False)
+                f"bootstrap failed: {failure} — the unit is KEPT at {plist_path} (it is valid; "
+                f"{heal}). A valid unit is not deleted on a transient/no-domain failure.")
+        if spec.start_interval is None:
+            # RESIDENT service: kickstart so it's running NOW (bootstrap + RunAtLoad would
+            # otherwise start it only at next login).
+            _run(["launchctl", "kickstart", "-k", f"{domain}/{spec.label}"], check=False)
         # VERIFY-don't-assume: report the ACTUAL run state. A kickstart that silently failed, or a
         # serve that crashed on a bad install dir, must NOT read as a false green (codex L3 MED).
         st = self.status(spec.label)
-        run_line = (f"running ({st.detail})" if st.running
-                    else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")
+        if spec.start_interval is not None:
+            # A PERIODIC seat is EXPECTED to be not-running between its turns, so the resident
+            # service's "NOT yet running → go check the log" line is a FALSE ALARM here — the
+            # mirror-image of a false green, and just as much a lying instrument. Report the
+            # CADENCE instead, and say plainly that idle is the healthy state. We also do NOT
+            # kickstart a seat: installing a schedule is not a request to run a real model turn
+            # right now (it would spend tokens, and could halt gated, at install time).
+            run_line = (
+                f"scheduled every {spec.start_interval}s — idle between turns is NORMAL "
+                f"(now: {st.detail}). Force a turn with `levain daemon restart`; "
+                f"activity lands in {spec.stdout_log} and DECISIONS (gated halts) in "
+                f"{spec.stderr_log}"
+            )
+        else:
+            run_line = (f"running ({st.detail})" if st.running
+                        else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")
         return (f"installed {spec.label}\n  unit:   {plist_path}\n"
                 f"  domain: {domain} (per-user, no sudo)\n  status: {run_line}")
 
@@ -406,7 +544,15 @@ class LaunchdProvider(DaemonProvider):
         elif current.load_state == "running":
             action = "no-op — unit unchanged and the service is running"
         elif current.load_state == "loaded":
-            action = "no-op — unit unchanged and loaded (idle)"
+            # "idle" is the healthy state for a periodic seat BETWEEN turns — and it is also what
+            # a seat that has failed every interval for three days looks like. Reporting a bare
+            # "idle" as the one-line verdict turns a chronic failure into a clean bill of health
+            # in the exact command an operator uses as a pre-flight check. The last exit code is
+            # already in `detail`; surface it in the ACTION too. (glm L3 LOW.)
+            failing = ("last exit = " in current.detail)
+            action = ("no-op — unit unchanged and loaded, but ⚠ its LAST RUN FAILED "
+                      f"({current.detail}) — check the seat's logs"
+                      if failing else "no-op — unit unchanged and loaded (idle)")
         elif current.load_state == "unknown":
             # can't read the service-manager domain (ssh / no Aqua) — don't claim a load state we
             # can't see (the honesty floor: no-data ≠ not-loaded).
