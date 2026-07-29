@@ -205,6 +205,66 @@ def test_install_seat_rejects_a_negative_iteration_bound(tmp_path, capsys, bad: 
     assert "must be >= 0" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("bad", ["-1", "-0.5"])
+def test_install_seat_rejects_a_negative_wall_clock_bound(tmp_path, capsys, bad: str):
+    """SAME GUARD, THE OTHER UNIT — `guard_scoped_by_symptom_misses_the_class`.
+
+    The negative-bound hole was found on `--max-iterations`; the CLASS is "any numeric bound flag
+    accepts nonsense and the nonsense becomes policy". Here it is worse than a bad step count:
+    `TurnDeadline` treats a non-positive value as DISARMED, so `--max-seconds -1` would read to the
+    operator as "bound it very tightly" and deliver "not bounded at all" — an unbounded seat wearing
+    a bounded seat's command line."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider"):
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t",
+                   "--max-seconds", bad])
+    assert rc == 2
+    assert "must be >= 0" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["-1", "-0.5"])
+def test_run_task_rejects_a_negative_wall_clock_bound(tmp_path, capsys, bad: str):
+    """The same flag on the OTHER command. `levain run --task` is where a hand-driven operator meets
+    it, and the seat is only one caller — validating at one door and not the other is the exact
+    shape of the K2 defect where `init_server.py` never called the new validation."""
+    rc = main(["run", str(tmp_path), "--task", "t", "--max-seconds", bad])
+    assert rc == 2
+    assert "must be >= 0" in capsys.readouterr().err
+
+
+def test_run_task_normalizes_an_explicit_zero_bound_to_unbounded(tmp_path):
+    """`0` is the operator's explicit "no wall-clock bound", and it must reach `run_task` as `None`.
+
+    One representation of "no bound" past the boundary, because `TurnDeadline` already treats both as
+    disarmed — and two spellings of one state is how a later `if max_seconds:` check starts
+    disagreeing with an `if max_seconds is not None:` check."""
+    seen: dict[str, object] = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return 0
+
+    with mock.patch("levain.run.run_task", side_effect=capture):
+        rc = main(["run", str(tmp_path), "--task", "t", "--max-seconds", "0"])
+    assert rc == 0
+    assert seen["max_seconds"] is None
+
+
+def test_run_task_passes_the_wall_clock_bound_through(tmp_path):
+    """The CONTROL for the test above: a real bound must arrive intact, or normalizing zero would be
+    indistinguishable from dropping the flag entirely."""
+    seen: dict[str, object] = {}
+
+    def capture(**kwargs):
+        seen.update(kwargs)
+        return 0
+
+    with mock.patch("levain.run.run_task", side_effect=capture):
+        rc = main(["run", str(tmp_path), "--task", "t", "--max-seconds", "42.5"])
+    assert rc == 0
+    assert seen["max_seconds"] == 42.5
+
+
 # --- drift-lock: CLI defaults must equal the daemon module's constants ------------------------
 
 def test_cli_daemon_defaults_match_the_daemon_module():
@@ -224,6 +284,11 @@ def test_cli_daemon_defaults_match_the_daemon_module():
         main(["daemon", "install-seat", "--task", "t"])
     assert seen["label"] == daemon.DEFAULT_SEAT_LABEL
     assert seen["interval"] == daemon.DEFAULT_SEAT_INTERVAL
+    # `--max-seconds` / `--max-iterations` default to None AT THE PARSER and resolve to the module
+    # constants inside the command, so what is drift-locked here is the sentinel, not the value —
+    # a literal default would be a second copy of the number.
+    assert seen["max_seconds"] is None
+    assert seen["max_iterations"] is None
 
     seen.clear()
     with mock.patch("levain.cli._cmd_daemon_install", side_effect=capture):

@@ -447,6 +447,50 @@ def test_seat_spec_iteration_bound_is_opt_outable(tmp_path) -> None:
     assert "--max-iterations" not in spec.argv
 
 
+def test_seat_spec_bounds_WALL_CLOCK_by_default(tmp_path) -> None:
+    """K4a ⑥, `spore-434`. The step bound above cannot bound a turn hung inside ONE step, and
+    because launchd COALESCES per label the seat then never runs again — behind a unit still
+    reporting installed + loaded. So this bound is not redundant with the step bound; it is the only
+    one of the two that makes K4a's "restartable" true.
+
+    EMITTED into the argv rather than left to a default inside the binary, so "is this seat
+    restartable" is answerable by reading the plist — which is where an auditor looks."""
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", log_dir=tmp_path / "l")
+    i = spec.argv.index("--max-seconds")
+    assert spec.argv[i + 1] == f"{daemon.DEFAULT_SEAT_MAX_SECONDS:g}"
+
+
+def test_seat_spec_wall_clock_bound_renders_without_a_float_tail(tmp_path) -> None:
+    """`str(1800.0)` is `"1800.0"`, and this value goes into a UNIT FILE a human reads. Cosmetic on
+    its own, but the plist is the audit surface, so noise in it costs real legibility."""
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", log_dir=tmp_path / "l")
+    i = spec.argv.index("--max-seconds")
+    assert spec.argv[i + 1] == "1800"
+    assert "." not in spec.argv[i + 1]
+
+
+def test_seat_spec_wall_clock_bound_is_opt_outable(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", max_seconds=None,
+                           log_dir=tmp_path / "l")
+    assert "--max-seconds" not in spec.argv
+
+
+def test_the_default_wall_clock_bound_fits_INSIDE_the_default_cadence() -> None:
+    """THE RELATIONSHIP BETWEEN THE TWO DEFAULTS IS ITSELF LOAD-BEARING, so it is pinned.
+
+    launchd coalesces per label, so a turn allowed to outlive its own interval necessarily SKIPS
+    intervals — the cadence silently becomes the turn's duration. That is legitimate when an operator
+    chooses it (the install banner says so), but it must never be what the DEFAULTS do: a seat that
+    quietly runs at half its stated cadence out of the box is the same class of lie as a unit that
+    reports itself loaded while dead.
+
+    Pinned in the other direction too — a bound must leave room for a real turn. 40 agent steps on a
+    cloud open model runs to minutes, so a bound of, say, 30s would terminate healthy work every
+    interval and present exactly as a broken seat."""
+    assert daemon.DEFAULT_SEAT_MAX_SECONDS < daemon.DEFAULT_SEAT_INTERVAL
+    assert daemon.DEFAULT_SEAT_MAX_SECONDS >= 300
+
+
 def test_seat_and_cockpit_do_not_share_a_label() -> None:
     # colliding labels would make `daemon install` silently REPLACE one unit with the other.
     assert daemon.DEFAULT_SEAT_LABEL != daemon.DEFAULT_LABEL

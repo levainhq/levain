@@ -862,3 +862,55 @@ def test_banner_names_readable_standard_creds(capsys) -> None:
     )
     out2 = capsys.readouterr().out
     assert "READABLE by this entity" not in out2   # and honest in the other direction
+
+
+# ---------- the banner states the TIME BOUND, and its absence (K4a ⑥, `spore-434`) ----------
+
+def test_banner_names_the_wall_clock_bound_and_the_new_exit_code(tmp_path: Path, capsys):
+    """The banner ENUMERATES the exit codes, so a new code that is not listed leaves it advertising
+    a contract the binary no longer honours.
+
+    That is not a cosmetic gap — it is the same claim-versus-behaviour asymmetry that WAS the bug in
+    the K4a cred-floor banner (one RESOLVED line sitting above one STATIC line, both answering the
+    operator's same question). Caught here by reading the real banner during the L4-live run."""
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/glm-5.2:cloud",
+        with_tools=True, bash_ok=True, ssh_mode="agent", task="do the thing",
+        max_seconds=1800.0,
+    )
+    out = capsys.readouterr().out
+    assert "1800s wall-clock" in out
+    assert "5 the wall-clock bound was exceeded" in out
+
+
+def test_banner_says_PLAINLY_when_there_is_no_wall_clock_bound(tmp_path: Path, capsys):
+    """THE CONTROL, and the more important half. An unbounded run must not look like a bounded one —
+    silence would read as a default, and "a hung model call will not be interrupted" is exactly the
+    fact an operator needs before they walk away from it."""
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/glm-5.2:cloud",
+        with_tools=True, bash_ok=True, ssh_mode="agent", task="do the thing",
+        max_seconds=None,
+    )
+    out = capsys.readouterr().out
+    assert "time bound: NONE" in out
+    assert "will not be interrupted" in out
+    assert "wall-clock" in out  # the exit-code ladder still lists 5 — the code exists either way
+
+
+def test_banner_omits_the_exit_ladder_entirely_for_the_REPL(tmp_path: Path, capsys):
+    """The bound is a `--task` concept; the REPL has a human who can press Ctrl-C. Printing a time
+    bound there would advertise a mechanism that is not armed."""
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/glm-5.2:cloud",
+        with_tools=True, bash_ok=True, ssh_mode="agent", task=None, max_seconds=None,
+    )
+    out = capsys.readouterr().out
+    assert "time bound" not in out
+    assert "wall-clock bound was exceeded" not in out
