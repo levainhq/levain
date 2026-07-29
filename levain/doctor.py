@@ -291,7 +291,13 @@ def _check_recorded_answers(install: Path) -> list[CheckResult]:
                 for name in _RENDER_TARGET_SEEDS
                 if (troot / "seed" / name).is_file()
             ]
-            fields = [f for f in build_field_plan(specs) if f.slot in answers]
+            # TWO lists, and keeping them apart IS the fix. `plan` is what this install's
+            # interview would ASK; `fields` is what the record actually HOLDS. Narrowing to
+            # `fields` before looking is what made a MISSING slot invisible — filtering by
+            # `f.slot in answers` deletes the absent slot from the evidence, and the check
+            # then asks whether any absent slot is blank. Nothing absent is ever blank.
+            plan = build_field_plan(specs)
+            fields = [f for f in plan if f.slot in answers]
     except Exception as e:  # noqa: BLE001 — an unreadable template must not crash doctor
         return [
             CheckResult(
@@ -344,21 +350,46 @@ def _check_recorded_answers(install: Path) -> list[CheckResult]:
     empty_identity = sorted(
         f.slot for f in fields if f.slot in IDENTITY_SLOTS and not answers[f.slot].strip()
     )
+    # ABSENT is a DISTINCT failure from BLANK, and collapsing the two was the hole: a
+    # record is scanned for identity slots that are EMPTY, so an identity slot that was
+    # never written at all — one typo'd key among otherwise-correct ones — was filtered
+    # out of the evidence before the scan and printed GREEN over a seed with no operator.
+    # The PARTIAL case of the same hole codex closed at L3 for the TOTAL case (the
+    # `fields`-empty branch that returned a cheerful "pack-layered" OK), and the likelier
+    # one by far: one mistyped key beats every key being wrong. Second
+    # `absence_of_signal_rendered_as_health` in this one function, which is the argument
+    # for reading the WHOLE function whenever one branch of it turns out to lie.
+    missing_identity = sorted(
+        f.slot for f in plan if f.slot in IDENTITY_SLOTS and f.slot not in answers
+    )
     empty_other = sorted(
         f.slot
         for f in fields
         if f.slot not in IDENTITY_SLOTS and is_required(f) and not answers[f.slot].strip()
     )
-    if empty_identity:
+    if missing_identity or empty_identity:
+        # Name WHICH failure it is. "never recorded" and "recorded blank" send the
+        # operator to different places — the first says the answer file is wrong (a
+        # typo'd or dropped key), the second says the interview was skipped.
+        parts = []
+        if missing_identity:
+            parts.append(f"NEVER RECORDED: {', '.join(missing_identity)}")
+        if empty_identity:
+            parts.append(f"recorded EMPTY: {', '.join(empty_identity)}")
         results.append(
             CheckResult(
                 "seed content (answers present)",
                 False,
-                f"identity field(s) recorded EMPTY: {', '.join(empty_identity)}",
+                f"identity field(s) {' · '.join(parts)}",
                 "The seed renders with nothing here and leaves no placeholder "
                 "behind, so the entity does not know who it is partnering with "
-                "while every other check passes. Re-run `levain init --force` and "
-                "answer them, or supply them via --answers.",
+                "while every other check passes. A slot that is missing entirely is "
+                "usually a mistyped key in .levain/answers.json — compare it against "
+                "`levain init --answers-template`. (If a pack replaced the base "
+                "origin seed, these slots may not apply to this install; doctor "
+                "records no roster and cannot tell, so it reports rather than "
+                "assumes.) Otherwise re-run `levain init --force`, or supply them "
+                "via --answers.",
             )
         )
     elif empty_other:
