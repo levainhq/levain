@@ -834,10 +834,14 @@ class EntitySession:
             # memory recording a fiction.
             self.binding.capture_turn(self.conversation)
         except TurnTimeout as exc:
-            # BEFORE the generic handler, because `TurnTimeout` IS an `Exception` and the broad
-            # clause below would otherwise swallow it into an ordinary failed turn — losing the
-            # one distinction a supervisor acts on differently (stalled environment, retry on the
-            # cadence) and reporting `3` for a hung socket. Classified by TYPE, never by message.
+            # BEFORE the generic handler. `TurnTimeout` derives from `BaseException` (so the agent
+            # SDK's broad handlers cannot swallow it), which means the clause below would NOT catch
+            # it and the ordering is no longer load-bearing for correctness — but it is kept
+            # explicit and first because the *reader* must see that a timeout is handled distinctly,
+            # and because narrowing this class back to `Exception` must not silently re-route
+            # timeouts into "the turn raised" (codex L3, LOW: an earlier version of this comment
+            # asserted `TurnTimeout` IS an `Exception`, which stopped being true the same day).
+            # Classified by TYPE, never by message.
             #
             # Note what is NOT here: no capture. The bound can fire anywhere inside this block,
             # including mid-`capture_turn`, and a turn killed mid-flight has no completed work to
@@ -981,13 +985,31 @@ class EntitySession:
         """Release the SDK conversation's resources. Idempotent; never raises.
 
         The bash slice's OS-sandbox process is what makes this teardown load-bearing — a
-        server holding N sessions leaks a sandboxed shell per session without it."""
+        server holding N sessions leaks a sandboxed shell per session without it.
+
+        ⚠ **``BaseException``, not ``Exception``, and this is the one place that breadth is right**
+        (codex L3, HIGH — a hole the K4a ⑥ fix itself opened). The wall-clock bound stays armed
+        through teardown deliberately, because launchd coalesces on PROCESS lifetime and a hung
+        ``close`` starves the cadence exactly as a hung turn does. But
+        :class:`~levain.firing.deadline.TurnTimeout` derives from ``BaseException`` precisely so the
+        agent SDK's broad handlers cannot swallow it — which means an alarm landing inside
+        ``conversation.close()`` would sail straight through an ``except Exception`` here, aborting
+        teardown *after* ``_closed`` was already set, so nothing would ever retry it, and LEAKING the
+        OS-sandboxed shell this method exists to reap. The fix the timeout needed at the TURN
+        boundary punched a hole at the TEARDOWN boundary.
+
+        The polarity is deliberate, and it is the exact mirror of ``reject_turn``'s: there a
+        fail-soft written for AVAILABILITY was wrong because the boundary was SECURITY, and uptime
+        lost. Here the boundary IS the availability of an OS resource — a leaked process group
+        outlives the process that made it — so completing the release beats propagating the
+        interruption. A genuinely hung teardown is still bounded, by layer 2 taking the whole
+        process down."""
         if self._closed:
             return
         self._closed = True
         try:
             self.conversation.close()
-        except Exception:  # noqa: BLE001 — teardown must never raise
+        except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
             pass
 
     @property

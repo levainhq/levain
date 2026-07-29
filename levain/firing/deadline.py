@@ -33,10 +33,19 @@ TWO LAYERS, AND THE SECOND IS THE POINT
    none of the machinery it is bounding. It is deliberately the crudest possible mechanism: no
    locks, no imports, no cleanup that could itself block.
 
-   The accepted cost of layer 2, stated rather than discovered later: a hard exit skips the
-   confinement teardown, so the sandboxed bash subprocess is reaped by the OS rather than by our
-   own process-group kill. That is strictly better than a seat that never runs again, and it only
-   happens when layer 1 has already failed.
+   The accepted cost of layer 2, stated precisely because the first version of this paragraph got
+   it WRONG (codex L3, HIGH): a hard exit skips confinement teardown, and the sandboxed bash is
+   **NOT** reaped by the OS. ``os._exit`` ends only THIS process; the SIGTERM-then-SIGKILL of the
+   shell's process GROUP lives in ``confinement.SandboxedShell.close`` and is simply never reached.
+   So a bash child mid-command is ORPHANED — reparented to init/launchd and left running, possibly
+   while launchd starts the next seat turn. "The OS will clean it up" was a comfortable assumption,
+   not a fact, and stating it in a report an operator reads would have made this module lie about
+   its own blast radius.
+
+   That cost is still worth paying — an orphaned child is recoverable, a seat that never runs again
+   is not — and it is bounded in practice by layer 1 now being the path that actually fires (the
+   ``BaseException`` fix below). But it is a REAL residual, so the hard report says so in those
+   words rather than reassuring words.
 
 **WHO MAY ARM LAYER 2 — the scoping is a security/architecture decision, not a detail.** A hard
 process exit belongs to whoever OWNS the process, so :class:`TurnDeadline` is armed by the headless
@@ -54,6 +63,7 @@ rather than re-deriving it.
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -112,31 +122,62 @@ class TurnTimeout(BaseException):
         self.seconds = seconds
 
 
-def format_timeout_report(seconds: float, *, hard: bool) -> str:
+def format_timeout_report(
+    seconds: float, *, hard: bool, captured: bool | None = False,
+) -> str:
     """The operator-facing explanation of a timeout — the log line that names it.
 
-    Both layers must SAY SO in the log, because the whole defect being closed is a seat that
-    stopped with nothing recording why. ``hard`` distinguishes the backstop firing (which also
-    means layer 1 failed, a fact worth surfacing rather than smoothing over — it is the signal
-    that this entity's stalls are not interruptible by signal, which changes what a supervisor
-    should investigate).
+    Both layers must SAY SO in the log, because the whole defect being closed is a seat that stopped
+    with nothing recording why. ``hard`` distinguishes the backstop firing, which also means layer 1
+    failed — a fact worth surfacing rather than smoothing over, since "this entity's stalls are not
+    interruptible by signal" changes what a supervisor should investigate.
+
+    ``captured`` is TRI-STATE, and it exists because the obvious wording was FALSE in one real window
+    (codex L3, MED). ``False`` — the turn was cut down before capture, which the session itself can
+    vouch for. ``None`` — WE DO NOT KNOW: the bound wraps rendering and teardown as well as the turn,
+    so an alarm can land *after* ``_drive`` already captured a completed turn. Asserting "nothing was
+    captured to memory" there tells an operator their episode store is missing work it actually holds,
+    and invites a supervisor to re-run work that already succeeded and was recorded. The same
+    authority-versus-description discipline as :attr:`levain.session.TurnResult.gated`: only claim
+    what the caller can actually vouch for.
     """
+    if captured is None:
+        memory = (
+            "     Whether this turn reached memory is UNKNOWN — the bound also covers output and "
+            "teardown, so it may\n"
+            "     have been captured before the stop. Check the entity's episodes rather than "
+            "assuming either way."
+        )
+    elif captured:
+        memory = (
+            "     The turn HAD already been captured to memory before the bound fired; that episode "
+            "stands."
+        )
+    else:
+        memory = (
+            "     Nothing was captured to memory: a turn killed mid-flight has no completed work to "
+            "record, and an\n"
+            "     episode asserting otherwise would be memory recording a fiction."
+        )
+
     if hard:
         return (
             f"  ⏱ WALL-CLOCK BOUND EXCEEDED ({seconds:g}s) — and the graceful stop did NOT take, "
             f"so the process was terminated outright after a {HARD_EXIT_GRACE_SECONDS:g}s grace "
             f"period.\n"
-            f"     Nothing was captured to memory, and cleanup was SKIPPED: the confined bash "
-            f"subprocess is left to the OS to reap.\n"
+            f"{memory}\n"
+            f"     ⚠ CLEANUP WAS SKIPPED, and the confined bash is NOT reaped for you: a child "
+            f"mid-command is ORPHANED\n"
+            f"     (reparented to init), because the process-group kill lives in the teardown this "
+            f"exit skipped.\n"
             f"     That the backstop was needed is itself a finding — the stall was not "
-            f"interruptible by signal (a blocking C call, or a non-main thread).\n"
+            f"interruptible by signal\n"
+            f"     (a blocking C call, or a non-main thread).\n"
             f"     The turn is over; the next scheduled run is free to start."
         )
     return (
         f"  ⏱ WALL-CLOCK BOUND EXCEEDED ({seconds:g}s) — the turn was terminated.\n"
-        f"     Nothing was captured to memory: a turn killed mid-flight has no completed work to "
-        f"record, and an episode\n"
-        f"     asserting otherwise would be memory recording a fiction.\n"
+        f"{memory}\n"
         f"     This is an ENVIRONMENT stall (a hung model call or socket), not a failed task — "
         f"the next scheduled run is free to start."
     )
@@ -168,6 +209,20 @@ class TurnDeadline:
         hard_exit_code: int = 5,
         stream=None,
     ) -> None:
+        # A NON-FINITE BOUND IS REFUSED HERE, LOUDLY (codex L3, HIGH — the nastiest of the set,
+        # because it produces a run that LOOKS bounded and is not). `nan` passes a `< 0` guard
+        # (every nan comparison is False), then fails `> 0` in `enabled`, so NOTHING arms — while the
+        # seat's plist carries `--max-seconds nan` and the banner prints `nans wall-clock`. An
+        # operator reading either would conclude the seat is bounded. `inf` is worse in the other
+        # direction: it reaches `signal.setitimer`, which raises `OverflowError` ("timestamp out of
+        # range for platform time_t") — a type that was NOT in the caught set, so it escaped
+        # `__enter__` as a traceback. Both are silent-or-crashing failures of the exact mechanism
+        # this class exists to guarantee, so neither may be representable.
+        if seconds is not None and not math.isfinite(seconds):
+            raise ValueError(
+                f"a wall-clock bound must be a finite number of seconds, got {seconds!r}. "
+                f"Pass None (or 0 at the CLI) to run unbounded — deliberately and visibly."
+            )
         self.seconds = seconds
         self.grace = grace
         self.hard_exit_code = hard_exit_code
@@ -182,9 +237,21 @@ class TurnDeadline:
     @property
     def enabled(self) -> bool:
         """Whether this deadline bounds anything at all."""
-        return self.seconds is not None and self.seconds > 0
+        return self.seconds is not None and math.isfinite(self.seconds) and self.seconds > 0
 
     def __enter__(self) -> TurnDeadline:
+        # RE-ENTRY IS REFUSED, not merely documented as unsupported (codex L3, MED). The class doc
+        # said "re-usable, not re-entrant" and nothing enforced it, and the failure is silent in the
+        # dangerous direction: a nested `with` overwrites `self._watchdog`, then the INNER `__exit__`
+        # clears the single `_active` flag and cancels only the inner timer — so the original
+        # watchdog survives but returns immediately (`_active` is False), the itimer is cancelled,
+        # and the OUTER body runs with NO layer 1 and NO effective layer 2. An unbounded turn wearing
+        # a bounded turn's syntax. `a_policy_is_not_real_until_the_thing_that_enforces_it_exists`.
+        if self._active:
+            raise RuntimeError(
+                "TurnDeadline is not re-entrant — this instance is already bounding a turn. "
+                "Nesting would silently leave the OUTER turn unbounded. Use a separate instance."
+            )
         if not self.enabled:
             return self
         assert self.seconds is not None  # narrowed by `enabled`
@@ -210,13 +277,24 @@ class TurnDeadline:
     def _arm_signal(self, seconds: float) -> None:
         try:
             self._previous_handler = signal.signal(signal.SIGALRM, self._on_alarm)
-            signal.setitimer(signal.ITIMER_REAL, seconds)
+            # SET THE INSTANT THE HANDLER IS INSTALLED, BEFORE the timer (codex L3, MED), and
+            # deliberately NOT cleared by the handler below.
+            #
+            # ⚠ THE FLAG MEANS "WE TOUCHED SIGALRM AND OWE A RESTORE" — not "layer 1 is live". That
+            # distinction is the whole fix, and the first attempt at it still failed its own test:
+            # setting the flag early is useless if the `except` clause then resets it, because
+            # `_disarm_signal` gates on it and would return early, leaving OUR handler installed on a
+            # host that never asked for it. Restoring an un-armed timer costs a no-op `setitimer(0)`;
+            # failing to restore an installed handler means a later host alarm raises `TurnTimeout`
+            # into unrelated code. The asymmetry decides it.
             self._armed_signal = True
-        except (ValueError, OSError, AttributeError):
+            signal.setitimer(signal.ITIMER_REAL, seconds)
+        except (ValueError, OSError, OverflowError, AttributeError):
             # Off the main thread, or a platform without SIGALRM. NOT fatal and NOT silent-green:
-            # layer 2 is already armed above, so the turn remains bounded — only the CLEANLINESS
-            # of the stop is lost, which is the correct thing to degrade.
-            self._armed_signal = False
+            # layer 2 is already armed above, so the turn remains bounded — only the CLEANLINESS of
+            # the stop is lost, which is the correct thing to degrade. `_armed_signal` is left ALONE
+            # (see above): whatever we installed still has to be handed back.
+            pass
 
     def _on_alarm(self, signum: int, frame: FrameType | None) -> None:
         if not self._active:
@@ -227,10 +305,29 @@ class TurnDeadline:
     def _disarm_signal(self) -> None:
         if not self._armed_signal:
             return
+        # TWO INDEPENDENT TEARDOWN ACTIONS, TWO SEPARATE `try` BLOCKS — and the separation is a
+        # defect fix, not tidiness. Sharing one `try` meant the FIRST failure skipped the SECOND, and
+        # the realistic way `setitimer` fails is *the same way it failed at arming time* (a platform
+        # or thread that will not have it). So exactly when the handler most needs putting back, the
+        # cancel raised and the restore never ran — leaving Levain's handler installed on a host that
+        # never asked for it, which is the failure this method exists to prevent.
+        #
+        # Found by the regression test written for the codex MED above, which failed against the
+        # first fix. `an_invariant_catches_the_defect_it_was_not_written_for`.
         try:
             signal.setitimer(signal.ITIMER_REAL, 0)
+        except (ValueError, OSError):
+            pass  # a timer we could not cancel must not cost us the handler restore below
+        try:
             if callable(self._previous_handler) or isinstance(self._previous_handler, int):
                 signal.signal(signal.SIGALRM, self._previous_handler)  # type: ignore[arg-type]
+            else:
+                # `signal.getsignal` returns None when the previous handler was installed from C and
+                # is not introspectable from Python — it CANNOT be restored (codex L3, MED). Falling
+                # back to SIG_DFL is the honest choice: leaving OUR handler installed would mean a
+                # later host alarm raises `TurnTimeout` into unrelated code, a failure we would have
+                # caused; SIG_DFL is merely the platform default we cannot improve on.
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
         except (ValueError, OSError):
             pass  # teardown must never mask the turn's own outcome
         finally:
@@ -259,7 +356,11 @@ class TurnDeadline:
         assert self.seconds is not None
         try:
             stream = self._stream if self._stream is not None else sys.stderr
-            print(format_timeout_report(self.seconds, hard=True), file=stream, flush=True)
+            # `captured=None`: a watchdog thread cannot know what the main thread reached.
+            print(
+                format_timeout_report(self.seconds, hard=True, captured=None),
+                file=stream, flush=True,
+            )
         except Exception:  # noqa: BLE001 — reporting must never prevent the termination
             pass
         # `os._exit`, not `sys.exit`: this runs on a watchdog THREAD, where SystemExit would only
