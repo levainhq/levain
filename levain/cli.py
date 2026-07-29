@@ -367,6 +367,19 @@ def main(argv: list[str] | None = None) -> int:
             "cannot spend forever on one message. Default: the SDK's own limit."
         ),
     )
+    run_p.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "With --task: declare that NO HUMAN is in the loop at all — a scheduler invoked "
+            "this and nobody will necessarily read the output (what `levain daemon install-seat` "
+            "emits). Beyond the gate that --task already arms, this also folds the standard "
+            "credential stores (~/.config/gh, ~/.aws/credentials, ~/.netrc) into the "
+            "crown-jewels floor by default, because an unattended read can compound into "
+            "always-loaded memory with nobody to notice. Override per-entity with "
+            "deny_standard_creds in .levain/confinement.json."
+        ),
+    )
     run_p.set_defaults(func=_cmd_run)
 
     wrap_p = subparsers.add_parser(
@@ -823,6 +836,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # non-interactive runner (one spec, exit-when-done, an exit code a caller can branch on);
     # without it, the interactive REPL. `--quiet`/`--max-iterations` only shape a task run.
     task = getattr(args, "task", None)
+    # `--unattended` without `--task` is REFUSED rather than ignored. It is a security-relevant
+    # DECLARATION (no human in the loop → the standard cred stores join the crown-jewels floor),
+    # and a REPL is definitionally attended, so honouring it there is impossible while dropping it
+    # silently would leave the operator believing a posture they did not get. A governance claim
+    # the run does not enforce is the exact failure class this keystone exists to make impossible.
+    if getattr(args, "unattended", False) and task is None:
+        print(
+            "levain run: --unattended requires --task. It declares that NO HUMAN is in the loop, "
+            "which cannot be true of an interactive REPL session — and silently ignoring it would "
+            "leave you believing the credential floor was tightened when it was not.",
+            file=sys.stderr,
+        )
+        return 2
     if task is not None:
         from levain.run import run_task
 
@@ -835,6 +861,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             with_tools=args.with_tools,
             quiet=getattr(args, "quiet", False),
             max_iterations=getattr(args, "max_iterations", None),
+            unattended=getattr(args, "unattended", False),
         )
 
     from levain.run import run_entity
@@ -963,15 +990,25 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # Fail-safe: an unreadable/…invalid config must not silently produce a "governed" claim.
     try:
         from levain.firing.confinement import load_confinement_config
+        from levain.firing.drive import resolve_cred_floor
         from levain.firing.gate import resolve_gate_mode
 
         # str-typed on purpose: "unknown" is OUR third state (config unreadable), which is not
         # part of the runtime's GateMode literal — and collapsing it into either real state is
         # exactly the guess this branch exists to refuse.
-        declared_gate: str = load_confinement_config(entity).efferent_gate
+        _cfg = load_confinement_config(entity)
+        declared_gate: str = _cfg.efferent_gate
         gate_mode: str = resolve_gate_mode(declared_gate, human_present=False)
+        # The FLOOR posture, resolved the same way and for the same reason. Until K4a the banner
+        # carried one RESOLVED line (the gate) directly above one STATIC line (the floor),
+        # answering the same operator question — what may this entity do to the world — and THAT
+        # ASYMMETRY WAS THE BUG: a decision to deny creds unattended could be true in the plan and
+        # absent from the run with nothing saying so.
+        cred_floor: bool | None = resolve_cred_floor(_cfg.deny_standard_creds, mode="unattended")
+        cred_declared: bool | None = _cfg.deny_standard_creds
     except Exception as exc:  # noqa: BLE001 — never let a config read failure fake a green claim
         declared_gate, gate_mode = f"unreadable ({type(exc).__name__})", "unknown"
+        cred_floor, cred_declared = None, None
     try:
         spec = daemon.build_seat_spec(
             entity_path=entity, task=args.task, interval=args.interval,
@@ -1023,6 +1060,18 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # last thing the operator reads before they stop watching. Resolved through the RUNTIME's own
     # resolve_gate_mode with human_present=False (how a seat is actually driven), so this claim
     # cannot drift from the behaviour it describes. (glm L3.)
+    print()
+    if cred_floor is True:
+        why = ("pinned by deny_standard_creds: true" if cred_declared is True
+               else "the default for an unattended seat")
+        print(f"  cred floor: ~/.config/gh · ~/.aws/credentials · ~/.netrc are DENIED ({why}).")
+    elif cred_floor is False:
+        print(
+            "  ⚠ cred floor: ~/.config/gh · ~/.aws/credentials · ~/.netrc are READABLE by this\n"
+            "    seat — deny_standard_creds is explicitly false, so the unattended default is\n"
+            "    OVERRIDDEN. It can read those credentials with nobody watching; the gate stops\n"
+            "    it SENDING them anywhere, but not reading them into memory that persists."
+        )
     print()
     if gate_mode == "gated":
         print(

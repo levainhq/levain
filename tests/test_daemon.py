@@ -416,6 +416,15 @@ def test_seat_spec_resolves_entity_path_absolute(tmp_path) -> None:
     assert Path(spec.argv[spec.argv.index("run") + 1]).is_absolute()
 
 
+def test_seat_spec_declares_itself_unattended(tmp_path) -> None:
+    """EMITTED, not inferred: the seat's governance posture must be auditable in the unit file
+    itself. Anyone reading the plist argv sees that this drive declares no human in the loop, and
+    therefore that the standard credential stores are denied by default. Inferring it from "does
+    this spec have a StartInterval" would hide a security-relevant fact from the argv."""
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", log_dir=tmp_path / "l")
+    assert "--unattended" in spec.argv
+
+
 def test_seat_spec_does_not_quiet_the_activity_stream(tmp_path) -> None:
     # --quiet suppresses tool activity and prints only the final reply. For an UNATTENDED seat
     # that stream IS the operator's fan-in surface — the record of what it did, including a K3

@@ -59,6 +59,12 @@ from levain.firing.confinement import (
     confinement_supported,
     load_confinement_config,
 )
+from levain.firing.drive import (
+    DriveMode,
+    bind_drive_mode,
+    human_present,
+    resolve_cred_floor,
+)
 from levain.firing.gate import (
     GateMode,
     PendingEfferent,
@@ -225,6 +231,31 @@ class TurnResult:
         return EXIT_OK if self.reply else EXIT_NO_REPLY
 
 
+def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
+    """Publish the drive mode on the fork-safe channel AND resolve the cred floor from it.
+
+    **One function on purpose, because the two must not drift.** The crown-jewels floor has one
+    policy and two enforcers: the bash seatbelt is rendered from the value this RETURNS, while the
+    file-editor policy is rebuilt PER CALL outside the session (fork-safety) and reads the mode
+    back off ``$LEVAIN_DRIVE_MODE``. Bind without resolving and bash gets the wrong floor; resolve
+    without binding and the FILE EDITOR does — and the file editor is the ``view`` path, i.e. the
+    afferent read the unattended cred floor exists to close. Two adjacent statements held together
+    by a comment is exactly how that drifts, so they are one call with one test.
+
+    Resolving through :func:`~levain.firing.drive.resolve_cred_floor` rather than reading
+    ``cfg.deny_standard_creds`` directly is load-bearing: the field is a TRI-STATE whose ``None``
+    means "derive from the drive", so a raw read silently treats an UNDECLARED entity as opted-OUT
+    and reinstates the exact hole this closes.
+
+    ``cfg`` is ``None`` for a ``--no-tools`` session; the mode is still published (nothing else
+    would) and the floor still resolves, harmlessly, for hands that do not exist.
+    """
+    bind_drive_mode(mode)
+    return resolve_cred_floor(
+        cfg.deny_standard_creds if cfg is not None else None, mode=mode
+    )
+
+
 def require_openhands_entity(entity_dir: Path) -> str | None:
     """Return an error message if ``entity_dir`` is not a clean, initialized OpenHands entity,
     else ``None``.
@@ -388,7 +419,7 @@ class EntitySession:
         with_tools: bool = True,
         on_event: Callable[[str], None] | None = None,
         max_iterations: int | None = None,
-        human_present: bool = False,
+        mode: DriveMode = "headless",
     ) -> EntitySession:
         """Open a sovereign session for the entity at ``path``.
 
@@ -408,13 +439,29 @@ class EntitySession:
         ``max_iteration_per_run``. ``None`` keeps the SDK default. A bounded turn is what stops
         an unattended entity from spending forever on one message.
 
-        ``human_present`` declares whether a person is DRIVING this session, and it is what the
-        **efferent gate** (K3, ``spore-295``) resolves against when the entity's
-        ``efferent_gate`` setting is ``"auto"``: an operator at the REPL watching tool activity
-        stream past already IS the fan-in the gate exists to provide, so the gate supplies that
-        fan-in exactly when presence does not. The REPL passes ``True``; ``--task``, a scheduler
-        and any unattended seat pass ``False``. **It defaults to ``False``** — a caller that
-        forgets gets governed, not ungoverned.
+        ``mode`` declares HOW this session is being driven, and it is the SINGLE AUTHORITY both
+        drive-dependent policies resolve against (:mod:`levain.firing.drive`):
+
+        - ``"interactive"`` — the REPL. A human is watching activity stream past.
+        - ``"headless"`` — ``--task``, typed by a human who will read the output afterwards.
+        - ``"unattended"`` — a scheduled seat. A scheduler invoked it; nobody necessarily reads
+          anything.
+
+        The **efferent gate** (K3, ``spore-295``) resolves on ``human_present(mode)``, which is
+        ``True`` only for ``interactive`` — an operator watching the stream already IS the fan-in
+        the gate exists to provide, so the gate supplies that fan-in exactly when presence does
+        not. The gate therefore treats ``headless`` and ``unattended`` identically, which is
+        correct: neither has anyone to fan an action in to at the moment it would fire.
+
+        The **crown-jewels cred floor** resolves on the mode DIRECTLY, because it must NOT collapse
+        those two: a human typing ``--task "open a PR"`` legitimately needs ``gh``, while a
+        scheduled seat's silent credential read can compound into always-loaded memory with nobody
+        in the loop. That asymmetry — and why the rest of the floor is deliberately presence-
+        INDEPENDENT — is argued in full in :mod:`levain.firing.drive`.
+
+        **It defaults to ``"headless"``** — a caller that forgets gets the GATE armed (governed,
+        not ungoverned) while keeping the cred floor at its documented default, so forgetting is
+        safe on the axis that can execute and non-surprising on the axis that cannot.
 
         Raises :class:`SessionStartError` (message already operator-ready) if the entity cannot
         be started sovereignly — INCLUDING a gate that would not arm. A session that believes it
@@ -475,7 +522,9 @@ class EntitySession:
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
-            deny_standard_creds = cfg.deny_standard_creds if cfg is not None else False
+            # Publish the drive mode AND resolve the cred floor — ONE call, because the two must
+            # not drift (see `_apply_drive_policy`). Must run BEFORE any tool policy is built.
+            deny_standard_creds = _apply_drive_policy(cfg, mode)
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR
@@ -500,9 +549,12 @@ class EntitySession:
             # The EFFERENT GATE (K3), armed on the live conversation — and this is the LAST step
             # of construction on purpose: it needs the conversation, and a session that reached
             # here ungated must not become reachable by any path that skips it.
+            # `human_present(mode)` is a DERIVATION, not a second signal — one drive-mode
+            # authority, so the gate and the cred floor can never disagree about how this
+            # session is being driven. resolve_gate_mode's own contract is UNCHANGED.
             gate_mode = resolve_gate_mode(
                 cfg.efferent_gate if cfg is not None else "auto",
-                human_present=human_present,
+                human_present=human_present(mode),
             )
             if gate_mode == "gated":
                 arm_efferent_gate(conversation)

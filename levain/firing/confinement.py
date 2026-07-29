@@ -642,8 +642,20 @@ class ConfinementConfig:
     deny_files: tuple[Path, ...] = ()      # credential FILES (literal): e.g. ~/Documents/flow/.env.flow
     deny_subtrees: tuple[Path, ...] = ()   # additional crown-jewel SUBTREES: a secrets dir, another store
     ssh_mode: SshMode = "agent"
-    deny_standard_creds: bool = False      # OPT-IN: fold ~/.config/gh + ~/.aws/credentials + ~/.netrc
-    # into the floor (default OFF — denying their READ breaks the entity's own gh/aws/curl use).
+    deny_standard_creds: bool | None = None
+    # TRI-STATE (K4a, 2026-07-29): fold ~/.config/gh + ~/.aws/credentials + ~/.netrc into the floor?
+    #   True  → deny ALWAYS (an explicit operator pin; the drive mode does not soften it)
+    #   False → allow ALWAYS (an explicit operator OPT-IN that deliberately survives an unattended
+    #           seat — a seat whose job is "open a PR nightly" genuinely needs gh)
+    #   None  → ABSENT: derive from the DRIVE MODE (deny for an unattended seat, allow otherwise)
+    # It was a plain `bool = False` until an unattended seat existed to distinguish, at which point
+    # ABSENT and EXPLICIT-FALSE being indistinguishable made the new default either un-overridable
+    # or defeated by every config already on disk. The reason this is not the `efferent_gate: "auto"`
+    # string enum two fields down — which solves the identical problem — is that a bool→string change
+    # invalidates every config already carrying true/false, and this loader is FAIL-CLOSED, so that
+    # is not a graceful degrade: it bricks `levain run`. Resolution + the full argument for why the
+    # floor is drive-dependent AT ALL (the rest of it deliberately is not) →
+    # `levain.firing.drive.resolve_cred_floor`.
     efferent_gate: GateSetting = "auto"
     # The K3 EFFERENT GATE (spore-295). "auto" (default) derives the mode from whether a human is
     # driving — ungated at the REPL (the operator watching the stream IS the fan-in), gated for
@@ -707,13 +719,27 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"{base}: ssh_mode must be \"agent\" or \"raw\", got {ssh_mode!r} — fail-closed."
         )
 
-    deny_standard_creds = data.get("deny_standard_creds", False)
+    # ABSENT is its own state — do NOT default it to False here (K4a). The sentinel must survive the
+    # loader so `drive.resolve_cred_floor` can tell "the operator never declared this" (derive from
+    # the drive mode) from "the operator explicitly wants creds reachable" (honour it, even for an
+    # unattended seat). Collapsing them here is exactly what made the unattended default impossible
+    # to express in the first place.
+    deny_standard_creds = data.get("deny_standard_creds", None)
     # ``isinstance(True, int)`` is True, so guard against a JSON number sneaking in as a bool — require
     # a real bool (fail-closed: an ambiguous cred-floor declaration must not silently mis-parse).
-    if not isinstance(deny_standard_creds, bool):
+    # ``None`` is legal ONLY as absence; a literal JSON `null` is rejected rather than silently read
+    # as "derive", because an explicit null is an operator TYPING something and meaning it, and we
+    # cannot tell which of the three they meant.
+    if deny_standard_creds is not None and not isinstance(deny_standard_creds, bool):
         raise ConfinementError(
             f"{base}: deny_standard_creds must be true or false, got "
             f"{deny_standard_creds!r} — fail-closed."
+        )
+    if "deny_standard_creds" in data and data["deny_standard_creds"] is None:
+        raise ConfinementError(
+            f"{base}: deny_standard_creds is present but null. Omit the key entirely to let the "
+            f"drive mode decide (denied for an unattended seat, allowed otherwise), or set it to "
+            f"true/false to pin it — fail-closed."
         )
 
     efferent_gate = data.get("efferent_gate", "auto")

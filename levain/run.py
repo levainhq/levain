@@ -97,7 +97,7 @@ def run_entity(
             # would otherwise supply, so gating here would add a prompt without adding oversight,
             # and prompts get bypassed. An operator who pins `"gated"` opts INTO the inline
             # approve/refuse drain below; that is an affordance, not the default.
-            human_present=True,
+            mode="interactive",
         )
     except SessionStartError as exc:
         print(f"levain run: {exc.message}")
@@ -224,6 +224,7 @@ def run_task(
     with_tools: bool = True,
     quiet: bool = False,
     max_iterations: int | None = None,
+    unattended: bool = False,
 ) -> int:
     """Drive the entity at ``path`` through ONE task, non-interactively, and exit.
 
@@ -287,9 +288,16 @@ def run_task(
             model=model, base_url=base_url, api_key=api_key, with_tools=with_tools,
             on_event=None if quiet else _emit_activity,
             max_iterations=max_iterations,
-            # No human is driving. With `efferent_gate: "auto"` this resolves GATED — the fan-in
-            # that a watching operator supplies at the REPL has to come from the gate here.
-            human_present=False,
+            # No human is driving. With `efferent_gate: "auto"` BOTH modes below resolve GATED —
+            # the fan-in a watching operator supplies at the REPL has to come from the gate here.
+            #
+            # The two are NOT interchangeable for the crown-jewels CRED floor, which is the whole
+            # reason this is a three-valued mode rather than the old `human_present` bool:
+            # `headless` is a human who typed this and will read the output (they may legitimately
+            # need `gh`), while `unattended` is a scheduler with nobody in the loop at all, where a
+            # silent credential read can compound into always-loaded memory. See
+            # `levain.firing.drive`.
+            mode="unattended" if unattended else "headless",
         )
     except SessionStartError as exc:
         print(f"levain run: {exc.message}", file=sys.stderr, flush=True)

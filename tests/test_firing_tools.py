@@ -130,12 +130,16 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     """The confinement.json ``deny_standard_creds`` opt-in threads through policy_for_conv_state into
     the built policy (apparatus L1/complement: nothing pinned this end-to-end wiring — a dropped
     pass-through in tools.py would silently lose the opt-in while every other test still passed)."""
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
+
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
     ent, ws = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
     pol = policy_for_conv_state(_FakeConvState(ws))
     assert crown_jewel_reason(pol, tmp_path / ".config" / "gh" / "hosts.yml") is not None
-    # a DIFFERENT entity with no confinement.json does NOT fold them in (default OFF — gh hands intact)
+    # a DIFFERENT entity with no confinement.json does NOT fold them in AT AN INTERACTIVE DRIVE
+    # (gh hands intact for the operator who is sitting right there)
     ent2 = tmp_path / "e2"
     (ent2 / ".levain").mkdir(parents=True)
     ws2 = ent2 / "workspace"
@@ -143,6 +147,57 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent2))
     pol2 = policy_for_conv_state(_FakeConvState(ws2))
     assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
+
+
+def test_policy_for_conv_state_denies_standard_creds_on_an_UNATTENDED_drive(tmp_path: Path,
+                                                                            monkeypatch):
+    """K4a: with no declaration, an UNATTENDED seat folds the standard cred stores into the floor
+    while an interactive drive does not — same entity, same (absent) config, drive mode the only
+    variable. This is the FILE-EDITOR enforcer, which is the one that matters: `view` is afferent,
+    so the K3 gate never sees the read."""
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent, ws = _entity(tmp_path)          # no confinement.json at all → the tri-state ABSENT
+    gh = tmp_path / ".config" / "gh" / "hosts.yml"
+
+    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
+    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is None
+
+    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
+    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is not None
+
+
+def test_policy_for_conv_state_honours_an_EXPLICIT_false_even_unattended(tmp_path: Path,
+                                                                         monkeypatch):
+    """An explicit ``false`` is an operator OPT-IN and must survive an unattended seat — a seat
+    whose job is "open a PR nightly" genuinely needs gh. The unattended default is a DEFAULT, not a
+    prohibition, and the tri-state exists precisely so this can be said."""
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
+    ent, ws = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": false}')
+    assert crown_jewel_reason(
+        policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"
+    ) is None
+
+
+def test_policy_for_conv_state_fails_CLOSED_when_the_drive_mode_is_unbound(tmp_path: Path,
+                                                                           monkeypatch):
+    """An UNBOUND drive mode must deny, not allow. The only way it is unset in a real run is a
+    WIRING failure, and a wiring failure must never WIDEN the floor: wrongly denying surfaces as a
+    visible refusal the operator fixes in one line, while wrongly granting is a silent credential
+    exposure on an unattended seat with nobody watching."""
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
+    ent, ws = _entity(tmp_path)
+    assert crown_jewel_reason(
+        policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"
+    ) is not None
 
 
 # --- the file-editor hand: create + declared_resources + the floor ---------------------------
