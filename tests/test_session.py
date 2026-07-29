@@ -717,10 +717,21 @@ def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(
     undeclared entity as opted-OUT — the exact hole this closes."""
     from levain.session import _apply_drive_policy
 
-    assert _apply_drive_policy(_Cfg(None), "unattended") is True     # absent + seat → DENY
-    assert _apply_drive_policy(_Cfg(None), "headless") is False      # absent + human → allow
-    assert _apply_drive_policy(_Cfg(False), "unattended") is False   # explicit opt-IN survives
-    assert _apply_drive_policy(_Cfg(True), "interactive") is True    # explicit pin survives
+    import os
+
+    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
+
+    def fresh(cfg, mode):
+        # Each assertion is a SEPARATE process in reality; bind_drive_mode now refuses a rebind
+        # that would widen the floor, so clear the binding between them rather than weakening the
+        # guard to suit the test.
+        os.environ.pop(LEVAIN_DRIVE_MODE_ENV, None)
+        return _apply_drive_policy(cfg, mode)
+
+    assert fresh(_Cfg(None), "unattended") is True     # absent + seat → DENY
+    assert fresh(_Cfg(None), "headless") is False      # absent + human → allow
+    assert fresh(_Cfg(False), "unattended") is False   # explicit opt-IN survives
+    assert fresh(_Cfg(True), "interactive") is True    # explicit pin survives
 
 
 def test_apply_drive_policy_handles_a_toolless_session(monkeypatch):

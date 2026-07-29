@@ -157,19 +157,38 @@ def test_install_seat_tells_the_truth_when_the_entity_is_UNGATED(tmp_path, capsy
     assert "GOVERNED, NOT AUTONOMOUS" not in out      # the false claim must be ABSENT
 
 
-def test_install_seat_does_not_guess_when_the_gate_posture_is_unreadable(tmp_path, capsys):
-    """A config read failure must not fake EITHER answer: a false "governed" tells the operator
-    to stop watching, a false "ungated" cries wolf."""
+def test_install_seat_REFUSES_when_the_confinement_config_is_unreadable(tmp_path, capsys):
+    """Two properties in one, and the second was a behaviour change at L3.
+
+    (1) A config read failure must not fake EITHER posture — a false "governed" tells the operator
+    to stop watching, a false "ungated" cries wolf. (2) It must also not INSTALL: the runtime loads
+    the same config fail-closed, so the seat would refuse to start on every interval forever,
+    turning one typo into recurring scheduled noise in a log nobody reads. Refuse at install, where
+    a human is present to read the error (codex L3 LOW)."""
     with mock.patch("levain.session.require_openhands_entity", return_value=None), \
          mock.patch("levain.daemon.select_provider") as sel, \
          mock.patch("levain.firing.confinement.load_confinement_config",
                     side_effect=OSError("boom")):
         sel.return_value.install.return_value = "installed"
         rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t"])
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert "GATE POSTURE UNKNOWN" in out
-    assert "GOVERNED, NOT AUTONOMOUS" not in out and "UNGATED SEAT" not in out
+    cap = capsys.readouterr()
+    assert rc == 2
+    sel.return_value.install.assert_not_called()
+    assert "cannot read this entity's confinement config" in cap.err
+    assert "GOVERNED, NOT AUTONOMOUS" not in cap.out and "UNGATED SEAT" not in cap.out
+
+
+def test_install_seat_does_not_swallow_a_programming_error_as_posture_unknown(tmp_path, capsys):
+    """The posture handler was a bare `except Exception` and it caught a NameError from a
+    mis-ordered reference in the same function, reporting it as "governance posture unknown" — a
+    coding error wearing a config error's clothes, which would have made the next typo silently
+    permanent. The handler is narrow now; an unexpected error must CRASH, not degrade."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider"), \
+         mock.patch("levain.firing.confinement.load_confinement_config",
+                    side_effect=TypeError("a bug, not a config problem")):
+        with pytest.raises(TypeError):
+            main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t"])
 
 
 @pytest.mark.parametrize("bad", ["-1", "-5"])

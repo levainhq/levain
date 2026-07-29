@@ -1136,3 +1136,42 @@ def test_caller_denies_is_case_insensitive_for_ssh_convenience_allow(
     profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path), deny_files=(variant,)))
     canonical = (tmp_path / ".ssh" / "config").resolve()
     assert f'(allow file-read* (literal "{canonical}"))' not in profile
+
+
+def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> None:
+    """SOURCE-LEVEL invariant: no shipped code may call ``build_policy`` without saying what the
+    credential floor is.
+
+    ``deny_standard_creds`` defaults to ``False`` because this function is the MECHANISM and the
+    drive-aware POLICY lives in ``levain.firing.drive.resolve_cred_floor``. That split is right,
+    but it leaves a real hole (glm L3): a future production path that builds a floor directly and
+    forgets the argument would silently allow ~/.config/gh on an unattended seat. Rather than make
+    the mechanism opinionated — duplicating policy into two places that can disagree — or churn 70+
+    test call sites that legitimately do not care, pin the thing that actually matters: PRODUCTION
+    callers decide explicitly. Tests may omit it; shipped code may not.
+    """
+    import re
+    from pathlib import Path
+
+    pkg = Path(__file__).resolve().parent.parent / "levain"
+    offenders: list[str] = []
+    for path in pkg.rglob("*.py"):
+        if "templates" in path.parts:      # shipped template scripts, not the confinement core
+            continue
+        text = path.read_text(encoding="utf-8")
+        for m in re.finditer(r"build_policy\(", text):
+            if text[:m.start()].rstrip().endswith("def"):
+                continue                    # the definition itself
+            i, depth = m.end(), 1
+            while i < len(text) and depth:
+                depth += (text[i] == "(") - (text[i] == ")")
+                i += 1
+            if "deny_standard_creds" not in text[m.end():i]:
+                line = text[: m.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(pkg.parent)}:{line}")
+    assert not offenders, (
+        "production call(s) to build_policy() omit deny_standard_creds — the credential floor "
+        "would silently default to PERMISSIVE. Resolve it via "
+        "levain.firing.drive.resolve_cred_floor(cfg.deny_standard_creds, mode=...): "
+        + ", ".join(offenders)
+    )
