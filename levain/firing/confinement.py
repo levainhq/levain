@@ -151,6 +151,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Literal
 
+# The efferent gate's accepted settings, imported rather than restated: the config loader and the
+# gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
+# are stdlib-only leaves, so this adds no dependency weight.
+from levain.firing.gate import GATE_SETTINGS, GateSetting
+
 __all__ = [
     "SANDBOX_EXEC",
     "ConfinementError",
@@ -613,6 +618,12 @@ class ConfinementConfig:
     ssh_mode: SshMode = "agent"
     deny_standard_creds: bool = False      # OPT-IN: fold ~/.config/gh + ~/.aws/credentials + ~/.netrc
     # into the floor (default OFF — denying their READ breaks the entity's own gh/aws/curl use).
+    efferent_gate: GateSetting = "auto"
+    # The K3 EFFERENT GATE (spore-295). "auto" (default) derives the mode from whether a human is
+    # driving — ungated at the REPL (the operator watching the stream IS the fan-in), gated for
+    # `--task` and any unattended seat. "gated" / "ungated" pin it explicitly. It lives HERE, beside
+    # the crown-jewels floor, because the two answer one operator question — what may this entity do
+    # to the world — and splitting that answer across two files is how half of it stops being read.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -626,14 +637,18 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
         {"deny_files": ["~/Documents/flow/.env.flow"],
          "deny_subtrees": ["~/some/secrets"],
          "ssh_mode": "agent",
-         "deny_standard_creds": false}
+         "deny_standard_creds": false,
+         "efferent_gate": "auto"}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
-    the default (empty declarations, ``ssh_mode="agent"``) — the universal floor still protects the
-    structurally-knowable crown jewels. A PRESENT-but-MALFORMED file (bad JSON, wrong types, an invalid
-    ``ssh_mode``) raises :class:`ConfinementError` — FAIL-CLOSED: a broken crown-jewels declaration must
-    not silently drop the operator's secrets and hand the entity a floor with holes; the caller refuses
-    to grant confined hands and surfaces the error, so the operator fixes the config."""
+    the default (empty declarations, ``ssh_mode="agent"``, ``efferent_gate="auto"``) — the universal
+    floor still protects the structurally-knowable crown jewels. A PRESENT-but-MALFORMED file (bad JSON,
+    wrong types, an invalid ``ssh_mode`` or ``efferent_gate``) raises :class:`ConfinementError` —
+    FAIL-CLOSED: a broken crown-jewels declaration must not silently drop the operator's secrets and hand
+    the entity a floor with holes; the caller refuses to grant confined hands and surfaces the error, so
+    the operator fixes the config. A mistyped ``efferent_gate`` is held to the SAME standard for the same
+    reason — ``"gate"`` silently falling back to the default is a governance declaration the operator
+    believes they made and did not."""
     base = Path(entity_dir).expanduser() / ".levain" / _CONFINEMENT_CONFIG_NAME
     try:
         raw = base.read_text(encoding="utf-8")
@@ -675,11 +690,19 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"{deny_standard_creds!r} — fail-closed."
         )
 
+    efferent_gate = data.get("efferent_gate", "auto")
+    if efferent_gate not in GATE_SETTINGS:
+        raise ConfinementError(
+            f"{base}: efferent_gate must be one of {', '.join(GATE_SETTINGS)}, got "
+            f"{efferent_gate!r} — fail-closed."
+        )
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
         ssh_mode=ssh_mode,
         deny_standard_creds=deny_standard_creds,
+        efferent_gate=efferent_gate,
     )
 
 

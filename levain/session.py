@@ -59,6 +59,11 @@ from levain.firing.confinement import (
     confinement_supported,
     load_confinement_config,
 )
+from levain.firing.gate import (
+    GateMode,
+    PendingEfferent,
+    resolve_gate_mode,
+)
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -67,6 +72,7 @@ from levain.firing.isolation import (
 from levain.install import effective_adapter
 
 __all__ = [
+    "EXIT_GATED",
     "EXIT_OK",
     "EXIT_INTERRUPTED",
     "EXIT_NO_REPLY",
@@ -109,6 +115,23 @@ confinement config, a bad ``--model``. Unchanged from ``levain run``'s existing 
 EXIT_TURN_FAILED = 3
 """The turn itself raised. The session is left un-resumable by design: a raised ``run()``
 leaves the SDK conversation in an ERROR state a later turn would resume FROM."""
+
+EXIT_GATED = 4
+"""The turn HALTED AT THE EFFERENT GATE with actions awaiting the human (**K3**, ``spore-295``).
+
+Its own code, and that is the point. Without it a gated halt would surface as
+:data:`EXIT_NO_REPLY` — because a halted turn genuinely has no reply yet — and a supervisor would
+read *"the entity is waiting for you"* as *"the entity stalled"*. Those demand opposite responses:
+one wants a human decision, the other wants a restart or an alarm. Conflating them re-creates, at
+the process boundary, exactly the ambiguity the other four codes were written to remove.
+
+**Not a failure.** The gate firing is the governor working — the entity proposed action on the
+world and the harness stopped it pending fan-in. A supervisor should treat ``4`` as *needs a
+decision*, never as an error to retry blindly (retrying re-proposes the same action into the same
+gate). The actions themselves are REPORTED, not persisted to a queue: nothing survives process
+exit, so a headless driver's report is the whole handoff. Naming that limit is deliberate — a
+durable pending-action queue is the unattended seat's problem (K4a), and claiming one here that
+does not exist is the ``claim > enforcement`` gap the floor's own discipline forbids."""
 
 EXIT_INTERRUPTED = 130
 """The operator interrupted the run (SIGINT / Ctrl-C). POSIX convention: 128 + SIGINT(2).
@@ -159,16 +182,46 @@ class TurnResult:
     nudged: bool = False
     """Whether the act-first backstop fired (the agent narrated a plan without acting)."""
 
+    gated: bool = False
+    """The turn STOPPED at the efferent gate, awaiting a human decision (**K3**).
+
+    Deliberately a FIELD, not a property derived from :attr:`pending` being non-empty. The
+    runtime's execution status is what authoritatively says a turn halted; the pending list is a
+    DESCRIPTION of what it halted on, built by reading and filtering events. Deriving the fact
+    from the description means any failure to describe — an unreadable action, a batch this
+    build filtered to nothing — silently reports the turn as complete, and the driver then
+    captures and exits on a turn whose actions never ran. Authority and description are separate
+    because they fail separately."""
+
+    pending: tuple[PendingEfferent, ...] = ()
+    """What the gate is holding, for the human to judge.
+
+    May be empty even when :attr:`gated` is ``True`` (see above) — an anomaly the report itself
+    surfaces rather than hides. Each entry carries what the entity proposed and why that
+    classification fanned in, because an operator deciding on ``git push --force`` needs the
+    command, not the tool's name."""
+
     @property
     def ok(self) -> bool:
-        """The turn completed AND produced a reply. Not 'the task succeeded'."""
-        return self.error is None and bool(self.reply)
+        """The turn completed AND produced a reply. Not 'the task succeeded'.
+
+        A gated turn is not ``ok`` — it has not finished. It is also not an ERROR, which is why
+        the two are separate properties rather than one tri-state: a driver that only asks
+        ``ok`` still behaves correctly (it does not treat a halt as success), and a driver that
+        wants to offer the human a decision asks :attr:`gated`."""
+        return self.error is None and not self.gated and bool(self.reply)
 
     @property
     def exit_code(self) -> int:
-        """The process exit code this turn implies, for a non-interactive driver."""
+        """The process exit code this turn implies, for a non-interactive driver.
+
+        Order is load-bearing: a raised turn beats a gated one (an exception means we cannot
+        trust what the pending list even is), and a gated turn beats the reply check — otherwise
+        a halt, which by construction has produced no reply yet, would report as a stall."""
         if self.error is not None:
             return EXIT_TURN_FAILED
+        if self.gated:
+            return EXIT_GATED
         return EXIT_OK if self.reply else EXIT_NO_REPLY
 
 
@@ -313,6 +366,13 @@ class EntitySession:
     bash_ok: bool
     ssh_mode: str = "agent"
     deny_standard_creds: bool = False
+    gate_mode: GateMode = "gated"
+    """The resolved EFFERENT GATE posture for this session (**K3**).
+
+    Defaults to ``"gated"`` — fail-closed. A caller that forgets to declare whether a human is
+    driving gets the governed posture, which costs an unnecessary halt; the opposite default
+    would silently hand an unattended seat ungoverned hands, and only one of those two mistakes
+    is recoverable after the fact."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
 
     # -- construction --------------------------------------------------------
@@ -328,6 +388,7 @@ class EntitySession:
         with_tools: bool = True,
         on_event: Callable[[str], None] | None = None,
         max_iterations: int | None = None,
+        human_present: bool = False,
     ) -> EntitySession:
         """Open a sovereign session for the entity at ``path``.
 
@@ -347,8 +408,18 @@ class EntitySession:
         ``max_iteration_per_run``. ``None`` keeps the SDK default. A bounded turn is what stops
         an unattended entity from spending forever on one message.
 
+        ``human_present`` declares whether a person is DRIVING this session, and it is what the
+        **efferent gate** (K3, ``spore-295``) resolves against when the entity's
+        ``efferent_gate`` setting is ``"auto"``: an operator at the REPL watching tool activity
+        stream past already IS the fan-in the gate exists to provide, so the gate supplies that
+        fan-in exactly when presence does not. The REPL passes ``True``; ``--task``, a scheduler
+        and any unattended seat pass ``False``. **It defaults to ``False``** — a caller that
+        forgets gets governed, not ungoverned.
+
         Raises :class:`SessionStartError` (message already operator-ready) if the entity cannot
-        be started sovereignly.
+        be started sovereignly — INCLUDING a gate that would not arm. A session that believes it
+        is gated while executing every efferent action is worse than an honestly ungated one, so
+        the wiring is proven at startup rather than assumed.
         """
         entity_dir = Path(str(path)).expanduser().resolve()
 
@@ -363,6 +434,11 @@ class EntitySession:
             from openhands.sdk import LLM, Conversation
 
             from levain.firing.openhands.entity import build_entity_agent
+            from levain.firing.openhands.gate import (
+                GateArmingError,
+                arm_efferent_gate,
+                disarm_efferent_gate,
+            )
             from levain.firing.openhands.tools import build_entity_tools
         except ImportError as exc:
             raise SessionStartError(
@@ -420,6 +496,28 @@ class EntitySession:
             # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`,
             # which under-declares the concrete `send_message` / `state` surface.
             conversation: Any = Conversation(binding.agent, **conv_kwargs)
+
+            # The EFFERENT GATE (K3), armed on the live conversation — and this is the LAST step
+            # of construction on purpose: it needs the conversation, and a session that reached
+            # here ungated must not become reachable by any path that skips it.
+            gate_mode = resolve_gate_mode(
+                cfg.efferent_gate if cfg is not None else "auto",
+                human_present=human_present,
+            )
+            if gate_mode == "gated":
+                arm_efferent_gate(conversation)
+            else:
+                disarm_efferent_gate(conversation)
+        except GateArmingError as exc:
+            # Its OWN handler, ABOVE the generic one: a gate that will not arm must never be
+            # reported as "check --model / --base-url", which would send the operator hunting a
+            # configuration problem while the actual news is that this entity would run
+            # ungoverned. Same lesson as the bash_ok handler below it (glm L3).
+            raise SessionStartError(
+                f"the efferent gate could not be armed — refusing to start:\n  {exc}\n"
+                f"  This entity is configured to gate efferent actions "
+                f"(.levain/confinement.json → efferent_gate), and the runtime did not accept it."
+            ) from exc
         except IsolationError as exc:
             raise SessionStartError(
                 f"sovereignty guard REFUSED to start the entity:\n  {exc}"
@@ -445,6 +543,7 @@ class EntitySession:
             bash_ok=with_tools and bash_ok,
             ssh_mode=ssh_mode,
             deny_standard_creds=deny_standard_creds,
+            gate_mode=gate_mode,
         )
 
     # -- the one operation ---------------------------------------------------
@@ -482,14 +581,152 @@ class EntitySession:
             return TurnResult(
                 reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR,
             )
-        nudged = False
+
+        # REFUSE A NEW MESSAGE WHILE THE GATE IS HOLDING (codex L3, HIGH). ``send_message`` does
+        # NOT clear ``WAITING_FOR_CONFIRMATION`` — but the ``run()`` that follows it DOES, and
+        # the SDK clears it as *the user approved*: ``Agent.step()`` executes the unmatched
+        # pending actions BEFORE it samples any new action. So a driver that answers a halt by
+        # simply talking again — "wait, don't push that" — EXECUTES the very push it is objecting
+        # to, and the objection arrives afterwards.
+        #
+        # The REPL drains the gate and ``--task`` exits, so neither reaches this today. But
+        # ``EntitySession`` is the SHARED long-lived API: K1's entire premise is that a server's
+        # ``/turn`` route and an unattended seat are further DRIVERS over this same object, and
+        # the ``/turn`` route is the next thing being built. A footgun reachable only by a caller
+        # not yet written is still a footgun, and this one silently breaks the one invariant the
+        # gate exists to hold. So it is refused HERE, at the object, rather than by asking every
+        # future driver to remember — ``invariant_must_fire_at_the_point_of_use``.
+        status = self._gate_status()
+        if status is None:
+            return self._undeterminable_gate_result(nudged=False)
+        if status:
+            return TurnResult(
+                reply=None,
+                tool_activity=[],
+                error=(
+                    "this session is HELD at the efferent gate — a new message here would be "
+                    "read by the runtime as approval and would run the held actions. Call "
+                    "resume_turn() to approve them, or reject_turn(reason) to refuse."
+                ),
+                gated=True,
+                pending=self._gate_report(),
+            )
+
         try:
             self.conversation.send_message(message)
+        except Exception as exc:  # noqa: BLE001 — a failed turn is a RESULT, not a crash
+            return TurnResult(reply=None, tool_activity=[], error=str(exc))
+        return self._drive()
+
+    def resume_turn(self) -> TurnResult:
+        """APPROVE the actions the gate is holding and carry the turn on.
+
+        The human's half of the fan-in. The pending actions execute — the SDK's next ``run()``
+        drains them — and the turn then continues normally, so approving is a continuation of
+        one turn rather than the start of a new one. That matters for memory: the episode this
+        turn eventually captures contains the whole arc including the halt, not a fragment
+        either side of it.
+
+        Safe to call when nothing is pending (it is then an ordinary continuation).
+        """
+        if self._closed:
+            return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        return self._drive()
+
+    def reject_turn(self, reason: str = "the operator declined this action") -> TurnResult:
+        """REFUSE the actions the gate is holding, and let the entity answer for it.
+
+        ``reason`` reaches the model as a rejection observation, so the entity LEARNS the action
+        did not happen — the difference between a partner that adapts ("understood, I'll open a
+        PR instead of pushing") and one that narrates success over a world it never touched. The
+        turn then continues, which is why this returns a :class:`TurnResult` rather than
+        ``None``: a refusal is a move in the conversation, not a dead end.
+        """
+        if self._closed:
+            return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        try:
+            from levain.firing.openhands.gate import reject_pending
+
+            reject_pending(self.conversation, reason)
+        except Exception:  # noqa: BLE001 — a rejection must not take down the driver
+            pass
+
+        # VERIFY THE REFUSAL LANDED — do not trust that the call succeeded (glm L3, HIGH).
+        # `_drive()` calls `run()`, and `run()` on a STILL-HALTED conversation is the SDK's
+        # APPROVAL path. So a rejection that silently failed would go on to execute the exact
+        # action the operator just refused: the operator says no, and the world changes.
+        #
+        # The bug was a fail-soft written for AVAILABILITY ("a rejection must not take down the
+        # driver") applied to a SECURITY boundary, where the two goals point opposite ways. On a
+        # gate, uptime loses. Same discipline as `arm_efferent_gate`: check the STATE, never the
+        # call's return — `verify_the_output_not_the_run`.
+        if self._gate_halted():
+            return TurnResult(
+                reply=None,
+                tool_activity=[],
+                error=(
+                    "the refusal did NOT take — the actions are still held and were NOT run. "
+                    "Do not resume this session; restart it."
+                ),
+                gated=True,
+                pending=self._gate_report(),
+            )
+        return self._drive()
+
+    def pending_efferent(self) -> tuple[PendingEfferent, ...]:
+        """The actions the gate is currently holding, or ``()`` if it is not holding any.
+
+        Asks AUTHORITY before DESCRIPTION — an un-halted session has nothing pending, and must
+        not be handed the "contents unknown" placeholder that a real-but-undescribable halt
+        produces. Never raises."""
+        if not self._gate_halted():
+            return ()
+        return self._gate_report()
+
+    def _drive(self) -> TurnResult:
+        """Run the conversation forward and report what the harness observed.
+
+        Shared by the first send, an approval and a refusal, so all three agree on the gate
+        check, the act-first backstop and — the one that bites — WHEN the turn is captured.
+        """
+        nudged = False
+        try:
             self.conversation.run()
+
+            # The gate check comes FIRST, before the act-first backstop, because a halted turn
+            # looks exactly like a stalled one from the outside: no tool ran, no reply arrived.
+            # Nudging here would tell an entity that DID act ("I'll run the tests" → proposed
+            # bash → held) to stop planning and act, which is both false and useless — the thing
+            # standing between it and acting is a human, not its own hesitation.
+            status = self._gate_status()
+            if status is None:
+                return self._undeterminable_gate_result(nudged=nudged)
+            if status:
+                return self._gated_result(nudged=nudged)
+
             if self.with_tools and planned_without_acting(self.conversation.state.events):
                 nudged = True
                 self.conversation.send_message(LEVAIN_ACT_NUDGE)
                 self.conversation.run()
+                # Same three-valued treatment as the pre-nudge check — the post-nudge run() is
+                # a second chance to halt, and an unreadable status here cascades identically.
+                status = self._gate_status()
+                if status is None:
+                    return self._undeterminable_gate_result(nudged=nudged)
+                if status:
+                    return self._gated_result(nudged=nudged)
+
+            # CAPTURE ONLY A COMPLETED TURN — never a gated halt. This is the SAME defect the
+            # nudge ordering above already paid for: `vagus_run` keys idempotency on the user
+            # turn id, so capturing at the halt would make the post-approval capture a NO-OP on
+            # the unchanged id, and memory would keep the moment the entity was STOPPED while
+            # the world got the work it was later allowed to do. Worse than losing the episode:
+            # a store that is perfectly grounded in a perfectly recorded misunderstanding.
+            #
+            # The accepted consequence, stated rather than discovered later: a headless run that
+            # halts and is never resumed captures NOTHING for that turn. Correct — the turn did
+            # not happen. An episode asserting "I ran X" for an action a human refused would be
+            # memory recording a fiction.
             self.binding.capture_turn(self.conversation)
         except Exception as exc:  # noqa: BLE001 — a failed turn is a RESULT, not a crash
             return TurnResult(reply=None, tool_activity=[], error=str(exc), nudged=nudged)
@@ -500,6 +737,116 @@ class EntitySession:
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
+        )
+
+    def _undeterminable_gate_result(self, *, nudged: bool) -> TurnResult:
+        """The turn ends as a FAILURE when the gate's own state cannot be read.
+
+        Not captured, not reported as complete, and non-zero on exit. "I could not tell whether
+        efferent actions are being held" is a real failure of a governed session — rendering it
+        as an ordinary finished turn is the same silent-green move the whole keystone exists to
+        refuse, and it is what would let the held actions run on the following turn."""
+        return TurnResult(
+            reply=None,
+            tool_activity=turn_tool_activity(self.conversation.state.events, self.workspace),
+            error=(
+                "could not determine whether the efferent gate is holding actions — ending the "
+                "turn rather than continuing blind. Restart the session; do not resume it."
+            ),
+            nudged=nudged,
+        )
+
+    def _gated_result(self, *, nudged: bool) -> TurnResult:
+        """The result for a turn stopped at the gate: activity so far, and what is held.
+
+        ``reply`` is ``None`` by construction — the turn has not reached one. Tool activity IS
+        reported, because afferent work earlier in the same turn really did happen and hiding it
+        would leave the operator judging a proposed action with no view of what led to it — but
+        the HELD actions are SUBTRACTED from it (codex L3).
+
+        That subtraction matters more than it sounds: the runtime emits an ``ActionEvent`` before
+        the confirmation decision and then skips execution, so an unfiltered activity list prints
+        ``⚙ terminal: git push`` — the standard "here is what it DID" line — on the same screen
+        where the gate says nothing was executed. Two true-looking statements contradicting each
+        other, and the operator has to guess which one to believe."""
+        return TurnResult(
+            reply=None,
+            tool_activity=self._executed_activity(),
+            error=None,
+            nudged=nudged,
+            gated=True,
+            pending=self._gate_report(),
+        )
+
+    def _executed_activity(self) -> list[str]:
+        """Activity for the actions that actually RAN this turn, with the held ones removed."""
+        events = self.conversation.state.events
+        try:
+            from levain.firing.openhands.gate import held_action_ids
+
+            held = held_action_ids(self.conversation)
+            if held:
+                events = [e for e in events if str(getattr(e, "id", "")) not in held]
+        except Exception:  # noqa: BLE001 — a display filter must never break a turn
+            pass
+        return turn_tool_activity(events, self.workspace)
+
+    def _gate_status(self) -> bool | None:
+        """AUTHORITY: did the runtime stop this turn at the gate? ``None`` = undeterminable.
+
+        Three-valued deliberately (glm L3, LOW). An unreadable status is NOT the same as "not
+        halted", and collapsing them defers the gate's own failure into the NEXT turn: the
+        driver would capture, report a normal result, and the following ``run()`` — issued on a
+        conversation the SDK still has parked in ``WAITING_FOR_CONFIRMATION`` — would execute
+        the previous turn's held actions with nobody having approved them. The invariant would
+        break one turn later than the HIGH above, by the same mechanism.
+
+        So an undeterminable status ends the turn honestly instead (see :meth:`_drive`), which
+        also removes the "next turn" that the cascade needs. Short-circuits to ``False`` when the
+        gate was never armed, so an ungated session pays nothing for any of this."""
+        if self.gate_mode != "gated":
+            return False
+        try:
+            from levain.firing.openhands.gate import awaiting_confirmation
+
+            # `awaiting_confirmation` is itself three-valued and returns None for an unreadable
+            # status — it must NOT collapse that to False, or this whole branch is dead code
+            # that merely looks like a safeguard (codex L3, HIGH: it did exactly that).
+            return awaiting_confirmation(self.conversation)
+        except Exception:  # noqa: BLE001 — undeterminable, NOT "no"
+            return None
+
+    def _gate_halted(self) -> bool:
+        """``True`` only when the runtime positively reports a halt.
+
+        Kept for the callers that are asking "is something held right now?" rather than driving
+        a turn — an undeterminable status is not a halt to report to them."""
+        return self._gate_status() is True
+
+    def _gate_report(self) -> tuple[PendingEfferent, ...]:
+        """DESCRIPTION: what the gate is holding, for the operator to judge.
+
+        Never gates anything itself — :meth:`_gate_halted` already decided that. A halt this
+        cannot describe returns a single loud placeholder rather than an empty list, because
+        "held, contents unknown" and "nothing held" look identical to a reader and mean opposite
+        things; the operator must never be shown an empty decision."""
+        if self.gate_mode != "gated":
+            return ()
+        try:
+            from levain.firing.openhands.gate import pending_gate_report
+
+            report = tuple(pending_gate_report(self.conversation))
+        except Exception:  # noqa: BLE001 — a report must never break a turn
+            report = ()
+        if report:
+            return report
+        return (
+            PendingEfferent(
+                tool_name="<unreported>",
+                detail="the runtime halted at the gate, but the held action could not be read",
+                reason="report unavailable — approve only if you know what this entity was doing",
+                recognized=False,
+            ),
         )
 
     # -- lifecycle -----------------------------------------------------------

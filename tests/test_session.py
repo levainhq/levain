@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from levain.session import (
+    EXIT_GATED,
     EXIT_NO_REPLY,
     EXIT_OK,
     EXIT_TURN_FAILED,
@@ -102,16 +103,25 @@ def test_turn_result_error_is_exit_turn_failed_even_with_a_reply():
 
 def test_exit_codes_are_distinct_and_stable():
     # These are a PROCESS CONTRACT a scheduler/supervisor branches on — pin the values.
-    assert (EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED) == (0, 1, 2, 3)
+    assert (EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED) == (0, 1, 2, 3, 4)
+    # And they must stay DISTINCT — the whole value of the contract is that a supervisor can
+    # tell "waiting for a human" from "stalled" without reading prose.
+    assert len({EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED}) == 5
 
 
 def test_turn_result_carries_no_task_success_field():
     """THE HONESTY FLOOR ON RESULTS. TurnResult must never grow a 'succeeded' / 'task_ok' field:
     a confined entity cannot truthfully report on its own environment (spore-373 [5] — it
     reported '25 failed, 1617 passed' for a suite that was 1702/0 outside the sandbox). This
-    test fails the moment someone adds one, which is the point."""
+    test fails the moment someone adds one, which is the point.
+
+    The K3 additions (``gated``, ``pending``) are admissible under exactly that rule, and the
+    distinction IS the floor: both are things the HARNESS observed — the runtime's own execution
+    status, and the tool calls sitting un-executed in its event log — never something the agent
+    asserted about its own work. The forbidden list below is what a self-report looks like.
+    Widening this set is fine; widening it with a self-report is the failure."""
     fields = set(TurnResult.__dataclass_fields__)
-    assert fields == {"reply", "tool_activity", "error", "nudged"}
+    assert fields == {"reply", "tool_activity", "error", "nudged", "gated", "pending"}
     for forbidden in ("succeeded", "success", "task_ok", "passed", "verdict"):
         assert not hasattr(TurnResult(reply="x"), forbidden)
 
@@ -285,6 +295,7 @@ class _FakeSession:
         self.bash_ok = True
         self.ssh_mode = "agent"
         self.deny_standard_creds = False
+        self.gate_mode = "ungated"
         self.label = tmp_path.name
         self._result = result
         self._emits = emits or []
@@ -318,6 +329,81 @@ def _patch_open(monkeypatch, session_or_exc):
         session_or_exc.opened_with = kwargs
         return session_or_exc
     monkeypatch.setattr("levain.run.EntitySession.open", staticmethod(_open))
+
+
+def test_run_task_declares_no_human_is_driving(tmp_path: Path, monkeypatch, capsys):
+    """The headless driver must open with ``human_present=False`` — that is what makes the
+    default ``efferent_gate: "auto"`` resolve GATED for a scheduler or an unattended seat, which
+    is the entire case K3 exists to serve."""
+    from levain.run import run_task
+
+    sess = _FakeSession(tmp_path, TurnResult(reply="done", tool_activity=[]))
+    _patch_open(monkeypatch, sess)
+    run_task(tmp_path, "do it")
+    assert sess.opened_with.get("human_present") is False
+
+
+def test_run_entity_declares_that_a_human_IS_driving(tmp_path: Path, monkeypatch, capsys):
+    """And the REPL opens with ``human_present=True``: the operator watching activity stream past
+    IS the fan-in, so `auto` resolves ungated and no prompt is imposed on them."""
+    from levain.run import run_entity
+
+    sess = _FakeSession(tmp_path, TurnResult(reply="hi", tool_activity=[]))
+    _patch_open(monkeypatch, sess)
+    monkeypatch.setattr("levain.run.TurnReader", lambda: _EOFReader())
+    run_entity(tmp_path)
+    assert sess.opened_with.get("human_present") is True
+
+
+class _EOFReader:
+    """A TurnReader stand-in that ends the session immediately."""
+
+    cancelled_lines = 0
+
+    def read_turn(self, prompt):
+        return None
+
+
+def test_run_task_gated_exits_4_and_says_nothing_ran(tmp_path: Path, monkeypatch, capsys):
+    """The headless half of the gate. Exit 4 (a decision, not a failure), the report on STDERR,
+    and — the part a supervisor's log depends on — an explicit statement that NOTHING WAS
+    EXECUTED, so a silent stdout cannot be read as "it did the work and said nothing"."""
+    from levain.firing.gate import PendingEfferent
+    from levain.run import run_task
+
+    held = PendingEfferent(
+        tool_name="terminal", detail="git push --force origin main",
+        reason="bash always fans in", recognized=True,
+    )
+    sess = _FakeSession(
+        tmp_path, TurnResult(reply=None, tool_activity=[], gated=True, pending=(held,))
+    )
+    _patch_open(monkeypatch, sess)
+
+    # quiet=True is the PIPELINE case: stdout carries the reply payload and nothing else, so it
+    # is where "did anything get emitted as if it were a result?" can actually be asserted.
+    rc = run_task(tmp_path, "push the branch", quiet=True)
+    out = capsys.readouterr()
+
+    assert rc == EXIT_GATED == 4
+    assert "nothing was executed" in out.err.lower()
+    assert "git push --force origin main" in out.err, "the operator must see the actual command"
+    assert out.out.strip() == "", "stdout is the reply payload, and there is no reply yet"
+    assert sess.closed_count == 1
+
+
+def test_run_task_gated_does_not_report_the_stall_message(tmp_path: Path, monkeypatch, capsys):
+    """A halt must not be described as "completed the turn without a reply". Same words, opposite
+    meaning: one needs a human, the other needs a restart."""
+    from levain.run import run_task
+
+    sess = _FakeSession(tmp_path, TurnResult(reply=None, tool_activity=[], gated=True))
+    _patch_open(monkeypatch, sess)
+
+    run_task(tmp_path, "push")
+    err = capsys.readouterr().err
+
+    assert "without a reply" not in err
 
 
 def test_run_task_replies_and_exits_zero(tmp_path: Path, monkeypatch, capsys):

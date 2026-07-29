@@ -38,6 +38,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from levain.firing.gate import PendingEfferent
 from levain.session import (
     EXIT_INTERRUPTED,
     EXIT_OK,
@@ -91,6 +92,12 @@ def run_entity(
     try:
         session = EntitySession.open(
             path, model=model, base_url=base_url, api_key=api_key, with_tools=with_tools,
+            # A human is DRIVING this one. With the default `efferent_gate: "auto"` that resolves
+            # UNGATED — the operator watching tool activity stream past is the fan-in the gate
+            # would otherwise supply, so gating here would add a prompt without adding oversight,
+            # and prompts get bypassed. An operator who pins `"gated"` opts INTO the inline
+            # approve/refuse drain below; that is an affordance, not the default.
+            human_present=True,
         )
     except SessionStartError as exc:
         print(f"levain run: {exc.message}")
@@ -129,6 +136,10 @@ def run_entity(
 
             try:
                 result = session.run_turn(message)
+                if result.gated:
+                    result, interrupted = _drain_gate(session, result)
+                    if interrupted:
+                        break
             except KeyboardInterrupt:
                 print("\n  (turn interrupted — exiting)")
                 interrupted = True
@@ -152,6 +163,51 @@ def run_entity(
 
     _farewell(session, interrupted=interrupted)
     return EXIT_OK
+
+
+def _drain_gate(
+    session: EntitySession, result: TurnResult
+) -> tuple[TurnResult, bool]:
+    """Fan a gated turn in to the operator, repeatedly, until the turn moves on.
+
+    Reached ONLY when the entity pinned ``efferent_gate: "gated"`` — the REPL's default posture
+    is ungated, because a watching human already is the fan-in. So this is the affordance an
+    operator explicitly asked for, not a prompt imposed on them, which is the distinction that
+    keeps it from becoming the permission-fatigue pattern operators bypass in real life.
+
+    Loops because approving one batch can lead straight into the next. Returns the final result
+    plus whether the session should END (the operator interrupted at the decision point).
+
+    **Ambiguity refuses.** A bare Enter, EOF and Ctrl-C all REJECT rather than approve: the only
+    input that runs an efferent action is an explicit yes. A gate whose default answer is "do it"
+    is a formality, and this one is meant to be load-bearing.
+    """
+    while result.gated:
+        print("\n  ⛔ \033[1mheld at the efferent gate\033[0m — this changes the world:")
+        _print_pending(result.pending)
+        try:
+            answer = input("\n  approve? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  (declined at the gate — ending the session)")
+            session.reject_turn("the operator interrupted at the gate")
+            return result, True
+
+        if answer in ("y", "yes"):
+            print("  → approved; running it.")
+            result = session.resume_turn()
+        else:
+            print("  → declined; telling the entity so it can adapt.")
+            result = session.reject_turn("the operator declined this action")
+
+        if result.error is not None:
+            return result, False
+    return result, False
+
+
+def _print_pending(pending: tuple[PendingEfferent, ...]) -> None:
+    """Render what the gate is holding. Each entry shows the ACT, then why it fanned in."""
+    for item in pending:
+        print(f"    • {item.line()}")
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +237,15 @@ def run_task(
       - ``0`` the turn completed and the agent replied;
       - ``1`` the turn completed but the agent produced NO reply (a real stall);
       - ``2`` a usage / environment / startup error, before any turn ran;
-      - ``3`` the turn raised.
+      - ``3`` the turn raised;
+      - ``4`` the turn HALTED AT THE EFFERENT GATE — the entity proposed action on the world and
+        the harness stopped it pending a human decision (K3, ``spore-295``). **Not a failure**:
+        it is the governor working. A supervisor should surface ``4`` for a human, never retry it
+        blindly — a retry re-proposes the same action into the same gate.
+
+    A headless run is ``human_present=False``, so with the default ``efferent_gate: "auto"`` it
+    is GATED. That is the whole reason K3 exists: this is the driver a scheduler and an
+    unattended seat use, and it is definitionally the case where nobody is watching the stream.
 
     A code derived from the agent's own account of its success would be the false-all-clear
     class Levain's trust pitch says cannot happen — a confined entity once reported "25 failed,
@@ -223,6 +287,9 @@ def run_task(
             model=model, base_url=base_url, api_key=api_key, with_tools=with_tools,
             on_event=None if quiet else _emit_activity,
             max_iterations=max_iterations,
+            # No human is driving. With `efferent_gate: "auto"` this resolves GATED — the fan-in
+            # that a watching operator supplies at the REPL has to come from the gate here.
+            human_present=False,
         )
     except SessionStartError as exc:
         print(f"levain run: {exc.message}", file=sys.stderr, flush=True)
@@ -242,6 +309,37 @@ def run_task(
 
         if result.error is not None:
             print(f"\n  ! the task failed: {result.error}", file=sys.stderr, flush=True)
+            return result.exit_code
+
+        if result.gated:
+            # STDERR, and worded as a decision rather than an error: stdout is the reply payload
+            # and there is no reply — the turn has not finished. Say plainly that nothing ran, so
+            # a supervisor's log cannot be misread as "it did the thing and said nothing".
+            # The "⚙" lines already streamed above are emitted by the runtime BEFORE the
+            # confirmation decision, so a held action can appear there looking like completed
+            # work. The result's own activity list has the held actions subtracted, but the
+            # STREAM cannot un-print itself — so say plainly that anything shown above was
+            # proposed. Leaving the operator to reconcile "⚙ terminal: git push" against
+            # "nothing was executed" is asking them to guess which of two true-looking lines
+            # to believe (codex L3).
+            print(
+                "\n  ⛔ HELD AT THE EFFERENT GATE — nothing was executed.\n"
+                "     The entity proposed action on the world; this run has no human to fan it "
+                "in to.\n"
+                "     Any ⚙ activity shown above was PROPOSED — the held actions below did NOT "
+                "run.",
+                file=sys.stderr, flush=True,
+            )
+            for item in result.pending:
+                print(f"       • {item.line()}", file=sys.stderr, flush=True)
+            print(
+                "     Re-run it with a human at the terminal (`levain run` without --task), or "
+                "pin\n"
+                "     efferent_gate: \"ungated\" in .levain/confinement.json if this entity is "
+                "trusted\n"
+                "     to act unattended. Nothing is queued — re-running re-proposes.",
+                file=sys.stderr, flush=True,
+            )
             return result.exit_code
 
         # The reply goes to STDOUT as the payload — activity already streamed above, so it is
@@ -297,6 +395,7 @@ def _entity_label(binding) -> str:
 def _print_banner(
     entity_dir: Path, binding, *, model: str, with_tools: bool, bash_ok: bool,
     ssh_mode: str = "agent", deny_standard_creds: bool = False, task: str | None = None,
+    gate_mode: str = "gated",
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -336,10 +435,24 @@ def _print_banner(
             print("             standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
+        # The GATE line sits with the floor because it answers the same question the floor does —
+        # what may this entity do to the world — and it is rendered from the RESOLVED mode, never
+        # a static string. A banner that claimed "gated" while the session ran ungated would be
+        # the one lie this whole keystone exists to make impossible.
+        if gate_mode == "gated":
+            print("  gate:      EFFERENT actions HELD for you — bash, and any file write.")
+            print("             Reads run free. Nothing graduates to unattended on its own.")
+        else:
+            print("  gate:      UNGATED — efferent actions run as the entity decides.")
+            if task is None:
+                print("             You are the fan-in: watch the activity as it streams.")
+            else:
+                print("             ⚠ no human is driving this run (efferent_gate: \"ungated\").")
     print()
     if task is not None:
         print("  Running ONE task, then exiting. Exit code reports what the HARNESS saw:")
-        print("    0 replied · 1 no reply · 2 startup error · 3 the turn raised")
+        print("    0 replied · 1 no reply · 2 startup error · 3 the turn raised ·")
+        print("    4 held at the efferent gate (a decision for you, NOT a failure)")
         print("  It does NOT assert the task succeeded — verify that against the world.")
     else:
         print("  Talk to it. It recalls its OWN memory and captures each turn there.")
@@ -354,6 +467,7 @@ def _banner_for(session: EntitySession, *, task: str | None = None) -> None:
         session.entity_dir, session.binding,
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
         ssh_mode=session.ssh_mode, deny_standard_creds=session.deny_standard_creds, task=task,
+        gate_mode=session.gate_mode,
     )
 
 
