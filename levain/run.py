@@ -38,10 +38,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from levain.firing.deadline import TurnDeadline, TurnTimeout, format_timeout_report
 from levain.firing.gate import PendingEfferent
 from levain.session import (
     EXIT_INTERRUPTED,
     EXIT_OK,
+    EXIT_TIMEOUT,
     EXIT_USAGE,
     EntitySession,
     SessionStartError,
@@ -224,6 +226,7 @@ def run_task(
     with_tools: bool = True,
     quiet: bool = False,
     max_iterations: int | None = None,
+    max_seconds: float | None = None,
     unattended: bool = False,
 ) -> int:
     """Drive the entity at ``path`` through ONE task, non-interactively, and exit.
@@ -243,6 +246,9 @@ def run_task(
         the harness stopped it pending a human decision (K3, ``spore-295``). **Not a failure**:
         it is the governor working. A supervisor should surface ``4`` for a human, never retry it
         blindly — a retry re-proposes the same action into the same gate.
+      - ``5`` the turn EXCEEDED ITS WALL-CLOCK BOUND and was terminated (K4a ⑥, ``spore-434``).
+        An ENVIRONMENT stall, not a broken task — retry on the cadence; if it repeats, the model
+        endpoint is sick.
 
     A headless run is ``human_present=False``, so with the default ``efferent_gate: "auto"`` it
     is GATED. That is the whole reason K3 exists: this is the driver a scheduler and an
@@ -257,6 +263,12 @@ def run_task(
     ``quiet`` suppresses the banner and the activity stream, printing only the reply — for use
     in a pipeline where the reply is the payload. ``max_iterations`` bounds the turn's agent
     steps, so an unattended run cannot spend forever on one message.
+
+    ``max_seconds`` bounds the turn in WALL-CLOCK time, which is a different guarantee and the one
+    a supervisor actually needs (K4a ⑥, ``spore-434``): ``max_iterations`` counts STEPS, so a turn
+    that hangs inside ONE step — a stalled model call — is unbounded by it. Left ``None`` nothing is
+    armed, preserving the existing behaviour for an operator running a task by hand; a scheduled
+    seat always sets it (see :func:`levain.daemon.build_seat_spec`).
 
     Streaming note: output is flushed as it is produced, so a caller reading the pipe sees
     progress DURING the turn rather than nothing until the process exits.
@@ -277,6 +289,65 @@ def run_task(
     # block-buffers a non-tty stdout, which is exactly why headless output was invisible until
     # process exit — the reconfigure is the fix, and it must happen before the first write.
     _line_buffer_stdout()
+
+    # THE WALL-CLOCK BOUND WRAPS EVERYTHING, INCLUDING SESSION STARTUP AND TEARDOWN (K4a ⑥).
+    #
+    # Not just the model turn, and the reason is what the defect actually is: launchd COALESCES per
+    # label, so it refuses to start the next scheduled run while THIS PROCESS is alive — it does not
+    # care which phase is stuck. `EntitySession.open` spawns the confined shell and completes a
+    # handshake over a private FIFO; `close` kills a process group. Both can block, and either one
+    # blocking forever starves the cadence exactly as a hung model call does. A bound scoped to
+    # `run_turn` alone would be a bound on the phase we happened to think of first.
+    #
+    # Consequence, stated rather than discovered: a turn that completes just under the bound and
+    # then hangs in teardown past the grace period exits `5` rather than `0`. Correct — at that
+    # point the PROCESS has overrun, which is the thing being bounded.
+    deadline = TurnDeadline(max_seconds, hard_exit_code=EXIT_TIMEOUT)
+    with deadline:
+        try:
+            return _drive_task(
+                path, task,
+                model=model, base_url=base_url, api_key=api_key, with_tools=with_tools,
+                quiet=quiet, max_iterations=max_iterations, max_seconds=max_seconds,
+                unattended=unattended,
+            )
+        except TurnTimeout:
+            # Reached when the bound fires OUTSIDE the turn (startup, teardown, rendering).
+            # `run_turn` catches its own and reports via `result.timed_out`, which routes to the
+            # same report below — one wording for one outcome, wherever it lands.
+            return _report_timeout(deadline.seconds)
+
+
+def _report_timeout(seconds: float | None) -> int:
+    """Print the graceful-timeout report and return its exit code. One wording, one place."""
+    print(format_timeout_report(seconds or 0.0, hard=False), file=sys.stderr, flush=True)
+    return EXIT_TIMEOUT
+
+
+def _drive_task(
+    path: Path,
+    task: str,
+    *,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    with_tools: bool,
+    quiet: bool,
+    max_iterations: int | None,
+    max_seconds: float | None,
+    unattended: bool,
+) -> int:
+    """Open a session, run ONE turn, report it, close. The body :func:`run_task` bounds.
+
+    ``max_seconds`` is NOT enforced here — the caller owns the bound. It is passed only so the
+    report can name the bound that fired, rather than recovering the number by parsing it back out
+    of an error message (an outcome read from its own description is the drift this build
+    deliberately avoids elsewhere).
+
+    Split out so the wall-clock bound can wrap session startup and teardown as well as the turn
+    (see the caller) without the drive logic being nested inside it — the bound is a property of the
+    PROCESS, and reading it should not require reading past it to find the work.
+    """
 
     def _emit_activity(line: str) -> None:
         if not quiet:
@@ -305,7 +376,7 @@ def run_task(
 
     try:
         if not quiet:
-            _banner_for(session, task=task)
+            _banner_for(session, task=task, max_seconds=max_seconds)
         try:
             result = session.run_turn(task)
         except KeyboardInterrupt:
@@ -314,6 +385,12 @@ def run_task(
             # precisely the unattended-supervision case the keystone exists to serve.
             print("\n  (task interrupted)", file=sys.stderr, flush=True)
             return EXIT_INTERRUPTED
+
+        # BEFORE the generic error branch, because a timed-out turn carries an error too. Reporting
+        # it as "the task failed" would tell a supervisor the entity or the spec is broken, when
+        # what actually happened is that the environment stalled and the next run is fine.
+        if result.timed_out:
+            return _report_timeout(max_seconds)
 
         if result.error is not None:
             print(f"\n  ! the task failed: {result.error}", file=sys.stderr, flush=True)
@@ -403,7 +480,7 @@ def _entity_label(binding) -> str:
 def _print_banner(
     entity_dir: Path, binding, *, model: str, with_tools: bool, bash_ok: bool,
     ssh_mode: str = "agent", deny_standard_creds: bool = False, task: str | None = None,
-    gate_mode: str = "gated",
+    gate_mode: str = "gated", max_seconds: float | None = None,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -466,9 +543,19 @@ def _print_banner(
                 print("             ⚠ no human is driving this run (efferent_gate: \"ungated\").")
     print()
     if task is not None:
+        # THE TIME BOUND IS STATED, AND SO IS ITS ABSENCE. The banner already enumerates the exit
+        # codes, so omitting `5` would have left it enumerating a contract it no longer matches —
+        # the same claim-versus-behaviour asymmetry that WAS the bug in the cred-floor banner (one
+        # resolved line above one static line, answering the same question).
+        if max_seconds is not None:
+            print(f"  time bound: {max_seconds:g}s wall-clock — the turn is terminated if it "
+                  f"overruns.")
+        else:
+            print("  time bound: NONE — a hung model call will not be interrupted.")
         print("  Running ONE task, then exiting. Exit code reports what the HARNESS saw:")
         print("    0 replied · 1 no reply · 2 startup error · 3 the turn raised ·")
-        print("    4 held at the efferent gate (a decision for you, NOT a failure)")
+        print("    4 held at the efferent gate (a decision for you, NOT a failure) ·")
+        print("    5 the wall-clock bound was exceeded (an ENVIRONMENT stall, not a bad task)")
         print("  It does NOT assert the task succeeded — verify that against the world.")
     else:
         print("  Talk to it. It recalls its OWN memory and captures each turn there.")
@@ -476,14 +563,16 @@ def _print_banner(
         print("  :quit (or Ctrl-D) to end the session.")
 
 
-def _banner_for(session: EntitySession, *, task: str | None = None) -> None:
+def _banner_for(
+    session: EntitySession, *, task: str | None = None, max_seconds: float | None = None,
+) -> None:
     """Render the banner from a live session — the drivers' convenience wrapper over
     :func:`_print_banner`, which stays fact-shaped so the floor tests stay cheap."""
     _print_banner(
         session.entity_dir, session.binding,
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
         ssh_mode=session.ssh_mode, deny_standard_creds=session.deny_standard_creds, task=task,
-        gate_mode=session.gate_mode,
+        gate_mode=session.gate_mode, max_seconds=max_seconds,
     )
 
 

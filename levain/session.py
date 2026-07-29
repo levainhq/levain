@@ -59,6 +59,7 @@ from levain.firing.confinement import (
     confinement_supported,
     load_confinement_config,
 )
+from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
     DriveMode,
     bind_drive_mode,
@@ -82,6 +83,7 @@ __all__ = [
     "EXIT_OK",
     "EXIT_INTERRUPTED",
     "EXIT_NO_REPLY",
+    "EXIT_TIMEOUT",
     "EXIT_USAGE",
     "EXIT_TURN_FAILED",
     "EntitySession",
@@ -138,6 +140,27 @@ gate). The actions themselves are REPORTED, not persisted to a queue: nothing su
 exit, so a headless driver's report is the whole handoff. Naming that limit is deliberate — a
 durable pending-action queue is the unattended seat's problem (K4a), and claiming one here that
 does not exist is the ``claim > enforcement`` gap the floor's own discipline forbids."""
+
+EXIT_TIMEOUT = 5
+"""The turn EXCEEDED ITS WALL-CLOCK BOUND and was terminated (**K4a ⑥**, ``spore-434``).
+
+Its own code, for the same reason :data:`EXIT_GATED` has one: collapsing it into an existing code
+inverts the operator's response. The tempting home is :data:`EXIT_TURN_FAILED` — a timeout does
+arrive as an exception — but ``3`` tells a supervisor *the work raised, the session is
+un-resumable, go read the traceback*, and it is a code that recurs identically on a retry because
+the cause is in the code. A timeout says the opposite: **the ENVIRONMENT stalled** (a hung model
+call, a socket with no read timeout), nothing is wrong with the entity or the task, and the next
+scheduled run is free to start and will very likely succeed.
+
+**Not a failure of the task, and not a failure of governance.** It is the time bound working — the
+half of K4a's *"supervised / restartable / time-bounded"* definition that ``--max-iterations``
+structurally cannot supply, because iterations count STEPS and the failure mode is one step that
+never returns. A supervisor should treat ``5`` as *retry on the cadence, and if it repeats, the
+model endpoint is sick* — never as *the entity is broken*.
+
+**Nothing is captured to memory on a timeout**, by the same discipline that refuses to capture a
+gated halt: the turn was killed mid-flight, so what completed is unknowable, and an episode
+asserting a completed turn would be memory recording a fiction."""
 
 EXIT_INTERRUPTED = 130
 """The operator interrupted the run (SIGINT / Ctrl-C). POSIX convention: 128 + SIGINT(2).
@@ -199,6 +222,18 @@ class TurnResult:
     captures and exits on a turn whose actions never ran. Authority and description are separate
     because they fail separately."""
 
+    timed_out: bool = False
+    """The turn was terminated for EXCEEDING ITS WALL-CLOCK BOUND (**K4a ⑥**, ``spore-434``).
+
+    A FIELD set from the exception TYPE we ourselves raised, for the same reason :attr:`gated` is a
+    field: the alternative is matching text in :attr:`error`, and an outcome recognised from its own
+    description silently reclassifies the day the wording changes. Here that reclassification has a
+    specific cost — the timeout would collapse into :data:`EXIT_TURN_FAILED`, telling a supervisor
+    to go read a traceback for a stalled network call.
+
+    A timed-out turn always also carries an :attr:`error` (the bound it exceeded), because it did
+    not complete. :attr:`exit_code` therefore checks this FIRST — see there."""
+
     pending: tuple[PendingEfferent, ...] = ()
     """What the gate is holding, for the human to judge.
 
@@ -215,15 +250,25 @@ class TurnResult:
         the two are separate properties rather than one tri-state: a driver that only asks
         ``ok`` still behaves correctly (it does not treat a halt as success), and a driver that
         wants to offer the human a decision asks :attr:`gated`."""
-        return self.error is None and not self.gated and bool(self.reply)
+        return self.error is None and not self.gated and not self.timed_out and bool(self.reply)
 
     @property
     def exit_code(self) -> int:
         """The process exit code this turn implies, for a non-interactive driver.
 
-        Order is load-bearing: a raised turn beats a gated one (an exception means we cannot
-        trust what the pending list even is), and a gated turn beats the reply check — otherwise
-        a halt, which by construction has produced no reply yet, would report as a stall."""
+        Order is load-bearing, and every step of it was paid for:
+
+        - **A timeout beats the generic raise.** A timed-out turn always carries an ``error`` too
+          (it did not complete), so checking ``error`` first would collapse every timeout into
+          :data:`EXIT_TURN_FAILED` and tell a supervisor to hunt a traceback for a hung socket.
+          More specific outcome, earlier check.
+        - **A raised turn beats a gated one** — an exception means we cannot trust what the pending
+          list even is.
+        - **A gated turn beats the reply check** — otherwise a halt, which by construction has
+          produced no reply yet, would report as a stall.
+        """
+        if self.timed_out:
+            return EXIT_TIMEOUT
         if self.error is not None:
             return EXIT_TURN_FAILED
         if self.gated:
@@ -666,6 +711,14 @@ class EntitySession:
 
         try:
             self.conversation.send_message(message)
+        except TurnTimeout as exc:
+            # `send_message` is not obviously blocking, but the deadline is armed around the WHOLE
+            # turn and a bound that reclassifies itself depending on which statement it lands in
+            # would be a bound the operator cannot reason about. Same TYPE-first ordering as
+            # `_drive`.
+            return TurnResult(
+                reply=None, tool_activity=[], error=str(exc), timed_out=True,
+            )
         except Exception as exc:  # noqa: BLE001 — a failed turn is a RESULT, not a crash
             return TurnResult(reply=None, tool_activity=[], error=str(exc))
         return self._drive()
@@ -780,6 +833,19 @@ class EntitySession:
             # not happen. An episode asserting "I ran X" for an action a human refused would be
             # memory recording a fiction.
             self.binding.capture_turn(self.conversation)
+        except TurnTimeout as exc:
+            # BEFORE the generic handler, because `TurnTimeout` IS an `Exception` and the broad
+            # clause below would otherwise swallow it into an ordinary failed turn — losing the
+            # one distinction a supervisor acts on differently (stalled environment, retry on the
+            # cadence) and reporting `3` for a hung socket. Classified by TYPE, never by message.
+            #
+            # Note what is NOT here: no capture. The bound can fire anywhere inside this block,
+            # including mid-`capture_turn`, and a turn killed mid-flight has no completed work to
+            # record. That the bound covers capture too is deliberate — capture opens the store and
+            # can itself block, so exempting it would leave a hole in the very bound being added.
+            return TurnResult(
+                reply=None, tool_activity=[], error=str(exc), nudged=nudged, timed_out=True,
+            )
         except Exception as exc:  # noqa: BLE001 — a failed turn is a RESULT, not a crash
             return TurnResult(reply=None, tool_activity=[], error=str(exc), nudged=nudged)
 

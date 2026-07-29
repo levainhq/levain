@@ -1,0 +1,496 @@
+"""The WALL-CLOCK BOUND on a turn (K4a ⑥, ``spore-434``).
+
+**Every test here is a FALSIFICATION PAIR, not an assertion that the timeout fired.** The spore is
+explicit about why: K3's glm L3 HIGH was a test that stipulated its own success — it asserted the
+rejection path worked by arranging for it to work. So the shape throughout is *same code, same
+call, the BOUND is the only variable*: the short-work run must complete and the long-work run must
+be terminated. A test that only ever ran the long case would pass just as happily against a bound
+that fired unconditionally, which is a different and equally broken product.
+
+The blocking work under test is a real ``time.sleep`` — a genuine blocking syscall — because that is
+the failure being bounded (a stalled model call parked in a socket read). Proving the bound can
+interrupt a Python loop that checks a flag would prove nothing about it.
+"""
+
+from __future__ import annotations
+
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+
+import pytest
+
+from levain.firing.deadline import (
+    HARD_EXIT_GRACE_SECONDS,
+    TurnDeadline,
+    TurnTimeout,
+    format_timeout_report,
+)
+
+# Short enough to keep the suite fast, long enough not to be flaky on a loaded machine.
+_BOUND = 0.4
+_LONG_WORK = 10.0     # must be terminated
+_SHORT_WORK = 0.05    # must complete
+
+
+# ---------- layer 1: the graceful bound, falsified against a control ----------
+
+def test_the_bound_terminates_work_that_outruns_it() -> None:
+    """THE HALF THAT MUST FIRE. A blocking sleep longer than the bound is interrupted.
+
+    ``time.sleep`` is deliberate: it blocks in a syscall, which is exactly the shape of the stalled
+    model call this exists for. That it is interrupted at all is the whole claim — SIGALRM reaching
+    a thread parked in the kernel."""
+    started = time.monotonic()
+    with pytest.raises(TurnTimeout) as caught:
+        with TurnDeadline(_BOUND):
+            time.sleep(_LONG_WORK)
+    elapsed = time.monotonic() - started
+
+    assert caught.value.seconds == _BOUND
+    # The point is not merely "it raised" — it raised EARLY. Without the bound this would have
+    # taken _LONG_WORK; a generous ceiling still proves the work was cut short.
+    assert elapsed < _LONG_WORK / 2, f"took {elapsed:.2f}s — the bound did not cut the work short"
+
+
+def test_the_bound_SURVIVES_a_broad_except_exception_in_the_code_it_bounds() -> None:
+    """THE REGRESSION TEST FOR THE DEFECT L4-LIVE FOUND, AND THE ONE THIS SUITE ORIGINALLY LACKED.
+
+    The first live run of this bound against a genuinely stalled endpoint died at ``bound + grace``
+    by hard kill, with layer 1 leaving no trace — because the agent SDK's LLM path wraps its work in
+    broad ``except Exception`` handlers (five in ``llm.py`` alone), which caught the raise, treated it
+    as an LLM error, and RETRIED into the same dead socket. Every test in this file was GREEN
+    throughout, because they all bound a bare ``time.sleep`` and nothing was there to swallow
+    anything. `the_device_is_the_oracle`.
+
+    The fix is that ``TurnTimeout`` derives from ``BaseException``, for exactly the reason
+    ``KeyboardInterrupt`` does. This test pins it BEHAVIOURALLY rather than asserting the base class,
+    because what must hold is the property (a bound that escapes hostile handling), not the mechanism
+    — assert the class and someone can satisfy the test while re-breaking the product with a
+    ``except BaseException`` retry loop."""
+    swallowed: list[str] = []
+
+    def sdk_like_worker():
+        """Stands in for the SDK: broad handling around a blocking call, exactly as shipped."""
+        try:
+            time.sleep(_LONG_WORK)
+        except Exception as exc:  # noqa: BLE001 — the POINT of the test is that this is here
+            swallowed.append(type(exc).__name__)
+
+    started = time.monotonic()
+    with pytest.raises(TurnTimeout):
+        with TurnDeadline(_BOUND):
+            sdk_like_worker()
+    elapsed = time.monotonic() - started
+
+    assert swallowed == [], f"the bound was swallowed by a broad handler: {swallowed}"
+    assert elapsed < _LONG_WORK / 2, f"took {elapsed:.2f}s — the bound did not escape"
+
+
+def test_the_bound_leaves_work_that_finishes_inside_it_ALONE() -> None:
+    """THE CONTROL, and it is the half that makes the test above mean something.
+
+    Identical construction, identical call, only the duration differs. A bound that fired
+    unconditionally — or a `TurnTimeout` raised on exit regardless — would pass the test above and
+    fail this one. Without this pair, neither result is evidence."""
+    started = time.monotonic()
+    with TurnDeadline(_BOUND):
+        time.sleep(_SHORT_WORK)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < _BOUND, "the control run should not have waited for the bound at all"
+
+
+def test_the_bound_does_not_leak_into_the_code_that_follows_the_turn() -> None:
+    """A spent-but-uncancelled timer would raise TurnTimeout in the middle of UNRELATED work.
+
+    The real-world shape: a fast turn finishes at 2s under a 600s bound, the driver goes on to
+    render output and close the session, and 598s later an orphaned ITIMER fires into whatever is
+    running then. Cancellation is not hygiene here, it is correctness — and this is the test that
+    would catch `__exit__` forgetting to disarm."""
+    with TurnDeadline(_BOUND):
+        pass  # finish immediately, well inside the bound
+
+    # Outlive the bound OUTSIDE the guarded region. No exception may arrive.
+    time.sleep(_BOUND * 3)
+
+
+def test_a_late_signal_racing_the_exit_is_dropped_not_raised() -> None:
+    """The window between the body finishing and the timer being cancelled.
+
+    ``__exit__`` clears ``_active`` FIRST for exactly this: a signal already queued when teardown
+    begins must be recognised as spent, not raised out of some arbitrary line of the teardown. Here
+    the handler is invoked DIRECTLY after the region closed, which is the worst case of that race."""
+    deadline = TurnDeadline(_BOUND)
+    with deadline:
+        pass
+    # Simulating the delivery, not the timing: after the region, the handler must be inert.
+    deadline._on_alarm(signal.SIGALRM, None)  # must NOT raise
+
+
+def test_the_previous_sigalrm_handler_is_restored() -> None:
+    """A library that permanently steals SIGALRM breaks its host.
+
+    ``levain run`` owns its process, but ``EntitySession`` is the shared long-lived API and an
+    embedding application may well use SIGALRM itself. Leaving our handler installed would turn a
+    later unrelated alarm into a spurious `TurnTimeout`."""
+    sentinel_called: list[bool] = []
+
+    def sentinel(signum, frame):  # pragma: no cover — installed, not invoked
+        sentinel_called.append(True)
+
+    previous = signal.signal(signal.SIGALRM, sentinel)
+    try:
+        with TurnDeadline(_BOUND):
+            pass
+        assert signal.getsignal(signal.SIGALRM) is sentinel
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+# ---------- the disarmed cases: a non-bound must be a TRANSPARENT no-op ----------
+
+@pytest.mark.parametrize("seconds", [None, 0, 0.0, -1, -0.5])
+def test_a_non_positive_bound_arms_nothing(seconds) -> None:
+    """``None`` / zero / negative all mean "not bounded", and must not half-arm anything.
+
+    The negative case is the one with teeth. ``--max-seconds -1`` is a plausible typo, and a
+    deadline that treated it as "already expired" would terminate every turn instantly, while one
+    that armed a negative timer would be undefined. Both are worse than the CLI's answer, which is
+    to refuse it outright (see ``test_cli``) — this pins the library's own behaviour underneath."""
+    deadline = TurnDeadline(seconds)
+    assert deadline.enabled is False
+    with deadline:
+        time.sleep(_SHORT_WORK)
+    assert deadline._armed_signal is False
+    assert deadline._watchdog is None
+
+
+def test_disarmed_deadline_does_not_touch_the_sigalrm_handler() -> None:
+    """A no-op bound must not even briefly install a handler — a caller passing ``None`` (every
+    hand-run ``levain run --task``) should be indistinguishable from not using this module."""
+    def sentinel(signum, frame):  # pragma: no cover
+        pass
+
+    previous = signal.signal(signal.SIGALRM, sentinel)
+    try:
+        with TurnDeadline(None):
+            pass
+        assert signal.getsignal(signal.SIGALRM) is sentinel
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+# ---------- layer 2: the hard-exit backstop, in a real subprocess ----------
+#
+# The backstop calls os._exit, so it CANNOT be exercised in-process — a test that could would be
+# killing the test runner. It is driven as a subprocess, and the stall is made deliberately
+# un-interruptible by layer 1 in the most honest way available: run the deadline OFF THE MAIN
+# THREAD, where CPython refuses to install a signal handler at all. That is not a contrivance — it
+# is precisely the documented degradation path ("fails SOFT to the backstop, never open"), so this
+# tests the shipped claim rather than a mock of it.
+
+_BACKSTOP_SCRIPT = textwrap.dedent(
+    """
+    import sys, threading, time
+    sys.path.insert(0, {repo!r})
+    from levain.firing.deadline import TurnDeadline
+
+    def work():
+        # Off the main thread: signal.signal() raises ValueError here, so layer 1 CANNOT arm.
+        with TurnDeadline({bound!r}, grace={grace!r}, hard_exit_code=5):
+            time.sleep({work!r})
+        print("BODY-COMPLETED", flush=True)
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join()
+    print("JOINED", flush=True)
+    """
+)
+
+
+def _run_backstop(repo: str, *, work: float, bound: float = 0.4, grace: float = 0.4):
+    script = _BACKSTOP_SCRIPT.format(repo=repo, bound=bound, grace=grace, work=work)
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+@pytest.fixture()
+def repo_root() -> str:
+    from pathlib import Path
+    return str(Path(__file__).resolve().parent.parent)
+
+
+def test_the_backstop_kills_a_stall_layer_one_cannot_reach(repo_root) -> None:
+    """THE HALF THAT MUST FIRE. Off the main thread the graceful bound cannot arm — and the turn
+    is still bounded, because the watchdog does not care which thread it is on.
+
+    This is the test that makes the two-layer design worth its complexity. A single-layer SIGALRM
+    bound would leave this process running forever while reporting itself bounded — the same
+    `absence_of_signal_rendered_as_health` shape as the seat the whole slice exists to fix."""
+    started = time.monotonic()
+    proc = _run_backstop(repo_root, work=30.0)
+    elapsed = time.monotonic() - started
+
+    assert proc.returncode == 5, (
+        f"expected the hard-exit code 5, got {proc.returncode}\n"
+        f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert elapsed < 15.0, f"the backstop took {elapsed:.1f}s — it did not bound the stall"
+    # It must SAY SO. The entire defect being closed is a seat that stopped with nothing in any log
+    # explaining why, so a silent kill would only relocate the problem.
+    assert "WALL-CLOCK BOUND EXCEEDED" in proc.stderr
+    # And it must not claim the turn finished.
+    assert "BODY-COMPLETED" not in proc.stdout
+
+
+def test_the_backstop_leaves_a_fast_turn_alone(repo_root) -> None:
+    """THE CONTROL. Same script, same threading, same unarmed layer 1 — short work instead of long.
+
+    A watchdog that fired regardless, or a daemon thread that held the interpreter open, would show
+    up here as a non-zero exit or a hang. This is what proves the backstop is a bound and not a
+    guillotine."""
+    proc = _run_backstop(repo_root, work=0.05)
+
+    assert proc.returncode == 0, (
+        f"a fast turn must exit cleanly, got {proc.returncode}\n"
+        f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert "BODY-COMPLETED" in proc.stdout
+    assert "JOINED" in proc.stdout
+    assert "WALL-CLOCK BOUND EXCEEDED" not in proc.stderr
+
+
+def test_a_fast_turn_exits_promptly_under_a_long_bound(repo_root) -> None:
+    """A 2-second turn under a 30-minute bound must exit in 2 seconds, not 30 minutes.
+
+    ⚠ WHAT THIS DOES *NOT* PROVE, stated because the first version of this test claimed it did:
+    it does not exercise ``timer.daemon = True``. ``Timer.cancel()`` sets the timer's finished
+    event, so the thread wakes and returns immediately whether or not it is a daemon — meaning a
+    ``daemon=False`` regression is INVISIBLE here, and a mutation run confirmed it (that mutation
+    SURVIVED). The claim was corrected rather than the mutation explained away.
+
+    ``daemon=True`` is therefore genuine defence-in-depth against a path where ``__exit__`` never
+    runs, and it is deliberately NOT test-covered: with the context-manager form the only reachable
+    path always disarms, so any test of it would have to fake a call sequence the API does not
+    permit. Recorded here and in the source rather than papered over with a test that manufactures
+    its own premise. What this test DOES pin is the property an operator feels — the process leaves
+    when the work is done."""
+    started = time.monotonic()
+    proc = _run_backstop(repo_root, work=0.05, bound=20.0, grace=20.0)
+    elapsed = time.monotonic() - started
+
+    assert proc.returncode == 0
+    assert elapsed < 10.0, (
+        f"exit took {elapsed:.1f}s against a 20s bound — something is holding the interpreter open"
+    )
+
+
+# ---------- the report: it must NAME the timeout ----------
+
+def test_both_reports_name_the_bound_and_refuse_to_claim_a_capture() -> None:
+    graceful = format_timeout_report(90.0, hard=False)
+    hard = format_timeout_report(90.0, hard=True)
+
+    for report in (graceful, hard):
+        assert "90s" in report, "the report must name the bound that fired"
+        assert "WALL-CLOCK BOUND EXCEEDED" in report
+        # A timed-out turn captures nothing; saying so is what stops an operator assuming the
+        # episode store holds a record of what happened.
+        assert "captured" in report.lower()
+
+    # The hard report must DISCLOSE that layer 1 failed rather than presenting itself as a normal
+    # timeout — it changes what a supervisor should investigate (an un-interruptible stall).
+    assert "did NOT take" in hard
+    assert f"{HARD_EXIT_GRACE_SECONDS:g}s" in hard
+    assert "did NOT take" not in graceful
+
+
+def test_the_backstop_refuses_to_fire_after_the_turn_finished() -> None:
+    """The ``_active`` guard on ``_hard_exit``, tested DIRECTLY — because it and the timer
+    cancellation are defence-in-depth for each other, and either one alone is enough to keep a fast
+    turn alive. That mutual cover is desirable in the product and a hole in the tests: remove either
+    guard and every integration test still passes. So each is pinned on its own.
+
+    ``os._exit`` is intercepted rather than allowed to run. That is not test convenience — a test
+    that could actually perform the guarded act would take the test runner down with it, which is
+    precisely the discipline K4a [7] paid for when a mutation run installed a real launchd agent."""
+    from unittest import mock
+
+    import levain.firing.deadline as mod
+
+    deadline = TurnDeadline(_BOUND)
+    with deadline:
+        pass  # region closed — the backstop must now be inert
+
+    with mock.patch.object(mod.os, "_exit") as exiter:
+        deadline._hard_exit()
+    assert exiter.call_count == 0, "the backstop fired AFTER the turn had already finished"
+
+
+def test_the_backstop_does_fire_while_the_turn_is_live() -> None:
+    """THE CONTROL for the guard above. Without it, ``_hard_exit`` hardcoded to return immediately
+    would pass that test and ship a backstop that never fires — which is the whole defect."""
+    from unittest import mock
+
+    import levain.firing.deadline as mod
+
+    deadline = TurnDeadline(_BOUND)
+    with deadline:
+        with mock.patch.object(mod.os, "_exit") as exiter:
+            deadline._hard_exit()
+    exiter.assert_called_once_with(5)
+
+
+def test_the_grace_period_is_finite_and_leaves_room_for_teardown() -> None:
+    """Both directions matter. Too short truncates a healthy unwind (killing a session that was
+    already stopping, skipping the confined-shell teardown for no reason); too long reinstates the
+    starvation being fixed, since the seat's slot stays held for bound+grace."""
+    assert 0 < HARD_EXIT_GRACE_SECONDS <= 60
+
+
+# ---------- the session classifies a timeout as a TIMEOUT, not a generic failure ----------
+#
+# `TurnTimeout` IS an `Exception`, so `_drive`'s broad handler will swallow it into an ordinary
+# failed turn unless the narrow clause comes first. That collapse is invisible in normal operation —
+# the turn still ends, the driver still exits non-zero — and it costs the one distinction a
+# supervisor acts on: exit 3 says "read the traceback, the work is broken", exit 5 says "the
+# endpoint stalled, the next scheduled run is fine".
+
+
+class _CountingBinding:
+    def __init__(self, tmp_path):
+        self.entity_dir = tmp_path
+        self.store_path = tmp_path / "store"
+        self.crystal_path = tmp_path / "crystal.json"
+        self.captures = 0
+
+    def capture_turn(self, conversation):
+        self.captures += 1
+
+    def wrap_nudge(self, **kwargs):
+        return None
+
+
+class _State:
+    events: list = []
+    agent_state: dict = {}
+
+
+class _StallingConversation:
+    """A conversation whose ``run()`` is interrupted by the wall-clock bound, as a real one is."""
+
+    def __init__(self, raise_on: str = "run") -> None:
+        self.state = _State()
+        self.raise_on = raise_on
+        self.runs = 0
+
+    def send_message(self, message):
+        if self.raise_on == "send":
+            raise TurnTimeout(_BOUND)
+
+    def run(self):
+        self.runs += 1
+        if self.raise_on == "run":
+            raise TurnTimeout(_BOUND)
+
+
+class _FailingConversation:
+    """The CONTROL: an ordinary exception, which must NOT be classified as a timeout."""
+
+    def __init__(self) -> None:
+        self.state = _State()
+
+    def send_message(self, message):
+        pass
+
+    def run(self):
+        raise RuntimeError("the model returned garbage")
+
+
+def _session(tmp_path, conv):
+    from levain.session import EntitySession
+
+    return EntitySession(
+        entity_dir=tmp_path,
+        binding=_CountingBinding(tmp_path),
+        conversation=conv,
+        workspace=tmp_path / "workspace",
+        model_label="ollama/glm-5.2:cloud",
+        with_tools=True,
+        bash_ok=True,
+        gate_mode="ungated",
+    )
+
+
+@pytest.mark.parametrize("raise_on", ["run", "send"])
+def test_a_timed_out_turn_is_classified_as_a_timeout_not_a_raise(tmp_path, raise_on) -> None:
+    """THE HALF THAT MUST FIRE — and both statements of the turn are covered, because a bound whose
+    meaning depends on which line it lands in is a bound nobody can reason about."""
+    from levain.session import EXIT_TIMEOUT
+
+    sess = _session(tmp_path, _StallingConversation(raise_on=raise_on))
+
+    result = sess.run_turn("summarise the overnight findings")
+
+    assert result.timed_out is True
+    assert result.exit_code == EXIT_TIMEOUT == 5
+    assert result.ok is False
+
+
+def test_an_ordinary_failure_is_NOT_classified_as_a_timeout(tmp_path) -> None:
+    """THE CONTROL. Same session, same call, a different exception — and it must still be exit 3.
+
+    Without this, `timed_out=True` hardcoded on every error would pass the test above. This is also
+    the test that fails if someone ever classifies a timeout by matching text in the error message:
+    broaden that match and ordinary failures start reporting as stalls."""
+    from levain.session import EXIT_TURN_FAILED
+
+    sess = _session(tmp_path, _FailingConversation())
+
+    result = sess.run_turn("summarise the overnight findings")
+
+    assert result.timed_out is False
+    assert result.exit_code == EXIT_TURN_FAILED == 3
+    assert "garbage" in (result.error or "")
+
+
+def test_a_timed_out_turn_is_NEVER_captured_to_memory(tmp_path) -> None:
+    """Same discipline as the gated halt, for the same reason. The turn was killed mid-flight, so
+    what completed is unknowable — and an episode asserting a completed turn would be a store
+    perfectly grounded in a perfectly recorded fiction."""
+    sess = _session(tmp_path, _StallingConversation())
+
+    sess.run_turn("summarise the overnight findings")
+
+    assert sess.binding.captures == 0, "a timed-out turn must not be written to memory"
+
+
+def test_the_timeout_code_beats_the_error_code_when_BOTH_are_set() -> None:
+    """The ordering inside ``exit_code``, pinned directly.
+
+    A timed-out turn ALWAYS carries an error too (it did not complete), so checking ``error`` first
+    would collapse every timeout into 3. This is the one-line regression that would silently undo
+    the whole distinction, so it gets its own test rather than riding on the integration ones."""
+    from levain.session import EXIT_TIMEOUT, TurnResult
+
+    both = TurnResult(reply=None, tool_activity=[], error="bound exceeded", timed_out=True)
+
+    assert both.exit_code == EXIT_TIMEOUT
+    assert both.ok is False
+
+
+def test_a_timed_out_turn_is_not_ok_even_with_a_partial_reply() -> None:
+    """A reply produced before the bound fired does not make the turn complete — the work it was
+    still doing was cut off, and reporting `ok` would hand a caller a half-turn as a whole one."""
+    from levain.session import EXIT_TIMEOUT, TurnResult
+
+    partial = TurnResult(reply="I'll start by reading the", tool_activity=[], timed_out=True)
+
+    assert partial.ok is False
+    assert partial.exit_code == EXIT_TIMEOUT

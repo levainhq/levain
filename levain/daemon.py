@@ -50,6 +50,17 @@ DEFAULT_SEAT_INTERVAL = 3600
 # alternative is the SDK's own limit, which nobody chose for this purpose. Calibrate against a
 # seat that has actually run rather than reasoning about it (`derive_dont_invent`).
 DEFAULT_SEAT_MAX_ITERATIONS = 40
+# A STARTING wall-clock bound for an unattended turn (K4a ⑥, `spore-434`). Finite for a REASON that
+# is stronger than the step bound's: a turn hung inside ONE step is unbounded by `max_iterations`,
+# and because launchd COALESCES per label the seat then never runs again at all — behind a unit
+# still reporting installed and loaded. So this is not belt-and-braces on the step bound; it is the
+# only thing that makes "restartable" true.
+#
+# 1800s = half the default hourly cadence. Chosen to sit comfortably ABOVE a legitimate 40-step turn
+# on a cloud open model (tens of seconds per step) and comfortably BELOW the interval, so a bounded
+# turn never starves its own next run. Like the step bound, a STARTING number to calibrate against a
+# seat that has actually run — not a derived one (`derive_dont_invent`).
+DEFAULT_SEAT_MAX_SECONDS = 1800.0
 # launchd's default minimum respawn spacing (`man launchd.plist` → ThrottleInterval). A
 # StartInterval below this is silently throttled up to it unless ThrottleInterval is lowered too.
 _LAUNCHD_DEFAULT_THROTTLE = 10
@@ -231,6 +242,7 @@ def build_seat_spec(
     label: str = DEFAULT_SEAT_LABEL,
     model: str | None = None,
     max_iterations: int | None = DEFAULT_SEAT_MAX_ITERATIONS,
+    max_seconds: float | None = DEFAULT_SEAT_MAX_SECONDS,
     log_dir: Path | None = None,
 ) -> DaemonSpec:
     """Build the OS-agnostic spec for a **scheduled governed seat** (K4a) — ONE sovereign entity
@@ -252,6 +264,18 @@ def build_seat_spec(
       unattended turn with no step bound can spend indefinitely with nobody watching. The default
       is a STARTING bound to be calibrated against a seat that has actually run — not a derived
       number (``derive_dont_invent``). Pass ``None`` to fall back to the SDK's own limit.
+    - **``--max-seconds`` defaults ON, and it is the one that makes "restartable" TRUE**
+      (K4a ⑥, ``spore-434``). The step bound above counts STEPS, so a turn hung inside ONE of them —
+      a stalled model call, a socket with no read timeout — is not bounded by it at all. And because
+      launchd **coalesces per label**, launchd will not start the next turn while that one lives:
+      the seat stops running FOREVER behind a unit that still reports installed and loaded, with
+      nothing in either log saying so. The two bounds are therefore not redundant; they bound
+      different failure modes, and only this one bounds the silent-death one.
+
+      Enforced IN-PROCESS rather than by the unit file, which is what lets ``K4c`` inherit it:
+      launchd has no ``RuntimeMaxSec`` and macOS has no ``timeout`` binary, so a unit-file bound
+      would be Linux-only and leave macOS holed — one requirement, two enforcement models, the trap
+      ``K4c`` is already warned about for confinement.
     - **The entity path is POSITIONAL** (``levain run <path>``), not ``--path``. Resolved absolute,
       because a login-launched unit has no stable cwd.
 
@@ -272,6 +296,13 @@ def build_seat_spec(
         argv += ["--model", model]
     if max_iterations is not None:
         argv += ["--max-iterations", str(max_iterations)]
+    if max_seconds is not None:
+        # EMITTED into the argv, like `--unattended`, so the seat's time bound is auditable in the
+        # unit file itself. A bound that lived only in a default inside the binary would leave an
+        # auditor of the plist unable to tell a bounded seat from an unbounded one — and "is this
+        # seat restartable" is exactly the question a plist reader is trying to answer.
+        # `%g` so a whole number of seconds renders as `1800`, not `1800.0`.
+        argv += ["--max-seconds", f"{max_seconds:g}"]
     logs = (log_dir or _default_log_dir()).expanduser().resolve()
     return DaemonSpec(
         label=label,

@@ -368,6 +368,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     run_p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        dest="max_seconds",
+        help=(
+            "With --task: bound the run to N seconds of WALL-CLOCK time and exit 5 if it is "
+            "exceeded. Different guarantee from --max-iterations, which counts STEPS and so "
+            "cannot bound a turn that hangs inside ONE step (a stalled model call). Default: "
+            "unbounded for a hand-run task; a scheduled seat always sets it."
+        ),
+    )
+    run_p.add_argument(
         "--unattended",
         action="store_true",
         help=(
@@ -638,6 +650,14 @@ def main(argv: list[str] | None = None) -> int:
                             "finite built-in bound — an unattended turn with no bound can spend "
                             "indefinitely with nobody watching; 0 = the SDK's own limit)."
                         ))
+    d_seat.add_argument("--max-seconds", type=float, default=None, dest="max_seconds",
+                        help=(
+                            "Bound each turn to N seconds of WALL-CLOCK time (default: a finite "
+                            "built-in bound). REQUIRED for a seat to be restartable: a turn hung "
+                            "inside one step is unbounded by --max-iterations, and because launchd "
+                            "coalesces per label the seat would then never run again. 0 disables "
+                            "it — do not, unless something else bounds the process."
+                        ))
     d_seat.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="Show what would be installed + the true live state; change nothing.")
     d_seat.set_defaults(func=_cmd_daemon_install_seat)
@@ -852,6 +872,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if task is not None:
         from levain.run import run_task
 
+        max_seconds = getattr(args, "max_seconds", None)
+        # A NEGATIVE bound is refused, not normalized. Both L3 lineages independently caught a
+        # negative `--max-iterations` reaching the seat argv, and the CLASS — not the symptom — is
+        # "any numeric bound flag accepts nonsense and the nonsense becomes policy". A negative
+        # wall-clock bound is worse than a bad step count: `TurnDeadline` treats non-positive as
+        # DISARMED, so `--max-seconds -1` would read as "bound it tightly" and deliver "not bounded
+        # at all" (`guard_scoped_by_symptom_misses_the_class`).
+        if max_seconds is not None and max_seconds < 0:
+            print(
+                f"levain run: --max-seconds must be >= 0, got {max_seconds:g}. "
+                f"Use 0 to disable the wall-clock bound explicitly.",
+                file=sys.stderr,
+            )
+            return 2
         return run_task(
             path=args.path,
             task=task,
@@ -861,6 +895,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             with_tools=args.with_tools,
             quiet=getattr(args, "quiet", False),
             max_iterations=getattr(args, "max_iterations", None),
+            # 0 means "explicitly unbounded" — normalize it to None at the boundary so exactly one
+            # representation of "no bound" reaches the deadline.
+            max_seconds=None if max_seconds == 0 else max_seconds,
             unattended=getattr(args, "unattended", False),
         )
 
@@ -948,6 +985,20 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _seat_bounds_line(max_iterations: int | None, max_seconds: float | None) -> str:
+    """Render the seat's two bounds as one line, naming what is UNBOUNDED as such.
+
+    Both are shown together because they bound different failure modes and an operator reading one
+    cannot infer the other: steps bound a turn that keeps working, wall-clock bounds a turn that
+    STOPS working (a hung model call). "unbounded" is printed as a word rather than omitted — a
+    missing bound rendered as a blank reads as a default, which is how an unbounded seat would look
+    exactly like a bounded one.
+    """
+    steps = f"{max_iterations} steps" if max_iterations is not None else "steps UNBOUNDED"
+    secs = f"{max_seconds:g}s wall-clock" if max_seconds is not None else "wall-clock UNBOUNDED"
+    return f"{steps} · {secs}"
+
+
 def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     from levain import daemon
     from levain.session import require_openhands_entity
@@ -985,6 +1036,22 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         else (None if args.max_iterations == 0 else args.max_iterations)
     )
 
+    # SAME THREE-VALUED TREATMENT FOR THE WALL-CLOCK BOUND — deliberately identical shape to the
+    # step bound above rather than a second convention, because the two flags answer the same
+    # question in different units and an operator should not have to learn each one separately.
+    if args.max_seconds is not None and args.max_seconds < 0:
+        print(
+            f"levain daemon install-seat: --max-seconds must be >= 0, got "
+            f"{args.max_seconds:g}. Use 0 to disable the wall-clock bound explicitly, or omit "
+            f"the flag for the finite default ({daemon.DEFAULT_SEAT_MAX_SECONDS:g}s).",
+            file=sys.stderr,
+        )
+        return 2
+    max_secs = (
+        daemon.DEFAULT_SEAT_MAX_SECONDS if args.max_seconds is None
+        else (None if args.max_seconds == 0 else args.max_seconds)
+    )
+
     # Read the entity's DECLARED gate posture and resolve it exactly as the runtime will for an
     # unattended drive, so the output below states what will actually happen (see the print block).
     # Fail-safe: an unreadable/…invalid config must not silently produce a "governed" claim.
@@ -992,6 +1059,7 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         spec = daemon.build_seat_spec(
             entity_path=entity, task=args.task, interval=args.interval,
             label=args.label, model=args.model, max_iterations=max_iters,
+            max_seconds=max_secs,
         )
     except ValueError as exc:      # an incoherent schedule (e.g. --interval 0)
         print(f"levain daemon install-seat: {exc}", file=sys.stderr)
@@ -1055,6 +1123,7 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         print(f"  entity:  {entity}")
         print(f"  task:    {args.task}")
         print(f"  cadence: every {spec.start_interval}s")
+        print(f"  bounds:  {_seat_bounds_line(max_iters, max_secs)}")
         print(f"  unit:    {plan.unit_path}")
         print(f"  on disk: {on_disk}")
         print(f"  live:    {st.load_state} — {st.detail}")
@@ -1070,6 +1139,32 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     print(result)
     print(f"\n  seat:   {entity}")
     print(f"  task:   {args.task}")
+    print(f"  bounds: {_seat_bounds_line(max_iters, max_secs)}")
+    # THE BOUND AND THE CADENCE INTERACT, AND THE OPERATOR CANNOT SEE IT FROM EITHER FLAG ALONE.
+    # launchd coalesces per label, so a turn allowed to run longer than the interval necessarily
+    # skips intervals — the cadence silently becomes the bound. This is NOT an error and is not
+    # refused: "poll as often as possible, one at a time" is a legitimate pattern (short interval,
+    # long bound). But it must be SAID, because the operator asked for one cadence and will get
+    # another, and a schedule that quietly means something else is how the original defect hid.
+    if max_secs is not None and max_secs >= args.interval:
+        print(
+            f"\n  ⓘ the time bound ({max_secs:g}s) is >= the cadence ({args.interval}s). launchd "
+            f"coalesces per label,\n"
+            f"    so a long turn will SKIP intervals — the effective cadence becomes the turn's "
+            f"own duration.\n"
+            f"    Fine if that is what you want; lower --max-seconds or raise --interval if not."
+        )
+    elif max_secs is None:
+        # The one genuinely dangerous configuration, and it is opt-in, so say what it costs.
+        print(
+            "\n  ⚠ NO WALL-CLOCK BOUND (--max-seconds 0). A turn that hangs inside one step will "
+            "never exit,\n"
+            "    and because launchd coalesces per label this seat would then STOP RUNNING "
+            "PERMANENTLY behind a\n"
+            "    unit still reporting installed + loaded. Nothing will tell you. Set "
+            "--max-seconds unless something\n"
+            "    else bounds this process."
+        )
     # BOTH streams, and the .err one is named LAST because it carries the decision. launchd sends
     # stdout and stderr to SEPARATE files, and the gated-halt report ("HELD AT THE EFFERENT GATE"
     # + the pending-action list) is printed to STDERR. Naming only the stdout path sends the

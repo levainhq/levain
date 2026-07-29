@@ -15,6 +15,7 @@ to pass today.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from levain.session import (
     EXIT_GATED,
     EXIT_NO_REPLY,
     EXIT_OK,
+    EXIT_TIMEOUT,
     EXIT_TURN_FAILED,
     EXIT_USAGE,
     SessionStartError,
@@ -103,10 +105,20 @@ def test_turn_result_error_is_exit_turn_failed_even_with_a_reply():
 
 def test_exit_codes_are_distinct_and_stable():
     # These are a PROCESS CONTRACT a scheduler/supervisor branches on — pin the values.
-    assert (EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED) == (0, 1, 2, 3, 4)
+    assert (EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED, EXIT_TIMEOUT) == (
+        0, 1, 2, 3, 4, 5,
+    )
     # And they must stay DISTINCT — the whole value of the contract is that a supervisor can
     # tell "waiting for a human" from "stalled" without reading prose.
-    assert len({EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED}) == 5
+    assert len({
+        EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED, EXIT_TIMEOUT,
+    }) == 6
+    # None of them may collide with a shell-reserved code, or a supervisor cannot distinguish the
+    # entity's own report from the shell's. 126/127 = "found but not executable"/"not found",
+    # 128+n = killed by signal n. EXIT_INTERRUPTED=130 is deliberately IN that space (it means
+    # exactly what 128+SIGINT means); the rest must stay out of it.
+    for code in (EXIT_OK, EXIT_NO_REPLY, EXIT_USAGE, EXIT_TURN_FAILED, EXIT_GATED, EXIT_TIMEOUT):
+        assert code < 126
 
 
 def test_turn_result_carries_no_task_success_field():
@@ -119,9 +131,18 @@ def test_turn_result_carries_no_task_success_field():
     distinction IS the floor: both are things the HARNESS observed — the runtime's own execution
     status, and the tool calls sitting un-executed in its event log — never something the agent
     asserted about its own work. The forbidden list below is what a self-report looks like.
-    Widening this set is fine; widening it with a self-report is the failure."""
+    Widening this set is fine; widening it with a self-report is the failure.
+
+    The K4a ⑥ addition (``timed_out``, ``spore-434``) is admissible for the same reason, and is
+    arguably the purest case of it: it records that OUR OWN wall-clock timer fired. The agent has
+    no input into it at all — indeed the whole point is that it holds even when the agent has
+    stopped responding entirely, which is the one circumstance in which a self-report is guaranteed
+    to be absent. This test failing on that addition is the mechanism working: a new field on this
+    class is a decision, not a detail."""
     fields = set(TurnResult.__dataclass_fields__)
-    assert fields == {"reply", "tool_activity", "error", "nudged", "gated", "pending"}
+    assert fields == {
+        "reply", "tool_activity", "error", "nudged", "gated", "pending", "timed_out",
+    }
     for forbidden in ("succeeded", "success", "task_ok", "passed", "verdict"):
         assert not hasattr(TurnResult(reply="x"), forbidden)
 
@@ -742,3 +763,122 @@ def test_apply_drive_policy_handles_a_toolless_session(monkeypatch):
 
     assert _apply_drive_policy(None, "unattended") is True
     assert current_drive_mode() == "unattended"
+
+
+# ---------- the WALL-CLOCK BOUND reaches the driver (K4a ⑥, `spore-434`) ----------
+#
+# These exist because a mutation pass found the hole: removing the deadline from `run_task`
+# ENTIRELY, and deleting the branch that reports a timeout, both SURVIVED the suite. Nothing was
+# driving `run_task` with a bound at all — the same shape as the K4a discovery that no test ever ran
+# the real `EntitySession.open`. A bound that only the library has tests for is a bound the product
+# does not necessarily have.
+
+
+class _SlowSession(_FakeSession):
+    """A session whose turn genuinely BLOCKS, so the driver's own deadline has to interrupt it.
+
+    Deliberately does NOT catch `TurnTimeout` — a real `EntitySession.run_turn` does, but letting it
+    propagate here is what proves the DRIVER armed the bound rather than the session classifying one
+    it was handed."""
+
+    def __init__(self, tmp_path: Path, result: TurnResult, *, sleep_for: float):
+        super().__init__(tmp_path, result)
+        self.sleep_for = sleep_for
+
+    def run_turn(self, message: str) -> TurnResult:
+        import time as _time
+        self.turns.append(message)
+        _time.sleep(self.sleep_for)
+        return self._result
+
+
+def test_run_task_ARMS_the_wall_clock_bound(tmp_path: Path, monkeypatch, capsys):
+    """THE HALF THAT MUST FIRE — end-to-end through the real driver, with a real blocking turn.
+
+    This is the test whose absence let "the driver never arms the deadline" survive mutation."""
+    from levain.run import run_task
+
+    sess = _SlowSession(tmp_path, TurnResult(reply="done", tool_activity=[]), sleep_for=10.0)
+    _patch_open(monkeypatch, sess)
+
+    started = time.monotonic()
+    rc = run_task(tmp_path, "summarise the findings", quiet=True, max_seconds=0.4)
+    elapsed = time.monotonic() - started
+    out = capsys.readouterr()
+
+    assert rc == EXIT_TIMEOUT == 5
+    assert elapsed < 5.0, f"took {elapsed:.1f}s — the driver did not bound the turn"
+    assert "WALL-CLOCK BOUND EXCEEDED" in out.err, "the log must name the timeout"
+    assert out.out.strip() == "", "stdout is the reply payload, and there is no completed reply"
+    assert sess.closed_count == 1, "the session must still be closed on the timeout path"
+
+
+def test_run_task_LEAVES_a_turn_that_finishes_inside_the_bound(tmp_path: Path, monkeypatch, capsys):
+    """THE CONTROL. Same driver, same bound, work that fits — must be a completely ordinary success.
+
+    Without this, a driver that returned 5 unconditionally would pass the test above."""
+    from levain.run import run_task
+
+    sess = _SlowSession(tmp_path, TurnResult(reply="done", tool_activity=[]), sleep_for=0.02)
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "summarise the findings", quiet=True, max_seconds=5.0)
+    out = capsys.readouterr()
+
+    assert rc == EXIT_OK == 0
+    assert out.out.strip() == "done"
+    assert "WALL-CLOCK BOUND EXCEEDED" not in out.err
+
+
+def test_run_task_without_a_bound_is_UNCHANGED(tmp_path: Path, monkeypatch, capsys):
+    """The default path — a hand-run `levain run --task` — must arm nothing. A bound that switched
+    itself on by default would silently start killing long legitimate interactive tasks."""
+    from levain.run import run_task
+
+    sess = _SlowSession(tmp_path, TurnResult(reply="done", tool_activity=[]), sleep_for=0.3)
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "a long task", quiet=True)  # no max_seconds
+
+    assert rc == EXIT_OK == 0
+    assert "WALL-CLOCK BOUND EXCEEDED" not in capsys.readouterr().err
+
+
+def test_run_task_reports_a_timeout_the_SESSION_classified(tmp_path: Path, monkeypatch, capsys):
+    """The other route to the same outcome: a REAL `EntitySession.run_turn` catches `TurnTimeout`
+    itself and returns `timed_out=True`, so the driver must recognise the FIELD too — not only the
+    exception. Both paths must produce one wording, or the same event reads differently depending on
+    which line the bound happened to land on."""
+    from levain.run import run_task
+
+    sess = _FakeSession(
+        tmp_path,
+        TurnResult(reply=None, tool_activity=[], error="bound exceeded", timed_out=True),
+    )
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "summarise", quiet=True, max_seconds=60.0)
+    err = capsys.readouterr().err
+
+    assert rc == EXIT_TIMEOUT == 5
+    assert "WALL-CLOCK BOUND EXCEEDED" in err
+    # It must NOT be described as a failed task — that sends a supervisor after a bug in the work.
+    assert "the task failed" not in err
+
+
+def test_run_task_still_reports_an_ordinary_failure_as_a_failure(tmp_path: Path, monkeypatch, capsys):
+    """THE CONTROL for the branch above. A generic error must keep its own wording and its own code,
+    or the timeout branch has simply swallowed the error branch."""
+    from levain.run import run_task
+
+    sess = _FakeSession(
+        tmp_path, TurnResult(reply=None, tool_activity=[], error="the model returned garbage"),
+    )
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "summarise", quiet=True, max_seconds=60.0)
+    err = capsys.readouterr().err
+
+    assert rc == EXIT_TURN_FAILED == 3
+    assert "the task failed" in err
+    assert "WALL-CLOCK BOUND EXCEEDED" not in err
