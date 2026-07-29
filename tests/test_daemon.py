@@ -17,7 +17,9 @@ import pytest
 from levain import daemon
 from levain.daemon import (
     DaemonError,
+    DaemonSpec,
     LaunchdProvider,
+    build_seat_spec,
     build_spec,
     select_provider,
 )
@@ -383,3 +385,214 @@ def test_restart_raises_on_failure(monkeypatch) -> None:
     monkeypatch.setattr(daemon.subprocess, "run", _FakeRun(rc_for={"kickstart": 3}))
     with pytest.raises(DaemonError):
         LaunchdProvider().restart("com.levainhq.t")
+
+
+# --- K4a: the scheduled governed seat (periodic, not resident) --------------------------------
+#
+# A seat and the cockpit are DIFFERENT SHAPES of supervised process: the cockpit is resident
+# (keep_alive, no interval), a seat runs one bounded turn on a cadence and exits. These tests pin
+# the difference, and pin the three argv choices that each look like an obvious flag to flip.
+
+def test_seat_spec_is_periodic_not_resident(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", interval=1800,
+                           log_dir=tmp_path / "logs")
+    assert spec.start_interval == 1800
+    assert spec.keep_alive is False        # a KeepAlive seat would ignore its own interval
+    assert spec.run_at_login is False      # installing a schedule ≠ spending a turn right now
+
+
+def test_seat_spec_passes_entity_path_positionally_not_as_a_flag(tmp_path) -> None:
+    # `levain run` takes the entity dir POSITIONALLY; a `--path` would be a usage error that
+    # fails identically every interval, forever, into a log nobody is watching.
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="review", log_dir=tmp_path / "l")
+    assert "--path" not in spec.argv
+    run_i = spec.argv.index("run")
+    assert spec.argv[run_i + 1] == str((tmp_path / "ent").resolve())
+    assert spec.argv[spec.argv.index("--task") + 1] == "review"
+
+
+def test_seat_spec_resolves_entity_path_absolute(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=Path("."), task="t", log_dir=tmp_path / "l")
+    assert Path(spec.argv[spec.argv.index("run") + 1]).is_absolute()
+
+
+def test_seat_spec_does_not_quiet_the_activity_stream(tmp_path) -> None:
+    # --quiet suppresses tool activity and prints only the final reply. For an UNATTENDED seat
+    # that stream IS the operator's fan-in surface — the record of what it did, including a K3
+    # gated halt. Quieting it leaves a log that cannot tell "did nothing" from "was stopped".
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", log_dir=tmp_path / "l")
+    assert "--quiet" not in spec.argv
+
+
+def test_seat_spec_bounds_iterations_by_default(tmp_path) -> None:
+    # "time-bounded" is part of K4a's definition: an unattended turn with no step bound can
+    # spend indefinitely with nobody watching.
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", log_dir=tmp_path / "l")
+    i = spec.argv.index("--max-iterations")
+    assert spec.argv[i + 1] == str(daemon.DEFAULT_SEAT_MAX_ITERATIONS)
+
+
+def test_seat_spec_iteration_bound_is_opt_outable(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", max_iterations=None,
+                           log_dir=tmp_path / "l")
+    assert "--max-iterations" not in spec.argv
+
+
+def test_seat_and_cockpit_do_not_share_a_label() -> None:
+    # colliding labels would make `daemon install` silently REPLACE one unit with the other.
+    assert daemon.DEFAULT_SEAT_LABEL != daemon.DEFAULT_LABEL
+
+
+# --- the invariant: a periodic spec that keeps alive is UNREPRESENTABLE ------------------------
+
+def test_periodic_spec_refuses_keep_alive() -> None:
+    # launchd relaunches a KeepAlive job the instant it exits, so periodic+keepalive silently
+    # collapses the cadence into a hot loop — a unit that renders cleanly and LIES about itself.
+    with pytest.raises(ValueError, match="keep_alive=False"):
+        DaemonSpec(label="x", argv=["a"], working_dir=Path("/"), env={},
+                   stdout_log=Path("/o"), stderr_log=Path("/e"),
+                   keep_alive=True, start_interval=60)
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_periodic_spec_refuses_nonpositive_interval(bad: int) -> None:
+    with pytest.raises(ValueError, match="positive number of seconds"):
+        DaemonSpec(label="x", argv=["a"], working_dir=Path("/"), env={},
+                   stdout_log=Path("/o"), stderr_log=Path("/e"),
+                   keep_alive=False, start_interval=bad)
+
+
+def test_resident_spec_is_unaffected_by_the_invariant() -> None:
+    spec = DaemonSpec(label="x", argv=["a"], working_dir=Path("/"), env={},
+                      stdout_log=Path("/o"), stderr_log=Path("/e"), keep_alive=True)
+    assert spec.start_interval is None and spec.keep_alive is True
+
+
+# --- rendering --------------------------------------------------------------------------------
+
+def test_render_unit_emits_start_interval_for_a_seat(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", interval=900,
+                           log_dir=tmp_path / "l")
+    doc = plistlib.loads(LaunchdProvider().render_unit(spec).encode("utf-8"))
+    assert doc["StartInterval"] == 900
+    assert doc["KeepAlive"] is False
+
+
+def test_render_unit_omits_start_interval_for_the_resident_cockpit(tmp_path) -> None:
+    # non-regression: the cockpit unit must be untouched by the seat addition.
+    spec = build_spec(install_path=tmp_path / "inst", port=7420)
+    doc = plistlib.loads(LaunchdProvider().render_unit(spec).encode("utf-8"))
+    assert "StartInterval" not in doc
+    assert doc["KeepAlive"] is True
+
+
+# --- install: a seat is NOT kickstarted, and idle is NOT an alarm -----------------------------
+
+def test_install_does_not_kickstart_a_periodic_seat(launchd, tmp_path) -> None:
+    prov, fake = launchd
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", label="com.levainhq.seat.t",
+                           log_dir=tmp_path / "logs")
+    prov.install(spec)
+    assert fake.subs[:2] == ["bootout", "bootstrap"]
+    assert "kickstart" not in fake.subs   # installing a schedule must not spend a model turn now
+
+
+def test_install_of_a_seat_reports_idle_as_normal_not_as_a_fault(launchd, tmp_path) -> None:
+    # The resident path says "NOT yet running — check the log" when there's no pid. For a periodic
+    # seat between turns that is the HEALTHY state, and that message is a false alarm.
+    prov, fake = launchd
+    spec = build_seat_spec(entity_path=tmp_path / "ent", task="t", interval=1800,
+                           label="com.levainhq.seat.t", log_dir=tmp_path / "logs")
+    msg = prov.install(spec)
+    assert "NOT yet running" not in msg
+    assert "1800s" in msg and "NORMAL" in msg
+    # BOTH streams named here too — the stdout-only pointer that codex's HIGH was about existed
+    # in TWO places, and fixing only the CLI copy would leave the same lie in the install banner.
+    assert str(spec.stdout_log) in msg and str(spec.stderr_log) in msg
+
+
+def test_install_of_the_cockpit_still_kickstarts_and_still_warns(launchd, tmp_path) -> None:
+    # non-regression on the resident path: both behaviours preserved.
+    prov, fake = launchd
+    spec = build_spec(install_path=tmp_path / "inst", port=7420, label="com.levainhq.c",
+                      log_dir=tmp_path / "logs")
+    msg = prov.install(spec)
+    assert "kickstart" in fake.subs
+    assert "NOT yet running" in msg   # no pid from the fake → the resident alarm still fires
+
+
+# --- L3 fixes: the unit must not lie about itself ---------------------------------------------
+
+def test_render_unit_lowers_throttle_for_a_sub_10s_interval(tmp_path) -> None:
+    """launchd will not spawn a job more than once every 10s by default (ThrottleInterval). A
+    sub-10s StartInterval otherwise installs happily and REPORTS its requested cadence while
+    launchd silently enforces ~10s — the unit lying about itself. (codex L3 MEDIUM.)"""
+    spec = build_seat_spec(entity_path=tmp_path / "e", task="t", interval=5,
+                           log_dir=tmp_path / "l")
+    doc = plistlib.loads(LaunchdProvider().render_unit(spec).encode("utf-8"))
+    assert doc["StartInterval"] == 5
+    assert doc["ThrottleInterval"] == 5
+
+
+def test_render_unit_leaves_throttle_default_at_or_above_10s(tmp_path) -> None:
+    spec = build_seat_spec(entity_path=tmp_path / "e", task="t", interval=3600,
+                           log_dir=tmp_path / "l")
+    doc = plistlib.loads(LaunchdProvider().render_unit(spec).encode("utf-8"))
+    assert "ThrottleInterval" not in doc      # don't override launchd's default needlessly
+
+
+def test_bootstrap_failure_message_does_not_promise_login_retry_to_a_seat(tmp_path,
+                                                                          monkeypatch) -> None:
+    """A seat has RunAtLoad=False, so "RunAtLoad will retry it at next login" is FALSE for it —
+    the operator reboots and waits for a run that never comes. (glm L3 MEDIUM.)"""
+    monkeypatch.setattr(LaunchdProvider, "UNIT_DIR", tmp_path / "LaunchAgents")
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(daemon.subprocess, "run",
+                        _FakeRun(rc_for={"bootstrap": 1}))
+    spec = build_seat_spec(entity_path=tmp_path / "e", task="t", interval=1800,
+                           label="com.levainhq.seat.z", log_dir=tmp_path / "logs")
+    with pytest.raises(DaemonError) as exc:
+        LaunchdProvider().install(spec)
+    msg = str(exc.value)
+    assert "RunAtLoad will retry it at next login" not in msg
+    assert "RunAtLoad=False" in msg and "1800s" in msg
+
+
+def test_bootstrap_failure_message_still_promises_login_retry_to_the_cockpit(tmp_path,
+                                                                             monkeypatch) -> None:
+    # non-regression: the resident unit genuinely DOES self-heal at login.
+    monkeypatch.setattr(LaunchdProvider, "UNIT_DIR", tmp_path / "LaunchAgents")
+    monkeypatch.setattr(daemon.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(daemon.subprocess, "run", _FakeRun(rc_for={"bootstrap": 1}))
+    spec = build_spec(install_path=tmp_path / "i", port=7420, label="com.levainhq.c2",
+                      log_dir=tmp_path / "logs")
+    with pytest.raises(DaemonError) as exc:
+        LaunchdProvider().install(spec)
+    assert "RunAtLoad will retry it at next login" in str(exc.value)
+
+
+def test_would_install_surfaces_a_chronically_failing_seat_instead_of_idle(launchd,
+                                                                           tmp_path) -> None:
+    """"idle" is the healthy state for a seat between turns AND what a seat that has failed every
+    interval for three days looks like. The one-line verdict must not read as a clean bill of
+    health. (glm L3 LOW.)"""
+    prov, fake = launchd
+    spec = build_seat_spec(entity_path=tmp_path / "e", task="t", label="com.levainhq.seat.f",
+                           log_dir=tmp_path / "logs")
+    prov.UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    prov._atomic_write(prov._plist_path(spec.label), prov.render_unit(spec).encode("utf-8"))
+    fake._stdout_for["print"] = "\tstate = waiting\n\tlast exit code = 3\n"
+    plan = prov.would_install(spec)
+    assert "LAST RUN FAILED" in plan.action
+    assert "last exit = 3" in plan.action
+
+
+def test_would_install_still_says_idle_for_a_healthy_loaded_seat(launchd, tmp_path) -> None:
+    prov, fake = launchd
+    spec = build_seat_spec(entity_path=tmp_path / "e", task="t", label="com.levainhq.seat.h",
+                           log_dir=tmp_path / "logs")
+    prov.UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    prov._atomic_write(prov._plist_path(spec.label), prov.render_unit(spec).encode("utf-8"))
+    fake._stdout_for["print"] = "\tstate = waiting\n\tlast exit code = 0\n"
+    plan = prov.would_install(spec)
+    assert plan.action == "no-op — unit unchanged and loaded (idle)"

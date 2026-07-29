@@ -587,6 +587,48 @@ def main(argv: list[str] | None = None) -> int:
                            help="Service label (default: com.levainhq.levain).")
     d_install.set_defaults(func=_cmd_daemon_install)
 
+    d_seat = daemon_sub.add_parser(
+        "install-seat",
+        help="Install a GOVERNED SEAT — one entity running a task unattended on a schedule.",
+        description=(
+            "Install a scheduled governed seat (K4a): ONE sovereign entity that runs a bounded "
+            "task unattended on a cadence, exits, and runs again. This is the PERIODIC sibling "
+            "of `daemon install` (which supervises the always-on cockpit) — a seat is NOT "
+            "kept-alive, because a kept-alive periodic job is relaunched the instant it exits "
+            "and would run continuously instead of on its schedule. "
+            "Every efferent action the seat takes fans in to you: with no human present the K3 "
+            "gate HALTS the turn before the action runs and reports it (exit 4). The full tool "
+            "activity stream — including a gated halt — goes to the seat's log, which is your "
+            "review surface. The seat is NOT started at install time: installing a schedule is "
+            "not a request to spend a model turn right now. Force a turn with `daemon restart "
+            "--label <label>`; manage it with `daemon status` / `uninstall` and the same label."
+        ),
+    )
+    d_seat.add_argument("--path", type=Path, default=Path.cwd(),
+                        help="The entity directory the seat runs (default: cwd).")
+    d_seat.add_argument("--task", required=True,
+                        help="The task spec the seat runs each turn (required).")
+    # NOTE: these literals mirror daemon.DEFAULT_SEAT_INTERVAL / DEFAULT_SEAT_LABEL rather than
+    # importing them (the daemon module is imported lazily, inside the command funcs, so `levain
+    # --help` stays cheap — the same reason the labels above are literals). A drift-lock test
+    # pins CLI defaults to the module constants so a divergence fails the suite instead of
+    # silently shipping two different defaults.
+    d_seat.add_argument("--interval", type=int, default=3600,
+                        help="Seconds between turns (default: 3600 = hourly).")
+    d_seat.add_argument("--label", default="com.levainhq.levain.seat",
+                        help="Service label (default: com.levainhq.levain.seat).")
+    d_seat.add_argument("--model", default=None,
+                        help="Model to run on (default: `levain run`'s own default).")
+    d_seat.add_argument("--max-iterations", type=int, default=None, dest="max_iterations",
+                        help=(
+                            "Bound each unattended turn to at most N agent steps (default: a "
+                            "finite built-in bound — an unattended turn with no bound can spend "
+                            "indefinitely with nobody watching; 0 = the SDK's own limit)."
+                        ))
+    d_seat.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="Show what would be installed + the true live state; change nothing.")
+    d_seat.set_defaults(func=_cmd_daemon_install_seat)
+
     d_uninstall = daemon_sub.add_parser(
         "uninstall", help="Stop + remove the autostart (no-op if absent).",
     )
@@ -876,6 +918,135 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
     print(result)
     print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
     print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
+    return 0
+
+
+def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
+    from levain import daemon
+    from levain.session import require_openhands_entity
+
+    provider, err = _daemon_provider()
+    if provider is None:
+        return err
+
+    # VALIDATE THE ENTITY HERE — daemon.build_seat_spec deliberately does not (it is a stdlib-only
+    # leaf and must not import the run/confinement layer). Without this an unrunnable seat installs
+    # happily and then fails IDENTICALLY every interval, forever, into a log nobody is watching —
+    # the schedule turns a one-time usage error into a silent permanent one.
+    entity = args.path.expanduser().resolve()
+    problem = require_openhands_entity(entity)
+    if problem:
+        print(f"levain daemon install-seat: {problem}", file=sys.stderr)
+        return 2
+
+    # 0 is the operator's explicit "unbounded" (the SDK's own limit); None means "use our finite
+    # default". Distinguishing them keeps the safe default finite while leaving the escape hatch.
+    # A NEGATIVE bound is neither: it is a typo (`-1` for `1`) that serializes straight into the
+    # unit's argv and is only "discovered" as whatever the SDK does with it, once per interval,
+    # in a log nobody is watching — silently defeating the finite default the time-bound rests on.
+    # Rejected at the gate. (Found INDEPENDENTLY by both L3 lineages — codex LOW + glm MEDIUM.)
+    if args.max_iterations is not None and args.max_iterations < 0:
+        print(
+            f"levain daemon install-seat: --max-iterations must be >= 0, got "
+            f"{args.max_iterations}. Use 0 for the SDK's own limit (explicitly unbounded), or "
+            f"omit the flag for the finite default ({daemon.DEFAULT_SEAT_MAX_ITERATIONS}).",
+            file=sys.stderr,
+        )
+        return 2
+    max_iters = (
+        daemon.DEFAULT_SEAT_MAX_ITERATIONS if args.max_iterations is None
+        else (None if args.max_iterations == 0 else args.max_iterations)
+    )
+
+    # Read the entity's DECLARED gate posture and resolve it exactly as the runtime will for an
+    # unattended drive, so the output below states what will actually happen (see the print block).
+    # Fail-safe: an unreadable/…invalid config must not silently produce a "governed" claim.
+    try:
+        from levain.firing.confinement import load_confinement_config
+        from levain.firing.gate import resolve_gate_mode
+
+        # str-typed on purpose: "unknown" is OUR third state (config unreadable), which is not
+        # part of the runtime's GateMode literal — and collapsing it into either real state is
+        # exactly the guess this branch exists to refuse.
+        declared_gate: str = load_confinement_config(entity).efferent_gate
+        gate_mode: str = resolve_gate_mode(declared_gate, human_present=False)
+    except Exception as exc:  # noqa: BLE001 — never let a config read failure fake a green claim
+        declared_gate, gate_mode = f"unreadable ({type(exc).__name__})", "unknown"
+    try:
+        spec = daemon.build_seat_spec(
+            entity_path=entity, task=args.task, interval=args.interval,
+            label=args.label, model=args.model, max_iterations=max_iters,
+        )
+    except ValueError as exc:      # an incoherent schedule (e.g. --interval 0)
+        print(f"levain daemon install-seat: {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        plan = provider.would_install(spec)
+        st = plan.current
+        on_disk = ("yes (differs from rendered)" if plan.on_disk and plan.would_change
+                   else "yes (matches rendered)" if plan.on_disk else "no")
+        print(f"install-seat dry-run for {plan.label} (NOTHING is changed):")
+        print(f"  entity:  {entity}")
+        print(f"  task:    {args.task}")
+        print(f"  cadence: every {spec.start_interval}s")
+        print(f"  unit:    {plan.unit_path}")
+        print(f"  on disk: {on_disk}")
+        print(f"  live:    {st.load_state} — {st.detail}")
+        print(f"  action:  {plan.action}")
+        print("\n  honesty floor: a unit file on disk is NOT proof the service is loaded.")
+        return 0
+
+    try:
+        result = provider.install(spec)
+    except daemon.DaemonError as exc:
+        print(f"levain daemon install-seat failed: {exc}", file=sys.stderr)
+        return 1
+    print(result)
+    print(f"\n  seat:   {entity}")
+    print(f"  task:   {args.task}")
+    # BOTH streams, and the .err one is named LAST because it carries the decision. launchd sends
+    # stdout and stderr to SEPARATE files, and the gated-halt report ("HELD AT THE EFFERENT GATE"
+    # + the pending-action list) is printed to STDERR. Naming only the stdout path sends the
+    # operator to a file that shows the entity's ACTIVITY but never the fact that it was STOPPED —
+    # it would break the exact fan-in this command claims to provide. (codex L3 HIGH.)
+    print(f"  activity: {spec.stdout_log}")
+    print(f"  DECISIONS + gated halts: {spec.stderr_log}   ← the fan-in surface")
+    print("\n  manage it with this label (the daemon subcommands default to the COCKPIT label):")
+    print(f"    levain daemon status    --label {args.label}")
+    print(f"    levain daemon restart   --label {args.label}      # force a turn now")
+    print(f"    levain daemon uninstall --label {args.label}")
+
+    # TELL THE TRUTH ABOUT THE GATE — never assert a governance property without checking it.
+    # An entity pinned `efferent_gate: "ungated"` runs its efferent actions with nobody present
+    # and nothing halting them; claiming otherwise here is worse than silence, because this is the
+    # last thing the operator reads before they stop watching. Resolved through the RUNTIME's own
+    # resolve_gate_mode with human_present=False (how a seat is actually driven), so this claim
+    # cannot drift from the behaviour it describes. (glm L3.)
+    print()
+    if gate_mode == "gated":
+        print(
+            "⚠ GOVERNED, NOT AUTONOMOUS: with no human present every efferent action HALTS at "
+            "the K3 gate before it runs (exit 4) and is reported in the decisions log above — "
+            "that log IS the fan-in, so a seat you never read is a seat you are not governing."
+        )
+    elif gate_mode == "unknown":
+        # Could not read the posture. Say THAT — do not guess in either direction. A false
+        # "governed" tells the operator to stop watching; a false "ungated" cries wolf.
+        print(
+            f"⚠ GATE POSTURE UNKNOWN — could not read this entity's confinement config\n"
+            f"   ({declared_gate}). The seat is installed, but whether its efferent actions are\n"
+            f"   halted for you CANNOT BE STATED HERE. Check with `levain doctor --path {entity}`\n"
+            f"   and read the first turn's decisions log before trusting it unattended."
+        )
+    else:
+        print(
+            f"🚨 UNGATED SEAT — THIS ENTITY IS NOT GOVERNED. Its .levain/confinement.json pins\n"
+            f"   efferent_gate: \"{declared_gate}\", so the K3 gate is DISARMED: every efferent\n"
+            f"   action (bash, file writes) will EXECUTE unattended, on a schedule, with no human\n"
+            f"   to fan in to and nothing to halt it. That is the ungoverned-autonomy posture\n"
+            f"   Levain exists to refuse. Set efferent_gate to \"auto\" to restore the gate."
+        )
     return 0
 
 
