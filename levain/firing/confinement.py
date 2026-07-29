@@ -96,17 +96,23 @@ three).
     session escapes the shell's process-group teardown (:meth:`SandboxedShell.close`) and outlives the
     run — the same behavior a normal shell / CC / Codex has. It stays SANDBOX-CONFINED (crown jewels
     remain off-limits), so it is not a confinement breach, but it is unattended code with network +
-    broad non-jewel authority. Human-in-the-loop bounds it now; the threshold membrane (network gating)
-    is the unattended-operation answer.
+    broad non-jewel authority. ⚠ **The K3 efferent gate does NOT bound this one** — it halts actions
+    BEFORE they run, and a setsid survivor is already running. Since K4a ships scheduled seats, the
+    old "human-in-the-loop bounds it now" is FALSE for an unattended seat: there is no human. The
+    per-domain network policy (``spore-417``) remains the real answer.
   - NETWORK EXFIL of non-crown-jewel data: default-allow network + broad read means anything not
-    crown-jeweled is exfiltratable — the SAME risk profile as CC. Mitigation is human-in-the-loop now
-    + the threshold membrane (spore-295) gating network ops before unattended operation later.
+    crown-jeweled is exfiltratable — the SAME risk profile as CC. Mitigation is now the K3 gate for
+    a GATED drive (bash is always efferent, so an exfil attempt halts before it runs) plus
+    human-in-the-loop where a human is present — but NEITHER covers an ``efferent_gate: "ungated"``
+    seat or a setsid survivor. Per-domain network gating is ``spore-417`` (NOT spore-295, which
+    shipped as the gate and has composted).
   - IPC / LOCALHOST SIDE CHANNELS (apparatus L2, confirmed): default-allow leaves mach + loopback
     open, so the entity can drive an EXISTING unsandboxed daemon (``pbcopy``/``pasteboardd``) or hit a
     LOCAL service that re-exposes crown-jewel content (the argushub store on ``:8420``, the continuity
     digest pushed to Supabase) — the file-deny doesn't cover the socket. Spawning a NON-descendant
     unsandboxed helper via ``launchd`` is plausible (L2 could not confirm it under a non-GUI shell).
-    Same class as network-exfil: human-in-the-loop now, the threshold membrane later.
+    Same class as network-exfil: gated-drive halt + human-in-the-loop where present, ``spore-417``
+    for the per-domain policy. ⚠ An unattended seat has no human in this class either.
   - CROWN-JEWEL DIRECTORY NAMES leak: ``ls ~`` lists ``.anneal-memory`` as a NAME (the parent's
     metadata is allowed; the subtree's CONTENTS + the jewel dir's own stat are denied). Names are
     already public; informational.
@@ -119,12 +125,32 @@ three).
     SUBTREES` / :data:`_STANDARD_CRED_FILES`) rather than always-on — operational-fit over purity. A
     caller can still pin any of them ad-hoc via ``deny_files`` / ``extra_deny_read_write``.
 
-**Gating (v1 REALITY, load-bearing honesty).** This floor protects the crown jewels and NOTHING else.
-With default-allow and no threshold membrane (a SPEC, not code — spore-295) and no permission prompts
+**Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** This
+floor protects the crown jewels and NOTHING else. With default-allow and no permission prompts
 (Phill: people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
-``git push --force``, or ``curl | bash`` — none of which the floor stops. Therefore v1 = **structural
-floor + you-in-the-loop** (YOLO-mode CC, crown jewels structurally protected). The membrane is the
-precondition for UNATTENDED operation, sequenced after — NOT a v1 claim.
+``git push --force``, or ``curl | bash`` — **none of which THE FLOOR stops.** That sentence is about
+the floor, and about the floor it is still exactly true.
+
+What covers the rest is a SEPARATE mechanism that did not exist when this paragraph was written: the
+**efferent gate** (:mod:`levain.firing.gate`, shipped K3), which HALTS every efferent action — and
+bash is ALWAYS efferent, because a shell command's effect is not knowable by reading it — whenever no
+human is present. The gate binds to the ABSENCE of the human, so the three examples above resolve
+differently per drive:
+
+  - **REPL** (``levain run``, ``human_present=True``) → UNGATED. The examples are live, and the
+    operator watching tool activity stream past IS the fan-in. "you-in-the-loop" is literal here.
+  - **Headless** (``--task``, or a scheduled seat) → GATED: the turn halts BEFORE the action runs,
+    reports what was held, and exits ``EXIT_GATED`` (4). Nothing is executed.
+  - **``efferent_gate: "ungated"``** in ``confinement.json`` disarms it in BOTH cases — an explicit
+    operator opt-out, and the one configuration in which an UNATTENDED entity really can do all
+    three. Any surface claiming an entity is governed must RESOLVE that setting, never assume it.
+
+⚠ **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a — ``levain daemon install-seat`` runs a governed
+seat on a schedule). This paragraph used to say the opposite, and said it correctly while the gate
+was still a spec. What remains ABSENT is not the gate but the per-domain threshold POLICY
+(``spore-417``): the stakes/context escalators, capability recalibration, and any GRADUATION to
+unattended-efferent firing. **Nothing graduates; everything efferent gates.** So v1 = **structural
+floor + the efferent gate + you-in-the-loop wherever you are present.**
 
 Pure stdlib (``os`` / ``platform`` / ``subprocess`` / ``tempfile`` / ``pathlib`` / ``threading``) —
 importing this pulls NO anneal and NO openhands, so the confinement core is unit-testable in complete
@@ -1085,8 +1111,10 @@ class SandboxedShell:
         behavior a normal shell (and CC/Codex) has. The survivor stays SANDBOX-CONFINED (the seatbelt
         is inherited, so crown jewels remain off-limits), but it is unattended code with network + broad
         non-jewel authority after the operator thinks the run ended. Reaping arbitrary setsid escapees
-        is racy and out of scope here; the human-in-the-loop v1 posture + the crown-jewels floor bound
-        it, and the threshold membrane (network gating) is the real answer for unattended operation."""
+        is racy and out of scope here; the crown-jewels floor bounds it, and the per-domain network
+        policy (``spore-417``) is the real answer. ⚠ Since K4a ships scheduled seats, do NOT read the
+        old "human-in-the-loop v1 posture" as covering this — an unattended seat has no human, and the
+        K3 gate cannot help because the survivor is ALREADY running."""
         self._closed = True
         proc = self._proc
         if self._cmd_w is not None:

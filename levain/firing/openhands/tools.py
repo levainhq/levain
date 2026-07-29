@@ -36,14 +36,22 @@ spore-359): spore-359 folds the neocortex into the always-loaded frame, so only 
 may compose it, never the hands. The firing's ``assert_entity_isolated`` moat, not these tools, keeps
 recall/capture off flow's store.
 
-**Gating (v1 REALITY, load-bearing honesty).** The floor protects the crown jewels and NOTHING else.
-With default-allow, no threshold membrane (a SPEC — spore-295), and no permission prompts (Phill:
-people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo, ``git push
---force``, or ``curl | bash`` — none of which the floor stops. So v1 = structural floor +
-you-in-the-loop (YOLO-mode CC, crown jewels structurally protected). The membrane is the precondition
-for UNATTENDED operation, sequenced after — NOT a v1 claim. The full honest limits (Apple-deprecated
-``sandbox-exec``, pre-populated hardlinks, resource exhaustion, non-crown-jewel network exfil, IPC
-side channels) live on :mod:`levain.firing.confinement`.
+**Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** The
+floor protects the crown jewels and NOTHING else. With default-allow and no permission prompts
+(Phill: people bypass those IRL), a confabulating open model can still ``rm -rf`` a real repo,
+``git push --force``, or ``curl | bash`` — **none of which THE FLOOR stops**, which is a true
+statement about the floor and never was one about the whole system.
+
+The rest is covered by the **efferent gate** (:mod:`levain.firing.gate`, shipped K3), which halts
+every efferent action — bash is ALWAYS efferent — when no human is present: the REPL
+(``human_present=True``) resolves UNGATED and the operator watching activity IS the fan-in, while
+``--task`` and scheduled seats resolve GATED and exit ``EXIT_GATED`` (4) with nothing executed.
+``efferent_gate: "ungated"`` disarms it in both cases, so a surface claiming an entity is governed
+must RESOLVE that setting rather than assume it. **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a,
+``levain daemon install-seat``); what is still absent is the per-domain threshold POLICY
+(``spore-417``) — nothing graduates, everything efferent gates. The full honest limits
+(Apple-deprecated ``sandbox-exec``, pre-populated hardlinks, resource exhaustion, non-crown-jewel
+network exfil, IPC side channels) live on :mod:`levain.firing.confinement`.
 
 Requires the ``openhands`` extra.
 """
