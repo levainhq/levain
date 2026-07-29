@@ -334,3 +334,117 @@ def test_install_seat_warns_LOUDLY_when_creds_are_opted_back_in(tmp_path, capsys
     out = capsys.readouterr().out
     assert rc == 0
     assert "READABLE by this" in out and "OVERRIDDEN" in out
+
+
+# ---------- the bound/cadence notes must appear on BOTH seat surfaces (K4a ⑥) ----------
+
+def _seat_dry_run(tmp_path, *extra: str):
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider") as sel, \
+         mock.patch("levain.firing.confinement.load_confinement_config") as cfg:
+        cfg.return_value = mock.Mock(efferent_gate="auto", deny_standard_creds=None)
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t",
+                   "--dry-run", *extra])
+    return rc, sel
+
+
+def test_dry_run_WARNS_about_an_unbounded_seat(tmp_path, capsys):
+    """`--dry-run` is the surface whose whole purpose is *inspect before you commit*, so it is the
+    one place this warning matters MOST — and the first version of this code printed it only after
+    `provider.install()`, leaving the dry-run silently showing "wall-clock UNBOUNDED" while the real
+    install warned loudly about the identical config.
+
+    Two surfaces disagreeing about one fact, with the SILENT one being what a cautious operator
+    reaches for. Found by running the dry-run and reading it, not by review."""
+    rc, _ = _seat_dry_run(tmp_path, "--max-seconds", "0")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NO WALL-CLOCK BOUND" in out
+    assert "STOP RUNNING PERMANENTLY" in out
+    assert "wall-clock UNBOUNDED" in out
+
+
+def test_dry_run_NOTES_when_the_bound_outlives_the_cadence(tmp_path, capsys):
+    """Not an error and not refused — "poll as often as possible, one at a time" is legitimate. But
+    launchd coalesces per label, so the operator asked for one cadence and will get another, and a
+    schedule that quietly means something else is how the original defect hid."""
+    rc, _ = _seat_dry_run(tmp_path, "--interval", "600")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "coalesces per label" in out
+    assert "SKIP intervals" in out
+
+
+def test_dry_run_is_QUIET_when_the_bound_fits_the_cadence(tmp_path, capsys):
+    """THE CONTROL. The default configuration must produce neither note, or the warnings become
+    noise an operator learns to scroll past — which is how a real one gets missed."""
+    rc, _ = _seat_dry_run(tmp_path)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NO WALL-CLOCK BOUND" not in out
+    assert "SKIP intervals" not in out
+    assert "1800s wall-clock" in out, "it must still REPORT the resolved bound"
+
+
+def test_the_install_path_prints_the_same_notes_as_the_dry_run(tmp_path, capsys):
+    """ONE function, TWO call sites — pinned, because the defect was precisely that the two surfaces
+    carried different amounts of truth about the same config."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider") as sel, \
+         mock.patch("levain.firing.confinement.load_confinement_config") as cfg:
+        sel.return_value.install.return_value = "installed"
+        cfg.return_value = mock.Mock(efferent_gate="auto", deny_standard_creds=None)
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t",
+                   "--max-seconds", "0"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NO WALL-CLOCK BOUND" in out
+    assert "wall-clock UNBOUNDED" in out
+
+
+# ---------- non-finite bounds are refused at BOTH doors (codex L3, HIGH) ----------
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "NaN", "Infinity"])
+def test_run_task_refuses_a_non_finite_wall_clock_bound(tmp_path, capsys, bad: str):
+    """`argparse type=float` happily parses these, and `nan` then slips through EVERY comparison
+    guard — `nan < 0` is False so a `>= 0` validator passes it, and `nan > 0` is False so the deadline
+    arms NOTHING. The result is an UNBOUNDED run whose own banner prints "nans wall-clock".
+
+    That is the worst failure shape this feature can have: not a crash, a run that looks time-bounded
+    to the operator and is not. `inf` fails the other way — it reaches `signal.setitimer`, which
+    raises OverflowError."""
+    rc = main(["run", str(tmp_path), "--task", "t", "--max-seconds", bad])
+    assert rc == 2
+    assert "finite" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf"])
+def test_install_seat_refuses_a_non_finite_wall_clock_bound(tmp_path, capsys, bad: str):
+    """The SAME guard at the other door — and worse here, because a `nan` serializes into the PLIST as
+    `--max-seconds nan`, so the seat reads as bounded to anyone auditing the unit file. The K2 defect
+    was precisely an invariant only its strongest caller enforced."""
+    with mock.patch("levain.session.require_openhands_entity", return_value=None), \
+         mock.patch("levain.daemon.select_provider"):
+        rc = main(["daemon", "install-seat", "--path", str(tmp_path), "--task", "t",
+                   "--max-seconds", bad])
+    assert rc == 2
+    assert "finite" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("cmd", [
+    ["run", "ENT", "--task", "t", "--max-seconds", "-inf"],
+    ["daemon", "install-seat", "--path", "ENT", "--task", "t", "--max-seconds", "-inf"],
+])
+def test_a_leading_dash_bound_is_refused_by_the_PARSER_before_our_guard(tmp_path, cmd):
+    """`-inf` never reaches the non-finite guard, and that is worth pinning rather than assuming.
+
+    argparse treats a value beginning with `-` as an OPTION, so `--max-seconds -inf` fails as
+    "expected one argument" and exits 2 via SystemExit — a refusal, just an earlier and cruder one
+    than our own message. Pinned in the exact shape it actually happens, because the tempting "fix"
+    for the ugly error text is to teach the parser to accept negative-looking values, which would
+    walk `-inf` straight past the guard the test above exists to enforce. Both paths must stay
+    closed; only one of them is ours."""
+    argv = [str(tmp_path) if a == "ENT" else a for a in cmd]
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2

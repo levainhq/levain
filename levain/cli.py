@@ -8,6 +8,7 @@ Lazy imports keep `levain --help` fast and isolate import errors per command.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -879,6 +880,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # wall-clock bound is worse than a bad step count: `TurnDeadline` treats non-positive as
         # DISARMED, so `--max-seconds -1` would read as "bound it tightly" and deliver "not bounded
         # at all" (`guard_scoped_by_symptom_misses_the_class`).
+        # NON-FINITE FIRST, because `nan` slips through EVERY comparison guard (codex L3, HIGH):
+        # `nan < 0` is False, so a `< 0` check passes it, and `nan > 0` is also False, so the
+        # deadline then arms NOTHING — an unbounded run whose own banner prints "nans wall-clock".
+        # `inf` gets as far as `setitimer` and raises OverflowError. Both must die at the door.
+        if max_seconds is not None and not math.isfinite(max_seconds):
+            print(
+                f"levain run: --max-seconds must be a finite number of seconds, got "
+                f"{max_seconds!r}. Use 0 to run unbounded — deliberately and visibly.",
+                file=sys.stderr,
+            )
+            return 2
         if max_seconds is not None and max_seconds < 0:
             print(
                 f"levain run: --max-seconds must be >= 0, got {max_seconds:g}. "
@@ -999,6 +1011,44 @@ def _seat_bounds_line(max_iterations: int | None, max_seconds: float | None) -> 
     return f"{steps} · {secs}"
 
 
+def _print_bound_cadence_notes(max_seconds: float | None, interval: int) -> None:
+    """Say what the two numbers MEAN TOGETHER — printed by the dry-run AND the real install.
+
+    ⚠ ONE FUNCTION, TWO CALL SITES, deliberately. The first version of this lived only after
+    `provider.install()`, so `--dry-run` — the surface whose entire purpose is *inspect before you
+    commit* — showed `wall-clock UNBOUNDED` with no warning at all, while the real install warned
+    loudly about the same config. Two surfaces disagreeing about one fact, with the silent one being
+    the one the cautious operator uses. Found by running the dry-run and reading it, not by review;
+    same shape as the K4a [7] finding where a pointer existed in two places and fixing one copy left
+    the other lying (`guard_scoped_by_symptom_misses_the_class`).
+    """
+    # THE BOUND AND THE CADENCE INTERACT, AND THE OPERATOR CANNOT SEE IT FROM EITHER FLAG ALONE.
+    # launchd coalesces per label, so a turn allowed to run longer than the interval necessarily
+    # SKIPS intervals — the cadence silently becomes the turn's duration. NOT an error and not
+    # refused: "poll as often as possible, one at a time" is a legitimate pattern (short interval,
+    # long bound). But it must be SAID, because the operator asked for one cadence and will get
+    # another, and a schedule that quietly means something else is how the original defect hid.
+    if max_seconds is not None and max_seconds >= interval:
+        print(
+            f"\n  ⓘ the time bound ({max_seconds:g}s) is >= the cadence ({interval}s). launchd "
+            f"coalesces per label,\n"
+            f"    so a long turn will SKIP intervals — the effective cadence becomes the turn's "
+            f"own duration.\n"
+            f"    Fine if that is what you want; lower --max-seconds or raise --interval if not."
+        )
+    elif max_seconds is None:
+        # The one genuinely dangerous configuration. It is opt-in, so say what it costs.
+        print(
+            "\n  ⚠ NO WALL-CLOCK BOUND (--max-seconds 0). A turn that hangs inside one step will "
+            "never exit,\n"
+            "    and because launchd coalesces per label this seat would then STOP RUNNING "
+            "PERMANENTLY behind a\n"
+            "    unit still reporting installed + loaded. Nothing will tell you. Set "
+            "--max-seconds unless something\n"
+            "    else bounds this process."
+        )
+
+
 def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     from levain import daemon
     from levain.session import require_openhands_entity
@@ -1039,6 +1089,17 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # SAME THREE-VALUED TREATMENT FOR THE WALL-CLOCK BOUND — deliberately identical shape to the
     # step bound above rather than a second convention, because the two flags answer the same
     # question in different units and an operator should not have to learn each one separately.
+    # Same non-finite guard as `levain run` — one flag, two doors, and the K2 defect was exactly an
+    # invariant that only its strongest caller enforced. A `nan` here is worse than there: it
+    # serializes into the PLIST as `--max-seconds nan`, so the seat looks bounded to anyone auditing
+    # the unit file and is not.
+    if args.max_seconds is not None and not math.isfinite(args.max_seconds):
+        print(
+            f"levain daemon install-seat: --max-seconds must be a finite number of seconds, got "
+            f"{args.max_seconds!r}. Use 0 to install an explicitly unbounded seat.",
+            file=sys.stderr,
+        )
+        return 2
     if args.max_seconds is not None and args.max_seconds < 0:
         print(
             f"levain daemon install-seat: --max-seconds must be >= 0, got "
@@ -1129,6 +1190,7 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         print(f"  live:    {st.load_state} — {st.detail}")
         print(f"  action:  {plan.action}")
         print("\n  honesty floor: a unit file on disk is NOT proof the service is loaded.")
+        _print_bound_cadence_notes(max_secs, args.interval)
         return 0
 
     try:
@@ -1140,31 +1202,7 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     print(f"\n  seat:   {entity}")
     print(f"  task:   {args.task}")
     print(f"  bounds: {_seat_bounds_line(max_iters, max_secs)}")
-    # THE BOUND AND THE CADENCE INTERACT, AND THE OPERATOR CANNOT SEE IT FROM EITHER FLAG ALONE.
-    # launchd coalesces per label, so a turn allowed to run longer than the interval necessarily
-    # skips intervals — the cadence silently becomes the bound. This is NOT an error and is not
-    # refused: "poll as often as possible, one at a time" is a legitimate pattern (short interval,
-    # long bound). But it must be SAID, because the operator asked for one cadence and will get
-    # another, and a schedule that quietly means something else is how the original defect hid.
-    if max_secs is not None and max_secs >= args.interval:
-        print(
-            f"\n  ⓘ the time bound ({max_secs:g}s) is >= the cadence ({args.interval}s). launchd "
-            f"coalesces per label,\n"
-            f"    so a long turn will SKIP intervals — the effective cadence becomes the turn's "
-            f"own duration.\n"
-            f"    Fine if that is what you want; lower --max-seconds or raise --interval if not."
-        )
-    elif max_secs is None:
-        # The one genuinely dangerous configuration, and it is opt-in, so say what it costs.
-        print(
-            "\n  ⚠ NO WALL-CLOCK BOUND (--max-seconds 0). A turn that hangs inside one step will "
-            "never exit,\n"
-            "    and because launchd coalesces per label this seat would then STOP RUNNING "
-            "PERMANENTLY behind a\n"
-            "    unit still reporting installed + loaded. Nothing will tell you. Set "
-            "--max-seconds unless something\n"
-            "    else bounds this process."
-        )
+    _print_bound_cadence_notes(max_secs, args.interval)
     # BOTH streams, and the .err one is named LAST because it carries the decision. launchd sends
     # stdout and stderr to SEPARATE files, and the gated-halt report ("HELD AT THE EFFERENT GATE"
     # + the pending-action list) is printed to STDERR. Naming only the stdout path sends the

@@ -882,3 +882,54 @@ def test_run_task_still_reports_an_ordinary_failure_as_a_failure(tmp_path: Path,
     assert rc == EXIT_TURN_FAILED == 3
     assert "the task failed" in err
     assert "WALL-CLOCK BOUND EXCEEDED" not in err
+
+
+class _TimeoutOnCloseSession(_FakeSession):
+    """A session whose TEARDOWN is what the bound interrupts — the outer-path case."""
+
+    def close(self) -> None:
+        from levain.firing.deadline import TurnTimeout
+        self.closed_count += 1
+        raise TurnTimeout(60.0)
+
+
+def test_run_task_does_NOT_claim_a_missing_capture_when_it_cannot_know(tmp_path, monkeypatch, capsys):
+    """codex L3, MED — the false claim, pinned at the driver.
+
+    The bound wraps rendering and teardown too, so an alarm can land AFTER `_drive` already captured a
+    COMPLETED turn. Asserting "Nothing was captured to memory" there tells the operator their episode
+    store is missing work it actually holds, and invites a supervisor to re-run work that succeeded.
+
+    Added because a mutation making the outer path pass `captured=False` SURVIVED the suite — the
+    tri-state existed and nothing checked which state each path used."""
+    from levain.run import run_task
+
+    sess = _TimeoutOnCloseSession(tmp_path, TurnResult(reply="done", tool_activity=[]))
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "summarise", quiet=True, max_seconds=60.0)
+    err = capsys.readouterr().err
+
+    assert rc == EXIT_TIMEOUT == 5
+    assert "UNKNOWN" in err, "the outer path cannot vouch for capture and must not pretend to"
+    assert "Nothing was captured" not in err
+
+
+def test_run_task_DOES_claim_no_capture_when_the_session_vouches_for_it(tmp_path, monkeypatch, capsys):
+    """THE CONTROL. When the SESSION classified the timeout it knows capture never happened, and the
+    report must say so plainly — hedging every timeout into "unknown" would throw away real
+    information and is the opposite over-correction."""
+    from levain.run import run_task
+
+    sess = _FakeSession(
+        tmp_path,
+        TurnResult(reply=None, tool_activity=[], error="bound exceeded", timed_out=True),
+    )
+    _patch_open(monkeypatch, sess)
+
+    rc = run_task(tmp_path, "summarise", quiet=True, max_seconds=60.0)
+    err = capsys.readouterr().err
+
+    assert rc == EXIT_TIMEOUT == 5
+    assert "Nothing was captured" in err
+    assert "UNKNOWN" not in err

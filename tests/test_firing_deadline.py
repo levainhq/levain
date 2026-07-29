@@ -494,3 +494,176 @@ def test_a_timed_out_turn_is_not_ok_even_with_a_partial_reply() -> None:
 
     assert partial.ok is False
     assert partial.exit_code == EXIT_TIMEOUT
+
+
+# ---------- the L3 findings (codex), each pinned ----------
+#
+# All seven were real, and two were opened BY the BaseException fix above — the change that made the
+# graceful layer work at the turn boundary punched a hole at the teardown boundary. That pairing is
+# the reason these are tests and not just fixes: the same trade will look tempting again.
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_NON_FINITE_bound_is_refused_LOUDLY(bad) -> None:
+    """codex L3, HIGH — the nastiest finding of the set, because it produces a run that LOOKS bounded.
+
+    `nan` defeats every comparison guard (`nan < 0` is False, so a `>= 0` validator passes it; `nan > 0`
+    is also False, so `enabled` then arms NOTHING) while the seat's plist carries `--max-seconds nan`
+    and the banner prints `nans wall-clock`. An operator auditing either would conclude the seat is
+    time-bounded. `inf` fails the other way: it reaches `signal.setitimer`, which raises OverflowError
+    — a type that was not in the caught set, so it escaped `__enter__` as a traceback.
+
+    Refused in the CONSTRUCTOR, so an unbounded-but-configured deadline is unrepresentable rather than
+    merely validated-against at the CLI."""
+    with pytest.raises(ValueError, match="finite"):
+        TurnDeadline(bad)
+
+
+def test_None_is_still_a_legal_unbounded_deadline() -> None:
+    """THE CONTROL for the guard above — "no bound" must stay expressible, or every hand-run
+    `levain run --task` breaks. The rejection is of INCOHERENCE, not of running unbounded."""
+    d = TurnDeadline(None)
+    assert d.enabled is False
+    with d:
+        pass
+
+
+def test_the_deadline_REFUSES_re_entry_instead_of_silently_unbounding_the_outer_turn() -> None:
+    """codex L3, MED. The class doc said "re-usable, not re-entrant" and nothing enforced it.
+
+    Nesting overwrites `self._watchdog`, then the INNER `__exit__` clears the single `_active` flag
+    and cancels only the inner timer — leaving the original watchdog alive but inert (`_active` is
+    False), the itimer cancelled, and the OUTER body running with no layer 1 AND no effective layer 2.
+    An unbounded turn wearing a bounded turn's syntax, which is the worst possible failure shape for
+    this class. `a_policy_is_not_real_until_the_thing_that_enforces_it_exists`."""
+    d = TurnDeadline(_BOUND)
+    with pytest.raises(RuntimeError, match="not re-entrant"):
+        with d:
+            with d:
+                pass
+
+
+def test_the_deadline_instance_is_REUSABLE_in_sequence() -> None:
+    """THE CONTROL. Refusing re-entry must not refuse re-USE — a driver looping over turns with one
+    deadline object has to keep working, and over-tightening the guard would break it silently."""
+    d = TurnDeadline(_BOUND)
+    for _ in range(3):
+        with d:
+            time.sleep(_SHORT_WORK)
+    assert d._armed_signal is False
+    assert d._watchdog is None
+
+
+def test_the_host_sigalrm_handler_is_restored_even_when_ARMING_FAILS(monkeypatch) -> None:
+    """codex L3, MED. `_armed_signal` used to be set AFTER `setitimer`, so a `setitimer` failure left
+    OUR handler installed with the flag False — `_disarm_signal` then returned early and never
+    restored the host's handler, and Levain silently owned SIGALRM for the rest of the process.
+
+    The flag now flips the instant the handler is installed, which is what makes teardown honest."""
+    import levain.firing.deadline as mod
+
+    def sentinel(signum, frame):  # pragma: no cover
+        pass
+
+    def boom(which, value):
+        raise OSError("setitimer refused")
+
+    previous = signal.signal(signal.SIGALRM, sentinel)
+    try:
+        monkeypatch.setattr(mod.signal, "setitimer", boom)
+        with TurnDeadline(_BOUND):
+            pass
+        assert signal.getsignal(signal.SIGALRM) is sentinel, (
+            "arming failed and the host's handler was not put back"
+        )
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_the_report_does_not_CLAIM_a_capture_it_cannot_vouch_for() -> None:
+    """codex L3, MED. The bound wraps rendering and teardown as well as the turn, so an alarm can land
+    AFTER `_drive` already captured a completed turn — and the report asserted "nothing was captured to
+    memory" in that window too. That tells an operator their store is missing work it actually holds,
+    and invites a supervisor to re-run work that already succeeded.
+
+    Tri-state, same authority-versus-description discipline as `TurnResult.gated`."""
+    definitely_not = format_timeout_report(30.0, hard=False, captured=False)
+    unknown = format_timeout_report(30.0, hard=False, captured=None)
+    did = format_timeout_report(30.0, hard=False, captured=True)
+
+    assert "Nothing was captured" in definitely_not
+    assert "UNKNOWN" in unknown and "Nothing was captured" not in unknown
+    assert "stands" in did and "Nothing was captured" not in did
+
+
+def test_the_hard_report_admits_the_bash_child_is_ORPHANED_not_reaped() -> None:
+    """codex L3, HIGH — a false claim in a report an operator reads.
+
+    `os._exit` ends only this process; the SIGTERM-then-SIGKILL of the shell's process GROUP lives in
+    `SandboxedShell.close` and is never reached. So a bash child mid-command is reparented to init and
+    LEFT RUNNING — possibly while launchd starts the next seat turn. The original wording said the
+    subprocess "is left to the OS to reap", which is a comfortable assumption dressed as a fact.
+
+    This project treats a claim the implementation does not enforce as a defect in itself, so the
+    honest wording is pinned."""
+    hard = format_timeout_report(30.0, hard=True, captured=None)
+
+    assert "ORPHANED" in hard
+    assert "NOT reaped" in hard
+    assert "reap" not in hard.replace("NOT reaped", ""), "no residual 'the OS reaps it' claim"
+
+
+def test_an_INFINITE_bound_assigned_after_construction_still_arms_nothing() -> None:
+    """`seconds` is a PUBLIC attribute, so the constructor guard is not the only door a non-finite
+    bound can come through — a caller can assign one afterwards, which is what makes `enabled`'s own
+    `isfinite` check reachable rather than dead defence-in-depth.
+
+    ⚠ IT HAS TO BE `inf`, AND THE FIRST VERSION OF THIS TEST USED `nan` AND PROVED NOTHING. `nan > 0`
+    is already False, so the plain `> 0` comparison disarms a nan by itself and a mutation deleting
+    `isfinite` SURVIVED. `inf > 0` is True, so without `isfinite` an infinite bound reports itself
+    ENABLED, `__enter__` arms, and `setitimer(inf)` raises OverflowError — layer 1 silently unarmed on
+    a deadline that claims to be on.
+
+    The mutation harness caught the weak TEST, not weak code. `the_instrument_needs_its_own_oracle`
+    applies to the test suite as much as to the product."""
+    d = TurnDeadline(5.0)
+    assert d.enabled is True
+    d.seconds = float("inf")
+    assert d.enabled is False, "an infinite bound must never report itself as enabled"
+    # And the disarmed path must be a real no-op, not a half-armed one.
+    with d:
+        pass
+    assert d._armed_signal is False and d._watchdog is None
+
+
+def test_the_session_close_COMPLETES_when_the_bound_fires_during_teardown() -> None:
+    """codex L3, HIGH — the hole the BaseException fix itself opened, now pinned.
+
+    The bound stays armed through teardown deliberately (launchd coalesces on PROCESS lifetime). But
+    `TurnTimeout` is a `BaseException` so the SDK cannot swallow it — which means an alarm landing
+    inside `conversation.close()` sails through an `except Exception`, aborting teardown AFTER
+    `_closed` was already set, so nothing ever retries it, and the OS-sandboxed shell LEAKS.
+
+    Added because a mutation narrowing `close()` back to `except Exception` SURVIVED the suite: the
+    fix was right and completely uncovered."""
+    from levain.session import EntitySession
+
+    class _ExplodingOnClose:
+        def __init__(self):
+            self.state = _State()
+            self.close_attempts = 0
+
+        def close(self):
+            self.close_attempts += 1
+            raise TurnTimeout(1.0)
+
+    conv = _ExplodingOnClose()
+    sess = EntitySession(
+        entity_dir=None, binding=None, conversation=conv, workspace=None,
+        model_label="m", with_tools=False, bash_ok=False, gate_mode="ungated",
+    )
+
+    sess.close()  # must NOT raise — that is the whole contract
+
+    assert conv.close_attempts == 1
+    assert sess.closed is True

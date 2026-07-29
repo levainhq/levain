@@ -315,12 +315,21 @@ def run_task(
             # Reached when the bound fires OUTSIDE the turn (startup, teardown, rendering).
             # `run_turn` catches its own and reports via `result.timed_out`, which routes to the
             # same report below — one wording for one outcome, wherever it lands.
-            return _report_timeout(deadline.seconds)
+            return _report_timeout(deadline.seconds, captured=None)
 
 
-def _report_timeout(seconds: float | None) -> int:
-    """Print the graceful-timeout report and return its exit code. One wording, one place."""
-    print(format_timeout_report(seconds or 0.0, hard=False), file=sys.stderr, flush=True)
+def _report_timeout(seconds: float | None, *, captured: bool | None) -> int:
+    """Print the graceful-timeout report and return its exit code. One wording, one place.
+
+    ``captured`` is threaded rather than assumed because the two call sites have DIFFERENT authority
+    (codex L3, MED). When the SESSION classified the timeout, it knows the turn never reached capture.
+    When the bound fired somewhere else under the ``with`` — rendering, teardown, startup — nothing
+    here can know, and the earlier version asserted "nothing was captured to memory" in that window
+    too, which is false for a turn that completed and was captured a moment before the alarm."""
+    print(
+        format_timeout_report(seconds or 0.0, hard=False, captured=captured),
+        file=sys.stderr, flush=True,
+    )
     return EXIT_TIMEOUT
 
 
@@ -390,7 +399,9 @@ def _drive_task(
         # it as "the task failed" would tell a supervisor the entity or the spec is broken, when
         # what actually happened is that the environment stalled and the next run is fine.
         if result.timed_out:
-            return _report_timeout(max_seconds)
+            # The session vouches for this one: `_drive` returns `timed_out` only from a path that
+            # has NOT called `capture_turn`.
+            return _report_timeout(max_seconds, captured=False)
 
         if result.error is not None:
             print(f"\n  ! the task failed: {result.error}", file=sys.stderr, flush=True)
