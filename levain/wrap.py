@@ -1,11 +1,30 @@
-"""levain.wrap — `levain wrap <entity>`: the HUMAN-GATED consolidate for a sovereign entity.
+"""levain.wrap — `levain wrap <entity>`: the consolidate for a sovereign entity.
 
 An OpenHands Levain entity CAPTURES every turn to its own episodic store (``levain run`` +
 :class:`~levain.firing.anneal.AnnealEntityFiring`), but the firing is CONSTITUTIONALLY FORBIDDEN
 from consolidating on its own ("captures but never consolidates" — the afferent/efferent membrane).
 So raw episodes pile up and never metabolize into felt memory: the entity never compounds identity
-across sessions. ``levain wrap`` is the explicit operator command that RUNS the consolidate — the
-command invocation IS the human gate the autonomous firing may never trip itself.
+across sessions. ``levain wrap`` is the invocation that RUNS the consolidate.
+
+⚠ **THIS MODULE WAS "THE HUMAN-GATED CONSOLIDATE" UNTIL K4a [6], AND THAT SENTENCE IS NOW FALSE IN
+ONE CASE — read the amendment before trusting any human-presence claim below.** A scheduled seat
+(``levain daemon install-seat``) consolidates ITSELF, with nobody present. Two things bound it, and
+neither is the human:
+
+- **A WALL-CLOCK BOUND** (``max_seconds``). K4a ⑥ bounded ``levain run`` and did NOT reach here — a
+  fact found only by the [6] handoff audit. Unbounded, the first stalled compose on a seat's
+  schedule hangs the process, launchd COALESCES per label, and the seat stops running forever behind
+  a unit still reporting installed and loaded. That is ``guard_scoped_by_symptom_misses_the_class``:
+  ⑥ bounded the place the symptom was found, while the CLASS is *any unattended long-running Levain
+  invocation*, and this is its second member. The bound therefore lives on the COMMAND, not on the
+  seat that calls it — so an operator who cron-drives ``levain wrap`` directly is covered too.
+- **A CRYSTALLIZATION REFUSAL** (``unattended``). An unattended consolidate MAY METABOLIZE the
+  working neocortex but MAY NEVER promote into the always-loaded bedrock tier — enforced by a
+  refusing proxy, not by a convention (:mod:`levain.firing.crystallization`).
+
+What survives unchanged, and was always the load-bearing half: **the FIRING never consolidates.** No
+in-turn afferent path can trip a memory write. A seat's consolidate happens after its turn is over,
+from its own invocation, under both bounds above.
 
 The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (never reinvent it):
 
@@ -43,9 +62,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
+from levain.firing.deadline import TurnDeadline, TurnTimeout
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -53,6 +75,7 @@ from levain.firing.isolation import (
     entity_store_paths,
 )
 from levain.run import _resolve_llm_kwargs, _resolve_model, require_openhands_entity
+from levain.session import EXIT_TIMEOUT
 
 __all__ = ["wrap_entity"]
 
@@ -157,6 +180,32 @@ def _cancel_if_ours(store: object, wrap_token: object) -> None:
         _log.debug("cancel-if-ours skipped (%s): %s", type(exc).__name__, exc)
 
 
+def _cancel_our_wrap(store: object, wrap_token: object) -> None:
+    """Cancel an in-progress wrap on the OUT-OF-BAND exit path (timeout / interrupt / refusal).
+
+    The sibling of :func:`_cancel_if_ours`, and the difference is exactly the ``wrap_token is None``
+    case. That function is a *race* guard: it compares tokens because, without the process lock, the
+    in-progress wrap might be a peer's. This one runs only from the ``except BaseException`` clause,
+    where we are still holding the exclusive ``wrap.lock`` — so a peer's wrap CANNOT be what is in
+    progress, and the token comparison is not the thing standing between us and someone else's work.
+
+    Why that distinction earns its own function rather than a flag: an out-of-band exit can land
+    BEFORE ``prepare_wrap`` returns a token, in the narrow window where anneal has already marked the
+    wrap started. Deferring to the token-matching guard there would compare ``None`` against a real
+    token, decline to cancel, and strand the wrap — the precise outcome the caller is trying to
+    prevent. So with no token in hand we cancel whatever we ourselves started, which the lock proves
+    is ours.
+
+    Never raises: cleanup must not replace the exception it is cleaning up after."""
+    try:
+        if wrap_token is not None:
+            _cancel_if_ours(store, wrap_token)
+        elif _wrap_in_progress(store):
+            store.wrap_cancelled()  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 — never mask the out-of-band exit being propagated
+        _log.debug("out-of-band wrap cancel skipped (%s): %s", type(exc).__name__, exc)
+
+
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
 # compression contract; this only sets the SOVEREIGN posture + the easy-to-get-wrong rules a weak
 # model needs spelled out). The entity's constitution is prepended so it composes AS ITSELF.
@@ -191,6 +240,40 @@ Output ONLY the Markdown document, starting with `## State`. No preamble, no clo
 code fences."""
 
 
+def format_wrap_timeout_report(seconds: float, *, hard: bool) -> str:
+    """The operator-facing explanation of a consolidate that hit its wall-clock bound.
+
+    A SEPARATE wording from :func:`levain.firing.deadline.format_timeout_report`, because that one
+    is about a TURN and would be false here in both directions: a consolidate spawns no confined
+    bash to orphan, and — the part that actually matters to whoever reads the log — the question is
+    not "was this captured" but "is my memory stranded and will the next wrap work".
+    """
+    if hard:
+        return (
+            f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — and the graceful stop did NOT take, "
+            f"so the process was terminated outright.\n"
+            f"     Your EPISODES ARE SAFE — nothing partial is ever written (the save fails closed), "
+            f"and unwrapped episodes\n"
+            f"     return to the next wrap.\n"
+            f"     ⚠ BUT THE WRAP IS LEFT IN PROGRESS: the hard exit skips the cancel, so the next "
+            f"consolidate will refuse\n"
+            f"     until the orphan is discarded. An UNATTENDED seat clears it automatically on its "
+            f"next run; for a manual\n"
+            f"     wrap, re-run with --reset.\n"
+            f"     That the backstop was needed is itself a finding — the stall was not "
+            f"interruptible by signal."
+        )
+    return (
+        f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated and the "
+        f"wrap CANCELLED cleanly.\n"
+        f"     Your memory is UNCHANGED and your episodes are safe: they return to the next wrap, "
+        f"losing nothing.\n"
+        f"     This is an ENVIRONMENT stall (a hung compose model or socket), not a failed "
+        f"consolidate — the next\n"
+        f"     scheduled run is free to start."
+    )
+
+
 def wrap_entity(
     path: Path,
     *,
@@ -201,14 +284,99 @@ def wrap_entity(
     reset: bool = False,
     affect_tag: str | None = None,
     affect_intensity: float = 0.5,
+    max_seconds: float | None = None,
+    unattended: bool = False,
 ) -> int:
-    """Consolidate the isolated entity at ``path`` — the human-gated efferent write.
+    """Consolidate the isolated entity at ``path`` — the gated efferent write on its own memory.
 
     Returns a process exit code: 0 on a clean consolidate (or an empty no-op); 2 for a
     precondition/environment error where nothing started (not an entity, isolation refusal, missing
     extra, wrong schema, an unreadable store, or a wrap already in progress); 1 only when THIS
     invocation started a wrap that did not complete (the compose or the save failed) — in which case
-    the entity's identity is left UNCHANGED and its episodes are safe.
+    the entity's identity is left UNCHANGED and its episodes are safe; **5 when the wall-clock bound
+    fired** (:data:`levain.session.EXIT_TIMEOUT`).
+
+    ``max_seconds`` bounds the WHOLE consolidate — store open, lock, prepare, compose and save — for
+    the same reason the turn bound wraps startup and teardown: launchd coalesces on PROCESS lifetime
+    and does not care which phase is stuck. ``None`` runs unbounded, deliberately and visibly.
+
+    ``unattended`` marks a consolidate with NO HUMAN PRESENT (a scheduled seat). It binds to the
+    absence of the human exactly as the K3 gate and the credential floor do, and it changes two
+    things — both of which would otherwise be silent-death paths rather than mere roughness:
+
+    - **Crystallization is REFUSED** (the store is wrapped by
+      :func:`~levain.firing.crystallization.refuse_crystallization`): metabolize yes, promote into
+      the always-loaded tier never.
+    - **An orphaned prior wrap is discarded automatically** instead of refusing and asking a human
+      to pass ``--reset``. See :func:`_consolidate` — this is a correctness requirement, not a
+      convenience.
+
+    ⚠ ``EXIT_TIMEOUT`` is checked and returned by the CALLER of the bound, never derived from an
+    error message — the same authority-not-description discipline as ``TurnResult.timed_out``.
+    """
+    # A FRESH DEADLINE INSTANCE per call: `TurnDeadline` is re-usable but NOT re-entrant, and it
+    # refuses re-entry loudly rather than silently unbounding the outer region. That matters here
+    # specifically, because the seat's self-consolidate runs as a SECOND bounded phase in a process
+    # that has already bounded its turn — sequential, never nested (see `levain.run.run_task`).
+    deadline = TurnDeadline(
+        max_seconds,
+        hard_exit_code=EXIT_TIMEOUT,
+        hard_report=lambda s: format_wrap_timeout_report(s, hard=True),
+    )
+    try:
+        with deadline:
+            return _consolidate(
+                path,
+                composer=composer,
+                base_url=base_url,
+                api_key=api_key,
+                dry_run=dry_run,
+                reset=reset,
+                affect_tag=affect_tag,
+                affect_intensity=affect_intensity,
+                unattended=unattended,
+            )
+    except TurnTimeout:
+        # `TurnTimeout` is a BaseException, so `_consolidate`'s `except Exception` clauses never see
+        # it; its own BaseException handler has already cancelled our in-progress wrap on the way
+        # out, so by here the store is clean and the next run starts fresh.
+        print(
+            format_wrap_timeout_report(deadline.seconds or 0.0, hard=False),
+            file=sys.stderr, flush=True,
+        )
+        return EXIT_TIMEOUT
+    except CrystallizationRefused as exc:
+        # Should be unreachable: nothing in the shipped consolidate path writes the crystal tier.
+        # Reported as a DEFECT rather than an operator error, and deliberately NOT given a new exit
+        # code — inventing a seventh rung for a state that should never occur is ceremony, while
+        # `1` already carries the correct operator response (the wrap did not complete; memory is
+        # unchanged; episodes are safe).
+        print(
+            f"levain wrap: {exc}\n"
+            "  Nothing was saved; the entity's identity is unchanged and its episodes are safe.\n"
+            "  Please report this — it means a code path tried to promote a pattern into the "
+            "always-loaded tier with no human present.",
+            file=sys.stderr, flush=True,
+        )
+        return 1
+
+
+def _consolidate(
+    path: Path,
+    *,
+    composer: str,
+    base_url: str,
+    api_key: str | None,
+    dry_run: bool,
+    reset: bool,
+    affect_tag: str | None,
+    affect_intensity: float,
+    unattended: bool,
+) -> int:
+    """The consolidate itself. :func:`wrap_entity` bounds this body in wall-clock time.
+
+    Split out for the same reason ``levain.run._drive_task`` is: the bound is a property of the
+    PROCESS, and reading the work should not require reading past the machinery that bounds it.
     """
     entity_dir = Path(str(path)).expanduser().resolve()
 
@@ -281,6 +449,12 @@ def wrap_entity(
         )
         return 2
 
+    # Bound BEFORE the try so the `except BaseException` cleanup can read it no matter how early an
+    # out-of-band exit lands. `None` is the honest "we never got a token"; `_cancel_our_wrap` knows
+    # how to handle that case, and a `NameError` inside a cleanup path would replace a recoverable
+    # stranded wrap with an unrecoverable traceback.
+    wrap_token: object = None
+
     try:
         # A partnership entity's store MUST be on the 6-section schema — an ops-schema store cannot
         # hold the compose, and a clear message here beats a cryptic save-time rejection.
@@ -298,9 +472,26 @@ def wrap_entity(
         # A wrap already in progress means a PRIOR consolidate crashed mid-flight (this command does
         # prepare→compose→save in one process, so it can't be a concurrent one). Refuse rather than
         # stack a second wrap; --reset discards the orphan and starts fresh (episodes are safe).
+        #
+        # ⚠ AN UNATTENDED SEAT DISCARDS THE ORPHAN AUTOMATICALLY, AND THIS IS A CORRECTNESS
+        # REQUIREMENT RATHER THAN A CONVENIENCE — found while wiring the bound, not by review.
+        # The wall-clock bound's LAYER 2 is a hard `os._exit`, which by design skips every cleanup
+        # path including the cancel below. So one backstop firing during a consolidate leaves a wrap
+        # in progress permanently. With the human-facing rule applied to a seat, EVERY subsequent
+        # consolidate then exits 2 asking a human to pass `--reset` — on a machine with no human.
+        # The seat keeps taking turns, keeps capturing episodes, and NEVER METABOLIZES AGAIN, behind
+        # a unit that still reports installed and loaded. That is precisely the
+        # `absence_of_signal_rendered_as_health` class this keystone exists to close, re-entering
+        # through the very mechanism that makes the bound trustworthy.
+        #
+        # It is SAFE, and the safety is structural rather than optimistic: we hold the exclusive
+        # non-blocking `wrap.lock` (taken above — a live peer would have exited at
+        # `_ANOTHER_WRAP_RUNNING`), so any wrap in progress at this point is definitionally an
+        # ORPHAN of a dead process, never a peer's live work. Discarding it loses nothing: the
+        # frozen episodes return to this wrap.
         started = store.get_wrap_started_at()
         if started:
-            if not reset:
+            if not reset and not unattended:
                 print(
                     f"levain wrap: a prior wrap is still in progress (started {started}).\n"
                     "  A previous consolidate did not finish. Re-run with --reset to discard it and "
@@ -308,9 +499,29 @@ def wrap_entity(
                 )
                 return 2
             store.wrap_cancelled()
-            print(f"levain wrap: discarded an unfinished prior wrap (started {started}).")
+            if unattended and not reset:
+                # SAID, not silent: a seat that keeps self-healing is a seat whose consolidates keep
+                # dying, and the log is the only place an operator can notice that pattern.
+                print(
+                    f"levain wrap: discarded an ORPHANED wrap from a prior run (started {started}) "
+                    "and continued — no human is present to be asked.\n"
+                    "  Episodes are safe (they return to this wrap). If this recurs every run, the "
+                    "consolidate is dying repeatedly: check the seat's log for a bound being hit."
+                )
+            else:
+                print(f"levain wrap: discarded an unfinished prior wrap (started {started}).")
 
+        # THE CRYSTALLIZATION BOUND, APPLIED AT THE POINT OF USE (`invariant_must_fire_at_the_point
+        # _of_use`). An unattended consolidate gets a store it can READ and cannot WRITE, so it
+        # metabolizes its working neocortex — the entire point of [6] — while the always-loaded
+        # bedrock tier stays unreachable without a human. The shrink gate keeps its crystallization
+        # credit and the composer still SEES its candidates and may still propose them in the text;
+        # only EXECUTING a promotion is refused. Wrapping here rather than at drive-resolution time
+        # is deliberate: the credential-floor slice paid for the other ordering the day before, when
+        # one policy resolved in one place and consumed in two produced a split-brain floor.
         crystal = CrystalStore(crystal_path)
+        if unattended:
+            crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
         # NO session_id — that engages flow's parallel-convo consolidate-efferent gate (spore-194),
         # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
         result = prepare_wrap(store, crystal_store=crystal)
@@ -448,6 +659,22 @@ def wrap_entity(
             f"({type(exc).__name__}: {exc})."
         )
         return 2
+    except BaseException:
+        # THE OUT-OF-BAND EXITS — and this clause exists because the two that matter are deliberately
+        # NOT `Exception` subclasses, so every handler above is blind to them by design:
+        # `TurnTimeout` (the wall-clock bound), `CrystallizationRefused`, and `KeyboardInterrupt`.
+        #
+        # Without this, an interrupted consolidate unwinds straight to the `finally`, which closes
+        # the store and releases the lock while leaving the wrap IN PROGRESS — so the next
+        # consolidate refuses. For a human that is a `--reset` away; for a seat it was permanent
+        # death until the auto-discard above, and relying on that discard alone would be leaving a
+        # known mess for a later run to clean rather than not making it.
+        #
+        # Cancelling is safe for the same structural reason the discard is: we hold the exclusive
+        # `wrap.lock`, so any wrap in progress here is OURS. Nothing partial can have been written —
+        # the save fails closed — so the frozen episodes simply return to the next wrap.
+        _cancel_our_wrap(store, wrap_token)
+        raise
     finally:
         store.close()
         _unlock_wrap(lock)

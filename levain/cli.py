@@ -381,6 +381,39 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     run_p.add_argument(
+        "--consolidate",
+        action="store_true",
+        help=(
+            "With --task: after the turn, run the entity's own wrap if enough episodes have "
+            "accumulated — as a SECOND, separately bounded phase (K4a [6]). Without this an "
+            "unattended entity piles up raw episodes forever and never metabolizes them, which is "
+            "worse than stateless: its recall degrades the longer it runs. Combined with "
+            "--unattended the consolidate may metabolize but is REFUSED from crystallizing."
+        ),
+    )
+    run_p.add_argument(
+        "--consolidate-every",
+        type=int,
+        default=None,
+        dest="consolidate_every",
+        help=(
+            "Episodes that must accumulate before --consolidate runs a wrap (default: the same "
+            "threshold the human-facing wrap-nudge uses, so the seat and the nudge can never "
+            "disagree about when a wrap is due)."
+        ),
+    )
+    run_p.add_argument(
+        "--consolidate-max-seconds",
+        type=float,
+        default=None,
+        dest="consolidate_max_seconds",
+        help=(
+            "Wall-clock bound for the --consolidate phase, INDEPENDENT of --max-seconds so a long "
+            "turn cannot starve the consolidate. Note the process can therefore live for the SUM "
+            "of the two bounds; keep a seat's cadence above that. 0 disables it explicitly."
+        ),
+    )
+    run_p.add_argument(
         "--unattended",
         action="store_true",
         help=(
@@ -399,11 +432,13 @@ def main(argv: list[str] | None = None) -> int:
         "wrap",
         help="Consolidate a sovereign entity's memory — metabolize its episodes into felt memory.",
         description=(
-            "Run the human-gated CONSOLIDATE for an ISOLATED entity (created with `levain init "
+            "Run the CONSOLIDATE for an ISOLATED entity (created with `levain init "
             "--adapter openhands`): metabolize the raw episodes it captured while you talked to it "
             "into its lasting 6-section memory, so its identity COMPOUNDS across sessions. The "
             "entity's firing captures every turn but is forbidden to consolidate on its own — this "
-            "command is the explicit operator gate that does it. The compose step runs on the "
+            "command is the invocation that does it. A scheduled seat may also run it unattended "
+            "(--unattended), in which case it may metabolize but is REFUSED from crystallizing "
+            "into the always-loaded identity tier. The compose step runs on the "
             "entity's OWN open model by default (sovereign — it metabolizes its own memory with its "
             "own mind); --composer points that step at a stronger model for a higher-quality wrap. "
             "Reads/writes ONLY the entity's own store; NEVER touches this laptop's flow store. Needs "
@@ -468,6 +503,29 @@ def main(argv: list[str] | None = None) -> int:
         default=0.5,
         dest="affect_intensity",
         help="How strongly the --affect-tag state was felt, 0.0-1.0 (default 0.5). Ignored without --affect-tag.",
+    )
+    wrap_p.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        dest="max_seconds",
+        help=(
+            "Bound the whole consolidate to N seconds of WALL-CLOCK time and exit 5 if exceeded. "
+            "Default: unbounded for a hand-run wrap (you are watching it); a scheduled seat always "
+            "sets it, because a compose stalled against a dead endpoint would otherwise hang the "
+            "seat forever. 0 disables it explicitly."
+        ),
+    )
+    wrap_p.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Declare that NO HUMAN is present for this consolidate (what a scheduled seat passes). "
+            "The consolidate may then METABOLIZE — compose the working memory — but is structurally "
+            "REFUSED from CRYSTALLIZING, i.e. promoting anything into the always-loaded identity "
+            "tier, which only a human-present wrap may ratify. Also discards an orphaned wrap left "
+            "by a crashed prior run instead of stopping to ask for --reset."
+        ),
     )
     wrap_p.set_defaults(func=_cmd_wrap)
 
@@ -658,6 +716,26 @@ def main(argv: list[str] | None = None) -> int:
                             "inside one step is unbounded by --max-iterations, and because launchd "
                             "coalesces per label the seat would then never run again. 0 disables "
                             "it — do not, unless something else bounds the process."
+                        ))
+    d_seat.add_argument("--no-consolidate", action="store_true", dest="no_consolidate",
+                        help=(
+                            "Do NOT let the seat metabolize its own memory. Off by default because "
+                            "a seat that only ever accumulates raw episodes is WORSE THAN "
+                            "STATELESS — its recall degrades the longer it runs. Use this only if "
+                            "you wrap the entity yourself on some other schedule."
+                        ))
+    d_seat.add_argument("--consolidate-every", type=int, default=None, dest="consolidate_every",
+                        help=(
+                            "Episodes that must accumulate before the seat consolidates (default: "
+                            "the same threshold the human-facing wrap-nudge uses)."
+                        ))
+    d_seat.add_argument("--consolidate-max-seconds", type=float, default=None,
+                        dest="consolidate_max_seconds",
+                        help=(
+                            "Wall-clock bound for the consolidate phase, SEPARATE from "
+                            "--max-seconds so a long turn cannot starve it (default: a finite "
+                            "built-in bound). The seat's worst-case run is therefore the SUM of "
+                            "the two; keep --interval above it. 0 disables it — do not."
                         ))
     d_seat.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="Show what would be installed + the true live state; change nothing.")
@@ -874,27 +952,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         from levain.run import run_task
 
         max_seconds = getattr(args, "max_seconds", None)
-        # A NEGATIVE bound is refused, not normalized. Both L3 lineages independently caught a
-        # negative `--max-iterations` reaching the seat argv, and the CLASS — not the symptom — is
-        # "any numeric bound flag accepts nonsense and the nonsense becomes policy". A negative
-        # wall-clock bound is worse than a bad step count: `TurnDeadline` treats non-positive as
-        # DISARMED, so `--max-seconds -1` would read as "bound it tightly" and deliver "not bounded
-        # at all" (`guard_scoped_by_symptom_misses_the_class`).
-        # NON-FINITE FIRST, because `nan` slips through EVERY comparison guard (codex L3, HIGH):
-        # `nan < 0` is False, so a `< 0` check passes it, and `nan > 0` is also False, so the
-        # deadline then arms NOTHING — an unbounded run whose own banner prints "nans wall-clock".
-        # `inf` gets as far as `setitimer` and raises OverflowError. Both must die at the door.
-        if max_seconds is not None and not math.isfinite(max_seconds):
-            print(
-                f"levain run: --max-seconds must be a finite number of seconds, got "
-                f"{max_seconds!r}. Use 0 to run unbounded — deliberately and visibly.",
-                file=sys.stderr,
-            )
+        if _reject_bad_max_seconds(max_seconds, command="run"):
             return 2
-        if max_seconds is not None and max_seconds < 0:
+        consolidate_max_seconds = getattr(args, "consolidate_max_seconds", None)
+        if _reject_bad_max_seconds(consolidate_max_seconds, command="run"):
+            return 2
+        # A consolidate TUNING flag with no --consolidate is REFUSED, not ignored — the same call
+        # `--unattended`-without-`--task` makes above, for the same reason. Silently dropping it
+        # leaves an operator believing they bounded a consolidate that is not going to happen, and
+        # on a seat that belief would persist unfalsified for as long as the seat runs.
+        if not getattr(args, "consolidate", False) and (
+            getattr(args, "consolidate_every", None) is not None
+            or consolidate_max_seconds is not None
+        ):
             print(
-                f"levain run: --max-seconds must be >= 0, got {max_seconds:g}. "
-                f"Use 0 to disable the wall-clock bound explicitly.",
+                "levain run: --consolidate-every / --consolidate-max-seconds require "
+                "--consolidate. They tune a phase that is off by default, so honouring them "
+                "without it would leave you believing the entity metabolizes its memory when it "
+                "does not.",
                 file=sys.stderr,
             )
             return 2
@@ -911,6 +986,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # representation of "no bound" reaches the deadline.
             max_seconds=None if max_seconds == 0 else max_seconds,
             unattended=getattr(args, "unattended", False),
+            consolidate=getattr(args, "consolidate", False),
+            consolidate_every=getattr(args, "consolidate_every", None),
+            consolidate_max_seconds=(
+                None if consolidate_max_seconds == 0 else consolidate_max_seconds
+            ),
         )
 
     from levain.run import run_entity
@@ -924,8 +1004,48 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+def _reject_bad_max_seconds(value: float | None, *, command: str) -> bool:
+    """Validate a ``--max-seconds`` value. Returns ``True`` (and explains) when it must be refused.
+
+    ONE validator for every command that takes the flag (``run``, ``wrap``, ``daemon install-seat``),
+    because the two edge cases below were each found by an L3 lineage and a second copy of this
+    check is a second place for them to be forgotten. The K4a [6] slice added ``wrap`` to the list of
+    callers, which is exactly when a duplicated guard starts to drift.
+
+    A NEGATIVE bound is refused rather than normalized: ``TurnDeadline`` treats non-positive as
+    DISARMED, so ``--max-seconds -1`` would read to an operator as "bound it tightly" and deliver
+    "not bounded at all" (``guard_scoped_by_symptom_misses_the_class``).
+
+    NON-FINITE IS CHECKED FIRST, because ``nan`` slips through every comparison guard (codex L3,
+    HIGH): ``nan < 0`` is False so a ``< 0`` check passes it, and ``nan > 0`` is also False so the
+    deadline then arms NOTHING — an unbounded run whose own banner prints ``nans wall-clock``.
+    ``inf`` gets as far as ``setitimer`` and raises ``OverflowError``. Both die at the door.
+    """
+    if value is None:
+        return False
+    if not math.isfinite(value):
+        print(
+            f"levain {command}: --max-seconds must be a finite number of seconds, got "
+            f"{value!r}. Use 0 to run unbounded — deliberately and visibly.",
+            file=sys.stderr,
+        )
+        return True
+    if value < 0:
+        print(
+            f"levain {command}: --max-seconds must be >= 0, got {value:g}. "
+            f"Use 0 to disable the wall-clock bound explicitly.",
+            file=sys.stderr,
+        )
+        return True
+    return False
+
+
 def _cmd_wrap(args: argparse.Namespace) -> int:
     from levain.wrap import wrap_entity
+
+    max_seconds = getattr(args, "max_seconds", None)
+    if _reject_bad_max_seconds(max_seconds, command="wrap"):
+        return 2
 
     return wrap_entity(
         path=args.path,
@@ -936,6 +1056,10 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
         reset=args.reset,
         affect_tag=args.affect_tag,
         affect_intensity=args.affect_intensity,
+        # 0 means "explicitly unbounded" — normalized at the boundary so exactly ONE representation
+        # of "no bound" reaches the deadline, matching `run`'s handling of the same flag.
+        max_seconds=None if max_seconds == 0 else max_seconds,
+        unattended=getattr(args, "unattended", False),
     )
 
 
@@ -1011,7 +1135,33 @@ def _seat_bounds_line(max_iterations: int | None, max_seconds: float | None) -> 
     return f"{steps} · {secs}"
 
 
-def _print_bound_cadence_notes(max_seconds: float | None, interval: int) -> None:
+def _seat_consolidate_line(
+    consolidate: bool, every: int | None, max_seconds: float | None
+) -> str:
+    """Render the seat's self-consolidate posture — the answer to "does this rewrite its own memory".
+
+    Printed for BOTH states rather than only when enabled. An operator scanning the banner for
+    "what does this thing do to itself while I am not here" must get an answer, and an absent line
+    reads as "no such feature" rather than "the feature is off" — the same reason
+    :func:`_seat_bounds_line` prints the word UNBOUNDED instead of omitting a missing bound.
+    """
+    if not consolidate:
+        return (
+            "OFF — this seat will accumulate raw episodes and never metabolize them, so its "
+            "recall degrades as it runs"
+        )
+    thr = f"every {every} episodes" if every is not None else "at the default episode threshold"
+    secs = f"{max_seconds:g}s bound" if max_seconds is not None else "UNBOUNDED"
+    return f"ON ({thr}, {secs}) · may metabolize, may NEVER crystallize"
+
+
+def _print_bound_cadence_notes(
+    max_seconds: float | None,
+    interval: int,
+    *,
+    consolidate: bool = False,
+    consolidate_max_seconds: float | None = None,
+) -> None:
     """Say what the two numbers MEAN TOGETHER — printed by the dry-run AND the real install.
 
     ⚠ ONE FUNCTION, TWO CALL SITES, deliberately. The first version of this lived only after
@@ -1028,13 +1178,34 @@ def _print_bound_cadence_notes(max_seconds: float | None, interval: int) -> None
     # refused: "poll as often as possible, one at a time" is a legitimate pattern (short interval,
     # long bound). But it must be SAID, because the operator asked for one cadence and will get
     # another, and a schedule that quietly means something else is how the original defect hid.
-    if max_seconds is not None and max_seconds >= interval:
+    #
+    # ⚠ THE COMPARISON IS AGAINST THE SUM OF BOTH BOUNDS, NOT THE TURN'S ALONE (K4a [6]). What
+    # occupies the label is the PROCESS, and a consolidating seat's process is turn THEN consolidate,
+    # sequentially, each with its own budget. Checking only `max_seconds` would have printed a clean
+    # "1800s < 3600s cadence, all good" for a seat whose real worst case is 2700s — and the operator
+    # would have been told the schedule holds when it does not. Same class as the two banners that
+    # answered one question with a resolved line and a static one.
+    occupancy = (max_seconds or 0) + (consolidate_max_seconds or 0 if consolidate else 0)
+    if max_seconds is not None and occupancy >= interval:
+        parts = f"{max_seconds:g}s turn"
+        if consolidate and consolidate_max_seconds is not None:
+            parts += f" + {consolidate_max_seconds:g}s consolidate = {occupancy:g}s"
         print(
-            f"\n  ⓘ the time bound ({max_seconds:g}s) is >= the cadence ({interval}s). launchd "
+            f"\n  ⓘ the seat's worst-case run ({parts}) is >= the cadence ({interval}s). launchd "
             f"coalesces per label,\n"
-            f"    so a long turn will SKIP intervals — the effective cadence becomes the turn's "
+            f"    so a long run will SKIP intervals — the effective cadence becomes the run's "
             f"own duration.\n"
-            f"    Fine if that is what you want; lower --max-seconds or raise --interval if not."
+            f"    Fine if that is what you want; lower the bounds or raise --interval if not."
+        )
+    elif max_seconds is not None and consolidate and consolidate_max_seconds is None:
+        # The turn is bounded and the consolidate is NOT. The turn bound alone looks reassuring, so
+        # this asymmetry has to be named or the seat reads as bounded while owning an unbounded tail.
+        print(
+            "\n  ⚠ the TURN is bounded but the CONSOLIDATE is not (--consolidate-max-seconds 0). "
+            "A compose stalled\n"
+            "    against a dead endpoint would hang this seat forever behind a unit still "
+            "reporting installed +\n"
+            "    loaded — the same silent death the turn bound closes, through the other door."
         )
     elif max_seconds is None:
         # The one genuinely dangerous configuration. It is opt-in, so say what it costs.
@@ -1113,6 +1284,40 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         else (None if args.max_seconds == 0 else args.max_seconds)
     )
 
+    # THE CONSOLIDATE PHASE — same three-valued treatment for its bound, and the same rejection of
+    # a tuning flag whose feature is switched off.
+    consolidate = not getattr(args, "no_consolidate", False)
+    if _reject_bad_max_seconds(
+        getattr(args, "consolidate_max_seconds", None), command="daemon install-seat"
+    ):
+        return 2
+    if getattr(args, "consolidate_every", None) is not None and args.consolidate_every < 1:
+        print(
+            f"levain daemon install-seat: --consolidate-every must be >= 1, got "
+            f"{args.consolidate_every}. A threshold of 0 would consolidate on an EMPTY store, "
+            f"burning a model call every interval to metabolize nothing.",
+            file=sys.stderr,
+        )
+        return 2
+    if not consolidate and (
+        getattr(args, "consolidate_every", None) is not None
+        or getattr(args, "consolidate_max_seconds", None) is not None
+    ):
+        print(
+            "levain daemon install-seat: --consolidate-every / --consolidate-max-seconds "
+            "contradict --no-consolidate. Refused rather than silently ignored: an operator who "
+            "tuned a consolidate and installed a seat that never runs one would have no way to "
+            "notice for as long as the seat lives.",
+            file=sys.stderr,
+        )
+        return 2
+    consolidate_secs = (
+        None if not consolidate
+        else daemon.DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS
+        if args.consolidate_max_seconds is None
+        else (None if args.consolidate_max_seconds == 0 else args.consolidate_max_seconds)
+    )
+
     # Read the entity's DECLARED gate posture and resolve it exactly as the runtime will for an
     # unattended drive, so the output below states what will actually happen (see the print block).
     # Fail-safe: an unreadable/…invalid config must not silently produce a "governed" claim.
@@ -1121,6 +1326,9 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
             entity_path=entity, task=args.task, interval=args.interval,
             label=args.label, model=args.model, max_iterations=max_iters,
             max_seconds=max_secs,
+            consolidate=consolidate,
+            consolidate_every=getattr(args, "consolidate_every", None),
+            consolidate_max_seconds=consolidate_secs,
         )
     except ValueError as exc:      # an incoherent schedule (e.g. --interval 0)
         print(f"levain daemon install-seat: {exc}", file=sys.stderr)
@@ -1185,12 +1393,16 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         print(f"  task:    {args.task}")
         print(f"  cadence: every {spec.start_interval}s")
         print(f"  bounds:  {_seat_bounds_line(max_iters, max_secs)}")
+        print(f"  memory:  {_seat_consolidate_line(consolidate, args.consolidate_every, consolidate_secs)}")
         print(f"  unit:    {plan.unit_path}")
         print(f"  on disk: {on_disk}")
         print(f"  live:    {st.load_state} — {st.detail}")
         print(f"  action:  {plan.action}")
         print("\n  honesty floor: a unit file on disk is NOT proof the service is loaded.")
-        _print_bound_cadence_notes(max_secs, args.interval)
+        _print_bound_cadence_notes(
+            max_secs, args.interval,
+            consolidate=consolidate, consolidate_max_seconds=consolidate_secs,
+        )
         return 0
 
     try:
@@ -1202,7 +1414,11 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     print(f"\n  seat:   {entity}")
     print(f"  task:   {args.task}")
     print(f"  bounds: {_seat_bounds_line(max_iters, max_secs)}")
-    _print_bound_cadence_notes(max_secs, args.interval)
+    print(f"  memory: {_seat_consolidate_line(consolidate, args.consolidate_every, consolidate_secs)}")
+    _print_bound_cadence_notes(
+        max_secs, args.interval,
+        consolidate=consolidate, consolidate_max_seconds=consolidate_secs,
+    )
     # BOTH streams, and the .err one is named LAST because it carries the decision. launchd sends
     # stdout and stderr to SEPARATE files, and the gated-halt report ("HELD AT THE EFFERENT GATE"
     # + the pending-action list) is printed to STDERR. Naming only the stdout path sends the

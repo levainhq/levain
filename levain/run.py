@@ -228,6 +228,9 @@ def run_task(
     max_iterations: int | None = None,
     max_seconds: float | None = None,
     unattended: bool = False,
+    consolidate: bool = False,
+    consolidate_every: int | None = None,
+    consolidate_max_seconds: float | None = None,
 ) -> int:
     """Drive the entity at ``path`` through ONE task, non-interactively, and exit.
 
@@ -270,6 +273,29 @@ def run_task(
     armed, preserving the existing behaviour for an operator running a task by hand; a scheduled
     seat always sets it (see :func:`levain.daemon.build_seat_spec`).
 
+    ``consolidate`` runs the entity's own wrap AFTER the turn, as a SECOND, SEPARATELY BOUNDED
+    phase — K4a [6], the bounded self-consolidate. Without it an unattended seat accumulates raw
+    episodes forever and never metabolizes them, which is **worse than stateless**: its recall
+    degrades the longer it runs. It is an explicit flag rather than something inferred from
+    ``unattended`` for the same reason ``--unattended`` is EMITTED into the seat's argv rather than
+    derived from the presence of a schedule — an entity that rewrites its own memory with nobody
+    watching is a governance fact, and an auditor reading the unit file must be able to see it.
+    They are genuinely two signals, not two names for one: ``consolidate`` decides WHETHER the wrap
+    happens, ``unattended`` decides what it is ALLOWED TO DO when it does (metabolize, never
+    crystallize — :mod:`levain.firing.crystallization`).
+
+    ``consolidate_every`` is the episode threshold that makes a wrap "due"; ``None`` uses the shared
+    default. The count is read through :func:`levain.firing.anneal.consolidate_readiness`, the SAME
+    predicate the human-facing wrap-nudge uses, so a seat can never consolidate on a different
+    definition of "due" than the one an operator is told about.
+
+    ``consolidate_max_seconds`` bounds the wrap independently of ``max_seconds``. Independent, not
+    shared, and that is the point of running it after the turn's ``with`` block rather than inside
+    it: a turn that spends the whole budget would otherwise starve the consolidate, which is exactly
+    backwards — the consolidate is the maintenance that keeps the seat healthy. The cost, stated:
+    the process's worst-case lifetime becomes ``max_seconds + consolidate_max_seconds``, so the
+    cadence must exceed the SUM (``levain daemon install-seat`` warns when it does not).
+
     Streaming note: output is flushed as it is produced, so a caller reading the pipe sees
     progress DURING the turn rather than nothing until the process exits.
     """
@@ -305,7 +331,7 @@ def run_task(
     deadline = TurnDeadline(max_seconds, hard_exit_code=EXIT_TIMEOUT)
     with deadline:
         try:
-            return _drive_task(
+            rc = _drive_task(
                 path, task,
                 model=model, base_url=base_url, api_key=api_key, with_tools=with_tools,
                 quiet=quiet, max_iterations=max_iterations, max_seconds=max_seconds,
@@ -315,7 +341,150 @@ def run_task(
             # Reached when the bound fires OUTSIDE the turn (startup, teardown, rendering).
             # `run_turn` catches its own and reports via `result.timed_out`, which routes to the
             # same report below — one wording for one outcome, wherever it lands.
-            return _report_timeout(deadline.seconds, captured=None)
+            rc = _report_timeout(deadline.seconds, captured=None)
+
+    # THE SECOND BOUNDED PHASE — the unattended self-consolidate (K4a [6]).
+    #
+    # SEQUENTIAL, NEVER NESTED, and the structure is forced rather than chosen: `TurnDeadline` is
+    # explicitly non-re-entrant and refuses a nested `with` loudly, because nesting would silently
+    # leave the OUTER region unbounded. Running the consolidate out here — after the turn's deadline
+    # has been disarmed — is what lets it carry its OWN independent budget instead of eating the
+    # turn's remainder. A consolidate funded out of whatever the turn left over is a consolidate
+    # that gets skipped precisely on the busy days when it is most needed.
+    if consolidate:
+        _self_consolidate(
+            path,
+            turn_exit_code=rc,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            unattended=unattended,
+            every=consolidate_every,
+            max_seconds=consolidate_max_seconds,
+        )
+    # THE TURN'S OUTCOME DOMINATES — the consolidate never rewrites it. A supervisor branches on
+    # this code to decide what to do about THE WORK: `4` means a human must review a held action,
+    # `5` means the endpoint stalled, `0` means it replied. Folding a maintenance failure into that
+    # channel would invert the operator's response — a successful, gated turn reported as `1` would
+    # send someone hunting a broken task instead of reviewing the action that was actually held.
+    # The consolidate reports its own outcome loudly on stderr instead; see `_self_consolidate`.
+    return rc
+
+
+def _self_consolidate(
+    path: Path,
+    *,
+    turn_exit_code: int,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    unattended: bool,
+    every: int | None,
+    max_seconds: float | None,
+) -> None:
+    """Metabolize accumulated episodes after the turn, if a wrap is due. Reports; never raises.
+
+    Returns ``None`` deliberately — the caller must not be able to fold this outcome into the turn's
+    exit code (see the call site). Everything this phase has to say, it says on stderr.
+
+    **The two skip cases are the interesting part, because each would otherwise make things worse:**
+
+    - ``EXIT_USAGE`` (2) — the session never opened. Whatever stopped it (a bad entity path, a
+      missing extra, a failed sovereignty guard) will stop the consolidate in the same way, so
+      attempting it adds a second confusing failure to a log that already names the real one.
+    - ``EXIT_TIMEOUT`` (5) — the turn's model endpoint just proved it stalls. The compose beat is
+      another call to that same endpoint, so consolidating now would very likely hang too, and the
+      seat's process lifetime would become turn-bound PLUS consolidate-bound against a dead socket —
+      doubling the window in which launchd's per-label coalescing keeps the next run from starting.
+      Skipping is what keeps one sick endpoint from costing two cadences.
+
+    A GATED turn (4) is NOT skipped, and that is deliberate rather than an omission: a gated halt is
+    never captured to memory, so it contributes no episodes — but earlier turns did, and their
+    metabolizing is independent of whether a human has reviewed a held action yet. Refusing to
+    consolidate while the entity waits for review would let recall degrade for exactly as long as
+    the human takes to look.
+    """
+    from levain.firing.anneal import consolidate_readiness
+    from levain.firing.isolation import entity_store_paths
+
+    if turn_exit_code in (EXIT_USAGE, EXIT_TIMEOUT):
+        print(
+            f"  ↩ consolidate SKIPPED — the turn exited {turn_exit_code} "
+            f"({'nothing started' if turn_exit_code == EXIT_USAGE else 'the endpoint stalled'}), "
+            f"so a compose against the same environment would likely fail the same way.",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    try:
+        _, episodic_path = entity_store_paths(Path(str(path)).expanduser().resolve())
+    except Exception as exc:  # noqa: BLE001 — a maintenance phase must never break a finished turn
+        print(f"  ⚠ consolidate SKIPPED — could not locate the entity's store ({exc}).",
+              file=sys.stderr, flush=True)
+        return
+
+    readiness = consolidate_readiness(episodic_path, every)
+    if not readiness.readable:
+        # NOT the same as "nothing to do", and it must never print as though it were. If this
+        # recurs every interval the entity is never metabolizing again — the silent-death class
+        # this keystone exists to close — so it is reported as a WARNING an operator can grep for.
+        print(
+            "  ⚠ consolidate SKIPPED — the entity's episode store could not be READ, which is not "
+            "the same as it being empty.\n"
+            "     If this repeats on every run, the entity is accumulating episodes it will never "
+            "metabolize: check the store.",
+            file=sys.stderr, flush=True,
+        )
+        return
+    if not readiness.due:
+        print(
+            f"  ↩ consolidate not due — {readiness.episodes}/{readiness.threshold} episodes since "
+            f"the last one.",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    print(
+        f"  ⟳ consolidating — {readiness.episodes} episodes accumulated "
+        f"(threshold {readiness.threshold})…",
+        file=sys.stderr, flush=True,
+    )
+    from levain.wrap import wrap_entity
+
+    try:
+        rc = wrap_entity(
+            Path(path),
+            composer=model,
+            base_url=base_url,
+            api_key=api_key,
+            max_seconds=max_seconds,
+            unattended=unattended,
+        )
+    except BaseException as exc:  # noqa: BLE001 — including the out-of-band ones, see below
+        # The turn is ALREADY DONE and its work is captured. A consolidate that blows up must not
+        # convert a completed turn into a traceback exit — that would misreport the turn's outcome,
+        # which is the one thing the exit-code ladder exists to get right. Caught at `BaseException`
+        # because the interesting failures here are deliberately not `Exception` subclasses
+        # (`TurnTimeout`, `CrystallizationRefused`); `wrap_entity` converts both to exit codes
+        # itself, so reaching this is already unexpected and is reported as such.
+        print(f"  ⚠ consolidate FAILED unexpectedly ({type(exc).__name__}: {exc}) — the turn's own "
+              f"result stands and its episodes are safe.", file=sys.stderr, flush=True)
+        return
+
+    if rc == 0:
+        print("  ✓ consolidated — the entity metabolized its episodes into memory.",
+              file=sys.stderr, flush=True)
+    else:
+        # SAID, and said in a way that names the compounding cost. A single failed consolidate is
+        # recoverable (the episodes return to the next wrap); a consolidate failing EVERY run is the
+        # seat quietly ceasing to metabolize, and the only place that pattern is visible is here.
+        print(
+            f"  ⚠ consolidate did not complete (exit {rc}) — the entity's memory is UNCHANGED and "
+            f"its episodes are safe; they return to the next wrap.\n"
+            f"     Recall degrades while this keeps failing, so a run of these in the log is worth "
+            f"acting on even though each one is survivable.",
+            file=sys.stderr, flush=True,
+        )
 
 
 def _report_timeout(seconds: float | None, *, captured: bool | None) -> int:

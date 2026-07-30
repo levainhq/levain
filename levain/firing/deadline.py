@@ -68,6 +68,7 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Callable
 from types import FrameType
 from typing import Literal
 
@@ -208,6 +209,7 @@ class TurnDeadline:
         grace: float = HARD_EXIT_GRACE_SECONDS,
         hard_exit_code: int = 5,
         stream=None,
+        hard_report: "Callable[[float], str] | None" = None,
     ) -> None:
         # A NON-FINITE BOUND IS REFUSED HERE, LOUDLY (codex L3, HIGH — the nastiest of the set,
         # because it produces a run that LOOKS bounded and is not). `nan` passes a `< 0` guard
@@ -227,6 +229,14 @@ class TurnDeadline:
         self.grace = grace
         self.hard_exit_code = hard_exit_code
         self._stream = stream
+        # THE BACKSTOP'S REPORT IS INJECTABLE BECAUSE THE DEFAULT ONE MAKES CLAIMS THAT ARE ONLY
+        # TRUE OF A TURN. `format_timeout_report(hard=True)` warns that the confined bash is
+        # orphaned and that cleanup was skipped — accurate for `levain run`, and FALSE for a
+        # consolidate, which spawns no shell and holds only a store handle and an flock. Printing it
+        # there would have this module lie about its own blast radius in the operator-facing line,
+        # which is the exact defect class the hard report was written to avoid. Callers bounding
+        # something other than a turn supply their own wording; everyone else gets the default.
+        self._hard_report = hard_report
         self._active = False
         self._armed_signal = False
         self._previous_handler: object = None
@@ -357,10 +367,12 @@ class TurnDeadline:
         try:
             stream = self._stream if self._stream is not None else sys.stderr
             # `captured=None`: a watchdog thread cannot know what the main thread reached.
-            print(
-                format_timeout_report(self.seconds, hard=True, captured=None),
-                file=stream, flush=True,
+            text = (
+                self._hard_report(self.seconds)
+                if self._hard_report is not None
+                else format_timeout_report(self.seconds, hard=True, captured=None)
             )
+            print(text, file=stream, flush=True)
         except Exception:  # noqa: BLE001 — reporting must never prevent the termination
             pass
         # `os._exit`, not `sys.exit`: this runs on a watchdog THREAD, where SystemExit would only

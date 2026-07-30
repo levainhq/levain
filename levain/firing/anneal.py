@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
@@ -99,39 +100,103 @@ def _resolve_wrap_nudge_threshold(explicit: int | None) -> int:
     return DEFAULT_WRAP_NUDGE_THRESHOLD
 
 
-def wrap_nudge(episodic_path: Path | None = None, threshold: int | None = None) -> str | None:
-    """The SessionEnd→wrap-nudge — afferent SURFACING. Returns a human-facing nudge string iff at
-    least ``threshold`` episodes have accumulated since the last consolidate (a wrap is due), else
-    ``None``.
+@dataclass(frozen=True)
+class ConsolidateReadiness:
+    """Whether a consolidate is due — and, separately, whether we could even tell.
 
-    AFFERENT-ONLY, by construction:
-      - **Read-only.** It opens the episodic store ``read_only=True`` and counts
-        ``episodes_since_wrap()`` — no write, no audit sidecar, no write-lock contention against a
-        concurrent capture or wrap.
-      - **Never consolidates.** It SURFACES that a wrap is due; the consolidate itself is the
-        human-gated efferent write the vagus is forbidden to perform. The return is a string for
-        the adopter to DISPLAY — it is NOT a transport send (a push/email would cross to efferent).
-      - **Fail-soft.** Any read failure (store absent/corrupt, anneal missing) returns ``None`` —
-        no nudge beats a crash; a missing reminder is low-stakes (not data loss like a capture)."""
+    **``episodes`` is TRI-STATE, and the third state is why this is a class and not an int.** A
+    count means the store was read. ``None`` means it could NOT be read (absent parent dir, corrupt,
+    anneal missing), which is emphatically not "zero episodes".
+
+    Collapsing those two is harmless for the NUDGE — a human who misses one reminder gets the next
+    one — and exactly wrong for a SEAT, where "unreadable" recurring every interval means the entity
+    never metabolizes again, quietly, which is the ``absence_of_signal_rendered_as_health`` class
+    K4a ⑥ just spent a whole slice closing. The two consumers owe different responses, so the
+    predicate must not pick one for them. Same discipline as ``format_timeout_report``'s tri-state
+    ``captured``: only claim what the caller can actually vouch for.
+    """
+
+    episodes: int | None
+    threshold: int
+
+    @property
+    def readable(self) -> bool:
+        """Was the store read? ``False`` is a fact to REPORT, never a quiet "nothing to do"."""
+        return self.episodes is not None
+
+    @property
+    def due(self) -> bool:
+        """Enough accumulated to be worth metabolizing? Unreadable is never due."""
+        return self.episodes is not None and self.episodes >= self.threshold
+
+
+def consolidate_readiness(
+    episodic_path: Path | None = None, threshold: int | None = None
+) -> ConsolidateReadiness:
+    """Read the accumulated-episode count and compare it to the wrap threshold. Never raises.
+
+    **THE SINGLE DEFINITION OF "a wrap is due", shared by both consumers** — the human-facing
+    :func:`wrap_nudge` and the unattended seat's self-consolidate (:func:`levain.run.run_task`). Two
+    surfaces answering one question from two copies of the arithmetic is how they drift, and this
+    particular drift would be near-invisible: a seat consolidating on a different definition than
+    the nudge reports leaves an operator reading a hint that disagrees with what the machine did.
+    One function, one answer — the same move as ``levain.answers.IDENTITY_SLOTS`` shared across the
+    three init surfaces, and ``resolve_gate_mode`` shared by the gate and the banners.
+
+    Read-only throughout (``read_only=True``, counting ``episodes_since_wrap()``): no write, no
+    audit sidecar, no write-lock contention against a concurrent capture or wrap — so it is safe to
+    call from a seat that is about to take the wrap lock.
+    """
     thr = _resolve_wrap_nudge_threshold(threshold)
     try:
         from anneal_memory import Store
 
         path = episodic_path or _env_episodic_path()
         if not Path(path).exists():
-            return None
+            # A store file that does not exist yet is READABLE and genuinely empty — a fresh entity
+            # that has never captured a turn. Deliberately distinct from a store that exists and
+            # cannot be read: reporting "unreadable" for a brand-new entity would cry wolf on every
+            # seat's first interval.
+            return ConsolidateReadiness(episodes=0, threshold=thr)
         with Store(path, read_only=True) as store:
-            count = len(store.episodes_since_wrap())
-        if count < thr:
-            return None
-        return (
-            f"{count} episodes captured since the last consolidate — a wrap is due. "
-            "(The vagus never consolidates autonomously; running the wrap is the human-gated step "
-            "that metabolizes these raw captures into memory.)"
-        )
-    except Exception as e:  # noqa: BLE001 — fail-soft: a missing nudge is not data loss
-        _log.debug("vagus wrap_nudge unavailable (%s): %s", type(e).__name__, e)
+            return ConsolidateReadiness(
+                episodes=len(store.episodes_since_wrap()), threshold=thr
+            )
+    except Exception as e:  # noqa: BLE001 — fail-soft: must never raise into a turn or a nudge
+        _log.debug("consolidate readiness unavailable (%s): %s", type(e).__name__, e)
+        return ConsolidateReadiness(episodes=None, threshold=thr)
+
+
+def wrap_nudge(episodic_path: Path | None = None, threshold: int | None = None) -> str | None:
+    """The SessionEnd→wrap-nudge — afferent SURFACING. Returns a human-facing nudge string iff at
+    least ``threshold`` episodes have accumulated since the last consolidate (a wrap is due), else
+    ``None``. A thin formatter over :func:`consolidate_readiness`.
+
+    AFFERENT-ONLY, by construction:
+      - **Read-only.** :func:`consolidate_readiness` opens the store ``read_only=True`` — no write,
+        no audit sidecar, no write-lock contention against a concurrent capture or wrap.
+      - **Never consolidates.** It SURFACES that a wrap is due; performing one is a separate,
+        explicitly-authorised act. ⚠ **Amended for K4a [6], because the old wording is now false in
+        one case:** this used to read "the consolidate itself is the human-gated efferent write the
+        vagus is forbidden to perform." A seat installed by ``levain daemon install-seat`` may now
+        consolidate itself — bounded in wall-clock time, and structurally forbidden to crystallize
+        (:mod:`levain.firing.crystallization`). What was always the load-bearing half remains
+        exactly true: **the FIRING never consolidates.** No in-turn afferent path may trip a memory
+        write; the seat's consolidate is driven by its own invocation, after the turn is over. The
+        return here is a string for the adopter to DISPLAY — never a transport send.
+      - **Fail-soft.** Any read failure returns ``None`` — no nudge beats a crash, and a missed
+        reminder is low-stakes for a HUMAN reader. ⚠ **A seat must NOT inherit that collapse:** call
+        :func:`consolidate_readiness` and branch on ``.readable``, because for an unattended caller
+        "unreadable" every interval is silent death, not a missed hint.
+    """
+    r = consolidate_readiness(episodic_path, threshold)
+    if not r.due:
         return None
+    return (
+        f"{r.episodes} episodes captured since the last consolidate — a wrap is due. "
+        "(The firing never consolidates autonomously; running the wrap is the step "
+        "that metabolizes these raw captures into memory.)"
+    )
 
 
 class AnnealFiring:

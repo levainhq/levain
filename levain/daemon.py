@@ -61,6 +61,29 @@ DEFAULT_SEAT_MAX_ITERATIONS = 40
 # turn never starves its own next run. Like the step bound, a STARTING number to calibrate against a
 # seat that has actually run — not a derived one (`derive_dont_invent`).
 DEFAULT_SEAT_MAX_SECONDS = 1800.0
+# A STARTING wall-clock bound for the seat's SELF-CONSOLIDATE (K4a [6]), separate from the turn's.
+#
+# SEPARATE, not shared, and the separation is the design: the consolidate runs as a second bounded
+# phase AFTER the turn, so a turn that spends its whole budget cannot starve the maintenance that
+# keeps the seat's recall from degrading. The cost is that a seat's worst-case PROCESS lifetime is
+# `max_seconds + consolidate_max_seconds`, which is why `install-seat` warns against the SUM rather
+# than against either bound alone.
+#
+# MEASURED, not guessed (L4-live, 2026-07-29, `glm-5.2:cloud` via Ollama Cloud): a consolidate of a
+# 12-episode window — the default wrap threshold, i.e. the size at which a seat actually wraps —
+# producing a 4020-char neocortex took **22s**; a 3-episode window took 7s. So 900s is ~40x a
+# measured compose at the threshold, which is the headroom a WALL-CLOCK bound wants: it must never
+# cut off legitimate work, only a stall. `derive_dont_invent` — this slice's handoff specifically
+# called out re-deriving this against a measured compose instead of reasoning about it.
+#
+# It also has to fit the cadence, and it does exactly: 1800s turn + 900s consolidate = 2700s, which
+# is under the 3600s default interval with room to spare, so a default seat never coalesces itself
+# out of a run. Changing either bound should be re-checked against that sum (`install-seat` warns).
+#
+# ⚠ WHAT THE MEASUREMENT DOES NOT COVER, said rather than implied: a long-lived seat's window grows
+# (more episodes, a larger existing memory to re-read), and cloud latency varies by day. 22s is the
+# shape of a healthy compose, NOT the worst case — the bound is sized for the tail, not the median.
+DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS = 900.0
 # launchd's default minimum respawn spacing (`man launchd.plist` → ThrottleInterval). A
 # StartInterval below this is silently throttled up to it unless ThrottleInterval is lowered too.
 _LAUNCHD_DEFAULT_THROTTLE = 10
@@ -243,6 +266,9 @@ def build_seat_spec(
     model: str | None = None,
     max_iterations: int | None = DEFAULT_SEAT_MAX_ITERATIONS,
     max_seconds: float | None = DEFAULT_SEAT_MAX_SECONDS,
+    consolidate: bool = True,
+    consolidate_every: int | None = None,
+    consolidate_max_seconds: float | None = DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS,
     log_dir: Path | None = None,
 ) -> DaemonSpec:
     """Build the OS-agnostic spec for a **scheduled governed seat** (K4a) — ONE sovereign entity
@@ -276,6 +302,16 @@ def build_seat_spec(
       launchd has no ``RuntimeMaxSec`` and macOS has no ``timeout`` binary, so a unit-file bound
       would be Linux-only and leave macOS holed — one requirement, two enforcement models, the trap
       ``K4c`` is already warned about for confinement.
+    - **``--consolidate`` defaults ON, and it is the difference between a seat that compounds and
+      one that decays** (K4a [6]). ``levain wrap`` is human-gated by invocation, so before this a
+      scheduled seat captured episodes forever and never metabolized them — and an agent whose raw
+      episodes only ever accumulate is **worse than stateless**, because its recall degrades as it
+      runs. Defaulting it OFF would ship a seat that looks healthy for a week and quietly gets worse
+      the whole time, which is the failure mode this keystone exists to remove. It runs as a SECOND
+      bounded phase after the turn, with its own ``--consolidate-max-seconds`` so a long turn cannot
+      starve it — and therefore a seat's worst-case PROCESS lifetime is the SUM of the two bounds,
+      which is what the install banner checks the cadence against.
+
     - **The entity path is POSITIONAL** (``levain run <path>``), not ``--path``. Resolved absolute,
       because a login-launched unit has no stable cwd.
 
@@ -303,6 +339,19 @@ def build_seat_spec(
         # seat restartable" is exactly the question a plist reader is trying to answer.
         # `%g` so a whole number of seconds renders as `1800`, not `1800.0`.
         argv += ["--max-seconds", f"{max_seconds:g}"]
+    if consolidate:
+        # EMITTED, like `--unattended` and `--max-seconds`, and for the strongest version of that
+        # reason yet: this flag is what permits the entity to REWRITE ITS OWN MEMORY with nobody
+        # present. Inferring it from "this is a seat" would bury the single most governance-relevant
+        # fact about the unit somewhere an auditor reading the plist cannot see it. Someone asking
+        # "does this thing modify its own identity while I sleep?" must be able to answer from the
+        # argv alone. (What it may NOT do is crystallize — that bound rides `--unattended`, also in
+        # the argv, and is enforced structurally rather than by this flag's absence.)
+        argv += ["--consolidate"]
+        if consolidate_every is not None:
+            argv += ["--consolidate-every", str(consolidate_every)]
+        if consolidate_max_seconds is not None:
+            argv += ["--consolidate-max-seconds", f"{consolidate_max_seconds:g}"]
     logs = (log_dir or _default_log_dir()).expanduser().resolve()
     return DaemonSpec(
         label=label,
