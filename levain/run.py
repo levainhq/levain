@@ -385,6 +385,42 @@ def run_task(
 PREWORK_BOUND_SECONDS = 60.0
 
 
+def _format_prework_timeout_report(seconds: float) -> str:
+    """The backstop wording for the consolidate PRE-WORK bound (added 2026-07-30, Diogenes).
+
+    `TurnDeadline`'s default `format_timeout_report(hard=True)` is TURN-shaped and is false in
+    this window in both of its scariest claims: it warns that "a child mid-command is ORPHANED"
+    when `_drive_task`'s `finally: session.close()` has already run so no confined shell exists,
+    and that "whether this turn reached memory is UNKNOWN" when the turn's capture status is
+    settled by the time this bound arms. Both would send an operator hunting a process that
+    cannot exist, and doubting a capture that already happened.
+
+    `deadline.py` added the injectable report for exactly this reason and says so — *"Callers
+    bounding something other than a turn supply their own wording"* — and `wrap_entity` honours
+    it. This second non-turn caller did not, which is the same guard-scoped-to-one-site shape
+    the rest of this file keeps closing. What is actually true here: the only work under the
+    bound is READING the episode count, so the store or the disk is the suspect.
+    """
+    return (
+        f"  ⏱ CONSOLIDATE PRE-WORK BOUND EXCEEDED ({seconds:g}s) — and the graceful stop did NOT "
+        f"take, so the process\n"
+        f"     was terminated outright.\n"
+        f"     ✅ THE TURN ITSELF ALREADY FINISHED and its work is captured — this bound arms "
+        f"AFTER the session is\n"
+        f"     closed, so there is no confined bash to orphan and nothing about the turn's "
+        f"capture is in doubt.\n"
+        f"     ✅ No consolidate was started, so no wrap is left in progress and nothing needs "
+        f"--reset.\n"
+        f"     ⚠ The ONLY work under this bound was READING the entity's episode count. That "
+        f"points at the store or\n"
+        f"     the disk under it — a stuck flock, a hung filesystem — not at the consolidate and "
+        f"not at the model.\n"
+        f"     A hard exit cannot hand back the turn's exit code, so the process reports the "
+        f"TIMEOUT code even\n"
+        f"     though the turn succeeded — read this line, not the code."
+    )
+
+
 def _self_consolidate(
     path: Path,
     *,
@@ -433,7 +469,11 @@ def _self_consolidate(
     try:
         # Its own instance: `TurnDeadline` is re-usable but never re-entrant, and this one is fully
         # exited before `wrap_entity` arms its own. Sequential bounds, never nested.
-        with TurnDeadline(PREWORK_BOUND_SECONDS, hard_exit_code=turn_exit_code):
+        with TurnDeadline(
+            PREWORK_BOUND_SECONDS,
+            hard_exit_code=turn_exit_code,
+            hard_report=_format_prework_timeout_report,
+        ):
             _, episodic_path = entity_store_paths(Path(str(path)).expanduser().resolve())
             readiness = consolidate_readiness(episodic_path, every)
     except TurnTimeout:

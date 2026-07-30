@@ -163,3 +163,40 @@ def test_a_non_consolidating_seat_is_judged_on_the_turn_bound_alone(capsys):
     out = capsys.readouterr().out
     assert "SKIP intervals" not in out
     assert "CONSOLIDATE is not" not in out
+
+
+# ── The co-occurring case the elif chain swallowed (Diogenes, 2026-07-30) ──────────────────
+# The three warnings were an elif chain over INDEPENDENT conditions. Every test above uses a
+# 600s turn against a 3600s interval, so the cadence branch and the unbounded-tail branch never
+# competed — the suite structurally could not catch this. These make them compete.
+
+def test_over_cadence_AND_unbounded_tail_prints_BOTH_warnings(capsys):
+    """THE DEFECT. A turn bound >= the interval AND an unbounded consolidate is a legal,
+    reachable config, and the `elif` meant only the first warning fired — silently swallowing
+    the one that names a SILENT DEATH. The operator was told the schedule holds by the very
+    banner that exists to tell them when it does not."""
+    _print_bound_cadence_notes(4000.0, 3600, consolidate=True, consolidate_max_seconds=None)
+    out = capsys.readouterr().out
+    assert "SKIP intervals" in out, "the cadence warning must still fire"
+    assert "TURN is bounded but the CONSOLIDATE is not" in out, (
+        "the silent-death warning must NOT be swallowed by the cadence branch")
+
+
+def test_an_unbounded_tail_never_reports_a_finite_worst_case(capsys):
+    """The first branch's own arithmetic dropped the tail: `consolidate_max_seconds or 0` makes
+    an UNBOUNDED consolidate contribute ZERO, so it printed 'worst-case run (4000s turn)' for a
+    seat whose real worst case has no upper bound at all. A number that is provably false is
+    worse here than no number, because the operator budgets against it."""
+    _print_bound_cadence_notes(4000.0, 3600, consolidate=True, consolidate_max_seconds=None)
+    out = capsys.readouterr().out
+    assert "UNBOUNDED consolidate" in out
+    assert "(4000s turn)" not in out, "must not claim a finite worst case over an unbounded tail"
+
+
+def test_an_unbounded_tail_is_over_cadence_even_under_a_tiny_turn_bound(capsys):
+    """An unbounded consolidate cannot fit ANY cadence, so the cadence warning must fire on the
+    tail alone — not only when the turn bound happens to exceed the interval by itself."""
+    _print_bound_cadence_notes(60.0, 3600, consolidate=True, consolidate_max_seconds=None)
+    out = capsys.readouterr().out
+    assert "SKIP intervals" in out
+    assert "TURN is bounded but the CONSOLIDATE is not" in out
