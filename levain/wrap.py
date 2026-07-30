@@ -67,7 +67,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
-from levain.firing.deadline import TurnDeadline, TurnTimeout
+from levain.firing.deadline import HARD_EXIT_GRACE_SECONDS, TurnDeadline, TurnTimeout
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -98,6 +98,16 @@ DEFAULT_COMPOSE_MODEL = "glm-5.2:cloud"
 # compose still fails CLOSED at `validated_save_continuity`, never saving a partial. (bench 2026-07-17:
 # glm composed a clean 6-section neocortex via /v1 at this budget; the `ollama/` route gave 0 chars.)
 _COMPOSE_MAX_OUTPUT_TOKENS = 16384
+
+# Slack added on top of (bound + hard-exit grace) before an in-progress wrap counts as an ORPHAN an
+# unattended seat may discard. Covers clock skew and the gap between "the process was killed" and
+# "the timestamp we are comparing against" — deliberately generous, because the asymmetry is stark:
+# waiting one extra cadence costs a delayed consolidate, discarding a live peer's wrap destroys work.
+_ORPHAN_MARGIN_SECONDS = 300.0
+# The staleness horizon when the consolidate is explicitly UNBOUNDED, where no bound-derived horizon
+# exists. One hour: longer than any healthy compose (a measured 12-episode wrap is ~22s) and short
+# enough that a genuinely dead seat recovers within a cadence or two.
+_ORPHAN_FALLBACK_SECONDS = 3600.0
 
 
 class _ComposeUnavailable(RuntimeError):
@@ -178,6 +188,46 @@ def _cancel_if_ours(store: object, wrap_token: object) -> None:
             store.wrap_cancelled()  # type: ignore[attr-defined]
     except Exception as exc:  # noqa: BLE001 — a guard must not raise into a failure path
         _log.debug("cancel-if-ours skipped (%s): %s", type(exc).__name__, exc)
+
+
+def _orphan_is_stale(started: object, bound: float | None) -> bool:
+    """Is an in-progress wrap old enough that no live writer could still legitimately hold it?
+
+    **THE SECOND HALF OF THE AUTO-DISCARD'S SAFETY ARGUMENT, and it exists because the first half is
+    not sufficient (codex, L3, MED).** Holding ``wrap.lock`` proves no other *Levain* consolidate is
+    running — but that lock is LEVAIN'S OWN INVENTION, taken precisely because anneal defers
+    cross-process safety to its caller. anneal's own lifecycle does not take it. So an
+    ``anneal-memory`` CLI call, an MCP tool, or any other library user can be mid-``prepare_wrap`` on
+    this same store while we hold a lock they never heard of, and "in progress ⇒ orphan" is false for
+    exactly that writer. Discarding there would cancel someone's LIVE wrap.
+
+    AGE CLOSES IT, and not as a heuristic — as a consequence of how orphans are made. A wrap is
+    stranded only when its process DIED mid-flight, and the thing that kills it is the wall-clock
+    bound (or a crash). So an orphan is necessarily OLDER than the bound that killed it, while a live
+    peer's wrap is necessarily YOUNGER than the bound it is still running under. Requiring the age to
+    exceed bound + grace + margin therefore discards the one and spares the other.
+
+    Fails SAFE in every ambiguous direction: an unparseable or absent timestamp returns ``False``
+    (refuse to discard), because the cost of skipping one consolidate is a delayed wrap, and the cost
+    of a wrong discard is destroying someone's live work.
+    """
+    from datetime import datetime, timezone
+
+    if not started:
+        return False
+    # A bound of None (explicitly unbounded) has no natural staleness horizon, so fall back to a
+    # conservative fixed one rather than inventing a smaller number from nothing.
+    horizon = (bound + HARD_EXIT_GRACE_SECONDS + _ORPHAN_MARGIN_SECONDS) if bound else _ORPHAN_FALLBACK_SECONDS
+    try:
+        text = str(started).replace("Z", "+00:00")
+        ts = datetime.fromisoformat(text)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+    except (ValueError, TypeError) as exc:
+        _log.debug("orphan staleness undecidable (%s): %s", type(exc).__name__, exc)
+        return False
+    return age >= horizon
 
 
 def _cancel_our_wrap(store: object, wrap_token: object) -> None:
@@ -261,7 +311,12 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool) -> str:
             f"next run; for a manual\n"
             f"     wrap, re-run with --reset.\n"
             f"     That the backstop was needed is itself a finding — the stall was not "
-            f"interruptible by signal."
+            f"interruptible by signal.\n"
+            f"     ⚠ IF THIS RAN AS A SEAT'S SECOND PHASE, THE TURN ITSELF ALREADY FINISHED and its "
+            f"work is captured.\n"
+            f"     A hard exit cannot hand back the turn's exit code, so the process reports the "
+            f"TIMEOUT code even though\n"
+            f"     the turn succeeded — read this line, not the code, for what actually stalled."
         )
     return (
         f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated and the "
@@ -286,6 +341,7 @@ def wrap_entity(
     affect_intensity: float = 0.5,
     max_seconds: float | None = None,
     unattended: bool = False,
+    hard_exit_code: int = EXIT_TIMEOUT,
 ) -> int:
     """Consolidate the isolated entity at ``path`` — the gated efferent write on its own memory.
 
@@ -313,6 +369,17 @@ def wrap_entity(
 
     ⚠ ``EXIT_TIMEOUT`` is checked and returned by the CALLER of the bound, never derived from an
     error message — the same authority-not-description discipline as ``TurnResult.timed_out``.
+
+    ``hard_exit_code`` is the code the wall-clock bound's LAYER-2 BACKSTOP exits with, and it is a
+    parameter because of a real inversion glm caught at L3. Layer 2 is an ``os._exit`` from a
+    watchdog thread: it cannot return through ``run_task``, so it overrides the process's exit code
+    outright. When this runs as a seat's SECOND PHASE, the turn has ALREADY FINISHED — so a hard exit
+    here would report ``5`` ("the environment stalled, retry") for a turn that actually completed.
+    **The worst case is a GATED turn**: exit ``4`` means a human must review a held action, and
+    silently rewriting it to ``5`` re-queues that action as an ordinary retry, so the fan-in the
+    whole gate exists to provide never happens. So the second phase passes the TURN's code here and
+    the invariant "the turn's outcome dominates" survives both layers, not just the graceful one.
+    A standalone ``levain wrap`` has no turn, so the default is correct there.
     """
     # A FRESH DEADLINE INSTANCE per call: `TurnDeadline` is re-usable but NOT re-entrant, and it
     # refuses re-entry loudly rather than silently unbounding the outer region. That matters here
@@ -320,7 +387,7 @@ def wrap_entity(
     # that has already bounded its turn — sequential, never nested (see `levain.run.run_task`).
     deadline = TurnDeadline(
         max_seconds,
-        hard_exit_code=EXIT_TIMEOUT,
+        hard_exit_code=hard_exit_code,
         hard_report=lambda s: format_wrap_timeout_report(s, hard=True),
     )
     try:
@@ -335,6 +402,7 @@ def wrap_entity(
                 affect_tag=affect_tag,
                 affect_intensity=affect_intensity,
                 unattended=unattended,
+                max_seconds=max_seconds,
             )
     except TurnTimeout:
         # `TurnTimeout` is a BaseException, so `_consolidate`'s `except Exception` clauses never see
@@ -372,6 +440,7 @@ def _consolidate(
     affect_tag: str | None,
     affect_intensity: float,
     unattended: bool,
+    max_seconds: float | None,
 ) -> int:
     """The consolidate itself. :func:`wrap_entity` bounds this body in wall-clock time.
 
@@ -489,13 +558,45 @@ def _consolidate(
         # `_ANOTHER_WRAP_RUNNING`), so any wrap in progress at this point is definitionally an
         # ORPHAN of a dead process, never a peer's live work. Discarding it loses nothing: the
         # frozen episodes return to this wrap.
+        # ⚠ THE SAFETY ARGUMENT IS CONDITIONAL ON ACTUALLY HOLDING THE LOCK, so the code asks rather
+        # than assuming. `_lock_wrap` returns None when `fcntl` is unavailable (Windows) and we
+        # proceed UNLOCKED as a best effort — and on that path "an in-progress wrap must be an
+        # orphan" is simply false, because a live peer could be mid-wrap right now. Auto-discarding
+        # there would cancel a concurrent peer's live work: the loser-cancels-winner race that
+        # `_cancel_if_ours` was written to prevent, reintroduced by the convenience that fixes the
+        # unattended case. Without a lock we fall back to the conservative refusal, which costs an
+        # unattended seat one skipped consolidate (recoverable) instead of destroying a live wrap
+        # (not). `invariant_must_fire_at_the_point_of_use`.
+        holds_lock = isinstance(lock, int)
         started = store.get_wrap_started_at()
+        # BOTH halves must hold before an unattended seat discards someone else's in-progress wrap:
+        # the LOCK (no live Levain peer) and the AGE (no live NON-Levain writer — an anneal CLI/MCP
+        # caller never takes our lock). See `_orphan_is_stale`.
+        may_self_heal = unattended and holds_lock and _orphan_is_stale(started, max_seconds)
         if started:
-            if not reset and not unattended:
+            if not reset and not may_self_heal:
+                extra = ""
+                if unattended and holds_lock and not _orphan_is_stale(started, max_seconds):
+                    extra = (
+                        "\n  (This seat would normally discard the orphan itself, but that wrap is "
+                        "too RECENT to be provably dead — another writer may still be mid-consolidate "
+                        "on this store. It will be discarded on a later run once it ages past the "
+                        "bound; refusing now is the safe side.)"
+                    )
+                elif unattended and not holds_lock:
+                    # SAY WHY the unattended self-heal did not apply, or this reads as the feature
+                    # simply not working — and a seat that silently stops metabolizing is the exact
+                    # thing this keystone exists to make impossible.
+                    extra = (
+                        "\n  (This seat would normally discard the orphan itself, but no wrap lock "
+                        "could be taken on this platform, so it cannot prove the wrap is not a live "
+                        "peer's. Refusing is the safe side.)"
+                    )
                 print(
                     f"levain wrap: a prior wrap is still in progress (started {started}).\n"
                     "  A previous consolidate did not finish. Re-run with --reset to discard it and "
                     "start fresh — your captured episodes are safe (they return to the next wrap)."
+                    + extra
                 )
                 return 2
             store.wrap_cancelled()

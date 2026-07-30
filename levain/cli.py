@@ -988,8 +988,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             unattended=getattr(args, "unattended", False),
             consolidate=getattr(args, "consolidate", False),
             consolidate_every=getattr(args, "consolidate_every", None),
-            consolidate_max_seconds=(
-                None if consolidate_max_seconds == 0 else consolidate_max_seconds
+            consolidate_max_seconds=_resolve_unattended_consolidate_bound(
+                consolidate_max_seconds,
+                unattended=getattr(args, "unattended", False),
+                consolidate=getattr(args, "consolidate", False),
             ),
         )
 
@@ -1040,6 +1042,36 @@ def _reject_bad_max_seconds(value: float | None, *, command: str) -> bool:
     return False
 
 
+def _resolve_unattended_consolidate_bound(
+    explicit: float | None, *, unattended: bool, consolidate: bool
+) -> float | None:
+    """Give an UNATTENDED consolidate a finite bound even when the operator did not name one.
+
+    THE FOOT-GUN THIS REMOVES (codex L3, LOW): ``daemon install-seat`` supplies finite defaults, so
+    the supported path was covered — but a direct ``levain run --task … --unattended --consolidate``
+    accepted "declare that no human is present" and "run an unbounded model call" in the SAME
+    command. That combination is precisely what the slice exists to make impossible, and it was
+    reachable by OMISSION rather than by choice, which is the worst way to reach it.
+
+    Defaulting rather than refusing, because the two flags are not in conflict — the operator asked
+    for something coherent and simply did not say how long to allow. Binding to the absence of the
+    human is the axis the gate and the credential floor already use, so this is that same rule
+    applied to a bound. ``0`` remains an explicit, deliberate "unbounded"; it is honoured untouched.
+    """
+    if explicit is not None or not (unattended and consolidate):
+        return None if explicit == 0 else explicit
+    from levain.daemon import DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS
+
+    print(
+        f"levain: an unattended consolidate with no wall-clock bound named — defaulting it to "
+        f"{DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS:g}s.\n"
+        f"  An unattended compose with no bound can hang this process forever, and a scheduled "
+        f"caller would never run again. Pass 0 to opt out deliberately.",
+        file=sys.stderr,
+    )
+    return DEFAULT_SEAT_CONSOLIDATE_MAX_SECONDS
+
+
 def _cmd_wrap(args: argparse.Namespace) -> int:
     from levain.wrap import wrap_entity
 
@@ -1057,8 +1089,15 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
         affect_tag=args.affect_tag,
         affect_intensity=args.affect_intensity,
         # 0 means "explicitly unbounded" — normalized at the boundary so exactly ONE representation
-        # of "no bound" reaches the deadline, matching `run`'s handling of the same flag.
-        max_seconds=None if max_seconds == 0 else max_seconds,
+        # of "no bound" reaches the deadline, matching `run`'s handling of the same flag. And an
+        # unattended wrap with no bound named gets the finite default rather than running unbounded
+        # by omission — same reasoning as the `run` path (codex L3, LOW): both commands accept the
+        # "no human present" declaration, so both must refuse to pair it with an unbounded compose.
+        max_seconds=_resolve_unattended_consolidate_bound(
+            max_seconds,
+            unattended=getattr(args, "unattended", False),
+            consolidate=True,  # `levain wrap` IS the consolidate
+        ),
         unattended=getattr(args, "unattended", False),
     )
 

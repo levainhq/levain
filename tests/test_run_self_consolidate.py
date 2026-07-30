@@ -242,3 +242,66 @@ def test_the_phase_returns_none_so_it_cannot_feed_an_exit_code(tmp_path, monkeyp
         unattended=True, every=1, max_seconds=60,
     )
     assert out is None
+
+
+# ======================================================================================
+# The L3 fixes — each needs its own test, or the mutation cell has nothing to catch it.
+# ======================================================================================
+
+def test_the_hard_exit_backstop_carries_the_TURNS_code_not_the_timeout_code(tmp_path, monkeypatch):
+    """glm L3, MED. Layer 2 is an `os._exit` from a watchdog thread — it never returns through
+    `run_task`, so whatever code it carries becomes the PROCESS's code and silently overrides the
+    turn's. The worst case is a GATED turn: exit 4 means a human must review a held action, and
+    rewriting it to 5 ("environment stalled") re-queues that action as an ordinary retry, so the
+    fan-in the whole gate exists to provide never happens. The phase must hand the turn's own code
+    down to the backstop."""
+    ent, _ = _entity_with_episodes(tmp_path, 50)
+    calls: list = []
+    monkeypatch.setattr("levain.wrap.wrap_entity", _spy_wrap(calls))
+    runmod._self_consolidate(
+        ent, turn_exit_code=EXIT_GATED, model="m", base_url="b", api_key=None,
+        unattended=True, every=1, max_seconds=60,
+    )
+    assert calls[0]["hard_exit_code"] == EXIT_GATED, (
+        "a hard exit during the consolidate would report a timeout for a GATED turn"
+    )
+
+
+def test_the_prework_read_is_itself_bounded(tmp_path, capsys, monkeypatch):
+    """codex L3, HIGH. Resolving the store path and counting episodes happens AFTER the turn's
+    deadline is disarmed and BEFORE the consolidate's is armed — an unbounded gap between two
+    bounded regions. A read-only SQLite open against a stalled disk or a dead mount would hang there
+    with no layer 1 and no layer 2, while launchd coalesces the seat's label indefinitely.
+
+    ⚠ THIS TEST WAS WRONG THE FIRST TIME AND THE MUTATION HARNESS CAUGHT IT. It hand-raised
+    `TurnTimeout` from a stubbed readiness call, which passes IDENTICALLY with the deadline deleted —
+    it proved the `except` clause existed, not that anything was bounded. A test that manufactures
+    its own premise proves nothing (K3's glm HIGH, ⑥'s nan-instead-of-inf). So: shorten the real
+    bound, make the read genuinely SLEEP past it, and require the real mechanism to interrupt it.
+    """
+    import time
+
+    ent, _ = _entity_with_episodes(tmp_path, 50)
+    calls: list = []
+    monkeypatch.setattr("levain.wrap.wrap_entity", _spy_wrap(calls))
+    monkeypatch.setattr(runmod, "PREWORK_BOUND_SECONDS", 1.0)
+
+    def _slow_read(*a, **k):
+        time.sleep(30)  # far past the bound; only a real deadline stops this
+        raise AssertionError("the pre-work bound did not fire")
+
+    monkeypatch.setattr("levain.firing.anneal.consolidate_readiness", _slow_read)
+
+    started = time.monotonic()
+    runmod._self_consolidate(
+        ent, turn_exit_code=EXIT_OK, model="m", base_url="b", api_key=None,
+        unattended=True, every=1, max_seconds=60,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 10, f"the read ran {elapsed:.1f}s — nothing bounded it"
+    assert calls == [], "proceeded to consolidate after the readiness read blew its bound"
+    err = capsys.readouterr().err
+    assert "READING the entity's episode count exceeded" in err
+    # It must point at the STORE, not at the consolidate — they need different responses.
+    assert "not at the consolidate" in err

@@ -371,6 +371,20 @@ def run_task(
     return rc
 
 
+# THE PRE-WORK GETS ITS OWN SHORT BOUND, because otherwise it is an UNBOUNDED GAP between two
+# bounded regions (codex L3 HIGH / glm L3 LOW — both lineages, independently). Resolving the store
+# path and counting episodes should take milliseconds, but "should" is what this whole slice is
+# about: a read-only SQLite open can block on a stalled disk or a dead network mount, and here it
+# would block with the turn's deadline already DISARMED and the consolidate's not yet ARMED — no
+# layer 1, no layer 2, and launchd coalescing the seat's label the entire time.
+#
+# Module-level rather than a local so a test can shorten it and prove the bound ACTUALLY FIRES. The
+# first version of that test hand-raised TurnTimeout instead, which passes identically with the
+# deadline deleted — it exercised the except-clause while claiming to prove the guard. The mutation
+# harness caught it (`the_instrument_needs_its_own_oracle`).
+PREWORK_BOUND_SECONDS = 60.0
+
+
 def _self_consolidate(
     path: Path,
     *,
@@ -417,13 +431,23 @@ def _self_consolidate(
         return
 
     try:
-        _, episodic_path = entity_store_paths(Path(str(path)).expanduser().resolve())
+        # Its own instance: `TurnDeadline` is re-usable but never re-entrant, and this one is fully
+        # exited before `wrap_entity` arms its own. Sequential bounds, never nested.
+        with TurnDeadline(PREWORK_BOUND_SECONDS, hard_exit_code=turn_exit_code):
+            _, episodic_path = entity_store_paths(Path(str(path)).expanduser().resolve())
+            readiness = consolidate_readiness(episodic_path, every)
+    except TurnTimeout:
+        print(
+            f"  ⚠ consolidate SKIPPED — just READING the entity's episode count exceeded "
+            f"{PREWORK_BOUND_SECONDS:g}s.\n"
+            f"     That points at the store or the disk under it, not at the consolidate.",
+            file=sys.stderr, flush=True,
+        )
+        return
     except Exception as exc:  # noqa: BLE001 — a maintenance phase must never break a finished turn
         print(f"  ⚠ consolidate SKIPPED — could not locate the entity's store ({exc}).",
               file=sys.stderr, flush=True)
         return
-
-    readiness = consolidate_readiness(episodic_path, every)
     if not readiness.readable:
         # NOT the same as "nothing to do", and it must never print as though it were. If this
         # recurs every interval the entity is never metabolizing again — the silent-death class
@@ -459,6 +483,12 @@ def _self_consolidate(
             api_key=api_key,
             max_seconds=max_seconds,
             unattended=unattended,
+            # THE TURN'S CODE SURVIVES THE BACKSTOP TOO (glm L3, MED). Layer 2 is an `os._exit` from
+            # a watchdog thread — it never returns through here, so whatever code it carries IS the
+            # process's code. Handing it the turn's own result keeps "the turn's outcome dominates"
+            # true for the hard path as well as the graceful one; otherwise a GATED turn awaiting
+            # human review (4) would be rewritten to a timeout (5) and re-queued as a plain retry.
+            hard_exit_code=turn_exit_code,
         )
     except BaseException as exc:  # noqa: BLE001 — including the out-of-band ones, see below
         # The turn is ALREADY DONE and its work is captured. A consolidate that blows up must not
