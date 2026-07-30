@@ -163,17 +163,33 @@ def test_unattended_wrap_leaves_the_crystal_store_byte_unchanged(tmp_path, monke
 # 2. THE ORPHANED WRAP — falsified against the human-present control
 # ======================================================================================
 
-def _strand_a_wrap(db: Path) -> None:
+def _strand_a_wrap(db: Path, *, age_seconds: float = 24 * 3600) -> None:
     """Leave a wrap in progress, exactly as a hard-exited consolidate would.
 
     Built from the store's REAL episode ids rather than invented ones: `wrap_started` records which
     episodes the orphaned wrap froze, and a wrap stranded over ids that do not exist would be a
     state anneal can never actually produce — a test proving the guard handles a situation that
     cannot arise.
+
+    ``age_seconds`` matters because the self-heal requires the orphan to be provably DEAD, not merely
+    present: an orphan is by construction older than the bound that killed its process, so a RECENT
+    in-progress wrap is far more likely to be a live non-Levain writer. Default is a day old — an
+    unambiguous corpse.
     """
+    from datetime import datetime, timedelta, timezone
+
     with Store(str(db), section_schema=None) as store:
         ids = [str(e.id) for e in store.episodes_since_wrap()]
         store.wrap_started(token="orphan-token", episode_ids=ids)
+        # Backdate it directly, because the age is what the guard reads and a test that could only
+        # produce "now" would silently exercise the recent-wrap branch while claiming to test decay.
+        when = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        store._conn.execute(  # noqa: SLF001 — reaching in to age a timestamp is the point
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('wrap_started_at', ?)", (when,)
+        )
+        store._conn.commit()  # noqa: SLF001
 
 
 def test_unattended_wrap_discards_an_orphan_and_proceeds(tmp_path, capsys, monkeypatch):
@@ -206,6 +222,70 @@ def test_human_present_wrap_REFUSES_an_orphan_the_control(tmp_path, capsys, monk
     assert wrap_entity(ent, unattended=False) == 2
     assert "--reset" in capsys.readouterr().out
     assert not (ent / ".levain" / "memory.continuity.md").exists()
+
+
+def test_the_self_heal_REFUSES_an_orphan_too_RECENT_to_be_provably_dead(tmp_path, capsys, monkeypatch):
+    """THE OTHER HALF OF THE SAFETY ARGUMENT (codex L3, MED).
+
+    `wrap.lock` is LEVAIN'S OWN lock — anneal's lifecycle never takes it — so holding it proves only
+    that no other `levain wrap` is running. An `anneal-memory` CLI call, an MCP tool, or any library
+    user can be mid-`prepare_wrap` on this same store right now, and discarding there destroys their
+    LIVE work rather than an orphan.
+
+    Age settles it, structurally rather than heuristically: an orphan exists only because its process
+    DIED, and what kills it is the bound — so an orphan is necessarily OLDER than that bound, while a
+    live writer's wrap is necessarily younger than the bound it is still running under.
+    """
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db, age_seconds=5)  # five seconds old — someone is very likely still working
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    assert wrap_entity(ent, unattended=True, max_seconds=900) == 2
+    out = capsys.readouterr().out
+    assert "too RECENT to be provably dead" in out
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is not None, "discarded a wrap that may have been live"
+
+
+def test_the_self_heal_REFUSES_when_no_lock_could_be_taken(tmp_path, capsys, monkeypatch):
+    """THE SELF-HEAL'S SAFETY ARGUMENT IS CONDITIONAL, so the code must check it rather than assert it.
+
+    "An in-progress wrap must be an orphan" holds only BECAUSE we hold the exclusive flock — a live
+    peer would have been turned away at `_ANOTHER_WRAP_RUNNING`. But `_lock_wrap` returns `None`
+    where `fcntl` is unavailable (Windows) and the wrap proceeds unlocked as a best effort. On that
+    path the argument is false: a peer really could be mid-wrap, and auto-discarding would cancel
+    its live work — the loser-cancels-winner race `_cancel_if_ours` exists to prevent, reintroduced
+    by the very convenience that fixes the unattended case.
+
+    Costing an unattended seat one skipped consolidate is recoverable; destroying a live wrap is not.
+    """
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+    # No lock obtainable — exactly what a platform without fcntl produces.
+    monkeypatch.setattr(wrapmod, "_lock_wrap", lambda entity_dir: None)
+
+    assert wrap_entity(ent, unattended=True) == 2, "auto-discarded an orphan without holding the lock"
+    out = capsys.readouterr().out
+    assert "no wrap lock could be taken" in out
+    # The orphan is still there — we declined to touch what we could not prove was ours.
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is not None
+
+
+def test_the_self_heal_DOES_apply_when_the_lock_is_held_the_control(tmp_path, monkeypatch):
+    """Control for the above: same orphan, same unattended flag, lock available → it self-heals.
+    Without this pair the refusal test could pass because the self-heal never works at all."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    assert wrap_entity(ent, unattended=True) == 0
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
 
 
 def test_self_healing_is_reported_not_silent(tmp_path, capsys, monkeypatch):
@@ -330,3 +410,65 @@ def test_a_crystallization_refusal_is_reported_as_a_defect_not_an_operator_error
     monkeypatch.setattr(wrapmod, "_compose", _refuse)
     assert wrap_entity(ent, unattended=True) == 1
     assert "Please report this" in capsys.readouterr().err
+
+
+def test_an_UNPARSEABLE_orphan_timestamp_refuses_rather_than_discards(tmp_path, capsys, monkeypatch):
+    """The staleness gate must fail SAFE when it cannot decide, and nothing covered that until the
+    mutation harness flipped the `except` branch to `return True` and the suite stayed green.
+
+    The asymmetry decides the direction: refusing costs one delayed consolidate (the next run tries
+    again); discarding on a timestamp we could not even read risks destroying a live writer's wrap.
+    """
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db, age_seconds=24 * 3600)
+    with Store(str(db), section_schema=None) as store:
+        store._conn.execute(  # noqa: SLF001
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES "
+            "('wrap_started_at', 'not-a-timestamp')"
+        )
+        store._conn.commit()  # noqa: SLF001
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    assert wrap_entity(ent, unattended=True, max_seconds=900) == 2
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is not None, "discarded on an undecidable timestamp"
+
+
+def test_the_staleness_horizon_is_derived_from_the_bound_not_a_magic_number():
+    """An orphan is older than the bound that killed its process, so the horizon must MOVE with the
+    bound. A fixed number would be wrong in both directions: too eager for a long-bounded seat, too
+    slow for a short one."""
+    from levain.wrap import _ORPHAN_MARGIN_SECONDS, _orphan_is_stale
+    from levain.firing.deadline import HARD_EXIT_GRACE_SECONDS
+    from datetime import datetime, timedelta, timezone
+
+    def at(age: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat().replace("+00:00", "Z")
+
+    bound = 100.0
+    horizon = bound + HARD_EXIT_GRACE_SECONDS + _ORPHAN_MARGIN_SECONDS
+    assert _orphan_is_stale(at(horizon + 5), bound) is True
+    assert _orphan_is_stale(at(horizon - 5), bound) is False
+    # A LONGER bound must push the horizon out — same age, different verdict.
+    assert _orphan_is_stale(at(horizon + 5), bound * 10) is False
+
+
+def test_an_unbounded_consolidate_still_gets_a_finite_staleness_horizon():
+    """With no bound there is no bound-derived horizon, and "never discard" would strand an
+    unbounded seat permanently the first time one died. A conservative fixed fallback instead."""
+    from levain.wrap import _ORPHAN_FALLBACK_SECONDS, _orphan_is_stale
+    from datetime import datetime, timedelta, timezone
+
+    def at(age: float) -> str:
+        return (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat().replace("+00:00", "Z")
+
+    assert _orphan_is_stale(at(_ORPHAN_FALLBACK_SECONDS + 60), None) is True
+    assert _orphan_is_stale(at(_ORPHAN_FALLBACK_SECONDS - 60), None) is False
+
+
+def test_no_timestamp_at_all_is_never_stale():
+    from levain.wrap import _orphan_is_stale
+
+    assert _orphan_is_stale(None, 900.0) is False
+    assert _orphan_is_stale("", 900.0) is False

@@ -41,8 +41,23 @@ and every existing test still passes. ``wiring_checked_content_unchecked_passes_
 failure mode, so a test asserting "we do not call it today" would document the accident rather than
 close it.
 
-A proxy that REFUSES makes it structural: the write cannot happen, whoever later calls it, and the
-attempt is loud instead of green. ``structural_invariants_beat_discipline``.
+A proxy that REFUSES makes it structural: the consolidate path cannot perform the write through the
+handle it was given, and an attempt is loud instead of green. ``structural_invariants_beat_discipline``.
+
+⚠ **WHAT THIS IS NOT — the claim above originally read "the write cannot happen, whoever later calls
+it", and that was an OVERCLAIM (glm, L3).** This is not an in-process security boundary, and it
+cannot be one. Two concrete routes around it: an allow-listed read returns a BOUND METHOD whose
+``__self__`` is the raw store, and — decisively — ``CrystalStore`` is constructible from a path that
+any code in this process can derive, exactly as :func:`levain.wrap._consolidate` derives it. **No
+wrapper can defend against in-process code that goes looking for the underlying object**, so
+pretending otherwise would be a check that cannot name the world it fails in.
+
+What it DOES deliver, which is the thing actually at risk: the consolidate hands anneal a handle
+that cannot be written through, so a future commit wiring up ``parse_crystal_decisions`` — the
+realistic way this invariant dies — fails LOUDLY at the boundary instead of silently promoting into
+bedrock with a green suite. Accident-of-omission becomes refusal. Adversarial in-process code is a
+different threat model, answered by the crown-jewels floor (which denies the entity's own hands
+write access to these files) rather than by this object.
 
 **DENY BY DEFAULT — the allow-list holds the READS, and the polarity is the point.** The consolidate
 path touches exactly two instance methods on the crystal store (derived from anneal's call sites,
@@ -81,7 +96,14 @@ filters; ``surface_rewarm_candidates`` loads, filters and ranks) — neither ope
 widen, and widening it is a deliberate, reviewable act. That is the trade being bought: an unknown
 new *write* is refused automatically, at the cost of an unknown new *read* needing a one-line
 change. For a boundary protecting the always-loaded identity tier, failing toward refusal is the
-correct direction."""
+correct direction.
+
+⚠ **THE ASSUMPTION UNDER THE ALLOW-LIST, named because it is invisible and load-bearing** (codex,
+L3, hidden assumptions). Both reads are safe *because* they return DETACHED objects — dicts parsed
+out of the JSON store by ``_load()``, not live handles into it — so a caller mutating a returned dict
+changes nothing on disk. **If a future anneal returns live mutable state from either method, an
+allow-listed READ silently becomes a WRITE SURFACE and this proxy stops meaning what it says.**
+Verified true in anneal-memory 0.9.6; re-check it when widening this set or bumping anneal."""
 
 
 class CrystallizationRefused(BaseException):
@@ -136,16 +158,16 @@ class NoCrystallizeStore:
     the whole thing is a no-op wearing a safety costume.
     """
 
-    __slots__ = ("_store",)
+    __slots__ = ("_ncs_store",)
 
     def __init__(self, store: Any) -> None:
-        object.__setattr__(self, "_store", store)
+        object.__setattr__(self, "_ncs_store", store)
 
     def __getattr__(self, name: str) -> Any:
         # Reached only when normal lookup fails, which — with `__slots__` and no methods of our own
         # besides the dunders — is every attribute anneal asks for.
         if name in CRYSTAL_READS:
-            return getattr(self._store, name)
+            return getattr(self._ncs_store, name)
         raise CrystallizationRefused(name)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -155,7 +177,7 @@ class NoCrystallizeStore:
         raise CrystallizationRefused(f"set {name}")
 
     def __repr__(self) -> str:
-        return f"NoCrystallizeStore({self._store!r})"
+        return f"NoCrystallizeStore({self._ncs_store!r})"
 
 
 def refuse_crystallization(store: Any) -> NoCrystallizeStore:

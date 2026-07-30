@@ -667,3 +667,60 @@ def test_the_session_close_COMPLETES_when_the_bound_fires_during_teardown() -> N
 
     assert conv.close_attempts == 1
     assert sess.closed is True
+
+
+# ======================================================================================
+# SEQUENTIAL deadlines in one process — new with K4a [6], flagged by codex at L3 as an
+# assumption it could not verify. A seat now bounds its TURN and then, separately, its
+# CONSOLIDATE, so two TurnDeadline instances live in one process back to back.
+# ======================================================================================
+
+def test_two_sequential_deadlines_each_restore_the_handler_they_found():
+    """The second deadline must not inherit or corrupt the first's signal state."""
+    import signal
+
+    from levain.firing.deadline import TurnDeadline
+
+    original = signal.getsignal(signal.SIGALRM)
+    with TurnDeadline(60):
+        first_installed = signal.getsignal(signal.SIGALRM)
+        assert first_installed is not original
+    assert signal.getsignal(signal.SIGALRM) is original, "first deadline did not restore"
+
+    with TurnDeadline(60):
+        second_installed = signal.getsignal(signal.SIGALRM)
+        assert second_installed is not original
+        # Each instance installs ITS OWN bound handler — the second must not still be routing
+        # into the first instance's state, whose `_active` is now False and whose `seconds`
+        # would be the wrong number to report.
+        assert second_installed is not first_installed
+    assert signal.getsignal(signal.SIGALRM) is original, "second deadline did not restore"
+
+
+def test_a_stale_alarm_from_a_FINISHED_deadline_is_dropped_not_raised():
+    """A SIGALRM delivered after its own deadline exited must be recognised as spurious.
+
+    THE CROSS-DEADLINE CASE THIS PROTECTS: `setitimer(0)` cancels a pending TIMER, but a signal
+    already delivered is still queued, and CPython runs it at the next bytecode check — by which
+    time a SECOND deadline may be the one installed. If the finished instance's handler could still
+    fire, a stale alarm from the TURN would surface as a spurious CONSOLIDATE timeout, reporting a
+    stall that never happened.
+    """
+    from levain.firing.deadline import TurnDeadline
+
+    finished = TurnDeadline(60)
+    with finished:
+        pass
+    # Deliver the stale alarm by hand — `_active` is False, so it must be dropped silently.
+    finished._on_alarm(14, None)  # noqa: SLF001 — invoking the handler IS the test
+
+
+def test_a_stale_handler_cannot_report_a_second_deadlines_bound():
+    """Belt-and-braces on the above: even mid-second-deadline, the FIRST instance stays inert."""
+    from levain.firing.deadline import TurnDeadline
+
+    first = TurnDeadline(11)
+    with first:
+        pass
+    with TurnDeadline(22):
+        first._on_alarm(14, None)  # noqa: SLF001 — must not raise 11s into the 22s region
