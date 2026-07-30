@@ -234,7 +234,10 @@ _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 # shell, so the deny fences only the entity's own hands — not the legitimate composer. Load-bearing
 # because spore-359 folds ``memory.continuity.md`` into the always-loaded system suffix and per-turn
 # recall reads ``memory.crystal.json``; ``memory.db`` is the episodic source the wrap consolidates FROM.
-# A raw self-write to any of them is a poison-the-next-session vector that bypasses the human-gated wrap.
+# A raw self-write to any of them is a poison-the-next-session vector that bypasses the GOVERNED wrap
+# path. (Said "human-gated" until K4a [6]: a seat may now wrap UNATTENDED — bounded, and structurally
+# refused from crystallizing — so what this deny protects is that the write went through anneal's
+# VALIDATED composer at all, which was always the real property. Who invoked it is a separate axis.)
 # The SQLite sidecars (``-wal``/``-shm``/``-journal``) are included because anneal opens the store in
 # WAL mode (``PRAGMA journal_mode=WAL``): in WAL mode the logical DB is ``memory.db`` PLUS ``memory.db-
 # wal`` — committed frames live in the WAL, so denying only the main file leaves the episodic source
@@ -310,7 +313,9 @@ class CrownJewelsPolicy:
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
     # memory.continuity.md into the always-loaded system_message_suffix and per-turn recall reads
     # memory.crystal.json — so a raw file-write by the entity's OWN confined hands would poison the
-    # highest-trust surface on a FUTURE session, BYPASSING the human-gated `levain wrap`. Only the
+    # highest-trust surface on a FUTURE session, BYPASSING the GOVERNED `levain wrap` (said
+    # "human-gated" until K4a [6] — a seat may now wrap unattended; the invariant is that ONLY the
+    # validated composer writes these, never that a human ran it). Only the
     # HOST-process capture/wrap (anneal in-process, NOT the sandboxed shell) may compose them; write-
     # denying the sandboxed hands makes "only wrap composes the always-loaded memory" a STRUCTURAL
     # invariant, not a docstring (L2 domain review, 2026-07-17). Distinct from config_file (read+write
@@ -1353,7 +1358,9 @@ class SeatbeltProvider(ConfinementProvider):
         if policy.own_memory_files:
             # The entity's OWN store (memory.continuity.md / crystal.json / db) — WRITE-only denied so a
             # confined-hands write can't poison the always-loaded memory that spore-359 injects, bypassing
-            # the human-gated wrap. READ stays allowed (bash may `cat` its own memory). anneal composes
+            # the GOVERNED wrap ("human-gated" until K4a [6]; a seat may now wrap unattended, so the
+            # property is the VALIDATED composer, not human presence). READ stays allowed (bash may
+            # `cat` its own memory). anneal composes
             # these in the HOST process (not this sandbox), so the wrap/capture writer is untouched. LAST
             # deny block so last-match-wins keeps it denied; nothing re-allows these.
             lines.append(";; the entity's OWN memory store (continuity/crystal/episodic) — WRITE-denied:")
