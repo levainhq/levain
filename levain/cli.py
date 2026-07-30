@@ -948,6 +948,30 @@ def _cmd_run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # ⚠ SAME REFUSAL, SAME PLACE — OUTSIDE `if task is not None` (fixed 2026-07-30, Diogenes).
+    # The consolidate-flag refusal below lives INSIDE the task branch, so on the REPL path
+    # --consolidate / --consolidate-every / --consolidate-max-seconds were SILENTLY IGNORED and
+    # the call fell straight through to run_entity. Its `--unattended` sibling above is
+    # deliberately outside for exactly this reason, and the two make the identical argument:
+    # a governance-relevant declaration that the run does not honour is worse than a refusal.
+    # --consolidate is the flag that PERMITS THE ENTITY TO REWRITE ITS OWN MEMORY — daemon.py
+    # calls it "the single most governance-relevant fact about the unit" — so an operator
+    # believing they enabled or bounded it when they did not is the exact failure class this
+    # keystone exists to make impossible. guard_scoped_by_symptom_misses_the_class: the rule was
+    # written for the tuning flags and missed the flag that actually carries the authority.
+    if task is None and (
+        getattr(args, "consolidate", False)
+        or getattr(args, "consolidate_every", None) is not None
+        or getattr(args, "consolidate_max_seconds", None) is not None
+    ):
+        print(
+            "levain run: --consolidate / --consolidate-every / --consolidate-max-seconds require "
+            "--task. They govern a self-memory-rewrite phase that only a task run performs, so "
+            "honouring them in an interactive REPL is impossible — and silently ignoring them "
+            "would leave you believing the entity metabolizes its memory when it does not.",
+            file=sys.stderr,
+        )
+        return 2
     if task is not None:
         from levain.run import run_task
 
@@ -1224,11 +1248,26 @@ def _print_bound_cadence_notes(
     # "1800s < 3600s cadence, all good" for a seat whose real worst case is 2700s — and the operator
     # would have been told the schedule holds when it does not. Same class as the two banners that
     # answered one question with a resolved line and a static one.
+    # ⚠ THESE THREE ARE INDEPENDENT `if`s, NOT AN elif CHAIN (fixed 2026-07-30, Diogenes).
+    # They were chained, but the conditions they warn about CO-OCCUR: a turn bound >= interval
+    # AND an unbounded consolidate is a legal, reachable configuration, and only the first branch
+    # fired. Worse, its own arithmetic dropped the tail — `consolidate_max_seconds or 0` makes an
+    # UNBOUNDED consolidate contribute ZERO — so it printed "the seat's worst-case run (4000s
+    # turn)" for a seat whose worst case is UNBOUNDED, while the "TURN bounded but CONSOLIDATE is
+    # not" silent-death warning was swallowed by the `elif`. The operator was told the schedule
+    # holds, by the very banner that exists to tell them when it does not.
+    # The suite structurally could not catch it: every test of that warning uses a 600s turn
+    # against a 3600s interval, so the branches never compete.
+    unbounded_tail = consolidate and consolidate_max_seconds is None
     occupancy = (max_seconds or 0) + (consolidate_max_seconds or 0 if consolidate else 0)
-    if max_seconds is not None and occupancy >= interval:
-        parts = f"{max_seconds:g}s turn"
-        if consolidate and consolidate_max_seconds is not None:
-            parts += f" + {consolidate_max_seconds:g}s consolidate = {occupancy:g}s"
+    # An unbounded consolidate means unbounded occupancy — it cannot be under ANY cadence.
+    if max_seconds is not None and (unbounded_tail or occupancy >= interval):
+        if unbounded_tail:
+            parts = f"{max_seconds:g}s turn + an UNBOUNDED consolidate"
+        else:
+            parts = f"{max_seconds:g}s turn"
+            if consolidate and consolidate_max_seconds is not None:
+                parts += f" + {consolidate_max_seconds:g}s consolidate = {occupancy:g}s"
         print(
             f"\n  ⓘ the seat's worst-case run ({parts}) is >= the cadence ({interval}s). launchd "
             f"coalesces per label,\n"
@@ -1236,7 +1275,7 @@ def _print_bound_cadence_notes(
             f"own duration.\n"
             f"    Fine if that is what you want; lower the bounds or raise --interval if not."
         )
-    elif max_seconds is not None and consolidate and consolidate_max_seconds is None:
+    if max_seconds is not None and consolidate and consolidate_max_seconds is None:
         # The turn is bounded and the consolidate is NOT. The turn bound alone looks reassuring, so
         # this asymmetry has to be named or the seat reads as bounded while owning an unbounded tail.
         print(
@@ -1246,7 +1285,7 @@ def _print_bound_cadence_notes(
             "reporting installed +\n"
             "    loaded — the same silent death the turn bound closes, through the other door."
         )
-    elif max_seconds is None:
+    if max_seconds is None:
         # The one genuinely dangerous configuration. It is opt-in, so say what it costs.
         print(
             "\n  ⚠ NO WALL-CLOCK BOUND (--max-seconds 0). A turn that hangs inside one step will "

@@ -305,6 +305,37 @@ def test_run_refuses_unattended_without_task(tmp_path, capsys: pytest.CaptureFix
     assert "--unattended requires --task" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("flag", [
+    ["--consolidate"],
+    ["--consolidate-every", "3"],
+    ["--consolidate-max-seconds", "5"],
+])
+def test_run_refuses_consolidate_flags_without_task(flag, tmp_path, capsys):
+    """The consolidate refusal lived INSIDE `if task is not None`, so on the REPL path these were
+    SILENTLY IGNORED and the call fell straight through to run_entity — while its `--unattended`
+    sibling directly above is deliberately OUTSIDE for exactly this reason.
+
+    `--consolidate` is the flag that PERMITS THE ENTITY TO REWRITE ITS OWN MEMORY (daemon.py
+    calls it "the single most governance-relevant fact about the unit"), so an operator believing
+    they enabled or bounded it when they did not is the precise failure class this keystone
+    exists to make impossible. The pre-existing rule was written for the two TUNING flags and
+    missed the one that actually carries the authority.
+    (Diogenes 2026-07-30 — guard_scoped_by_symptom_misses_the_class.)"""
+    rc = main(["run", str(tmp_path), *flag])
+    assert rc == 2, f"{flag} without --task must be REFUSED, not ignored"
+    assert "require --task" in capsys.readouterr().err
+
+
+def test_the_consolidate_tuning_refusal_still_fires_with_a_task(tmp_path, capsys):
+    """Guard the other direction: hoisting a task-level refusal must not shadow the ORIGINAL
+    rule, which makes a different claim — the tuning flags require `--consolidate` itself."""
+    rc = main(["run", str(tmp_path), "--task", "hi", "--consolidate-max-seconds", "5"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "require --consolidate" in err
+    assert "require --task" not in err, "with --task present, the task-level rule must not fire"
+
+
 def test_install_seat_reports_the_RESOLVED_cred_floor(tmp_path, capsys):
     """The banner used to carry one RESOLVED line (the gate) directly above one STATIC line (the
     floor), answering the same operator question — and that asymmetry was the bug that let a
