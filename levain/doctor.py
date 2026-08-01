@@ -149,13 +149,29 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
 
 # The base-install REQUIRED-minimum seed set (a static check on an installed
 # dir). NOT the full seed taxonomy: the canonical seed classification — which
-# files load as harness context (the roster-driven adapter @import list) vs the
-# non-context files (continuity.md / README.md) — lives in `levain.packs`
-# (NON_IMPORT_SEED / BASE_IMPORT_ORDER / import_entries). A PACK extends the seed
-# set, so this fixed list checks only the base minimum; if doctor ever needs to
-# validate a pack-layered install's full import list it must read the installed
-# adapter file or a recorded roster, not grow this constant (Slice 3 deferral).
-_SEED_REQUIRED = ("origin.md", "partnership.md", "world.md", "memory.md")
+# files load as harness context (the roster-driven adapter @import list), which
+# are reached on demand through a carrier pointer, and which are not entity
+# context at all (continuity.md / README.md) — lives in `levain.packs`
+# (NON_IMPORT_SEED / ON_DEMAND_SEED / BASE_IMPORT_ORDER / import_entries). A PACK
+# extends the seed set, so this fixed list checks only the base minimum; if doctor
+# ever needs to validate a pack-layered install's full import list it must read the
+# installed adapter file or a recorded roster, not grow this constant (Slice 3
+# deferral).
+#
+# ⚠ `spore_instructions.md` JOINED THIS LIST 2026-08-01, WITH THE MOVE THAT MADE IT
+# ON-DEMAND. It had never been here: eagerly imported, its absence surfaced anyway
+# (a broken `@seed/` line in the carrier). Behind a POINTER it would not — the
+# carrier would instruct the entity to read a file that is not on disk, with doctor
+# reporting green. That is `absence_of_signal_rendered_as_health`, and the move to
+# on-demand is what would have created it. An on-demand seed needs its existence
+# checked MORE than an eager one, not less.
+_SEED_REQUIRED = (
+    "origin.md",
+    "partnership.md",
+    "world.md",
+    "memory.md",
+    "spore_instructions.md",
+)
 _SEED_EXPECTED = _SEED_REQUIRED + ("continuity.md", "README.md")
 _HOOK_REQUIRED = ("session_start.py", "user_prompt_submit.py", "_levain_hook.py")
 _ACTIVATION_FILES = ("posture.md", "recency_directives.md")
@@ -532,7 +548,10 @@ def _check_install_layout(install: Path, expect_hooks: bool = True) -> list[Chec
                 "seed/",
                 False,
                 "missing",
-                "Required: seed/{origin,partnership,world,memory}.md",
+                # DERIVED from _SEED_REQUIRED, never hand-listed: the hand-written
+                # form read "{origin,partnership,world,memory}.md" and silently went
+                # stale the moment the required set changed.
+                "Required: " + ", ".join(f"seed/{f}" for f in _SEED_REQUIRED),
             )
         )
     else:
@@ -906,9 +925,60 @@ def _check_openhands(install: Path) -> list[CheckResult]:
     ]
 
 
+def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
+    """Does the rendered adapter carrier still match the CURRENT seed classification?
+
+    ⚠ THE UPGRADE PATH DOES NOT RE-RENDER THIS FILE. Adapter carriers are written at
+    `init` only: `update.py` never calls `apply_init`/`_install_adapter`, and
+    `reconcile.py` says so outright ("the adapter @import list is NOT regenerated").
+    So when a seed file changes class — as `spore_instructions.md` did on 2026-08-01,
+    eager -> on-demand — every EXISTING install keeps eagerly importing it forever,
+    gaining none of the benefit, while every other check stays green.
+
+    That is the same shape as the defect being fixed: the operator cannot see it, and
+    nothing tells them. Presence-only carrier checks cannot catch it (the file IS
+    present; its CONTENT is stale). So this check reads the carrier and reports the
+    drift with the exact remedy.
+
+    Reported as a FAILING check rather than a note, deliberately: it is actionable and
+    silently costs the operator the thing they upgraded for. Found by codex at L3 —
+    the finding neither the Claude layers nor the open-weight seat produced, because
+    it lives in the files this change never touched.
+    """
+    from levain.packs import ON_DEMAND_SEED
+
+    try:
+        text = carrier.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        return [CheckResult(f"{carrier.name} freshness", False, f"unreadable: {e}")]
+
+    # An on-demand seed appearing as an EAGER entry — `@seed/<name>` (claude-code) or
+    # a numbered "N. `seed/<name>`" read-list row (codex). The on-demand POINTER also
+    # names the file, as ``- `seed/<name>` — summary``, so match the eager forms only.
+    stale = [
+        name
+        for name in ON_DEMAND_SEED
+        if f"@seed/{name}" in text or f". `seed/{name}`" in text
+    ]
+    if stale:
+        return [
+            CheckResult(
+                f"{carrier.name} freshness",
+                False,
+                "eagerly loads seed file(s) now classified on-demand: "
+                + ", ".join(stale),
+                f"This install predates the change. Re-render the carrier with "
+                f"`levain init --force --path {install}` (your store, seed answers "
+                f"and operator edits are kept). `levain update` does NOT rewrite it.",
+            )
+        ]
+    return [CheckResult(f"{carrier.name} freshness", True, "matches current seed classification")]
+
+
 def _check_claude_code(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
+    results.extend(_check_carrier_freshness(install, install / "CLAUDE.md"))
 
     settings_path = install / ".claude" / "settings.json"
     if not settings_path.is_file():
@@ -1071,6 +1141,7 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
 def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
+    results.extend(_check_carrier_freshness(install, install / "AGENTS.md"))
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     hooks_path = codex_home / "hooks.json"

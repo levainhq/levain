@@ -20,6 +20,8 @@ That difference cuts both ways — it asks more of you than an assistant does, a
 
 Drive it like an assistant — tasks in, output out, your side of the loop skipped — and it stays the near-empty tool it started as, an assistant you're doing extra work to run. Drive it as a partner and it compounds. Everything below is how.
 
+**One thing onboarding did not do.** The interview asked you a great deal and wrote it into your seed — who you are, how you think, how you want to be talked to. That is what your partner *knows*. What *directs* it is a different file: `activation/posture.md`, the block injected at the top of every session, which the interview leaves exactly as it ships — generic, the same for every operator. So if you told the interview you want to be argued with and you are not being argued with, that is why: the preference is known, not enforced. Open `activation/posture.md` and say it there, in the imperative, in your own words. It is the highest-leverage edit of your first week, and it is easy to miss, because until now nothing in the install told you the two were different files.
+
 ## 2. A day with it
 
 A day with your partner has a shape, and the shape is the point: it keeps the two things that get skipped under pressure — starting oriented and ending consolidated — from getting skipped.

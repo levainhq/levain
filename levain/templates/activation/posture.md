@@ -4,6 +4,13 @@
 > `SessionStart` hook injects at primacy position on every session start —
 > the auto-opener that stands in for a hand-typed session opener.
 >
+> **⚠ THE ONBOARDING INTERVIEW DOES NOT FILL THIS FILE.** The interview fills
+> `seed/world.md` and `seed/origin.md` — who you are. Those are read as
+> *context*. This file is the *directive*, and it ships exactly as you see it
+> below, generic, for every operator. Everything you told the interview about
+> how you want to be worked with is **known** to your entity; it is not
+> **enforced** until you write it here. That is the one thing to change first.
+>
 > The hook reads the single `## ` block below and injects its body verbatim.
 > Keep exactly one `## ` block; the hook injects the first one it finds.
 >

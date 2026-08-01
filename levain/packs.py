@@ -422,26 +422,114 @@ def verbatim_names(roster: Sequence[SeedEntry]) -> list[str]:
 #     entity context.
 NON_IMPORT_SEED: tuple[str, ...] = ("continuity.md", "README.md")
 
-# The authored load ORDER of the base methodology-core seed files — the curriculum
-# sequence (who you are -> how we work -> who your operator is -> your memory ->
-# your open loops). This is an ORDER HINT, not a membership gate: an importable
-# seed file NOT named here (a pack's addition, or a future base file) still loads,
-# appended after these in roster order. Overriding one of these (same filename)
-# keeps its curriculum position.
+# --- the third class: installed, NOT eagerly loaded, POINTED AT from the carrier ---
+#
+# The always-on surface was 65% documentation-about-the-machinery and 17% who the
+# operator and entity actually are (measured on a real install, 2026-07-30 — the
+# first friction report from outside this machine). A harness author measures the
+# carrier they READ, never the one the install LOADS, which is why an outside
+# installer found it first.
+#
+# This is the container change, not another trim: the same fix flow made when its
+# own always-loaded carrier kept outgrowing a hard cap (six trims in two months
+# with the interval SHRINKING) — move the reference material behind a load and
+# leave a POINTER, so a new entry costs the carrier nothing.
+#
+# ⚠ THE POINTER IS NOT A FILENAME. A bare `see also` here would silently kill the
+# layer it points at: the spore tools stay in context, but the DISCIPLINE that
+# makes them fire (plant the moment a loop opens, resolution is mandatory) lives
+# only in the file. So each on-demand seed ships a RETENTION SUMMARY — the part
+# the entity must hold without opening the file — and the detail is one read away.
+# Same rule flow applies to its own on-demand siblings: capability + name stay
+# inline (reachable), the exact procedure one read away.
+ON_DEMAND_SEED: tuple[str, ...] = ("spore_instructions.md",)
+
+# The retention summary per on-demand seed: what the entity must retain WITHOUT
+# opening the file, plus when to open it. Keyed by filename; `test_packs` asserts
+# every ON_DEMAND_SEED name has one, so adding to that tuple without writing the
+# summary FAILS rather than quietly emitting a bare pointer.
+ON_DEMAND_SUMMARY: dict[str, str] = {
+    "spore_instructions.md": (
+        "**Your open loops are a real layer of your mind** — prospective memory, "
+        "the sibling of anneal-memory. Your memory holds what happened and never "
+        "completes; a spore holds what is OPEN and must close. Plant one with "
+        "`spore_add` the moment a loop opens, rather than carrying it in your head "
+        "or burying it in your continuity. Every spore resolves exactly one of two "
+        "ways: `spore_descend` (it composted) or `spore_ascend` (it grew into "
+        "memory or work). A spore that never resolves is a leak. **Read this file "
+        "before you plant, resolve, or reason about an open loop** — it holds the "
+        "typed lifecycle, the germination surface, and the ascend membrane into "
+        "your retrospective memory."
+    ),
+}
+
+# The authored load ORDER of the base methodology-core seed files that load
+# EAGERLY — the curriculum sequence (who you are -> how we work -> who your
+# operator is -> your memory). This is an ORDER HINT, not a membership gate: an
+# importable seed file NOT named here (a pack's addition, or a future base file)
+# still loads, appended after these in roster order. Overriding one of these
+# (same filename) keeps its curriculum position.
+#
+# `spore_instructions.md` LEFT this list 2026-08-01 — it is now ON_DEMAND_SEED.
+# It is still a base methodology seed and still MUST reach the entity, which is
+# what BASE_SEED_REACHABLE below exists to keep true.
 BASE_IMPORT_ORDER: tuple[str, ...] = (
     "origin.md",
     "partnership.md",
     "world.md",
     "memory.md",
-    "spore_instructions.md",
 )
+
+# Every base methodology-core seed that must reach the entity SOMEHOW — eagerly
+# imported, or installed with a carrier pointer. The install-time honesty floor
+# checks THIS set, never the eager list alone: moving a file to on-demand must not
+# punch a hole in the corrupt-wheel guard that the eager list used to close.
+BASE_SEED_REACHABLE: tuple[str, ...] = BASE_IMPORT_ORDER + ON_DEMAND_SEED
+
+def check_seed_classes_disjoint(
+    eager: Sequence[str], on_demand: Sequence[str], not_context: Sequence[str]
+) -> None:
+    """Raise if the three seed classes overlap. Called at import with the real
+    constants; a PURE function so the LOGIC is testable with synthetic overlapping
+    inputs rather than only asserted against data that is already correct.
+
+    `import_entries`' first loop walks BASE_IMPORT_ORDER checking only
+    NON_IMPORT_SEED, so a name added to BOTH tuples would be emitted as EAGER *and*
+    returned by `on_demand_entries` — double-classified: eagerly imported while also
+    carrying a "not loaded above" pointer that contradicts the import. A test caught
+    that, but a test is not present at the moment a maintainer edits the constant,
+    and an import-time failure is (glm, L3).
+
+    ⚠ HONEST LIMIT, recorded rather than papered over: mutation shows that DELETING
+    the call below is not observable by any test here — a test can only prove this
+    function rejects bad input, not that something still calls it. The first version
+    of this guard was a bare `assert` whose test asserted the same already-correct
+    data, so removing it changed nothing at all; this version at least makes the
+    logic real. Deletion of the call site remains unobservable.
+    """
+    for a, b, label in (
+        (eager, on_demand, "eagerly imported and on-demand"),
+        (on_demand, not_context, "on-demand context and not-context"),
+        (eager, not_context, "eagerly imported and not-context"),
+    ):
+        overlap = set(a) & set(b)
+        if overlap:
+            raise ValueError(
+                f"a seed file cannot be both {label}: {sorted(overlap)}"
+            )
+
+
+check_seed_classes_disjoint(BASE_IMPORT_ORDER, ON_DEMAND_SEED, NON_IMPORT_SEED)
 
 
 def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     """The seed entries that load as always-on harness context, in load order.
 
     Membership: every roster seed file EXCEPT those in :data:`NON_IMPORT_SEED`
-    (continuity.md / README.md) — so a pack's new seed file imports by default.
+    (continuity.md / README.md, which are not entity context at all) and
+    :data:`ON_DEMAND_SEED` (which IS entity context, reached through a carrier
+    pointer instead of an eager load) — so a pack's new seed file still imports
+    by default.
 
     Order: the :data:`BASE_IMPORT_ORDER` curriculum first (for the base files the
     roster actually provides, each taken from its WINNING layer), then any other
@@ -459,6 +547,8 @@ def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
     for entry in roster:
         if entry.name in seen or entry.name in NON_IMPORT_SEED:
             continue
+        if entry.name in ON_DEMAND_SEED:
+            continue
         ordered.append(entry)
         seen.add(entry.name)
     return ordered
@@ -467,3 +557,25 @@ def import_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
 def import_names(roster: Sequence[SeedEntry]) -> list[str]:
     """The importable seed filenames, in load order (see :func:`import_entries`)."""
     return [e.name for e in import_entries(roster)]
+
+
+def on_demand_entries(roster: Sequence[SeedEntry]) -> list[SeedEntry]:
+    """The seed entries that install to disk and are POINTED AT from the adapter
+    carrier rather than eagerly loaded, in :data:`ON_DEMAND_SEED` order.
+
+    Peer of :func:`import_entries` over the same roster — an entry is eager XOR
+    on-demand XOR not-context-at-all, and these two functions plus
+    :data:`NON_IMPORT_SEED` partition the roster exactly. Taken from the WINNING
+    layer like every other selector, so a pack overriding an on-demand file's
+    CONTENT keeps its on-demand position."""
+    by_name = {e.name: e for e in roster}
+    return [
+        entry
+        for entry in (by_name.get(name) for name in ON_DEMAND_SEED)
+        if entry is not None
+    ]
+
+
+def on_demand_names(roster: Sequence[SeedEntry]) -> list[str]:
+    """The on-demand seed filenames, in load order (see :func:`on_demand_entries`)."""
+    return [e.name for e in on_demand_entries(roster)]

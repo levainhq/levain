@@ -2,7 +2,11 @@
 
 This is your always-loaded context. It imports the methodology-core seed —
 the files that define who you are, how you and your operator work together,
-who your operator is, how your memory works, and how you hold open loops.
+who your operator is, and how your memory works.
+
+Not everything is loaded here. Reference material you need only when you act
+on it is listed further down, to be read on demand — so this always-on surface
+stays about who you are rather than how the machinery works.
 
 Edit the seed files themselves, not these import lines.
 
@@ -11,4 +15,6 @@ Edit the seed files themselves, not these import lines.
 <!-- seed/continuity.md is intentionally not imported here — it is the entity's
      living memory and loads through the anneal-memory server (the
      anneal://continuity resource), not as a static context file. -->
+
+{{SEED_ON_DEMAND}}
 

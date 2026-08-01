@@ -10,7 +10,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from levain.doctor import _check_recorded_answers, _check_seed_content
+from levain.doctor import (
+    _SEED_REQUIRED,
+    _check_carrier_freshness,
+    _check_claude_code,
+    _check_codex,
+    _check_install_layout,
+    _check_recorded_answers,
+    _check_seed_content,
+)
 
 
 def _seed(install: Path, files: dict[str, str]) -> None:
@@ -213,3 +221,130 @@ def test_overlong_single_line_is_reported_but_does_not_condemn(tmp_path: Path):
     _install(tmp_path, {"OPERATOR_NAME": "x" * 500, "ENTITY_NAME": "Ada"})
     r = _by(_check_recorded_answers(tmp_path), "answer shapes")
     assert r.ok and "note" in r.detail
+
+
+# ---------- F2: an on-demand seed's existence is CHECKED (2026-08-01) ----------
+
+
+def _minimal_seed(install: Path) -> Path:
+    seed = install / "seed"
+    seed.mkdir(parents=True)
+    for name in _SEED_REQUIRED:
+        (seed / name).write_text(f"# {name}\n", encoding="utf-8")
+    return seed
+
+
+def test_doctor_fails_when_the_on_demand_seed_is_missing(tmp_path: Path):
+    """`spore_instructions.md` is pointed at by the carrier, not @imported.
+
+    Eagerly imported, a vanished file announced itself — the adapter carried a
+    broken `@seed/` line. Behind a POINTER it does not: the entity is told to read
+    a file that is not there, and every wiring check stays green. So the move to
+    on-demand is exactly what makes this existence check load-bearing."""
+    install = tmp_path / "ent"
+    seed = _minimal_seed(install)
+    (seed / "spore_instructions.md").unlink()
+
+    results = _check_install_layout(install, expect_hooks=False)
+    seed_checks = [r for r in results if r.name == "seed/"]
+    assert seed_checks and not seed_checks[0].ok
+    assert "spore_instructions.md" in seed_checks[0].detail
+
+
+def test_doctor_seed_hint_lists_every_required_file(tmp_path: Path):
+    """The remediation hint is DERIVED from _SEED_REQUIRED. Hand-listed, it read
+    '{origin,partnership,world,memory}.md' and silently omitted the file whose
+    absence it was meant to help fix."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    results = _check_install_layout(install, expect_hooks=False)
+    hint = next(r.hint for r in results if r.name == "seed/")
+    for name in _SEED_REQUIRED:
+        assert name in hint
+
+
+# ---------- L3 codex: the upgrade path does not re-render the carrier ----------
+
+
+def test_doctor_flags_a_stale_carrier_that_still_eagerly_imports_an_on_demand_seed(tmp_path: Path):
+    """codex L3, the finding that decides whether this fix REACHES anyone.
+
+    Adapter carriers are written at `init` only — `update.py` never calls
+    `apply_init`, and `reconcile.py` says outright that the @import list is not
+    regenerated. So every install predating the eager->on-demand move keeps loading
+    the file forever while every other check stays green: the operator upgrades, gains
+    nothing, and is told nothing. Presence-only checks cannot see it, because the file
+    IS present and its CONTENT is stale."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    (install / "CLAUDE.md").write_text(
+        "# Partnership\n\n@seed/origin.md\n@seed/memory.md\n"
+        "@seed/spore_instructions.md\n",
+        encoding="utf-8",
+    )
+    results = _check_carrier_freshness(install, install / "CLAUDE.md")
+    assert results and not results[0].ok
+    assert "spore_instructions.md" in results[0].detail
+    # the remedy must be actionable AND must correct the wrong instinct
+    assert "init --force" in results[0].hint
+    assert "update" in results[0].hint
+
+
+def test_doctor_carrier_freshness_passes_on_a_current_carrier(tmp_path: Path):
+    """The control. A carrier that POINTS AT the on-demand file (rather than
+    importing it) must pass — the pointer names the file too, so a naive substring
+    check would fail every correct install."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    (install / "CLAUDE.md").write_text(
+        "# Partnership\n\n@seed/origin.md\n@seed/memory.md\n\n"
+        "## Read these when you need them\n\n"
+        "- `seed/spore_instructions.md` — plant one with `spore_add`.\n",
+        encoding="utf-8",
+    )
+    results = _check_carrier_freshness(install, install / "CLAUDE.md")
+    assert results and results[0].ok
+
+
+def test_doctor_carrier_freshness_catches_the_codex_read_list_form(tmp_path: Path):
+    """The codex adapter's eager form is a numbered read-list row, not `@seed/` — a
+    check written only for claude-code would leave every codex install unflagged."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    (install / "AGENTS.md").write_text(
+        "# Partnership\n\n1. `seed/origin.md` — Who You Are\n"
+        "5. `seed/spore_instructions.md` — Your Open Loops\n",
+        encoding="utf-8",
+    )
+    results = _check_carrier_freshness(install, install / "AGENTS.md")
+    assert results and not results[0].ok
+    assert "spore_instructions.md" in results[0].detail
+
+
+def test_stale_carrier_reaches_the_ADAPTER_check_not_just_the_helper(tmp_path: Path):
+    """MUTATION-DRIVEN: the first version of these tests called
+    `_check_carrier_freshness` directly, so deleting its wiring into
+    `_check_claude_code` SURVIVED — the guard's logic was covered and its
+    CONNECTION was not. A guard nothing calls is a guard that does not exist."""
+    install = tmp_path / "ent"
+    (install / ".claude").mkdir(parents=True)
+    (install / "CLAUDE.md").write_text("@seed/spore_instructions.md\n", encoding="utf-8")
+
+    results = _check_claude_code(install)
+    freshness = [r for r in results if "freshness" in r.name]
+    assert freshness, "the adapter check does not run the carrier-freshness check"
+    assert not freshness[0].ok
+
+
+def test_stale_carrier_reaches_the_CODEX_adapter_check(tmp_path: Path):
+    """Same wiring proof for the codex adapter — it is a separate call site, so it
+    is a separate way for the guard to be silently absent."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    (install / "AGENTS.md").write_text(
+        "1. `seed/spore_instructions.md` — Your Open Loops\n", encoding="utf-8"
+    )
+    results = _check_codex(install)
+    freshness = [r for r in results if "freshness" in r.name]
+    assert freshness, "the codex adapter check does not run the carrier-freshness check"
+    assert not freshness[0].ok

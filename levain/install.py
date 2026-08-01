@@ -40,7 +40,8 @@ from typing import TYPE_CHECKING
 
 from levain.answers import AnswersError
 from levain.packs import (
-    BASE_IMPORT_ORDER,
+    BASE_SEED_REACHABLE,
+    ON_DEMAND_SUMMARY,
     PackBrand,
     PackError,
     PackManifest,
@@ -49,6 +50,7 @@ from levain.packs import (
     compose_roster,
     import_entries,
     load_pack_manifest,
+    on_demand_entries,
     order_activation_roots,
     render_entries,
     verbatim_entries,
@@ -625,15 +627,24 @@ def apply_init(
     render_seed = [
         SeedEntry(name=spec.path.name, path=spec.path, mode="render") for spec in specs
     ]
-    import_seed = import_entries([*render_seed, *verbatim])
+    roster_seed = [*render_seed, *verbatim]
+    import_seed = import_entries(roster_seed)
+    on_demand_seed = on_demand_entries(roster_seed)
 
-    # Honesty floor (the base half): every base methodology-core seed must be in
-    # the import list. A corrupt wheel that dropped one (e.g. spore_instructions.md)
-    # would otherwise generate an adapter SILENTLY missing that import — recreating,
-    # for a base seed, the invisible-infrastructure failure this seam closes (the
-    # old hard-coded template named it, so the break was visible). Fail loud, named.
-    imported = {entry.name for entry in import_seed}
-    missing_base = [name for name in BASE_IMPORT_ORDER if name not in imported]
+    # Honesty floor (the base half): every base methodology-core seed must REACH
+    # the entity. A corrupt wheel that dropped one would otherwise generate an
+    # adapter SILENTLY missing it — recreating, for a base seed, the
+    # invisible-infrastructure failure this seam closes (the old hard-coded
+    # template named it, so the break was visible). Fail loud, named.
+    #
+    # ⚠ CHECKED AGAINST REACHABILITY, NOT THE EAGER IMPORT LIST. When
+    # spore_instructions.md moved to ON_DEMAND_SEED, an import-list check would
+    # have kept passing while quietly ceasing to cover it — a guard that reports
+    # itself armed and no longer defends the file it was written for. Reachable =
+    # eagerly imported OR carrying a carrier pointer.
+    reachable = {entry.name for entry in import_seed}
+    reachable |= {entry.name for entry in on_demand_seed}
+    missing_base = [name for name in BASE_SEED_REACHABLE if name not in reachable]
     if missing_base:
         raise InitError(
             f"base methodology seed file(s) missing from the install roster: "
@@ -654,7 +665,7 @@ def apply_init(
         roots = [_base_activation_root(chosen, templates_root)]
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
-        activation_roots=roots, emit=emit,
+        on_demand_seed, activation_roots=roots, emit=emit,
     )
 
     store = install / ".levain" / "memory.db"
@@ -1164,6 +1175,7 @@ def _install_adapter(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    on_demand_seed: Sequence[SeedEntry],
     *,
     activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
@@ -1173,14 +1185,15 @@ def _install_adapter(
     if name == "claude-code":
         _install_claude_code(
             install, templates_root, adapter_root, python_path, anneal_path,
-            import_seed, activation_roots=activation_roots, emit=emit,
+            import_seed, on_demand_seed,
+            activation_roots=activation_roots, emit=emit,
         )
         return
 
     if name == "codex":
         _install_codex(
             install, adapter_root, python_path, anneal_path, import_seed,
-            activation_roots=activation_roots, emit=emit,
+            on_demand_seed, activation_roots=activation_roots, emit=emit,
         )
         return
 
@@ -1199,6 +1212,7 @@ def _install_adapter(
 # ---------- adapter seed-import-list generation (the load-side @import seam) ----------
 
 _SEED_IMPORTS_PLACEHOLDER = "{{SEED_IMPORTS}}"
+_SEED_ON_DEMAND_PLACEHOLDER = "{{SEED_ON_DEMAND}}"
 
 
 def _seed_role_title(path: Path) -> str | None:
@@ -1252,6 +1266,138 @@ def _codex_import_block(import_seed: Sequence[SeedEntry]) -> str:
     return "\n".join(lines)
 
 
+def _on_demand_block(on_demand_seed: Sequence[SeedEntry]) -> str:
+    """The carrier's on-demand pointer block — one entry per seed file that
+    installs to disk but is NOT eagerly loaded. Fills ``{{SEED_ON_DEMAND}}`` in
+    both adapter templates (the text is prose, so it needs no per-adapter form).
+
+    Each entry carries its RETENTION SUMMARY from :data:`ON_DEMAND_SUMMARY` — the
+    part the entity must hold without opening the file — because a bare filename
+    pointer would silently kill the layer it points at. Returns ``""`` when there
+    are no on-demand entries, so the block disappears rather than leaving an empty
+    heading.
+
+    Fail-soft on a MISSING summary: emit the pointer with the file's H1 role
+    instead. A summary-less pointer is a weaker pointer, but dropping the entry
+    entirely would leave a file that installs to disk and reaches context by no
+    path at all — fail toward reachable. (`test_packs` fails the build for a
+    missing summary, so this branch is a backstop, not the plan.)
+    """
+    if not on_demand_seed:
+        return ""
+    base_seed_root = _base_seed_root()
+    lines = [
+        "## Read these when you need them",
+        "",
+        "These seed files install with your entity but are deliberately NOT loaded",
+        "above. Each line here is the part to RETAIN; the file is one read away when",
+        "you act on it. This keeps your always-on context about who you are rather",
+        "than how the machinery works.",
+        "",
+    ]
+    for entry in on_demand_seed:
+        summary = ON_DEMAND_SUMMARY.get(entry.name)
+        # ⚠ A PACK OVERRIDE MUST NOT INHERIT THE BASE SUMMARY (both L3 lineages found
+        # this independently). `on_demand_entries` resolves to the WINNING layer, so a
+        # pack can replace this file's content entirely — but ON_DEMAND_SUMMARY is
+        # keyed by FILENAME, so the pointer would keep asserting the BASE discipline
+        # over pack-authored content. The retained text IS the point of the pointer,
+        # which makes the wrong retained text worse than none: it confidently
+        # describes a procedure the file does not contain. No pack-manifest field for
+        # a custom summary exists today, so fall back to the file's OWN H1 whenever
+        # the winning entry is not the base file.
+        if summary and not _is_base_seed(entry, base_seed_root):
+            summary = None
+        if not summary:
+            title = _seed_role_title(entry.path)
+            summary = (
+                f"{title} — read this file before working in that area."
+                if title
+                else "Read this file before working in the area it covers."
+            )
+        lines.append(f"- `seed/{entry.name}` — {summary}")
+    return "\n".join(lines)
+
+
+def _base_seed_root() -> Path | None:
+    """The package's own shipped `seed/` directory, resolved ONCE.
+
+    Hoisted out of the per-entry loop deliberately: `_templates_root` is a context
+    manager that may EXTRACT the wheel to a temp dir, so calling it per seed file
+    would re-extract per file and — worse — compare against a directory already torn
+    down. ``None`` means "could not determine", handled by the caller.
+    """
+    try:
+        with _templates_root() as templates_root:
+            return (templates_root / "seed").resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _is_base_seed(entry: SeedEntry, base_seed_root: Path | None) -> bool:
+    """Is this roster entry the BASE file, or a pack's override of it?
+
+    Compared against the package's own shipped seed directory, `.resolve()`d on both
+    sides — never a substring match on the path, which an editable install, a
+    temp-extracted wheel, and a symlinked venv would each get wrong differently.
+    """
+    if base_seed_root is None:
+        return False
+    try:
+        return entry.path.resolve() == base_seed_root / entry.name
+    except OSError:
+        # Cannot tell -> treat as NOT base, which drops to the file's own H1. A
+        # generic-but-true pointer beats a specific-but-possibly-false one.
+        return False
+
+
+def _fill_seed_on_demand(template_text: str, block: str) -> str:
+    """Substitute the single ``{{SEED_ON_DEMAND}}`` placeholder with the pointer
+    block.
+
+    Same placeholder-count honesty floor as :func:`_fill_seed_imports`, and for
+    the same reason: a template missing it writes a carrier whose on-demand files
+    are unreachable. It differs on the EMPTY case, which is legitimate here — an
+    empty :data:`ON_DEMAND_SEED` means nothing was moved behind a load, so the
+    block is dropped along with its surrounding blank line rather than leaving a
+    hole in the rendered file. (The guarantee that a file dropped from the EAGER
+    list actually got a pointer is `BASE_SEED_REACHABLE`, enforced in
+    `apply_init` — it is a roster-level invariant, not a text-substitution one.)
+    """
+    count = template_text.count(_SEED_ON_DEMAND_PLACEHOLDER)
+    if count != 1:
+        raise InitError(
+            f"adapter template must contain exactly one {_SEED_ON_DEMAND_PLACEHOLDER} "
+            f"placeholder (found {count}) — the wheel may be corrupt or the template "
+            f"hand-edited; reinstall with `pip install --force-reinstall levain`."
+        )
+    if not block.strip():
+        # Drop the placeholder's OWN LINE, preserving the surrounding line structure.
+        #
+        # Scoped to a placeholder that OWNS its line, which is the only shape the
+        # shipped templates use and the only one this claims to handle (L3, both
+        # lineages: the earlier docstring claimed more than the code delivered). An
+        # INLINE placeholder — "a {{X}}\nb" — is left to the plain substitution below
+        # it, because silently eating an inline placeholder's whole line would drop
+        # the operator's own text with it.
+        #
+        # The naive form (replacing "\n{{X}}\n" with "") consumes BOTH newlines and
+        # JOINS the lines either side — caught by this function's own unit test, not
+        # by review. Collapsing "\n\n{{X}}\n" to "\n" also absorbs the blank line the
+        # placeholder was spaced with, so the carrier does not gain a double blank.
+        for old, new in (
+            (f"\n\n{_SEED_ON_DEMAND_PLACEHOLDER}\n", "\n"),
+            (f"\n{_SEED_ON_DEMAND_PLACEHOLDER}\n", "\n"),
+            (f"{_SEED_ON_DEMAND_PLACEHOLDER}\n", ""),
+        ):
+            if old in template_text:
+                return template_text.replace(old, new, 1)
+        # End-of-file placeholder (no trailing newline), or an inline one: remove the
+        # token itself and leave surrounding text exactly as authored.
+        return template_text.replace(_SEED_ON_DEMAND_PLACEHOLDER, "")
+    return template_text.replace(_SEED_ON_DEMAND_PLACEHOLDER, block)
+
+
 def _fill_seed_imports(template_text: str, block: str) -> str:
     """Substitute the single ``{{SEED_IMPORTS}}`` placeholder with the generated
     import block. Honesty floor — BOTH failure modes write an import-less adapter
@@ -1283,6 +1429,7 @@ def _install_claude_code(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    on_demand_seed: Sequence[SeedEntry] = (),
     *,
     activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
@@ -1304,6 +1451,7 @@ def _install_claude_code(
     # fixes). Fill {{SEED_IMPORTS}} rather than copy the template byte-for-byte.
     claude_md = (adapter_root / "CLAUDE.md.template").read_text(encoding="utf-8")
     claude_md = _fill_seed_imports(claude_md, _claude_import_block(import_seed))
+    claude_md = _fill_seed_on_demand(claude_md, _on_demand_block(on_demand_seed))
     (install / "CLAUDE.md").write_text(claude_md, encoding="utf-8")
 
     settings_dir = install / ".claude"
@@ -1326,6 +1474,7 @@ def _install_codex(
     python_path: str,
     anneal_path: str,
     import_seed: Sequence[SeedEntry],
+    on_demand_seed: Sequence[SeedEntry] = (),
     *,
     activation_roots: Sequence[Path],
     emit: Callable[[str], None] = print,
@@ -1345,6 +1494,7 @@ def _install_codex(
     # seed file appears in the numbered "read these, in order" list it must load.
     agents_md = (adapter_root / "AGENTS.md.template").read_text(encoding="utf-8")
     agents_md = _fill_seed_imports(agents_md, _codex_import_block(import_seed))
+    agents_md = _fill_seed_on_demand(agents_md, _on_demand_block(on_demand_seed))
     (install / "AGENTS.md").write_text(agents_md, encoding="utf-8")
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
@@ -1888,17 +2038,71 @@ def _print_manifest(
 
     if (install / "activation").is_dir():
         print()
+        # Points FORWARD at the behavior note rather than restating it. Framed as
+        # "yours to tune" ALONE this read as optional polish, immediately above a
+        # block saying posture.md is the file that actually directs the entity.
         print(
-            "  (activation/posture.md + activation/recency_directives.md are yours "
-            "to tune as you find your own RLHF-leakage patterns.)"
+            "  (activation/posture.md is what DIRECTS your entity — see below. It "
+            "and\n   recency_directives.md are yours to tune as you learn the shapes "
+            "your\n   substrate's training leaks.)"
         )
+
+
+def _behavior_note_lines(install: Path, has_posture: bool) -> list[str]:
+    """The interview's honest closing statement: what it just captured, and what
+    it did NOT.
+
+    The interview fills IDENTITY (`seed/world.md` + `seed/origin.md` — the two
+    render targets). It never touches the file that shapes BEHAVIOR: the
+    activation posture injected at primacy on every session, which ships as a
+    generic starter. Nothing in the onboarding flow said those were different
+    files, so an operator finishes having described at length how they want to
+    be worked with and reasonably believes they configured it. (First reported
+    from outside this machine by Alex De Groodt, 2026-07-30: *"I'm not sure if
+    it's applying all that I told it."* He was right.)
+
+    `has_posture` is passed rather than probed so the text stays pure and
+    testable: a hookless adapter (openhands) installs NO activation tree, and
+    naming a file that is not on disk would trade one wrong belief for another.
+    Its posture ships in the package (`levain.firing.contract.DIRECTIVES`); the
+    operator-editable surface there is the seed's own partnership discipline.
+    """
+    lines = [""]
+    lines.append("What the interview did NOT set:")
+    lines.append("  Your answers describe WHO you are — they were written into your")
+    lines.append("  seed files under seed/, which your entity reads as CONTEXT.")
+    lines.append("")
+    if has_posture:
+        lines.append("  They did NOT write HOW it behaves. That is a separate file:")
+        lines.append(f"        {install / 'activation' / 'posture.md'}")
+        lines.append("  — the block injected at the TOP of every session. It ships as a")
+        lines.append("  generic starter and the interview leaves it untouched.")
+        lines.append("")
+        lines.append("  So if you told the interview how you want to be worked with and")
+        lines.append("  want that ENFORCED rather than merely known, edit posture.md now.")
+        lines.append("  (activation/recency_directives.md is the same idea applied within")
+        lines.append("   a session.)")
+    else:
+        lines.append("  They did NOT write HOW it behaves. This adapter is hookless, so")
+        lines.append("  it has no activation/ tree — its posture and drift-defense ship")
+        lines.append("  inside the package and are injected by the runtime. The")
+        lines.append("  operator-editable discipline is:")
+        lines.append(f"        {install / 'seed' / 'partnership.md'}")
+    return lines
 
 
 def _next_steps_lines(install: Path, adapter: str, store_ok: bool = True) -> list[str]:
     """The post-install next-steps banner as a list of lines (leading + trailing
     blank included, so a plain print-each reproduces the CLI byte-for-byte).
     Pure — extracted from `_print_next_steps` so a web init renders the same
-    guidance as structured lines."""
+    guidance as structured lines.
+
+    Carries `_behavior_note_lines` so BOTH surfaces (terminal `levain init` and
+    the web init form, which renders these same lines) inherit the identity-vs-
+    behavior statement from ONE site. It is placed BEFORE "Next steps:" because
+    it corrects a belief the operator has just formed, and after the action list
+    is where a correction goes unread.
+    """
     lines: list[str] = [""]
     lines.append("=" * 60)
     if store_ok:
@@ -1908,6 +2112,11 @@ def _next_steps_lines(install: Path, adapter: str, store_ok: bool = True) -> lis
     lines.append("=" * 60)
     lines.append(f"  Install:   {install}")
     lines.append(f"  Adapter:   {adapter}")
+    lines.extend(
+        _behavior_note_lines(
+            install, has_posture=(install / "activation" / "posture.md").is_file()
+        )
+    )
     lines.append("")
     lines.append("Next steps:")
     if adapter == "claude-code":
