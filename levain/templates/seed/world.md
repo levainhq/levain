@@ -86,8 +86,11 @@ Roles:
 {{COMMUNICATION}}
 
 <!-- interview style=prose: How you want to be talked to — directness, information
-     density, formality, profanity, how much challenge you want. This calibrates
-     the entity's voice, so be specific. -->
+     density, formality, profanity, how much challenge you want. Be specific.
+     NOTE what this does and does not do. It is CONTEXT your entity reads, not an
+     instruction injected into every session. The file that DIRECTS behavior is
+     activation/posture.md, and onboarding does not fill it. Answer here so the
+     preference is KNOWN, then put the part you want ENFORCED into posture.md. -->
 
 ## Boundaries & Privacy
 

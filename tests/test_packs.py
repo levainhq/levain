@@ -15,16 +15,24 @@ import pytest
 
 from levain.install import _templates_root
 from levain.packs import (
+    BASE_IMPORT_ORDER,
+    BASE_SEED_REACHABLE,
+    NON_IMPORT_SEED,
+    ON_DEMAND_SEED,
+    ON_DEMAND_SUMMARY,
     PackBrand,
     PackError,
     PackManifest,
     SeedEntry,
     compose_brand,
+    check_seed_classes_disjoint,
     compose_roster,
     discover_roster,
     import_entries,
     import_names,
     load_pack_manifest,
+    on_demand_entries,
+    on_demand_names,
     order_activation_roots,
     render_entries,
     verbatim_names,
@@ -332,7 +340,11 @@ _BASE_ROSTER = [
     _entry("spore_instructions.md"),
 ]
 
-_CURRICULUM = ["origin.md", "partnership.md", "world.md", "memory.md", "spore_instructions.md"]
+# The EAGER curriculum. `spore_instructions.md` is deliberately absent — it is
+# ON_DEMAND_SEED as of 2026-08-01 (installed, pointed at from the carrier, not
+# eagerly loaded), and `_ON_DEMAND` below pins that half.
+_CURRICULUM = ["origin.md", "partnership.md", "world.md", "memory.md"]
+_ON_DEMAND = ["spore_instructions.md"]
 
 
 def test_import_entries_curriculum_order_excludes_continuity_and_readme():
@@ -343,6 +355,11 @@ def test_import_entries_curriculum_order_excludes_continuity_and_readme():
     assert names == _CURRICULUM
     assert "continuity.md" not in names
     assert "README.md" not in names
+    # ON_DEMAND_SEED is context too, just not EAGER context — so its absence here
+    # must be paired with its presence there, or the file reaches the entity by no
+    # path at all. Asserting only the exclusion would pass for a DELETED file.
+    assert "spore_instructions.md" not in names
+    assert on_demand_names(_BASE_ROSTER) == _ON_DEMAND
 
 
 def test_import_entries_pack_file_loads_appended_after_curriculum():
@@ -350,8 +367,11 @@ def test_import_entries_pack_file_loads_appended_after_curriculum():
     after the base curriculum — the load-bearing Slice 3 behavior."""
     roster = [*_BASE_ROSTER, _entry("audit_method.md")]
     names = import_names(roster)
-    assert names[:5] == _CURRICULUM
+    assert names[: len(_CURRICULUM)] == _CURRICULUM
     assert names[-1] == "audit_method.md"
+    # A pack file imports EAGERLY by default — on-demand is an explicit base
+    # classification, never something a pack addition falls into by accident.
+    assert "audit_method.md" not in on_demand_names(roster)
 
 
 def test_import_entries_override_keeps_position_and_uses_winning_entry():
@@ -370,6 +390,91 @@ def test_import_entries_multiple_pack_files_append_in_roster_order():
     """Two pack additions both load, appended in roster order after the base."""
     roster = [*_BASE_ROSTER, _entry("audit_method.md"), _entry("sizing.md")]
     assert import_names(roster) == [*_CURRICULUM, "audit_method.md", "sizing.md"]
+
+
+# ---------- the on-demand class (F2, 2026-08-01) ----------
+#
+# A seed file is EAGER xor ON-DEMAND xor NOT-CONTEXT. These pin the partition and
+# the two invariants that would otherwise rot silently: that every on-demand file
+# ships a retention summary, and that moving a file between classes cannot make it
+# unreachable.
+
+
+def test_seed_classes_partition_the_roster_exactly():
+    """Eager + on-demand + not-context covers every roster file, with no overlap.
+
+    The partition IS the safety property: a file in no class installs to disk and
+    reaches the entity by no path, which is the invisible-infrastructure failure
+    the import seam exists to close. A file in two classes double-loads."""
+    eager = set(import_names(_BASE_ROSTER))
+    on_demand = set(on_demand_names(_BASE_ROSTER))
+    not_context = set(NON_IMPORT_SEED)
+    all_names = {e.name for e in _BASE_ROSTER}
+
+    assert eager | on_demand | not_context == all_names, "a seed file is in no class"
+    assert not (eager & on_demand)
+    assert not (eager & not_context)
+    assert not (on_demand & not_context)
+
+
+def test_every_on_demand_seed_has_a_retention_summary():
+    """A bare filename pointer would silently kill the layer it points at — the
+    spore TOOLS stay in context but the DISCIPLINE that makes them fire lives only
+    in the file. So adding to ON_DEMAND_SEED without writing its summary must FAIL
+    here rather than quietly emit a pointer with no retained content."""
+    for name in ON_DEMAND_SEED:
+        assert name in ON_DEMAND_SUMMARY, f"{name} is on-demand with no retention summary"
+        assert ON_DEMAND_SUMMARY[name].strip(), f"{name} has an empty retention summary"
+
+
+def test_on_demand_seed_files_exist_in_the_shipped_templates():
+    """The pointer must not dangle. An eagerly-imported file that vanished from the
+    wheel announced itself (a broken @seed/ line); behind a pointer it would not."""
+    seed_root = Path(__file__).resolve().parent.parent / "levain" / "templates" / "seed"
+    for name in ON_DEMAND_SEED:
+        assert (seed_root / name).is_file(), f"{name} is pointed at but not shipped"
+
+
+def test_base_seed_reachable_covers_eager_and_on_demand():
+    """The install-time honesty floor checks REACHABILITY, not the eager list.
+
+    This is the guard that would have silently stopped covering
+    spore_instructions.md the moment it moved classes — armed, reporting healthy,
+    and no longer defending the file it was written for."""
+    assert set(BASE_SEED_REACHABLE) == set(BASE_IMPORT_ORDER) | set(ON_DEMAND_SEED)
+    for name in ON_DEMAND_SEED:
+        assert name in BASE_SEED_REACHABLE
+    assert not set(BASE_SEED_REACHABLE) & set(NON_IMPORT_SEED)
+
+
+def test_check_seed_classes_disjoint_rejects_each_overlap():
+    """glm L3. Tests the GUARD with synthetic overlapping input, not the already-
+    correct real constants — the first version asserted the data and therefore
+    SURVIVED deletion of the guard entirely (mutation-caught)."""
+    check_seed_classes_disjoint(["a.md"], ["b.md"], ["c.md"])  # disjoint: no raise
+    with pytest.raises(ValueError, match="eagerly imported and on-demand"):
+        check_seed_classes_disjoint(["a.md"], ["a.md"], ["c.md"])
+    with pytest.raises(ValueError, match="on-demand context and not-context"):
+        check_seed_classes_disjoint(["a.md"], ["b.md"], ["b.md"])
+    with pytest.raises(ValueError, match="eagerly imported and not-context"):
+        check_seed_classes_disjoint(["a.md"], ["b.md"], ["a.md"])
+
+
+def test_the_real_seed_constants_are_disjoint():
+    """And the live data satisfies it (the import-time call would already have
+    raised, but state it so the intent is legible)."""
+    check_seed_classes_disjoint(BASE_IMPORT_ORDER, ON_DEMAND_SEED, NON_IMPORT_SEED)
+
+
+def test_on_demand_entries_resolve_to_the_winning_layer():
+    """A pack overriding an on-demand file's CONTENT keeps its on-demand position
+    and resolves to the winner — same rule every other selector follows."""
+    pack_spores = _entry("spore_instructions.md", path=Path("/pack/spore_instructions.md"))
+    roster = [e for e in _BASE_ROSTER if e.name != "spore_instructions.md"]
+    roster.append(pack_spores)
+    result = on_demand_entries(roster)
+    assert [e.name for e in result] == _ON_DEMAND
+    assert result[0].path == Path("/pack/spore_instructions.md")
 
 
 # ---------- order_activation_roots: the activation peer of seed layering ----------

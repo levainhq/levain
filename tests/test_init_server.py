@@ -358,6 +358,13 @@ class TestInstall:
         assert isinstance(body["messages"], list)
         assert any("adapter installed" in m for m in body["messages"])  # emit captured
         assert body["next_steps"]
+        # F1: the identity-vs-behavior correction reaches the WEB operator too, not
+        # only the terminal one. It lives in `_next_steps_lines` precisely so both
+        # surfaces render it from one site — assert it HERE, or "both surfaces" is a
+        # claim about a call graph rather than about what an operator is told.
+        steps = "\n".join(body["next_steps"])
+        assert "What the interview did NOT set:" in steps
+        assert "activation/posture.md" in steps
         # the writes really happened on disk, rendered from the answers
         world = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "{{" not in world

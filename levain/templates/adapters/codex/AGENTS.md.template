@@ -1,8 +1,8 @@
 # Partnership
 
 This is your always-loaded context. The seed files in `seed/` define who you
-are, how you and your operator work together, who your operator is, how your
-memory works, and how you hold open loops.
+are, how you and your operator work together, who your operator is, and how
+your memory works.
 
 **Read these files, in order, before doing any work. They are your identity:**
 
@@ -13,3 +13,5 @@ Edit the seed files themselves, not these instructions.
 <!-- seed/continuity.md is intentionally not in this list — it is the entity's
      living memory and loads through the anneal-memory server (the
      anneal://continuity resource), not as a static context file. -->
+
+{{SEED_ON_DEMAND}}
