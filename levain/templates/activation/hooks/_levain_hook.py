@@ -9,10 +9,16 @@ unwrapped-episode query, temporal formatting, and the harness output format.
 That common surface lives here.
 
 Harness-portability seam: emit() is the primary harness-coupled function — it
-formats output as Claude Code hook JSON. Two smaller Claude-Code couplings live
-in the hook scripts rather than here: the CLAUDE_PROJECT_DIR env-var name read
-in install_root(), and the SessionStart `source` vocabulary parsed in
-session_start.py. A non-Claude-Code adapter swaps emit() and re-verifies those.
+formats output as Claude Code hook JSON. One smaller Claude-Code coupling lives
+in the hook scripts rather than here: the SessionStart `source` vocabulary
+parsed in session_start.py. A non-Claude-Code adapter swaps emit() and
+re-verifies that.
+
+(This used to name a second coupling — `CLAUDE_PROJECT_DIR`, read in
+install_root(). That read was DELETED on 2026-08-01: its containment check
+accepted any ancestor of this file as the install, which silently resolved the
+whole activation layer under the wrong root. install_root() is now derived from
+this file's own location alone, so there is no env coupling left to port.)
 
 FAIL-OPEN — structural rule: the GUARANTEE that a hook never crashes or writes
 stderr noise into the operator's session is enforced at the harness ENTRY
