@@ -35,6 +35,7 @@ from levain.packs import (
     on_demand_names,
     order_activation_roots,
     render_entries,
+    seed_role,
     verbatim_names,
 )
 
@@ -700,3 +701,72 @@ def test_brand_accepts_normal_punctuation_and_unicode(tmp_path: Path):
         {"x.md": "x"},
     )
     assert load_pack_manifest(tmp_path).brand.surface_name == "Pressable — Solutions Harness ™"
+
+
+# ---------- the eager-surface budget (the anti-recurrence guard, 2026-08-01) ----------
+#
+# F2 fixed the surface ONCE. flow's own history says a one-time trim does not hold:
+# six hand-trims in two months with the interval SHRINKING, fixed only when a guard
+# started refusing the commit. Levain inherited the container change and not the
+# guard. These are the guard, wired into the suite because this repo has no CI — a
+# check nobody runs is not a check.
+
+
+def test_base_eager_surface_stays_within_budget():
+    """The BASE composition — what every fresh install loads before the operator has
+    written a word — must stay inside its mechanism-share and byte budgets.
+
+    Falsified against a control rather than merely asserted: run against the pre-F2
+    constants this same guard reports 64% / 48,843 B and FAILS, reproducing Alex De
+    Groodt's measured 48,451 B. It would have caught his bug before he installed."""
+    import scripts.check_seed_budget as budget
+
+    total, by_role, rows = budget.measure()
+    share = by_role.get("mechanism", 0) / total
+    assert share <= budget.MECHANISM_SHARE_LIMIT, (
+        f"eager surface is {share:.0%} mechanism docs (limit "
+        f"{budget.MECHANISM_SHARE_LIMIT:.0%}). Move a file to ON_DEMAND_SEED with a "
+        f"retention summary — do not trim words."
+    )
+    assert total <= budget.TOTAL_BYTES_LIMIT, f"eager surface is {total:,} B"
+
+
+def test_budget_guard_rejects_the_pre_f2_composition():
+    """The control for the test above. A budget that can only pass proves nothing —
+    this pins that the guard actually fires on the composition Alex reported."""
+    import scripts.check_seed_budget as budget
+
+    # the pre-F2 eager set: spore_instructions.md loaded rather than pointed at
+    seed_root = budget.REPO / "levain" / "templates" / "seed"
+    pre_f2 = ("origin.md", "partnership.md", "world.md", "memory.md", "spore_instructions.md")
+    total = sum((seed_root / n).stat().st_size for n in pre_f2)
+    mechanism = sum(
+        (seed_root / n).stat().st_size
+        for n in pre_f2
+        if seed_role(n) == "mechanism"
+    )
+    assert mechanism / total > budget.MECHANISM_SHARE_LIMIT
+    assert total > budget.TOTAL_BYTES_LIMIT
+
+
+def test_every_eagerly_loaded_base_seed_has_a_declared_role():
+    """An unclassified base seed would silently land in `other` and dilute the
+    mechanism share — a file could grow the surface while making the ratio look
+    BETTER. Roles are declared, never inferred."""
+    for name in BASE_IMPORT_ORDER:
+        assert seed_role(name) != "other", f"{name} has no declared role in SEED_ROLE"
+
+
+def test_budget_measure_actually_attributes_bytes_to_roles():
+    """MUTATION-DRIVEN: a `measure()` that stopped accumulating `by_role` reported
+    0% mechanism and the budget PASSED — a broken instrument reading clean is worse
+    than no instrument, and it is the exact failure this whole guard exists to stop."""
+    import scripts.check_seed_budget as budget
+
+    total, by_role, rows = budget.measure()
+    assert total > 0 and rows
+    assert by_role.get("mechanism", 0) > 0, "measure() attributes no mechanism bytes"
+    assert by_role.get("identity", 0) > 0
+    # the sum of the parts is the seed half of the total (total also holds the carrier)
+    assert 0 < sum(by_role.values()) <= total
+    assert {name for name, _s, _r in rows} == set(BASE_IMPORT_ORDER)

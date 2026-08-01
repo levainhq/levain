@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -975,10 +976,96 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     return [CheckResult(f"{carrier.name} freshness", True, "matches current seed classification")]
 
 
+def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
+    """Report the EAGER context surface — the bytes this install loads into every
+    single session — broken down by what those bytes ARE.
+
+    ⚠ THIS CHECK EXISTS BECAUSE AN OPERATOR HAD TO GUESS. Alex De Groodt, the first
+    installer outside this machine: *"I'm wondering if levain isn't filling too much
+    context actually."* He was right — it was 48,451 bytes, 65% of it documentation
+    about the machinery — and he could only feel it, because nothing in Levain ever
+    reported the number. A harness that will not tell you what it loads makes its own
+    operator the instrument. That is the root under F2, and it is the part a
+    one-time trim does not fix.
+
+    The health signal is the mechanism SHARE, never the byte total: an operator with
+    a long, rich `world.md` has a large surface and a HEALTHY one — that is Levain
+    working. An operator whose surface is mostly docs-about-the-substrate has the
+    defect. Failing on raw size would punish precisely the right behaviour.
+
+    Reported for the file set the carrier actually imports, read from the CARRIER on
+    disk rather than recomputed from the roster, so it measures what this install
+    really loads — including an install that predates a classification change, or one
+    the operator hand-edited.
+    """
+    from levain.packs import MECHANISM_SHARE_WARN, seed_role
+
+    try:
+        text = carrier.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        return [CheckResult("context surface", False, f"carrier unreadable: {e}")]
+
+    # Both eager forms: claude-code `@seed/<name>`, codex `N. \`seed/<name>\``.
+    names: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("@seed/"):
+            names.append(s[len("@seed/"):].strip())
+        else:
+            m = re.match(r"^\d+\.\s+`seed/([^`]+)`", s)
+            if m:
+                names.append(m.group(1))
+
+    by_role: dict[str, int] = {}
+    total = len(text.encode("utf-8"))  # the carrier itself loads too
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        f = install / "seed" / name
+        try:
+            size = f.stat().st_size
+        except OSError:
+            continue  # a dangling import is the freshness check's job, not this one
+        total += size
+        by_role[seed_role(name)] = by_role.get(seed_role(name), 0) + size
+
+    if not seen:
+        return [CheckResult("context surface", True, "no eager seed imports")]
+
+    mechanism = by_role.get("mechanism", 0)
+    share = mechanism / total if total else 0.0
+    breakdown = " · ".join(
+        f"{role} {by_role[role]:,}B" for role in sorted(by_role) if by_role[role]
+    )
+    detail = (
+        f"{total:,} B loaded every session across {len(seen)} seed file(s) "
+        f"+ carrier — {breakdown} ({share:.0%} mechanism)"
+    )
+    # ⚠ REPORTS, NEVER FAILS — and that split is deliberate, not softness.
+    #
+    # The first version FAILED above the threshold, which meant a fresh base install
+    # failed `doctor` on day one for a ratio the operator cannot act on: `memory.md`
+    # is OUR composition choice, and the remedy ("move it on-demand") is a Levain
+    # internals change, not something an operator does. Failing them for our decision
+    # points the signal at the wrong party — the same defect class this whole change
+    # is about. Enforcement belongs where the actor is, so the BUDGET is enforced
+    # repo-side in `scripts/check_seed_budget.py`, which fails OUR build.
+    #
+    # What the operator needs here is the NUMBER, every time, which is the exact
+    # thing Alex did not have. So it always prints, and says plainly whose problem a
+    # skewed ratio is.
+    if share > MECHANISM_SHARE_WARN:
+        detail += " — mostly machinery, which is a Levain composition issue, not yours"
+    return [CheckResult("context surface", True, detail)]
+
+
 def _check_claude_code(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
     results.extend(_check_carrier_freshness(install, install / "CLAUDE.md"))
+    results.extend(_check_context_surface(install, install / "CLAUDE.md"))
 
     settings_path = install / ".claude" / "settings.json"
     if not settings_path.is_file():
@@ -1142,6 +1229,7 @@ def _check_codex(install: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
     results.append(CheckResult("AGENTS.md", True, "present"))
     results.extend(_check_carrier_freshness(install, install / "AGENTS.md"))
+    results.extend(_check_context_surface(install, install / "AGENTS.md"))
 
     codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
     hooks_path = codex_home / "hooks.json"
