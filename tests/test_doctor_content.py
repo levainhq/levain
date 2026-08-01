@@ -14,6 +14,7 @@ from levain.doctor import (
     _SEED_REQUIRED,
     _check_carrier_freshness,
     _check_claude_code,
+    _check_context_surface,
     _check_codex,
     _check_install_layout,
     _check_recorded_answers,
@@ -348,3 +349,100 @@ def test_stale_carrier_reaches_the_CODEX_adapter_check(tmp_path: Path):
     freshness = [r for r in results if "freshness" in r.name]
     assert freshness, "the codex adapter check does not run the carrier-freshness check"
     assert not freshness[0].ok
+
+
+# ---------- the operator-facing context-surface report ----------
+
+
+def _surface_install(tmp_path: Path, sizes: dict[str, int]) -> Path:
+    install = tmp_path / "ent"
+    (install / "seed").mkdir(parents=True)
+    for name, size in sizes.items():
+        (install / "seed" / name).write_text("x" * size, encoding="utf-8")
+    imports = "\n".join(f"@seed/{n}" for n in sizes)
+    (install / "CLAUDE.md").write_text(f"# Partnership\n\n{imports}\n", encoding="utf-8")
+    return install
+
+
+def test_context_surface_reports_the_number_an_operator_could_not_see(tmp_path: Path):
+    """The whole point: Alex could only report this BY FEEL because nothing printed
+    it. The report must state total bytes, the file count, and the role split."""
+    install = _surface_install(tmp_path, {"world.md": 4000, "memory.md": 6000})
+    r = _check_context_surface(install, install / "CLAUDE.md")[0]
+    assert "10," in r.detail or "10." in r.detail  # ~10k of seed + carrier
+    assert "identity" in r.detail and "mechanism" in r.detail
+    assert "% mechanism" in r.detail
+
+
+def test_context_surface_never_fails_the_operator_for_our_composition(tmp_path: Path):
+    """REPORTS, never FAILS. The first version failed a fresh base install on day one
+    for a ratio the operator cannot act on — memory.md is Levain's choice and the
+    remedy is a Levain internals change. Failing them for our decision points the
+    signal at the wrong party. Enforcement lives in scripts/check_seed_budget.py,
+    which fails OUR build."""
+    install = _surface_install(tmp_path, {"world.md": 100, "memory.md": 40000})
+    r = _check_context_surface(install, install / "CLAUDE.md")[0]
+    assert r.ok, "a skewed ratio must not fail the operator's doctor"
+    assert "not yours" in r.detail
+
+
+def test_context_surface_is_a_ratio_not_a_size_so_a_rich_profile_is_healthy(tmp_path: Path):
+    """A LARGE surface that is mostly identity is Levain working as intended. If this
+    ever flags it, the guard is punishing the behaviour the product wants."""
+    install = _surface_install(tmp_path, {"world.md": 60000, "memory.md": 3000})
+    r = _check_context_surface(install, install / "CLAUDE.md")[0]
+    assert r.ok
+    assert "not yours" not in r.detail
+
+
+def test_context_surface_reads_the_carrier_so_it_measures_the_REAL_install(tmp_path: Path):
+    """Computed from the carrier on disk, not recomputed from the roster — so it
+    measures what THIS install actually loads, including one that predates a
+    classification change or that the operator hand-edited."""
+    install = _surface_install(tmp_path, {"world.md": 4000, "memory.md": 6000})
+    # operator removes an import by hand; the report must follow the file, not theory
+    (install / "CLAUDE.md").write_text("# Partnership\n\n@seed/world.md\n", encoding="utf-8")
+    r = _check_context_surface(install, install / "CLAUDE.md")[0]
+    assert "1 seed file(s)" in r.detail
+    # memory.md is on disk but NOT imported by this carrier, so it contributes
+    # nothing: the report follows the carrier, not the seed directory.
+    assert "0% mechanism" in r.detail
+    assert "mechanism 6,000B" not in r.detail
+
+
+def test_context_surface_reaches_the_ADAPTER_checks_not_just_the_helper(tmp_path: Path):
+    """MUTATION-DRIVEN, and the SECOND time this exact gap appeared in one session:
+    the freshness check had it, I fixed it, then wrote the surface tests the same
+    way. Calling the helper directly proves the logic and says nothing about whether
+    anything CALLS it."""
+    install = _surface_install(tmp_path, {"world.md": 100, "memory.md": 200})
+    (install / ".claude").mkdir(parents=True, exist_ok=True)
+    names = [r.name for r in _check_claude_code(install)]
+    assert any("context surface" in n for n in names), "claude-code check omits it"
+
+    agents = tmp_path / "cx"
+    (agents / "seed").mkdir(parents=True)
+    (agents / "seed" / "memory.md").write_text("x" * 200, encoding="utf-8")
+    (agents / "AGENTS.md").write_text(
+        "1. `seed/memory.md` — Your Memory\n", encoding="utf-8"
+    )
+    names = [r.name for r in _check_codex(agents)]
+    assert any("context surface" in n for n in names), "codex check omits it"
+
+
+def test_context_surface_counts_the_codex_numbered_read_list(tmp_path: Path):
+    """The codex adapter's eager form is `N. \\`seed/<name>\\``, not `@seed/`. A
+    reader written only for claude-code would report every codex install as having
+    no eager surface at all — 0 bytes, perfectly healthy, entirely wrong."""
+    install = tmp_path / "ent"
+    (install / "seed").mkdir(parents=True)
+    (install / "seed" / "memory.md").write_text("x" * 5000, encoding="utf-8")
+    (install / "seed" / "world.md").write_text("x" * 1000, encoding="utf-8")
+    (install / "AGENTS.md").write_text(
+        "1. `seed/world.md` — Who Your Operator Is\n"
+        "2. `seed/memory.md` — Your Memory\n",
+        encoding="utf-8",
+    )
+    r = _check_context_surface(install, install / "AGENTS.md")[0]
+    assert "2 seed file(s)" in r.detail
+    assert "mechanism 5,000B" in r.detail

@@ -486,6 +486,44 @@ BASE_IMPORT_ORDER: tuple[str, ...] = (
 # punch a hole in the corrupt-wheel guard that the eager list used to close.
 BASE_SEED_REACHABLE: tuple[str, ...] = BASE_IMPORT_ORDER + ON_DEMAND_SEED
 
+# --- what each base seed file IS, for the context-surface report ---
+#
+# Alex De Groodt found the eager surface was 65% machinery BY FEEL — "I'm wondering
+# if levain isn't filling too much context actually" — because nothing anywhere
+# reported the number. He was right about a quantity no operator could see.
+#
+# The split is THREE-way, not two, because the honest reading of that measurement is
+# three-way: IDENTITY (who the operator and entity are), METHOD (how you work
+# together — discipline, not machinery), MECHANISM (documentation ABOUT the
+# substrate). A big IDENTITY surface is the system working as intended; a big
+# MECHANISM surface is the defect. That is why the health signal below is a RATIO
+# and never a byte total: failing an operator for having a rich world.md would
+# punish exactly the thing Levain wants.
+#
+# Pack seed files are deliberately NOT guessed at — they report as "other".
+SEED_ROLE: dict[str, str] = {
+    "origin.md": "identity",
+    "world.md": "identity",
+    "partnership.md": "method",
+    "memory.md": "mechanism",
+    "spore_instructions.md": "mechanism",
+}
+
+# Share of the EAGER surface that may be `mechanism` before the composition is
+# called unhealthy. Measured, not picked: Alex's install sat at 65% and was the bug
+# report; after F2's first cut the same install is 54%; the base install this ships
+# with is ~57%. 50% is the first round number below all three — deliberately still
+# ABOVE where the base sits today, so this reports honestly rather than flattering
+# the current state. Moving memory.md is what takes it under.
+MECHANISM_SHARE_WARN = 0.50
+
+
+def seed_role(name: str) -> str:
+    """The role of a seed file for surface reporting: identity / method / mechanism,
+    or `other` for a pack's own file (never guessed from the filename)."""
+    return SEED_ROLE.get(name, "other")
+
+
 def check_seed_classes_disjoint(
     eager: Sequence[str], on_demand: Sequence[str], not_context: Sequence[str]
 ) -> None:
