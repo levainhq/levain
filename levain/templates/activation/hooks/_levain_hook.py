@@ -41,31 +41,42 @@ def install_root() -> Path:
     """The Levain install directory (the operator's partnership working dir).
 
     The source of truth is THIS hook file's own location — activation/hooks/ is
-    two parents below the install root. $CLAUDE_PROJECT_DIR is consulted only as
-    confirmation: it names the *current Claude Code project*, which equals the
-    install only when the hook file actually lives inside it. With a
-    project-scoped settings.json it always does; with global wiring it may not —
-    so trusting it unconditionally would resolve a globally-wired hook to an
-    unrelated project. It is used only when verified to contain this file.
+    two parents below the install root. That is the whole mechanism, and it is
+    the same one the Codex copy of this file has always used.
 
-    Fully guarded: an unexpectedly shallow install path or a bad env value
-    degrades rather than raising."""
+    ⚠ $CLAUDE_PROJECT_DIR IS NO LONGER CONSULTED, AND THE REASON MATTERS.
+    It used to be, "as confirmation", verified like this:
+
+        Path(__file__).resolve().relative_to(candidate)   # called for the raise
+
+    That succeeds for ANY ANCESTOR of this file, not just the install — so the
+    docstring's contract said CONFIRMATION while the code implemented
+    CONTAINMENT. Install at `~/.levain`, launch Claude Code from `~`, and this
+    returned `~`. Reported and root-caused in one line by Alex De Groodt
+    (2026-08-01), who noted it fires 100% of the time for that layout.
+
+    The blast radius was the ENTIRE activation layer, not the one banner the
+    report mentioned: every consumer is install-root-relative — the anneal store,
+    `activation/posture.md` (the primacy injection), `activation/
+    recency_directives.md` (the anti-drift layer), `manifest.json`,
+    `config.json`, `seed/origin.md`, `context.json`. Under the wrong root they
+    all miss, every read is fail-silent BY DESIGN, and the operator gets a Levain
+    that reports itself healthy while injecting nothing.
+    `invisible_infrastructure_failure`.
+
+    Correcting the check to equality (`candidate == file_root`) would leave a
+    branch that returns the value it already had, so the honest fix is to delete
+    it: the env var was load-bearing only through the bug. The case it was
+    written to defend — a globally-wired hook resolving to an unrelated project —
+    is handled BETTER by file-location, which cannot name a project this file
+    does not live in.
+
+    Fully guarded: an unexpectedly shallow install path degrades rather than
+    raising."""
     try:
-        file_root: Path | None = Path(__file__).resolve().parents[2]
+        return Path(__file__).resolve().parents[2]
     except (IndexError, OSError, RuntimeError):
-        file_root = None
-
-    env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
-    if env_dir:
-        try:
-            candidate = Path(env_dir).resolve()
-            Path(__file__).resolve().relative_to(candidate)
-            return candidate
-        except (OSError, RuntimeError, ValueError):
-            pass
-
-    if file_root is not None:
-        return file_root
+        pass
     try:
         return Path.cwd()
     except (OSError, RuntimeError):

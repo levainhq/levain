@@ -77,6 +77,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
 
     core: list[CheckResult] = []
     core.extend(_check_install_layout(install, expect_hooks=not hookless))
+    if not hookless:
+        core.extend(_check_hook_freshness(install))
     core.extend(_check_seed_content(install))
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
@@ -974,6 +976,88 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
             )
         ]
     return [CheckResult(f"{carrier.name} freshness", True, "matches current seed classification")]
+
+
+def _hook_body(text: str) -> str:
+    """A hook script's comparable body: install-time placeholder substitutions
+    normalised away, so a healthy install is not reported as drifted."""
+    return re.sub(
+        r"^_INSTALL_ANNEAL_BIN = .*$", "_INSTALL_ANNEAL_BIN = <>", text, flags=re.M
+    ).strip()
+
+
+def _check_hook_freshness(install: Path) -> list[CheckResult]:
+    """Do the installed HOOK SCRIPTS still match the ones this package ships?
+
+    ⚠ A THIRD SURFACE IN THE SAME CLASS, and the class is the finding. Levain
+    copies artifacts into the operator's install at `init` and has NO upgrade path
+    that refreshes them: `update.py` never re-installs, and `reconcile.py` only
+    handles pack drift — it SURFACES activation changes rather than applying them
+    (reconcile.py:296). So `pip install -U levain` upgrades the package and leaves
+    the operator running the old copies. It already bit the adapter carrier; it
+    bites hooks harder, because a hook fix is exactly what a bug report produces.
+
+    Concretely, 2026-08-01: Alex De Groodt reported that `install_root()` accepted
+    any ANCESTOR as the install, which silently killed the whole activation layer
+    for an install nested under the launch dir. The fix ships in the package — and
+    would reach nobody who merely upgraded, because their `activation/hooks/` copy
+    is whatever `init` wrote.
+
+    ⚠ SCOPE — and the correction matters, because the first version of this
+    docstring claimed a mechanism the code does not use. The operator-owned files
+    (`posture.md`, `recency_directives.md` — the ones every operator is explicitly
+    TOLD to tune) are excluded by DIRECTORY: they live in `activation/`, while this
+    walks `activation/hooks/` only. The `*.py` filter is not what protects them; it
+    only skips `__pycache__`. Mutation proved it — widening the glob to `*` changed
+    nothing, because the markdown was never in scope to begin with.
+
+    The distinction still governs the check: hooks are MACHINERY and must match the
+    package, activation markdown is OPERATOR-OWNED and must never be compared.
+    Flagging a tuned posture would fail an operator for doing what the product asks.
+    Enforced by the directory boundary — so if this ever grows to walk
+    `activation/` itself, the exclusion has to become explicit.
+    """
+    from levain.install import _templates_root
+
+    hooks_dir = install / "activation" / "hooks"
+    if not hooks_dir.is_dir():
+        return []  # hookless adapter, or a layout failure the layout check owns
+
+    stale: list[str] = []
+    try:
+        with _templates_root() as templates_root:
+            for shipped_root in (
+                templates_root / "activation" / "hooks",
+                templates_root / "adapters" / "codex" / "activation" / "hooks",
+            ):
+                if not shipped_root.is_dir():
+                    continue
+                for shipped in sorted(shipped_root.glob("*.py")):
+                    installed = hooks_dir / shipped.name
+                    if not installed.is_file():
+                        continue
+                    if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
+                        shipped.read_text(encoding="utf-8")
+                    ):
+                        stale.append(shipped.name)
+                break  # the first present tree is this install's lineage
+    except (OSError, UnicodeError, RuntimeError) as e:
+        return [CheckResult("hook freshness", False, f"could not compare: {e}")]
+
+    if stale:
+        return [
+            CheckResult(
+                "hook freshness",
+                False,
+                "installed hook script(s) differ from the package: "
+                + ", ".join(sorted(set(stale))),
+                f"Your hooks predate the installed levain version, and hook fixes "
+                f"do NOT arrive via `pip install -U` or `levain update`. Re-render "
+                f"with `levain init --force --path {install}` (your store, seed "
+                f"answers and activation markdown edits are kept).",
+            )
+        ]
+    return [CheckResult("hook freshness", True, "hook scripts match the package")]
 
 
 def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:

@@ -15,6 +15,7 @@ from levain.doctor import (
     _check_carrier_freshness,
     _check_claude_code,
     _check_context_surface,
+    _check_hook_freshness,
     _check_codex,
     _check_install_layout,
     _check_recorded_answers,
@@ -446,3 +447,107 @@ def test_context_surface_counts_the_codex_numbered_read_list(tmp_path: Path):
     r = _check_context_surface(install, install / "AGENTS.md")[0]
     assert "2 seed file(s)" in r.detail
     assert "mechanism 5,000B" in r.detail
+
+
+# ---------- hook freshness: init-time copies no upgrade path refreshes ----------
+
+
+def _hooked_install(tmp_path: Path) -> Path:
+    from levain.install import _templates_root
+
+    install = tmp_path / "ent"
+    hooks = install / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    with _templates_root() as tr:
+        for f in (tr / "activation" / "hooks").glob("*.py"):
+            (hooks / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+    return install
+
+
+def test_hook_freshness_passes_when_hooks_match_the_package(tmp_path: Path):
+    install = _hooked_install(tmp_path)
+    r = _check_hook_freshness(install)[0]
+    assert r.ok
+
+
+def test_hook_freshness_catches_a_stale_installed_hook(tmp_path: Path):
+    """The real case: `pip install -U levain` upgrades the package and leaves the
+    operator's init-time hook copy on disk, so a hook FIX — which is exactly what a
+    bug report produces — reaches nobody who merely upgraded."""
+    install = _hooked_install(tmp_path)
+    f = install / "activation" / "hooks" / "_levain_hook.py"
+    f.write_text(f.read_text(encoding="utf-8") + "\n# stale copy\n", encoding="utf-8")
+    r = _check_hook_freshness(install)[0]
+    assert not r.ok
+    assert "_levain_hook.py" in r.detail
+    # the remedy must correct the wrong instinct, not just name a command
+    assert "init --force" in r.hint
+    assert "pip install -U" in r.hint
+
+
+def test_hook_freshness_ignores_operator_edits_to_activation_markdown(tmp_path: Path):
+    """SCOPE, and it is the load-bearing half. posture.md and recency_directives.md
+    live in the same tree and are the files every operator is TOLD to tune. Flagging
+    them would fail an operator for doing exactly what the product asks."""
+    install = _hooked_install(tmp_path)
+    (install / "activation" / "posture.md").write_text(
+        "## mine\n\nargue with me\n", encoding="utf-8"
+    )
+    (install / "activation" / "recency_directives.md").write_text(
+        "## mine\n\nno hedging\n", encoding="utf-8"
+    )
+    assert _check_hook_freshness(install)[0].ok
+
+
+def test_hook_freshness_tolerates_the_install_time_placeholder_substitution(tmp_path: Path):
+    """The installer rewrites _INSTALL_ANNEAL_BIN at copy time, so a byte compare
+    would report every healthy install as drifted — the false-positive that would
+    have made this check noise and got it ignored."""
+    install = _hooked_install(tmp_path)
+    f = install / "activation" / "hooks" / "_levain_hook.py"
+    f.write_text(
+        f.read_text(encoding="utf-8").replace(
+            '_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"',
+            '_INSTALL_ANNEAL_BIN = "/usr/local/bin/anneal-memory"',
+        ),
+        encoding="utf-8",
+    )
+    assert _check_hook_freshness(install)[0].ok
+
+
+def test_hook_freshness_is_silent_for_a_hookless_install(tmp_path: Path):
+    """openhands installs no activation tree; demanding hooks there would fail a
+    perfectly healthy sovereign entity."""
+    install = tmp_path / "ent"
+    install.mkdir()
+    assert _check_hook_freshness(install) == []
+
+
+def test_hook_freshness_is_wired_into_run_doctor(tmp_path: Path, capsys):
+    """MUTATION-DRIVEN, and the THIRD time this exact gap appeared in one session:
+    the helper was covered and its WIRING was not, so deleting the call from
+    `run_doctor` survived. Covered here by running the real entry point."""
+    from levain.doctor import run_doctor
+
+    install = _hooked_install(tmp_path)
+    (install / "seed").mkdir(parents=True, exist_ok=True)
+    f = install / "activation" / "hooks" / "_levain_hook.py"
+    f.write_text(f.read_text(encoding="utf-8") + "\n# stale\n", encoding="utf-8")
+
+    run_doctor(install)
+    out = capsys.readouterr().out
+    assert "hook freshness" in out, "run_doctor never runs the hook-freshness check"
+    assert "differ from the package" in out
+
+
+def test_operator_markdown_lives_outside_the_scanned_directory(tmp_path: Path):
+    """Pins the ACTUAL protection (a directory boundary), not the one the docstring
+    originally claimed. If activation markdown ever moves into hooks/, or the walk
+    widens to activation/, this fails and the exclusion must be made explicit."""
+    from levain.install import _templates_root
+
+    with _templates_root() as tr:
+        hooks = tr / "activation" / "hooks"
+        assert (tr / "activation" / "posture.md").is_file()
+        assert not (hooks / "posture.md").exists()
+        assert not (hooks / "recency_directives.md").exists()

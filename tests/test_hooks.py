@@ -740,3 +740,101 @@ class TestFocusNotice:
             h_fresh, h_age = hook._focus_freshness(set_at, now=now)
             assert h_fresh == k.freshness, (hours, h_fresh, k.freshness)
             assert h_age == k.age_label, (hours, h_age, k.age_label)
+
+
+# ---------- install_root(): the ancestor bug (Alex De Groodt, 2026-08-01) ----------
+#
+# Reported with the root cause already found: `install_root()` consulted
+# $CLAUDE_PROJECT_DIR and "verified" it with
+#     Path(__file__).resolve().relative_to(candidate)
+# which succeeds for ANY ancestor, not just the install. The docstring's own
+# contract was CONFIRMATION ("used only when verified to contain this file"); the
+# code implemented CONTAINMENT. Install at ~/.levain, launch Claude Code from ~,
+# and install_root() returns ~ — which Alex noted is 100% of the time for that
+# layout.
+#
+# ⚠ THE BLAST RADIUS IS THE WHOLE ACTIVATION LAYER, not the banner he mentioned.
+# EVERY consumer is install-root-relative: the store, activation/posture.md (the
+# primacy injection), activation/recency_directives.md (the anti-drift layer),
+# manifest.json, config.json, seed/origin.md, context.json. All resolve under the
+# wrong root, all read fail-silent, so the entire activation is DEAD and reports
+# nothing. `invisible_infrastructure_failure`.
+#
+# ⚠ AND THE REASON FOUR REVIEW LAYERS MISSED IT: `install_root` is monkeypatched
+# in every other test in this file. The function under the whole activation layer
+# was never once executed by the suite — the same class as the cred-floor slice's
+# "no test ever runs the real EntitySession.open". These tests run the REAL one.
+
+
+def _fake_install(tmp_path: Path) -> Path:
+    """A real on-disk install tree with a real copy of the hook, so install_root()
+    resolves from an actual __file__ instead of a stub."""
+    install = tmp_path / ".levain"
+    hooks = install / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "_levain_hook.py").write_text(
+        (_HOOKS / "_levain_hook.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    return install
+
+
+def _load_hook_from(install: Path, name: str):
+    spec = importlib.util.spec_from_file_location(
+        name, install / "activation" / "hooks" / "_levain_hook.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_install_root_ignores_an_ANCESTOR_claude_project_dir(tmp_path, monkeypatch):
+    """Alex's exact repro: install at <tmp>/.levain, CLAUDE_PROJECT_DIR=<tmp>.
+
+    The ancestor must NOT win. Before the fix this returned <tmp>."""
+    install = _fake_install(tmp_path)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    mod = _load_hook_from(install, "_hook_ancestor")
+    assert mod.install_root() == install.resolve()
+
+
+def test_store_path_points_at_a_store_that_exists_from_an_ancestor_cwd(tmp_path, monkeypatch):
+    """The consequence Alex traced: every hook-side anneal query read a store path
+    that does not exist, silently, because _anneal_json is fail-silent by design."""
+    install = _fake_install(tmp_path)
+    (install / ".levain").mkdir()
+    (install / ".levain" / "memory.db").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    mod = _load_hook_from(install, "_hook_store")
+    assert mod.store_path().exists(), "hook resolves a store that is not on disk"
+
+
+def test_activation_files_resolve_from_an_ancestor_cwd(tmp_path, monkeypatch):
+    """The part the report undersold: posture.md and recency_directives.md are the
+    ACTIVATION. Under the wrong root both read fail-silent, so an operator gets no
+    posture at primacy and no recency directives — with nothing reporting it."""
+    install = _fake_install(tmp_path)
+    (install / "activation" / "posture.md").write_text("## p\n\nbody\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    mod = _load_hook_from(install, "_hook_activation")
+    assert (mod.install_root() / "activation" / "posture.md").is_file()
+
+
+def test_install_root_still_resolves_with_no_env_var(tmp_path, monkeypatch):
+    """The control: file-derived resolution is the authority and works alone —
+    which is exactly what the codex copy has always done."""
+    install = _fake_install(tmp_path)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    mod = _load_hook_from(install, "_hook_noenv")
+    assert mod.install_root() == install.resolve()
+
+
+def test_install_root_ignores_an_unrelated_claude_project_dir(tmp_path, monkeypatch):
+    """A globally-wired hook must not resolve to an unrelated project — the case
+    the env branch was originally written to defend against. It still holds."""
+    install = _fake_install(tmp_path)
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
+    mod = _load_hook_from(install, "_hook_unrelated")
+    assert mod.install_root() == install.resolve()
