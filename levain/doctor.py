@@ -1016,31 +1016,53 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     Flagging a tuned posture would fail an operator for doing what the product asks.
     Enforced by the directory boundary — so if this ever grows to walk
     `activation/` itself, the exclusion has to become explicit.
+
+    ⚠ THE SHIPPED TREE IS SELECTED BY ADAPTER, THROUGH `install`'s OWN HELPER — NEVER BY
+    SEARCH (0.4.1, after 0.4.0 shipped the opposite). 0.4.0 iterated
+    `(templates/activation/hooks, adapters/codex/activation/hooks)` and broke on the
+    first present dir, under a comment asserting "the first present tree is this
+    install's lineage." That was FALSE: `templates/activation/hooks` ALWAYS ships, so
+    the loop always broke on the claude-code tree and the codex branch was unreachable
+    dead code. Every codex install had its hooks compared against the claude-code
+    hooks — which legitimately differ — so `doctor` reported them stale and exited 1
+    PERMANENTLY, and the remedy it printed (`levain init --force`) rewrote the same
+    codex hooks and failed again. The check written to carry the `install_root` fix to
+    operators destroyed its own signal for an entire adapter lineage.
+
+    The repair is SUBTRACTION, not a corrected branch. The rule for which tree an
+    adapter installs from already exists exactly once — `install._base_activation_root`,
+    the same helper `init` renders from. Calling it here means doctor CANNOT disagree
+    with install about lineage, because there is no second copy of the rule left to
+    drift. (The defect was `the_comment_names_one_authority_the_code_leaves_a_second_
+    alive`; the fix is `a_fix_that_deletes_mechanism_beats_one_that_adds_it`.)
     """
-    from levain.install import _templates_root
+    from levain.install import _base_activation_root, _templates_root, effective_adapter
 
     hooks_dir = install / "activation" / "hooks"
     if not hooks_dir.is_dir():
         return []  # hookless adapter, or a layout failure the layout check owns
 
+    # A hooks/ dir with no coherent adapter identity is an INCOHERENT install, and the
+    # LAYOUT check owns that. Comparing it against an arbitrarily chosen tree is exactly
+    # how 0.4.0 manufactured a hook-freshness failure for a defect of a different name.
+    adapter = effective_adapter(install)
+    if adapter is None:
+        return []
+
     stale: list[str] = []
     try:
         with _templates_root() as templates_root:
-            for shipped_root in (
-                templates_root / "activation" / "hooks",
-                templates_root / "adapters" / "codex" / "activation" / "hooks",
-            ):
-                if not shipped_root.is_dir():
+            shipped_root = _base_activation_root(adapter, templates_root) / "hooks"
+            if not shipped_root.is_dir():
+                return []  # this adapter ships no hooks tree; nothing to compare
+            for shipped in sorted(shipped_root.glob("*.py")):
+                installed = hooks_dir / shipped.name
+                if not installed.is_file():
                     continue
-                for shipped in sorted(shipped_root.glob("*.py")):
-                    installed = hooks_dir / shipped.name
-                    if not installed.is_file():
-                        continue
-                    if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
-                        shipped.read_text(encoding="utf-8")
-                    ):
-                        stale.append(shipped.name)
-                break  # the first present tree is this install's lineage
+                if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
+                    shipped.read_text(encoding="utf-8")
+                ):
+                    stale.append(shipped.name)
     except (OSError, UnicodeError, RuntimeError) as e:
         return [CheckResult("hook freshness", False, f"could not compare: {e}")]
 

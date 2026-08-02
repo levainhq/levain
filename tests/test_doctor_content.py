@@ -452,16 +452,83 @@ def test_context_surface_counts_the_codex_numbered_read_list(tmp_path: Path):
 # ---------- hook freshness: init-time copies no upgrade path refreshes ----------
 
 
-def _hooked_install(tmp_path: Path) -> Path:
-    from levain.install import _templates_root
+def _hooked_install(tmp_path: Path, adapter: str = "claude-code") -> Path:
+    """An install whose hooks are a faithful init-time copy of ITS OWN adapter's tree.
+
+    ⚠ THE `adapter` PARAM IS THE WHOLE POINT (0.4.1). Until now this fixture copied from
+    `templates/activation/hooks` unconditionally and wrote no adapter tag file, so the
+    suite contained NO codex install at all — which is exactly how 0.4.0 shipped a
+    hook-freshness check whose codex branch was unreachable dead code. The tag file is
+    written because `effective_adapter` reads the FILES as ground truth, and a real
+    install always has one.
+    """
+    from levain.install import _base_activation_root, _templates_root
 
     install = tmp_path / "ent"
     hooks = install / "activation" / "hooks"
     hooks.mkdir(parents=True)
     with _templates_root() as tr:
-        for f in (tr / "activation" / "hooks").glob("*.py"):
+        for f in (_base_activation_root(adapter, tr) / "hooks").glob("*.py"):
             (hooks / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+    (install / ("AGENTS.md" if adapter == "codex" else "CLAUDE.md")).write_text(
+        "# tag\n", encoding="utf-8"
+    )
     return install
+
+
+def test_the_two_adapter_hook_trees_actually_differ(tmp_path: Path):
+    """CONTROL for the codex tests below — without it they could pass vacuously.
+
+    If the claude-code and codex hook bodies were identical, comparing a codex install
+    against the WRONG tree would still come out green and the regression tests would
+    prove nothing. They are not identical: all three shared files differ under
+    `_hook_body`, which is why the 0.4.0 defect was TOTAL for codex, not intermittent."""
+    from levain.doctor import _hook_body
+    from levain.install import _base_activation_root, _templates_root
+
+    with _templates_root() as tr:
+        cc = _base_activation_root("claude-code", tr) / "hooks"
+        cx = _base_activation_root("codex", tr) / "hooks"
+        shared = sorted(f.name for f in cx.glob("*.py") if (cc / f.name).is_file())
+        assert shared, "the two adapters must ship same-named hooks for this to bite"
+        for name in shared:
+            assert _hook_body((cc / name).read_text(encoding="utf-8")) != _hook_body(
+                (cx / name).read_text(encoding="utf-8")
+            ), f"{name} identical across adapters — the codex tests below prove nothing"
+
+
+def test_hook_freshness_passes_for_a_FRESH_CODEX_install(tmp_path: Path):
+    """THE 0.4.0 REGRESSION, and it reached PyPI.
+
+    `_check_hook_freshness` iterated both adapter trees but broke on the first present
+    one, under a comment claiming that tree was the install's lineage.
+    `templates/activation/hooks` ALWAYS ships, so codex was never compared against its
+    own hooks — doctor called every FRESH codex install stale and exited 1 forever, and
+    the remedy it printed (`init --force`) rewrote the same hooks and failed again."""
+    install = _hooked_install(tmp_path, adapter="codex")
+    r = _check_hook_freshness(install)[0]
+    assert r.ok, f"a fresh codex install must pass doctor: {r.detail}"
+
+
+def test_hook_freshness_catches_a_stale_hook_on_a_CODEX_install(tmp_path: Path):
+    """The other half: fixing the false FAILURE must not cost the true one. A codex
+    install with a genuinely stale hook must still be caught, or 0.4.1 trades a
+    permanently-red check for a permanently-green one."""
+    install = _hooked_install(tmp_path, adapter="codex")
+    f = install / "activation" / "hooks" / "_levain_hook.py"
+    f.write_text(f.read_text(encoding="utf-8") + "\n# stale copy\n", encoding="utf-8")
+    r = _check_hook_freshness(install)[0]
+    assert not r.ok
+    assert "_levain_hook.py" in r.detail
+
+
+def test_hook_freshness_is_silent_on_an_install_with_no_adapter_identity(tmp_path: Path):
+    """An incoherent install (hooks present, no tag file, no marker) belongs to the
+    LAYOUT check. Choosing a tree by guesswork here is what let 0.4.0 manufacture a
+    hook-freshness failure for a defect of a different name."""
+    install = _hooked_install(tmp_path)
+    (install / "CLAUDE.md").unlink()
+    assert _check_hook_freshness(install) == []
 
 
 def test_hook_freshness_passes_when_hooks_match_the_package(tmp_path: Path):

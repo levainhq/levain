@@ -99,7 +99,6 @@ def test_auto_snapshots_returns_four_label_date_pairs(tmp_path: Path):
         assert "=" in spec
         label, date_str = spec.split("=", 1)
         # Both halves should be non-empty and the date should parse.
-        from datetime import date
         assert label and date.fromisoformat(date_str)
 
 
