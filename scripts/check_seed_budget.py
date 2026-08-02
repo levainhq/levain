@@ -38,12 +38,20 @@ TWO BUDGETS, and the ratio is the load-bearing one:
   TOTAL BYTES       a backstop, so the composition cannot grow without bound even
                     while staying proportional.
 
-⚠ THE MECHANISM BUDGET IS SET ABOVE WHERE THE BASE SITS TODAY, ON PURPOSE. The
-base install is ~60% mechanism as of 2026-08-01 — F2 shipped its FIRST CUT only
-(`spore_instructions.md`), and `memory.md` at 21,347 B is the bigger half and still
-loads eagerly. Setting the budget at today's number would freeze the defect in
-place and call it compliance. It is set where it is to stop REGRESSION now, and it
-should be RATCHETED DOWN when the `memory.md` half lands (`spore-451`).
+⚠ THE MECHANISM BUDGET IS SET ABOVE WHERE THE BASE SITS TODAY, ON PURPOSE. F2 shipped
+its FIRST CUT only (`spore_instructions.md`), and `memory.md` at 21,347 B is the bigger
+half and still loads eagerly. Setting the budget at today's number would freeze the
+defect in place and call it compliance. It is set where it is to stop REGRESSION now,
+and it should be RATCHETED DOWN when the `memory.md` half lands (`spore-451`).
+
+⚠ THE CURRENT SHARE IS NOT RESTATED HERE — RUN THE SCRIPT (0.4.1). This paragraph used
+to say "~60% mechanism as of 2026-08-01" while `measure()` five lines down printed 55%,
+`packs.py` said ~57%, and `doctor` on a rendered install said 59%: FOUR numbers for ONE
+quantity, all introduced in one commit set. The argument the paragraph is making —
+that the 0.62 limit sits just above today's number — was also wrong in the direction
+that matters: at 55% the headroom is 7 points, not 2. A prose copy of a measured value
+is a description that rots against correct code, so there is now exactly one authority
+and it is `measure()`. Run `python3 scripts/check_seed_budget.py` for today's figure.
 
 WHEN THIS FIRES, DO NOT JUST SHAVE WORDS. The durable fix is the container move:
 add the file to `levain.packs.ON_DEMAND_SEED` with a RETENTION SUMMARY in

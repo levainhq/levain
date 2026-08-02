@@ -1323,9 +1323,26 @@ def _base_seed_root() -> Path | None:
     """The package's own shipped `seed/` directory, resolved ONCE.
 
     Hoisted out of the per-entry loop deliberately: `_templates_root` is a context
-    manager that may EXTRACT the wheel to a temp dir, so calling it per seed file
-    would re-extract per file and — worse — compare against a directory already torn
-    down. ``None`` means "could not determine", handled by the caller.
+    manager that may EXTRACT the wheel to a temp dir, so calling it per seed file would
+    re-extract per file. ``None`` means "could not determine", handled by the caller.
+
+    ⚠ KNOWN DEFECT, NAMED RATHER THAN DENIED (0.4.1). An earlier version of this
+    docstring also claimed the hoist avoids "compar[ing] against a directory already
+    torn down" — and this function does precisely that: it returns a path from INSIDE
+    its own `with` block, so the context manager has exited before any caller compares
+    against it.
+
+    IMPACT IS BOUNDED, AND IS CURRENTLY ZERO IN THE FIELD. `importlib.resources.as_file`
+    only materializes a temp dir for a ZIPPED distribution; pip unpacks wheels into
+    site-packages, so every real install yields a persistent path and this is inert.
+    Under a zipped distribution the returned path is dead, `_is_base_seed` reads EVERY
+    base seed as a pack override, and the retention summary degrades to the bare H1
+    fallback — the layer the code below calls the whole point.
+
+    The real fix is STRUCTURAL (callers must hold the CM open across the comparison),
+    not a bigger hoist, so it is deliberately not in this patch release. Do not attempt
+    to "fix" it by hoisting further — that cannot work, and the previous docstring's
+    confidence is what kept anyone from looking.
     """
     try:
         with _templates_root() as templates_root:
