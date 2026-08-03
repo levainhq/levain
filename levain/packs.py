@@ -512,9 +512,21 @@ SEED_ROLE: dict[str, str] = {
 # Share of the EAGER surface that may be `mechanism` before the composition is
 # called unhealthy. Measured, not picked: Alex's install sat at 65% and was the bug
 # report; after F2's first cut the same install is 54%; the base install this ships
-# with is ~57%. 50% is the first round number below all three — deliberately still
-# ABOVE where the base sits today, so this reports honestly rather than flattering
-# the current state. Moving memory.md is what takes it under.
+# with is 55% AS MEASURED OVER THE SOURCE TEMPLATES. 50% is the first round number
+# below all three — deliberately still ABOVE where the base sits today, so this
+# reports honestly rather than flattering the current state. Moving memory.md is what
+# takes it under.
+#
+# ⚠ STATE THE BASIS OR THE NUMBERS FORK. This read "~57%" until 2026-08-03 — the last
+# of FOUR different figures for what looked like one quantity, and the reason they
+# could coexist is that none of them said what it MEASURED. They are not all the same
+# measurement: `scripts/check_seed_budget.py` reads the SOURCE templates and prints
+# 55%, while `doctor` reports a RENDERED install (a thin-answers install measures
+# 61%). Those are legitimately different numbers for legitimately different objects.
+# The figure here is the SOURCE-template one, because that is what "the base install
+# this ships with" means — now named, so the next reader comparing it against a doctor
+# readout knows why they differ instead of assuming one is stale.
+# The argument is unaffected and MECHANISM_SHARE_WARN does not move.
 MECHANISM_SHARE_WARN = 0.50
 
 

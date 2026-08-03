@@ -1058,9 +1058,21 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     if not hooks_dir.is_dir():
         return []  # hookless adapter, or a layout failure the layout check owns
 
-    # A hooks/ dir with no coherent adapter identity is an INCOHERENT install, and the
-    # LAYOUT check owns that. Comparing it against an arbitrarily chosen tree is exactly
-    # how 0.4.0 manufactured a hook-freshness failure for a defect of a different name.
+    # A hooks/ dir with no coherent adapter identity is an INCOHERENT install, and
+    # `run_doctor`'s adapter-detection block owns it — it emits
+    # "no adapter detected (no CLAUDE.md or AGENTS.md at install root)" and fails the
+    # run. Comparing such an install against an arbitrarily chosen tree is exactly how
+    # 0.4.0 manufactured a hook-freshness failure for a defect of a different name.
+    #
+    # ⚠ This comment said "the LAYOUT check owns that" until 2026-08-03, and the test
+    # asserting this path repeated the misattribution in its docstring. It is wrong:
+    # `_check_install_layout` never inspects CLAUDE.md or AGENTS.md at all — it checks
+    # the install root, seed/, _ACTIVATION_FILES, the hooks dir, _HOOK_REQUIRED presence
+    # and hook syntax. Verified by reproduction: delete CLAUDE.md from a healthy install
+    # and LAYOUT prints [OK] on both its checks while the FAIL comes from the adapter
+    # block. No behavioural bug — the operator IS protected — but it sent the next
+    # reader to the wrong function, which is the same "a comment naming a world it is
+    # not in" class this release shipped to fix.
     adapter = effective_adapter(install)
     if adapter is None:
         return []

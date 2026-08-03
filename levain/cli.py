@@ -52,6 +52,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     init_p.add_argument(
         "--adapter",
+        # ⚠ THIS LIST IS A DUPLICATE OF `install.KNOWN_ADAPTERS` AND IS PINNED TO IT BY
+        # TEST, NOT BY IMPORT (2026-08-03). Deriving it here is the obvious move and it
+        # is WRONG: this module's docstring promises "lazy imports keep `levain --help`
+        # fast", parser construction runs on every invocation including --help, and
+        # `levain.install` measures 18.5 ms to import against a 20-30 ms --help — so
+        # deriving would roughly double the cost of the one path the laziness exists to
+        # protect. `install.py:290` is the real gate and produces the better error;
+        # argparse `choices=` only buys --help display and shell completion.
+        # The drift is closed by `test_cli_adapter_choices_match_KNOWN_ADAPTERS`, which
+        # pays the import at TEST time where it is free.
         choices=["claude-code", "codex", "openhands"],
         help=(
             "Harness adapter to install. Prompts if omitted. `claude-code` and "
