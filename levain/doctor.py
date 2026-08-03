@@ -1031,10 +1031,26 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
 
     The repair is SUBTRACTION, not a corrected branch. The rule for which tree an
     adapter installs from already exists exactly once — `install._base_activation_root`,
-    the same helper `init` renders from. Calling it here means doctor CANNOT disagree
-    with install about lineage, because there is no second copy of the rule left to
-    drift. (The defect was `the_comment_names_one_authority_the_code_leaves_a_second_
-    alive`; the fix is `a_fix_that_deletes_mechanism_beats_one_that_adds_it`.)
+    the same helper `init` renders from. (The defect was `the_comment_names_one_
+    authority_the_code_leaves_a_second_alive`; the fix is `a_fix_that_deletes_mechanism_
+    beats_one_that_adds_it`.)
+
+    ⚠ **AND THIS PARAGRAPH USED TO END WITH A CLAIM THAT WAS FALSE WHEN WRITTEN**
+    (corrected 2026-08-03): *"doctor CANNOT disagree with install about lineage, because
+    there is no second copy of the rule left to drift."* It could, and it did. `init`
+    renders from `order_activation_roots(templates_root, _base_activation_root(...),
+    pack_dirs)` — base is only the FIRST layer — while this check called
+    `_base_activation_root` alone. **Doctor took half the helper chain**, so an install
+    built with a pack that overrides a hook had that hook installed correctly and then
+    reported stale against a tree it never came from: EXIT 1 permanently, with
+    `init --force` unable to clear it. Byte-for-byte the 0.4.0 shape above, one release
+    later, for a different population, shipped INSIDE the fix for it —
+    `guard_scoped_by_symptom_misses_the_class`.
+
+    It was latent when found (no shipped pack overrides hooks), and the confidence is
+    what made it dangerous: by this very release's own argument about `_base_seed_root`,
+    *"the previous docstring's confidence is what kept anyone from looking."* Pack-owned
+    hooks are now resolved against `.levain/manifest.json` — see the comment in the body.
     """
     from levain.install import _base_activation_root, _templates_root, effective_adapter
 
@@ -1049,8 +1065,49 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     if adapter is None:
         return []
 
+    # ⚠ PACK-OWNED HOOKS ARE NOT BASE HOOKS, AND COMPARING THEM AGAINST BASE WAS THE
+    # SAME DEFECT 0.4.1 SHIPPED TO FIX — one release later, for a different population.
+    #
+    # `init` renders the activation tree from the LAYERED stack (install.py:387-389,
+    # `order_activation_roots(templates_root, _base_activation_root(...), pack_dirs)`)
+    # and a pack layer WINS per relative path (documented install.py:1620: "a pack's
+    # ``hooks/x.py`` replaces base's ``hooks/x.py``"). This check read only
+    # `_base_activation_root`, so a hook a pack contributed was installed CORRECTLY and
+    # then reported stale against a tree it never came from — doctor EXIT 1 forever,
+    # and `init --force`, the remedy this check itself prints, could not clear it.
+    #
+    # That makes the docstring's central claim above false as written: doctor took HALF
+    # the helper chain, so there WAS a second copy of the rule left to drift. install's
+    # rule is order_activation_roots(base, pack_dirs); this one was base alone.
+    #
+    # THE DATA WAS ALREADY ON DISK. `.levain/manifest.json` records every pack layer's
+    # contributed files with their source hashes, so a pack-owned hook is checked
+    # against the hash the pack ACTUALLY shipped — still real drift detection, just
+    # against the right authority. Hooks are copied verbatim (not rendered), so the
+    # source hash and the installed bytes are directly comparable.
+    #
+    # `_sha256_file` is imported rather than reimplemented ON PURPOSE (`derive_dont_
+    # invent`): we are comparing against a digest the manifest computed, so the two must
+    # use one hashing definition or this check drifts back into disagreeing with the
+    # thing it consults.
+    pack_hooks: dict[str, str] = {}
+    try:
+        from levain.manifest import read_pack_locks
+
+        for prov in read_pack_locks(install):
+            for rel, digest in prov.files.items():
+                if rel.startswith("activation/hooks/") and rel.endswith(".py"):
+                    pack_hooks[rel.rsplit("/", 1)[-1]] = digest
+    except Exception:
+        # A missing or corrupt lock must not turn a content check into a hard failure —
+        # the LOCK check owns lock integrity. Falling back to base-only comparison is
+        # the pre-existing behaviour, i.e. no worse than before this fix.
+        pack_hooks = {}
+
     stale: list[str] = []
     try:
+        from levain.manifest import _sha256_file
+
         with _templates_root() as templates_root:
             shipped_root = _base_activation_root(adapter, templates_root) / "hooks"
             if not shipped_root.is_dir():
@@ -1058,6 +1115,12 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
             for shipped in sorted(shipped_root.glob("*.py")):
                 installed = hooks_dir / shipped.name
                 if not installed.is_file():
+                    continue
+                recorded = pack_hooks.get(shipped.name)
+                if recorded is not None:
+                    # Pack-owned: the authority is the pack's recorded hash, not base.
+                    if _sha256_file(installed) != recorded:
+                        stale.append(shipped.name)
                     continue
                 if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
                     shipped.read_text(encoding="utf-8")

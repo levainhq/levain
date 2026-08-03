@@ -522,6 +522,108 @@ def test_hook_freshness_catches_a_stale_hook_on_a_CODEX_install(tmp_path: Path):
     assert "_levain_hook.py" in r.detail
 
 
+def _pack_layered_install(tmp_path: Path, adapter: str = "claude-code",
+                          hook: str = "session_start.py", body: str | None = None):
+    """An install whose `session_start.py` came from a PACK, not from base — with the
+    `.levain/manifest.json` provenance a real `init --pack` writes.
+
+    ⚠ THIS FIXTURE SHAPE DID NOT EXIST, AND THAT IS THE ROOT CAUSE OF TWO RELEASES.
+    0.4.0 shipped a hook check whose codex branch was unreachable because no test built
+    a CODEX install. 0.4.1 fixed that by parameterising `_hooked_install` on adapter —
+    and shipped the identical defect for PACK-LAYERED installs, because no test built
+    one of those either. Same sentence, third occurrence in this repo: *the branch was
+    never executed by the suite*. Adding the fixture is the DURABLE half of the fix; the
+    code change alone would just move the hole.
+
+    Returns (install, pack_dir, pack_body)."""
+    from levain.install import _base_activation_root, _templates_root
+    from levain.manifest import CompatSet, pack_provenance, write_lock
+
+    install = tmp_path / "ent"
+    hooks = install / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+
+    with _templates_root() as tr:
+        for f in (_base_activation_root(adapter, tr) / "hooks").glob("*.py"):
+            (hooks / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+    (install / ("AGENTS.md" if adapter == "codex" else "CLAUDE.md")).write_text(
+        "# tag\n", encoding="utf-8")
+
+    pack_dir = tmp_path / "mypack"
+    (pack_dir / "activation" / "hooks").mkdir(parents=True)
+    (pack_dir / "pack.toml").write_text('name = "mypack"\n', encoding="utf-8")
+    pack_body = body if body is not None else "# pack-owned hook\nprint('from the pack')\n"
+    (pack_dir / "activation" / "hooks" / hook).write_text(pack_body, encoding="utf-8")
+
+    # init copies the WINNING layer into the install, then records provenance.
+    (hooks / hook).write_text(pack_body, encoding="utf-8")
+    write_lock(install, CompatSet(levain="0", anneal="0", schema="0"),
+               packs=[pack_provenance("mypack", pack_dir, None)])
+    return install, pack_dir, pack_body
+
+
+def test_a_pack_hook_actually_differs_from_base(tmp_path: Path):
+    """CONTROL — without it every pack test below could pass vacuously. If the pack body
+    happened to equal base, base-comparison would come out green and prove nothing."""
+    from levain.doctor import _hook_body
+    from levain.install import _base_activation_root, _templates_root
+
+    _install, _pack, body = _pack_layered_install(tmp_path)
+    with _templates_root() as tr:
+        base = _base_activation_root("claude-code", tr) / "hooks" / "session_start.py"
+        assert _hook_body(base.read_text(encoding="utf-8")) != _hook_body(body), (
+            "the pack hook must differ from base or the pack tests prove nothing")
+
+
+def test_hook_freshness_passes_for_a_FRESH_PACK_LAYERED_install(tmp_path: Path):
+    """THE 0.4.1 REGRESSION — byte-for-byte the 0.4.0 shape, one release later, for a
+    different population, shipped INSIDE the fix for it.
+
+    `init` renders from `order_activation_roots(templates_root,
+    _base_activation_root(...), pack_dirs)` and a pack layer WINS per relative path
+    (install.py:1620). This check consulted `_base_activation_root` ALONE, so a
+    correctly-installed pack hook was reported stale against a tree it never came from:
+    EXIT 1 permanently, and `init --force` — the remedy this check itself prints —
+    rewrote the same pack hook and failed again."""
+    install, _pack, _body = _pack_layered_install(tmp_path)
+    r = _check_hook_freshness(install)[0]
+    assert r.ok, f"a fresh pack-layered install must pass doctor: {r.detail}"
+
+
+def test_hook_freshness_still_catches_a_STALE_pack_hook(tmp_path: Path):
+    """The other half, and what makes this a fix rather than a mute button: resolving
+    pack hooks against the manifest must KEEP real drift detection."""
+    install, _pack, _body = _pack_layered_install(tmp_path)
+    f = install / "activation" / "hooks" / "session_start.py"
+    f.write_text(f.read_text(encoding="utf-8") + "\n# hand-edited\n", encoding="utf-8")
+    r = _check_hook_freshness(install)[0]
+    assert not r.ok, "a hand-edited PACK hook must still be reported stale"
+    assert "session_start.py" in r.detail
+
+
+def test_a_pack_layer_does_not_mute_the_OTHER_hooks(tmp_path: Path):
+    """SCOPE. The manifest must govern ONLY the paths a pack actually contributed — a
+    base-owned hook in the same install is still checked against base."""
+    install, _pack, _body = _pack_layered_install(tmp_path)
+    f = install / "activation" / "hooks" / "_levain_hook.py"   # base-owned
+    f.write_text(f.read_text(encoding="utf-8") + "\n# stale copy\n", encoding="utf-8")
+    r = _check_hook_freshness(install)[0]
+    assert not r.ok
+    assert "_levain_hook.py" in r.detail
+
+
+def test_a_corrupt_lock_falls_back_instead_of_hard_failing(tmp_path: Path):
+    """LOCK integrity belongs to the LOCK check. A corrupt manifest must not turn a
+    CONTENT check into a hard error — degrading to base-only is the pre-fix behaviour,
+    i.e. no worse than before."""
+    install, _pack, _body = _pack_layered_install(tmp_path)
+    (install / ".levain" / "manifest.json").write_text("{ not json", encoding="utf-8")
+    out = _check_hook_freshness(install)
+    assert out, "the check must still run"
+    assert "could not compare" not in (out[0].detail or ""), (
+        "a corrupt lock must degrade to base comparison, not error out")
+
+
 def test_hook_freshness_is_silent_on_an_install_with_no_adapter_identity(tmp_path: Path):
     """An incoherent install (hooks present, no tag file, no marker) belongs to the
     LAYOUT check. Choosing a tree by guesswork here is what let 0.4.0 manufacture a
