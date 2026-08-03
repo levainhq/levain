@@ -479,3 +479,44 @@ def test_a_leading_dash_bound_is_refused_by_the_PARSER_before_our_guard(tmp_path
     with pytest.raises(SystemExit) as exc:
         main(argv)
     assert exc.value.code == 2
+
+
+def test_cli_adapter_choices_match_KNOWN_ADAPTERS():
+    """⚠ THE PIN. `--adapter`'s argparse `choices=` is a hand-written DUPLICATE of
+    `install.KNOWN_ADAPTERS`, and that duplication is deliberate — see the comment at the
+    call site. Deriving it would import `levain.install` during parser construction,
+    which runs on EVERY invocation including `--help`; measured, that import is 18.5 ms
+    against a 20-30 ms `--help`, so deriving would roughly double the cost of the exact
+    path cli.py's "lazy imports keep `levain --help` fast" docstring exists to protect.
+
+    So the duplicate stays and this test is the invariant instead — paying the import at
+    TEST time, where it is free. `structural_invariants_beat_discipline`: the copy is
+    fine, an UNPINNED copy is not.
+
+    What this catches: adding a fourth adapter to KNOWN_ADAPTERS without updating the
+    CLI. `install.py:290` would accept it, but argparse would reject it first, with an
+    error naming the wrong authority — the drift is invisible until an operator hits it.
+    """
+    import argparse
+    from unittest import mock
+
+    from levain.install import KNOWN_ADAPTERS
+
+    captured: dict[str, object] = {}
+    real_add_argument = argparse.ArgumentParser.add_argument
+
+    def spy(self, *args, **kwargs):
+        if args and args[0] == "--adapter" and "choices" in kwargs:
+            captured["choices"] = list(kwargs["choices"])
+        return real_add_argument(self, *args, **kwargs)
+
+    with mock.patch.object(argparse.ArgumentParser, "add_argument", spy):
+        with pytest.raises(SystemExit):
+            main(["init", "--help"])
+
+    assert "choices" in captured, "could not observe --adapter's choices"
+    assert captured["choices"] == list(KNOWN_ADAPTERS), (
+        f"cli.py --adapter choices {captured['choices']} have drifted from "
+        f"install.KNOWN_ADAPTERS {list(KNOWN_ADAPTERS)} — update the CLI list, or "
+        "delete choices= and let install.py:290 be the only gate"
+    )

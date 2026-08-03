@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from levain.install import HOOKLESS_ADAPTERS, KNOWN_ADAPTERS
 from levain.doctor import (
     _SEED_REQUIRED,
     _check_carrier_freshness,
@@ -624,10 +627,96 @@ def test_a_corrupt_lock_falls_back_instead_of_hard_failing(tmp_path: Path):
         "a corrupt lock must degrade to base comparison, not error out")
 
 
+@pytest.mark.parametrize("adapter", KNOWN_ADAPTERS)
+def test_hook_freshness_is_correct_for_EVERY_KNOWN_ADAPTER(adapter: str, tmp_path: Path):
+    """⚠ THE CEMENT. This is the test that stops a FOURTH occurrence.
+
+    The same root cause has now shipped three times in this repo, and each fix addressed
+    only its own instance:
+      0.4.0  the codex branch was unreachable dead code -- no test built a CODEX install
+      0.4.1  fixed that by parameterising the fixture on adapter, and shipped the
+             identical defect for PACK-LAYERED installs -- no test built one of those
+      0.4.2* pack layering fixed; a FOURTH install shape would repeat it again
+    Every one of them is the same sentence: *the branch was never executed by the suite*.
+    A hand-written fixture per shape can only ever fix the shape someone thought of.
+
+    So this is DERIVED from `install.KNOWN_ADAPTERS` rather than enumerated. Adding a
+    fourth adapter makes this test demand a working hook-freshness path for it
+    automatically -- the drift cannot land silently. Same move this codebase already
+    applies at doctor.py:554 ("_HOOK_REQUIRED is DERIVED from _SEED_REQUIRED, never
+    hand-listed: the hand-written form went stale the moment the required set changed").
+
+    The HOOKLESS branch is checked from `HOOKLESS_ADAPTERS`, not from the adapter's name,
+    so the capability predicate stays the single authority (install.py:74's whole point:
+    "branch on the CAPABILITY (has-hooks) rather than re-enumerating adapter names")."""
+    if adapter in HOOKLESS_ADAPTERS:
+        install = tmp_path / "ent"
+        (install / "activation").mkdir(parents=True)
+        (install / "CLAUDE.md").write_text("# tag\n", encoding="utf-8")
+        assert _check_hook_freshness(install) == [], (
+            f"{adapter} installs no hooks tree, so hook freshness must be SILENT — "
+            "not a failure, and not a pass it did not earn")
+        return
+
+    # ⚠ NON-VACUITY GUARD, AND THE FIRST DRAFT OF THIS TEST DID NOT HAVE IT — which is
+    # why it PASSED for a phantom fourth adapter, i.e. failed at the one job it exists
+    # to do. `install._base_activation_root` is
+    #     if adapter == "codex": <codex tree>
+    #     return <claude-code tree>
+    # so ANY adapter that is not literally "codex" silently receives claude-code's tree.
+    # A new adapter with no tree of its own therefore gets compared against claude-code
+    # hooks it also got INSTALLED from — both sides wrong identically, check green,
+    # nothing learned. That is the 0.4.0 assumption ("the first present tree is this
+    # install's lineage") surviving inside a default branch.
+    # So: a hooked adapter must own a DISTINCT tree, or this test proves nothing.
+    from levain.install import _base_activation_root, _templates_root
+
+    with _templates_root() as tr:
+        own = _base_activation_root(adapter, tr) / "hooks"
+        cc = _base_activation_root("claude-code", tr) / "hooks"
+        assert own.is_dir(), f"{adapter} is hooked but ships no hooks tree at {own}"
+        if adapter != "claude-code":
+            assert own.resolve() != cc.resolve(), (
+                f"{adapter} resolves to claude-code's hooks tree — _base_activation_root "
+                "silently defaulted, so every assertion below would pass vacuously "
+                "against hooks that are not this adapter's")
+
+    install = _hooked_install(tmp_path, adapter=adapter)
+    out = _check_hook_freshness(install)
+    assert out, f"{adapter} ships hooks, so the check must actually run"
+    assert out[0].ok, f"a fresh {adapter} install must pass doctor: {out[0].detail}"
+
+
+@pytest.mark.parametrize("adapter", sorted(set(KNOWN_ADAPTERS) - set(HOOKLESS_ADAPTERS)))
+def test_hook_freshness_catches_drift_for_EVERY_HOOKED_ADAPTER(adapter: str, tmp_path: Path):
+    """The other half of the cement, and the one that keeps the fix honest: fixing a
+    false FAILURE must never cost the true one. Derived the same way, so a fourth hooked
+    adapter is required to detect real drift and not merely to stay quiet.
+
+    A check that cannot fail is the defect 0.4.0's codex branch already was, inverted."""
+    install = _hooked_install(tmp_path, adapter=adapter)
+    hooks = sorted((install / "activation" / "hooks").glob("*.py"))
+    assert hooks, f"{adapter} fixture built no hooks — the assertion below would be vacuous"
+    f = hooks[0]
+    f.write_text(f.read_text(encoding="utf-8") + "\n# stale copy\n", encoding="utf-8")
+    out = _check_hook_freshness(install)
+    assert out and not out[0].ok, f"a stale {adapter} hook must still be caught"
+    assert f.name in out[0].detail
+
+
 def test_hook_freshness_is_silent_on_an_install_with_no_adapter_identity(tmp_path: Path):
-    """An incoherent install (hooks present, no tag file, no marker) belongs to the
-    LAYOUT check. Choosing a tree by guesswork here is what let 0.4.0 manufacture a
-    hook-freshness failure for a defect of a different name."""
+    """An incoherent install (hooks present, no tag file, no marker) belongs to
+    `run_doctor`'s ADAPTER-DETECTION block, which emits "no adapter detected (no
+    CLAUDE.md or AGENTS.md at install root)" and fails the run. Choosing a tree by
+    guesswork HERE is what let 0.4.0 manufacture a hook-freshness failure for a defect
+    of a different name.
+
+    ⚠ This docstring said "belongs to the LAYOUT check" until 2026-08-03, mirroring the
+    same wrong claim in doctor.py's comment. `_check_install_layout` never inspects
+    CLAUDE.md or AGENTS.md at all — verified by reproduction: delete CLAUDE.md from a
+    healthy install and LAYOUT prints [OK] on both its checks while the FAIL comes from
+    the adapter block. The behaviour was always right; the pointer sent the next reader
+    to the wrong function, in a TEST, which is where readers go to learn what owns what."""
     install = _hooked_install(tmp_path)
     (install / "CLAUDE.md").unlink()
     assert _check_hook_freshness(install) == []
