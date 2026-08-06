@@ -1102,14 +1102,39 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # invent`): we are comparing against a digest the manifest computed, so the two must
     # use one hashing definition or this check drifts back into disagreeing with the
     # thing it consults.
+    # ⚠ KEYED BY PATH RELATIVE TO `activation/hooks/`, **NEVER BY BASENAME** — and the loop
+    # below iterates the UNION of these keys with base's. Those are two separate defects
+    # with two separate fixes, and repairing either alone leaves the other alive.
+    #
+    # FOURTH OCCURRENCE of the shape 0.4.0 and 0.4.1 each shipped: a check operating in one
+    # namespace over a tree composed in another. `install` builds the activation tree in
+    # RELATIVE-PATH space as a UNION over layers; this check worked in BASENAME space over
+    # BASE's file list alone. That produced two independent failures:
+    #
+    #   (a) a pack shipping `activation/hooks/sub/session_start.py` collapsed onto the key
+    #       `session_start.py` and made doctor report a completely UNTOUCHED base hook
+    #       stale — EXIT 1 permanently, which a perfect `init --force` could not clear
+    #       (simulated three times: red, red, red). `install.py:1677` documents nested pack
+    #       hooks as SUPPORTED, so this is not an invented shape.
+    #   (b) a pack hook that base does NOT ship was installed, recorded in the manifest,
+    #       and never compared to ANYTHING — its digest was read here and thrown away.
+    #       Replacing one wholesale with `os.system(...)` still printed "hook scripts match
+    #       the package".
+    #
+    # THE SUITE COULD NOT SEE EITHER — 299 tests passed patched and unpatched — because
+    # every pack test used `hook: str = "session_start.py"`, the one shape in which
+    # basename and relative path coincide. The cement laid after the THIRD occurrence
+    # parametrised the ADAPTER axis and left the pack-path axis hardcoded, so the fourth
+    # occurrence simply arrived on the unparametrised axis.
     pack_hooks: dict[str, str] = {}
+    _PREFIX = "activation/hooks/"
     try:
         from levain.manifest import read_pack_locks
 
         for prov in read_pack_locks(install):
             for rel, digest in prov.files.items():
-                if rel.startswith("activation/hooks/") and rel.endswith(".py"):
-                    pack_hooks[rel.rsplit("/", 1)[-1]] = digest
+                if rel.startswith(_PREFIX) and rel.endswith(".py"):
+                    pack_hooks[rel[len(_PREFIX):]] = digest
     except Exception:
         # A missing or corrupt lock must not turn a content check into a hard failure —
         # the LOCK check owns lock integrity. Falling back to base-only comparison is
@@ -1122,22 +1147,33 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
 
         with _templates_root() as templates_root:
             shipped_root = _base_activation_root(adapter, templates_root) / "hooks"
-            if not shipped_root.is_dir():
-                return []  # this adapter ships no hooks tree; nothing to compare
-            for shipped in sorted(shipped_root.glob("*.py")):
-                installed = hooks_dir / shipped.name
+            if not shipped_root.is_dir() and not pack_hooks:
+                return []  # no base hooks tree and no pack hooks; nothing to compare
+            # `rglob`, not `glob`: base is now read in the SAME relative-path space the
+            # pack keys use, so a nested hook on either side lands on one key and the
+            # union below is well defined.
+            base_hooks: dict[str, Path] = {}
+            if shipped_root.is_dir():
+                base_hooks = {
+                    str(p.relative_to(shipped_root)): p
+                    for p in shipped_root.rglob("*.py")
+                }
+            for rel in sorted(set(base_hooks) | set(pack_hooks)):
+                installed = hooks_dir / rel
                 if not installed.is_file():
                     continue
-                recorded = pack_hooks.get(shipped.name)
+                recorded = pack_hooks.get(rel)
                 if recorded is not None:
                     # Pack-owned: the authority is the pack's recorded hash, not base.
+                    # Reached for pack hooks base does not ship too — that is fix (b).
                     if _sha256_file(installed) != recorded:
-                        stale.append(shipped.name)
+                        stale.append(rel)
                     continue
+                shipped = base_hooks[rel]
                 if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
                     shipped.read_text(encoding="utf-8")
                 ):
-                    stale.append(shipped.name)
+                    stale.append(rel)
     except (OSError, UnicodeError, RuntimeError) as e:
         return [CheckResult("hook freshness", False, f"could not compare: {e}")]
 
