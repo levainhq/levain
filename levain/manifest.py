@@ -66,7 +66,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "0.9.6"
+KNOWN_GOOD_ANNEAL = "0.9.7"
 
 # The anneal store section-schema a partnership entity runs on (anneal
 # AM-INITSCHEMA). A store left on the default silently runs the 4-section ops
@@ -110,7 +110,7 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # entry's guidance (or its no-edit allowlisting) so a future template edit that DROPS
 # it — or a new at/below-cap entry left unmapped — fails the suite instead of
 # silently making the init-ack dishonest.
-TEMPLATES_RECONCILED_ANNEAL = "0.9.6"
+TEMPLATES_RECONCILED_ANNEAL = "0.9.7"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).

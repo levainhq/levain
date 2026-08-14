@@ -24,8 +24,13 @@ def _store(tmp_path: Path) -> Path:
 
 
 def _inst(**kw) -> InstalledSet:
-    base = dict(levain="0.3.4", anneal="0.9.6", schema="partnership",
-                migrate_acked="0.9.6", pending_count=0)
+    # ⛔ DERIVED, NEVER A LITERAL (2026-08-14). These hardcoded "0.9.6" and the lock
+    # fixtures below meant "the declared/known-good version", so every anneal bump broke
+    # tests whose subject is not the version at all — the 0.9.7 cut turned an in-sync
+    # fixture into a BEHIND one and reddened two suites. Same class as a cap encoded in a
+    # test: an assertion about MATCHING must read the thing it claims to match.
+    base = dict(levain="0.3.4", anneal=manifest.KNOWN_GOOD_ANNEAL, schema="partnership",
+                migrate_acked=manifest.TEMPLATES_RECONCILED_ANNEAL, pending_count=0)
     base.update(kw)
     return InstalledSet(**base)
 
@@ -43,7 +48,7 @@ def test_doctor_compat_all_green_when_in_sync(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
+                        lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     results = doctor._check_compat_set(tmp_path)
     assert results and all(r.ok for r in results)
     assert any(r.name == "compat: pip-pin" for r in results)
@@ -67,7 +72,7 @@ def test_doctor_compat_pending_is_advisory_not_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(pending_count=6))
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
+                        lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     results = doctor._check_compat_set(tmp_path)
     migrate = next(r for r in results if r.name == "compat: migrate")
     assert migrate.ok                          # advisory, green
@@ -82,7 +87,7 @@ def test_doctor_compat_ahead_is_advisory_not_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(anneal="0.10.0"))
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
+                        lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     results = doctor._check_compat_set(tmp_path)
     anneal = next(r for r in results if r.name == "compat: anneal")
     assert anneal.ok
@@ -94,7 +99,7 @@ def test_doctor_pip_pin_unknown_does_not_red_operator(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
+                        lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     monkeypatch.setattr(manifest, "pip_floor_verdict",
                         lambda: AxisVerdict("pip-pin", "unknown", "metadata unreadable"))
     pin = next(r for r in doctor._check_compat_set(tmp_path) if r.name == "compat: pip-pin")
@@ -109,7 +114,7 @@ def test_doctor_pip_pin_is_advisory_never_fails_operator(tmp_path, monkeypatch):
     _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     monkeypatch.setattr(manifest, "read_lock",
-                        lambda _i: CompatSet("0.3.4", "0.9.6", "partnership"))
+                        lambda _i: CompatSet("0.3.4", manifest.KNOWN_GOOD_ANNEAL, "partnership"))
     monkeypatch.setattr(manifest, "pip_floor_verdict",
                         lambda: AxisVerdict("pip-pin", "drift", "KNOWN_GOOD != the pin"))
     pin = next(r for r in doctor._check_compat_set(tmp_path) if r.name == "compat: pip-pin")
@@ -156,7 +161,7 @@ def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(manifest, "discover_installed_set", lambda *a, **k: _inst())
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
     lock = manifest.read_lock(tmp_path)
-    assert lock == CompatSet(manifest.declared_set().levain, "0.9.6", "partnership")
+    assert lock == CompatSet(manifest.declared_set().levain, manifest.KNOWN_GOOD_ANNEAL, "partnership")
 
 
 def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypatch):
@@ -169,7 +174,7 @@ def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypat
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
-    target = manifest.template_ack_target("0.9.6")  # == TEMPLATES_RECONCILED_ANNEAL
+    target = manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL)
     assert ["migrate", "ack", target] in calls
     assert manifest.read_lock(tmp_path) is not None
 

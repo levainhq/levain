@@ -55,12 +55,23 @@ dependencies = [
     # 0.9.4's `descend` has no such param, so the first compost/dismiss/remove would TypeError, not
     # refuse cleanly. (The tier CAS rides `update`'s expect_disposition, present since 0.9.1.)
     # `>=0.9.6` (spore-225 — the Chris release bundle): a RELEASE-GATE lockstep bump, NOT a new-API
-    # contract gate. 0.9.6 is the first PUBLIC 0.9.x on PyPI (AM-CONSOLIDATE-EFFERENT + the now-keyed
-    # AM-WRAP-GENERATED + the full 0.9.x stack); the compat-manifest's `pip_floor_verdict` release-gate
-    # requires this floor == `manifest.KNOWN_GOOD_ANNEAL` (also bumped to 0.9.6), so they move together
-    # or `levain doctor`'s `compat: pip-pin` check flags the skew. levain calls no 0.9.6-only API that
-    # 0.9.5 lacks — the floor is the published-known-good, not a runtime requirement.
-    "anneal-memory>=0.9.6,<0.10",
+    # contract gate. The compat-manifest's `pip_floor_verdict` release-gate requires this floor ==
+    # `manifest.KNOWN_GOOD_ANNEAL`, so they move together or `levain doctor`'s `compat: pip-pin`
+    # check flags the skew.
+    #
+    # ⛔ 0.9.7 IS A CORRECTNESS FLOOR, NOT A HOUSEKEEPING BUMP (AM-LEVELCAP, 2026-08-14). Every
+    # anneal through 0.9.6 capped Proven-tier at 2x/3x in BOTH `_GRADUATION_RE` and
+    # `CrystalStore._validate_level`, so a pattern at 4x or higher was SILENTLY invisible to
+    # graduation validation — no validation, no demotion, no counter, and (because co-citation is
+    # extracted inside the graduation path) ZERO Hebbian links — while also being impossible to
+    # crystallize OUT. An entity whose practice counts past 3x loses its association graph with no
+    # error and no warning. Levain's own methodology-core teaches 1x->2x->3x-then-crystallize, so a
+    # seed-following entity never produced an affected line — which is exactly why this survived to
+    # 0.9.6 unnoticed, and why the floor moves rather than the templates.
+    #
+    # levain calls no 0.9.7-only API; the floor is the published-known-good, not a runtime
+    # requirement. `MIN_PROVEN_LEVEL` is new public surface in 0.9.7 but levain does not import it.
+    "anneal-memory>=0.9.7,<0.10",
 ]
 
 [project.optional-dependencies]
