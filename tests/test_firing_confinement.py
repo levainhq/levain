@@ -761,6 +761,93 @@ def test_build_policy_pins_lexical_ssh_anchor_even_when_ssh_is_a_symlink(
     policy = build_policy(_entity(tmp_path), ssh_mode="raw")
     assert (tmp_path.resolve() / ".ssh") in policy.deny_write_dirs   # LEXICAL anchor pinned (blocks rm/mv)
     assert realssh.resolve() in policy.deny_write_dirs               # resolved target also pinned
+    # ...AND the FILES inside it, at BOTH paths (2026-08-21 — the assertion this test stopped one level
+    # short of: it set up the exact symlink scenario and only ever looked at ``deny_write_dirs``).
+    for name in ("authorized_keys", "authorized_keys2", "config", "rc"):
+        assert (tmp_path.resolve() / ".ssh" / name) in policy.deny_write_files
+        assert (realssh.resolve() / name) in policy.deny_write_files
+
+
+def test_build_policy_denies_lexical_vector_when_the_FILE_is_a_preexisting_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """REGRESSION (Diogenes HIGH, 2026-08-21, verified by repro): a PRE-EXISTING
+    ``~/.ssh/authorized_keys -> ~/evil/authorized_keys`` symlink defeated the write-floor entirely.
+
+    ``deny_write_files`` was built with ``.resolve()`` ONLY, so the deny named ~/evil/authorized_keys —
+    while the entity writes the LEXICAL ~/.ssh/authorized_keys, which sshd honours via ``realpath()``.
+    ⛔ The (2) dir-anchor pin does NOT cover it: pinning the ~/.ssh LITERAL blocks rename/replace but
+    deliberately still allows "file creation/reads INSIDE it", which is exactly the write used here.
+    The fix denies BOTH paths for every vector."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (evil / "authorized_keys").write_text("ssh-ed25519 AAAA attacker\n")
+    (ssh / "authorized_keys").symlink_to(evil / "authorized_keys")
+
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+
+    lexical = tmp_path.resolve() / ".ssh" / "authorized_keys"
+    resolved = (evil / "authorized_keys").resolve()
+    assert lexical != resolved, "test is inert unless the two paths actually diverge"
+    assert lexical in policy.deny_write_files    # THE FIX: the path the entity writes / sshd reads
+    assert resolved in policy.deny_write_files   # content protection, unchanged
+
+    # ⚠ NON-DISCRIMINATING, AND LABELLED AS SUCH (codex L3 2026-08-21, which RECONSTRUCTED the
+    # predecessor policy and confirmed this line passes WITH the bug). `crown_jewel_reason` resolves
+    # its argument FIRST, so it matches the already-denied TARGET whether or not the lexical entry
+    # exists. It is kept because both-hands-agree is worth stating, NOT as evidence of the fix.
+    # ⛔ THE DISCRIMINATING ASSERTIONS ARE `lexical in policy.deny_write_files` above and the profile
+    # literal below — both mutation-checked red against the one-line `.resolve()`-only construction.
+    assert crown_jewel_reason(policy, lexical) is not None
+
+    # And the seatbelt hand renders the lexical literal, not only the target.
+    profile = SeatbeltProvider().render_profile(policy)  # type: ignore[arg-type]
+    assert f'(literal "{lexical}")' in profile
+
+
+def test_build_policy_denies_the_RAW_home_spelling_when_HOME_is_a_symlink(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """REGRESSION (apparatus L3 codex, 2026-08-21): the first cut of the lexical fix used ONLY
+    ``home.resolve() / ".ssh" / n``, matching ``ssh_anchor``'s convention — but that convention is
+    itself incomplete. With HOME a symlink (``/tmp/linkhome -> /tmp/realhome``) BOTH of the two
+    original spellings collapse onto realhome, so the path the entity actually writes and sshd
+    actually reads — ``linkhome/.ssh/authorized_keys`` — was named by nothing.
+
+    ⚠ NOT THEORETICAL ON macOS: codex observed ``/var/folders/... -> /private/var/folders/...``
+    locally, i.e. ``Path.home() != Path.home().resolve()`` on an ordinary box.
+    ⛔ This NARROWS the symlinked-HOME vector; it does not close it. A *replaceable* HOME symlink is
+    still open and is recorded in build_policy's KNOWN-OPEN block."""
+    real = tmp_path / "realhome"
+    (real / ".ssh").mkdir(parents=True)
+    link = tmp_path / "linkhome"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+
+    policy = build_policy(_entity(real), ssh_mode="raw")
+
+    denied = set(policy.deny_write_files)
+    assert (link / ".ssh" / "authorized_keys") in denied, (
+        "the RAW Path.home() spelling — the one the entity writes — must be denied")
+    assert (real.resolve() / ".ssh" / "authorized_keys") in denied  # resolved target still denied
+    assert link.resolve() != link, "test is inert unless HOME actually diverges from its target"
+
+
+def test_build_policy_ssh_vectors_do_not_double_up_without_symlinks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CONTROL for the fix above: with no symlink anywhere, lexical == resolved, so ``_dedup`` must
+    collapse the pair and the ordinary case gets exactly ONE entry per vector — not two."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir()
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+    for name in ("authorized_keys", "authorized_keys2", "config", "rc"):
+        hits = [p for p in policy.deny_write_files if p.name == name]
+        assert len(hits) == 1, f"{name} duplicated in the no-symlink case: {hits}"
+    assert len(policy.deny_write_files) == 4
 
 
 def test_build_policy_deny_standard_creds_expands_known_locations(tmp_path: Path, monkeypatch) -> None:

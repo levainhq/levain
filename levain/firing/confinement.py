@@ -285,8 +285,13 @@ class CrownJewelsPolicy:
     with :func:`build_policy`, never by hand — the crown-jewels assembly (flow store + creds + sibling
     stores + ssh keys) is shared across OSes and is the load-bearing security surface.
 
-    Every path is stored RESOLVED (symlink-followed, absolute) so the rendered denies match what the
-    kernel sees. ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
+    Paths are stored ABSOLUTE, and MOSTLY resolved (symlink-followed) so the rendered denies match
+    what the kernel sees. ⚠ ``deny_write_files`` IS THE DELIBERATE EXCEPTION AND THIS SENTENCE USED
+    TO DENY IT (it read "Every path is stored RESOLVED", which my own 2026-08-21 change falsified and
+    codex L3 caught): each ssh vector is stored at up to THREE spellings — raw ``Path.home()``,
+    resolved-HOME, and fully resolved — because resolving alone LOSES the lexical path that sshd
+    honours through ``realpath()``. ``deny_write_dirs`` carries the same exception for the ~/.ssh
+    anchor. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
     jail (the entity may read/write broadly under default-allow) — it is just where a fresh entity's
     work lands by convention."""
 
@@ -302,7 +307,9 @@ class CrownJewelsPolicy:
     # ProxyCommand config / an rc hook (code the operator or sshd runs later). Rendered as write-only
     # literals (read stays allowed on the seatbelt hand → raw-mode ~/.ssh reads work), AND their ancestor
     # ~/.ssh is pinned in deny_write_dirs (build_policy adds them to all_jewels) so the dir can't be
-    # relocated to dodge the literal — the codex raw-mode bypass. Distinct from deny_files (read+write);
+    # relocated to dodge the literal — the codex raw-mode bypass. ⚠ EACH VECTOR APPEARS TWICE WHEN A
+    # SYMLINK MAKES ITS LEXICAL AND RESOLVED PATHS DIFFER (build_policy (3)) — the dir pin does NOT
+    # cover a symlinked FILE, since writes INSIDE ~/.ssh stay allowed by design. Distinct from deny_files (read+write);
     # the in-process file-editor twin denies them outright (read included, stricter-on-ssh).
     config_file: Path | None = None     # <entity>/.levain/confinement.json — the config that DEFINES
     # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
@@ -465,8 +472,51 @@ def build_policy(
     #       literal yet sshd's ``realpath()`` honours it (codex; VERIFIED LIVE — the bypass planted an
     #       attacker key). Write-denying the ~/.ssh dir LITERAL blocks renaming/replacing it while STILL
     #       allowing file creation/reads INSIDE it (a child-path write-check), so raw-mode is NOT re-jailed.
+    #   (3) EACH VECTOR IS DENIED AT BOTH ITS LEXICAL AND ITS RESOLVED PATH (2026-08-21). ``.resolve()``
+    #       alone gives CONTENT protection (the real write target) but LOSES the lexical path, and a
+    #       PRE-EXISTING ``~/.ssh/authorized_keys -> ~/evil/authorized_keys`` symlink is therefore denied
+    #       only at ~/evil — while the entity writes to the LEXICAL ~/.ssh/authorized_keys, which sshd
+    #       honours via ``realpath()``. The (2) dir-anchor pin does NOT cover this: it blocks renaming
+    #       ~/.ssh while deliberately still allowing "file creation/reads INSIDE it", which is exactly
+    #       the write the attack uses. ⚠ THIS IS THE SAME lexical-vs-resolved ARGUMENT ALREADY MADE
+    #       TWICE IN THIS FILE — for the ~/.ssh dir anchor below ("resolved jewel vs lexical anchor are
+    #       different objects") and for the confinement config's fail-closed symlink check. It was
+    #       applied to the DIRECTORY and to the CONFIG and not to the FILES between them.
+    #       ⛔ DENY BOTH RATHER THAN REASONING ABOUT SEATBELT'S CANONICALISATION: whether the sandbox
+    #       matches ``(literal ...)`` lexically or after resolving is a platform detail we would then
+    #       depend on being right about. Every entry makes the deny correct under either semantics.
+    #       ``_dedup`` collapses them to one entry in the ordinary no-symlink case.
+    #       ⚠ IT IS NOT FREE, AND THE FIRST DRAFT OF THIS COMMENT CLAIMED IT WAS ("breaks no real
+    #       setup") — corrected by codex L3. A dotfile manager (stow/chezmoi/yadm) that REPLACES or
+    #       RE-LINKS ~/.ssh/config now fails inside raw mode. Reading it still works and ssh still
+    #       works; only rewriting the link does not. That is a real workflow cost, accepted
+    #       deliberately: an entity re-pointing ~/.ssh/config IS the ProxyCommand vector.
+    #   ⛔⛔ KNOWN-OPEN, NOT CLOSED BY THIS FIX (codex L3 2026-08-21, each REAL and each reproduced
+    #       by reasoning from disk — do not read this block as "ssh is now safe in raw mode"):
+    #       (a) REPLACEABLE INTERMEDIATE SYMLINK. With ~/.ssh/authorized_keys -> ../bridge/authorized_
+    #           keys and ~/bridge -> ~/good, the policy pins the lexical entry and ~/good — but NOT
+    #           ~/bridge, because ``_write_deny_ancestors`` only walks RESOLVED ancestors. The entity
+    #           re-points ~/bridge and writes a file neither denied endpoint names. TOCTOU by design:
+    #           it never touches a denied path.
+    #       (b) REPLACEABLE / SYMLINKED HOME. Same shape one level up; already admitted at the top of
+    #           this file. The third spelling above narrows it, it does not close it.
+    #       (c) TRANSITIVE INPUTS. An existing ``Include config.d/*`` in a protected config, or an
+    #           ``rc`` that sources a writable helper, is an exec path we do not deny — the anchor
+    #           deliberately permits child creation inside ~/.ssh. Denying the top-level files does
+    #           not protect what those files PULL IN.
+    #       (d) DYNAMIC DIVERGENCE BETWEEN THE HANDS. ``crown_jewel_reason`` resolves the requested
+    #           path FIRST, so a symlink retargeted AFTER policy construction leaves seatbelt matching
+    #           the static lexical literal while the in-process twin resolves to a new, unlisted
+    #           target. Denying more endpoints does not fix resolve-first.
+    #       (e) HARDLINKS — pre-existing outside hardlink to a vector; already documented above.
     ssh_home = home / ".ssh"
-    deny_write_files_l = [(ssh_home / n).resolve() for n in _SSH_WRITE_DENIED]
+    ssh_home_lexical = home.resolve() / ".ssh"      # resolved HOME + un-deref'd .ssh, as ``ssh_anchor``
+    deny_write_files_l: list[Path] = []
+    for n in _SSH_WRITE_DENIED:
+        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21).
+        deny_write_files_l.append(ssh_home / n)               # RAW ``Path.home()`` — the true lexical
+        deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
+        deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
 
     # De-dup while preserving order (a sibling could coincide with an extra); resolved paths compare
     # exactly, so a simple seen-set is sound.
