@@ -778,7 +778,29 @@ def test_build_policy_denies_lexical_vector_when_the_FILE_is_a_preexisting_symli
     while the entity writes the LEXICAL ~/.ssh/authorized_keys, which sshd honours via ``realpath()``.
     ⛔ The (2) dir-anchor pin does NOT cover it: pinning the ~/.ssh LITERAL blocks rename/replace but
     deliberately still allows "file creation/reads INSIDE it", which is exactly the write used here.
-    The fix denies BOTH paths for every vector."""
+    The fix denies BOTH paths for every vector.
+
+    ⛔⛔ **THE MECHANISM NAMED ABOVE IS REFUTED. THE FIX IS CORRECT; ITS STATED REASON WAS NOT.**
+    (Diogenes levain-HIGH 2026-08-22, measured live with sandbox-exec on Darwin 25.5; independently
+    re-measured 2026-08-23 with a minimal profile and both controls.)
+
+    "the entity writes the LEXICAL path" DOES NOT HAPPEN — seatbelt CANONICALISES a requested path
+    before matching ``(literal ...)``. Against a minimal ``(version 1)(allow default)(deny
+    file-write* (literal <RESOLVED>))``, appending at the lexical path returns **"Operation not
+    permitted"** and the real file is untouched. A converse profile denying only the LEXICAL path
+    lets the same append through at exit 0, which is what proves canonicalisation rather than luck.
+
+    ▶ **THE ACTUAL BYPASS IS UNLINK-THEN-RECREATE.** ``unlink``/``rename``/``ln`` operate on the
+    LINK, and seatbelt matches THOSE lexically. Re-measured: under a profile denying the resolved
+    path, ``rm -f <lexical>`` SUCCEEDS and the link is gone — after which a fresh file at that name
+    is a new object nothing denies, and sshd reads it.
+
+    ⚠ **WHY THIS IS FILED AS HIGH AGAINST A CORRECT FIX:** denying both spellings closes
+    unlink-then-recreate too, so the CODE is right and stays. But the wrong model was written into
+    a comment, this docstring and a commit message, and then generalised into a design rule — and a
+    threat model is reused far more often than the line it justifies. The next guard reasoned from
+    "seatbelt matches writes lexically" would be built on a measurement that says the opposite.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     evil = tmp_path / "evil"
     evil.mkdir()
@@ -834,6 +856,52 @@ def test_build_policy_denies_the_RAW_home_spelling_when_HOME_is_a_symlink(
         "the RAW Path.home() spelling — the one the entity writes — must be denied")
     assert (real.resolve() / ".ssh" / "authorized_keys") in denied  # resolved target still denied
     assert link.resolve() != link, "test is inert unless HOME actually diverges from its target"
+
+
+def test_build_policy_denies_the_RESOLVED_HOME_LEXICAL_spelling(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """⛔ THE SPELLING THAT CLOSES THE VULNERABILITY WAS THE ONE SPELLING NO TEST COVERED, AND
+    DELETING IT LEFT THE SUITE FULLY GREEN (Diogenes levain-MEDIUM 2026-08-22, confirmed by
+    mutation 2026-08-23: removing ``ssh_home_lexical / n`` from ``build_policy`` gave 91 passed,
+    0 failed — while removing the RAW spelling beside it failed a dedicated regression test).
+    Coverage was exactly INVERTED against security value.
+
+    ⚠ THE REASON IT LOOKED COVERED: in the ordinary symlinked-HOME case all three spellings
+    collapse. ``Path("link/.ssh/ak").resolve()`` resolves its existing prefix even when the leaf
+    does not exist, so the RESOLVED spelling already yields ``real/.ssh/ak`` and hides the gap.
+    This spelling is uniquely load-bearing in exactly ONE geometry — **HOME diverges AND the
+    vector file is itself a pre-existing symlink** — which is the attack ``build_policy``'s own
+    comment (3) describes:
+
+        link/.ssh/authorized_keys  ->  evil/authorized_keys      and  link -> real
+
+        RAW      ssh_home / n              -> link/.ssh/authorized_keys
+        LEXICAL  ssh_home_lexical / n      -> real/.ssh/authorized_keys   <- ONLY this one
+        RESOLVED (ssh_home / n).resolve()  -> evil/authorized_keys
+
+    Both enforcing hands resolve the requested path before matching (``crown_jewel_reason``
+    resolves first — see KNOWN-OPEN (d)), so a write aimed at the lexical file lands on
+    ``real/.ssh/authorized_keys``: named by the LEXICAL entry and by neither of the others."""
+    real = tmp_path / "realhome"
+    (real / ".ssh").mkdir(parents=True)
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    # PRE-EXISTING vector symlink — the shape comment (3) of build_policy describes.
+    (real / ".ssh" / "authorized_keys").symlink_to(evil / "authorized_keys")
+    link = tmp_path / "linkhome"
+    link.symlink_to(real)
+    monkeypatch.setenv("HOME", str(link))
+
+    policy = build_policy(_entity(real), ssh_mode="raw")
+    denied = set(policy.deny_write_files)
+
+    assert link.resolve() != link, "test is inert unless HOME actually diverges from its target"
+    assert (real / ".ssh" / "authorized_keys").resolve() != (real / ".ssh" / "authorized_keys"), (
+        "test is inert unless the vector file is really a symlink")
+    assert (real / ".ssh" / "authorized_keys") in denied, (
+        "the resolved-HOME LEXICAL spelling must be denied — it is the path a resolve-first hand "
+        "lands on, and neither the raw nor the fully-resolved entry names it")
 
 
 def test_build_policy_ssh_vectors_do_not_double_up_without_symlinks(
