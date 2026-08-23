@@ -475,8 +475,21 @@ def build_policy(
     #   (3) EACH VECTOR IS DENIED AT BOTH ITS LEXICAL AND ITS RESOLVED PATH (2026-08-21). ``.resolve()``
     #       alone gives CONTENT protection (the real write target) but LOSES the lexical path, and a
     #       PRE-EXISTING ``~/.ssh/authorized_keys -> ~/evil/authorized_keys`` symlink is therefore denied
-    #       only at ~/evil — while the entity writes to the LEXICAL ~/.ssh/authorized_keys, which sshd
-    #       honours via ``realpath()``. The (2) dir-anchor pin does NOT cover this: it blocks renaming
+    #       only at ~/evil — while the entity reaches the LEXICAL ~/.ssh/authorized_keys, which sshd
+    #       honours via ``realpath()``.
+    #       ⛔⛔ "WRITES TO" WAS THE WRONG VERB AND IT WAS A REFUTED MECHANISM (Diogenes HIGH
+    #       2026-08-22, measured live with sandbox-exec; re-measured independently 2026-08-23).
+    #       A DIRECT DATA WRITE AT THE LEXICAL PATH IS DENIED: seatbelt CANONICALISES a requested
+    #       path before matching ``(literal ...)``, so a profile denying only the RESOLVED path
+    #       already refuses ``echo >> <lexical>`` with "Operation not permitted". The converse
+    #       minimal profile — denying only the LEXICAL path — lets that same append through at
+    #       exit 0, which is what makes this canonicalisation rather than coincidence.
+    #       ▶ THE REAL VECTOR IS UNLINK-THEN-RECREATE: ``unlink``/``rename``/``ln`` act on the LINK
+    #       and ARE matched lexically, so ``rm -f <lexical>`` succeeds under a resolved-only deny
+    #       and the recreated file is an object nothing names. Denying both spellings closes that
+    #       too, so the code below is unchanged and correct — only its stated reason moved.
+    #       ⚠ DO NOT REASON FROM THE OLD MODEL. "seatbelt matches writes lexically" is FALSE and
+    #       was generalised into a design rule here; a guard built on it would be built backwards. The (2) dir-anchor pin does NOT cover this: it blocks renaming
     #       ~/.ssh while deliberately still allowing "file creation/reads INSIDE it", which is exactly
     #       the write the attack uses. ⚠ THIS IS THE SAME lexical-vs-resolved ARGUMENT ALREADY MADE
     #       TWICE IN THIS FILE — for the ~/.ssh dir anchor below ("resolved jewel vs lexical anchor are
@@ -518,8 +531,17 @@ def build_policy(
         deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
         deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
 
-    # De-dup while preserving order (a sibling could coincide with an extra); resolved paths compare
-    # exactly, so a simple seen-set is sound.
+    # De-dup while preserving order (a sibling could coincide with an extra).
+    # ⚠ THE SOUNDNESS PREMISE HERE USED TO READ "resolved paths compare exactly, so a simple
+    # seen-set is sound" — AND THE FOUR LINES DIRECTLY ABOVE IT FALSIFY IT (Diogenes levain-LOW
+    # 2026-08-22). Two of the three spellings appended above are LEXICAL and are deliberately NOT
+    # resolved; that is the entire point of the fix. So the premise names a property only one third
+    # of the input has.
+    # ▶ THE SEEN-SET IS STILL SOUND, for a reason that does not depend on resolution: this dedups
+    # by ``Path`` VALUE EQUALITY, which is exact for any pair of paths whatever their provenance.
+    # It collapses the ordinary no-symlink case where the three spellings coincide, and correctly
+    # KEEPS them apart when they diverge — which is the behaviour the deny list needs. The old
+    # sentence reached the right conclusion through an argument about the wrong property.
     def _dedup(items: list[Path]) -> tuple[Path, ...]:
         seen: set[Path] = set()
         out: list[Path] = []
@@ -586,7 +608,20 @@ def build_policy(
     if ssh_dir is not None:
         all_jewels.append(ssh_dir)
     # Pin the LEXICAL ~/.ssh anchor too (apparatus L3 codex re-verify HIGH — "resolved jewel vs lexical
-    # anchor are different objects"). ``deny_write_files_l`` uses ``.resolve()`` for CONTENT protection
+    # anchor are different objects").
+    # ⚠ THE SENTENCE BELOW DESCRIBED A ``deny_write_files_l`` THAT STOPPED EXISTING TWENTY LINES
+    # ABOVE IT, IN THE SAME COMMIT (Diogenes levain-MEDIUM 2026-08-22). Since 7211bbf that list is
+    # built from THREE spellings, not one: raw lexical, resolved-HOME lexical, and resolved. So
+    # ".resolve() only" is no longer true of it, and the paragraph is kept below with its original
+    # argument intact ONLY because that argument is about the DIRECTORY and still holds.
+    # ⛔ AND THE REDUNDANCY CLAIM THAT CAME WITH THE FINDING DOES NOT HOLD — CHECKED BEFORE ACTING,
+    # 2026-08-23. The finding called this code "now unconditionally redundant". It is not: the three
+    # spellings deny lexical FILES inside ~/.ssh and never the lexical DIRECTORY, so
+    # ``rm ~/.ssh; ln -s ~/evil ~/.ssh`` — replacing the directory itself — is named by this anchor
+    # and by nothing else. It IS redundant in the no-symlink case, where ``ssh_anchor == ssh_dir``
+    # and ``_dedup`` already collapses the pair. Redundant-when-collapsed is not redundant.
+    # Historical form of the argument, still correct for the directory:
+    # ``deny_write_files_l`` uses ``.resolve()`` for CONTENT protection
     # (it must deny the real write TARGET, even through a symlink) — but that FOLLOWS a pre-existing
     # ``~/.ssh -> ~/realssh`` symlink, so ancestor-deny pins ~/realssh, leaving lexical ~/.ssh replaceable
     # (``rm ~/.ssh; ln -s ~/evil ~/.ssh`` → the planted key at ~/evil dodges the resolved-target deny).
