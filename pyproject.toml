@@ -65,9 +65,16 @@ dependencies = [
     # graduation validation — no validation, no demotion, no counter, and (because co-citation is
     # extracted inside the graduation path) ZERO Hebbian links — while also being impossible to
     # crystallize OUT. An entity whose practice counts past 3x loses its association graph with no
-    # error and no warning. Levain's own methodology-core teaches 1x->2x->3x-then-crystallize, so a
+    # error and no warning. Levain's methodology-core USED TO TEACH 1x->2x->3x-then-crystallize, so a
     # seed-following entity never produced an affected line — which is exactly why this survived to
-    # 0.9.6 unnoticed, and why the floor moves rather than the templates.
+    # 0.9.6 unnoticed, and why the floor moved on 2026-08-14 while the templates did not.
+    #
+    # ⚠ THAT CLAUSE IS NOW HISTORY, NOT CURRENT STATE (2026-08-31, spore-535). The seed's
+    # `memory.md` taught a ladder terminating at 3x for seventeen days after the library removed
+    # the cap, so every Levain entity was taught a practice that structurally could not reach 4x —
+    # SAFE (no adopter was ever broken, which is what made TEMPLATES_RECONCILED_ANNEAL = 0.9.7 an
+    # honest ack) but never CURRENT. The seed now teaches the uncapped ladder and the
+    # level-vs-recency split. Do not cite this comment as evidence that the templates still cap.
     #
     # levain calls no 0.9.7-only API; the floor is the published-known-good, not a runtime
     # requirement. `MIN_PROVEN_LEVEL` is new public surface in 0.9.7 but levain does not import it.
