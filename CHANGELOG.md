@@ -6,6 +6,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-02
+
+**`doctor` no longer fails a correct install rooted at `$HOME`.** A one-line fix to a defect that shipped in 0.4.2, found by review within the hour.
+
+### Fixed — the install's own settings file was read as user-level wiring
+
+For an install rooted at `$HOME`, `<install>/.claude/settings.json` and `~/.claude/settings.json` are **the same file** — the one `levain init` wrote. `_check_activation_scope` read it as a deliberate operator choice, reported the activation layer dark, and made `levain doctor` exit nonzero on an install that was working perfectly.
+
+⚠ **This is the third time `doctor` has gone red for a whole class of operators**, and all three are one mistake: confusing the file the *installer* wrote with a signal of operator *intent*.
+
+- **0.4.0** — `_check_hook_freshness` compared every install against the Claude Code tree, so every Codex install failed on a false "stale hooks" report.
+- **0.4.2's first draft** — the new scope check treated `~/.codex/hooks.json` as user-level wiring, when Codex has no per-project hooks file and `levain init` writes that path itself. Caught before release by running `doctor` against a real install of each adapter.
+- **This one** — the Claude Code equivalent, which that adapter-by-adapter check did not reach because it needs an install at a specific *location* rather than a specific adapter.
+
+The function's own docstring already named the discriminator (*"`levain init` writes `<install>/.claude/settings.json`, INSIDE the install"*); the code simply never tested that identity. It does now, and a genuinely dark configuration still fails.
+
+### Fixed — the 0.4.2 hook fix had no test at any of its four call sites
+
+Not a shipped defect — the code was correct — but the reason it could stop being correct without anyone noticing. The suite covered `wrap_state()` and `format_wrap_blocked()` as units and nothing covered the **routing** between them, which is the entire finding. Replacing the call sites with `state = (hook.episodes_since_wrap(), False)` reintroduces the original bug completely and leaves the full suite green.
+
+That is the same structural failure that let the bug ship in the first place: the function under the activation layer having no test that runs it. Four parameterised tests now drive each hook's `main()` on **both** adapter trees and assert what the entity is actually told.
+
 ## [0.4.2] — 2026-09-02
 
 **Four field-reported defects from one adopter, all in the activation layer.** Reported by [Alex De Groodt](https://github.com/Hurleveur) on 2026-08-04 against 0.4.1. No API removals. Default behaviour is unchanged for every install that does not opt in.
