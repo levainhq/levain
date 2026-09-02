@@ -1127,7 +1127,6 @@ def _env_scope_caveat() -> str:
 def _check_activation_scope(install: Path) -> list[CheckResult]:
     """Report the runtime gate, and fail the one combination that is dark."""
     scope = _configured_scope(install)
-    user_wiring = _user_level_wiring(install)
     env_note = _env_scope_caveat()
     env_raw = os.environ.get("LEVAIN_SCOPE", "").strip().lower()
 
@@ -1146,6 +1145,10 @@ def _check_activation_scope(install: Path) -> list[CheckResult]:
         ) + env_note
         return [CheckResult("activation scope", True, detail)]
 
+    # Computed HERE, not above: the global branch returns without using it, and
+    # scanning a stranger's settings file for a result nobody reads is how the
+    # null-entry crash fired on installs that were never going to be flagged.
+    user_wiring = _user_level_wiring(install)
     if user_wiring and env_raw != "global":
         # env_raw == "global" means the gate IS open for every session in this
         # environment, so the install is NOT dark and failing it would be a

@@ -308,50 +308,76 @@ def wrap_state(timeout: float = 5.0) -> tuple[int, bool] | None:
 def episodes_since_wrap(timeout: float = 5.0) -> int | None:
     """Episodes recorded since the last wrap, or None on failure.
 
-    Retained as the narrow view over :func:`wrap_state` for callers that only
-    want the count. A caller that ADVISES the operator must use ``wrap_state``
-    instead — advice that ignores ``wrap_in_progress`` is what produced the
-    stuck-wrap loop described there."""
+    ⚠ NOTHING IN THIS REPO CALLS THIS ANY MORE — all four advice sites moved to
+    :func:`wrap_state`. It is kept as a COMPATIBILITY SHIM, not as a convenience:
+    an operator carrying local edits to their installed hooks (Alex De Groodt was
+    carrying exactly that against `in_install_session` for a month) would have
+    them break on upgrade if the helper's surface shrank underneath them.
+    Removing it is a breaking change to a file operators demonstrably patch.
+
+    A caller that ADVISES the operator must use ``wrap_state`` instead — advice
+    that ignores ``wrap_in_progress`` is what produced the stuck-wrap loop
+    described there, and this function cannot see it."""
     state = wrap_state(timeout)
     return None if state is None else state[0]
 
 
-def format_wrap_blocked(n: int) -> str:
+def format_wrap_blocked(fresh_session: bool = False) -> str:
     """The line that replaces the wrap nudge when a wrap is already open.
 
     The nudge it replaces said "run prepare_wrap". With a wrap in progress that
     call can only raise, so repeating it every prompt taught the entity to keep
     trying the one thing that could not work while episodes piled up behind it —
-    the exact loop Alex De Groodt sat in for three days at 29, then 31 episodes.
+    the loop Alex De Groodt sat in for three days.
 
-    Names BOTH resolutions and names them per transport, because the reader here
-    is an agent: over MCP it can reach the tools directly, and `wrap_cancel` (the
-    escape hatch that had no MCP surface at all before anneal 0.9.8) is the half
-    that was previously unreachable from inside a session.
+    ``fresh_session`` splits the two callers, because they are not in the same
+    position. A SessionStart hook fires before this session has ever called
+    ``prepare_wrap``, so "finish what prepare_wrap returned" is dead text there —
+    it names an artifact this session does not have. Only the per-prompt caller
+    can meaningfully be told to finish its own wrap.
 
-    ⚠ IT DOES NOT PRESENT CANCELLING AS FREE, AND THAT WORDING IS LOAD-BEARING.
-    anneal spawns one `serve` process per client session against a shared store,
-    so the session holding the wrap may be a LIVE SIBLING mid-compression rather
-    than a dead one. Cancelling discards that session's in-flight compression —
-    its episodes survive, the work it already composed does not. An earlier draft
-    of this line said "Nothing is lost either way" while recommending cancel,
-    which would have turned a stuck-wrap notice into an instruction to destroy a
-    peer session's work. Caught by codex at L3."""
+    ⚠ IT DOES NOT PRESENT CANCELLING AS FREE. anneal runs one server process per
+    client session against a shared store, so the wrap holder may be a LIVE
+    sibling mid-compression rather than a dead one; cancelling discards that
+    session's in-flight compression. An earlier draft said "Nothing is lost
+    either way" while recommending cancel, which would have turned a stuck-wrap
+    notice into an instruction to destroy a peer's work.
+
+    ⚠ IT TAKES NO COUNT, AND THAT IS THE FIX RATHER THAN AN OMISSION.
+    ``episodes_since_wrap`` counts from the last COMPLETED wrap, so ``n``
+    includes the episodes frozen inside the OPEN snapshot — measured: two
+    episodes wrapped, one recorded after, and the count reads 3 while only 1 is
+    actually waiting. "N episodes are waiting behind it" therefore overstated
+    the backlog to the agent, in a release whose subject is numbers that
+    disagree with reality. The honest number needs more qualification than this
+    line can carry, so it carries none — and the parameter is gone rather than
+    left unused, because an argument that exists only because the message used
+    to misreport it is residue the next reader would have to decode.
+
+    The discriminator is ``status``, not ``anneal-memory wrap-status``: the
+    former is an MCP tool this reader can actually call and reports the wrap's
+    start time as of anneal 0.9.8; the latter is a shell command, and an agent
+    with no shell was Alex's whole report.
+    """
+    if fresh_session:
+        return (
+            "[wrap blocked] A wrap left open by an earlier session is blocking "
+            "prepare_wrap, so do not call it yet. Call `status` — it reports "
+            "when that wrap started. A wrap opened moments ago belongs to a live "
+            "session still compressing, and cancelling discards its work; an old "
+            "one is a corpse from a session that ended without saving, and you "
+            "clear it with the `wrap_cancel` MCP tool (or `anneal-memory "
+            "wrap-cancel`). Your episodes are not deleted either way."
+        )
     return (
-        f"[wrap blocked] A wrap is already open and {n} episode(s) are waiting "
-        f"behind it — prepare_wrap will refuse until it is resolved, so do not "
-        f"call it yet. If THIS session opened it, finish it: compress what "
-        f"prepare_wrap returned and call save_continuity. If you did not open "
-        f"it, it belongs to another session — which may be a dead one that left "
-        f"it behind, or a live one still compressing right now. Check "
-        f"`anneal-memory wrap-status` before doing anything else. Abandoning it "
-        f"(the `wrap_cancel` MCP tool, or `anneal-memory wrap-cancel`) clears "
-        f"the way, but it DISCARDS whatever compression that other session has "
-        f"in flight, so do not cancel a wrap you cannot account for. Your "
-        f"episodes are safe either way — they stay recorded and the next "
-        f"prepare_wrap picks them up."
+        "[wrap blocked] A wrap is already open, so prepare_wrap will refuse — do "
+        "not call it yet. If YOU opened it this session, finish it: compress what "
+        "prepare_wrap returned and call save_continuity. If you did not, call "
+        "`status` for when it started — a recent wrap is a live session still "
+        "compressing, and cancelling it (the `wrap_cancel` MCP tool, or "
+        "`anneal-memory wrap-cancel`) throws that work away. Your episodes are "
+        "not deleted either way."
     )
-
 
 # ---- Compatibility manifest — version-set drift (a session-init signal) ----
 

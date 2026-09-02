@@ -359,10 +359,14 @@ class TestReadmePinClaim:
     def test_readme_pin_matches_pyproject(self):
         import re
         root = self._repo_root()
+        # The skip must precede the reads. It used to sit after them, where a
+        # non-source checkout would already have raised FileNotFoundError —
+        # a guard that could never fire, which is worse than no guard because
+        # it reads as handled.
+        if not (root / "pyproject.toml").is_file():
+            pytest.skip("not a source checkout")
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
-        if not (root / "pyproject.toml").exists():
-            pytest.skip("not a source checkout")
         real = re.search(r'"anneal-memory(>=[^"]+)"', pyproject)
         assert real, "could not find the anneal-memory pin in pyproject.toml"
         spec = real.group(1)  # e.g. ">=0.9.8,<0.10"

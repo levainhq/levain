@@ -118,7 +118,7 @@ def main() -> int:
             if state is not None:
                 n, wrap_in_progress = state
                 if wrap_in_progress and hasattr(hook, "format_wrap_blocked"):
-                    sections.append(hook.format_wrap_blocked(n))
+                    sections.append(hook.format_wrap_blocked(fresh_session=True))
                 elif n > 0:
                     sections.append(
                         f"[wrap check] {n} episode(s) recorded since the last "
