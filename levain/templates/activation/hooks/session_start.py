@@ -38,6 +38,31 @@ except Exception:
     sys.exit(0)
 
 
+
+def _wrap_state_compat(hook_mod, timeout=None):
+    """`(episodes, wrap_in_progress)` from whichever helper API this install has.
+
+    ⚠ WHY THIS IS NOT JUST `hook.wrap_state(...)`. A pack may layer its own
+    `activation/hooks/_levain_hook.py` over the base tree (packs own the whole
+    `activation` subtree), so a 0.4.2 entry point can end up composed against a
+    PRE-0.4.2 helper that has `episodes_since_wrap` and no `wrap_state`. The
+    resulting AttributeError is swallowed by this file's structural fail-open
+    catch, and every hook then emits NOTHING — silently, with doctor still
+    green. That is the exact failure this release exists to end, so the entry
+    points must not hard-depend on a helper symbol they cannot guarantee.
+
+    Falls back to the old count-only API, which loses only the wrap-blocked
+    branch — the pre-0.4.2 behaviour, which is the right degradation.
+    """
+    fn = getattr(hook_mod, "wrap_state", None)
+    if fn is not None:
+        return fn(timeout=timeout) if timeout is not None else fn()
+    legacy = getattr(hook_mod, "episodes_since_wrap", None)
+    if legacy is None:
+        return None
+    n = legacy(timeout=timeout) if timeout is not None else legacy()
+    return None if n is None else (n, False)
+
 def main() -> int:
     try:
         payload = hook.read_stdin()
@@ -85,16 +110,24 @@ def main() -> int:
         #    is Claude Code's SessionStart payload — a harness-coupling point a
         #    non-Claude-Code adapter must re-verify (see _levain_hook docstring).
         if payload.get("source") in ("startup", "clear"):
-            n = hook.episodes_since_wrap()
-            if n is not None and n > 0:
-                sections.append(
-                    f"[wrap check] {n} episode(s) recorded since the last "
-                    f"wrap. If your last session did real work, run the wrap "
-                    f"sequence (prepare_wrap -> compress -> save_continuity) "
-                    f"to consolidate it — unwrapped episodes never compound "
-                    f"into continuity. They are not lost: prepare_wrap still "
-                    f"sees them."
-                )
+            # wrap_state, not episodes_since_wrap: a wrap left open by the
+            # session that just ended is EXACTLY the state a fresh session
+            # opens into, and telling it to run prepare_wrap sends it at the
+            # one call that cannot succeed (Alex De Groodt, 2026-08-04).
+            state = _wrap_state_compat(hook)
+            if state is not None:
+                n, wrap_in_progress = state
+                if wrap_in_progress and hasattr(hook, "format_wrap_blocked"):
+                    sections.append(hook.format_wrap_blocked(n))
+                elif n > 0:
+                    sections.append(
+                        f"[wrap check] {n} episode(s) recorded since the last "
+                        f"wrap. If your last session did real work, run the wrap "
+                        f"sequence (prepare_wrap -> compress -> save_continuity) "
+                        f"to consolidate it — unwrapped episodes never compound "
+                        f"into continuity. They are not lost: prepare_wrap still "
+                        f"sees them."
+                    )
 
             # Time-based spore germination — open loops that have gone dormant
             # or whose `next` date has arrived, surfaced once on a fresh session

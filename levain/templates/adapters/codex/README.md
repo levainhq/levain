@@ -410,9 +410,19 @@ hooks will read different stores, and the hooks may not fire at all.
 - **Hooks fire for every Codex session on the machine.** Because
   `~/.codex/hooks.json` is global, the hooks run any time `codex` is
   invoked anywhere. The `in_install_session()` gate in `_levain_hook.py`
-  scopes them: hooks fire only when Codex's cwd is inside the install, and
-  no-op silently otherwise. Without this gate, unrelated Codex sessions
-  would receive Levain's posture and recency directives.
+  scopes them: by default, hooks fire only when Codex's cwd is inside the
+  install, and no-op silently otherwise. Without this gate, unrelated Codex
+  sessions would receive Levain's posture and recency directives.
+- **To activate everywhere, opt in explicitly** (0.4.2). If you want the
+  entity present in every Codex session — not only inside the install —
+  set `{"scope": "global"}` in `.levain/config.json` (durable; survives
+  `levain update`) or `LEVAIN_SCOPE=global` for one session. Anything that
+  is not exactly `global` keeps the install-scoped default, so a typo or an
+  unreadable config can never silently open the gate, and
+  `LEVAIN_HOOK_SUPPRESS=1` still wins over both. `levain doctor` reports
+  which way the gate is set — and FAILS when hooks are wired at the user
+  level while the scope is still install-scoped, because that combination
+  means the whole activation layer is silently off.
 
 ## Harness portability
 

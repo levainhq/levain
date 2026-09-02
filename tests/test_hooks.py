@@ -290,7 +290,11 @@ class TestFormatCrystalRecall:
 # behind (the gap Slice 3 closed). This is the structural guard against that
 # recurring until the v1.2 single-_levain_hook refactor collapses the two copies.
 _PORTED_FNS = (
-    "_anneal_json", "_is_int_episodes", "episodes_since_wrap",
+    "_anneal_json", "_is_int_episodes", "wrap_state", "episodes_since_wrap",
+    # wrap-blocked advice + activation-scope opt-in (0.4.2) — byte-identical.
+    # in_install_session is NOT here: its BODY is shared but its docstring is
+    # adapter-specific by design, so it gets its own body-parity test below.
+    "format_wrap_blocked", "_config_dict", "configured_scope",
     "open_spores", "_is_loop", "_tokens", "spores_colliding", "due_dormant_spores",
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
     # compatibility-manifest drift surface — byte-identical across both copies
@@ -838,3 +842,445 @@ def test_install_root_ignores_an_unrelated_claude_project_dir(tmp_path, monkeypa
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(other))
     mod = _load_hook_from(install, "_hook_unrelated")
     assert mod.install_root() == install.resolve()
+
+
+# ===========================================================================
+# 0.4.2 — Alex De Groodt's two levain findings (gists filed 2026-08-04).
+#
+# ⚠ BOTH functions under test here had ZERO behavioural coverage before this
+# release. in_install_session / should_fire had no test reference in the suite
+# at all — not stubbed like install_root was, simply never executed — which is
+# why the entire activation layer could go dark in a real operator's install
+# while every test stayed green. That absence IS the finding, so these tests
+# drive the real functions and monkeypatch only cwd and the install root.
+# ===========================================================================
+
+
+import os  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(params=["claude", "codex"])
+def both_hooks(request):
+    """Every test in this section runs against BOTH adapter copies.
+
+    levain 0.4.0 shipped `doctor` permanently red for every codex operator
+    because a check was pointed at the Claude Code tree — and it went out in
+    the release built to carry Alex's PREVIOUS fix. A green suite did not catch
+    it, because the divergence was in which tree a check read, not in whether
+    the code ran. Parameterising the fixture is the structural answer.
+    """
+    return hook if request.param == "claude" else codex_hook
+
+
+class TestActivationScope:
+    """L1 — the global-scope opt-in.
+
+    Alex moved Levain into a global tool and wired the hooks at user level, so
+    every session he actually works in sat outside the install root and the
+    whole activation layer went dark — while `levain doctor` reported healthy.
+    """
+
+    def _install(self, mod, monkeypatch, tmp_path, cwd):
+        monkeypatch.setattr(mod, "install_root", lambda: tmp_path)
+        monkeypatch.setattr(mod.Path, "cwd", staticmethod(lambda: cwd))
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        monkeypatch.delenv("LEVAIN_HOOK_SUPPRESS", raising=False)
+
+    def _write_config(self, tmp_path, payload):
+        d = tmp_path / ".levain"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "config.json").write_text(payload, encoding="utf-8")
+
+    # -- the default is UNCHANGED. This is the contamination guarantee. --
+
+    def test_default_still_fires_inside_the_install(self, both_hooks, monkeypatch, tmp_path):
+        self._install(both_hooks, monkeypatch, tmp_path, tmp_path / "sub")
+        (tmp_path / "sub").mkdir()
+        assert both_hooks.in_install_session() is True
+
+    def test_default_still_silent_outside_the_install(self, both_hooks, monkeypatch, tmp_path, ):
+        outside = tmp_path.parent / "elsewhere-default"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        assert both_hooks.in_install_session() is False
+
+    # -- the opt-in itself --
+
+    def test_config_scope_global_fires_outside_the_install(self, both_hooks, monkeypatch, tmp_path):
+        """Alex's fix, via the channel he argued for: a config key survives in
+        the install and `levain update` cannot eat it."""
+        outside = tmp_path.parent / "elsewhere-cfg"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        assert both_hooks.in_install_session() is False  # before opting in
+        self._write_config(tmp_path, '{"scope": "global"}')
+        assert both_hooks.in_install_session() is True
+
+    def test_env_var_scope_global_fires_outside_the_install(self, both_hooks, monkeypatch, tmp_path):
+        outside = tmp_path.parent / "elsewhere-env"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        assert both_hooks.in_install_session() is True
+
+    def test_env_var_beats_config(self, both_hooks, monkeypatch, tmp_path):
+        """A per-session override must be able to turn global back OFF without
+        editing the install."""
+        outside = tmp_path.parent / "elsewhere-prec"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        self._write_config(tmp_path, '{"scope": "global"}')
+        monkeypatch.setenv("LEVAIN_SCOPE", "install")
+        assert both_hooks.configured_scope() == "install"
+        assert both_hooks.in_install_session() is False
+
+    def test_scope_is_case_insensitive(self, both_hooks, monkeypatch, tmp_path):
+        outside = tmp_path.parent / "elsewhere-case"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        self._write_config(tmp_path, '{"scope": "GLOBAL"}')
+        assert both_hooks.in_install_session() is True
+
+    # -- FAIL-CLOSED: only an exact opt-in opens the gate --
+
+    @pytest.mark.parametrize("payload", [
+        '{"scope": "globl"}',            # typo
+        '{"scope": "Global "}',          # tolerated: stripped+lowered -> global
+        '{"scope": 1}',                  # wrong type
+        '{"scope": null}',
+        '{}',                            # key absent
+        'not json at all',               # malformed
+        '[]',                            # not an object
+    ])
+    def test_only_exact_global_opens_the_gate(self, both_hooks, monkeypatch, tmp_path, payload):
+        """Anything that is not "global" resolves to install scope. Silently
+        staying scoped is the status quo; silently going global leaks this
+        partnership's posture into a stranger's workspace, so an unreadable
+        config must never be the thing that opens the gate."""
+        outside = tmp_path.parent / "elsewhere-fc"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        self._write_config(tmp_path, payload)
+        expected = "global" if payload == '{"scope": "Global "}' else "install"
+        assert both_hooks.configured_scope() == expected
+
+    def test_absent_config_file_is_install_scope(self, both_hooks, monkeypatch, tmp_path):
+        outside = tmp_path.parent / "elsewhere-none"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        assert both_hooks.configured_scope() == "install"
+
+    # -- global scope must not defeat the suppression switch --
+
+    def test_suppress_still_wins_over_global_scope(self, both_hooks, monkeypatch, tmp_path):
+        """LEVAIN_HOOK_SUPPRESS is how a consultation subprocess keeps this
+        partnership's posture out of an independent context. Opting into global
+        scope must not silently disarm it."""
+        outside = tmp_path.parent / "elsewhere-sup"
+        outside.mkdir(exist_ok=True)
+        self._install(both_hooks, monkeypatch, tmp_path, outside)
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        monkeypatch.setenv("LEVAIN_HOOK_SUPPRESS", "1")
+        assert both_hooks.should_fire() is False
+
+
+class TestWrapStateRouting:
+    """L2 — the hook must stop discarding wrap_in_progress.
+
+    Alex sat at 29, then 31 episodes against a threshold of 12, being told
+    every prompt to run prepare_wrap, which could only raise.
+    """
+
+    def _status(self, both_hooks, monkeypatch, payload):
+        monkeypatch.setattr(both_hooks, "_anneal_json",
+                            lambda *a, **k: payload)
+
+    def test_reads_both_fields_from_one_status_call(self, both_hooks, monkeypatch):
+        calls = []
+
+        def fake(sub_args, timeout, validator=None):
+            calls.append(sub_args)
+            return {"episodes_since_wrap": 31, "wrap_in_progress": True}
+
+        monkeypatch.setattr(both_hooks, "_anneal_json", fake)
+        assert both_hooks.wrap_state() == (31, True)
+        # One subprocess per prompt, not two: the nudge runs inside a tight
+        # per-prompt timeout budget.
+        assert len(calls) == 1
+
+    def test_wrap_in_progress_false_is_carried(self, both_hooks, monkeypatch):
+        self._status(both_hooks, monkeypatch,
+                     {"episodes_since_wrap": 4, "wrap_in_progress": False})
+        assert both_hooks.wrap_state() == (4, False)
+
+    def test_missing_flag_degrades_to_false_not_silence(self, both_hooks, monkeypatch):
+        """An older anneal that does not emit the field should still get the
+        ordinary nudge — degrade the flag, never the whole read."""
+        self._status(both_hooks, monkeypatch, {"episodes_since_wrap": 7})
+        assert both_hooks.wrap_state() == (7, False)
+
+    def test_non_bool_flag_degrades_to_false(self, both_hooks, monkeypatch):
+        self._status(both_hooks, monkeypatch,
+                     {"episodes_since_wrap": 7, "wrap_in_progress": "yes"})
+        assert both_hooks.wrap_state() == (7, False)
+
+    def test_failure_is_none(self, both_hooks, monkeypatch):
+        self._status(both_hooks, monkeypatch, None)
+        assert both_hooks.wrap_state() is None
+
+    def test_episodes_since_wrap_still_works(self, both_hooks, monkeypatch):
+        """The narrow view is retained for count-only callers."""
+        self._status(both_hooks, monkeypatch,
+                     {"episodes_since_wrap": 12, "wrap_in_progress": True})
+        assert both_hooks.episodes_since_wrap() == 12
+
+    def test_narrow_view_also_costs_exactly_one_status_call(self, both_hooks, monkeypatch):
+        """The delegating wrapper must not re-fetch. Caught by mutation: the
+        single-call assertion above pins wrap_state only, so an implementation
+        that called wrap_state twice here survived it. Every hook call is a
+        subprocess inside a per-prompt timeout budget."""
+        calls = []
+
+        def fake(sub_args, timeout, validator=None):
+            calls.append(sub_args)
+            return {"episodes_since_wrap": 12, "wrap_in_progress": True}
+
+        monkeypatch.setattr(both_hooks, "_anneal_json", fake)
+        assert both_hooks.episodes_since_wrap() == 12
+        assert len(calls) == 1
+
+    def test_blocked_message_does_not_tell_you_to_run_prepare_wrap(self, both_hooks):
+        """The whole finding in one assertion: the advice given during a stuck
+        wrap must not be the call that cannot succeed."""
+        msg = both_hooks.format_wrap_blocked(31)
+        assert "31" in msg
+        assert "wrap_cancel" in msg          # the escape hatch, now MCP-reachable
+        assert "anneal-memory wrap-cancel" in msg
+        assert "save_continuity" in msg      # the other way out
+        assert "do not call it yet" in msg   # explicit about prepare_wrap
+
+
+class TestCodexBodyParity:
+    def test_in_install_session_body_matches_across_adapters(self):
+        """in_install_session cannot be byte-identical (its docstring names the
+        adapter's own settings file), so pin the CODE instead — the half that
+        actually gates activation."""
+        import ast, textwrap
+
+        def body_dump(mod):
+            src = textwrap.dedent(inspect.getsource(mod.in_install_session))
+            tree = ast.parse(src).body[0]
+            # drop the docstring statement, keep the executable body
+            stmts = tree.body[1:] if (
+                isinstance(tree.body[0], ast.Expr)
+                and isinstance(tree.body[0].value, ast.Constant)
+                and isinstance(tree.body[0].value.value, str)
+            ) else tree.body
+            return "\n".join(ast.dump(s) for s in stmts)
+
+        assert body_dump(codex_hook) == body_dump(hook), (
+            "in_install_session's CODE drifted between the shared and Codex "
+            "copies — the activation gate must behave identically on both."
+        )
+
+
+class TestPreO42HelperCompat:
+    """L3 codex finding 1, which codex REPRODUCED before reporting.
+
+    Packs own the whole `activation` subtree, so a pack may layer its own
+    `_levain_hook.py` over the base tree. A 0.4.2 entry point composed against a
+    PRE-0.4.2 helper calls `hook.wrap_state`, which does not exist; the entry
+    point's structural fail-open catch swallows the AttributeError, and the hook
+    emits NOTHING — silently, with doctor still green.
+
+    That is a NEW way for the activation layer to go dark, introduced in the
+    release whose entire purpose is that it stopped going dark. The entry points
+    feature-detect instead.
+    """
+
+    def _entry(self, name):
+        """Load an entry-point hook module (not the shared helper)."""
+        import importlib.util
+        f = _HOOKS / name
+        spec = importlib.util.spec_from_file_location(f"_entry_{name}", f)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    class _PreO42Helper:
+        """A 0.4.1 helper: episodes_since_wrap, and no wrap_state."""
+        def __init__(self, n): self._n = n
+        def episodes_since_wrap(self, timeout=None): return self._n
+
+    class _Broken:
+        """Neither API — a helper older still, or a partial override."""
+
+    def test_falls_back_to_the_old_count_only_api(self):
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            mod = self._entry(name)
+            assert mod._wrap_state_compat(self._PreO42Helper(31)) == (31, False), (
+                f"{name} does not degrade to the pre-0.4.2 helper API"
+            )
+
+    def test_uses_wrap_state_when_the_helper_has_it(self):
+        class Modern:
+            def wrap_state(self, timeout=None): return (12, True)
+            def episodes_since_wrap(self, timeout=None):  # must NOT be used
+                raise AssertionError("fell back despite wrap_state being present")
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            assert self._entry(name)._wrap_state_compat(Modern()) == (12, True)
+
+    def test_a_helper_with_neither_api_is_silent_not_a_crash(self):
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            assert self._entry(name)._wrap_state_compat(self._Broken()) is None
+
+    def test_old_helper_returning_None_stays_None(self):
+        class Nothing:
+            def episodes_since_wrap(self, timeout=None): return None
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            assert self._entry(name)._wrap_state_compat(Nothing()) is None
+
+
+    def test_entry_point_survives_a_PARTIAL_helper_override(self, tmp_path, monkeypatch, capsys):
+        """The narrow gap the `hasattr(format_wrap_blocked)` guard exists for.
+
+        A helper that HAS `wrap_state` but lacks `format_wrap_blocked` is the
+        only way to reach that branch — the legacy fallback always reports
+        wrap_in_progress=False, so an old helper never gets there. Without the
+        guard this raises AttributeError, the structural catch swallows it, and
+        the hook goes silent exactly when it has the most to say: a wrap is
+        stuck. Found by mutation; the earlier test could not reach this line.
+        """
+        import io, json as _json, importlib.util
+
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            spec = importlib.util.spec_from_file_location(f"_ep_{name}_partial", _HOOKS / name)
+            mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+            install = tmp_path / f"partial_{name}"
+            (install / "activation").mkdir(parents=True, exist_ok=True)
+            (install / "activation" / "posture.md").write_text(
+                "# p\n## Posture\nBE PRESENT.\n", encoding="utf-8")
+            (install / "activation" / "recency_directives.md").write_text(
+                "# r\n## Recency\nSTAY SHARP.\n", encoding="utf-8")
+
+            helper = mod.hook
+            monkeypatch.setattr(helper, "install_root", lambda: install, raising=False)
+            monkeypatch.setattr(helper, "should_fire", lambda: True, raising=False)
+            monkeypatch.setattr(helper, "wrap_state",
+                                lambda timeout=None: (31, True), raising=False)
+            monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
+            for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+                        "crystal_recall", "compat_drift", "pack_drift"):
+                monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
+
+            payload = {"source": "startup"} if "session" in name else {"prompt": "hi"}
+            monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(payload)))
+            capsys.readouterr()
+            rc = mod.main()
+            out = capsys.readouterr().out.strip()
+            assert rc == 0
+            assert out, (
+                f"{name} went SILENT on a partial helper override — the "
+                f"activation layer dropped everything, not just the wrap line"
+            )
+            emitted = _json.loads(out)["hookSpecificOutput"]["additionalContext"]
+            assert emitted.strip(), f"{name} emitted an empty context block"
+            # It degrades to the ordinary nudge rather than crashing. That is
+            # worse advice than [wrap blocked] but it is not SILENCE, and
+            # silence is the failure this whole release exists to end. (Only
+            # session_start emits posture, so don't assert on that here.)
+            assert "STAY SHARP" in emitted or "wrap" in emitted.lower()
+
+    def test_codex_entry_points_have_the_same_shim(self):
+        """The whole point of the two-copy parity discipline."""
+        import importlib.util, inspect
+        codex_hooks = (Path(__file__).resolve().parents[1] / "levain" / "templates"
+                       / "adapters" / "codex" / "activation" / "hooks")
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            spec = importlib.util.spec_from_file_location(f"_cx_{name}", codex_hooks / name)
+            mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+            assert mod._wrap_state_compat(self._PreO42Helper(7)) == (7, False)
+            shared = inspect.getsource(self._entry(name)._wrap_state_compat)
+            assert inspect.getsource(mod._wrap_state_compat) == shared
+
+
+class TestWrapBlockedDoesNotUnderstateTheRisk:
+    """L3 codex finding 6. The first draft said "Nothing is lost either way"
+    while recommending `wrap_cancel`. anneal spawns one serve process per client
+    session against a shared store, so the wrap holder may be a LIVE sibling
+    mid-compression — and cancelling discards its in-flight work. A stuck-wrap
+    notice must not read as permission to destroy a peer session's work."""
+
+    def test_does_not_claim_cancelling_is_free(self, both_hooks):
+        msg = both_hooks.format_wrap_blocked(31)
+        assert "Nothing is lost either way" not in msg
+
+    def test_warns_that_the_wrap_may_belong_to_a_live_session(self, both_hooks):
+        msg = both_hooks.format_wrap_blocked(31)
+        assert "another session" in msg
+        assert "live one still compressing" in msg
+        assert "DISCARDS" in msg
+
+    def test_tells_the_agent_how_to_check_before_cancelling(self, both_hooks):
+        assert "anneal-memory wrap-status" in both_hooks.format_wrap_blocked(31)
+
+    def test_still_says_the_reader_s_own_episodes_are_safe(self, both_hooks):
+        """The reassurance that IS true must survive — an agent that thinks its
+        episodes are at risk will do something worse."""
+        msg = both_hooks.format_wrap_blocked(31)
+        assert "episodes are safe" in msg
+        assert "next prepare_wrap picks them up" in msg
+
+    def test_ENTRY_POINT_survives_a_pre_042_helper(self, tmp_path, monkeypatch, capsys):
+        """The regression that actually matters, and the one codex reproduced.
+
+        ⚠ Testing `_wrap_state_compat` alone is NOT this test: a mutation that
+        put `hook.wrap_state(...)` back at the CALL SITE survived the direct
+        tests, because they never exercised the call site. This drives `main()`
+        with a pre-0.4.2 helper module in place and asserts the hook still
+        EMITS — the failure mode is silence, so silence is what must be pinned.
+        """
+        import io, json as _json, importlib.util
+
+        for name in ("session_start.py", "user_prompt_submit.py"):
+            spec = importlib.util.spec_from_file_location(f"_ep_{name}_pre", _HOOKS / name)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            install = tmp_path / f"inst_{name}"
+            (install / "activation").mkdir(parents=True, exist_ok=True)
+            (install / "activation" / "posture.md").write_text(
+                "# p\n## Posture\nBE PRESENT.\n", encoding="utf-8")
+            (install / "activation" / "recency_directives.md").write_text(
+                "# r\n## Recency\nSTAY SHARP.\n", encoding="utf-8")
+
+            # A 0.4.1-era helper: real read_blocks/emit/should_fire, but the
+            # wrap surface is count-only — no wrap_state, no format_wrap_blocked.
+            helper = mod.hook
+            monkeypatch.setattr(helper, "install_root", lambda: install, raising=False)
+            monkeypatch.setattr(helper, "should_fire", lambda: True, raising=False)
+            monkeypatch.setattr(helper, "episodes_since_wrap",
+                                lambda timeout=None: 40, raising=False)
+            monkeypatch.delattr(helper, "wrap_state", raising=False)
+            monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
+            for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+                        "crystal_recall", "compat_drift", "pack_drift"):
+                monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
+
+            payload = {"source": "startup"} if "session" in name else {"prompt": "hi"}
+            monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(payload)))
+            capsys.readouterr()
+            rc = mod.main()
+            out = capsys.readouterr().out.strip()
+
+            assert rc == 0
+            assert out, (
+                f"{name} emitted NOTHING against a pre-0.4.2 helper — the "
+                f"activation layer went silently dark, which is the exact "
+                f"failure this release exists to end"
+            )
+            emitted = _json.loads(out)["hookSpecificOutput"]["additionalContext"]
+            # It degrades to the pre-0.4.2 nudge; it does not go silent.
+            assert "40" in emitted
