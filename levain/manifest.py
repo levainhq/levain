@@ -66,7 +66,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "0.9.7"
+KNOWN_GOOD_ANNEAL = "0.9.8"
 
 # The anneal store section-schema a partnership entity runs on (anneal
 # AM-INITSCHEMA). A store left on the default silently runs the 4-section ops

@@ -79,6 +79,10 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_install_layout(install, expect_hooks=not hookless))
     if not hookless:
         core.extend(_check_hook_freshness(install))
+    if not hookless:
+        # Additive scope report — a hookless (openhands) entity has no hooks and
+        # therefore no activation gate to report on.
+        core.extend(_check_activation_scope(install))
     core.extend(_check_seed_content(install))
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
@@ -910,6 +914,268 @@ def _hook_command_targets(
         except OSError:
             continue
     return False
+
+
+# ---------------------------------------------------------------------------
+# Activation scope — the gate doctor never reported (Alex De Groodt, 2026-08-04)
+#
+# ⚠ THE FINDING IN ONE LINE: a healthy-looking doctor was compatible with the
+# WHOLE activation layer being off. Every static check passed — hooks present,
+# wired to this install, python resolvable, store open — because they all check
+# FILES. What decides whether a hook emits anything is a RUNTIME gate,
+# `_levain_hook.in_install_session()`, and doctor never mentioned it existed.
+# Alex moved Levain into a global tool, worked in his own project directories,
+# and lost posture / recency directives / spore surfacing / crystal recall / the
+# wrap nudge in every session that mattered, for weeks, with doctor green.
+#
+# ⛔ DELIBERATELY NARROW, AND IT MUST STAY THAT WAY. This is additive: it reads
+# `.levain/config.json` and the user-level harness settings and reports. It does
+# NOT touch `_check_hook_freshness`, `_hook_body`, `PackProvenance`, or anything
+# else the doctor redesign owns — that redesign is BLOCKED on a design defect
+# (an init-time receipt cannot notice the package moved) and this finding is the
+# same CLASS, so folding them together would ship the narrow fix behind a
+# blocker. Recorded, not merged.
+#
+# Scope is a GAUGE in the GATE/GAUGE/FEED tiering, with one exception: the
+# combination "install-scoped + wired ONLY at user level" is not a soft reading,
+# it is a dark install, and it fails.
+
+_SCOPE_CONFIG_REL = (".levain", "config.json")
+
+
+def _configured_scope(install: Path) -> str:
+    """The activation scope this install declares: ``"global"`` or ``"install"``.
+
+    MUST agree with ``_levain_hook.configured_scope()`` — same key, same
+    fail-closed rule (anything that is not exactly "global" means install
+    scope). The hook cannot be imported here (it is a template, and it resolves
+    its own install root from ``__file__``), so the contract is pinned by test
+    instead: ``TestScopeAgreesWithHook``.
+
+    ``LEVAIN_SCOPE`` is NOT read HERE — this function answers "what does the
+    install DECLARE", which is a property of the install. The env override is
+    handled by :func:`_env_scope_caveat` and reported alongside, rather than
+    folded in.
+
+    ⚠ AN EARLIER VERSION IGNORED THE ENV VAR ENTIRELY, on the reasoning that
+    doctor's environment is not the session's. Two L3 seats independently
+    called that wrong, and they were right: it holds for a per-invocation
+    ``LEVAIN_SCOPE=global claude``, and breaks the moment an operator exports it
+    from a shell profile — which is the natural way to make "always on" durable.
+    Then doctor's env IS every session's env, and staying silent misreports in
+    BOTH directions: green while the layer is dark (config says global, profile
+    says install), and a hard FAIL on an install that is working fine (config
+    says install, profile says global). The second is worse than saying nothing,
+    because it sends an operator to fix something that is not broken.
+
+    The fix is not to guess which kind of export it is. It is to stop asserting
+    a scope that cannot be verified from here, and say so.
+    """
+    try:
+        data = json.loads(install.joinpath(*_SCOPE_CONFIG_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "install"
+    if not isinstance(data, dict):
+        return "install"
+    value = data.get("scope")
+    if isinstance(value, str) and value.strip().lower() == "global":
+        return "global"
+    return "install"
+
+
+def _user_level_wiring(install: Path) -> list[str]:
+    """Settings files wiring THIS install's hooks from a place `levain init`
+    did NOT put them — i.e. wiring that is an operator CHOICE.
+
+    Returns display paths, or [] (absent/unreadable files included — this is a
+    report, never a hard failure on someone else's config).
+
+    ⛔ `~/.codex/hooks.json` IS DELIBERATELY NOT CHECKED, AND THIS IS THE WHOLE
+    SUBTLETY OF THE CHECK. Codex has no per-project hooks file, so
+    `levain init --adapter codex` writes the GLOBAL `~/.codex/hooks.json`
+    itself (`install.py`, `hooks_target`). For a Codex install, user-level
+    wiring is not a signal of anything — it is the only deployment there is,
+    and every Codex install on earth would match it.
+
+    ⚠ THIS EXACT MISTAKE ALREADY SHIPPED ONCE. levain 0.4.0 turned `doctor`
+    PERMANENTLY RED for every Codex operator, because `_check_hook_freshness`
+    compared every install against the Claude Code tree — and it went out in
+    the release built to carry this same reporter's previous fixes. The first
+    draft of THIS function repeated it, and a green suite did not catch that
+    either; running `levain doctor` against a real Codex install did. The
+    defect is never "does the code run", it is always "which tree is it
+    pointed at".
+
+    Claude Code is different in the way that matters: `levain init` writes
+    `<install>/.claude/settings.json`, INSIDE the install. So hooks wired from
+    `~/.claude/settings.json` are something the operator did on purpose, and
+    combined with install scope that is precisely the dark configuration —
+    invisible to every check that only reads the install's own settings.
+    """
+    found: list[str] = []
+    # CLAUDE_CONFIG_DIR relocates the whole ~/.claude tree; checking only the
+    # home path would read a directory Claude Code is not using and false-green
+    # the dark configuration (codex L3).
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(cfg_dir).expanduser() if cfg_dir else Path.home() / ".claude"
+    for path in [root / "settings.json"]:
+        try:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            continue
+        for event, script in (("SessionStart", "session_start.py"),
+                              ("UserPromptSubmit", "user_prompt_submit.py")):
+            entries = hooks.get(event)
+            if isinstance(entries, list) and _user_entry_targets(entries, install, script):
+                found.append(str(path))
+                break
+    return found
+
+
+def _user_entry_targets(entries: list, install: Path, expected_script: str) -> bool:
+    """Does ANY command in these user-level entries run THIS install's hook?
+
+    Deliberately NOT ``_hook_command_targets``, for two reasons codex found at
+    L3, both of which make that function wrong for a user-level file:
+
+    1. It inspects only the FIRST command it finds across all entries. A foreign
+       hook registered ahead of Levain's would hide Levain's entirely, and the
+       dark configuration would go unreported. Here every entry and every hook
+       is scanned.
+    2. It substitutes ``${CLAUDE_PROJECT_DIR}`` with this install's path. That
+       is right for the install's OWN settings file, where the placeholder does
+       resolve to the install — and wrong here, because in a user-level file the
+       harness expands it to whatever project is open, so such a command never
+       runs this install's hook at all. Treating it as wiring to this install
+       would then send the operator to fix a scope that was never the problem.
+       User-level wiring must name an absolute path.
+
+    Fail-soft on shape: a foreign settings file may contain anything (``None``
+    entries included — an unguarded ``entry.get`` there aborted the whole doctor
+    run). Never raise; this is a report about someone else's config.
+    """
+    expected = (install / "activation" / "hooks" / expected_script).resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks") or []:
+            if not isinstance(hook, dict):
+                continue
+            cmd = hook.get("command")
+            if not isinstance(cmd, str) or not cmd:
+                continue
+            try:
+                tokens = shlex.split(cmd)
+            except ValueError:
+                continue
+            for tok in tokens[1:]:
+                if "${CLAUDE_PROJECT_DIR}" in tok or "$CLAUDE_PROJECT_DIR" in tok:
+                    continue  # resolves elsewhere at user level — not this install
+                try:
+                    if Path(tok).resolve() == expected:
+                        return True
+                except (OSError, ValueError):
+                    continue
+    return False
+
+
+def _env_scope_caveat() -> str:
+    """A note when ``LEVAIN_SCOPE`` is set in doctor's own environment.
+
+    Returns "" when unset. Deliberately does NOT resolve the ambiguity: doctor
+    cannot tell a one-off ``LEVAIN_SCOPE=global levain doctor`` from a line in
+    the operator's shell profile, and those two mean opposite things about every
+    other session. Naming the value and the ambiguity is the honest report.
+    """
+    raw = os.environ.get("LEVAIN_SCOPE", "").strip()
+    if not raw:
+        return ""
+    effective = "global" if raw.lower() == "global" else "install"
+    return (
+        f" — NOTE: LEVAIN_SCOPE={raw} is set in this shell, which overrides the "
+        f"config and resolves to {effective} scope. If that is exported "
+        f"persistently (a shell profile), it applies to your real sessions too "
+        f"and the config line above is not the whole story"
+    )
+
+
+def _check_activation_scope(install: Path) -> list[CheckResult]:
+    """Report the runtime gate, and fail the one combination that is dark."""
+    scope = _configured_scope(install)
+    user_wiring = _user_level_wiring(install)
+    env_note = _env_scope_caveat()
+    env_raw = os.environ.get("LEVAIN_SCOPE", "").strip().lower()
+
+    if scope == "global":
+        # Careful with this wording. Scope opens the RUNTIME GATE; it does not
+        # make a harness INVOKE the hook. A Claude Code install wired only in
+        # <install>/.claude/settings.json is still never invoked outside that
+        # project, so "fires in every session" would be an overclaim doctor
+        # cannot back (codex L3). Report the gate, and name the other half.
+        detail = (
+            "global — the gate is open, so the hooks no longer suppress "
+            "themselves outside the install "
+            f"(set in {Path(*_SCOPE_CONFIG_REL)}). They still only run where "
+            "your harness actually invokes them, so wire them at the user level "
+            "if you want them everywhere"
+        ) + env_note
+        return [CheckResult("activation scope", True, detail)]
+
+    if user_wiring and env_raw != "global":
+        # env_raw == "global" means the gate IS open for every session in this
+        # environment, so the install is NOT dark and failing it would be a
+        # false alarm sending the operator to fix working software.
+        where = ", ".join(user_wiring)
+        return [
+            CheckResult(
+                "activation scope",
+                False,
+                f"install-scoped, but this install's hooks are wired at the user "
+                f"level ({where}) — they run for sessions outside the install and "
+                f"then SUPPRESS THEMSELVES, so posture, recency directives, spore "
+                f"surfacing, crystal recall and the wrap nudge are all silently off "
+                f"in those sessions" + env_note,
+                # A fresh `levain init` writes NO config.json, so this has to
+                # say CREATE, and it has to show the literal JSON — an operator
+                # told to "opt in to global scope" with no example has been
+                # given a diagnosis, not a fix.
+                'Opt in to global scope: create or edit '
+                f'{Path(*_SCOPE_CONFIG_REL)} so it contains {{"scope": "global"}} '
+                "(it survives `levain update`), or set LEVAIN_SCOPE=global for a "
+                "single session. To keep the hooks scoped instead, remove the "
+                "user-level wiring and use the install's own .claude/settings.json.",
+            )
+        ]
+
+    detail = (
+        f"install-scoped (the default) — hooks fire only for sessions whose "
+        f"working directory is inside {install}"
+    )
+    from levain.install import effective_adapter
+    # NOT `(install / "AGENTS.md").is_file()`: a `levain init --adapter
+    # claude-code --force` over a former codex install leaves AGENTS.md behind,
+    # and the operator would get a Codex diagnostic about hooks their install no
+    # longer uses — a wrong-artifact reading inside the check written to stop
+    # wrong-artifact readings (glm L3). `effective_adapter` is the shared
+    # classifier doctor/verify/run already agree on.
+    if effective_adapter(install) == "codex":
+        # Codex wires ~/.codex/hooks.json globally by design, so this operator's
+        # hooks DO run in every Codex session on the machine and then no-op
+        # outside the install. Saying so is the point of the check: that is the
+        # condition that looked like health while the activation layer was off.
+        detail += (
+            " — your Codex hooks are wired globally, so they run in every Codex "
+            'session and stay silent outside it. Set {"scope": "global"} in '
+            f"{Path(*_SCOPE_CONFIG_REL)} if you want the entity present everywhere"
+        )
+    return [CheckResult("activation scope", True, detail + env_note)]
 
 
 def _check_openhands(install: Path) -> list[CheckResult]:

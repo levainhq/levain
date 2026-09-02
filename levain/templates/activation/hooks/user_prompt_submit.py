@@ -54,6 +54,31 @@ SPORE_CHECK_TIMEOUT = 2.0
 CRYSTAL_CHECK_TIMEOUT = 2.0
 
 
+
+def _wrap_state_compat(hook_mod, timeout=None):
+    """`(episodes, wrap_in_progress)` from whichever helper API this install has.
+
+    ⚠ WHY THIS IS NOT JUST `hook.wrap_state(...)`. A pack may layer its own
+    `activation/hooks/_levain_hook.py` over the base tree (packs own the whole
+    `activation` subtree), so a 0.4.2 entry point can end up composed against a
+    PRE-0.4.2 helper that has `episodes_since_wrap` and no `wrap_state`. The
+    resulting AttributeError is swallowed by this file's structural fail-open
+    catch, and every hook then emits NOTHING — silently, with doctor still
+    green. That is the exact failure this release exists to end, so the entry
+    points must not hard-depend on a helper symbol they cannot guarantee.
+
+    Falls back to the old count-only API, which loses only the wrap-blocked
+    branch — the pre-0.4.2 behaviour, which is the right degradation.
+    """
+    fn = getattr(hook_mod, "wrap_state", None)
+    if fn is not None:
+        return fn(timeout=timeout) if timeout is not None else fn()
+    legacy = getattr(hook_mod, "episodes_since_wrap", None)
+    if legacy is None:
+        return None
+    n = legacy(timeout=timeout) if timeout is not None else legacy()
+    return None if n is None else (n, False)
+
 def main() -> int:
     try:
         payload = hook.read_stdin()
@@ -98,14 +123,21 @@ def main() -> int:
                 sections.append(hook.format_crystal_recall(patterns))
 
         # Layer D — ambient nudge. Independent of the sections above.
-        n = hook.episodes_since_wrap(timeout=WRAP_CHECK_TIMEOUT)
-        if n is not None and n >= WRAP_NUDGE_THRESHOLD:
-            sections.append(
-                f"[wrap nudge] {n} episodes recorded since the last wrap. At "
-                f"the next natural pause, run the wrap sequence (prepare_wrap "
-                f"-> compress -> save_continuity) — that is where the "
-                f"partnership compounds across sessions."
-            )
+        # Reads wrap_state, not episodes_since_wrap: with a wrap already open,
+        # "run prepare_wrap" is advice that can only raise, and repeating it every
+        # prompt is how a stuck wrap stays stuck (Alex De Groodt, 2026-08-04).
+        state = _wrap_state_compat(hook, timeout=WRAP_CHECK_TIMEOUT)
+        if state is not None:
+            n, wrap_in_progress = state
+            if wrap_in_progress and hasattr(hook, "format_wrap_blocked"):
+                sections.append(hook.format_wrap_blocked(n))
+            elif n >= WRAP_NUDGE_THRESHOLD:
+                sections.append(
+                    f"[wrap nudge] {n} episodes recorded since the last wrap. At "
+                    f"the next natural pause, run the wrap sequence (prepare_wrap "
+                    f"-> compress -> save_continuity) — that is where the "
+                    f"partnership compounds across sessions."
+                )
 
         if sections:
             hook.emit("\n\n".join(sections), "UserPromptSubmit")

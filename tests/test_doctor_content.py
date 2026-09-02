@@ -864,3 +864,399 @@ def test_operator_markdown_lives_outside_the_scanned_directory(tmp_path: Path):
         assert (tr / "activation" / "posture.md").is_file()
         assert not (hooks / "posture.md").exists()
         assert not (hooks / "recency_directives.md").exists()
+
+
+# ===========================================================================
+# 0.4.2 — L3: doctor reports the activation gate (Alex De Groodt, 2026-08-04).
+#
+# The finding: a green doctor was compatible with the entire activation layer
+# being off, because every static check reads FILES and what actually decides
+# whether a hook emits anything is a runtime gate doctor never mentioned.
+# ===========================================================================
+
+from levain.doctor import (  # noqa: E402
+    _check_activation_scope,
+    _configured_scope,
+    _user_level_wiring,
+)
+
+
+def _scope_install(tmp_path: Path, payload: str | None = None) -> Path:
+    (tmp_path / ".levain").mkdir(parents=True, exist_ok=True)
+    if payload is not None:
+        (tmp_path / ".levain" / "config.json").write_text(payload, encoding="utf-8")
+    return tmp_path
+
+
+class TestConfiguredScope:
+    def test_absent_config_is_install_scope(self, tmp_path: Path):
+        assert _configured_scope(_scope_install(tmp_path)) == "install"
+
+    def test_global_opt_in(self, tmp_path: Path):
+        assert _configured_scope(_scope_install(tmp_path, '{"scope": "global"}')) == "global"
+
+    def test_case_and_whitespace_tolerated(self, tmp_path: Path):
+        assert _configured_scope(_scope_install(tmp_path, '{"scope": " GLOBAL "}')) == "global"
+
+    @pytest.mark.parametrize("payload", [
+        '{"scope": "globl"}', '{"scope": 1}', '{"scope": null}',
+        '{}', 'not json', '[]', '{"other": "global"}',
+    ])
+    def test_fail_closed(self, tmp_path: Path, payload: str):
+        """Anything that is not an exact opt-in reads as install scope — doctor
+        must never report 'global' off a malformed config, or it would green-light
+        the dark state it exists to catch."""
+        assert _configured_scope(_scope_install(tmp_path, payload)) == "install"
+
+
+class TestScopeAgreesWithHook:
+    """doctor._configured_scope and _levain_hook.configured_scope are two
+    implementations of one rule (the hook is a template and cannot be imported
+    by the package). Two pieces of code computing one fact is exactly how the
+    scope key would come to mean different things in doctor and at runtime —
+    which is this finding's own class. Pin them together."""
+
+    def _hook(self):
+        import importlib.util
+        f = (Path(__file__).resolve().parents[1] / "levain" / "templates"
+             / "activation" / "hooks" / "_levain_hook.py")
+        spec = importlib.util.spec_from_file_location("_levain_hook_scopechk", f)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @pytest.mark.parametrize("payload", [
+        '{"scope": "global"}', '{"scope": "GLOBAL"}', '{"scope": " global "}',
+        '{"scope": "globl"}', '{"scope": "install"}', '{"scope": 1}',
+        '{}', 'not json', '[]',
+    ])
+    def test_same_verdict_for_the_same_config(self, tmp_path, monkeypatch, payload):
+        install = _scope_install(tmp_path, payload)
+        hookmod = self._hook()
+        monkeypatch.setattr(hookmod, "install_root", lambda: install)
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        assert _configured_scope(install) == hookmod.configured_scope()
+
+    @pytest.mark.parametrize("payload", [
+        None,                     # no config file at all
+        '{}',                     # config present, no scope key
+        '{"scope": "install"}',   # config present, explicitly install-scoped
+        '{"other": 1}',
+    ])
+    def test_doctor_ignores_LEVAIN_SCOPE(self, tmp_path, monkeypatch, payload):
+        """The env var is a per-session override and doctor's env is not the
+        session's. Reading it here would report doctor's own environment as
+        though it were the entity's — the wrong-artifact reading this check
+        exists to stop.
+
+        ⚠ PARAMETERISED DELIBERATELY. The single no-config case did not reach
+        the code it was testing: with no config.json the function returns from
+        its read-failure branch before any scope resolution runs, so a mutant
+        that read LEVAIN_SCOPE further down SURVIVED this test. Caught by
+        mutation. The present-but-scopeless cases are the ones that exercise
+        the resolution path."""
+        install = _scope_install(tmp_path, payload)
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        assert _configured_scope(install) == "install"
+
+
+class TestUserLevelWiring:
+    def _wire(self, home: Path, rel: tuple[str, ...], install: Path, script: str):
+        p = home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"/usr/bin/python3 {install / 'activation' / 'hooks' / script}",
+        }]}]}}), encoding="utf-8")
+
+    def test_detects_claude_user_level_wiring(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        self._wire(home, (".claude", "settings.json"), install, "session_start.py")
+        assert _user_level_wiring(install) == [str(home / ".claude" / "settings.json")]
+
+    def test_codex_global_hooks_are_NOT_flagged(self, tmp_path, monkeypatch):
+        """⚠ REGRESSION GUARD FOR A DEFECT THAT ALREADY SHIPPED ONCE.
+
+        levain 0.4.0 turned `doctor` permanently red for every Codex operator
+        by pointing a check at the wrong tree — in the release built to carry
+        this same reporter's previous fixes. The first draft of this check did
+        it again: `levain init --adapter codex` WRITES ~/.codex/hooks.json
+        itself (Codex has no per-project hooks file), so treating that as
+        operator intent fails every Codex install on earth.
+
+        A green suite did not catch it either time. Running `levain doctor`
+        against a real Codex install did.
+        """
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        self._wire(home, (".codex", "hooks.json"), install, "session_start.py")
+        assert _user_level_wiring(install) == []
+
+    def test_a_codex_install_is_never_failed_by_this_check(self, tmp_path, monkeypatch):
+        """The end-to-end form of the guard above: a normal Codex install —
+        AGENTS.md tag-file, hooks in ~/.codex/hooks.json, no scope opt-in —
+        must come back OK, and must still be TOLD where its hooks fire."""
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (install / ".levain").mkdir()
+        (install / "AGENTS.md").write_text("# codex", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        self._wire(home, (".codex", "hooks.json"), install, "session_start.py")
+        [r] = _check_activation_scope(install)
+        assert r.ok, f"codex install false-FAILed: {r.detail}"
+        assert "wired globally" in r.detail
+        assert '"scope": "global"' in r.detail
+
+    def test_stale_AGENTS_md_does_not_produce_a_codex_diagnostic(self, tmp_path, monkeypatch):
+        """glm L3: `levain init --adapter claude-code --force` over a former
+        codex install leaves AGENTS.md behind. Keying the Codex-specific detail
+        off that tag-file hands a Claude Code operator a diagnostic about Codex
+        hooks their install no longer uses — a wrong-artifact reading inside the
+        check written to stop wrong-artifact readings. `effective_adapter` is
+        the shared classifier, and it puts CLAUDE.md first."""
+        home = tmp_path / "home"; home.mkdir()
+        install = tmp_path / "inst"; install.mkdir(); (install / ".levain").mkdir()
+        (install / "CLAUDE.md").write_text("# claude", encoding="utf-8")
+        (install / "AGENTS.md").write_text("# stale codex leftover", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        [r] = _check_activation_scope(install)
+        assert r.ok
+        assert "Codex" not in r.detail, (
+            f"stale AGENTS.md produced a Codex diagnostic on a claude-code "
+            f"install: {r.detail}"
+        )
+
+    def test_ignores_wiring_for_a_DIFFERENT_install(self, tmp_path, monkeypatch):
+        """Two Levain installs on one machine must not make each other look
+        misconfigured."""
+        home = tmp_path / "home"
+        install = tmp_path / "inst"; other = tmp_path / "other"
+        install.mkdir(); other.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        self._wire(home, (".claude", "settings.json"), other, "session_start.py")
+        assert _user_level_wiring(install) == []
+
+    def test_no_home_files_is_empty(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; home.mkdir()
+        install = tmp_path / "inst"; install.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        assert _user_level_wiring(install) == []
+
+    def test_unreadable_home_settings_is_not_a_crash(self, tmp_path, monkeypatch):
+        """Never hard-fail on someone else's config file."""
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text("{ broken", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        assert _user_level_wiring(install) == []
+
+
+class TestActivationScopeCheck:
+    def _no_home(self, tmp_path, monkeypatch):
+        home = tmp_path / "emptyhome"; home.mkdir(exist_ok=True)
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+    def test_default_install_scope_reports_the_condition(self, tmp_path, monkeypatch):
+        """Green, but it must SAY where hooks fire — before this, doctor never
+        mentioned the gate at all, which is how a dark install read healthy."""
+        self._no_home(tmp_path, monkeypatch)
+        install = _scope_install(tmp_path / "i")
+        [r] = _check_activation_scope(install)
+        assert r.ok
+        assert "install-scoped" in r.detail
+        assert str(install) in r.detail
+
+    def test_global_scope_is_reported(self, tmp_path, monkeypatch):
+        self._no_home(tmp_path, monkeypatch)
+        install = _scope_install(tmp_path / "i", '{"scope": "global"}')
+        [r] = _check_activation_scope(install)
+        assert r.ok
+        assert "global" in r.detail
+
+    def test_the_dark_configuration_FAILS(self, tmp_path, monkeypatch):
+        """Alex's exact state: hooks wired at user level, scope left at the
+        default, so they fire everywhere and then suppress themselves. This is
+        the one combination that is not a soft reading — it is an outage."""
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (install / ".levain").mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        p = home / ".claude" / "settings.json"
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{
+            "type": "command",
+            "command": f"python3 {install / 'activation' / 'hooks' / 'user_prompt_submit.py'}",
+        }]}]}}), encoding="utf-8")
+
+        [r] = _check_activation_scope(install)
+        assert not r.ok
+        assert "user level" in r.detail
+        # The remedy must be the thing that actually fixes it.
+        assert '{"scope": "global"}' in (r.hint or "")
+        assert "LEVAIN_SCOPE=global" in (r.hint or "")
+
+    def test_user_level_wiring_with_global_scope_is_fine(self, tmp_path, monkeypatch):
+        """Once opted in, user-level wiring is the CORRECT deployment — it must
+        not be reported as a problem."""
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (install / ".levain").mkdir()
+        (install / ".levain" / "config.json").write_text('{"scope": "global"}', encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        p = home / ".claude" / "settings.json"
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"python3 {install / 'activation' / 'hooks' / 'session_start.py'}",
+        }]}]}}), encoding="utf-8")
+        [r] = _check_activation_scope(install)
+        assert r.ok
+
+
+# ===========================================================================
+# 0.4.2 L3 findings — defects in the ABOVE checks, found by the review mesh.
+# Each of these is a bug in code written earlier in this same release.
+# ===========================================================================
+
+from levain.doctor import _env_scope_caveat, _user_entry_targets  # noqa: E402
+
+
+class TestEnvScopeCaveat:
+    """CONSENSUS L3 finding (two independent seats, both HIGH).
+
+    `_configured_scope` reads only the config file. That is right for "what
+    does the install declare", and WRONG as the whole report: an operator who
+    exports LEVAIN_SCOPE from a shell profile has changed every real session,
+    including doctor's own. Silence there misreported in both directions —
+    green while dark, and a hard FAIL on a working install.
+    """
+
+    def test_no_caveat_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        assert _env_scope_caveat() == ""
+
+    def test_caveat_names_the_value_and_the_ambiguity(self, monkeypatch):
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        note = _env_scope_caveat()
+        assert "LEVAIN_SCOPE=global" in note
+        assert "persistently" in note
+
+    def test_caveat_reports_the_EFFECTIVE_scope_not_the_raw_value(self, monkeypatch):
+        """A typo resolves to install scope at runtime; the note must say so
+        rather than echoing the raw string as though it were meaningful."""
+        monkeypatch.setenv("LEVAIN_SCOPE", "globl")
+        assert "resolves to install scope" in _env_scope_caveat()
+
+    def test_caveat_rides_every_branch(self, tmp_path, monkeypatch):
+        home = tmp_path / "h"; home.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        install = _scope_install(tmp_path / "i")
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        assert "LEVAIN_SCOPE=global" in _check_activation_scope(install)[0].detail
+        (install / ".levain" / "config.json").write_text('{"scope":"global"}')
+        assert "LEVAIN_SCOPE=global" in _check_activation_scope(install)[0].detail
+
+    def test_no_false_FAIL_when_the_env_var_opens_the_gate(self, tmp_path, monkeypatch):
+        """The damaging half. Hooks wired at user level + install-scoped config
+        would FAIL — but with LEVAIN_SCOPE=global exported, the gate is open and
+        the install is working. Failing it sends the operator to fix nothing."""
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (install / ".levain").mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        p = home / ".claude" / "settings.json"; p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"python3 {install / 'activation' / 'hooks' / 'session_start.py'}",
+        }]}]}}))
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        assert not _check_activation_scope(install)[0].ok      # dark: correct FAIL
+        monkeypatch.setenv("LEVAIN_SCOPE", "global")
+        assert _check_activation_scope(install)[0].ok          # not dark: no FAIL
+
+
+class TestUserEntryTargets:
+    """L3 codex findings 3, 5 and 7 — all in `_user_level_wiring`'s scanning."""
+
+    def _cmd(self, install, script):
+        return f"/usr/bin/python3 {install / 'activation' / 'hooks' / script}"
+
+    def test_finds_levain_behind_a_FOREIGN_hook(self, tmp_path):
+        """codex#3: the old helper returned on the FIRST command it found, so a
+        foreign hook registered ahead of Levain's hid it completely and the dark
+        configuration went unreported."""
+        install = tmp_path / "i"; install.mkdir()
+        entries = [
+            {"hooks": [{"type": "command", "command": "/usr/bin/env somebody-elses-hook"}]},
+            {"hooks": [{"type": "command", "command": self._cmd(install, "session_start.py")}]},
+        ]
+        assert _user_entry_targets(entries, install, "session_start.py") is True
+
+    def test_finds_levain_as_a_LATER_hook_in_one_entry(self, tmp_path):
+        install = tmp_path / "i"; install.mkdir()
+        entries = [{"hooks": [
+            {"type": "command", "command": "/usr/bin/env other"},
+            {"type": "command", "command": self._cmd(install, "session_start.py")},
+        ]}]
+        assert _user_entry_targets(entries, install, "session_start.py") is True
+
+    def test_placeholder_wiring_is_NOT_this_install(self, tmp_path):
+        """codex#5: at user level `${CLAUDE_PROJECT_DIR}` expands to whatever
+        project is open, so such a command never runs THIS install's hook.
+        Substituting the install (right for the install's own settings file)
+        would send the operator to fix a scope that was never the problem."""
+        install = tmp_path / "i"; install.mkdir()
+        entries = [{"hooks": [{"type": "command",
+                               "command": "python3 ${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py"}]}]
+        assert _user_entry_targets(entries, install, "session_start.py") is False
+
+    @pytest.mark.parametrize("entries", [
+        [None],
+        [{"hooks": [None]}],
+        [{"hooks": "not-a-list"}],
+        [{"hooks": [{"command": None}]}],
+        [{"hooks": [{"command": 42}]}],
+        [{"hooks": [{"command": 'unbalanced "quote'}]}],
+        ["a string"],
+        [{}],
+    ])
+    def test_never_raises_on_a_malformed_foreign_config(self, tmp_path, entries):
+        """codex#7: `{"hooks":{"SessionStart":[null]}}` reached `entry.get` on
+        None. The AttributeError escaped `_user_level_wiring`'s (OSError,
+        ValueError) catch and ABORTED the whole doctor run — breaking the
+        function's own documented promise never to hard-fail on someone else's
+        config file."""
+        install = tmp_path / "i"; install.mkdir()
+        assert _user_entry_targets(entries, install, "session_start.py") is False
+
+    def test_doctor_survives_a_null_entry_end_to_end(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; install = tmp_path / "inst"
+        install.mkdir(); (install / ".levain").mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        p = home / ".claude" / "settings.json"; p.parent.mkdir(parents=True)
+        p.write_text('{"hooks":{"SessionStart":[null]}}')
+        [r] = _check_activation_scope(install)   # must not raise
+        assert r.ok
+
+
+class TestClaudeConfigDir:
+    """codex#4: CLAUDE_CONFIG_DIR relocates the whole ~/.claude tree. Reading
+    only the home path checks a directory Claude Code is not using, and
+    false-greens the dark configuration."""
+
+    def test_wiring_found_under_CLAUDE_CONFIG_DIR(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; home.mkdir()
+        alt = tmp_path / "altcfg"; alt.mkdir()
+        install = tmp_path / "inst"; install.mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(alt))
+        (alt / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"python3 {install / 'activation' / 'hooks' / 'session_start.py'}",
+        }]}]}}))
+        assert _user_level_wiring(install) == [str(alt / "settings.json")]

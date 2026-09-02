@@ -97,13 +97,73 @@ def store_path() -> Path:
     return install_root() / ".levain" / "memory.db"
 
 
+# ---- Activation scope — install-scoped by default, global by explicit opt-in ----
+# Reported by Alex De Groodt 2026-08-04. He moved Levain into a global tool and
+# wired the hooks at the user level so his entity would be present in the projects
+# he actually works in. in_install_session() gates on cwd containment alone, so
+# the entire activation layer — posture, recency directives, spore surfacing,
+# crystal recall, the wrap nudge — went dark in every one of those sessions, while
+# `levain doctor` reported healthy. He was carrying a local patch that `levain
+# update` overwrote on each upgrade.
+#
+# The cwd gate is CORRECT as a default and is not being weakened: it is what stops
+# an unrelated session in a different codebase inheriting this partnership's
+# posture. What was missing is a way to SAY you want the global behaviour. Two
+# channels, config first because it survives in the install and doctor can see it:
+#
+#   .levain/config.json  {"scope": "global"}   — durable, survives `levain update`
+#   LEVAIN_SCOPE=global                        — per-session override, wins
+#
+# FAIL-CLOSED ON THE CONTAMINATION AXIS: anything that is not exactly "global"
+# (absent, unreadable, malformed, misspelled) resolves to install scope. Silently
+# staying scoped is the status quo; silently going global leaks the partnership's
+# posture into a stranger's workspace, so an unreadable config must never be the
+# thing that opens the gate.
+_SCOPE_INSTALL = "install"
+_SCOPE_GLOBAL = "global"
+
+
+def _config_dict() -> dict:
+    """Fail-soft read of ``<install>/.levain/config.json`` → dict (``{}`` on any
+    failure). Mirrors the dashboard's ``_read_levain_config``. Stdlib only — the
+    hook never imports the levain package (it runs on a stranger install)."""
+    try:
+        raw = (install_root() / ".levain" / "config.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def configured_scope() -> str:
+    """The activation scope this install asked for: ``"global"`` or ``"install"``.
+
+    ``LEVAIN_SCOPE`` (env) beats ``.levain/config.json`` ``"scope"``, so an
+    operator can override one session without editing the install. Every value
+    other than a case-insensitive ``"global"`` resolves to ``"install"`` — see the
+    fail-closed note above."""
+    env = os.environ.get("LEVAIN_SCOPE", "").strip().lower()
+    if env:
+        return _SCOPE_GLOBAL if env == _SCOPE_GLOBAL else _SCOPE_INSTALL
+    value = _config_dict().get("scope")
+    if isinstance(value, str) and value.strip().lower() == _SCOPE_GLOBAL:
+        return _SCOPE_GLOBAL
+    return _SCOPE_INSTALL
+
+
 def in_install_session() -> bool:
     """True when the session's cwd is within the Levain install.
 
     With a project-scoped .claude/settings.json this is structurally almost
     always true — Claude Code only loads project hooks for that project. It is
     kept as a cheap defensive assertion, and it correctly scopes the hooks for
-    an operator who wires them globally (~/.claude/settings.json) instead."""
+    an operator who wires them globally (~/.claude/settings.json) instead.
+
+    Scope is opt-in, and the default is unchanged: without an explicit
+    ``scope: "global"`` (config) or ``LEVAIN_SCOPE=global`` (env) this is exactly
+    the cwd-containment gate it has always been. See ``configured_scope``."""
+    if configured_scope() == _SCOPE_GLOBAL:
+        return True
     try:
         cwd = Path.cwd().resolve()
         cwd.relative_to(install_root())
@@ -216,16 +276,81 @@ def _is_int_episodes(data: object) -> bool:
     return isinstance(data, dict) and isinstance(data.get("episodes_since_wrap"), int)
 
 
-def episodes_since_wrap(timeout: float = 5.0) -> int | None:
-    """Episodes recorded since the last wrap (the signal Layer D runs on), via
-    anneal-memory's `status --json`. Returns None on any failure — Layer D then
-    stays silent."""
+def wrap_state(timeout: float = 5.0) -> tuple[int, bool] | None:
+    """``(episodes_since_wrap, wrap_in_progress)``, or None on any failure.
+
+    Reported by Alex De Groodt 2026-08-04. ``status --json`` has always carried
+    ``wrap_in_progress`` and this consumer read the episode count and threw the
+    flag away — so with a wrap stuck open, Layer D and the ``[wrap check]`` line
+    kept telling him to run ``prepare_wrap``, which is the one thing that could
+    only raise. He sat at 29, then 31 episodes against a threshold of 12.
+
+    This was a ROUTING defect, not a missing feature: ``dashboard.py`` reads the
+    field at three sites and ``tui.py`` reads it too. Levain already knew. The one
+    consumer that fires on every prompt was the one dropping it.
+
+    Both values come from a SINGLE ``status --json`` call — the nudge runs inside
+    a tight per-prompt timeout budget, so asking twice would double the subprocess
+    cost of every prompt to re-fetch a field already in hand.
+
+    A missing or non-bool ``wrap_in_progress`` degrades to ``False`` rather than
+    failing the whole read: an older anneal that does not emit it should still get
+    the ordinary nudge, not silence."""
     data = _anneal_json(["status", "--json"], timeout, validator=_is_int_episodes)
     if isinstance(data, dict):
         value = data.get("episodes_since_wrap")
         if isinstance(value, int):
-            return value
+            in_progress = data.get("wrap_in_progress")
+            return value, in_progress if isinstance(in_progress, bool) else False
     return None
+
+
+def episodes_since_wrap(timeout: float = 5.0) -> int | None:
+    """Episodes recorded since the last wrap, or None on failure.
+
+    Retained as the narrow view over :func:`wrap_state` for callers that only
+    want the count. A caller that ADVISES the operator must use ``wrap_state``
+    instead — advice that ignores ``wrap_in_progress`` is what produced the
+    stuck-wrap loop described there."""
+    state = wrap_state(timeout)
+    return None if state is None else state[0]
+
+
+def format_wrap_blocked(n: int) -> str:
+    """The line that replaces the wrap nudge when a wrap is already open.
+
+    The nudge it replaces said "run prepare_wrap". With a wrap in progress that
+    call can only raise, so repeating it every prompt taught the entity to keep
+    trying the one thing that could not work while episodes piled up behind it —
+    the exact loop Alex De Groodt sat in for three days at 29, then 31 episodes.
+
+    Names BOTH resolutions and names them per transport, because the reader here
+    is an agent: over MCP it can reach the tools directly, and `wrap_cancel` (the
+    escape hatch that had no MCP surface at all before anneal 0.9.8) is the half
+    that was previously unreachable from inside a session.
+
+    ⚠ IT DOES NOT PRESENT CANCELLING AS FREE, AND THAT WORDING IS LOAD-BEARING.
+    anneal spawns one `serve` process per client session against a shared store,
+    so the session holding the wrap may be a LIVE SIBLING mid-compression rather
+    than a dead one. Cancelling discards that session's in-flight compression —
+    its episodes survive, the work it already composed does not. An earlier draft
+    of this line said "Nothing is lost either way" while recommending cancel,
+    which would have turned a stuck-wrap notice into an instruction to destroy a
+    peer session's work. Caught by codex at L3."""
+    return (
+        f"[wrap blocked] A wrap is already open and {n} episode(s) are waiting "
+        f"behind it — prepare_wrap will refuse until it is resolved, so do not "
+        f"call it yet. If THIS session opened it, finish it: compress what "
+        f"prepare_wrap returned and call save_continuity. If you did not open "
+        f"it, it belongs to another session — which may be a dead one that left "
+        f"it behind, or a live one still compressing right now. Check "
+        f"`anneal-memory wrap-status` before doing anything else. Abandoning it "
+        f"(the `wrap_cancel` MCP tool, or `anneal-memory wrap-cancel`) clears "
+        f"the way, but it DISCARDS whatever compression that other session has "
+        f"in flight, so do not cancel a wrap you cannot account for. Your "
+        f"episodes are safe either way — they stay recorded and the next "
+        f"prepare_wrap picks them up."
+    )
 
 
 # ---- Compatibility manifest — version-set drift (a session-init signal) ----

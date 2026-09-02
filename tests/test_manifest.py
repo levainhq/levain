@@ -343,3 +343,39 @@ def test_run_anneal_json_timeout_returns_none(monkeypatch, tmp_path):
         raise subprocess.TimeoutExpired(cmd="x", timeout=1)
     monkeypatch.setattr(manifest.subprocess, "run", boom)
     assert manifest._run_anneal_json(tmp_path, "anneal-memory", ["status", "--json"]) is None
+
+
+class TestReadmePinClaim:
+    """The README states the anneal-memory pin as prose. Nothing checked it, so
+    it drifted: it said `>=0.9.6` while pyproject said `>=0.9.7`, and it is the
+    line an adopter reads before installing. This is the same class as every
+    finding Alex De Groodt filed on 2026-08-04 — a description that disagrees
+    with correct code — so the fix is an assertion, not a corrected number."""
+
+    def _repo_root(self):
+        import levain
+        return Path(levain.__file__).resolve().parent.parent
+
+    def test_readme_pin_matches_pyproject(self):
+        import re
+        root = self._repo_root()
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        if not (root / "pyproject.toml").exists():
+            pytest.skip("not a source checkout")
+        real = re.search(r'"anneal-memory(>=[^"]+)"', pyproject)
+        assert real, "could not find the anneal-memory pin in pyproject.toml"
+        spec = real.group(1)  # e.g. ">=0.9.8,<0.10"
+        claimed = re.search(r"pinned `([^`]+)`", readme)
+        assert claimed, "README no longer states the pin — update this test if that was deliberate"
+        assert claimed.group(1) == spec, (
+            f"README claims the anneal-memory pin is `{claimed.group(1)}` but "
+            f"pyproject.toml declares `{spec}`"
+        )
+
+    def test_readme_pin_matches_known_good(self):
+        """And the stated pin must name the version levain actually ships against."""
+        import re
+        readme = (self._repo_root() / "README.md").read_text(encoding="utf-8")
+        claimed = re.search(r"pinned `>=([0-9.]+)", readme)
+        assert claimed and claimed.group(1) == manifest.KNOWN_GOOD_ANNEAL

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.4.1"
+version = "0.4.2"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -54,6 +54,11 @@ dependencies = [
     # `expect_disposition` to `SporeStore.descend` (the descend CAS added in 0.9.5). Same contract —
     # 0.9.4's `descend` has no such param, so the first compost/dismiss/remove would TypeError, not
     # refuse cleanly. (The tier CAS rides `update`'s expect_disposition, present since 0.9.1.)
+    # `>=0.9.8` (AM-MCP-WRAPCANCEL): a real API contract gate, not a lockstep bump.
+    # The hook's `[wrap blocked]` line names the `wrap_cancel` MCP tool as the way out
+    # of a stuck wrap, and that tool does not exist before anneal 0.9.8 — against 0.9.7
+    # the advice would name a tool the agent cannot call, which is the very defect
+    # (a message pointing at an unreachable path) this pair of releases exists to fix.
     # `>=0.9.6` (spore-225 — the Chris release bundle): a RELEASE-GATE lockstep bump, NOT a new-API
     # contract gate. The compat-manifest's `pip_floor_verdict` release-gate requires this floor ==
     # `manifest.KNOWN_GOOD_ANNEAL`, so they move together or `levain doctor`'s `compat: pip-pin`
@@ -78,7 +83,7 @@ dependencies = [
     #
     # levain calls no 0.9.7-only API; the floor is the published-known-good, not a runtime
     # requirement. `MIN_PROVEN_LEVEL` is new public surface in 0.9.7 but levain does not import it.
-    "anneal-memory>=0.9.7,<0.10",
+    "anneal-memory>=0.9.8,<0.10",
 ]
 
 [project.optional-dependencies]
