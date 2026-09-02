@@ -1018,9 +1018,27 @@ def _user_level_wiring(install: Path) -> list[str]:
     # the dark configuration (codex L3).
     cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     root = Path(cfg_dir).expanduser() if cfg_dir else Path.home() / ".claude"
+    # ⚠ THE INSTALL'S OWN SETTINGS FILE IS NOT USER-LEVEL WIRING, EVEN WHEN IT
+    # SITS AT THIS PATH. An install rooted at $HOME makes
+    # <install>/.claude/settings.json and ~/.claude/settings.json the SAME FILE
+    # — the one `levain init` wrote — so reading it as a deliberate operator
+    # choice false-FAILs a perfectly correct install and makes `levain doctor`
+    # exit nonzero. Same shape as the codex case below: confusing the file the
+    # installer wrote with a signal of operator intent. This function's own
+    # docstring already names the discriminator ("levain init writes
+    # <install>/.claude/settings.json, INSIDE the install"); the code just never
+    # checked that identity. Third instance of doctor going red for a whole
+    # operator class, so the guard is an explicit identity test, not a path
+    # heuristic. Found at review.
+    try:
+        own_settings = (install / ".claude" / "settings.json").resolve()
+    except (OSError, ValueError):
+        own_settings = None
     for path in [root / "settings.json"]:
         try:
             if not path.is_file():
+                continue
+            if own_settings is not None and path.resolve() == own_settings:
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
