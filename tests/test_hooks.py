@@ -1284,3 +1284,103 @@ class TestWrapBlockedDoesNotUnderstateTheRisk:
             emitted = _json.loads(out)["hookSpecificOutput"]["additionalContext"]
             # It degrades to the pre-0.4.2 nudge; it does not go silent.
             assert "40" in emitted
+
+
+class TestWrapAdviceRoutingThroughMain:
+    """⚠ THE L2 DEFECT ITSELF, WHICH HAD NO COVERAGE UNTIL REVIEW SAID SO.
+
+    The tests above cover `wrap_state()` and `format_wrap_blocked()` as units.
+    Neither covers the ROUTING between them — and routing is the whole finding:
+    the docstring calls it "a ROUTING defect, not a missing feature".
+
+    Demonstrated by mutation. Replacing the call sites with
+
+        state = (hook.episodes_since_wrap(), False)
+
+    reintroduces Alex De Groodt's bug COMPLETELY — wrap_in_progress hardcoded
+    False, so a stuck wrap is advised to run prepare_wrap forever — and the
+    whole suite stayed green. My own mutants died only because they happened to
+    break the pre-0.4.2 compat path; this one does not touch it.
+
+    So these drive each hook's `main()` end to end, on BOTH adapter trees, and
+    assert on what the entity is actually told.
+    """
+
+    ADAPTERS = {
+        "claude": _HOOKS,
+        "codex": (Path(__file__).resolve().parents[1] / "levain" / "templates"
+                  / "adapters" / "codex" / "activation" / "hooks"),
+    }
+
+    def _run(self, hooks_dir, script, tmp_path, monkeypatch, capsys,
+             *, episodes, in_progress):
+        import io, json as _json, importlib.util
+        spec = importlib.util.spec_from_file_location(
+            f"_route_{hooks_dir.parent.parent.name}_{script}", hooks_dir / script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        install = tmp_path / f"i_{hooks_dir.parent.parent.name}_{script}"
+        (install / "activation").mkdir(parents=True, exist_ok=True)
+        (install / "activation" / "posture.md").write_text(
+            "# p\n## Posture\nBE PRESENT.\n", encoding="utf-8")
+        (install / "activation" / "recency_directives.md").write_text(
+            "# r\n## Recency\nSTAY SHARP.\n", encoding="utf-8")
+
+        helper = mod.hook
+        monkeypatch.setattr(helper, "install_root", lambda: install, raising=False)
+        monkeypatch.setattr(helper, "should_fire", lambda: True, raising=False)
+        # Stub the TRANSPORT, not the routing: the real wrap_state parses this.
+        monkeypatch.setattr(
+            helper, "_anneal_json",
+            lambda *a, **k: {"episodes_since_wrap": episodes,
+                             "wrap_in_progress": in_progress},
+            raising=False)
+        for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+                    "crystal_recall", "compat_drift", "pack_drift"):
+            monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
+
+        payload = {"source": "startup"} if "session" in script else {"prompt": "hi"}
+        monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(payload)))
+        capsys.readouterr()
+        assert mod.main() == 0
+        out = capsys.readouterr().out.strip()
+        if not out:
+            return ""
+        return _json.loads(out)["hookSpecificOutput"]["additionalContext"]
+
+    @pytest.mark.parametrize("adapter", ["claude", "codex"])
+    @pytest.mark.parametrize("script", ["session_start.py", "user_prompt_submit.py"])
+    def test_a_stuck_wrap_gets_wrap_blocked_not_the_nudge(
+            self, adapter, script, tmp_path, monkeypatch, capsys):
+        """Alex's exact state, through the real entry point. This is the
+        assertion whose absence let the bug be reintroduced silently."""
+        text = self._run(self.ADAPTERS[adapter], script, tmp_path, monkeypatch,
+                         capsys, episodes=31, in_progress=True)
+        assert "[wrap blocked]" in text, (
+            f"{adapter}/{script}: a stuck wrap did not produce [wrap blocked] — "
+            f"got: {text[:200]!r}"
+        )
+        assert "[wrap nudge]" not in text
+        assert "[wrap check]" not in text
+        # The precise harm: being sent back at the one call that cannot succeed.
+        assert "run the wrap sequence (prepare_wrap" not in text
+
+    @pytest.mark.parametrize("adapter", ["claude", "codex"])
+    @pytest.mark.parametrize("script", ["session_start.py", "user_prompt_submit.py"])
+    def test_no_wrap_open_still_gets_the_ordinary_nudge(
+            self, adapter, script, tmp_path, monkeypatch, capsys):
+        """The other half — the fix must not silence normal advice."""
+        text = self._run(self.ADAPTERS[adapter], script, tmp_path, monkeypatch,
+                         capsys, episodes=40, in_progress=False)
+        assert "[wrap blocked]" not in text
+        assert ("[wrap nudge]" in text) or ("[wrap check]" in text), (
+            f"{adapter}/{script}: no wrap advice at all — got {text[:200]!r}"
+        )
+
+    @pytest.mark.parametrize("adapter", ["claude", "codex"])
+    def test_below_threshold_and_idle_says_nothing_about_wraps(
+            self, adapter, tmp_path, monkeypatch, capsys):
+        text = self._run(self.ADAPTERS[adapter], "user_prompt_submit.py", tmp_path,
+                         monkeypatch, capsys, episodes=1, in_progress=False)
+        assert "[wrap blocked]" not in text and "[wrap nudge]" not in text

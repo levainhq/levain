@@ -1260,3 +1260,71 @@ class TestClaudeConfigDir:
             "command": f"python3 {install / 'activation' / 'hooks' / 'session_start.py'}",
         }]}]}}))
         assert _user_level_wiring(install) == [str(alt / "settings.json")]
+
+
+class TestInstallOwnSettingsIsNotUserLevelWiring:
+    """Found at review: an install rooted at $HOME false-FAILed.
+
+    `<install>/.claude/settings.json` and `~/.claude/settings.json` are then the
+    SAME FILE — the one `levain init` wrote — so the check read the installer's
+    own output as a deliberate operator choice, reported the install dark, and
+    made `levain doctor` exit nonzero on a correct install.
+
+    ⚠ THIS IS THE THIRD TIME DOCTOR HAS GONE RED FOR A WHOLE OPERATOR CLASS:
+    0.4.0 (every codex install, via `_check_hook_freshness` reading the wrong
+    tree), this release's first draft (every codex install again, via
+    `~/.codex/hooks.json`), and this. All three are one mistake — confusing the
+    file the INSTALLER wrote with a signal of operator INTENT.
+    """
+
+    def _init_shaped(self, install: Path, settings_path: Path):
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": f"python3 {install / 'activation' / 'hooks' / 'session_start.py'}",
+        }]}]}}), encoding="utf-8")
+
+    def test_install_rooted_at_home_is_not_failed(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; home.mkdir()
+        install = home                      # the install IS the home directory
+        (install / ".levain").mkdir()
+        (install / "CLAUDE.md").write_text("# claude", encoding="utf-8")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        self._init_shaped(install, install / ".claude" / "settings.json")
+
+        [r] = _check_activation_scope(install)
+        assert r.ok, f"a correct $HOME-rooted install was reported dark: {r.detail}"
+
+    def test_the_install_own_file_is_excluded_from_wiring_detection(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"; home.mkdir()
+        install = home
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        self._init_shaped(install, install / ".claude" / "settings.json")
+        assert _user_level_wiring(install) == []
+
+    def test_a_DIFFERENT_install_wired_from_home_is_still_detected(self, tmp_path, monkeypatch):
+        """The guard must not blind the check to real user-level wiring — the
+        dark configuration still has to fail."""
+        home = tmp_path / "home"; home.mkdir()
+        install = tmp_path / "elsewhere"; install.mkdir(); (install / ".levain").mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        self._init_shaped(install, home / ".claude" / "settings.json")
+
+        assert _user_level_wiring(install) == [str(home / ".claude" / "settings.json")]
+        [r] = _check_activation_scope(install)
+        assert not r.ok, "the genuinely dark configuration stopped failing"
+
+    def test_guard_holds_under_CLAUDE_CONFIG_DIR(self, tmp_path, monkeypatch):
+        """CLAUDE_CONFIG_DIR can also be pointed at the install's own .claude."""
+        home = tmp_path / "home"; home.mkdir()
+        install = tmp_path / "inst"; install.mkdir(); (install / ".levain").mkdir()
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(install / ".claude"))
+        monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
+        self._init_shaped(install, install / ".claude" / "settings.json")
+        assert _user_level_wiring(install) == []
