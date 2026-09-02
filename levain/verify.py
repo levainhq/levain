@@ -247,7 +247,7 @@ def _invoke(
             script.name,
             False,
             "timed out after 10s",
-            "Hook likely hangs on subprocess (anneal-memory status query). Investigate _levain_hook.episodes_since_wrap.",
+            "Hook likely hangs on subprocess (anneal-memory status query). Investigate _levain_hook.wrap_state (episodes_since_wrap delegates to it).",
         )
     except OSError as e:
         return VerifyResult(

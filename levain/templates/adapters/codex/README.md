@@ -386,7 +386,7 @@ hooks will read different stores, and the hooks may not fire at all.
   fixes inline TOML parsing, the adapter can move the wiring into
   `config.toml` directly.
 - **Hooks are sandboxed against `/tmp` writes.** Hook scripts can run
-  subprocesses (the Layer D `episodes_since_wrap` query works) but cannot
+  subprocesses (the Layer D `wrap_state` status query works) but cannot
   write directly to `/tmp/*.log` from inside the hook process. Use
   `$HOME/...` paths for any diagnostic logging the operator adds.
 - **`user_prompt_submit.py` runs `anneal-memory status` once per prompt** to

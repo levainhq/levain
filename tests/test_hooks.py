@@ -1053,10 +1053,15 @@ class TestWrapStateRouting:
     def test_blocked_message_does_not_tell_you_to_run_prepare_wrap(self, both_hooks):
         """The whole finding in one assertion: the advice given during a stuck
         wrap must not be the call that cannot succeed."""
-        msg = both_hooks.format_wrap_blocked(31)
-        assert "31" in msg
+        msg = both_hooks.format_wrap_blocked()
+        # ⚠ THE NEGATIVE IN THE NAME, WHICH THIS TEST NEVER ACTUALLY CHECKED.
+        # It asserted four PRESENCE conditions and nothing about the property it
+        # is named for, so a mutant re-adding the old advice passed. Flagged at
+        # review. "prepare_wrap will refuse" is a legitimate mention; being told
+        # to RUN it is the defect.
+        assert "run the wrap sequence (prepare_wrap" not in msg
+        assert "run prepare_wrap" not in msg
         assert "wrap_cancel" in msg          # the escape hatch, now MCP-reachable
-        assert "anneal-memory wrap-cancel" in msg
         assert "save_continuity" in msg      # the other way out
         assert "do not call it yet" in msg   # explicit about prepare_wrap
 
@@ -1214,24 +1219,73 @@ class TestWrapBlockedDoesNotUnderstateTheRisk:
     notice must not read as permission to destroy a peer session's work."""
 
     def test_does_not_claim_cancelling_is_free(self, both_hooks):
-        msg = both_hooks.format_wrap_blocked(31)
-        assert "Nothing is lost either way" not in msg
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            assert "Nothing is lost either way" not in msg
 
     def test_warns_that_the_wrap_may_belong_to_a_live_session(self, both_hooks):
-        msg = both_hooks.format_wrap_blocked(31)
-        assert "another session" in msg
-        assert "live one still compressing" in msg
-        assert "DISCARDS" in msg
+        """Semantics, not phrasing: the hazard has to be named in both variants.
+        The first version of this test pinned the exact words and failed on a
+        reword that preserved every fact — pinning the register instead of the
+        meaning."""
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            low = msg.lower()
+            assert "live session still compressing" in low or "session still compressing" in low
+            assert "discards its work" in low or "throws that work away" in low
 
     def test_tells_the_agent_how_to_check_before_cancelling(self, both_hooks):
-        assert "anneal-memory wrap-status" in both_hooks.format_wrap_blocked(31)
+        """The check must be one the READER can run. `status` is an MCP tool and
+        reports the wrap's start time as of anneal 0.9.8; the CLI wrap-status
+        is a shell command an MCP agent may have no way to run."""
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            assert "`status`" in msg
 
     def test_still_says_the_reader_s_own_episodes_are_safe(self, both_hooks):
         """The reassurance that IS true must survive — an agent that thinks its
         episodes are at risk will do something worse."""
-        msg = both_hooks.format_wrap_blocked(31)
-        assert "episodes are safe" in msg
-        assert "next prepare_wrap picks them up" in msg
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            assert "episodes are not deleted" in msg.lower()
+
+    def test_does_not_claim_all_n_episodes_are_stranded(self, both_hooks):
+        """⚠ THE COUNT WAS A FALSE CLAIM AND IT WAS MEASURED.
+
+        `episodes_since_wrap` counts from the last COMPLETED wrap, so n includes
+        the episodes frozen INSIDE the open snapshot. Measured against a real
+        store: two episodes wrapped, one recorded after, and the count reads 3
+        while only 1 is actually waiting. The old line said "{n} episode(s) are
+        waiting behind it", which overstated the backlog to the agent — a wrong
+        number handed to a reader, in a release about numbers that disagree
+        with reality.
+        """
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            assert "waiting behind it" not in msg
+
+    def test_points_at_status_not_a_shell_command(self, both_hooks):
+        """The discriminator has to be reachable BY THE READER. An MCP agent
+        with no shell was Alex's entire report, so telling it to run
+        `anneal-memory wrap-status` to decide is the reachability defect one
+        layer up. `status` is an MCP tool and reports the start time as of
+        anneal 0.9.8."""
+        for msg in (both_hooks.format_wrap_blocked(),
+                    both_hooks.format_wrap_blocked(fresh_session=True)):
+            assert "wrap-status" not in msg
+            assert "`status`" in msg
+
+    def test_fresh_session_is_not_told_to_finish_a_wrap_it_never_started(self, both_hooks):
+        """A SessionStart hook fires before this session has called
+        prepare_wrap, so "compress what prepare_wrap returned" names an artifact
+        it does not have — dead text at exactly the moment the agent is deciding
+        what to do."""
+        fresh = both_hooks.format_wrap_blocked(fresh_session=True)
+        assert "compress what prepare_wrap returned" not in fresh
+        assert "earlier session" in fresh
+        # ...while the per-prompt caller, which may well own the wrap, IS told.
+        per_prompt = both_hooks.format_wrap_blocked()
+        assert "compress what prepare_wrap returned" in per_prompt
 
     def test_ENTRY_POINT_survives_a_pre_042_helper(self, tmp_path, monkeypatch, capsys):
         """The regression that actually matters, and the one codex reproduced.
@@ -1365,6 +1419,17 @@ class TestWrapAdviceRoutingThroughMain:
         assert "[wrap check]" not in text
         # The precise harm: being sent back at the one call that cannot succeed.
         assert "run the wrap sequence (prepare_wrap" not in text
+
+        # ...and the RIGHT VARIANT for this caller. Caught by mutation: the
+        # routing tests asserted [wrap blocked] appeared and never which of the
+        # two messages it was, so a session_start that dropped fresh_session=True
+        # passed while telling a brand-new session to "compress what prepare_wrap
+        # returned" — naming an artifact it does not have.
+        if "session" in script:
+            assert "earlier session" in text
+            assert "compress what prepare_wrap returned" not in text
+        else:
+            assert "compress what prepare_wrap returned" in text
 
     @pytest.mark.parametrize("adapter", ["claude", "codex"])
     @pytest.mark.parametrize("script", ["session_start.py", "user_prompt_submit.py"])
