@@ -68,6 +68,19 @@ Every item below is a bug in code written earlier in this same release, caught b
 - **User-level wiring detection missed real cases:** it inspected only the first command found (so a foreign hook registered ahead of Levain's hid it), ignored `CLAUDE_CONFIG_DIR`, and treated `${CLAUDE_PROJECT_DIR}` wiring as pointing at this install when at user level it resolves to whatever project is open.
 - **A stale `AGENTS.md`** left behind by an adapter switch produced a Codex diagnostic on a Claude Code install; the check now uses the shared `effective_adapter` classifier.
 
+### Also in this release — work that accumulated since 0.4.1
+
+⚠ **0.4.2 is not only the four items above, and saying otherwise would be the same defect they describe.** The `v0.4.1` tag is old; a month of work sat on `main` behind a deliberate decision not to cut a release for it (recorded at the time in *"Record what is fixed, what is open, and why there is no 0.4.2"*). All of it ships here:
+
+- **`doctor` hook-freshness, closed on both axes** — the check now works in relative-path space and iterates the union of keyspaces, and asks the manifest which hooks a pack owns. This was the fourth recurrence of one bug shape; a fixture that had been missing three times now exists.
+- **SSH vectors denied at every spelling**, not just the resolved one (`levain/firing/confinement.py`).
+- **Five findings closed** from the spore-604 bugfix session.
+- **The anneal floor moved to `>=0.9.7`** (AM-LEVELCAP) before this release moved it again to `>=0.9.8`, and compat fixtures now derive the version instead of hard-coding it.
+- **The seed no longer teaches crystallize-OUT** while the level ladder is capped.
+- Routine routing of the nightly reviewer's findings into project memory (documentation only; no shipped code).
+
+*(This section was added after publication. The `0.4.2` sdist on PyPI carries the release notes without it — the omission was in the notes, never in the code.)*
+
 ### Upgrading
 
 - **`pip install -U levain` will also upgrade `anneal-memory` to >= 0.9.8.** This is a real API contract, not a lockstep bump: the new `[wrap blocked]` advice names the `wrap_cancel` MCP tool, which does not exist before anneal 0.9.8. Against 0.9.7 the hook would name a tool the agent cannot reach — precisely the defect this pair of releases exists to fix.
