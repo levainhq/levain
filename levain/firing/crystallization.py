@@ -4,7 +4,7 @@ CRYSTALLIZE (K4a [6], ``spore-373`` [6]; the ``spore-325`` slice).
 **Two different things are called "graduation" around this code, and blocking the wrong one would
 break the feature this module exists to enable. The distinction is the first thing to get right:**
 
-- **Pattern graduation (1x → 2x → 3x) inside the working neocortex.** Citation-validated, performed
+- **Pattern graduation (1x → 2x → 3x → 4x, onward, no ceiling) inside the working neocortex.** Citation-validated, performed
   by ``validated_save_continuity`` on every wrap. This is ORDINARY METABOLIZING — it is the whole
   point of letting a seat consolidate at all, and this module does **NOT** touch it.
 - **CRYSTALLIZATION — a pattern leaving the working set for the always-loaded bedrock tier**
@@ -103,7 +103,12 @@ L3, hidden assumptions). Both reads are safe *because* they return DETACHED obje
 out of the JSON store by ``_load()``, not live handles into it — so a caller mutating a returned dict
 changes nothing on disk. **If a future anneal returns live mutable state from either method, an
 allow-listed READ silently becomes a WRITE SURFACE and this proxy stops meaning what it says.**
-Verified true in anneal-memory 0.9.6; re-check it when widening this set or bumping anneal."""
+⚠ **Verified true in anneal-memory 0.9.6, and the floor has since moved TWICE (0.9.7, 0.9.8)
+without this being re-checked** — the sentence carried its own re-check trigger (*"when … bumping
+anneal"*) and nothing watched it, which is the deferral-in-prose class: a condition that comes true
+quietly with no mechanism to surface it. Treat this as VERIFIED AT 0.9.6 AND UNVERIFIED SINCE, not
+as a current guarantee, and re-read `_load()`'s return path against the pinned anneal before relying
+on the detachment property."""
 
 
 class CrystallizationRefused(BaseException):
