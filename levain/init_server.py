@@ -300,7 +300,14 @@ class _InitHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] != "/init":
             return self._reject(404, "not_found", "no such route")
         clen_raw = self.headers.get("Content-Length")
-        if clen_raw is None or not clen_raw.isdigit():
+        # ⛔ `isascii()` IS LOAD-BEARING, NOT BELT-AND-BRACES. `str.isdigit()` is TRUE for
+        # characters `int()` REFUSES — superscripts and other Unicode digit-category
+        # characters. Measured: `"²".isdigit()` is True and `int("²")` raises ValueError, so a
+        # `Content-Length: ²` header passed this guard and blew up on the next line, turning a
+        # clean 411 into an unhandled exception. A guard that admits values the very next
+        # statement rejects is not narrowing anything. RFC 7230 makes Content-Length ASCII
+        # DIGITS, so this is also the spec-correct test.
+        if clen_raw is None or not (clen_raw.isascii() and clen_raw.isdigit()):
             return self._reject(411, "length_required", "Content-Length required")
         clen = int(clen_raw)
         if clen > _MAX_INIT_BODY:

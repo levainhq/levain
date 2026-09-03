@@ -14,6 +14,7 @@ the store; the server binds loopback.
 from __future__ import annotations
 
 import json
+import pytest
 import threading
 import urllib.error
 import urllib.request
@@ -1813,3 +1814,55 @@ class TestFocusEditRoute:
         with _serving(ro) as (base, _httpd):
             status, resp = _post(base + "/edit", {"kind": "focus", "text": "x"})
         assert status == 422 and resp["error"] == "read_only"
+
+
+class TestContentLengthGuardMatchesWhatIntAccepts:
+    """`str.isdigit()` admits characters `int()` refuses, and the guard sat one line above the call.
+
+    ⛔ MEASURED, NOT REASONED: `"²".isdigit()` is True and `int("²")` raises ValueError. So a
+    `Content-Length: ²` header PASSED the length guard and blew up on the very next statement,
+    turning a clean 411 into an unhandled exception. A guard that admits values the next line
+    rejects is not narrowing anything — the check and the consumer disagreed about what a number is.
+
+    ⚠ NON-ASCII DIGITS ARE REFUSED DELIBERATELY, and it is not a regression: `int("٣")` succeeds,
+    but RFC 7230 defines Content-Length as ASCII DIGIT, so 411 is the spec-correct answer for a
+    non-conformant client. Pinned here so a future reader does not "fix" it back.
+
+    Both servers carried the identical line (`web_server.py`, `init_server.py`) — the sibling class
+    this repo keeps finding — so both are asserted, from the source, rather than one standing in
+    for the other.
+    """
+
+    ACCEPTED = ["0", "1", "123", "9999999"]
+    REFUSED = ["²", "٣", "½", "⅓", "一", "", " 12", "12 ", "+12", "-1", "1.0", "0x10", "abc"]
+
+    def _guard(self, raw):
+        # The predicate as it appears in BOTH servers. Kept as one expression here so a
+        # divergence between the two files shows up as a failure in the parity test below.
+        return raw is not None and raw.isascii() and raw.isdigit()
+
+    @pytest.mark.parametrize("raw", ACCEPTED)
+    def test_plain_ascii_lengths_are_accepted(self, raw):
+        assert self._guard(raw)
+        int(raw)  # must not raise — the guard's whole job is to make this safe
+
+    @pytest.mark.parametrize("raw", REFUSED)
+    def test_everything_int_would_choke_on_is_refused(self, raw):
+        assert not self._guard(raw), f"{raw!r} reached int() and could raise"
+
+    def test_the_old_guard_admitted_a_value_that_crashes(self):
+        """The regression itself, stated as a fact rather than a memory."""
+        assert "²".isdigit() is True, "premise of this test"
+        with pytest.raises(ValueError):
+            int("²")
+        assert not self._guard("²")
+
+    def test_both_servers_carry_the_same_guard(self):
+        """One fact, two files. The defect was in both; a fix in one is the sibling class."""
+        from pathlib import Path
+        import levain
+        root = Path(levain.__file__).resolve().parent
+        needle = "clen_raw.isascii() and clen_raw.isdigit()"
+        for name in ("web_server.py", "init_server.py"):
+            src = (root / name).read_text(encoding="utf-8")
+            assert needle in src, f"{name} no longer carries the ASCII-digit guard"
