@@ -599,8 +599,12 @@ def build_policy(
     # own store files, AND the config file (all relocate the same way). Including ``deny_write_files_t``
     # here write-denies ~/.ssh (the persistence-vector dir anchor) so it can't be renamed/replaced to
     # relocate the protected literal — the raw-mode bypass codex found. The ssh_dir is guarded as a
-    # subtree below (agent mode), so its ancestors are covered too; in raw mode this is the only thing
-    # that pins ~/.ssh's anchor.
+    # subtree below (agent mode), so its ancestors are covered too.
+    # ⛔ THE CLAUSE THAT STOOD HERE — "in raw mode this is the only thing that pins ~/.ssh's anchor" —
+    # WAS FALSE, and :469 in this same file already said so ("the files are added to ``all_jewels``
+    # below, so ~/.ssh (their ancestor DIR) is write-denied"). Two comments in one file, opposite
+    # answers. See the block below `ssh_anchor` for the measurement; pinned by
+    # test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it.
     all_jewels = (
         list(deny_read_write) + list(deny_files_t) + list(deny_write_files_t)
         + list(own_memory_files_t) + [config_file]
@@ -614,12 +618,25 @@ def build_policy(
     # built from THREE spellings, not one: raw lexical, resolved-HOME lexical, and resolved. So
     # ".resolve() only" is no longer true of it, and the paragraph is kept below with its original
     # argument intact ONLY because that argument is about the DIRECTORY and still holds.
-    # ⛔ AND THE REDUNDANCY CLAIM THAT CAME WITH THE FINDING DOES NOT HOLD — CHECKED BEFORE ACTING,
-    # 2026-08-23. The finding called this code "now unconditionally redundant". It is not: the three
-    # spellings deny lexical FILES inside ~/.ssh and never the lexical DIRECTORY, so
-    # ``rm ~/.ssh; ln -s ~/evil ~/.ssh`` — replacing the directory itself — is named by this anchor
-    # and by nothing else. It IS redundant in the no-symlink case, where ``ssh_anchor == ssh_dir``
-    # and ``_dedup`` already collapses the pair. Redundant-when-collapsed is not redundant.
+    # ⛔⛔ THE 2026-08-23 REBUTTAL THAT STOOD HERE WAS ITSELF FALSE, AND A WRONG REBUTTAL IS WORSE
+    # THAN A WRONG FINDING — it discharges the next reader's obligation to look again. It said the
+    # 2026-08-22 redundancy finding "does not hold" because "the three spellings deny lexical FILES
+    # inside ~/.ssh and never the lexical DIRECTORY, so ``rm ~/.ssh; ln -s ~/evil ~/.ssh`` … is named
+    # by this anchor and by nothing else."
+    # ▶ MEASURED, NOT ARGUED (2026-09-03): ``_write_deny_ancestors`` walks ``jewel.parents`` and does
+    # NOT resolve, so the DIRECTORY is produced by the FILES' own ancestors. Both lexical spellings
+    # are in ``all_jewels`` by construction thirty lines up — ``ssh_home / n`` (raw ``Path.home()``)
+    # and ``ssh_home_lexical / n`` (``home.resolve()`` + un-deref'd ``.ssh``) — so their parents are
+    # exactly ``home / ".ssh"`` AND ``home.resolve() / ".ssh"``. The second of those IS
+    # ``ssh_anchor``. It is therefore already denied whether or not HOME is itself a symlink, which
+    # is the one case the rebuttal's "and by nothing else" needed in order to be true.
+    # ⚠ THE LINE IS KEPT ANYWAY, and deliberately: it is harmless, ``_dedup`` collapses it, and
+    # deleting a belt from a security floor to win a tidiness argument is the wrong direction of
+    # error. What was actually wrong here was the JUSTIFICATION, not the code.
+    # ▶ AND THE CLAIM IS NOW EXECUTED RATHER THAN ASSERTED — if a future edit teaches
+    # ``_write_deny_ancestors`` to resolve, this anchor stops being redundant and becomes
+    # load-bearing again, which is precisely the day you need to be told:
+    # ``test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it``.
     # Historical form of the argument, still correct for the directory:
     # ``deny_write_files_l`` uses ``.resolve()`` for CONTENT protection
     # (it must deny the real write TARGET, even through a symlink) — but that FOLLOWS a pre-existing
