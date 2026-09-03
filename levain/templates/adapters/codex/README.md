@@ -420,9 +420,16 @@ hooks will read different stores, and the hooks may not fire at all.
   is not exactly `global` keeps the install-scoped default, so a typo or an
   unreadable config can never silently open the gate, and
   `LEVAIN_HOOK_SUPPRESS=1` still wins over both. `levain doctor` reports
-  which way the gate is set — and FAILS when hooks are wired at the user
-  level while the scope is still install-scoped, because that combination
-  means the whole activation layer is silently off.
+  which way the gate is set. ⚠ For a **Codex** install it can only REPORT:
+  `~/.codex/hooks.json` is the only deployment Codex has and `levain init`
+  writes it itself, so treating it as operator intent would fail every Codex
+  install in existence — `_user_level_wiring` deliberately never reads that
+  file, and a test pins the never-FAIL. The FAIL is the **Claude Code** case,
+  where wiring from `~/.claude/settings.json` is a deliberate operator choice
+  and, with install scope, means the activation layer is silently off. If you
+  are a Codex operator wondering whether you are dark, the answer is in
+  doctor's PASS detail, which names the condition explicitly — not in a red
+  exit that will never come.
 
 ## Harness portability
 

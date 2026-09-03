@@ -6,6 +6,41 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+Stamped `0.4.4.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+
+### Fixed — `doctor` reported green on two of the three ways to write user-level wiring
+
+The dark-install detector compared each hook command token as a **literal path**, with no variable expansion and no `~` handling. So `~/lev/activation/hooks/session_start.py` and `$HOME/lev/...` — the second of which Levain's own `settings.template.json` spells inside double quotes — resolved against the current directory, never matched the install, and the scan came back empty. `levain doctor` then reported the reassuring install-scoped PASS on the exact configuration the check exists to FAIL.
+
+A miss in `_hook_command_targets` produces a wiring FAIL, which is loud. A miss here produced silence — the same `absence_of_signal_rendered_as_health` that this whole run of releases is about, inside the instrument built to end it.
+
+⚠ **The first cut of that fix reintroduced a defect closed earlier in this same release.** `Path("~someuser/...").expanduser()` raises `RuntimeError` for a user with no passwd entry, and `RuntimeError` is neither `OSError` nor `ValueError` — so expanding tokens added a fresh way for a *foreign* `~/.claude/settings.json` to abort the entire doctor run. That is the `[null]`-entry crash from 0.4.2 arriving by a new door. Caught before commit by asking whether the condition the guard covers would disable the guard.
+
+### Fixed — the upgrade note named the wrong command
+
+The 0.4.3 notes said `levain update` overwrites the hook templates. It does not: `update` writes nothing under `activation/` at all, and its pack phase only ever writes under `seed/`. What replaces the activation tree is **`levain init --force`** — which is step two of the documented upgrade procedure, so following our own instructions is what kept eating the local patch. Corrected at all four sites carrying the claim, including `docs/operator-manual.md`, which said `update` "re-applies any updated partnership settings".
+
+### Fixed — the Codex adapter README promised a failure Codex operators cannot get
+
+It told Codex operators `doctor` FAILS when hooks are wired at the user level under install scope. For a Codex install both halves of that condition are the **default**, and `_user_level_wiring` deliberately never reads `~/.codex/hooks.json` — a test pins the never-FAIL. A promise of a red that never comes reads as a green. The bullet now says `doctor` REPORTS the gate for Codex and names where the answer actually appears.
+
+### Fixed — the seed still scaffolded the graduation cap the library removed
+
+`seed/continuity.md` taught "graduates to 2x, then 3x" while `seed/memory.md` teaches the uncapped ladder. The 2026-08-31 uncapping landed at one of the two sites, so a fresh entity was still scaffolded with the cap anneal dropped in 0.9.7. The scaffold now states the direction and points at `memory.md` rather than carrying a second copy of the rule.
+
+### Changed — `[wrap blocked]` no longer names a shell command or a false count
+
+- The episode count is **gone from the message**, not rephrased. `episodes_since_wrap` counts from the last *completed* wrap, so it included episodes frozen inside the open snapshot: measured at 3 reported while 1 was actually waiting. An honest figure needs more qualification than the line can carry.
+- Its discriminator was `anneal-memory wrap-status`, a **shell** command — which was the reporter's own finding one layer up, since an agent with no shell was his entire report. It now points at `status`, reachable over MCP.
+- Split by caller: a `SessionStart` hook fires before this session ever called `prepare_wrap`, so advice to "compress what prepare_wrap returned" named an artifact it does not have.
+- `episodes_since_wrap()`'s docstring no longer justifies itself as "the count-only view for callers that do not give advice" — it has zero in-repo callers and is a compatibility shim for operators carrying local hook edits. It now says so. *(This retracts the rationale given for it under 0.4.2 below; that entry stands as an accurate record of what 0.4.2 shipped.)*
+- `verify.py`'s timeout hint and the Codex adapter README both named `episodes_since_wrap` as the per-prompt subprocess site, which is now one delegation away.
+
+### Fixed — tests
+
+- The activation-scope tests read `LEVAIN_SCOPE` and `CLAUDE_CONFIG_DIR` from the **real environment**, so their verdict depended on the reviewer's shell. `LEVAIN_SCOPE=global` — the value `doctor`'s own hint tells operators to set — turned the dark-config regression guard RED, and `CLAUDE_CONFIG_DIR` made four user-wiring guards pass **vacuously**, silently retiring the two-installs-on-one-machine discrimination. One autouse fixture in `conftest.py`; the suite is now identical under all three environments.
+- The source-checkout skip guarded one of two sibling tests, eight lines below the comment explaining why it must exist. Hoisted into the shared helper.
+
 ## [0.4.3] — 2026-09-02
 
 **`doctor` no longer fails a correct install rooted at `$HOME`.** A one-line fix to a defect that shipped in 0.4.2, found by review within the hour.
@@ -118,3 +153,11 @@ Every item below is a bug in code written earlier in this same release, caught b
 The governed seat, the efferent gate, and three field-reported fixes.
 
 > ⚠ **UNDOCUMENTED AT THE TIME, AND IT CHANGED DEPLOYMENTS SILENTLY.** This release deleted the hook's `$CLAUDE_PROJECT_DIR` read. That read's containment check accepted **any ancestor of the hook file** as the install root, which could resolve the whole activation layer under the wrong root — so an install with globally-wired hooks may have been passing the session gate *by accident*. Tightening `install_root()` to derive from the hook file's own location was correct, but for anyone in that position it turned activation off, with no note in any release material saying so and `doctor` still reporting healthy. **0.4.2 is the release that gives that operator a supported way to get the behaviour back** (`scope: "global"`), and a `doctor` check that says which way the gate is set.
+
+---
+
+## Versioning — why the tree is stamped `.devN` between releases
+
+A release tag names a tree. The commit *after* it does not, and for one window in 0.4.3 both read `version = "0.4.3"` while the second had rewritten a shipped hook message — so "0.4.3" named two different trees, and what a developer cloned was not what an adopter installed, with nothing in the tree saying so.
+
+**The rule: the release commit is the last one on that number.** The next commit bumps both stamps (`pyproject.toml` and `levain/__init__.py`) to the next `.dev0`, and its changes go under `## [Unreleased]`. Cutting a release drops the suffix in the same commit that tags it. This is asserted by `tests/test_manifest.py::TestReleaseStampIsNotAPublishedVersion`, not left to the release checklist — the checklist is what missed it.

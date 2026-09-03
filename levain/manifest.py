@@ -82,7 +82,12 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # version's manifest entries. Invariant (release-gate, test-locked): must be
 # <= KNOWN_GOOD_ANNEAL — you cannot reconcile templates to a version you don't ship.
 #
-# Reconciled through 0.9.6 (spore-218 — the AM-WRAP-GENERATED reconcile on the
+# Reconciled through the version in `TEMPLATES_RECONCILED_ANNEAL` below — do not
+# re-spell it here, which is how this comment came to say 0.9.6 while the constant
+# said 0.9.7 for nineteen days. What follows is HISTORY of what each entry required,
+# not a second declaration of the cap.
+#
+# Through 0.9.6 (spore-218 — the AM-WRAP-GENERATED reconcile on the
 # spore-216 crystal-recall base). The seed genuinely incorporates every migration
 # entry through this version: the spores boundary (0.4.7 AM-SPORES-BOUNDARY), the
 # `levain update` upgrade habit (0.4.7 AM-MIGRATE-NOTIFY), the bare-path demotion
@@ -110,6 +115,10 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # entry's guidance (or its no-edit allowlisting) so a future template edit that DROPS
 # it — or a new at/below-cap entry left unmapped — fails the suite instead of
 # silently making the init-ack dishonest.
+# 0.9.7 (AM-LEVELCAP, 2026-08-14): the library made Proven-tier 2-and-up with NO
+# ceiling. Reconciled into the seed on 2026-08-31 (`memory.md`'s temporal-graduation
+# ladder) and into its continuity scaffold on 2026-09-03, which had kept teaching the
+# cap for three further days because the 08-31 fix landed at one site of a two-site fact.
 TEMPLATES_RECONCILED_ANNEAL = "0.9.7"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the

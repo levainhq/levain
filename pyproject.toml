@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.4.3"
+version = "0.4.4.dev0"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -81,8 +81,14 @@ dependencies = [
     # honest ack) but never CURRENT. The seed now teaches the uncapped ladder and the
     # level-vs-recency split. Do not cite this comment as evidence that the templates still cap.
     #
-    # levain calls no 0.9.7-only API; the floor is the published-known-good, not a runtime
-    # requirement. `MIN_PROVEN_LEVEL` is new public surface in 0.9.7 but levain does not import it.
+    # levain calls no 0.9.7-only API. `MIN_PROVEN_LEVEL` is new public surface in 0.9.7 but
+    # levain does not import it. (Both clauses are scoped to 0.9.7 and are true as history. The
+    # sentence that stood here — "the floor is the published-known-good, not a runtime
+    # requirement" — was a generalisation over a MOVING value: "the floor" is a definite
+    # reference to the specifier below, which is now 0.9.8, and the comment at the head of this
+    # block states that floor IS a contract gate. Two answers in one file, the wrong one sitting
+    # last before the specifier. Deleted rather than re-worded: the current floor is described
+    # once, above.)
     "anneal-memory>=0.9.8,<0.10",
 ]
 
