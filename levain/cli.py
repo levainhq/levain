@@ -989,7 +989,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if _reject_bad_max_seconds(max_seconds, command="run"):
             return 2
         consolidate_max_seconds = getattr(args, "consolidate_max_seconds", None)
-        if _reject_bad_max_seconds(consolidate_max_seconds, command="run"):
+        if _reject_bad_max_seconds(consolidate_max_seconds, command="run",
+                                   flag="--consolidate-max-seconds"):
             return 2
         # A consolidate TUNING flag with no --consolidate is REFUSED, not ignored — the same call
         # `--unattended`-without-`--task` makes above, for the same reason. Silently dropping it
@@ -1040,8 +1041,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
-def _reject_bad_max_seconds(value: float | None, *, command: str) -> bool:
-    """Validate a ``--max-seconds`` value. Returns ``True`` (and explains) when it must be refused.
+def _reject_bad_max_seconds(value: float | None, *, command: str, flag: str = "--max-seconds") -> bool:
+    """Validate a wall-clock bound. Returns ``True`` (and explains) when it must be refused.
+
+    ⛔ ``flag`` EXISTS BECAUSE THIS VALIDATOR IS SHARED AND USED TO LIE. It hardcoded
+    ``--max-seconds`` in all three messages, and ``levain run`` also routes
+    ``--consolidate-max-seconds`` through it — so an operator who typed a bad value for the
+    consolidate bound was told ``levain run: --max-seconds must be >= 0``, naming a flag they
+    never set and sending them to fix the wrong option. Being one validator is the right call
+    (a second copy is a second place to forget the edge cases); saying the same thing about
+    every caller was not.
 
     ONE validator for every command that takes the flag (``run``, ``wrap``, ``daemon install-seat``),
     because the two edge cases below were each found by an L3 lineage and a second copy of this
@@ -1061,14 +1070,14 @@ def _reject_bad_max_seconds(value: float | None, *, command: str) -> bool:
         return False
     if not math.isfinite(value):
         print(
-            f"levain {command}: --max-seconds must be a finite number of seconds, got "
+            f"levain {command}: {flag} must be a finite number of seconds, got "
             f"{value!r}. Use 0 to run unbounded — deliberately and visibly.",
             file=sys.stderr,
         )
         return True
     if value < 0:
         print(
-            f"levain {command}: --max-seconds must be >= 0, got {value:g}. "
+            f"levain {command}: {flag} must be >= 0, got {value:g}. "
             f"Use 0 to disable the wall-clock bound explicitly.",
             file=sys.stderr,
         )
@@ -1376,7 +1385,8 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # a tuning flag whose feature is switched off.
     consolidate = not getattr(args, "no_consolidate", False)
     if _reject_bad_max_seconds(
-        getattr(args, "consolidate_max_seconds", None), command="daemon install-seat"
+        getattr(args, "consolidate_max_seconds", None), command="daemon install-seat",
+        flag="--consolidate-max-seconds",
     ):
         return 2
     if getattr(args, "consolidate_every", None) is not None and args.consolidate_every < 1:
