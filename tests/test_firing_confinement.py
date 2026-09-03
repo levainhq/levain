@@ -1265,7 +1265,19 @@ def test_live_plain_config_cannot_be_unlinked_or_relocated(tmp_path: Path, monke
     ed = _entity(tmp_path)
     cfg = ed / ".levain" / "confinement.json"
     cfg.write_text("{}")
-    from levain.firing.openhands.tools import SandboxedBashExecutor  # openhands leaf, gated by @live
+    # ⛔ @live DOES NOT GATE THIS IMPORT, WHICH IS WHAT THE OLD COMMENT CLAIMED.
+    # `live` is `skipif(not _LIVE)` where `_LIVE = platform.system() == "Darwin" and
+    # sandbox_exec_available()` — it gates on the macOS SANDBOX and says nothing about the
+    # openhands extra. So on any Darwin box WITH sandbox-exec and WITHOUT `levain[firing]`
+    # this test RAN and died on the next line with ModuleNotFoundError. A comment naming a
+    # gate that does not gate the thing it is attached to (Diogenes 2026-08-07, HIGH-adjacent
+    # MEDIUM, open 27 days).
+    # ⚠ WHY IT IS NOT COSMETIC: this is the confinement suite — the file whose subject is an
+    # entity being unable to disarm its own floor — and a permanent red there is
+    # indistinguishable from a real regression. It also makes "the suite is green"
+    # unavailable as evidence for any fix in this repo.
+    pytest.importorskip("openhands.tools.terminal", reason="openhands extra not installed")
+    from levain.firing.openhands.tools import SandboxedBashExecutor
     from openhands.tools.terminal.definition import TerminalAction
 
     ex = SandboxedBashExecutor(build_policy(ed))
