@@ -8,7 +8,9 @@ real ~/Library/LaunchAgents.
 
 from __future__ import annotations
 
+import platform
 import plistlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,6 +21,7 @@ from levain.daemon import (
     DaemonError,
     DaemonSpec,
     LaunchdProvider,
+    SystemdUserProvider,
     build_seat_spec,
     build_spec,
     select_provider,
@@ -90,7 +93,14 @@ def test_select_provider_darwin() -> None:
     assert isinstance(select_provider("Darwin"), LaunchdProvider)
 
 
-@pytest.mark.parametrize("os_name", ["Linux", "Windows", "Plan9"])
+def test_select_provider_linux_is_systemd_user() -> None:
+    """K4c. Linux was previously in the "unsupported" parametrize list below; it shipping is why it
+    moved out. Without this provider there is no SCHEDULED Linux seat at all — only confinement with
+    nothing supervising it."""
+    assert isinstance(select_provider("Linux"), SystemdUserProvider)
+
+
+@pytest.mark.parametrize("os_name", ["Windows", "Plan9"])
 def test_select_provider_unsupported_raises(os_name: str) -> None:
     with pytest.raises(NotImplementedError):
         select_provider(os_name)
@@ -649,3 +659,296 @@ def test_would_install_still_says_idle_for_a_healthy_loaded_seat(launchd, tmp_pa
     fake._stdout_for["print"] = "\tstate = waiting\n\tlast exit code = 0\n"
     plan = prov.would_install(spec)
     assert plan.action == "no-op — unit unchanged and loaded (idle)"
+
+
+# =============================================================================================
+# SystemdUserProvider (K4c) — the Linux lifecycle half.
+#
+# ⚠ THE CENTRAL TRAP THESE TESTS GUARD: on launchd the cadence is one more key in the SAME plist,
+# so a launchd-derived reading of DaemonSpec says "one spec, one unit". systemd has no such key —
+# a periodic job is a .service PLUS a .timer, different unit types with different lifecycles. A
+# unit that renders the interval into the service installs cleanly and NEVER FIRES.
+# =============================================================================================
+
+
+class _FakeSystemctl:
+    """Records systemctl/loginctl invocations; returns per-verb rc and `show` output."""
+
+    def __init__(self, rc_for=None, show=None) -> None:  # noqa: ANN001
+        self.calls: list[list[str]] = []
+        self._rc_for = rc_for or {}
+        self._show = show or {}
+
+    def __call__(self, cmd, *, check=False):  # noqa: ANN001
+        # NOTE the signature: this fake replaces `daemon._run` (which takes `check`), not
+        # `subprocess.run` (which the launchd fake above replaces). Two fakes, two seams.
+        self.calls.append(cmd)
+        verb = cmd[2] if cmd[0] == "systemctl" and len(cmd) > 2 else cmd[0]
+        rc = self._rc_for.get(verb, 0)
+        out = ""
+        if verb == "show":
+            unit = cmd[3]
+            props = self._show.get(unit, self._show.get("*", {}))
+            out = "\n".join(f"{k}={v}" for k, v in props.items())
+            if not props:
+                rc = self._rc_for.get("show", 1)
+        return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+
+    @property
+    def verbs(self) -> list[str]:
+        return [c[2] if c[0] == "systemctl" and len(c) > 2 else c[0] for c in self.calls]
+
+
+@pytest.fixture
+def systemd(tmp_path, monkeypatch):
+    monkeypatch.setattr(SystemdUserProvider, "UNIT_DIR", tmp_path / "systemd-user")
+    return SystemdUserProvider()
+
+
+def _resident(tmp_path) -> DaemonSpec:
+    return DaemonSpec(
+        label="levain-cockpit", argv=["/usr/bin/levain", "serve", "--write"],
+        working_dir=tmp_path, env={"PATH": "/usr/bin", "HOME": str(tmp_path)},
+        stdout_log=tmp_path / "out.log", stderr_log=tmp_path / "err.log",
+    )
+
+
+def _seat(tmp_path, interval: int = 900) -> DaemonSpec:
+    return DaemonSpec(
+        label="levain-seat", argv=["/usr/bin/levain", "run", "--task", "x"],
+        working_dir=tmp_path, env={"PATH": "/usr/bin"},
+        stdout_log=tmp_path / "seat.log", stderr_log=tmp_path / "seat.err",
+        run_at_login=False, keep_alive=False, start_interval=interval,
+    )
+
+
+def test_systemd_resident_unit_restarts_and_has_no_schedule(systemd, tmp_path) -> None:
+    unit = systemd.render_unit(_resident(tmp_path))
+    assert "Type=simple" in unit
+    assert "Restart=always" in unit           # the KeepAlive analogue
+    assert "WantedBy=default.target" in unit
+    assert systemd.render_timer(_resident(tmp_path)) is None
+
+
+def test_systemd_seat_puts_the_cadence_in_a_TIMER_not_the_service(systemd, tmp_path) -> None:
+    """⛔ THE RE-DERIVATION TRAP. A seat's cadence must live in a separate .timer unit. If it were
+    rendered into the .service (the shape launchd's StartInterval suggests) the unit would install
+    cleanly, report success, and never fire — the unit lying about its own cadence."""
+    spec = _seat(tmp_path, 900)
+    service = systemd.render_unit(spec)
+    timer = systemd.render_timer(spec)
+    assert timer is not None
+    assert "OnUnitActiveSec=900" in timer
+    assert "Unit=levain-seat.service" in timer
+    assert "WantedBy=timers.target" in timer
+    # and the SERVICE must not pretend to schedule itself, nor restart-loop
+    assert "900" not in service
+    assert "Restart=" not in service
+    assert "Type=oneshot" in service
+
+
+def test_systemd_timer_pins_accuracy_or_the_cadence_is_a_lie(systemd, tmp_path) -> None:
+    """systemd's DEFAULT AccuracySec is ONE MINUTE. Without pinning it, a sub-minute cadence
+    installs happily and silently runs about once a minute — the same class as an unthrottled
+    sub-10s launchd job, which the launchd provider already guards with ThrottleInterval."""
+    assert "AccuracySec=1s" in systemd.render_timer(_seat(tmp_path, 30))
+
+
+def test_systemd_timer_is_not_persistent(systemd, tmp_path) -> None:
+    """`Persistent=true` would make a box that was off for a week fire every missed turn at once —
+    a token stampede on boot. Absence here is a decision, so it is asserted."""
+    assert "Persistent" not in systemd.render_timer(_seat(tmp_path))
+
+
+def test_systemd_env_and_argv_are_quoted(systemd, tmp_path) -> None:
+    spec = DaemonSpec(
+        label="q", argv=["/usr/bin/levain", "run", "--task", "a b c"],
+        working_dir=tmp_path, env={"MSG": 'he said "hi"', "P": "/a b"},
+        stdout_log=tmp_path / "o", stderr_log=tmp_path / "e",
+    )
+    unit = systemd.render_unit(spec)
+    assert "'a b c'" in unit                       # argv shell-quoted
+    assert r'Environment="MSG=he said \"hi\""' in unit  # embedded quote escaped, not terminating
+
+
+def test_systemd_refuses_a_control_char_in_a_unit_value(systemd, tmp_path) -> None:
+    """A newline in a value would END the directive and inject a new one — in the file that defines
+    what runs unattended. FAIL CLOSED, the same call the seatbelt provider makes for SBPL."""
+    spec = DaemonSpec(
+        label="x", argv=["/usr/bin/levain"], working_dir=tmp_path,
+        env={"EVIL": "a\nExecStartPost=/bin/rm -rf /"},
+        stdout_log=tmp_path / "o", stderr_log=tmp_path / "e",
+    )
+    with pytest.raises(DaemonError):
+        systemd.render_unit(spec)
+
+
+def test_systemd_install_writes_both_units_and_enables_the_timer(systemd, tmp_path, monkeypatch) -> None:
+    fake = _FakeSystemctl(show={"*": {"LoadState": "loaded", "ActiveState": "active",
+                                      "SubState": "waiting", "MainPID": "0",
+                                      "ExecMainStatus": "0"}})
+    monkeypatch.setattr(daemon, "_run", fake)
+    out = systemd.install(_seat(tmp_path))
+    assert (systemd.UNIT_DIR / "levain-seat.service").exists()
+    assert (systemd.UNIT_DIR / "levain-seat.timer").exists()
+    assert "daemon-reload" in fake.verbs
+    # the TIMER is what gets enabled — enabling the service would run it once and never again
+    assert ["systemctl", "--user", "enable", "--now", "levain-seat.timer"] in fake.calls
+    assert "idle between turns is NORMAL" in out
+
+
+def test_systemd_install_requests_lingering_and_reports_a_refusal(systemd, tmp_path, monkeypatch) -> None:
+    """⚠ WITHOUT LINGERING A USER UNIT DIES AT LOGOUT — spore-418's "always-on agent that dies when
+    the laptop lid closes", reappearing as a session lifetime. A refusal must be SURFACED, never
+    swallowed into a green install line."""
+    fake = _FakeSystemctl(rc_for={"loginctl": 1},
+                          show={"*": {"LoadState": "loaded", "ActiveState": "active",
+                                      "SubState": "running", "MainPID": "42",
+                                      "ExecMainStatus": "0"}})
+    monkeypatch.setattr(daemon, "_run", fake)
+    out = systemd.install(_resident(tmp_path))
+    assert ["loginctl", "enable-linger"] in fake.calls
+    assert "could NOT enable lingering" in out
+    assert "will NOT run while you are logged out" in out
+
+
+def test_systemd_status_reports_the_TIMER_for_a_seat(systemd, tmp_path, monkeypatch) -> None:
+    """A seat's SERVICE is inactive between turns — that is health, not failure. Reporting on the
+    service would call a perfectly working seat "inactive" in the command an operator uses to check
+    on it. The timer is the thing that must be active."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-seat.service").write_text("x")
+    (systemd.UNIT_DIR / "levain-seat.timer").write_text("x")
+    fake = _FakeSystemctl(show={"levain-seat.timer": {"LoadState": "loaded",
+                                                      "ActiveState": "active",
+                                                      "SubState": "waiting", "MainPID": "0",
+                                                      "ExecMainStatus": "0"}})
+    monkeypatch.setattr(daemon, "_run", fake)
+    st = systemd.status("levain-seat")
+    assert any(c[3] == "levain-seat.timer" for c in fake.calls if c[0] == "systemctl")
+    assert st.installed is True
+    # a timer is `active (waiting)` with MainPID=0 FOREVER — that is healthy, and it is not "running"
+    assert st.running is False
+    assert st.load_state == "loaded"
+
+
+def test_systemd_status_unknown_when_the_user_manager_is_unreachable(systemd, tmp_path, monkeypatch) -> None:
+    """⛔ NO-DATA IS NOT NO-EVENT. `systemctl --user` fails outright over ssh without lingering, or
+    in a container with no systemd. Calling that "not loaded" is the same violation the launchd
+    provider guards against for an unreadable Aqua domain."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-cockpit.service").write_text("x")
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(rc_for={"show": 1}))
+    st = systemd.status("levain-cockpit")
+    assert st.load_state == "unknown"
+    assert st.running is False
+    assert "cannot reach" in st.detail
+
+
+def test_systemd_uninstall_removes_the_timer_too(systemd, tmp_path, monkeypatch) -> None:
+    """An orphan timer left behind stays armed to start a unit that no longer exists — systemd then
+    reports a failing timer forever, and a later resident install gets two schedulers on one
+    service."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-seat.service").write_text("x")
+    (systemd.UNIT_DIR / "levain-seat.timer").write_text("x")
+    fake = _FakeSystemctl()
+    monkeypatch.setattr(daemon, "_run", fake)
+    out = systemd.uninstall("levain-seat")
+    assert not (systemd.UNIT_DIR / "levain-seat.service").exists()
+    assert not (systemd.UNIT_DIR / "levain-seat.timer").exists()
+    # the timer is disabled BEFORE the service
+    disabled = [c[4] for c in fake.calls if len(c) > 4 and c[2] == "disable"]
+    assert disabled.index("levain-seat.timer") < disabled.index("levain-seat.service")
+    assert "levain-seat.timer" in out
+
+
+def test_systemd_would_install_diffs_the_timer_too(systemd, tmp_path, monkeypatch) -> None:
+    """A pure CADENCE edit changes ONLY the timer. Diffing just the service would report "no change"
+    for the single field a seat's operator is most likely to be changing."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    spec = _seat(tmp_path, 900)
+    (systemd.UNIT_DIR / "levain-seat.service").write_text(systemd.render_unit(spec))
+    (systemd.UNIT_DIR / "levain-seat.timer").write_text(systemd.render_timer(spec))
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(
+        show={"*": {"LoadState": "loaded", "ActiveState": "active", "SubState": "waiting",
+                    "MainPID": "0", "ExecMainStatus": "0"}}))
+    assert systemd.would_install(spec).would_change is False
+    assert systemd.would_install(_seat(tmp_path, 60)).would_change is True
+
+
+def test_systemd_install_drops_an_orphan_timer_on_a_shape_change(systemd, tmp_path, monkeypatch) -> None:
+    """periodic -> resident. A left-behind timer would keep firing the service on the OLD cadence
+    alongside the new resident unit — two schedulers driving one service, which reads to an operator
+    as "it randomly restarts"."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-cockpit.timer").write_text("stale")
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(
+        show={"*": {"LoadState": "loaded", "ActiveState": "active", "SubState": "running",
+                    "MainPID": "7", "ExecMainStatus": "0"}}))
+    systemd.install(_resident(tmp_path))
+    assert not (systemd.UNIT_DIR / "levain-cockpit.timer").exists()
+
+
+def test_systemd_install_rolls_back_to_the_prior_unit_on_failure(systemd, tmp_path, monkeypatch) -> None:
+    """Same transactional floor as launchd: a failed enable must not destroy a prior good unit."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    prior = "[Unit]\nDescription=PRIOR\n"
+    (systemd.UNIT_DIR / "levain-cockpit.service").write_text(prior)
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(rc_for={"enable": 1}))
+    with pytest.raises(DaemonError, match="rolled back"):
+        systemd.install(_resident(tmp_path))
+    assert (systemd.UNIT_DIR / "levain-cockpit.service").read_text() == prior
+
+
+# --- systemd's OWN parser is the oracle, not our string assertions ----------------------------
+
+_HAS_SYSTEMD_ANALYZE = shutil.which("systemd-analyze") is not None
+_systemd_live = pytest.mark.skipif(
+    not (platform.system() == "Linux" and _HAS_SYSTEMD_ANALYZE),
+    reason="needs a Linux host with systemd-analyze",
+)
+
+
+@_systemd_live
+@pytest.mark.parametrize("periodic", [False, True])
+def test_systemd_rendered_units_pass_systemd_analyze_verify(tmp_path, monkeypatch, periodic) -> None:
+    """⚠ EVERY OTHER TEST IN THIS SECTION CHECKS THAT OUR STRINGS SAY WHAT WE INTENDED. None of them
+    can tell whether SYSTEMD accepts the file — a unit can satisfy all of them and still be rejected
+    at load, which is the mechanism-correct/meaning-wrong class. This hands the rendered units to
+    systemd's own parser.
+
+    ``systemd-analyze verify`` fails on an ExecStart binary it cannot find, so a stub is placed on
+    PATH first — otherwise this asserts "levain is installed", not "the unit is valid"."""
+    monkeypatch.setattr(SystemdUserProvider, "UNIT_DIR", tmp_path / "units")
+    p = SystemdUserProvider()
+    stub_dir = tmp_path / "bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "levain-stub"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+
+    spec = DaemonSpec(
+        label="levain-verify", argv=[str(stub), "run", "--task", "a task with spaces"],
+        working_dir=tmp_path, env={"PATH": "/usr/bin:/bin", "MSG": 'quoted "value"'},
+        stdout_log=tmp_path / "o.log", stderr_log=tmp_path / "e.log",
+        run_at_login=not periodic, keep_alive=not periodic,
+        start_interval=900 if periodic else None,
+    )
+    units = {"levain-verify.service": p.render_unit(spec)}
+    timer = p.render_timer(spec)
+    if timer is not None:
+        units["levain-verify.timer"] = timer
+    d = tmp_path / "units"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in units.items():
+        (d / name).write_text(text)
+    for name in units:
+        proc = subprocess.run(
+            ["systemd-analyze", "verify", "--user", str(d / name)],
+            capture_output=True, text=True,
+        )
+        # A container has no system bus; that is environmental, not a unit defect.
+        errs = [ln for ln in (proc.stderr or "").splitlines()
+                if ln.strip() and "Failed to connect to system bus" not in ln]
+        assert not errs, f"{name} rejected by systemd: {errs}"

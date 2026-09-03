@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -656,16 +657,344 @@ class LaunchdProvider(DaemonProvider):
         return f"restarted {label}"
 
 
+# --- Linux: systemd --user units -------------------------------------------------------------
+
+_SYSTEMD_USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
+
+
+def _systemd_escape(value: str) -> str:
+    r"""Escape a value for a systemd unit's double-quoted string (``Environment="K=V"``).
+
+    systemd's unit parser treats ``\`` as an escape and ``"`` as a quote delimiter, so both are
+    escaped; a newline would END the directive and inject a new one, which in a file that defines
+    what runs unattended is the same class as SBPL profile injection on the macOS side. Refuse a
+    control character outright rather than trust the escaping (FAIL CLOSED — the seatbelt provider
+    makes the identical choice for the identical reason)."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise DaemonError(
+            f"refusing to render a systemd unit with a control character in a value ({value!r}) — "
+            "fail-closed rather than risk unit-directive injection."
+        )
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+class SystemdUserProvider(DaemonProvider):
+    """Linux ``systemd --user`` provider (K4c) — the lifecycle half, and it is the half that is
+    easy to miss: without it there is no SCHEDULED Linux seat at all, only confinement with nothing
+    supervising it.
+
+    Per-user and sudo-free, exactly like the launchd provider: units land in
+    ``~/.config/systemd/user`` and every verb is ``systemctl --user``. Never a system unit.
+
+    ⚠ **THE CADENCE LIVES IN A SEPARATE UNIT, AND THAT IS THE RE-DERIVATION TRAP THIS PROVIDER
+    EXISTS TO AVOID.** On launchd, ``StartInterval`` is one more key in the same plist, so
+    ``DaemonSpec`` naturally reads as "one spec, one unit". systemd has no such key: a periodic job
+    is a ``.service`` (what to run) PLUS a ``.timer`` (when), and they are different unit types with
+    different lifecycles. So a periodic spec renders TWO files here, ``status`` reports on the TIMER
+    (the thing that is supposed to be active, while the service is correctly inactive between turns),
+    and ``uninstall`` must remove both or the next install inherits an orphan timer. Rendering the
+    interval into the service — the shape a launchd-derived reading suggests — produces a unit that
+    installs cleanly and never fires.
+
+    ⚠ **LINGERING IS WHAT MAKES AN ALWAYS-ON AGENT ACTUALLY ALWAYS-ON.** By default a user's systemd
+    instance stops when their last session ends, so a headless box's seat would die on logout — the
+    precise contradiction ``spore-418`` names ("an always-on agent that dies when the laptop lid
+    closes is a contradiction in terms"), reappearing as a session lifetime instead of a lid.
+    ``install`` requests ``loginctl enable-linger`` and REPORTS whether it was granted rather than
+    assuming it; a refusal is surfaced in the install summary, never swallowed."""
+
+    UNIT_DIR = _SYSTEMD_USER_UNIT_DIR
+
+    # ---- paths -------------------------------------------------------------------------------
+
+    def _service_path(self, label: str) -> Path:
+        return self.UNIT_DIR / f"{label}.service"
+
+    def _timer_path(self, label: str) -> Path:
+        return self.UNIT_DIR / f"{label}.timer"
+
+    def _is_periodic_on_disk(self, label: str) -> bool:
+        """A seat is identified by its TIMER existing. ``status``/``uninstall`` receive only a label,
+        never the spec, so the on-disk shape is the only thing that can say which kind of unit this
+        is — and reporting a seat's *service* state would call a healthy idle seat "inactive"."""
+        return self._timer_path(label).exists()
+
+    # ---- rendering (PURE) --------------------------------------------------------------------
+
+    def render_unit(self, spec: DaemonSpec) -> str:
+        """The ``.service`` unit. For a periodic spec this deliberately carries NO schedule — see
+        :meth:`render_timer`."""
+        periodic = spec.start_interval is not None
+        lines = [
+            "[Unit]",
+            f"Description=Levain {spec.label}",
+            # A user unit that starts at "login" should come up with the user session; for a linger-
+            # enabled headless box this is also what boots it.
+            "After=default.target",
+            "",
+            "[Service]",
+            # oneshot for a seat (it runs one bounded turn and EXITS, and systemd must not treat that
+            # exit as a crash); simple + Restart for the resident cockpit.
+            "Type=oneshot" if periodic else "Type=simple",
+            f"ExecStart={' '.join(shlex.quote(a) for a in spec.argv)}",
+            f"WorkingDirectory={spec.working_dir}",
+        ]
+        for key, value in spec.env.items():
+            lines.append(f'Environment="{_systemd_escape(key)}={_systemd_escape(value)}"')
+        lines += [
+            # `append:` matches launchd's StandardOutPath/StandardErrorPath semantics — accumulate
+            # rather than truncate, so a crash loop's evidence survives. DOCUMENTED as systemd 240+
+            # (systemd.exec(5)); what was actually VERIFIED here is that `systemd-analyze verify`
+            # accepts it on systemd 255, which is what Ubuntu 24.04 ships. An older systemd is
+            # untested by us — the distinction matters because the failure would be at unit LOAD.
+            f"StandardOutput=append:{spec.stdout_log}",
+            f"StandardError=append:{spec.stderr_log}",
+        ]
+        if not periodic and spec.keep_alive:
+            # The launchd KeepAlive analogue: survive a crash. Deliberately NOT set for a seat —
+            # `DaemonSpec` already refuses a periodic spec with keep_alive, and on systemd a Restart
+            # on a oneshot is how a seat becomes a hot loop.
+            lines += ["Restart=always", "RestartSec=5"]
+        lines += ["", "[Install]", "WantedBy=default.target", ""]
+        return "\n".join(lines)
+
+    def render_timer(self, spec: DaemonSpec) -> str | None:
+        """The ``.timer`` unit for a periodic seat, or None for a resident service.
+
+        ``OnUnitActiveSec`` measures from the END of the last run, which is the launchd
+        ``StartInterval`` semantic an operator expects ("every N seconds"); ``OnActiveSec`` gives the
+        first run one interval after the timer starts, so installing a schedule does not
+        immediately spend a model turn. ``AccuracySec`` is pinned to 1s rather than left to systemd's
+        default, which systemd.timer(5) DOCUMENTS as one minute — ⚠ documented, not measured here
+        (the man pages were not installed on the box these units were verified on). The reason does
+        not depend on the exact default: any accuracy window wider than the interval means a short
+        cadence installs happily and silently fires on a different schedule than the one the operator
+        asked for, the unit lying about itself exactly as an unthrottled sub-10s launchd job does.
+        Pinning it makes the reported cadence TRUE regardless of what the default happens to be. ``Persistent`` is deliberately NOT set: a seat that missed turns while the box was off
+        must not stampede them all on boot."""
+        if spec.start_interval is None:
+            return None
+        return "\n".join([
+            "[Unit]",
+            f"Description=Levain {spec.label} schedule",
+            "",
+            "[Timer]",
+            f"OnActiveSec={spec.start_interval}",
+            f"OnUnitActiveSec={spec.start_interval}",
+            f"Unit={spec.label}.service",
+            "AccuracySec=1s",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ])
+
+    # ---- helpers -----------------------------------------------------------------------------
+
+    @staticmethod
+    def _atomic_write(path: Path, data: bytes) -> None:
+        """Same atomicity floor as the launchd provider: temp + ``os.replace`` in the same directory,
+        so a crash can never leave a TRUNCATED unit that systemd would parse as a valid one."""
+        tmp = path.with_name(f"{path.name}.new.{os.getpid()}")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+
+    def _primary_unit(self, label: str) -> str:
+        """The unit whose state ANSWERS "is this thing working" — the timer for a seat, the service
+        for a resident cockpit."""
+        return f"{label}.timer" if self._is_periodic_on_disk(label) else f"{label}.service"
+
+    def _show(self, unit: str, props: str) -> dict[str, str]:
+        proc = _run(["systemctl", "--user", "show", unit, "-p", props], check=False)
+        if proc.returncode != 0:
+            return {}
+        out: dict[str, str] = {}
+        for ln in proc.stdout.splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                out[k.strip()] = v.strip()
+        return out
+
+    def _enable_linger(self) -> str:
+        """Ask for lingering and REPORT the answer. Never assumes it was granted — a polkit-denied
+        linger on a locked-down box would otherwise leave an operator with a unit that looks
+        installed and dies at logout."""
+        proc = _run(["loginctl", "enable-linger"], check=False)
+        if proc.returncode == 0:
+            return "lingering enabled (the seat survives logout)"
+        detail = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
+        return (f"⚠ could NOT enable lingering ({detail}) — the unit is installed, but a systemd "
+                f"--user instance stops when your last session ends, so this will NOT run while you "
+                f"are logged out. Fix with `sudo loginctl enable-linger $USER`.")
+
+    # ---- verbs -------------------------------------------------------------------------------
+
+    def install(self, spec: DaemonSpec) -> str:
+        _refuse_root()
+        self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
+        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
+        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+
+        service_path = self._service_path(spec.label)
+        timer_path = self._timer_path(spec.label)
+        timer_text = self.render_timer(spec)
+
+        prior_service = service_path.read_bytes() if service_path.exists() else None
+        prior_timer = timer_path.read_bytes() if timer_path.exists() else None
+
+        self._atomic_write(service_path, self.render_unit(spec).encode("utf-8"))
+        if timer_text is not None:
+            self._atomic_write(timer_path, timer_text.encode("utf-8"))
+        elif timer_path.exists():
+            # SHAPE CHANGE, periodic -> resident. An orphan timer left here would keep firing the
+            # service on the OLD cadence alongside the new resident unit — two schedulers driving one
+            # service, which is the kind of thing that reads as "it randomly restarts".
+            _run(["systemctl", "--user", "disable", "--now", f"{spec.label}.timer"], check=False)
+            timer_path.unlink(missing_ok=True)
+
+        _run(["systemctl", "--user", "daemon-reload"], check=False)
+        target = f"{spec.label}.timer" if timer_text is not None else f"{spec.label}.service"
+        proc = _run(["systemctl", "--user", "enable", "--now", target], check=False)
+        if proc.returncode != 0:
+            failure = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
+            if prior_service is not None:
+                # ROLL BACK to the prior good definition — the same transactional floor as launchd.
+                self._atomic_write(service_path, prior_service)
+                if prior_timer is not None:
+                    self._atomic_write(timer_path, prior_timer)
+                _run(["systemctl", "--user", "daemon-reload"], check=False)
+                _run(["systemctl", "--user", "enable", "--now", target], check=False)
+                raise DaemonError(
+                    f"enabling the new unit failed: {failure} — rolled back to the prior installed "
+                    f"unit at {service_path}")
+            raise DaemonError(
+                f"enabling failed: {failure} — the unit is KEPT at {service_path} (it is valid). "
+                f"A valid unit is not deleted on a transient failure; re-run the install once the "
+                f"cause is fixed.")
+
+        linger = self._enable_linger()
+        st = self.status(spec.label)
+        if timer_text is not None:
+            run_line = (
+                f"scheduled every {spec.start_interval}s — idle between turns is NORMAL "
+                f"(now: {st.detail}). Force a turn with `levain daemon restart`; activity lands in "
+                f"{spec.stdout_log} and DECISIONS (gated halts) in {spec.stderr_log}"
+            )
+        else:
+            run_line = (f"running ({st.detail})" if st.running
+                        else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")
+        units = f"{service_path}" + (f"\n          {timer_path}" if timer_text is not None else "")
+        return (f"installed {spec.label}\n  unit:   {units}\n"
+                f"  domain: systemd --user (per-user, no sudo)\n"
+                f"  linger: {linger}\n  status: {run_line}")
+
+    def uninstall(self, label: str) -> str:
+        _refuse_root()
+        service_path = self._service_path(label)
+        timer_path = self._timer_path(label)
+        # Disable the TIMER first: disabling only the service would leave the timer armed to start a
+        # unit that no longer exists, which systemd reports as a failing timer forever.
+        for unit in (f"{label}.timer", f"{label}.service"):
+            _run(["systemctl", "--user", "disable", "--now", unit], check=False)
+        existed = service_path.exists() or timer_path.exists()
+        removed = [str(p) for p in (service_path, timer_path) if p.exists()]
+        service_path.unlink(missing_ok=True)
+        timer_path.unlink(missing_ok=True)
+        _run(["systemctl", "--user", "daemon-reload"], check=False)
+        return (f"uninstalled {label} (removed {', '.join(removed)})" if existed
+                else f"{label} was not installed (no unit at {service_path})")
+
+    def status(self, label: str) -> DaemonStatus:
+        installed = self._service_path(label).exists()
+        unit = self._primary_unit(label)
+        props = self._show(unit, "LoadState,ActiveState,SubState,MainPID,ExecMainStatus")
+        if not props:
+            # `systemctl --user show` failed outright — no user manager reachable (no session bus,
+            # a container without systemd, ssh without linger). That is NO DATA, and reporting it as
+            # "not loaded" is the no-data≠no-event violation the launchd provider guards against for
+            # an unreadable Aqua domain. Same honesty floor, same wording.
+            return DaemonStatus(installed=installed, running=False,
+                                detail="unknown (cannot reach the systemd --user manager)",
+                                load_state="unknown")
+        load_state = props.get("LoadState", "")
+        active = props.get("ActiveState", "")
+        sub = props.get("SubState", "")
+        pid = props.get("MainPID", "0")
+        last_exit = props.get("ExecMainStatus", "0")
+        if load_state != "loaded":
+            return DaemonStatus(installed=installed, running=False,
+                                detail=f"not loaded (LoadState={load_state or 'unknown'})",
+                                load_state="not-loaded")
+        # A live numeric pid is the run signal, exactly as on launchd — NOT the ActiveState string.
+        # A TIMER is `active (waiting)` with MainPID=0 forever, which is its HEALTHY state, so a
+        # string check would call a working seat "running" and a resident crash-loop "active" too.
+        running = pid.isdigit() and int(pid) > 0
+        detail = f"{active} ({sub})" if sub else active or "loaded"
+        if running:
+            detail += f", pid = {pid}"
+        if last_exit not in ("", "0"):
+            detail += f", last exit = {last_exit}"
+        return DaemonStatus(installed=installed, running=running, detail=detail,
+                            load_state="running" if running else "loaded")
+
+    def would_install(self, spec: DaemonSpec) -> DaemonPlan:
+        service_path = self._service_path(spec.label)
+        timer_path = self._timer_path(spec.label)
+        on_disk = service_path.exists()
+        rendered = self.render_unit(spec)
+        rendered_timer = self.render_timer(spec)
+        try:
+            existing = service_path.read_text(encoding="utf-8") if on_disk else None
+        except OSError:
+            existing = None
+        try:
+            existing_timer = timer_path.read_text(encoding="utf-8") if timer_path.exists() else None
+        except OSError:
+            existing_timer = None
+        # BOTH files are diffed. Comparing only the service would report "no change" for a pure
+        # cadence edit — the one field a seat's operator is most likely to be changing.
+        would_change = existing != rendered or existing_timer != rendered_timer
+        current = self.status(spec.label)
+        if not on_disk:
+            action = "FRESH INSTALL — write the unit(s) + daemon-reload + enable --now"
+        elif would_change:
+            action = "REINSTALL — the unit(s) changed; atomic-swap, daemon-reload, re-enable"
+        elif current.load_state == "running":
+            action = "no-op — unit unchanged and the service is running"
+        elif current.load_state == "loaded":
+            failing = ("last exit = " in current.detail)
+            action = ("no-op — unit unchanged and loaded, but ⚠ its LAST RUN FAILED "
+                      f"({current.detail}) — check the seat's logs"
+                      if failing else "no-op — unit unchanged and loaded (idle)")
+        elif current.load_state == "unknown":
+            action = "UNKNOWN — unit unchanged, but the systemd --user manager can't be read"
+        else:
+            action = ("RE-ENABLE — unit unchanged but NOT loaded (a file on disk is not a loaded "
+                      "service)")
+        return DaemonPlan(label=spec.label, unit_path=service_path, on_disk=on_disk,
+                          would_change=would_change, current=current, action=action)
+
+    def restart(self, label: str) -> str:
+        _refuse_root()
+        # Restart the SERVICE even for a seat: "force a turn now" is what an operator means, and
+        # restarting the timer would merely reset the countdown.
+        _run(["systemctl", "--user", "restart", f"{label}.service"], check=True)
+        return f"restarted {label}"
+
+
 def select_provider(system: str | None = None) -> DaemonProvider:
-    """The provider for this OS. macOS ships now; Linux/Windows are planned pure-additions
-    against the same contract (the interface is here, the providers slot in)."""
+    """The provider for this OS. macOS (launchd user agent) and Linux (systemd ``--user``, K4c)
+    ship; Windows (Task Scheduler) remains a planned pure-addition against the same contract.
+
+    ⚠ A PROVIDER IS NOT A GUARANTEE THAT THE SERVICE MANAGER IS REACHABLE. On Linux the units can be
+    written while ``systemctl --user`` has no session bus to talk to (ssh without lingering, a
+    container), which :meth:`SystemdUserProvider.status` reports as ``unknown`` rather than as
+    not-loaded — no-data is not no-event."""
     system = system or platform.system()
     if system == "Darwin":
         return LaunchdProvider()
     if system == "Linux":
-        raise NotImplementedError(
-            "the systemd --user provider is a planned pure-addition (spore-205); macOS ships "
-            "first. For now run `levain serve --write --no-open` under your own supervisor.")
+        return SystemdUserProvider()
     if system == "Windows":
         raise NotImplementedError(
             "the Task Scheduler (schtasks /SC ONLOGON) provider is a planned pure-addition "
