@@ -1670,3 +1670,43 @@ class TestThePackFixtureIsRealAndNotHandWritten:
         text = (install / "activation" / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
         assert "{{ANNEAL_MEMORY}}" not in text, "the composer must have substituted the placeholder"
         assert "/usr/local/bin/anneal-memory" in text, "the substituted value must be present"
+
+
+def test_doctor_confinement_check_reports_and_never_fails(tmp_path, monkeypatch):
+    """⚖ A REPORT, NOT A GATE — deliberate. An entity with only its file-editor hand is a WORKING,
+    supported configuration (the in-process crown-jewels floor is cross-platform and enforces the
+    same denylist). Turning a healthy install red for a missing OPTIONAL hand is how an operator
+    learns to ignore doctor. The remedy still has to reach them, in the same `→` shape a hint uses."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(
+        conf, "diagnose_confinement",
+        lambda *a, **k: conf.ConfinementDiagnosis(
+            supported=False, provider="bwrap (Linux mount namespace)",
+            reason="AppArmor denies unprivileged user namespaces",
+            remedy="install Ubuntu's bwrap-userns-restrict profile"),
+    )
+    results = _check_confinement(tmp_path)
+    assert len(results) == 1
+    r = results[0]
+    assert r.ok is True, "a bash-free entity is supported, not a failing install"
+    assert "file_editor only" in r.detail
+    assert "supported configuration" in r.detail
+    assert "bwrap-userns-restrict" in r.detail
+    assert "→" in r.detail
+
+
+def test_doctor_confinement_check_survives_a_broken_diagnosis(tmp_path, monkeypatch):
+    """The diagnosis probes the filesystem and executes a binary. Neither may take the whole doctor
+    run down — an unrelated crash here would hide every other check."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    def boom(*a, **k):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(conf, "diagnose_confinement", boom)
+    results = _check_confinement(tmp_path)
+    assert results[0].ok is True
+    assert "not determinable" in results[0].detail

@@ -914,3 +914,36 @@ def test_banner_omits_the_exit_ladder_entirely_for_the_REPL(tmp_path: Path, caps
     out = capsys.readouterr().out
     assert "time bound" not in out
     assert "wall-clock bound was exceeded" not in out
+
+
+def test_banner_never_claims_the_platform_is_unsupported(tmp_path: Path, capsys):
+    """⛔ THE EXACT WORDING REGRESSION K4c CREATED. This line read "no OS sandbox on this platform"
+    and was correct while macOS was the only supported OS. After Linux shipped it became false in
+    the most common Linux case — a SUPPORTED platform whose kernel refuses to start the sandbox —
+    and it is the sentence an operator reads before concluding Levain has no Linux support.
+
+    Pinned as a NEGATIVE assertion because the failure mode is a sentence coming back, not a
+    function breaking: nothing else in the suite would notice."""
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="m", with_tools=True, bash_ok=False,
+        bash_note="bwrap is installed but this kernel's AppArmor policy denies user namespaces "
+                  "— install Ubuntu's bwrap profile",
+    )
+    out = capsys.readouterr().out
+    assert "no OS sandbox on this platform" not in out
+    assert "file editor only" in out
+    assert "AppArmor" in out                       # the real reason reaches the operator
+    assert "levain doctor" in out                  # and where to get the full diagnosis
+
+
+def test_banner_without_a_diagnosis_still_says_something_true(tmp_path: Path, capsys):
+    """A diagnosis is best-effort — it must never break the banner, and its absence must not
+    resurrect a claim about the platform."""
+    from levain.run import _print_banner
+
+    _print_banner(tmp_path, _FakeBinding(tmp_path), model="m", with_tools=True, bash_ok=False)
+    out = capsys.readouterr().out
+    assert "file editor only" in out
+    assert "no OS sandbox on this platform" not in out

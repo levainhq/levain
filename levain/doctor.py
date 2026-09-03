@@ -111,6 +111,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_seed_content(install))
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
+    core.extend(_check_confinement(install))
     core.extend(_check_store(install))
     core.extend(_check_compat_set(install))
     for r in core:
@@ -805,6 +806,44 @@ def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
         return False, f"timed out after {timeout}s"
     except OSError as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def _check_confinement(install: Path) -> list[CheckResult]:
+    """Report whether ``levain run`` will get its bash hand on THIS host, and if not, how to fix it.
+
+    ⚖ THIS REPORTS, IT NEVER FAILS — a deliberate call, not an oversight. An entity with only its
+    file-editor hand is a WORKING, SUPPORTED configuration: the in-process crown-jewels floor is
+    fully cross-platform and enforces the same denylist. Turning a healthy install red because it
+    lacks an optional hand is how an operator learns to ignore doctor, and it would contradict what
+    the code actually does (``levain run`` fails CLOSED and carries on without bash, by design).
+    The remedy is rendered in the SAME ``→`` shape ``_emit`` uses for a hint, so a report that needs
+    action still looks like one.
+
+    ⚡ WHY THIS CHECK EXISTS AT ALL. Before K4c the answer was uninteresting — macOS had a floor,
+    everything else did not. Now Linux ships one, and the common Ubuntu case is a SUPPORTED platform
+    whose kernel refuses to let the sandbox start. That is one command away from working, and
+    without a surface saying so the operator's only signal is a banner line and a missing tool.
+
+    The diagnosis itself is NOT computed here: :func:`~levain.firing.confinement.diagnose_confinement`
+    is the single source, shared with the ``levain run`` banner, so the two cannot drift."""
+    # Lazy import — this module keeps levain imports out of its top level (see `run_doctor`).
+    try:
+        from levain.firing.confinement import diagnose_confinement
+    except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
+        return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
+
+    try:
+        d = diagnose_confinement()
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
+
+    if d.supported:
+        return [CheckResult("confinement floor", True,
+                            f"{d.provider} — `levain run` gets file_editor + bash")]
+    detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"
+    if d.remedy:
+        detail += f"\n      → to enable the bash hand: {d.remedy}"
+    return [CheckResult("confinement floor", True, detail)]
 
 
 def _check_store(install: Path) -> list[CheckResult]:

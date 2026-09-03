@@ -202,7 +202,7 @@ Two of those write targets are your own inbox into the partnership. Dump anythin
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
-## Keep it running (macOS)
+## Keep it running (macOS and Linux)
 
 ```
 levain daemon install       # start the local write window on login, survive a crash
@@ -213,7 +213,29 @@ levain daemon restart       # restart a running serve or seat, e.g. after new co
 levain daemon uninstall
 ```
 
-`levain daemon install` keeps the local writable cockpit (`levain serve --write`) available without an ad-hoc background process — it starts on login and restarts on crash. `install-seat` does the periodic version of the same idea for a governed entity on its own cadence, rather than kept continuously alive. Both are per-user, no admin or root (a launchd user agent on macOS today; Linux `systemd --user` and Windows Task Scheduler are planned), and both stay pointed at loopback, never off-box. `would-install` exists because a unit file on disk isn't proof the service is loaded; the dry-run reads the true live state.
+`levain daemon install` keeps the local writable cockpit (`levain serve --write`) available without an ad-hoc background process — it starts on login and restarts on crash. `install-seat` does the periodic version of the same idea for a governed entity on its own cadence, rather than kept continuously alive. Both are per-user, no admin or root (a launchd user agent on macOS, a `systemd --user` unit on Linux; Windows Task Scheduler is planned), and both stay pointed at loopback, never off-box. `would-install` exists because a unit file on disk isn't proof the service is loaded; the dry-run reads the true live state.
+
+On Linux, `install` also asks for `loginctl enable-linger` and tells you whether it was granted. Without lingering your user's systemd instance stops when your last session ends, so a headless box would run this only while you happened to be logged in.
+
+## Linux: one thing to know about the bash hand
+
+The sovereign entity (`levain run`) gets two hands: a file editor and a bash shell. The file editor works everywhere. **Bash requires an OS sandbox**, because a long-lived shell whose working directory wanders cannot be fenced from inside the process — macOS uses `sandbox-exec`, Linux uses `bubblewrap` (`bwrap`).
+
+Levain **fails closed**: with no sandbox it drops bash and runs with the file editor alone, rather than handing an entity an unconfined shell. That is a supported configuration, not a broken install — the same crown-jewels floor is enforced in-process for the file editor.
+
+**On Ubuntu 23.10 through 24.10 you will land there on first run**, including 24.04 LTS. Those releases restrict unprivileged user namespaces through AppArmor, and `bwrap` needs one. Ubuntu 25.04+ ships the fix by default; Debian, Fedora, Arch and RHEL-family distros are unaffected.
+
+Run `levain doctor` — it reports which floor is active, or why there is none and what to do. The fix is Ubuntu's own profile:
+
+```
+sudo apt install apparmor-profiles
+sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+```
+
+This keeps Ubuntu's host-wide restriction on and is reversible with `apparmor_parser -R`. Note that it also denies namespace creation to `bwrap`'s children, so the entity's shell cannot run rootless docker/podman, flatpak, or a nested sandbox.
+
+⚠ **Don't diagnose this by reading `kernel.unprivileged_userns_clone`.** That sysctl still reports `1` on affected Ubuntu hosts while `kernel.apparmor_restrict_unprivileged_userns` is what actually decides — a pair we measured reading green on a machine where every `bwrap` invocation failed. Levain checks by running `bwrap`, not by reading either.
 
 ## Audience
 
@@ -223,8 +245,8 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 - **Harnesses:** Claude Code and Codex CLI (hook-wired), plus `openhands` (hookless, scaffolds a sovereign entity). One adapter per install — separate installs if you need more than one.
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
-- **Always-on daemon and governed seats:** macOS today; Linux and Windows are planned.
-- **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) is macOS only. On any other platform the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
+- **Always-on daemon and governed seats:** macOS (launchd) and Linux (`systemd --user`); Windows is planned.
+- **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) needs an OS sandbox: `sandbox-exec` on macOS, `bwrap` on Linux. Where there is none, or the host refuses it (see the Linux section above), the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
 - **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled seat. `daemon install-seat` warns loudly at install time if you're about to install one that way; `doctor` doesn't re-check it on a seat that's already running.
 - **One seat at a time:** a governed seat runs one entity on one schedule. Coordinating several seats as a fleet is not built yet — see *Where this is going* below.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.

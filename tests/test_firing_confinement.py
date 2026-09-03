@@ -35,6 +35,7 @@ from levain.firing.confinement import (
     ConfinementError,
     ConfinementProvider,
     BwrapProvider,
+    diagnose_confinement,
     BWRAP,
     _bwrap_argv,
     bwrap_available,
@@ -2668,3 +2669,72 @@ def test_linux_live_floor_is_inherited_by_descendants(linux_floor) -> None:
     the property that makes an OS sandbox work for a long-lived shell whose cwd wanders."""
     sh, _home, _ent, jewel, _s, _c = linux_floor
     assert sh.run(f"bash -c 'bash -c \"cat {jewel}/secret.txt\"'").exit_code != 0
+
+
+# =============================================================================================
+# diagnose_confinement — ONE explanation, shared by the run banner and `levain doctor`.
+# =============================================================================================
+
+
+def test_diagnose_no_provider_for_the_os_has_no_remedy() -> None:
+    """Nothing the operator can do about an unported OS, so offering a fix would be noise. The
+    THREE outcomes matter: no provider / provider present but host refuses / working."""
+    d = diagnose_confinement("Plan9")
+    assert d.supported is False
+    assert d.provider is None
+    assert d.remedy is None
+
+
+@_darwin_only
+def test_diagnose_macos_reports_the_seatbelt_floor() -> None:
+    d = diagnose_confinement()
+    assert d.supported is True
+    assert "sandbox-exec" in (d.provider or "")
+
+
+def test_diagnose_linux_missing_bwrap_says_install_it(monkeypatch) -> None:
+    monkeypatch.setattr(os.path, "isfile", lambda p: False if p == BWRAP else os.path.isfile(p))
+    d = diagnose_confinement("Linux")
+    assert d.supported is False
+    assert "not installed" in d.reason
+    assert "bubblewrap" in (d.remedy or "")
+
+
+def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkeypatch) -> None:
+    """⚡ THE CASE THIS WHOLE SURFACE EXISTS FOR, and the remedy must be UBUNTU'S OWN profile
+    (`bwrap-userns-restrict`, shipped in `apparmor-profiles`), not one we hand-roll. It must also
+    carry the constraint the profile imposes — bwrap's CHILDREN cannot create namespaces, so the
+    entity's bash cannot run rootless docker/podman or a nested sandbox."""
+    monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
+    monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
+    monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
+    monkeypatch.setattr("levain.firing.confinement._apparmor_restricts_userns", lambda: True)
+    d = diagnose_confinement("Linux")
+    assert d.supported is False
+    assert "AppArmor" in d.reason
+    assert "bwrap-userns-restrict" in (d.remedy or "")
+    assert "CHILDREN" in (d.remedy or "")
+
+
+def test_diagnose_linux_namespace_denied_without_apparmor_is_a_different_sentence(monkeypatch) -> None:
+    """Not every namespace refusal is AppArmor (a container's seccomp does it too, which is how the
+    Linux branches were exercised). A remedy naming the wrong cause is worse than a generic one."""
+    monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
+    monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
+    monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
+    monkeypatch.setattr("levain.firing.confinement._apparmor_restricts_userns", lambda: False)
+    d = diagnose_confinement("Linux")
+    assert "AppArmor" not in d.reason
+    assert "seccomp" in (d.remedy or "")
+
+
+def test_apparmor_probe_is_diagnostic_only_and_never_gates(monkeypatch) -> None:
+    """⛔ THE LESSON OF K4c, PINNED. `spore-418` specified a sysctl read as the capability check and
+    it reported GREEN on a host where bwrap could not run. `bwrap_available` must therefore depend
+    on EXECUTING bwrap, never on this probe — so flipping the probe must not move the gate."""
+    calls = []
+    monkeypatch.setattr("levain.firing.confinement._apparmor_restricts_userns",
+                        lambda: calls.append(1) or True)
+    before = bwrap_available()
+    assert bwrap_available() == before
+    assert calls == [], "bwrap_available consulted the AppArmor sysctl — that is the defect"

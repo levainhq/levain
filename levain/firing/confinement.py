@@ -255,6 +255,8 @@ __all__ = [
     "sandbox_exec_available",
     "bwrap_available",
     "confinement_supported",
+    "ConfinementDiagnosis",
+    "diagnose_confinement",
 ]
 
 # The macOS seatbelt driver. An ABSOLUTE path (never a PATH lookup — a confined child must resolve
@@ -2751,4 +2753,104 @@ def select_provider(system: str | None = None) -> ConfinementProvider:
         "(bwrap) ship today. The ConfinementProvider seam is here; a container / Windows-native "
         "provider slots in as a pure addition. Refusing to grant bash hands without a confinement "
         "floor (fail-closed)."
+    )
+
+
+@dataclass(frozen=True)
+class ConfinementDiagnosis:
+    """Why this host does or does not have an OS confinement floor, in operator-facing terms.
+
+    ⚡ ONE SOURCE FOR AN EXPLANATION TWO SURFACES NEED. The ``levain run`` banner and ``levain
+    doctor`` both have to answer "will this entity get bash, and if not what do I do about it".
+    Computing that twice is the ``two_things_that_should_be_one_computed_by_two_pieces_of_code``
+    class, and the drift would land in the two places an operator looks when something is wrong."""
+
+    supported: bool
+    provider: str | None   # human name of the provider for this OS, None if there is none
+    reason: str            # one line: why there is (or is not) a floor here
+    remedy: str | None     # operator-actionable fix, or None when there is nothing to do
+
+    def operator_note(self) -> str:
+        """A single line for the run banner. The remedy is folded in because the banner is often
+        the ONLY thing an operator reads before concluding the tool is broken."""
+        if self.supported:
+            return self.reason
+        return self.reason if self.remedy is None else f"{self.reason} — {self.remedy}"
+
+
+def _apparmor_restricts_userns() -> bool:
+    """True if this kernel's AppArmor policy is the thing blocking unprivileged user namespaces.
+
+    ⛔ DIAGNOSTIC ONLY. THIS MUST NEVER BECOME THE CAPABILITY GATE, and the distinction is the
+    whole lesson of K4c: ``spore-418`` specified exactly this shape of check (read a sysctl) and it
+    reported GREEN on a host where bwrap could not run, because it named the OTHER sysctl —
+    ``unprivileged_userns_clone``, the older Debian-lineage knob, which still reads 1 on Ubuntu
+    while ``apparmor_restrict_unprivileged_userns`` is what actually decides. Capability is decided
+    by RUNNING bwrap (:func:`bwrap_available`); this only explains a failure after the fact, so
+    being wrong here costs a worse error message and never a wrong floor."""
+    try:
+        return Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").read_text().strip() == "1"
+    except OSError:
+        return False
+
+
+_APPARMOR_REMEDY = (
+    "install Ubuntu's own bwrap profile: `sudo apt install apparmor-profiles && sudo install -m "
+    "0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo "
+    "apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict` (keeps the host-wide restriction on; "
+    "reverse with `apparmor_parser -R`). Note it also denies namespace creation to bwrap's CHILDREN, "
+    "so the entity's bash cannot run rootless docker/podman, flatpak or a nested sandbox."
+)
+
+
+def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
+    """Answer "does this host have an OS confinement floor, and if not what do I do" ONCE.
+
+    ⚠ THE THREE OUTCOMES ARE NOT TWO, and collapsing them is what made the pre-K4c message wrong:
+    a floor can be absent because the OS has NO PROVIDER (nothing the operator can do), or because
+    a provider exists and this HOST will not let it run (one command away). Telling an Ubuntu
+    operator "no OS sandbox on this platform" when Levain fully supports their platform sends them
+    looking for a port that already shipped."""
+    system = system or platform.system()
+    try:
+        provider = select_provider(system)
+    except ConfinementError:
+        return ConfinementDiagnosis(
+            supported=False, provider=None,
+            reason=f"no OS confinement provider for {system} — macOS and Linux ship today",
+            remedy=None,
+        )
+
+    if isinstance(provider, SeatbeltProvider):
+        if provider.available():
+            return ConfinementDiagnosis(True, "sandbox-exec (macOS seatbelt)",
+                                        "macOS seatbelt floor active", None)
+        return ConfinementDiagnosis(
+            False, "sandbox-exec (macOS seatbelt)",
+            f"{SANDBOX_EXEC} is missing or not executable on this Mac", None,
+        )
+
+    # Linux. THREE distinguishable states, and an operator needs a different sentence for each.
+    if not (os.path.isfile(BWRAP) and os.access(BWRAP, os.X_OK)):
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            f"bubblewrap is not installed at {BWRAP}",
+            "install it (`sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, "
+            "`sudo pacman -S bubblewrap`)",
+        )
+    if provider.available():
+        return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
+                                    "Linux bwrap floor active", None)
+    if _apparmor_restricts_userns():
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            "bwrap is installed but this kernel's AppArmor policy denies unprivileged user "
+            "namespaces (Ubuntu 23.10+; fixed by default in 25.04+)",
+            _APPARMOR_REMEDY,
+        )
+    return ConfinementDiagnosis(
+        False, "bwrap (Linux mount namespace)",
+        "bwrap is installed but cannot create a user namespace on this kernel",
+        "check `sysctl kernel.unprivileged_userns_clone user.max_user_namespaces` and any "
+        "container/seccomp policy confining this process",
     )

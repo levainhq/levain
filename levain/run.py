@@ -40,6 +40,7 @@ from pathlib import Path
 
 from levain.firing.deadline import TurnDeadline, TurnTimeout, format_timeout_report
 from levain.firing.gate import PendingEfferent
+from levain.firing.confinement import diagnose_confinement
 from levain.session import (
     EXIT_INTERRUPTED,
     EXIT_OK,
@@ -732,6 +733,7 @@ def _print_banner(
     ssh_mode: str = "agent", deny_standard_creds: bool = False, task: str | None = None,
     gate_mode: str = "gated", max_seconds: float | None = None,
     allow_container_sockets: bool = False,
+    bash_note: str | None = None,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -759,7 +761,16 @@ def _print_banner(
         hands = "file_editor + terminal (bash)" if bash_ok else "file_editor"
         print(f"  tools:     {hands} — confined to the crown-jewels floor")
         if not bash_ok:
-            print("             (bash dropped: no OS sandbox on this platform — file editor only)")
+            # ⚠ THIS LINE USED TO READ "no OS sandbox on this platform", WHICH K4c MADE FALSE and
+            # which was the most operator-visible sentence in the whole Linux story. Levain supports
+            # Linux; the common Ubuntu case is a SUPPORTED platform whose kernel will not let the
+            # sandbox start — one command away, and the old wording sent that operator looking for a
+            # port that had already shipped. `bash_note` carries the real reason + the fix, computed
+            # ONCE in `diagnose_confinement` so this and `levain doctor` cannot drift.
+            note = bash_note or "no OS confinement floor available here"
+            print(f"             (bash dropped — file editor only: {note})")
+            if bash_note:
+                print("             run `levain doctor` for the full confinement diagnosis")
         print("  floor:     DENIES ~/.anneal-memory/ (flow store) · sibling entity stores ·")
         print("             operator creds + the confinement config (.levain/confinement.json)")
         if ssh_mode == "agent":
@@ -837,11 +848,19 @@ def _banner_for(
 ) -> None:
     """Render the banner from a live session — the drivers' convenience wrapper over
     :func:`_print_banner`, which stays fact-shaped so the floor tests stay cheap."""
+    # Computed HERE, not inside `_print_banner`: the banner stays a pure render over plain facts so
+    # every floor permutation stays cheap to test without standing up a real entity.
+    bash_note = None
+    if session.with_tools and not session.bash_ok:
+        try:
+            bash_note = diagnose_confinement().operator_note()
+        except Exception:  # noqa: BLE001 — a diagnosis that fails must never break the banner
+            bash_note = None
     _print_banner(
         session.entity_dir, session.binding,
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
         ssh_mode=session.ssh_mode, deny_standard_creds=session.deny_standard_creds, task=task,
-        gate_mode=session.gate_mode, max_seconds=max_seconds,
+        gate_mode=session.gate_mode, max_seconds=max_seconds, bash_note=bash_note,
         allow_container_sockets=session.allow_container_sockets,
     )
 
