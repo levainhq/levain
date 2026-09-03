@@ -28,6 +28,45 @@ It told Codex operators `doctor` FAILS when hooks are wired at the user level un
 
 `seed/continuity.md` taught "graduates to 2x, then 3x" while `seed/memory.md` teaches the uncapped ladder. The 2026-08-31 uncapping landed at one of the two sites, so a fresh entity was still scaffolded with the cap anneal dropped in 0.9.7. The scaffold now states the direction and points at `memory.md` rather than carrying a second copy of the rule.
 
+### Fixed — `doctor` reported a pack-owned hook as permanently stale, and the remedy could not clear it
+
+A pack hook containing an install-time placeholder (`{{ANNEAL_MEMORY}}`) was compared as RAW BYTES against the manifest's PRE-substitution source hash, so it read stale forever. Worse, the fix `doctor` itself prints — `levain init --force` — **cannot** clear it, because re-rendering substitutes the placeholder again. The base-adapter branch never had this problem because it normalises both sides; the pack branch skipped that step and now does the same, against the pack source. A pack whose source directory has moved is reported as *not comparable* rather than as a stale hook — that is the pack-drift surface's business, not this check's.
+
+### Fixed — a corrupt `.levain/manifest.json` silently turned pack-hook checking OFF
+
+`doctor` read the pack lock through a wrapper that returns "no packs" for ABSENT and for CORRUPT alike, so a truncated or partially-synced manifest dropped every pack-owned hook out of the comparison **while still reporting "hook scripts match the package"** — over a tampered file, if there was one. It now refuses and names the cause: an unreadable lock is not a clean bill of health. A genuinely absent lock is still the ordinary pack-less install and stays green.
+
+### Fixed — the local servers mishandled two Content-Length cases
+
+Both `levain serve` and the onboarding server:
+
+- **A header like `Content-Length: ²` crashed past the guard.** The check was `str.isdigit()`, which is TRUE for characters `int()` refuses, and `int()` was the very next statement — so a deliberate `411` became an unhandled exception. Now ASCII-digits-only, which is also what RFC 7230 specifies. Non-ASCII digits are refused with a `411`.
+- **An oversize POST whose Content-Length OVERSTATED the body got no response at all** (`levain serve` only). The drain stranded on the socket timeout, and the resulting error was indistinguishable from a benign browser keep-alive reset, so it was swallowed: no `413`, no traceback, no log entry. The connection is now always closed on an oversize refusal, and the `413` is sent whether or not the client sent the bytes it promised.
+
+### Fixed — `--consolidate-max-seconds` errors named `--max-seconds`
+
+`levain run` and `levain daemon install-seat` validate the consolidate bound through the same checker as `--max-seconds`, which hardcoded that flag in its messages — so a bad `--consolidate-max-seconds` value produced `levain run: --max-seconds must be >= 0`, sending the operator to fix an option they had not set.
+
+### Changed — a lease-expired job now reads `failed` instead of disappearing
+
+**Behaviour change, and it is operator-visible.** A `pending`/`running` job whose lease expired (a crashed worker's orphan) was DROPPED on the next store write, so polling it returned `unknown` — the status this API reserves for "never seen it, re-propose". Four places in the code and the `/job` route's own docs said such a job reads `failed`.
+
+The composition is what made it matter: the result TTL is matched to the 24-hour idempotency window **deliberately**, so a replayed propose can still poll its handle. Non-terminal records reaped at the 10-minute lease broke that — a same-key retry replayed a handle saying `pending` while the store answered `unknown` for that job id, which is the dead-handle case the TTL matching exists to prevent, and it made an expensive job look re-runnable.
+
+Such a record is now transitioned to `failed` / `"interrupted"` — exactly what restart recovery already does to the same records — and then ages out under the result TTL like any other finished job.
+
+### Fixed — the crown-jewels floor's own record
+
+No behaviour change; the enforcement was correct throughout and is stricter than these descriptions implied.
+
+- `build_policy`'s public docstring described the superseded **name-based** ssh design (`~/.ssh/id_*`) and contradicted its own next bullet. The floor is **location-based** — all of `~/.ssh`, which catches `deploy_key` and per-host keys — and the module docstring is now the single place that states it.
+- A comment claimed the raw `Path.home()` ssh spelling *narrows* the symlinked-HOME vector. Measured: it is unreachable on both enforcing hands. The entry is kept as defence-in-depth against a platform canonicalisation change; the claim that it mitigates a live vector is gone.
+- The seed's `continuity.md` scaffold taught the capped graduation ladder at a **third** site missed by the earlier fix, and `crystallization.py` carried a fourth.
+
+### Fixed — the suite has zero permanent failures for the first time
+
+Eight tests failed on every run, on any machine without the optional `mcp` and `openhands` extras, because two import sites lacked the `importorskip` guard used at a dozen others. A permanent red is indistinguishable from a real regression, which made "the suite is green" unusable as evidence. Same passing count, zero failures, and the eight now skip and say why.
+
 ### Changed — `[wrap blocked]` no longer names a shell command or a false count
 
 - The episode count is **gone from the message**, not rephrased. `episodes_since_wrap` counts from the last *completed* wrap, so it included episodes frozen inside the open snapshot: measured at 3 reported while 1 was actually waiting. An honest figure needs more qualification than the line can carry.
@@ -40,6 +79,25 @@ It told Codex operators `doctor` FAILS when hooks are wired at the user level un
 
 - The activation-scope tests read `LEVAIN_SCOPE` and `CLAUDE_CONFIG_DIR` from the **real environment**, so their verdict depended on the reviewer's shell. `LEVAIN_SCOPE=global` — the value `doctor`'s own hint tells operators to set — turned the dark-config regression guard RED, and `CLAUDE_CONFIG_DIR` made four user-wiring guards pass **vacuously**, silently retiring the two-installs-on-one-machine discrimination. One autouse fixture in `conftest.py`; the suite is now identical under all three environments.
 - The source-checkout skip guarded one of two sibling tests, eight lines below the comment explaining why it must exist. Hoisted into the shared helper.
+
+### Upgrading
+
+⛔ **`pip install -U levain` DOES NOT REFRESH YOUR INSTALL'S ACTIVATION FILES OR SEED.** It never has. The templates ship inside the wheel, but `levain init` COPIED them into your install when you created it, and no upgrade path rewrites those copies — `levain update` reconciles the memory library and surfaces changes for review, it does not apply them. This is the single most-repeated cause of "I upgraded and nothing changed" in this project's history.
+
+**What you get from `pip install -U levain` alone:**
+
+- every `doctor` fix above — the user-level wiring detector, the pack-hook staleness fix, the corrupt-lock refusal;
+- both Content-Length fixes in `levain serve` and the onboarding server;
+- the `--consolidate-max-seconds` message fix;
+- the job-store lease behaviour change.
+
+**What additionally requires `levain init --force`** (it replaces the activation tree, backing up your edits to `posture.md` and `recency_directives.md` first, and preserves your anneal-memory store):
+
+- the reworded `[wrap blocked]` hook message;
+- the seed's uncapped graduation ladder — **relevant if your entity was scaffolded before this release**, since it was being taught a ladder that stopped at 3x while the library had removed the ceiling;
+- the corrected Codex adapter README and operator manual.
+
+⚠ **Run `levain doctor` after upgrading.** If you wired Levain's hooks at the user level with a `~` or `$HOME` path, this release is the first one that can SEE that — so a `doctor` run that passed before may now correctly FAIL with `activation scope`. That is not a regression: it means your activation layer has been silently off in those sessions and `doctor` previously could not tell you.
 
 ## [0.4.3] — 2026-09-02
 
