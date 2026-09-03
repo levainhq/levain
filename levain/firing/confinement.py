@@ -1146,8 +1146,18 @@ def _ci_within(path: Path, root: Path) -> bool:
     ``isolation._is_within_ci`` guards for the store forbidden-zone (apparatus L2 HIGH, and a
     regression: the step-6 ``assert_path_within_workspace`` predecessor used the CI compare and this
     predicate initially dropped it). Separator-anchored so it never false-matches a sibling like
-    ``.anneal-memory-backup``. Over-matching here is FAIL-CLOSED (refuse a variant of a crown jewel) —
-    ``crown_jewel_reason`` is a pure denylist, so there is no legitimate path this wrongly rejects."""
+    ``.anneal-memory-backup``. Over-matching here is FAIL-CLOSED (refuse a variant of a crown jewel).
+
+    ⚠ **"WRONGLY REJECTS NOTHING" IS A macOS CLAIM AND IT DOES NOT PORT — measured on argushub
+    (ext4) 2026-09-03, and predicted before any Linux code existed.** On a case-INSENSITIVE volume
+    (APFS/Windows) a case variant of a jewel IS the same on-disk file, so folding case rejects only
+    paths the kernel would deny anyway and the sentence held. On a case-SENSITIVE volume (ext4)
+    ``~/.Anneal-Memory`` and ``~/.anneal-memory`` are two genuinely different directories, yet
+    :func:`_ci_within` returns True for the pair — so a legitimate path CAN be denied on account of a
+    jewel it merely resembles. The BEHAVIOUR is deliberately unchanged: on a pure denylist,
+    over-denying is the safe direction, and folding case is what closes the variant bypass that
+    motivated this predicate. Only the CLAIM is qualified. Do NOT "fix" this by making the compare
+    platform-conditional — that would reopen the bypass on exactly the volumes where it bites."""
     p = _canon(str(path))
     r = _canon(str(root))
     return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
@@ -1909,6 +1919,20 @@ class ConfinementProvider(ABC):
     against this contract, and the macOS crown-jewels denylist is their requirements spec."""
 
     @abstractmethod
+    def available(self) -> bool:
+        """True iff THIS provider's sandbox driver is present + executable ON THIS HOST right now.
+
+        Part of the CONTRACT rather than a module-level function, because the driver differs per OS
+        (``sandbox-exec`` / ``bwrap`` / a container runtime) while the QUESTION does not. The previous
+        shape asked the polymorphic :func:`select_provider` which provider applies and then checked
+        the macOS driver unconditionally — one requirement with two enforcement models, which is the
+        exact trap ``spore-418`` names for the confinement policy itself, arriving in the GATE. That
+        shape had two faces the moment a second provider existed: on Linux a working ``bwrap`` floor
+        would never be offered (the macOS driver is absent), and on a Mac asked about Linux it would
+        answer True from a host that cannot know. Neither is a platform branch away — the check has
+        to travel WITH the provider."""
+
+    @abstractmethod
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """Render ``policy`` into the platform's native sandbox profile text (no I/O)."""
 
@@ -2074,6 +2098,11 @@ class SeatbeltProvider(ConfinementProvider):
     based, not ``id_*``) while re-allowing ``known_hosts`` (r+w) and ``config`` (r) so agent-auth
     still works. ⚠ ``config`` is read-re-allowed and its WRITE stays denied in BOTH modes, which
     the previous wording omitted."""
+
+    def available(self) -> bool:
+        """The seatbelt driver is ``/usr/bin/sandbox-exec``. Delegates to the long-standing module
+        function so there is ONE definition of "is the macOS driver usable", not two."""
+        return sandbox_exec_available()
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         lines: list[str] = [
@@ -2369,19 +2398,30 @@ def sandbox_exec_available() -> bool:
 
 
 def confinement_supported(system: str | None = None) -> bool:
-    """True iff an OS confinement floor can actually be established on this platform RIGHT NOW —
-    a provider exists for the OS AND its sandbox driver is present + executable.
+    """True iff an OS confinement floor can actually be established RIGHT NOW — a provider exists
+    for the OS AND *that provider's* sandbox driver is present + executable on this host.
 
     The honest gate for granting bash hands: ``levain run`` calls this to decide whether to offer the
-    bash tool at all (macOS with a working ``sandbox-exec``), rather than wire a tool whose first
-    command would fail-closed. On any non-macOS platform (no provider yet) or a macOS box missing
-    ``sandbox-exec``, returns False — the entity gets its file-editor hand but no bash, and the banner
-    says so (honesty floor). NEVER grants an unconfined shell as a fallback."""
+    bash tool at all, rather than wire a tool whose first command would fail-closed. With no provider
+    for the OS, or with the provider's driver missing, returns False — the entity gets its file-editor
+    hand but no bash, and the banner says so (honesty floor). NEVER grants an unconfined shell as a
+    fallback.
+
+    ⚠ THE DRIVER CHECK BELONGS TO THE PROVIDER (:meth:`ConfinementProvider.available`), NOT TO THIS
+    FUNCTION. It used to select polymorphically and then call ``sandbox_exec_available()``
+    unconditionally, which was correct only while exactly one provider existed and would have failed
+    in BOTH directions the moment a second one landed (see that method's docstring). Adding a
+    platform branch here would have been the same defect one layer up.
+
+    ⚠ ``system`` IS A SELECTION SEAM, NOT A REMOTE QUERY. The availability probe reads THIS host's
+    filesystem, so ``confinement_supported("Linux")`` from a Mac asks "would the Linux provider find
+    its driver *here*", never "is that other box confined". Callers gating real hands must pass
+    ``None`` (the running OS); the parameter exists so provider selection is testable."""
     try:
-        select_provider(system)
+        provider = select_provider(system)
     except ConfinementError:
         return False
-    return sandbox_exec_available()
+    return provider.available()
 
 
 def select_provider(system: str | None = None) -> ConfinementProvider:

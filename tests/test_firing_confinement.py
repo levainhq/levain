@@ -32,6 +32,7 @@ import pytest
 from levain.firing.confinement import (
     ConfinementConfig,
     ConfinementError,
+    ConfinementProvider,
     CrownJewelsPolicy,
     SandboxedShell,
     SeatbeltProvider,
@@ -1147,6 +1148,51 @@ def test_confinement_supported_matches_platform() -> None:
 
 def test_confinement_supported_false_off_darwin() -> None:
     assert confinement_supported("Linux") is False
+
+
+# --- the driver check must travel with the PROVIDER, not be hardcoded to seatbelt (K4c) ------
+# These two pin the delegation in BOTH directions. Without them the pre-K4c shape — select
+# polymorphically, then call sandbox_exec_available() unconditionally — passes every test above
+# while being wrong the moment a second provider exists: on Linux a working bwrap floor is never
+# offered (macOS driver absent), and on a Mac asked about Linux it answers True from a host that
+# cannot know. A single-provider suite cannot see that; a stub provider can.
+
+
+class _StubProvider(ConfinementProvider):
+    """Minimal concrete provider whose ``available()`` is the only thing under test."""
+
+    def __init__(self, available: bool) -> None:
+        self._available = available
+
+    def available(self) -> bool:
+        return self._available
+
+    def render_profile(self, policy) -> str:  # pragma: no cover - not exercised here
+        return ""
+
+    def spawn_shell(self, policy, *, env=None, default_timeout: float = 120.0):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_confinement_supported_uses_the_providers_driver_check_not_seatbelts(monkeypatch) -> None:
+    """A provider that reports its driver ABSENT makes the floor unsupported — even on a Mac where
+    ``sandbox_exec_available()`` is True. Pins that the seatbelt driver is not consulted for a
+    provider that does not use it."""
+    monkeypatch.setattr(
+        "levain.firing.confinement.select_provider", lambda system=None: _StubProvider(False)
+    )
+    monkeypatch.setattr("levain.firing.confinement.sandbox_exec_available", lambda: True)
+    assert confinement_supported() is False
+
+
+def test_confinement_supported_true_when_provider_available_without_seatbelt(monkeypatch) -> None:
+    """The other direction, which is the one that would silently drop bash on a real Linux box: a
+    provider reporting its OWN driver present is supported even with no ``sandbox-exec`` anywhere."""
+    monkeypatch.setattr(
+        "levain.firing.confinement.select_provider", lambda system=None: _StubProvider(True)
+    )
+    monkeypatch.setattr("levain.firing.confinement.sandbox_exec_available", lambda: False)
+    assert confinement_supported() is True
 
 
 @live
