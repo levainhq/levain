@@ -512,7 +512,21 @@ def build_policy(
     #           re-points ~/bridge and writes a file neither denied endpoint names. TOCTOU by design:
     #           it never touches a denied path.
     #       (b) REPLACEABLE / SYMLINKED HOME. Same shape one level up; already admitted at the top of
-    #           this file. The third spelling above narrows it, it does not close it.
+    #           this file. ⛔ THE THIRD SPELLING ABOVE DOES NOT NARROW IT EITHER — this line
+    #           used to say it did, and measurement refutes that. The RAW ``Path.home() / .ssh``
+    #           entry differs from the other two ONLY when an ANCESTOR component is a symlink,
+    #           and seatbelt CANONICALISES ancestor components for every operation, not just
+    #           data access — so the entry fires for NO operation on that hand. Live on Darwin
+    #           25.5 with /tmp -> /private/tmp: a profile whose only rule names the
+    #           un-canonicalised spelling allows append, `rm -f` AND `mv` (exit 0); the control
+    #           naming the canonical spelling denies all three. It is equally dead on the
+    #           in-process hand, where ``crown_jewel_reason`` resolves its argument first, so a
+    #           lexical entry can never be what matches.
+    #           ▶ THE LINE IS KEPT AS DEFENCE-IN-DEPTH AGAINST A CANONICALISATION CHANGE — this
+    #           file already warns that seatbelt is Apple-deprecated and its behaviour
+    #           undocumented — NOT as a mitigation of (b). Deleting a belt from a security floor
+    #           to win a tidiness argument is the wrong direction of error; claiming it mitigates
+    #           a live vector is the wrong direction of belief.
     #       (c) TRANSITIVE INPUTS. An existing ``Include config.d/*`` in a protected config, or an
     #           ``rc`` that sources a writable helper, is an exec path we do not deny — the anchor
     #           deliberately permits child creation inside ~/.ssh. Denying the top-level files does
