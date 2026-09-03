@@ -17,9 +17,10 @@ matter what the model is told to do:
 **One floor, two enforcers (``structural_invariants_beat_discipline``).** A
 :class:`~levain.firing.confinement.CrownJewelsPolicy` — built by EACH hand's ``create`` from the SAME
 inputs (the entity dir + ``<entity>/.levain/confinement.json``) via :func:`policy_for_conv_state`, so
-the two are equivalent — fences BOTH hands. bash rides the rendered ``sandbox-exec``
-profile (the OS fences it — a persistent shell whose cwd wanders can't be confined in-process, which
-is the whole reason bash needed an OS sandbox). The file editor is ordinary in-process Python, NOT
+the two are equivalent — fences BOTH hands. bash rides the rendered platform sandbox — macOS
+``sandbox-exec`` or, since K4c, a Linux ``bwrap`` mount namespace (the OS fences it — a persistent
+shell whose cwd wanders can't be confined in-process, which is the whole reason bash needed an OS
+sandbox). The POLICY is identical on both; only the enforcement model differs. The file editor is ordinary in-process Python, NOT
 under the sandbox, so it calls the IN-PROCESS twin :func:`~levain.firing.confinement.crown_jewel_reason`
 on every path — the same denylist, so there is no ``claim > enforcement`` gap between the two hands.
 
@@ -49,9 +50,12 @@ every efferent action — bash is ALWAYS efferent — when no human is present: 
 ``efferent_gate: "ungated"`` disarms it in both cases, so a surface claiming an entity is governed
 must RESOLVE that setting rather than assume it. **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a,
 ``levain daemon install-seat``); what is still absent is the per-domain threshold POLICY
-(``spore-417``) — nothing graduates, everything efferent gates. The full honest limits
-(Apple-deprecated ``sandbox-exec``, pre-populated hardlinks, resource exhaustion, non-crown-jewel
-network exfil, IPC side channels) live on :mod:`levain.firing.confinement`.
+(``spore-417``) — nothing graduates, everything efferent gates. The full honest limits live on
+:mod:`levain.firing.confinement`, and they are NOT identical across platforms: the shared ones are
+pre-populated hardlinks, resource exhaustion, non-crown-jewel network exfil and IPC side channels,
+while "Apple-deprecated ``sandbox-exec``" is macOS-only and Linux carries its own — chiefly that a
+denied read reports ENOENT rather than EPERM, and that a missing write-denied file's mountpoint is
+created on the host.
 
 Requires the ``openhands`` extra.
 """
@@ -570,10 +574,11 @@ class LevainFileEditorTool(FileEditorTool):
 
 class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     """Drives spore-311's :class:`~levain.firing.confinement.SandboxedShell` (a persistent
-    ``sandbox-exec``-confined bash) instead of the SDK's un-confinable host ``TerminalExecutor``.
+    OS-confined bash — ``sandbox-exec`` on macOS, ``bwrap`` on Linux since K4c) instead of the SDK's
+    un-confinable host ``TerminalExecutor``.
 
     The shell is spawned LAZILY on the first command — a ``--no-tools`` or never-touch-bash session
-    pays nothing, and a spawn failure (no OS sandbox on this platform) becomes a clean in-band refusal,
+    pays nothing, and a spawn failure (no usable OS sandbox on this host) becomes a clean in-band refusal,
     never a conversation-build crash (fail-closed: no floor → no unconfined shell). The
     ``SandboxedShell`` is SINGLE-CALLER; :meth:`LevainBashTool.declared_resources` serializes bash calls
     against each other so two never race the one shell. ``reset`` closes + respawns a fresh shell;
@@ -840,10 +845,16 @@ def build_entity_tools(*, with_bash: bool = True) -> list[Tool]:
     executors at conversation-build time via the registry, where the shared floor is built).
 
     These are the ONLY blessed executor-tool builders Levain ships, and both are confined by
-    construction. ``with_bash=False`` drops bash — the caller (``levain run``) passes it when the
-    platform has no OS confinement floor (:func:`~levain.firing.confinement.confinement_supported`),
-    so the entity keeps its file-editor hand rather than getting a bash whose first command would
-    fail-closed. NEVER grants an unconfined shell as a fallback."""
+    construction. ``with_bash=False`` drops bash — the caller (``levain run``) passes it when no OS
+    confinement floor can be established here
+    (:func:`~levain.firing.confinement.confinement_supported`), so the entity keeps its file-editor
+    hand rather than getting a bash whose first command would fail-closed. NEVER grants an unconfined
+    shell as a fallback.
+
+    ⚠ "HERE", not "on this platform": since K4c a Linux host HAS a provider, so the common Linux
+    case is a supported platform that still cannot establish a floor (AppArmor-restricted user
+    namespaces). The bash-free entity is therefore a normal Linux configuration rather than an
+    exotic one, and the file-editor floor is fully cross-platform by design."""
     tools: list[Tool] = [Tool(name=LEVAIN_FILE_EDITOR_TOOL)]
     if with_bash:
         tools.append(Tool(name=LEVAIN_BASH_TOOL))

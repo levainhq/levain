@@ -474,10 +474,17 @@ class EntitySession:
         """Open a sovereign session for the entity at ``path``.
 
         ``with_tools`` (default True) grants the confined HANDS — a file editor plus, where an
-        OS confinement floor exists (macOS ``sandbox-exec``), a persistent sandboxed bash —
-        both fenced to the shared crown-jewels floor. On a platform with no OS sandbox, bash is
-        dropped and only the file editor is granted (honesty floor, NEVER an unconfined
-        fallback).
+        OS confinement floor exists (macOS ``sandbox-exec`` or Linux ``bwrap``, K4c), a persistent
+        sandboxed bash — both fenced to the shared crown-jewels floor. Where no floor can be
+        established, bash is dropped and only the file editor is granted (honesty floor, NEVER an
+        unconfined fallback).
+
+        ⚠ "NO FLOOR" IS NOT THE SAME AS "UNSUPPORTED PLATFORM", and on Linux the difference bites:
+        a box can have a Linux provider AND a bwrap binary and still be unable to establish a
+        namespace (Ubuntu 23.10+ restricts unprivileged user namespaces via AppArmor). That is a
+        correct fail-closed and the entity runs bash-free — see
+        :func:`~levain.firing.confinement.bwrap_available` for why the probe executes bwrap rather
+        than reading a sysctl.
 
         ``on_event`` opts into LIVE tool-activity streaming: it is called with a display line
         as each tool action happens, rather than the caller waiting for the whole turn. This is

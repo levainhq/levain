@@ -414,6 +414,21 @@ replaced by placeholder-aware normalisation, along with a comment explaining why
 rather than reimplemented. A dead import keeps its justifying comment looking live. Both are gone,
 and `ruff` passes again.
 
+### Added — Linux support: a confinement floor and a scheduled seat (K4c)
+
+Levain's sovereign entity now runs on Linux, not only macOS. Two pieces, and the second is the one that makes an unattended seat possible at all:
+
+- **Confinement** — a `bwrap` (bubblewrap) mount-namespace floor enforcing the same crown-jewels policy as the macOS seatbelt floor. It is a re-derivation, not a port: seatbelt is a path predicate, `bwrap` is a mount namespace with the opposite default, and every mapping was measured on a Linux kernel rather than read off a man page. Where the two differ, Linux is stronger — a write-denied file cannot be renamed out (`EBUSY`, it is a mountpoint) or hardlinked out (`EXDEV`, separate mount device), which rests on ordinary mount semantics instead of the undocumented Apple behaviour the macOS floor depends on.
+- **Lifecycle** — a `systemd --user` provider (service, plus a separate `.timer` for a scheduled seat). `install` also requests `loginctl enable-linger`, without which a user unit stops when your last session ends and a headless box's seat would quietly die at logout.
+
+**⚠ If you are on Ubuntu 23.10 or newer, expect Levain to report no bash hands until you act.** Those releases restrict unprivileged user namespaces through AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`), and `bwrap` needs one. Levain fails closed and says so — the entity still gets its file-editor hand, which is fully cross-platform, but no shell. The narrow fix is an AppArmor profile granting `userns` to `/usr/bin/bwrap`; the blunt one is turning that sysctl off host-wide.
+
+**Do not infer capability from the usual two checks.** `bwrap` being installed and `kernel.unprivileged_userns_clone=1` can BOTH be true on a host where every invocation still fails — that pair reads green on a machine we measured as entirely unable to run it. Levain therefore probes by *executing* `bwrap`, and you should too.
+
+### Fixed — `confinement_supported()` could not have reported a second platform correctly
+
+It selected a provider polymorphically and then checked the macOS driver unconditionally. With one provider that was invisible; with two it fails in both directions — a working Linux floor would never be offered, and asked about Linux from a Mac it would answer yes from a host that cannot know. The driver check now travels with the provider.
+
 ### Fixed — `doctor` reported green on two of the three ways to write user-level wiring
 
 The dark-install detector compared each hook command token as a **literal path**, with no variable expansion and no `~` handling. So `~/lev/activation/hooks/session_start.py` and `$HOME/lev/...` — the second of which Levain's own `settings.template.json` spells inside double quotes — resolved against the current directory, never matched the install, and the scan came back empty. `levain doctor` then reported the reassuring install-scoped PASS on the exact configuration the check exists to FAIL.
