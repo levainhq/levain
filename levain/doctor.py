@@ -1097,9 +1097,39 @@ def _user_entry_targets(entries: list, install: Path, expected_script: str) -> b
                 if "${CLAUDE_PROJECT_DIR}" in tok or "$CLAUDE_PROJECT_DIR" in tok:
                     continue  # resolves elsewhere at user level — not this install
                 try:
-                    if Path(tok).resolve() == expected:
+                    # EXPAND BEFORE RESOLVING. `Path(tok)` does no variable
+                    # expansion and no `expanduser`, so `~/lev/.../hook.py` and
+                    # `$HOME/lev/.../hook.py` — both of which a shell DOES
+                    # expand, and the second of which levain's own
+                    # settings.template.json spells inside double quotes —
+                    # resolved to `<cwd>/~/lev/...` and `<cwd>/$HOME/lev/...`,
+                    # never equalled `expected`, and the scan returned [].
+                    # A miss in `_hook_command_targets` produces a wiring FAIL,
+                    # which is fail-loud; a miss HERE produces the reassuring
+                    # green on the one configuration this function exists to
+                    # fail — `absence_of_signal_rendered_as_health` inside the
+                    # instrument built to end it. The `${CLAUDE_PROJECT_DIR}`
+                    # skip stays AHEAD of this, so a placeholder is still
+                    # correctly not-this-install rather than being expanded to
+                    # the empty string and matching something. Measured on all
+                    # four spellings (Diogenes 2026-09-03).
+                    if Path(os.path.expandvars(tok)).expanduser().resolve() == expected:
                         return True
-                except (OSError, ValueError):
+                # ⛔ RuntimeError IS IN THIS CLAUSE BECAUSE OF `expanduser`, AND
+                # LEAVING IT OUT REPRODUCED THE CLASS THIS FUNCTION WAS BUILT TO
+                # CLOSE. `Path("~someuser/...").expanduser()` raises RuntimeError
+                # ("Could not determine home directory") for a user with no passwd
+                # entry — measured, not reasoned — and RuntimeError is neither
+                # OSError nor ValueError. A foreign entry naming another operator's
+                # home is an ordinary thing to find in a shared
+                # ~/.claude/settings.json, so without this the expansion added a
+                # fresh way to ABORT THE WHOLE DOCTOR RUN on somebody else's
+                # config: exactly codex#7, which
+                # `test_never_raises_on_a_malformed_foreign_config` exists to
+                # prevent, reintroduced by the fix for the blindness right above.
+                # The question that caught it, and it is checkable AT WRITE TIME:
+                # would the condition this guard covers disable the guard?
+                except (OSError, ValueError, RuntimeError):
                     continue
     return False
 

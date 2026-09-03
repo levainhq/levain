@@ -16,7 +16,7 @@
 
 ## Patterns
 
-*Nothing yet. Patterns are what you learn about the work and the partnership — recurring shapes, not single events. A new pattern starts at 1x; re-confirmed by fresh evidence it graduates to 2x, then 3x, each carrying an `[evidence: <episode-id> "why"]` citation. This is how you get smarter across sessions, and it is the one section the immune system runs in — graduate the principle, not the observation.*
+*Nothing yet. Patterns are what you learn about the work and the partnership — recurring shapes, not single events. A new pattern starts at 1x; each re-confirmation by fresh evidence climbs one level — 2x, 3x, 4x, onward, with no ceiling — each carrying an `[evidence: <episode-id> "why"]` citation. (Temporal graduation in *Your memory* carries the full discipline; this scaffold states the direction, not a second copy of the rule.) This is how you get smarter across sessions, and it is the one section the immune system runs in — graduate the principle, not the observation.*
 
 ## Decisions
 

@@ -107,7 +107,7 @@ Every item below is a bug in code written earlier in this same release, caught b
 
 - **`pip install -U levain` will also upgrade `anneal-memory` to >= 0.9.8.** This is a real API contract, not a lockstep bump: the new `[wrap blocked]` advice names the `wrap_cancel` MCP tool, which does not exist before anneal 0.9.8. Against 0.9.7 the hook would name a tool the agent cannot reach — precisely the defect this pair of releases exists to fix.
 - **If you wired Levain's hooks globally and your activation layer has been quiet, this is why.** Add `{"scope": "global"}` to `.levain/config.json`, then run `levain doctor` — it now tells you which way it is set.
-- **If you are carrying a local patch to `in_install_session()`, drop it.** `levain update` overwrites the hook templates, which is what kept eating it; the supported opt-in survives updates.
+- **If you are carrying a local patch to `in_install_session()`, drop it.** What kept eating it is `levain init --force` — step two of the documented upgrade procedure (`pip install -U levain`, then `levain init --force`), which replaces the whole `activation/` tree. `levain update` was never the culprit: it writes nothing under `activation/` at all. The supported opt-in lives in `.levain/config.json`, which neither command touches.
 
 ## [0.4.1] — 2026-08-02
 
