@@ -357,9 +357,13 @@ def test_seed_templates_carry_the_reconciled_guidance():
             f"TEMPLATES_RECONCILED_ANNEAL."
         )
         checked += 1
-    # Non-vacuous: at the 0.9.6 cap we exercise spores + migrate-notify + crystal +
-    # mcp-crystal + linkgate via sentinels (0.4.8 AM-PRESERVE-BARE-PATH and 0.9.6
-    # AM-WRAP-GENERATED are allowlisted no-edit, so they don't add to the count).
+    # Non-vacuous: at the cap in `manifest.TEMPLATES_RECONCILED_ANNEAL` we exercise spores +
+    # migrate-notify + crystal + mcp-crystal + linkgate via sentinels (0.4.8
+    # AM-PRESERVE-BARE-PATH and 0.9.6 AM-WRAP-GENERATED are allowlisted no-edit, so they don't
+    # add to the count).
+    # ⛔ DO NOT RE-SPELL THE CAP HERE. This comment said "at the 0.9.6 cap" while the constant
+    # read 0.9.7 — a stored copy of a moving value, which is the class this suite exists to
+    # catch, sitting in the suite.
     assert checked >= 5
 
     # The linkgate example is co-citation, not a bare single-id (AM-LINKGATE detail).

@@ -1296,8 +1296,22 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
 
 
 def _hook_body(text: str) -> str:
-    """A hook script's comparable body: install-time placeholder substitutions
-    normalised away, so a healthy install is not reported as drifted."""
+    """A hook script's comparable body: the ONE install-time substitution normalised away, so a
+    healthy install is not reported as drifted.
+
+    ⛔ SINGULAR, DELIBERATELY. This used to say "placeholder substitutionS", which promised more
+    than the regex below delivers — it normalises exactly `_INSTALL_ANNEAL_BIN`, the line
+    `{{ANNEAL_MEMORY}}` becomes. `install._substitute_hook_placeholders` is called with a dict
+    (`{"{{ANNEAL_MEMORY}}": anneal_path}`) and its own docstring says "and potentially more keys
+    later" — so the day a second key ships, this function silently UNDER-normalises and every
+    install reads stale. The plural was a description of an intention, and it would have read as
+    coverage.
+
+    ⚠ AND THE BLAST RADIUS DOUBLED 2026-09-03: the pack branch of `_check_hook_freshness` now
+    normalises through here too, so an under-normalisation would false-red pack hooks as well as
+    base ones. `test_hook_body_normalises_every_placeholder_install_substitutes` pins the coupling
+    so adding a key without teaching this function fails loudly instead of shipping.
+    """
     return re.sub(
         r"^_INSTALL_ANNEAL_BIN = .*$", "_INSTALL_ANNEAL_BIN = <>", text, flags=re.M
     ).strip()

