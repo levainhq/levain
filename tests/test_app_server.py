@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import importlib.util
+
 import anyio
 import pytest
 
@@ -100,7 +102,28 @@ class TestRenderSummary:
 
 # --- build_app: the server factory -----------------------------------------
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("mcp") is None,
+    reason="the Levain MCP-App server needs the MCP SDK (optional extra)",
+)
 class TestBuildApp:
+    """⛔ THE GUARD IS ON THIS CLASS, NOT ON THE MODULE, AND THE DIFFERENCE IS 9 TESTS.
+
+    These 7 were the bulk of this repo's permanent red: `build_app()` raises ImportError
+    without the `mcp` extra, and nothing gated it (Diogenes, open since 2026-08-05). The
+    repo's convention is settled at a dozen-plus sites; this file was the exception.
+
+    ⚠ THE FIRST CUT OF THIS FIX PUT A MODULE-LEVEL `importorskip("mcp")` AT THE TOP AND
+    SILENTLY RETIRED NINE PASSING TESTS. Measured before/after rather than assumed: the file
+    was 7 failed / 9 PASSED, and a module-level skip made it 0 run. The module IMPORT
+    succeeds without the extra — only calling `build_app` fails — so a module-scoped guard
+    was over-broad by exactly the 9 tests that never needed it. Trading 7 reds for 9 silent
+    skips is a worse deal than the red, because a red is visible.
+
+    ⚠ WHY THE REDS MATTERED AT ALL: a permanent red is indistinguishable from a real
+    regression, so `the suite is green` was unavailable as evidence for ANY fix in a repo
+    whose recurring defect is a green suite that proves nothing.
+    """
     def test_declares_the_view_resource(self, tmp_path: Path) -> None:
         app = build_app(_store_with_data(tmp_path))
         resources = _run(app.list_resources())
