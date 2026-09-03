@@ -520,3 +520,50 @@ def test_cli_adapter_choices_match_KNOWN_ADAPTERS():
         f"install.KNOWN_ADAPTERS {list(KNOWN_ADAPTERS)} — update the CLI list, or "
         "delete choices= and let install.py:290 be the only gate"
     )
+
+
+class TestMaxSecondsErrorNamesTheFlagYouTyped:
+    """The shared bound validator used to name `--max-seconds` for every caller, including the
+    ones validating `--consolidate-max-seconds`.
+
+    ⛔ An operator who typed a bad `--consolidate-max-seconds` was told
+    `levain run: --max-seconds must be >= 0` — a flag they never set — and sent to fix the wrong
+    option. Being ONE validator is right (a second copy is a second place to forget the two edge
+    cases an L3 lineage each found); saying the same thing about every caller was not.
+
+    ⚠ There were TWO call sites, not one: `levain run` and `daemon install-seat` both route the
+    consolidate bound through it. The grep found the sibling after the first was fixed — the
+    sibling class, again.
+    """
+
+    def _stderr_of(self, **kw):
+        import contextlib, io
+        from levain.cli import _reject_bad_max_seconds
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert _reject_bad_max_seconds(-1.0, **kw) is True
+        return err.getvalue()
+
+    def test_default_still_names_max_seconds(self):
+        assert "--max-seconds" in self._stderr_of(command="run")
+
+    def test_consolidate_bound_names_the_consolidate_flag(self):
+        out = self._stderr_of(command="run", flag="--consolidate-max-seconds")
+        assert "--consolidate-max-seconds" in out
+        assert "levain run: --max-seconds" not in out, "still naming the flag the operator did not type"
+
+    def test_every_consolidate_call_site_passes_the_flag(self):
+        """Source-level, because a future caller is exactly how this recurs."""
+        import re
+        from pathlib import Path
+        import levain
+        src = (Path(levain.__file__).resolve().parent / "cli.py").read_text(encoding="utf-8")
+        offenders = [
+            c.strip()[:80]
+            for c in re.findall(r"_reject_bad_max_seconds\(\s*(?!value)(.*?)\)\s*:", src, re.S)
+            if "consolidate" in c and "flag=" not in c
+        ]
+        assert not offenders, (
+            "a consolidate bound is validated without naming its own flag, so the error will "
+            f"say --max-seconds: {offenders}"
+        )
