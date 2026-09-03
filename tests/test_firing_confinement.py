@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import platform
+import shlex
 import shutil
 import socket
 import subprocess
@@ -33,6 +34,10 @@ from levain.firing.confinement import (
     ConfinementConfig,
     ConfinementError,
     ConfinementProvider,
+    BwrapProvider,
+    BWRAP,
+    _bwrap_argv,
+    bwrap_available,
     CrownJewelsPolicy,
     SandboxedShell,
     SeatbeltProvider,
@@ -291,10 +296,22 @@ def test_select_provider_darwin_is_seatbelt() -> None:
     assert isinstance(select_provider("Darwin"), SeatbeltProvider)
 
 
+def test_select_provider_linux_is_bwrap() -> None:
+    """K4c. Was previously the "other OS fails closed" case, with Linux as the stand-in for
+    unsupported — so this line changing is the shipping of the Linux provider, not a weakened test.
+    The fail-closed case it used to cover now lives in the test below, on an OS that really has no
+    provider."""
+    assert isinstance(select_provider("Linux"), BwrapProvider)
+
+
 def test_select_provider_other_os_fails_closed_naming_the_seam() -> None:
     with pytest.raises(ConfinementError) as exc:
-        select_provider("Linux")
-    assert "bwrap" in str(exc.value).lower() or "fail-closed" in str(exc.value).lower()
+        select_provider("Windows")
+    msg = str(exc.value).lower()
+    assert "fail-closed" in msg
+    # It must name what DOES ship, so the operator learns the seam exists rather than reading it as
+    # "confinement is unimplemented".
+    assert "bwrap" in msg and "sandbox-exec" in msg
 
 
 def test_sandbox_exec_available_is_a_bool() -> None:
@@ -1141,12 +1158,35 @@ def test_load_confinement_config_non_object_fails_closed(tmp_path: Path) -> None
 # =============================================================================================
 
 
+# ⚡ THESE THREE WERE macOS-ASSUMING AND FAILED THE FIRST TIME THE SUITE WAS RUN ON LINUX — the
+# same "one platform, hardcoded" defect K4c fixed in `confinement_supported` itself, living in the
+# tests that were supposed to guard it. They are now platform-gated and each has a Linux twin, so
+# the suite states the truth on BOTH hosts instead of encoding one of them as the definition.
+_darwin_only = pytest.mark.skipif(platform.system() != "Darwin", reason="states a fact about macOS")
+_linux_only = pytest.mark.skipif(platform.system() != "Linux", reason="states a fact about Linux")
+
+
+@_darwin_only
 def test_confinement_supported_matches_platform() -> None:
-    # macOS with sandbox-exec → True; any non-Darwin (no provider) → False.
-    assert confinement_supported() == (platform.system() == "Darwin" and sandbox_exec_available())
+    # On macOS the floor is available iff the seatbelt driver is.
+    assert confinement_supported() == sandbox_exec_available()
 
 
+@_linux_only
+def test_confinement_supported_matches_platform_on_linux() -> None:
+    """The twin, and the whole point of the K4c seam fix: on Linux the answer tracks BWRAP's
+    availability, not sandbox-exec's. Before that fix this was False on every Linux host, including
+    ones where the floor genuinely works."""
+    assert confinement_supported() == bwrap_available()
+
+
+@_darwin_only
 def test_confinement_supported_false_off_darwin() -> None:
+    """⚠ THE ASSERTION IS UNCHANGED AND ITS REASON IS NOT. Before K4c this was False because no
+    Linux PROVIDER existed. Now :class:`BwrapProvider` exists and is selected, and this is False
+    because that provider's driver — ``/usr/bin/bwrap`` — is not on a Mac. A test whose meaning
+    silently moves under it is worth a sentence; the delegation itself is pinned by the two
+    stub-provider tests below."""
     assert confinement_supported("Linux") is False
 
 
@@ -2217,3 +2257,414 @@ def test_live_localhost_outbound_deny_blocks_the_self_sshd_bypass(tmp_path: Path
                 sshd_proc.wait(timeout=5)  # reap after SIGKILL so it can't linger as a zombie (codex L3 #4)
         if agent_pid is not None:
             subprocess.run(["kill", agent_pid], capture_output=True)
+# =============================================================================================
+# BwrapProvider — the K4c Linux floor. THE MEASURED EQUIVALENCE TABLE, PINNED AS A CONTRACT.
+#
+# Every assertion below corresponds to a behaviour MEASURED on Ubuntu 24.04 / bubblewrap 0.9.0
+# (2026-09-03), not to a reading of the bwrap man page. These tests are PURE — they check the
+# rendered invocation — so they run on macOS, where the enforcement itself cannot be exercised.
+# ⚠ THAT IS THE LIMIT OF THIS FILE AND IT IS DELIBERATE: a green run here proves the argv says
+# what we measured to be correct, NEVER that the kernel does it. The enforcement half is owed on
+# a real Linux host (see `_bwrap_argv`'s module comment).
+# =============================================================================================
+
+
+def _lin_policy(tmp_path: Path, monkeypatch, **kw) -> CrownJewelsPolicy:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return build_policy(_entity(tmp_path), **kw)
+
+
+def _pairs(argv: list[str], flag: str) -> list[tuple[str, str]]:
+    """Every (flag, target) occurrence for a two-argument bwrap op."""
+    return [(argv[i], argv[i + 1]) for i, a in enumerate(argv) if a == flag and i + 1 < len(argv)]
+
+
+def _triples(argv: list[str], flag: str) -> list[tuple[str, str]]:
+    """Every (src, dest) for a three-argument bwrap op like ``--ro-bind SRC DEST``."""
+    return [
+        (argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == flag and i + 2 < len(argv)
+    ]
+
+
+def test_bwrap_base_flags_are_the_default_allow_polarity(tmp_path, monkeypatch) -> None:
+    """``--bind / /`` IS the polarity flip in one flag: the whole filesystem present and writable,
+    with the floor then subtracted. ``--proc``/``--dev`` are MEASURED as required, not defensive —
+    with ``--bind / /`` alone, /proc is missing and /dev/null is unopenable, which breaks ordinary
+    tooling and silently breaks shell redirections."""
+    argv = _bwrap_argv(_lin_policy(tmp_path, monkeypatch))
+    assert argv[0] == BWRAP
+    assert argv[1:4] == ["--bind", "/", "/"]
+    assert ("--proc", "/proc") in _pairs(argv, "--proc")
+    assert ("--dev", "/dev") in _pairs(argv, "--dev")
+    assert "--die-with-parent" in argv
+
+
+def test_bwrap_never_uses_a_try_variant(tmp_path, monkeypatch) -> None:
+    """⛔ THE FAIL-OPEN BAN. ``--ro-bind-try``/``--bind-try`` START THE SANDBOX WITH NOTHING
+    PROTECTING THE PATH when the source is missing (measured). A security-surface generator that
+    degrades to a pass is the shape of the defect this whole module is written against, so the try
+    variants may never appear — including as a future "fix" for a missing-source crash."""
+    argv = _bwrap_argv(_lin_policy(tmp_path, monkeypatch))
+    assert not [a for a in argv if a.endswith("-try")]
+
+
+def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
+    """A BARE tmpfs hides the jewel but lets writes into it SILENTLY SUCCEED and vanish — the entity
+    is told its write worked when nothing was written. ``--remount-ro`` keeps the hiding and makes
+    the refusal honest (EROFS). Both measured; the pairing is the contract."""
+    policy = _lin_policy(tmp_path, monkeypatch)
+    assert policy.deny_read_write, "fixture must produce at least one crown-jewel subtree"
+    argv = _bwrap_argv(policy)
+    for sub in policy.deny_read_write:
+        assert ("--tmpfs", str(sub)) in _pairs(argv, "--tmpfs")
+        assert ("--remount-ro", str(sub)) in _pairs(argv, "--remount-ro")
+
+
+def test_bwrap_every_tmpfs_is_remounted_ro_except_the_ssh_dir(tmp_path, monkeypatch) -> None:
+    """The invariant behind the previous test, stated so a NEW tmpfs added later cannot quietly skip
+    the pairing. The ssh dir is the ONE deliberate exception: files are bound back INTO it (known_hosts
+    must stay writable so ssh can record host keys), so it cannot be read-only."""
+    policy = _lin_policy(tmp_path, monkeypatch)
+    argv = _bwrap_argv(policy)
+    tmpfs = {t for _, t in _pairs(argv, "--tmpfs")}
+    ro = {t for _, t in _pairs(argv, "--remount-ro")}
+    exempt = {str(policy.ssh_dir)} if policy.ssh_dir is not None else set()
+    assert tmpfs - ro == exempt
+
+
+def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, monkeypatch) -> None:
+    """THE FINDING THAT NEARLY WENT THE OTHER WAY. Inside one sandbox, renaming a jewel's ancestor
+    does not expose it (the over-mount travels with the dentry) — which makes the ancestor pin look
+    unnecessary on Linux. It is not: the rename PERSISTS TO THE HOST, the next sandbox over-mounts
+    the ORIGINAL path, bwrap silently CREATES that missing path, and the tmpfs lands on a decoy while
+    the real jewel sits readable at the new location. Measured: it printed the jewel.
+
+    ``--bind P P`` is the exact analogue of macOS's ``(deny file-write* (literal <dir>))`` — the dir
+    becomes a mountpoint, so renaming it is EBUSY while creating files INSIDE it still works.
+
+    Parent-before-child is a HARD ordering requirement: a child over-mount must land inside an
+    already-established parent bind."""
+    policy = _lin_policy(tmp_path, monkeypatch)
+    assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
+    argv = _bwrap_argv(policy)
+    self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
+    bound = [d for _, d in self_binds]
+    for anc in policy.deny_write_dirs:
+        assert str(anc) in bound
+    for i, a in enumerate(bound):
+        for b in bound[i + 1:]:
+            assert not Path(b) in Path(a).parents, f"{b} is a parent of {a} but is mounted after it"
+
+
+def test_bwrap_cred_files_and_config_deny_both_directions(tmp_path, monkeypatch) -> None:
+    """``--ro-bind /dev/null`` denies READ (EACCES) as well as write — the closest analogue of macOS's
+    ``(deny file-read* file-write* (literal ...))``. Measured to hold with AND without ``--dev``, so
+    it does not depend on the device tree."""
+    secret = tmp_path / "secret.env"
+    secret.write_text("TOKEN")
+    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret,))
+    argv = _bwrap_argv(policy)
+    devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
+    assert str(secret.resolve()) in devnull_targets
+    if policy.config_file is not None:
+        assert str(policy.config_file) in devnull_targets
+
+
+def test_bwrap_write_only_files_are_ro_self_binds_when_they_exist(tmp_path, monkeypatch) -> None:
+    """Read stays allowed, write returns EROFS — matching macOS, where raw-mode ``~/.ssh`` reads
+    still work and the entity may ``cat`` its own memory. Measured additionally: ``rm`` of such a
+    file is EBUSY, and so is ``rm -rf`` of its PARENT directory."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    mem = ent / ".levain" / "memory.continuity.md"
+    mem.write_text("REAL MEMORY")
+    policy = build_policy(ent, ssh_mode="raw")
+    argv = _bwrap_argv(policy)
+    existing = [p for p in policy.own_memory_files if p.exists()]
+    assert existing, "fixture must produce at least one existing own-memory file"
+    self_ro = [d for s, d in _triples(argv, "--ro-bind") if s == d]
+    for p in existing:
+        assert str(p) in self_ro
+
+
+def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkeypatch) -> None:
+    """⚠ THE ssh PERSISTENCE VECTOR IS ABOUT A FILE THAT DOES NOT EXIST YET — planting an
+    authorized_keys that was never there (spore-322). macOS denies a path STRING, so it covers future
+    creation for free; a MOUNT needs a mountpoint. A missing vector therefore gets
+    ``--ro-bind /dev/null``, which blocks the plant (measured against a control run that plants
+    successfully without it) at the cost of bwrap creating a 0-byte ``-r--r--r--`` file on the host.
+    Skipping it instead is ``--ro-bind-try`` by another name."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    policy = build_policy(_entity(tmp_path), ssh_mode="raw")
+    missing = [p for p in policy.deny_write_files if not p.exists()]
+    assert missing, "fixture must produce at least one not-yet-existing ssh vector"
+    argv = _bwrap_argv(policy)
+    devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
+    for p in missing:
+        assert str(p) in devnull_targets
+
+
+def test_bwrap_agent_mode_hides_keys_and_binds_the_two_ssh_files_back(tmp_path, monkeypatch) -> None:
+    """The mount-namespace analogue of SBPL's last-match-wins re-allow: tmpfs the directory, then
+    bind the two files ssh actually needs back INTO it. Measured — key material reads ENOENT, the
+    known_hosts bind is READ-WRITE and a write inside the sandbox appears in the REAL host file (so
+    ssh can still record new host keys), and config is read-only, matching macOS where its WRITE
+    stays denied in BOTH modes."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("PRIVKEY")
+    (ssh / "known_hosts").write_text("HOSTS")
+    (ssh / "config").write_text("CFG")
+    policy = build_policy(_entity(tmp_path), ssh_mode="agent")
+    argv = _bwrap_argv(policy)
+    assert ("--tmpfs", str(policy.ssh_dir)) in _pairs(argv, "--tmpfs")
+    assert (str(ssh / "known_hosts"), str(ssh / "known_hosts")) in _triples(argv, "--bind")
+    assert (str(ssh / "config"), str(ssh / "config")) in _triples(argv, "--ro-bind")
+    # the key itself is never bound back — it is simply gone inside the tmpfs
+    assert str(ssh / "id_ed25519") not in [d for _, d in _triples(argv, "--bind")]
+
+
+def test_bwrap_never_binds_a_vector_back_into_a_tmpfs_that_hid_it(tmp_path, monkeypatch) -> None:
+    """⛔ THE RE-EXPOSE REGRESSION, AND IT IS WHY ``_shadowed_by`` IS NOT AN OPTIMIZATION. In agent
+    mode every ssh persistence vector lives inside the tmpfs'd ``~/.ssh``. A self-bind of
+    ``authorized_keys`` there would restore READ access to material the agent mode exists to deny —
+    the sandbox would render cleanly, start cleanly, and quietly undo its own floor.
+
+    ⚠ SCOPED TO THE SELF-BIND FORM ON PURPOSE. This originally asserted the path never appeared as
+    ANY bind target, which was right while a shadowed vector was skipped outright. It is now
+    ``--ro-bind /dev/null``-ed (to make the write refusal honest — see the test below), and a blanket
+    "never bound" assertion would have failed for the RIGHT change. What must never happen is the
+    path being bound to ITSELF, which is what re-exposes the content."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("KEYS")
+    policy = build_policy(_entity(tmp_path), ssh_mode="agent")
+    argv = _bwrap_argv(policy)
+    ak = str(ssh / "authorized_keys")
+    self_bound = [d for s, d in _triples(argv, "--bind") + _triples(argv, "--ro-bind") if s == d]
+    assert ak not in self_bound
+    # nothing else may be bound FROM the real path either (that would copy content in)
+    assert ak not in [s for s, _ in _triples(argv, "--bind") + _triples(argv, "--ro-bind")]
+
+
+def test_bwrap_denies_writes_to_a_vector_hidden_inside_a_tmpfs(tmp_path, monkeypatch) -> None:
+    """⚡ FOUND BY THE LIVE FLOOR TEST, INVISIBLE TO EVERY PURE TEST ABOVE. Under agent mode the ssh
+    vectors sit inside the tmpfs'd ``~/.ssh``, so a plant used to return rc=0 while the host file
+    stayed absent — the ATTACK failed but the REPORT lied. The ssh tmpfs cannot be ``--remount-ro``
+    (known_hosts must stay writable), so honesty is restored per-file with ``--ro-bind /dev/null`` on
+    the enumerable vector list. Verified live afterwards: the plant returns Permission denied and the
+    host file is still absent, at zero host mutation (the mountpoint lands inside the tmpfs).
+
+    ⛔ The form matters: a SELF-bind here would re-expose the key material the tmpfs hid, which is
+    why this is not simply "bind it like any other vector"."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("KEYS")
+    policy = build_policy(_entity(tmp_path), ssh_mode="agent")
+    argv = _bwrap_argv(policy)
+    ak = ssh / "authorized_keys"
+    devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
+    assert str(ak) in devnull_targets
+    # and NOT self-bound, which would undo the tmpfs
+    assert (str(ak), str(ak)) not in _triples(argv, "--ro-bind")
+
+
+def test_bwrap_does_not_overmount_the_ssh_files_it_deliberately_rebound(tmp_path, monkeypatch) -> None:
+    """``config`` is in ``deny_write_files`` AND is deliberately re-allowed for READ. Its ``--ro-bind``
+    already refuses writes honestly (EROFS), so a later ``/dev/null`` over-mount would undo the read
+    re-allow and break ssh — the two rules meeting at one path."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "config").write_text("CFG")
+    (ssh / "known_hosts").write_text("HOSTS")
+    policy = build_policy(_entity(tmp_path), ssh_mode="agent")
+    argv = _bwrap_argv(policy)
+    devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
+    assert str(ssh / "config") not in devnull_targets
+    assert str(ssh / "known_hosts") not in devnull_targets
+    assert (str(ssh / "config"), str(ssh / "config")) in _triples(argv, "--ro-bind")
+
+
+def test_bwrap_respects_an_operator_deny_of_known_hosts(tmp_path, monkeypatch) -> None:
+    """Same rule, same reason as the seatbelt provider: the ssh convenience re-allow must NEVER
+    silently override a path the CALLER explicitly declared a crown jewel."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    kh = ssh / "known_hosts"
+    kh.write_text("HOSTS")
+    policy = build_policy(_entity(tmp_path), ssh_mode="agent", deny_files=(kh,))
+    argv = _bwrap_argv(policy)
+    assert (str(kh), str(kh)) not in _triples(argv, "--bind")
+
+
+def test_bwrap_render_profile_is_the_same_argv_it_spawns(tmp_path, monkeypatch) -> None:
+    """ONE computation, two views. bwrap has no profile FILE — the policy IS the argv — so rendering
+    and spawning must never be two builders that can drift (the class fired on this repo the day
+    before this was written). shlex-quoted so the rendered form is pasteable into a terminal to
+    reproduce a floor by hand, which is how an equivalence claim gets re-checked by someone who does
+    not trust the docstring."""
+    policy = _lin_policy(tmp_path, monkeypatch)
+    rendered = BwrapProvider().render_profile(policy)
+    assert shlex.split(rendered) == _bwrap_argv(policy)
+
+
+def test_bwrap_spawn_shell_fails_closed_and_names_the_apparmor_cause(tmp_path, monkeypatch) -> None:
+    """Fail-closed with an error that TEACHES. The Ubuntu 23.10+ cause is not guessable from
+    "permission denied", and the message must say that bwrap being installed with
+    ``unprivileged_userns_clone=1`` can BOTH be true on a host where it still fails — because that is
+    exactly the pair that read GREEN on argushub while every invocation failed."""
+    monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
+    with pytest.raises(ConfinementError) as exc:
+        BwrapProvider().spawn_shell(_lin_policy(tmp_path, monkeypatch))
+    msg = str(exc.value)
+    assert "fail-closed" in msg.lower()
+    assert "apparmor_restrict_unprivileged_userns" in msg
+
+
+@_darwin_only
+def test_bwrap_available_is_false_on_a_mac_and_never_raises() -> None:
+    """The probe EXECUTES bwrap rather than stat-ing it — the argushub finding. On a Mac there is no
+    ``/usr/bin/bwrap``, so it short-circuits False. It must never raise: an exception escaping an
+    availability check would read as a crash where the honest answer is "no floor here"."""
+    assert bwrap_available() is False
+
+
+@_linux_only
+def test_bwrap_available_is_a_bool_on_linux() -> None:
+    """⚠ DELIBERATELY NOT ``is True``. A Linux host with bwrap installed can still be unable to
+    create a namespace (Ubuntu 23.10+ AppArmor), and asserting True here would make the suite fail on
+    a correctly-fail-closed box — turning an honest "no floor available" into a red build."""
+    assert isinstance(bwrap_available(), bool)
+
+
+# =============================================================================================
+# LINUX LIVE — the ENFORCEMENT half of the K4c equivalence proof.
+#
+# Everything above this line is PURE: it proves the rendered argv says what we measured to be
+# correct. It CANNOT prove the kernel does it. These tests spawn a REAL confined bash through the
+# REAL BwrapProvider and attack the floor, so they only run where that is possible — a Linux host
+# with a working bwrap. They SKIP on macOS and on a Linux box whose kernel refuses unprivileged
+# user namespaces (which is the common case on Ubuntu 23.10+; see `bwrap_available`).
+#
+# ⚠ EVERY CHECK IS A CONTROL/ATTACK PAIR. The controls come first and must PASS — if a neutral file
+# is unreadable then the "jewel unreadable" result proves nothing but a broken sandbox. This is the
+# lesson from the first pass of these experiments, where an ancestor-rename "denial" turned out to be
+# ordinary directory permissions rather than anything the floor did.
+# =============================================================================================
+
+linux_live = pytest.mark.skipif(
+    not (platform.system() == "Linux" and bwrap_available()),
+    reason="needs a Linux host where bwrap can actually establish a namespace",
+)
+
+
+@pytest.fixture()
+def linux_floor(tmp_path: Path, monkeypatch):
+    """A real confined shell over a realistic crown-jewels layout."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "memory.continuity.md").write_text("REAL ENTITY MEMORY\n")
+    jewel = tmp_path / ".anneal-memory"
+    jewel.mkdir()
+    (jewel / "secret.txt").write_text("JEWEL-CONTENT\n")
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("PRIVATE-KEY\n")
+    (ssh / "known_hosts").write_text("HOSTS\n")
+    (tmp_path / "work").mkdir()
+    (tmp_path / "work" / "ok.txt").write_text("NORMAL\n")
+    cred = tmp_path / "secret.env"
+    cred.write_text("TOKEN=abc\n")
+    policy = build_policy(ent, deny_files=(cred,), ssh_mode="agent")
+    shell = BwrapProvider().spawn_shell(policy)
+    try:
+        yield shell, tmp_path, ent, jewel, ssh, cred
+    finally:
+        shell.close()
+
+
+@linux_live
+def test_linux_live_controls_a_working_filesystem(linux_floor) -> None:
+    """THE CONTROLS. Without these passing, every denial below is unfalsifiable."""
+    sh, home, _ent, _j, _s, _c = linux_floor
+    assert sh.run(f"cat {home}/work/ok.txt").exit_code == 0
+    assert sh.run(f"echo x > {home}/work/new.txt").exit_code == 0
+    assert sh.run("python3 -c 'print(1)'").exit_code == 0
+
+
+@linux_live
+def test_linux_live_crown_jewel_is_unreadable_and_unwritable(linux_floor) -> None:
+    sh, _home, _ent, jewel, _s, _c = linux_floor
+    assert sh.run(f"cat {jewel}/secret.txt").exit_code != 0
+    assert sh.run(f'test -n "$(ls -A {jewel})"').exit_code != 0
+    # ⚠ EROFS, not a silent success: the `--remount-ro` half of the pairing is what makes this fail
+    # loudly instead of writing into an ephemeral tmpfs and reporting rc=0.
+    assert sh.run(f"echo POISON > {jewel}/x").exit_code != 0
+    assert (jewel / "secret.txt").read_text().strip() == "JEWEL-CONTENT"
+
+
+@linux_live
+def test_linux_live_jewel_cannot_be_relocated(linux_floor) -> None:
+    """apparatus L2 CRITICAL, re-proved in the mount model. EBUSY, because it is a mountpoint."""
+    sh, home, _ent, jewel, _s, _c = linux_floor
+    assert sh.run(f"mv {jewel} {home}/stolen").exit_code != 0
+    assert (jewel / "secret.txt").exists()
+
+
+@linux_live
+def test_linux_live_write_denied_file_cannot_be_hardlinked_or_renamed_out(linux_floor) -> None:
+    """⛔ THE STANDING REQUIREMENT FROM THE MODULE DOCSTRING, which named this as the thing a Linux
+    backend MUST re-prove and doubted a ``--ro-bind`` would give. Read stays allowed by design; the
+    file cannot be written, renamed out, hardlinked out, or removed."""
+    sh, home, ent, _j, _s, _c = linux_floor
+    mem = ent / ".levain" / "memory.continuity.md"
+    assert sh.run(f"cat {mem}").exit_code == 0
+    assert sh.run(f"echo POISON > {mem}").exit_code != 0
+    assert sh.run(f"mv {mem} {home}/out.md").exit_code != 0
+    assert sh.run(f"ln {mem} {home}/hard.md").exit_code != 0
+    assert sh.run(f"rm -f {mem}").exit_code != 0
+    assert mem.read_text().strip() == "REAL ENTITY MEMORY"
+
+
+@linux_live
+def test_linux_live_credential_file_denies_both_directions(linux_floor) -> None:
+    sh, _home, _ent, _j, _s, cred = linux_floor
+    assert sh.run(f"cat {cred}").exit_code != 0
+    assert sh.run(f"echo x > {cred}").exit_code != 0
+    assert cred.read_text().strip() == "TOKEN=abc"
+
+
+@linux_live
+def test_linux_live_ssh_agent_mode(linux_floor) -> None:
+    """Key material gone; known_hosts read AND write, with the write reaching the REAL host file —
+    that last assertion is what distinguishes a live bind from a tmpfs copy that silently discards."""
+    sh, _home, _ent, _j, ssh, _c = linux_floor
+    assert sh.run(f"cat {ssh}/id_ed25519").exit_code != 0
+    assert sh.run(f"cat {ssh}/known_hosts").exit_code == 0
+    assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code == 0
+    assert "NEWHOST" in (ssh / "known_hosts").read_text()
+
+
+@linux_live
+def test_linux_live_planting_authorized_keys_is_refused_not_silently_discarded(linux_floor) -> None:
+    """⚡ THE REGRESSION THIS FILE EXISTS FOR. The first live run had this returning rc=0 while the
+    host file stayed absent — attack defeated, report false — and NO pure test could see it. Both
+    halves are asserted: the write must be REFUSED, and the host must stay clean."""
+    sh, _home, _ent, _j, ssh, _c = linux_floor
+    assert sh.run(f"echo PLANTED > {ssh}/authorized_keys").exit_code != 0
+    assert not (ssh / "authorized_keys").exists()
+
+
+@linux_live
+def test_linux_live_floor_is_inherited_by_descendants(linux_floor) -> None:
+    """A mount namespace is inherited structurally, so this is per-PROCESS-TREE, not per-command —
+    the property that makes an OS sandbox work for a long-lived shell whose cwd wanders."""
+    sh, _home, _ent, jewel, _s, _c = linux_floor
+    assert sh.run(f"bash -c 'bash -c \"cat {jewel}/secret.txt\"'").exit_code != 0

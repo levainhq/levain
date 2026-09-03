@@ -55,10 +55,14 @@ per-command.
 **The provider seam (``canonical_object_model_plus_replaceable_surfaces``, mirroring
 ``levain.daemon.DaemonProvider``).** ONE OS-agnostic :class:`CrownJewelsPolicy` behind a
 :class:`ConfinementProvider` interface (``render_profile`` PURE → the platform's sandbox text;
-``spawn_shell`` I/O → a persistent confined shell). macOS (:class:`SeatbeltProvider`) ships first;
-Linux (``bwrap --ro-bind`` exclusions) and a container backend slot in as PURE ADDITIONS against this
-contract — and the macOS denylist IS their requirements spec (macOS-first is the de-risk pass for all
-three).
+``spawn_shell`` I/O → a persistent confined shell). macOS (:class:`SeatbeltProvider`) shipped first;
+Linux (:class:`BwrapProvider`, K4c) shipped second against the same contract; a container backend
+remains a PURE ADDITION — and the macOS denylist IS their requirements spec (macOS-first was the
+de-risk pass, and it held: the contract needed ONE addition, ``available()``, and no reshaping).
+⚠ The Linux mechanism is NOT "``--ro-bind`` exclusions" as this line predicted before it was built.
+A ``--ro-bind`` denies WRITES while leaving READS open, so it is right for the write-only vectors and
+WRONG for a crown-jewel subtree; those are ``--tmpfs`` + ``--remount-ro``. The full measured mapping
+is tabulated above :func:`_bwrap_argv`.
 
 **Honest limits (welded in, not discovered — apparatus L2-verified, from the scope doc + review):**
   - ``sandbox-exec`` is Apple-DEPRECATED. Works on Darwin 25.5 (proven), Chrome still ships on it,
@@ -77,9 +81,14 @@ three).
   - SEATBELT ``link()``/``rename()`` SOURCE-CHECK COUPLING (apparatus L3 complement, verified live): the
     write-floor's integrity rests on seatbelt applying ``file-write*`` to the SOURCE path of a hardlink/
     rename (so a write-denied file can't be relocated OUT), which held on Darwin 25.5 but is undocumented
-    Apple behaviour on a deprecated tool. The ``ConfinementProvider`` seam is the hedge; the eventual
-    Linux ``bwrap`` / container backend MUST re-prove "cannot hardlink/rename a write-denied file out" as
-    a first-class provider-contract test — a ``--ro-bind`` on one file does not obviously give it.
+    Apple behaviour on a deprecated tool. The ``ConfinementProvider`` seam is the hedge. ✅ **RE-PROVEN
+    FOR LINUX (K4c, 2026-09-03) — this requirement is MET**, by a mechanism that does not rest on a
+    vendor quirk: under :class:`BwrapProvider`, moving a write-denied file out returns EBUSY (it is a
+    mountpoint) and hardlinking it out returns EXDEV (the bind is a separate mount device); ``rm`` of
+    the file and ``rm -rf`` of its parent both return EBUSY too. Measured on Ubuntu 24.04 / bubblewrap
+    0.9.0 and covered by a provider-contract test. The original doubt — "a ``--ro-bind`` on one file
+    does not obviously give it" — was well placed; it turns out to give MORE than seatbelt does, for a
+    different reason (mount identity, not a source-path predicate).
   - REPLACEABLE LEXICAL HOME-CHAIN ANCESTOR (apparatus L3 codex round-3, the generalized class): the
     slice-3 fix pins the lexical ``~/.ssh`` anchor, but the pin is ``home.resolve() / ".ssh"`` — so if
     ``HOME`` ITSELF (or a lexical ancestor of it) is a USER-WRITABLE symlink (e.g. ``HOME=/tmp/linkhome``
@@ -209,6 +218,7 @@ import json
 import os
 import platform
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -228,6 +238,7 @@ from levain.firing.gate import GATE_SETTINGS, GateSetting
 
 __all__ = [
     "SANDBOX_EXEC",
+    "BWRAP",
     "ConfinementError",
     "SshMode",
     "CrownJewelsPolicy",
@@ -239,14 +250,23 @@ __all__ = [
     "SandboxedShell",
     "ConfinementProvider",
     "SeatbeltProvider",
+    "BwrapProvider",
     "select_provider",
     "sandbox_exec_available",
+    "bwrap_available",
     "confinement_supported",
 ]
 
 # The macOS seatbelt driver. An ABSOLUTE path (never a PATH lookup — a confined child must resolve
 # the sandbox binary deterministically, and this is the OS-shipped location).
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+# The Linux sandbox driver. ABSOLUTE for the same reason as ``SANDBOX_EXEC`` — a confined child must
+# resolve the sandbox binary deterministically, never through a PATH the entity could influence.
+# ⚠ LIMIT, NAMED: this is the Debian/Ubuntu/Fedora location. A distro that ships ``bwrap`` elsewhere
+# (Nix, some source builds) reads as "no confinement available" and fails CLOSED — the entity loses
+# bash and is told why. That is the correct direction to be wrong in; a PATH lookup is not.
+BWRAP = "/usr/bin/bwrap"
 
 SshMode = Literal["agent", "raw"]
 
@@ -1915,8 +1935,11 @@ class SandboxedShell:
 class ConfinementProvider(ABC):
     """One thin provider per OS. ``render_profile`` is PURE (no I/O) so the generated sandbox text is
     fully testable without touching the system; ``spawn_shell`` shells out to the platform sandbox
-    driver. The macOS provider ships first; ``bwrap`` (Linux) + a container backend are PURE ADDITIONS
-    against this contract, and the macOS crown-jewels denylist is their requirements spec."""
+    driver. macOS (:class:`SeatbeltProvider`) shipped first and Linux (:class:`BwrapProvider`, K4c)
+    shipped against this contract unchanged apart from the ``available()`` addition — which is the
+    seam doing its job. A container backend remains a pure addition. The macOS crown-jewels denylist
+    is the requirements spec for every provider; the Linux one was re-derived against it row by row
+    and measured, never ported."""
 
     @abstractmethod
     def available(self) -> bool:
@@ -2390,6 +2413,288 @@ class _SeatbeltShell(SandboxedShell):
                 pass
 
 
+# --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
+#
+# ⚠ THIS IS A RE-DERIVATION, NOT A PORT, AND EVERY ROW BELOW WAS MEASURED ON A LINUX KERNEL
+# RATHER THAN REASONED FROM THE macOS PROFILE OR THE bwrap MAN PAGE.
+#
+# WHERE, EXACTLY, BECAUSE "MEASURED ON LINUX" WOULD LET A READER ASSUME THE WRONG HOST. The
+# measurements were taken in a disposable Ubuntu 24.04.4 / bubblewrap 0.9.0 container (aarch64) on
+# 2026-09-03, driving the real provider. They were NOT taken on argushub — argushub is Ubuntu 24.04.4
+# / bubblewrap 0.9.0 too, but on x86_64, and it CANNOT RUN bwrap at all (see `bwrap_available`), which
+# is what sent the proof to a container in the first place. Same distro, same bwrap, different arch.
+# ⛔ STILL OWED: one confirming run on a real (non-container) Linux host, because a container relaxes
+# seccomp to permit user namespaces at all and that is a difference in the environment under test.
+# The `linux_live` tests in tests/test_firing_confinement.py ARE that run — they self-skip anywhere
+# bwrap cannot establish a namespace, so pointing them at a capable host is the whole procedure.
+# seatbelt is a PATH PREDICATE evaluated per syscall; bwrap is a MOUNT NAMESPACE established once
+# at spawn. The polarity is also inverted — crown-jewels is deliberately default-ALLOW-with-denies
+# (the Slice-1 flip) while bwrap's idiom is default-deny-with-binds — so the base is ``--bind / /``
+# and each jewel is then OVER-MOUNTED. ``confinement.py``'s module docstring states the standing
+# requirement this had to satisfy: the Linux backend MUST re-prove "cannot hardlink/rename a
+# write-denied file out". It does, and by a stronger mechanism than macOS (see ``_bwrap_argv``).
+#
+# THE MEASURED EQUIVALENCE TABLE (policy field -> bwrap op -> observed behaviour):
+#
+#   deny_read_write (subtrees)   --tmpfs P --remount-ro P   read ENOENT, write EROFS
+#   deny_files / config_file     --ro-bind /dev/null P      read EACCES, write EACCES
+#   deny_write_dirs (ancestors)  --bind P P (self-bind)     rename EBUSY, writes INSIDE still OK
+#   deny_write_files             --ro-bind P P (self-bind)  read OK, write EROFS
+#   own_memory_files             --ro-bind P P (self-bind)  read OK, write EROFS
+#   ssh_dir (agent mode)         --tmpfs, then bind back    key material ENOENT; known_hosts r+w
+#                                known_hosts (rw) + config  reaches the REAL host file; config
+#                                (ro) INTO the tmpfs        read OK / write EROFS
+#
+# WHY THE ANCESTOR SELF-BIND IS NOT DROPPABLE HERE, WHICH IS THE FINDING THAT NEARLY WENT THE OTHER
+# WAY. Inside ONE sandbox, renaming a jewel's ancestor does not expose the jewel — the over-mount is
+# attached to the dentry and travels with the rename. That makes it LOOK like bwrap has no need for
+# macOS's ancestor-write-deny. It does. The rename PERSISTS TO THE HOST, so the NEXT sandbox builds
+# its over-mount at the ORIGINAL path, ``bwrap`` silently CREATES that missing path, and the tmpfs
+# lands on a decoy while the real jewel sits at the new location fully readable. Measured: it printed
+# the jewel. The relocation bypass (apparatus L2 CRITICAL) survives the port intact, and bwrap's
+# path-autocreation makes it worse than on macOS by making the useless mount look protective.
+# ``--bind P P`` is the exact analogue of macOS's ``(deny file-write* (literal <dir>))``: it makes the
+# dir a MOUNTPOINT, so renaming it returns EBUSY while ``open(dir/child, O_CREAT)`` still succeeds —
+# both halves measured.
+#
+# WHY ``--tmpfs`` IS PAIRED WITH ``--remount-ro`` AND NEVER USED BARE. A bare tmpfs over-mount hides
+# the jewel but lets writes into it SILENTLY SUCCEED and vanish — the entity is told its write
+# worked when nothing was written (``absence_of_signal_rendered_as_health`` arriving at the
+# confinement layer). ``--remount-ro`` keeps the hiding and makes the refusal honest (EROFS).
+#
+# ⛔ ``--ro-bind-try`` / ``--bind-try`` ARE BANNED FOR JEWELS. On a missing source they start the
+# sandbox with NOTHING protecting that path — a fail-OPEN in a security-surface generator, which is
+# the shape of the defect the whole module is written against. Use the explicit forms and let a
+# genuinely missing source raise.
+
+
+def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
+    """True if ``path`` already sits under a subtree this policy over-mounts with a tmpfs.
+
+    Load-bearing, not an optimization, and it SELECTS THE FORM rather than skipping the path. A
+    SELF-bind (``--ro-bind P P``) of such a path would RE-EXPOSE it through the very over-mount that
+    hid it: in ``ssh_mode="agent"`` every ssh persistence vector lives inside the tmpfs'd ``~/.ssh``,
+    so self-binding ``authorized_keys`` there would restore READ access to material agent mode exists
+    to deny. A ``/dev/null`` bind exposes nothing and is therefore the correct form here — see the
+    write-only block in :func:`_bwrap_argv` for why it is applied rather than skipping outright.
+    Matched with :func:`_ci_within` for consistency with the rest of the module (and see that
+    function on why the fold is macOS-shaped)."""
+    return any(_ci_within(path, r) for r in roots)
+
+
+def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
+    """THE single source of the bwrap invocation. :meth:`BwrapProvider.render_profile` renders this
+    list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
+    with two views, never two builders that can drift (the ``two_things_that_should_be_one`` class
+    fired on this repo the day before this was written).
+
+    Pure: no I/O EXCEPT ``Path.exists`` probes, which decide between the self-bind and the
+    ``/dev/null`` form for a write-denied file. That is a read, never a mutation."""
+    argv: list[str] = [
+        BWRAP,
+        # The polarity flip, in one flag: the whole filesystem is present and writable, exactly as a
+        # CC/Codex replacement needs, and the floor is then subtracted from it.
+        "--bind", "/", "/",
+        # MEASURED AS REQUIRED, not added defensively: with `--bind / /` alone, /proc is MISSING and
+        # /dev/null is unopenable, which breaks ordinary tooling and (worse) silently breaks shell
+        # redirections a test might be relying on.
+        "--proc", "/proc",
+        "--dev", "/dev",
+        # The sandbox dies with the levain process that owns it. Complements — never replaces —
+        # SandboxedShell.close()'s process-group teardown.
+        "--die-with-parent",
+    ]
+
+    # (1) ANCESTOR DIRS FIRST. Parent-before-child is a HARD ordering requirement (bwrap applies ops
+    # in sequence and a child over-mount must land inside an already-established parent bind).
+    # `_write_deny_ancestors` already returns lexicographically sorted paths, and for a path string a
+    # parent is a prefix of its child, so that sort IS parent-first. Re-sorted here anyway so this
+    # block does not silently depend on a guarantee made in another function.
+    for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
+        argv += ["--bind", str(d), str(d)]
+
+    # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
+    tmpfs_roots: list[Path] = list(policy.deny_read_write)
+    for sub in policy.deny_read_write:
+        argv += ["--tmpfs", str(sub), "--remount-ro", str(sub)]
+
+    # (3) ssh KEY MATERIAL (agent mode). tmpfs the directory, then bind the two files ssh actually
+    # needs back INTO it — the mount-namespace analogue of SBPL's last-match-wins re-allow. The
+    # known_hosts bind is READ-WRITE and reaches the REAL host file (measured: a write inside the
+    # sandbox appeared in the host's known_hosts), so ssh can still record new host keys; config is
+    # read-only, matching macOS where its WRITE stays denied in BOTH modes. NEVER re-allow a path the
+    # CALLER explicitly denied — same rule, same reason as the seatbelt provider.
+    rebound: list[Path] = []
+    if policy.ssh_dir is not None:
+        ssh = policy.ssh_dir
+        argv += ["--tmpfs", str(ssh)]
+        tmpfs_roots.append(ssh)
+        known_hosts = ssh / "known_hosts"
+        config = ssh / "config"
+        if known_hosts.exists() and not _caller_denies(known_hosts, policy):
+            argv += ["--bind", str(known_hosts), str(known_hosts)]
+            rebound.append(known_hosts)
+        if config.exists() and not _caller_denies(config, policy):
+            argv += ["--ro-bind", str(config), str(config)]
+            rebound.append(config)
+
+    # (4) READ+WRITE-DENIED FILES — credential files and the confinement config that defines the
+    # floor. `--ro-bind /dev/null` denies BOTH directions (EACCES on read and on write), which is the
+    # closest analogue of macOS's `(deny file-read* file-write* (literal ...))`. Measured to hold with
+    # and without `--dev`, so it does not depend on the device tree above.
+    roots = tuple(tmpfs_roots)
+    deny_both = list(policy.deny_files)
+    if policy.config_file is not None:
+        deny_both.append(policy.config_file)
+    for f in deny_both:
+        if _shadowed_by(f, roots):
+            continue  # already hidden by a tmpfs; binding it back would re-expose it
+        argv += ["--ro-bind", "/dev/null", str(f)]
+
+    # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
+    # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
+    # write returns EROFS. `rm` of one returns EBUSY, and so does `rm -rf` of its parent directory —
+    # both measured, which is what makes the vector floor hold without the ancestor pin doing it.
+    #
+    # ⚠ THE MISSING-FILE CASE IS THE ONE PLACE THIS FLOOR MUTATES THE HOST, AND IT IS DELIBERATE.
+    # A mount needs a mountpoint. macOS denies a path STRING, so it covers a file that does not exist
+    # YET — which is the entire point of the ssh vector floor (`spore-322`): the attack is PLANTING an
+    # authorized_keys that was never there. bwrap can only over-mount something that exists, so a
+    # missing vector gets `--ro-bind /dev/null`, and bwrap CREATES the mountpoint — leaving a 0-byte
+    # `-r--r--r--` regular file on the host after the sandbox exits (measured). Blocking the plant is
+    # worth an empty file: sshd reads an empty authorized_keys as NO KEYS, an empty config/rc as no
+    # directives. The alternative — skip it — is `--ro-bind-try` by another name and lets the plant
+    # through, which a control run confirmed it does.
+    # ⚠ OPEN, FLAGGED RATHER THAN BURIED: `own_memory_files` goes through this same branch, so a
+    # FRESH entity whose memory.continuity.md does not exist yet gets a 0-byte one created by the
+    # confinement layer. That is very likely benign (a fresh entity has no memory to read) but it has
+    # NOT been verified end-to-end against a real `levain run` on Linux, and a confinement floor
+    # writing into the memory store is exactly the kind of thing that must be checked, not assumed.
+    for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
+        if any(_ci_within(f, r) for r in rebound):
+            # known_hosts / config were deliberately bound BACK for ssh to work. known_hosts is
+            # read-write by design; config is a ``--ro-bind``, which already refuses writes honestly
+            # (EROFS). Over-mounting either here would undo the re-allow.
+            continue
+        if _shadowed_by(f, roots):
+            # Inside a tmpfs the content is already gone, but a WRITE would SILENTLY SUCCEED and
+            # evaporate — measured live: planting ~/.ssh/authorized_keys under agent mode returned
+            # rc=0 while the host file stayed absent. The attack fails; the REPORT lies, which is the
+            # `absence_of_signal_rendered_as_health` shape this module refuses elsewhere (it is why
+            # `--remount-ro` is paired onto every jewel tmpfs). The ssh tmpfs CANNOT be remounted
+            # read-only because known_hosts has to stay writable, so the honesty is restored per-file
+            # on exactly the paths that matter: the vectors are a fixed, enumerable list.
+            # ⚡ AND THE MOUNTPOINT LANDS INSIDE THE TMPFS, so unlike the missing-file case below this
+            # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
+            argv += ["--ro-bind", "/dev/null", str(f)]
+        elif f.exists():
+            argv += ["--ro-bind", str(f), str(f)]
+        else:
+            argv += ["--ro-bind", "/dev/null", str(f)]
+
+    return argv
+
+
+def bwrap_available() -> bool:
+    """True iff ``bwrap`` is present AND CAN ACTUALLY ESTABLISH A NAMESPACE ON THIS HOST RIGHT NOW.
+
+    ⛔ THIS EXECUTES bwrap. THAT IS THE POINT, AND A FILE-EXISTENCE CHECK IS NOT A SUBSTITUTE — the
+    check that spore-418 specified (``bwrap`` present + ``unprivileged_userns_clone``) REPORTS GREEN
+    ON A HOST WHERE bwrap CANNOT RUN. Measured on argushub 2026-09-03: ``/usr/bin/bwrap`` present,
+    ``kernel.unprivileged_userns_clone = 1``, and every invocation fails with ``setting up uid map:
+    Permission denied``, because Ubuntu 23.10+ gates unprivileged user namespaces behind a DIFFERENT
+    knob — ``kernel.apparmor_restrict_unprivileged_userns`` — that the specified probe never reads.
+    Two proxies both green, the real target red: the honest probe is to run the thing.
+
+    Deliberately NOT cached. It is one ``bwrap --bind / / /bin/true`` (single-digit milliseconds), and
+    a cached answer would survive an operator loading an AppArmor profile or flipping the sysctl —
+    reporting "no confinement" for the life of the process on a box that has just become capable."""
+    if not (os.path.isfile(BWRAP) and os.access(BWRAP, os.X_OK)):
+        return False
+    try:
+        proc = subprocess.run(
+            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # Cannot even attempt it -> not available. FAIL CLOSED; never let an exception here read as
+        # "probably fine".
+        return False
+    return proc.returncode == 0
+
+
+class BwrapProvider(ConfinementProvider):
+    """Linux ``bubblewrap`` (mount-namespace) provider — the K4c counterpart to
+    :class:`SeatbeltProvider`.
+
+    Renders ``--bind / /`` (the default-ALLOW polarity) and then OVER-MOUNTS each crown jewel. See
+    the module-level comment above :func:`_bwrap_argv` for the measured equivalence table, and that
+    function for why each op was chosen over its plausible alternative.
+
+    WHERE THIS IS STRONGER THAN THE macOS FLOOR, stated because the module docstring names the macOS
+    version's weak point explicitly. The seatbelt write-floor's integrity rests on Apple applying
+    ``file-write*`` to the SOURCE path of a hardlink/rename — undocumented behaviour on a deprecated
+    tool. Here, moving a write-denied file out returns EBUSY (it is a mountpoint) and hardlinking it
+    out returns EXDEV (the bind is a separate mount device). Both are ordinary, documented mount
+    semantics rather than a vendor quirk, and both were measured.
+
+    WHERE IT IS DIFFERENT IN A WAY A READER MUST KNOW. macOS answers a denied read with EPERM; a
+    tmpfs over-mount answers with ENOENT — the jewel does not appear to exist rather than appearing
+    forbidden. Confidentiality is equal (arguably better: existence is not confirmed), but an error
+    message a human reads will say "No such file or directory", and anything matching on EPERM to
+    detect a denial will not fire.
+
+    ⚠ NOT CLAIMED, BECAUSE NOT MEASURED: whether ``--unshare-pid`` would close the DAEMONIZED
+    SURVIVOR limit the module docstring documents as open on macOS. It plausibly would (a pid
+    namespace reaps its children when its init exits), it is one flag, and it is deliberately NOT
+    built here — K4c is PARITY, and the one attempt to measure it was invalidated by a container
+    artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
+    before it is either claimed or shipped."""
+
+    def available(self) -> bool:
+        return bwrap_available()
+
+    def render_profile(self, policy: CrownJewelsPolicy) -> str:
+        """The bwrap invocation as shell-quoted text.
+
+        bwrap has no profile FILE — the policy IS the argv — so "render the platform's native
+        sandbox profile text" is honoured by rendering the exact command. Quoted with
+        :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
+        terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
+        later by someone who does not trust this docstring."""
+        return shlex.join(_bwrap_argv(policy)) + "\n"
+
+    def spawn_shell(
+        self,
+        policy: CrownJewelsPolicy,
+        *,
+        env: dict[str, str] | None = None,
+        default_timeout: float = 120.0,
+    ) -> SandboxedShell:
+        if not bwrap_available():
+            raise ConfinementError(
+                f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "
+                "without a confinement floor (fail-closed). The usual cause on Ubuntu 23.10+ is "
+                "`kernel.apparmor_restrict_unprivileged_userns=1`, which blocks unprivileged user "
+                "namespaces for unconfined programs; an AppArmor profile granting `userns` to "
+                f"{BWRAP} is the narrow fix. Note that `bwrap` being INSTALLED and "
+                "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
+                "fails — which is why this is probed by running bwrap, not by reading either."
+            )
+        argv = _bwrap_argv(policy) + ["/bin/bash", "--noprofile", "--norc"]
+        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
+        # needs it to exist. Not a jail — reach is default-allowed.
+        policy.workspace.mkdir(parents=True, exist_ok=True)
+        shell = SandboxedShell(
+            argv=argv,
+            cwd=policy.workspace,
+            env=env if env is not None else _default_shell_env(),
+            default_timeout=default_timeout,
+        )
+        return shell.start()
+
+
 def sandbox_exec_available() -> bool:
     """True iff the macOS seatbelt driver is present + executable. The honesty floor: a caller must
     check this and REFUSE to grant bash hands if False, rather than fall through to an unconfined
@@ -2427,15 +2732,23 @@ def confinement_supported(system: str | None = None) -> bool:
 def select_provider(system: str | None = None) -> ConfinementProvider:
     """The confinement provider for ``system`` (default: the running OS).
 
-    macOS → :class:`SeatbeltProvider`. Anything else raises :class:`ConfinementError` naming the seam
-    — Linux ``bwrap`` + a container backend are PURE ADDITIONS here (the seam exists so "defer the
-    others" is on-rails, not a rewrite), but until one is built, a non-macOS caller must fail-closed,
-    never grant an unconfined shell."""
+    macOS → :class:`SeatbeltProvider`. Linux → :class:`BwrapProvider` (K4c). Anything else raises
+    :class:`ConfinementError` naming the seam — a container backend and a Windows-native provider are
+    still PURE ADDITIONS here — and until one is built a caller on those platforms must fail-closed,
+    never grant an unconfined shell.
+
+    ⚠ SELECTING A PROVIDER IS NOT THE SAME AS HAVING A FLOOR. This answers "which provider governs
+    this OS", never "can it run here" — :func:`confinement_supported` is the gate that asks the
+    provider itself, and on Linux the answer is genuinely often False on a host where bwrap IS
+    installed (see :func:`bwrap_available`)."""
     system = system or platform.system()
     if system == "Darwin":
         return SeatbeltProvider()
+    if system == "Linux":
+        return BwrapProvider()
     raise ConfinementError(
-        f"OS confinement is not yet implemented for {system!r} — only macOS (sandbox-exec) ships in "
-        "this slice. The ConfinementProvider seam is here; a bwrap (Linux) / container provider slots "
-        "in as a pure addition. Refusing to grant bash hands without a confinement floor (fail-closed)."
+        f"OS confinement is not yet implemented for {system!r} — macOS (sandbox-exec) and Linux "
+        "(bwrap) ship today. The ConfinementProvider seam is here; a container / Windows-native "
+        "provider slots in as a pure addition. Refusing to grant bash hands without a confinement "
+        "floor (fail-closed)."
     )
