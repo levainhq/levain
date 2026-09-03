@@ -1446,16 +1446,44 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     pack_hooks: dict[str, str] = {}
     _PREFIX = "activation/hooks/"
     try:
-        from levain.manifest import read_pack_locks
+        from levain.manifest import read_pack_locks_status
 
-        for prov in read_pack_locks(install):
+        # ⛔ `read_pack_locks_status`, NOT `read_pack_locks` — AND THE DIFFERENCE IS THE WHOLE
+        # POINT. The thin wrapper returns `[]` for ABSENT and for CORRUPT alike, so a truncated
+        # or partially-synced `.levain/manifest.json` silently turned pack-hook checking OFF
+        # while this check went on reporting "hook scripts match the package". Tampering with an
+        # installed pack hook was then invisible. `absence_of_signal_rendered_as_health`, inside
+        # doctor, again — and the realistic path is not an attacker, it is a half-written file.
+        #
+        # ⛔⛔ THE JUSTIFICATION THAT STOOD HERE WAS FALSE: "the LOCK check owns lock integrity."
+        # NO DOCTOR CHECK READS THE PACK AXIS. Measured: `read_pack_locks_status` had ZERO
+        # callers in this file; its consumers are `update.py` and `reconcile.py`. Doctor's lock
+        # check reads `manifest.read_lock_status` — a DIFFERENT function, covering the ENGINE
+        # compat set, whose corrupt branch reports on `.levain/manifest.json` as a version
+        # record and says nothing about pack provenance. The axis was unowned, and this comment
+        # is what stopped anyone noticing.
+        provs, pack_status = read_pack_locks_status(install)
+        if pack_status == "corrupt":
+            return [
+                CheckResult(
+                    "hook freshness",
+                    False,
+                    "pack provenance in .levain/manifest.json is unreadable, so pack-owned "
+                    "hooks CANNOT be checked — a tampered or stale pack hook would not be "
+                    "reported. This is a refusal to guess, not a hook failure.",
+                    "Restore .levain/manifest.json (a truncated or partially-synced file is "
+                    f"the usual cause), or re-onboard with `levain init --force --path {install}`. "
+                    "Base-adapter hooks are still compared; only the pack layer is dark.",
+                )
+            ]
+        for prov in provs:
             for rel, digest in prov.files.items():
                 if rel.startswith(_PREFIX) and rel.endswith(".py"):
                     pack_hooks[rel[len(_PREFIX):]] = digest
     except Exception:
-        # A missing or corrupt lock must not turn a content check into a hard failure —
-        # the LOCK check owns lock integrity. Falling back to base-only comparison is
-        # the pre-existing behaviour, i.e. no worse than before this fix.
+        # A genuinely ABSENT lock is the ordinary pack-less install: nothing to compare, and
+        # base-only comparison is correct rather than degraded. Only `corrupt` is the silent
+        # case, and it is now handled above rather than swallowed here.
         pack_hooks = {}
 
     stale: list[str] = []
