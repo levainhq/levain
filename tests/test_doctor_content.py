@@ -1220,6 +1220,11 @@ class TestUserEntryTargets:
         [{"hooks": [{"command": None}]}],
         [{"hooks": [{"command": 42}]}],
         [{"hooks": [{"command": 'unbalanced "quote'}]}],
+        # `~someuser` with no passwd entry: `expanduser` raises RuntimeError,
+        # which is neither OSError nor ValueError. Added when the token-expansion
+        # fix (Diogenes 2026-09-03) introduced a new route to the codex#7 abort.
+        [{"hooks": [{"command": "python3 ~nosuchuser99/activation/hooks/session_start.py"}]}],
+        [{"hooks": [{"command": "python3 $NO_SUCH_VAR_XYZ/activation/hooks/session_start.py"}]}],
         ["a string"],
         [{}],
     ])
@@ -1242,6 +1247,69 @@ class TestUserEntryTargets:
         p.write_text('{"hooks":{"SessionStart":[null]}}')
         [r] = _check_activation_scope(install)   # must not raise
         assert r.ok
+
+
+class TestUserEntryTargetsExpandsTheToken:
+    """Diogenes 2026-09-03: the detector only recognised a LITERAL ABSOLUTE
+    PATH, so the two natural ways to hand-write user-level wiring both read as
+    green.
+
+    `Path(tok)` does no variable expansion and no `expanduser`, so `~/...` and
+    `$HOME/...` resolved against the CWD, never equalled `expected`, and the
+    scan returned []. `_hook_command_targets` has the same blind spot, but a
+    miss THERE is a wiring FAIL — fail-loud. A miss here is the reassuring
+    green on the one configuration this function exists to fail.
+
+    The parametrisation is the point: the previous suite tested exactly one
+    spelling, which is how a detector shipped that recognised exactly one
+    spelling. `${CLAUDE_PROJECT_DIR}` is carried in the SAME list so the skip
+    that must stay ahead of the expansion cannot be dropped without a red.
+    """
+
+    @pytest.mark.parametrize("spelling,expected_hit", [
+        ("absolute", True),
+        ("tilde", True),
+        ("dollar_home", True),
+        ("placeholder", False),
+    ])
+    def test_every_spelling_of_this_install_is_recognised(
+        self, tmp_path, monkeypatch, spelling, expected_hit
+    ):
+        home = tmp_path / "home"; home.mkdir()
+        install = home / "lev"; (install / "activation" / "hooks").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+        target = install / "activation" / "hooks" / "session_start.py"
+        cmd = {
+            "absolute": f"/usr/bin/python3 {target}",
+            "tilde": "/usr/bin/python3 ~/lev/activation/hooks/session_start.py",
+            "dollar_home": "/usr/bin/python3 $HOME/lev/activation/hooks/session_start.py",
+            "placeholder": "/usr/bin/python3 ${CLAUDE_PROJECT_DIR}/activation/hooks/session_start.py",
+        }[spelling]
+
+        entries = [{"hooks": [{"type": "command", "command": cmd}]}]
+        assert _user_entry_targets(entries, install, "session_start.py") is expected_hit
+
+    def test_the_dark_configuration_FAILS_when_wired_with_a_tilde(self, tmp_path, monkeypatch):
+        """End to end, not just the helper: a tilde-wired install must reach a
+        doctor FAIL. This is the assertion that would have caught the defect —
+        the helper-level test above says WHY, this one says it MATTERS."""
+        home = tmp_path / "home"; home.mkdir()
+        install = home / "lev"
+        (install / "activation" / "hooks").mkdir(parents=True)
+        (install / ".levain").mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+        p = home / ".claude" / "settings.json"; p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"hooks": {"SessionStart": [{"hooks": [{
+            "type": "command",
+            "command": "/usr/bin/python3 ~/lev/activation/hooks/session_start.py",
+        }]}]}}))
+
+        [r] = _check_activation_scope(install)
+        assert not r.ok, f"tilde-wired dark install reported green: {r.detail}"
 
 
 class TestClaudeConfigDir:

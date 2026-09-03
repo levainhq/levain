@@ -103,8 +103,11 @@ def store_path() -> Path:
 # he actually works in. in_install_session() gates on cwd containment alone, so
 # the entire activation layer — posture, recency directives, spore surfacing,
 # crystal recall, the wrap nudge — went dark in every one of those sessions, while
-# `levain doctor` reported healthy. He was carrying a local patch that `levain
-# update` overwrote on each upgrade.
+# `levain doctor` reported healthy. He was carrying a local patch to this file,
+# which `levain init --force` replaced on each upgrade — that command rewrites the
+# whole activation/ tree and is step two of the documented upgrade procedure, so
+# following our own instructions is what ate it. (`levain update` does NOT write
+# activation/; its only file writes are pack reconciles under seed/.)
 #
 # The cwd gate is CORRECT as a default and is not being weakened: it is what stops
 # an unrelated session in a different codebase inheriting this partnership's

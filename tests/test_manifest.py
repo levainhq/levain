@@ -353,18 +353,30 @@ class TestReadmePinClaim:
     with correct code — so the fix is an assertion, not a corrected number."""
 
     def _repo_root(self):
+        """The source checkout — or a SKIP if this is not one.
+
+        ⛔ THE GUARD LIVES HERE, IN THE ONE PLACE BOTH TESTS GO THROUGH. It used
+        to be a copy inside `test_readme_pin_matches_pyproject` only, with a
+        four-line comment explaining why it must exist sitting eight lines above
+        the sibling that did not have it (Diogenes 2026-09-03, run-verified:
+        `levain/` alone on the path gave 1 skipped, 1 FileNotFoundError). Two
+        tests, one guard and one copy of the reason — which is the night's own
+        shape at its smallest, a fix landing where it was written and not at the
+        sibling its own description reaches.
+
+        The skip must still precede every read: placed after one, a non-source
+        checkout has already raised FileNotFoundError, so the guard can never
+        fire — worse than no guard, because it reads as handled.
+        """
         import levain
-        return Path(levain.__file__).resolve().parent.parent
+        root = Path(levain.__file__).resolve().parent.parent
+        if not (root / "pyproject.toml").is_file() or not (root / "README.md").is_file():
+            pytest.skip("not a source checkout")
+        return root
 
     def test_readme_pin_matches_pyproject(self):
         import re
-        root = self._repo_root()
-        # The skip must precede the reads. It used to sit after them, where a
-        # non-source checkout would already have raised FileNotFoundError —
-        # a guard that could never fire, which is worse than no guard because
-        # it reads as handled.
-        if not (root / "pyproject.toml").is_file():
-            pytest.skip("not a source checkout")
+        root = self._repo_root()   # skips if this is not a source checkout
         pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
         real = re.search(r'"anneal-memory(>=[^"]+)"', pyproject)
