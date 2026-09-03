@@ -181,14 +181,25 @@ def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypat
 
 def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
     # A store whose marker is ALREADY ahead of the ack target must NOT be lowered.
-    # This fixture is the "marker ahead of the installed runtime" shape (acked 0.9.7
-    # over installed 0.9.6 — e.g. a prior newer/manual ack, then run under an older
-    # anneal): ack_target = min(reconciled 0.9.6, installed 0.9.6) = 0.9.6, acked 0.9.7
-    # > 0.9.6 -> no ack. The cleaner "--force over an already-reviewed higher store"
-    # shape is the companion test below.
+    #
+    # ⛔ THIS FIXTURE USED TO BE BYTE-IDENTICAL TO ITS NEIGHBOUR, AND ITS COMMENT WAS WRONG ON
+    # EVERY NUMBER. It said "acked 0.9.7 over installed 0.9.6 … ack_target = min(reconciled 0.9.6,
+    # installed 0.9.6) = 0.9.6" while `_inst`'s installed anneal is DERIVED from
+    # `KNOWN_GOOD_ANNEAL` and the cap is `TEMPLATES_RECONCILED_ANNEAL` — so with a literal
+    # `migrate_acked="0.9.7"` the marker sat EXACTLY AT the target, not ahead of it, and this test
+    # exercised the EQUAL branch its companion below already covers. Constructing both fixtures
+    # showed them equal field-for-field. ⚠ It survived a second floor bump that way.
+    #
+    # STRICTLY AHEAD, derived: the marker is at KNOWN_GOOD (above the reconciled cap), so
+    # ack_target = min(cap, installed) = cap, and acked > cap is the shape under test.
     store = _store(tmp_path)
+    ahead_of_target = manifest.KNOWN_GOOD_ANNEAL
+    assert manifest._cmp(ahead_of_target, manifest.TEMPLATES_RECONCILED_ANNEAL) == 1, (
+        "this test is only non-vacuous while the known-good runtime is AHEAD of the reconciled "
+        "cap; if they converge, pick a genuinely higher marker rather than pinning a literal"
+    )
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(migrate_acked="0.9.7"))
+                        lambda *a, **k: _inst(migrate_acked=ahead_of_target))
     calls = []
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
@@ -216,14 +227,26 @@ def test_record_compat_lock_acks_prerelease_to_exact_runtime(tmp_path, monkeypat
     # the suffix) but must be acked to its EXACT string, never substituted with the
     # bare final cap label — a 0.9.6rc1 runtime acked as the final 0.9.6 would record
     # a compose that did not happen (codex L3; init now mirrors update._ack_target).
+    # ⛔ DERIVED FROM THE CAP, NEVER A LITERAL — this test used `0.9.6rc1`, which sits BELOW
+    # `TEMPLATES_RECONCILED_ANNEAL` and therefore took the BEHIND branch, where the installed
+    # string is returned trivially for ANY input under the cap. It passed for the wrong reason
+    # and would have kept passing with the exact-prerelease branch deleted. The branch this test
+    # NAMES needs `_cmp(installed, cap) == 0`, i.e. a prerelease OF THE CAP ITSELF.
+    # This file's own `_inst` already carries the rule ("⛔ DERIVED, NEVER A LITERAL … Same class
+    # as a cap encoded in a test"); the rc1 literals beside it were the exception.
     store = _store(tmp_path)
+    prerelease_of_cap = f"{manifest.TEMPLATES_RECONCILED_ANNEAL}rc1"
+    assert manifest._cmp(prerelease_of_cap, manifest.TEMPLATES_RECONCILED_ANNEAL) == 0, (
+        "this test is only non-vacuous on the EQUAL branch — if this fails, the version "
+        "comparison changed and the fixture must be re-derived, not re-pinned"
+    )
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *a, **k: _inst(anneal="0.9.6rc1", migrate_acked=None))
+                        lambda *a, **k: _inst(anneal=prerelease_of_cap, migrate_acked=None))
     calls = []
     monkeypatch.setattr(install, "_run_anneal_cmd",
                         lambda store, ap, args, **k: calls.append(args) or (True, "", []))
     install._record_compat_lock(tmp_path, store, "anneal-memory", emit=lambda _l: None)
-    assert ["migrate", "ack", "0.9.6rc1"] in calls
+    assert ["migrate", "ack", prerelease_of_cap] in calls
 
 
 def test_record_compat_lock_no_reack_at_target(tmp_path, monkeypatch):
