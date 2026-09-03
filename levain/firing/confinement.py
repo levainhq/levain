@@ -409,10 +409,17 @@ def build_policy(
         read the operator's own memory;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
-      - ``~/.ssh/id_*`` private keys (read-denied when ``ssh_mode="agent"``): the entity authenticates
-        via the agent socket but can't READ raw key material to exfil it. ``ssh_mode="raw"`` omits this
-        (the fallback — a live round-trip 2026-07-12 confirmed ``ssh_mode="agent"`` is tight AND
-        functional, so raw is genuinely only a fallback);
+      - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
+        r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
+        is the one home for this fact and carries its provenance (apparatus L2). This bullet used
+        to say ``~/.ssh/id_*``, describing the name-based design the module explicitly REPLACED —
+        and it contradicted the very next bullet, four lines below, which says the whole subtree is
+        already covered in agent mode. Both were in one docstring and only one was true. The
+        direction was SAFE (the emitter is STRICTER than the doc, denying the whole subtree), which
+        is why it survived fifteen nights of review; the cost is that a caller reading it believes
+        ``deploy_key`` and per-host keys stay readable under agent mode, understating the floor and
+        making the two modes look closer than they are — and raw mode is where the real vector
+        lives;
       - ``~/.ssh/authorized_keys`` (+ ``authorized_keys2``) WRITE — denied in BOTH ssh_modes: planting
         a key is a persistent SSH backdoor with zero legit entity use (in agent-mode the whole ~/.ssh
         subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
@@ -489,7 +496,8 @@ def build_policy(
     #       and the recreated file is an object nothing names. Denying both spellings closes that
     #       too, so the code below is unchanged and correct — only its stated reason moved.
     #       ⚠ DO NOT REASON FROM THE OLD MODEL. "seatbelt matches writes lexically" is FALSE and
-    #       was generalised into a design rule here; a guard built on it would be built backwards. The (2) dir-anchor pin does NOT cover this: it blocks renaming
+    #       was generalised into a design rule here; a guard built on it would be built backwards.
+    #       The (2) dir-anchor pin does NOT cover this: it blocks renaming
     #       ~/.ssh while deliberately still allowing "file creation/reads INSIDE it", which is exactly
     #       the write the attack uses. ⚠ THIS IS THE SAME lexical-vs-resolved ARGUMENT ALREADY MADE
     #       TWICE IN THIS FILE — for the ~/.ssh dir anchor below ("resolved jewel vs lexical anchor are
@@ -1386,8 +1394,10 @@ class SeatbeltProvider(ConfinementProvider):
     Renders a ``(version 1)(allow default)`` profile that DENIES the crown jewels — the polarity flip:
     the sandbox is a FLOOR, not a jail. Deny both read AND write on the subtrees (the entity can
     neither exfil nor corrupt flow's memory / a sibling's memory); deny the credential FILES; and for
-    ``ssh_mode="agent"`` deny READS of ``~/.ssh/id_*`` (raw key material) while leaving the agent
-    socket + ``known_hosts`` + ``config`` readable so agent-auth still works."""
+    ``ssh_mode="agent"`` deny read+write on ALL of ``~/.ssh`` (see the module docstring — location-
+    based, not ``id_*``) while re-allowing ``known_hosts`` (r+w) and ``config`` (r) so agent-auth
+    still works. ⚠ ``config`` is read-re-allowed and its WRITE stays denied in BOTH modes, which
+    the previous wording omitted."""
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         lines: list[str] = [
