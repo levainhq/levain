@@ -1866,3 +1866,71 @@ class TestContentLengthGuardMatchesWhatIntAccepts:
         for name in ("web_server.py", "init_server.py"):
             src = (root / name).read_text(encoding="utf-8")
             assert needle in src, f"{name} no longer carries the ASCII-digit guard"
+
+
+class TestOversizeWithALyingContentLength:
+    """The 413 must arrive even when Content-Length OVERSTATES the body.
+
+    ⛔ WHY NO EXISTING TEST COULD FAIL ON THIS. `test_oversize_413` builds an HONEST body and
+    urllib sends every declared byte, so the drain always completes and the 413 always arrives.
+    The defect only exists when Content-Length LIES — and no test in either server's suite
+    constructed one. A passing assertion that excludes the variable the bug lives in.
+
+    ⚡ RUN-VERIFIED BEFORE THE FIX (Diogenes 2026-08-19), one probe against both real servers:
+    `init_server` answered `413` after 30s; `web_server` answered NOTHING and closed. The bare
+    `self._drain(clen)` let `rfile.read()` hit the socket timeout, and `socket.timeout IS
+    TimeoutError`, which `_LevainHTTPServer.handle_error` deliberately swallows as a benign
+    keep-alive reset — so the failure was silent at every surface: no status, no traceback, no log.
+
+    This test uses a RAW SOCKET because urllib cannot lie about Content-Length, which is precisely
+    why the defect survived a suite that only ever spoke through urllib.
+    """
+
+    def _post_with_lying_length(self, base: str, declared: int, actually_send: bytes, timeout=15.0):
+        import socket as _socket
+        from urllib.parse import urlparse
+        u = urlparse(base)
+        s = _socket.create_connection((u.hostname, u.port), timeout=timeout)
+        try:
+            s.sendall(
+                f"POST /edit HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n".encode()
+                + actually_send
+            )
+            chunks = []
+            while True:
+                try:
+                    b = s.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+                if b"\r\n\r\n" in b"".join(chunks):
+                    break
+            return b"".join(chunks)
+        finally:
+            s.close()
+
+    def test_a_413_still_arrives_when_the_body_is_short(self, tmp_path: Path, monkeypatch) -> None:
+        from levain import web_server
+        from levain.web_server import _MAX_POST_BYTES, _DRAIN_CAP
+
+        declared = _MAX_POST_BYTES + 1024
+        assert declared <= _DRAIN_CAP, "this test must exercise the DRAINABLE oversize branch"
+
+        # Shorten the handler's own socket timeout so the stalled drain trips in ~1s instead of
+        # 30. This exercises the REAL timeout path — the drain still raises, `handle_error` still
+        # sees a TimeoutError — it just does so promptly. Patching the class attribute is what
+        # makes this a 1-second regression test rather than a 30-second one nobody keeps.
+        monkeypatch.setattr(web_server._Handler, "timeout", 1.0)
+
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            raw = self._post_with_lying_length(base, declared, b"zzzzzzzzzz", timeout=15.0)
+
+        assert raw, (
+            "the server answered NOTHING to an oversize request whose Content-Length overstated "
+            "the body — the drain stranded on the socket timeout and handle_error swallowed it"
+        )
+        assert b"413" in raw.split(b"\r\n", 1)[0], f"expected a 413 status line, got: {raw[:120]!r}"
