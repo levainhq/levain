@@ -34,6 +34,7 @@ from levain.firing.confinement import (
     _sbpl_regex,
     _sbpl_string,
     _sibling_entity_stores,
+    _write_deny_ancestors,
     build_policy,
     confinement_supported,
     crown_jewel_reason,
@@ -1342,3 +1343,53 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
         "levain.firing.drive.resolve_cred_floor(cfg.deny_standard_creds, mode=...): "
         + ", ".join(offenders)
     )
+
+
+def test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it(tmp_path):
+    """The `ssh_anchor` line in `build_policy` is a BELT, not the only strap — and this pins it.
+
+    ⛔ WHAT THIS REPLACES. A 2026-08-22 finding said the anchor was redundant; a 2026-08-23
+    rebuttal in the source rejected it, claiming the three spellings "deny lexical FILES inside
+    ~/.ssh and never the lexical DIRECTORY", so replacing the directory is "named by this anchor
+    and by nothing else." The rebuttal was FALSE, and `confinement.py` already contradicted it
+    thirty lines earlier ("the files are added to ``all_jewels`` below, so ~/.ssh (their ancestor
+    DIR) is write-denied"). Two comments, one file, opposite answers — and the wrong one was the
+    one that closed a finding. A wrong rebuttal outranks a wrong finding because it tells the next
+    reader the question is settled.
+
+    ⚡ WHY A TEST RATHER THAN A BETTER SENTENCE. The redundancy is a property of
+    `_write_deny_ancestors` NOT resolving. If a future edit teaches it to resolve, the anchor stops
+    being redundant and becomes load-bearing again — and that is exactly the day someone needs to
+    be told, rather than the day they read a comment written in 2026 and believe it.
+
+    The two spellings below are the ones `build_policy` actually appends, and the second is
+    `ssh_anchor` itself, so this holds whether or not HOME is a symlink.
+    """
+    # ⛔⛔ THE SYMLINK MUST BE REAL, ON DISK. The first cut of this test used two paths that were
+    # never created, and `Path.resolve()` on a NON-EXISTENT path is a no-op — so the mutation this
+    # test exists to catch (teaching `_write_deny_ancestors` to resolve) left it GREEN. A guard that
+    # passes without exercising the thing it is named for, inside the test written to close an
+    # instance of exactly that. Mutation-checked after the fix, not before.
+    real_home = tmp_path / "real"
+    (real_home / ".ssh").mkdir(parents=True)
+    home_lexical = tmp_path / "home"
+    home_lexical.symlink_to(real_home)          # HOME itself is a symlink — the rebuttal's own case
+    assert home_lexical.resolve() == real_home  # the premise of this test, asserted not assumed
+
+    for n in ("authorized_keys", "config"):
+        (real_home / ".ssh" / n).write_text("x")
+        # The two LEXICAL spellings `build_policy` actually appends (the third, fully-resolved one
+        # is not at issue): raw `Path.home()`, and `home.resolve()` + un-deref'd `.ssh` — the
+        # second of which IS `ssh_anchor`.
+        jewels = [home_lexical / ".ssh" / n, home_lexical.resolve() / ".ssh" / n]
+        ancestors = _write_deny_ancestors(jewels)
+
+        assert home_lexical / ".ssh" in ancestors, (
+            "the RAW Path.home() spelling's parent must already be write-denied"
+        )
+        assert real_home / ".ssh" in ancestors, (
+            "the resolved-HOME spelling's parent — which IS `ssh_anchor` — must already be "
+            "write-denied by the ancestor walk, so the anchor line adds nothing. If this FAILS, "
+            "`_write_deny_ancestors` has started resolving: the anchor is load-bearing again and "
+            "its justification must be restored rather than this test deleted."
+        )
