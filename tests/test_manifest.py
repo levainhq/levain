@@ -395,3 +395,79 @@ class TestReadmePinClaim:
         readme = (self._repo_root() / "README.md").read_text(encoding="utf-8")
         claimed = re.search(r"pinned `>=([0-9.]+)", readme)
         assert claimed and claimed.group(1) == manifest.KNOWN_GOOD_ANNEAL
+
+
+class TestReleaseStampIsNotAPublishedVersion:
+    """The tree past a release tag must not claim the released version.
+
+    ⛔ THE DEFECT THIS PINS, measured 2026-09-03. `v0.4.3` pointed at `ebec171`;
+    HEAD was `d84270d`, one commit later, and BOTH still read `0.4.3` — while
+    that commit had rewritten the `[wrap blocked]` message the shipped hook
+    actually emits. So "0.4.3" named two different trees: anyone building from
+    HEAD produced a wheel called `levain-0.4.3` whose activation layer said
+    something different from the `levain-0.4.3` on PyPI, and nothing in the tree
+    said so. That is the failure the CHANGELOG was created to end, reproduced
+    one commit after it was created, inside the release whose own subject is
+    descriptions that disagree with artifacts.
+
+    THE POLICY, asserted here rather than left on a release checklist — the
+    checklist is what missed it: **the release commit is the last one on that
+    number.** A commit that is not itself the release bumps both stamps to the
+    next `.devN`.
+
+    ⚠ WHY THE CHECK IS WRITTEN AGAINST TAGS AND NOT AGAINST PyPI: the guard has
+    to run offline in a fresh clone, and a network oracle that is unreachable
+    degrades to a PASS — which is the shape this whole class takes. Tags are in
+    the repo the test is already reading.
+
+    ⚠ AND IT SKIPS LOUDLY RATHER THAN PASSING QUIETLY. No git, or a clone with
+    no tags, means the check could not run — reporting that as green is
+    `absence_of_signal_rendered_as_health`, which is the defect one level up.
+    """
+
+    def _git(self, root, *args):
+        import subprocess
+        try:
+            r = subprocess.run(("git", "-C", str(root)) + args,
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def test_a_non_release_commit_does_not_claim_a_released_version(self):
+        from levain import __version__
+        root = TestReadmePinClaim()._repo_root()   # skips a non-source checkout
+
+        if self._git(root, "rev-parse", "--git-dir") is None:
+            pytest.skip("no git available / not a git checkout")
+        all_tags = self._git(root, "tag", "--list", "v*")
+        if not all_tags:
+            pytest.skip("clone carries no release tags — nothing to compare against")
+
+        released = {t[1:] for t in all_tags.split("\n") if t.startswith("v")}
+        at_head = {t[1:] for t in (self._git(root, "tag", "--points-at", "HEAD") or "").split("\n")
+                   if t.startswith("v")}
+
+        if __version__ in at_head:
+            return   # this IS the release commit — the one place the stamp may equal a tag
+
+        assert __version__ not in released, (
+            f"the working tree is stamped {__version__}, which is already the "
+            f"released tag v{__version__} pointing at a DIFFERENT commit. Anyone "
+            f"building from here produces an artifact named levain-{__version__} "
+            f"that is not the levain-{__version__} adopters installed. Bump both "
+            f"stamps (pyproject.toml, levain/__init__.py) to the next .dev0 and "
+            f"put the changes under '## [Unreleased]'. See CHANGELOG 'Versioning'."
+        )
+
+    def test_the_two_version_stamps_agree(self):
+        """One fact, two files. They drifted apart is the *other* way this breaks."""
+        import re
+        from levain import __version__
+        root = TestReadmePinClaim()._repo_root()
+        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+        assert m, "no version stamp in pyproject.toml"
+        assert m.group(1) == __version__, (
+            f"pyproject.toml says {m.group(1)}, levain/__init__.py says {__version__}"
+        )
