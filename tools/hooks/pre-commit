@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# ⛔ THE LANE GATE, AS A REFUSAL RATHER THAN A HABIT.
+#
+# Thin ON PURPOSE — all the logic lives in `tools/verify_lane.sh --staged`, which owns the only
+# parser for `LANES.tsv`. A second copy of the map logic here is the duplication class this repo
+# keeps finding; the hook's whole job is to be the thing git calls.
+#
+# Installed by `tools/install_hooks.sh` (sets `core.hooksPath=tools/hooks`, so this file is TRACKED
+# and survives a clone — unlike anything dropped in `.git/hooks/`, which does not).
+#
+# Bypass is `git commit --no-verify`, deliberately left available: the seat sometimes has to fix the
+# map itself, and a gate with no override gets uninstalled instead of used.
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/tools/verify_lane.sh" --staged

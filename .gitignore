@@ -19,3 +19,7 @@ venv/
 .coverage
 htmlcov/
 .worktrees/
+
+# The lane identity slot — per-clone, never shared (FLOW_DEV_PROTOCOL: it MUST be a file,
+# not an env var, because an agent every Bash call is a fresh shell).
+.levain-lane
