@@ -77,7 +77,7 @@ Hangul, Devanagari, Greek) renders with a `0xE0`–`0xEF` lead — `à` through 
 ordinary accented lowercase letters. Flagging on those would fire on a large share of French
 and Portuguese captures, so that damage currently passes through unflagged. Cyrillic (`0xD0`
 lead → `Ð`) and everything Latin-1 *is* covered. Pinned as an explicit test rather than left
-implicit: `test_KNOWN_BLIND_SPOT_cjk_mojibake_passes_through_unflagged`.
+implicit: `test_KNOWN_BLIND_SPOT_three_byte_script_mojibake_passes_through_unflagged`.
 
 Until then, the honest statement is: **levain detects and records this damage; it does not
 prevent it, it cannot recover what the upstream chain has already discarded, and its detection
