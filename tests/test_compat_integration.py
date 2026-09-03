@@ -319,12 +319,28 @@ def test_template_ack_target_caps_and_skips():
 # appear in the seed templates, proving that entry's guidance landed. Keyed by
 # `feature` (unique per entry) because two entries share version 0.4.7 — a
 # version-keyed map could not hold both.
+# ⛔ EACH SENTINEL NAMES ITS OWNING FILE, AND THAT IS THE POINT. This map used to be
+# feature -> sentinel, checked against a GLUED corpus of every seed file joined together — so a
+# sentinel present ANYWHERE satisfied it, including in a file where it means nothing, and a
+# sentinel that drifted to another file kept passing.
+#
+# ⚡ THAT HOLE IS NOT HYPOTHETICAL — IT IS HOW TODAY'S DEFECT SURVIVED. `memory.md` had its
+# graduation ladder uncapped on 2026-08-31 while `continuity.md` went on teaching "graduates to
+# 2x, then 3x" for three more days. The glued corpus contained both, the sentinel matched, and
+# this guard passed over a live contradiction between two seed files.
+#
+# ⚠ WHAT THIS STILL DOES NOT DO, stated so the next reader does not over-trust it: it is
+# POSITIVE-PRESENCE per file. It proves the guidance is where the map says it is; it CANNOT catch
+# a different file contradicting it. Contradiction-detection needs negative patterns per feature
+# and is a separate piece of work — `test_am_wrap_generated_inline_end_state_is_structurally_
+# guarded` is the one entry that has both halves today, and it is the shape to copy.
 _COVERAGE_SENTINELS = {
-    "AM-SPORES-BOUNDARY": "spore_add",                  # the prospective-layer tools
-    "AM-MIGRATE-NOTIFY": "levain update",               # the upgrade habit
-    "AM-CRYSTAL": "crystallization candidates",         # crystallize-OUT routing
-    "AM-MCP-CRYSTAL": "crystal_recall",                 # the MCP read surface
-    "AM-LINKGATE": "Co-citing 2+ episodes",             # co-citation, not single-id
+    # feature: (owning seed file, sentinel text)
+    "AM-SPORES-BOUNDARY": ("spore_instructions.md", "spore_add"),      # prospective-layer tools
+    "AM-MIGRATE-NOTIFY": ("memory.md", "levain update"),               # the upgrade habit
+    "AM-CRYSTAL": ("memory.md", "crystallization candidates"),         # crystallize-OUT routing
+    "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
+    "AM-LINKGATE": ("memory.md", "Co-citing 2+ episodes"),             # co-citation, not single-id
 }
 # EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
 # sentinel" is a reviewed decision rather than an omission.
@@ -353,10 +369,11 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # manifest entry reconciled-but-unmapped, fails HERE — instead of silently
     # making the init-ack dishonest.
     seed_dir = Path(install.__file__).parent / "templates" / "seed"
-    seed_text = "\n".join(
-        p.read_text(encoding="utf-8")
-        for p in sorted(seed_dir.rglob("*")) if p.is_file()
-    )
+    # NOT a glued corpus — see the note on `_COVERAGE_SENTINELS`. Each sentinel is checked in the
+    # file that OWNS the guidance, so it cannot be satisfied by an unrelated file that happens to
+    # contain the string.
+    seed_files = {p.name: p.read_text(encoding="utf-8")
+                  for p in sorted(seed_dir.rglob("*")) if p.is_file()}
     reconciled = manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL)
 
     checked = 0
@@ -366,18 +383,24 @@ def test_seed_templates_carry_the_reconciled_guidance():
         feature = entry["feature"]
         if feature in _NO_EDIT_REQUIRED:
             continue
-        sentinel = _COVERAGE_SENTINELS.get(feature)
-        assert sentinel is not None, (
+        mapping = _COVERAGE_SENTINELS.get(feature)
+        assert mapping is not None, (
             f"{feature} (v{entry['version']}) is reconciled (<= "
             f"{manifest.TEMPLATES_RECONCILED_ANNEAL}) but has no coverage sentinel "
             f"or no-edit allowlist entry — add its guidance + a sentinel here, or "
             f"allowlist it as no-edit-required."
         )
-        assert sentinel in seed_text, (
-            f"{feature} (v{entry['version']}) guidance missing from the seed "
-            f"templates — sentinel {sentinel!r} not found. The init-ack would "
-            f"silently suppress this proposal; restore the guidance or lower "
-            f"TEMPLATES_RECONCILED_ANNEAL."
+        owner, sentinel = mapping
+        assert owner in seed_files, (
+            f"{feature}'s sentinel is mapped to seed file {owner!r}, which does not exist. "
+            f"Seed files present: {sorted(seed_files)}"
+        )
+        assert sentinel in seed_files[owner], (
+            f"{feature} (v{entry['version']}) guidance missing from {owner} — sentinel "
+            f"{sentinel!r} not found THERE. ⚠ Check the other seed files before 'fixing' the "
+            f"map: if the guidance MOVED, move the mapping; if it was DELETED, restore it or "
+            f"lower TEMPLATES_RECONCILED_ANNEAL. The init-ack would otherwise silently suppress "
+            f"this proposal."
         )
         checked += 1
     # Non-vacuous: at the cap in `manifest.TEMPLATES_RECONCILED_ANNEAL` we exercise spores +
@@ -389,8 +412,13 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # catch, sitting in the suite.
     assert checked >= 5
 
-    # The linkgate example is co-citation, not a bare single-id (AM-LINKGATE detail).
-    assert "[evidence: <id1>, <id2>" in seed_text
+    # The linkgate example is co-citation, not a bare single-id (AM-LINKGATE detail) — checked
+    # in the file that OWNS it, for the same reason as every sentinel above.
+    linkgate_owner = _COVERAGE_SENTINELS["AM-LINKGATE"][0]
+    assert "[evidence: <id1>, <id2>" in seed_files[linkgate_owner], (
+        f"the co-citation example must live in {linkgate_owner} — a single-id example there "
+        "would teach the exact habit AM-LINKGATE exists to end"
+    )
 
 
 def test_am_wrap_generated_inline_end_state_is_structurally_guarded():
