@@ -327,11 +327,22 @@ if [[ "${1:-}" == "--staged" ]]; then
     fi
     # ⚠ SAY IT WHEN THE LANE IS UNKNOWN. A silent pass here reads as "all three checks green" when
     # only two ran, which is `absence_of_signal_rendered_as_health` on the guard's own report line.
+    # ⛔ THE SEAT-OVERRIDE COUNT RIDES BOTH SUMMARY LINES, AND IT USED TO RIDE ONLY THE FAIL ONE.
+    # Measured 2026-09-03: a seat commit over `levain-linux`'s file printed the per-file
+    # `⚡ SEAT OVERRIDE` block correctly and then closed with `ok — 0 owned · 0 shared-append` —
+    # a summary accounting for NONE of the files in the commit. The per-file block is the loud
+    # half; this line is the half a CI log, a `tail`, or a scrolling operator actually reads, and
+    # it under-reported in the direction that looks clean. `⚖ named loudly and never fatal` needs
+    # both halves: we had never-fatal without the naming that pays for it.
+    # ⚡ SIBLING-FIX CLASS, and the evidence is three lines up: the FAIL line at the top of this
+    # block already carries `$sseat seat-override`, added when someone hit this once and corrected
+    # exactly one of the two sites. A correction that landed where it was written and not at the
+    # twin its own reason reaches.
     if [[ -z "$LANE_ID" ]]; then
-        echo "verify_lane --staged: ok — $sok owned · $sshared shared-append"
+        echo "verify_lane --staged: ok — $sok owned · $sshared shared-append · $sseat seat-override"
         echo "   ⚠ LANE UNKNOWN — the spill check did NOT run (only 2 of 3). \`echo <lane> > .levain-lane\`"
     else
-        echo "verify_lane --staged: ok — lane=$LANE_ID · $sok owned · $sshared shared-append"
+        echo "verify_lane --staged: ok — lane=$LANE_ID · $sok owned · $sshared shared-append · $sseat seat-override"
         # ⚠ DISCLOSE A GUESSED IDENTITY. `.levain-lane` is ONE slot every lane in this worktree writes,
         # so a name read from it is the LAST WRITER's, not necessarily yours — and the dangerous
         # direction is the one that passes: paths owned by whoever the slot names sail through under
