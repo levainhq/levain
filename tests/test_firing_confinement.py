@@ -246,6 +246,19 @@ def test_sbpl_string_escapes_quotes_and_backslashes() -> None:
 
 
 def test_sbpl_regex_escapes_metacharacters() -> None:
+    """⚠ `_sbpl_regex` HAS ZERO PRODUCTION CALLERS, and this test is the only thing exercising it.
+
+    Measured: `grep -rn _sbpl_regex levain/` returns only the definition. Its sibling
+    `_sbpl_string` has NINE call sites in `render_profile`. So the pair is asymmetric — one is
+    load-bearing and one is reserved — and a green test beside the live ones reads as coverage of
+    the SBPL layer when it covers a function no profile has ever been rendered through.
+
+    ⛔ KEPT, NOT DELETED, AND KEPT HONEST INSTEAD. The escaper is correct for a form SBPL
+    supports, and throwing away vetted escaping in a security floor to tidy a coverage number is
+    the wrong direction of error. What was actually wrong is that nothing said it is unreached.
+    ▶ IF YOU ARE ABOUT TO USE IT: it has never been rendered into a real profile or run under
+    `sandbox-exec`, so treat it as unproven at the enforcement layer and add a live case with it.
+    """
     out = _sbpl_regex("/a.b+c")
     assert out == r"\/a\.b\+c"  # every metachar (/, ., +) escaped to match the literal prefix
 
@@ -842,8 +855,24 @@ def test_build_policy_denies_the_RAW_home_spelling_when_HOME_is_a_symlink(
 
     ⚠ NOT THEORETICAL ON macOS: codex observed ``/var/folders/... -> /private/var/folders/...``
     locally, i.e. ``Path.home() != Path.home().resolve()`` on an ordinary box.
-    ⛔ This NARROWS the symlinked-HOME vector; it does not close it. A *replaceable* HOME symlink is
-    still open and is recorded in build_policy's KNOWN-OPEN block."""
+    ⛔ IT DOES NOT NARROW ANYTHING, AND THIS DOCSTRING USED TO SAY IT DID (Diogenes levain-MEDIUM,
+    live-measured with controls on Darwin 25.5). The RAW spelling differs from the other two ONLY
+    when an ancestor component is a symlink, and seatbelt CANONICALISES ancestor components for
+    every operation — a profile whose only rule names the un-canonicalised spelling allows append,
+    `rm -f` and `mv` (all exit 0), while the control naming the canonical spelling denies all
+    three. On the in-process hand `crown_jewel_reason` resolves first, so a lexical entry can
+    never match. The entry is unreachable on BOTH hands.
+
+    ⚠ THIS TEST IS THEREFORE NOT EVIDENCE THAT A VECTOR IS CLOSED — it asserts tuple membership
+    in `policy.deny_write_files` and never renders a profile or runs the sandbox, so a
+    permanently-unreachable deny reads to it as a live mitigation. That is the same shape this
+    commit's predecessor was written to indict ("SET UP THIS EXACT SCENARIO AND LOOKED ONLY AT
+    deny_write_dirs"), reproduced one layer over in the fix for it.
+
+    ▶ IT IS KEPT, and so is the line it pins, as DEFENCE-IN-DEPTH against a canonicalisation
+    change — seatbelt is Apple-deprecated and this behaviour is undocumented. The *replaceable*
+    HOME symlink remains KNOWN-OPEN in build_policy's own block and is not addressed by this
+    entry."""
     real = tmp_path / "realhome"
     (real / ".ssh").mkdir(parents=True)
     link = tmp_path / "linkhome"
@@ -854,7 +883,10 @@ def test_build_policy_denies_the_RAW_home_spelling_when_HOME_is_a_symlink(
 
     denied = set(policy.deny_write_files)
     assert (link / ".ssh" / "authorized_keys") in denied, (
-        "the RAW Path.home() spelling — the one the entity writes — must be denied")
+        "the RAW Path.home() spelling must be PRESENT in the denylist as defence-in-depth. "
+        "⚠ Presence is all this asserts: the entry is unreachable on both enforcing hands "
+        "today (seatbelt canonicalises ancestors; crown_jewel_reason resolves first), so do "
+        "not read this as proof the symlinked-HOME vector is closed — it is not.")
     assert (real.resolve() / ".ssh" / "authorized_keys") in denied  # resolved target still denied
     assert link.resolve() != link, "test is inert unless HOME actually diverges from its target"
 
@@ -881,9 +913,25 @@ def test_build_policy_denies_the_RESOLVED_HOME_LEXICAL_spelling(
         LEXICAL  ssh_home_lexical / n      -> real/.ssh/authorized_keys   <- ONLY this one
         RESOLVED (ssh_home / n).resolve()  -> evil/authorized_keys
 
-    Both enforcing hands resolve the requested path before matching (``crown_jewel_reason``
-    resolves first — see KNOWN-OPEN (d)), so a write aimed at the lexical file lands on
-    ``real/.ssh/authorized_keys``: named by the LEXICAL entry and by neither of the others."""
+    ⛔ THE PARAGRAPH THAT STOOD HERE WAS WRONG ABOUT WHICH ENTRY CATCHES WHAT, AND THE ERROR WAS A
+    CONFLATION OF TWO OPERATION CLASSES (Diogenes levain-MEDIUM). It said "both enforcing hands
+    resolve the requested path before matching, so a write aimed at the lexical file lands on
+    ``real/.ssh/authorized_keys``: named by the LEXICAL entry and by neither of the others."
+    MEASURED: a write to any of these spellings resolves through BOTH symlinks — HOME and the
+    final component — and lands on ``evil/authorized_keys``, i.e. the RESOLVED entry. Not the
+    lexical one. For a DATA WRITE the lexical entry is not what matches.
+
+    ▶ THE LEXICAL ENTRY IS STILL LOAD-BEARING, FOR A DIFFERENT OPERATION. `unlink` and `rename`
+    do NOT follow the final component, so seatbelt matches them on the canonical-directory +
+    lexical-final-component spelling — which is exactly this entry, and exactly what stops the
+    live `rm ~/.ssh/authorized_keys; recreate` bypass (measured: with this entry removed, rm exit
+    0, create exit 0, and the attacker key is readable). So:
+
+        DATA WRITE to the vector      -> resolves to evil/  -> caught by the RESOLVED entry
+        UNLINK / RENAME of the vector -> not resolved       -> caught by the LEXICAL entry
+
+    Both are needed, for different verbs. Saying one of them catches everything is what made the
+    other look redundant."""
     real = tmp_path / "realhome"
     (real / ".ssh").mkdir(parents=True)
     evil = tmp_path / "evil"
