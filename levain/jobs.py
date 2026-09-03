@@ -80,7 +80,10 @@ JOB_LEASE_S = 600
 # the RESULT were pruned sooner, that replay would poll ``unknown`` (a dead handle the operator
 # can't re-run with the same key). Keeping the result as long as the handle keeps a replay
 # resolvable. Affordable because the result text is CAPPED (the bridge consult handler truncates),
-# so a day of terminal records is small. (A NON-terminal orphan still reaps at the short lease.)
+# so a day of terminal records is small. (A NON-terminal orphan is TRANSITIONED to
+# ``failed``/"interrupted" at the short lease and then ages out under THIS ttl — it is not dropped
+# at the lease, because that broke the very matching this paragraph describes: the handle outlived
+# the record and a replay polled ``unknown``.)
 RESULT_TTL_S = 24 * 3600
 # Concurrent jobs cap. consult spawns reviewer subprocesses (codex/claude — heavy), so the runtime
 # REJECTS (503, back-pressure) past this rather than queue an unbounded pile of expensive jobs. A
@@ -292,10 +295,17 @@ class JobStore:
         return age is None or age > self.lease_s
 
     def _prune(self, records: list[dict[str, Any]], now: str) -> list[dict[str, Any]]:
-        """Lazy GC on the write path. Drop a TERMINAL (done/failed) record whose result has aged
-        past ``result_ttl_s``, AND a NON-TERMINAL (pending/running) record whose LEASE has expired
-        (an orphan a crashed worker left behind, that no live thread will ever resolve). A record
-        with an unparseable timestamp is treated as expired (never lives forever)."""
+        """Lazy GC on the write path. TWO different reaps, and the difference is operator-visible:
+
+        - a TERMINAL (done/failed) record whose result has aged past ``result_ttl_s`` is DROPPED;
+        - a NON-TERMINAL (pending/running) record whose LEASE has expired — an orphan a crashed
+          worker left behind that no live thread will ever resolve — is **TRANSITIONED to
+          ``failed``/"interrupted"** with ``finished_at=now``, exactly as :meth:`sweep` does on
+          restart, and then ages out under ``result_ttl_s`` like any other finished job.
+
+        A record with an unparseable timestamp is treated as expired (never lives forever); a
+        malformed non-terminal record is dropped rather than transitioned, since it cannot be
+        parsed into one — poll fails closed on it either way."""
         kept: list[dict[str, Any]] = []
         for r in records:
             status = r.get("status")
@@ -305,7 +315,37 @@ class JobStore:
             ttl = self.result_ttl_s if status in ("done", "failed") else self.lease_s
             age = self._age_s(ts, now) if isinstance(ts, str) else None
             if age is None or age > ttl:
-                continue  # expired (or un-ageable) → drop
+                if status in _NON_TERMINAL:
+                    # ⛔ TRANSITION, DO NOT DROP — AND `sweep()` IS THE ARGUMENT.
+                    # `sweep()` performs the SAME conceptual operation on the SAME records
+                    # (reap a dead non-terminal orphan) and marks them failed/"interrupted"
+                    # with `finished_at=now`. This path used to DROP them. Two pieces of code
+                    # for one operation, producing opposite operator-visible outcomes.
+                    #
+                    # ⚡ THE COST WAS AT THE COMPOSITION, not here. `RESULT_TTL_S` is matched
+                    # to the 24h idempotency window DELIBERATELY (see the constant's comment)
+                    # so a replayed propose can still poll its handle. Non-terminal records
+                    # reaped at the 600s lease broke exactly that: a same-key retry at +2h
+                    # replayed the ORIGINAL handle reading `pending`, while polling that
+                    # job_id returned `unknown` — a cached handle saying pending over a store
+                    # saying it never existed, which is the dead-handle case the TTL matching
+                    # exists to prevent. And `unknown` is the one status this module's
+                    # read-polarity doctrine reserves for "the operator re-proposes", so the
+                    # failure mode was re-running an expensive job.
+                    #
+                    # Becoming terminal here means the record then ages under `result_ttl_s`
+                    # like any other finished job — no new unboundedness, since that is
+                    # exactly the lifetime a completed job already has.
+                    try:
+                        rec = JobRecord.from_dict(r)
+                    except (KeyError, TypeError, ValueError):
+                        continue  # malformed → drop, as before; poll fails closed on it
+                    kept.append(JobRecord(
+                        job_id=rec.job_id, verb=rec.verb, status="failed",
+                        created_at=rec.created_at, started_at=rec.started_at,
+                        finished_at=now, error=rec.error or "interrupted").to_dict())
+                    continue
+                continue  # expired TERMINAL result (or un-ageable) → drop
             kept.append(r)
         return kept
 

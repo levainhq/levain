@@ -202,18 +202,70 @@ class TestLeaseAndRecovery:
         assert JobStore(p).sweep(_T0) == 0
         assert p.read_text() == "garbage"
 
-    def test_prune_drops_expired_terminal_and_orphans(self, tmp_path: Path) -> None:
+    def test_prune_drops_expired_terminals_and_FAILS_orphans(self, tmp_path: Path) -> None:
+        """⛔ THIS TEST USED TO PIN THE DEFECT, and it is why fourteen nights of review missed it.
+
+        It asserted `old_pending` reads `unknown` after a prune — the code and this test agreed
+        with each other and BOTH disagreed with the prose at four sites (jobs.py:41, :438, :519
+        and the operator-facing web_server.py route docstring), each promising a lease-expired
+        job reads `failed` at poll. A green suite therefore actively CERTIFIED the half that
+        contradicted the documentation.
+
+        ⚡ `sweep()` settles which side was wrong: it performs the SAME operation on the SAME
+        records and marks them failed/"interrupted". One operation, two implementations,
+        opposite outcomes. `_prune` now matches `sweep`, so an orphan becomes terminal and then
+        ages out under `result_ttl_s` — which is what makes the deliberate TTL/idempotency
+        matching hold (see the composition test below).
+        """
         s = JobStore(tmp_path / "jobs.json", result_ttl_s=3600, lease_s=600)
         # an old done (past TTL) + an old pending orphan (past lease), written far in the past
         s.create("old_done", "consult", _T0)
         s.claim_running("old_done", _T0)
         s.finish("old_done", "done", {"x": 1}, None, _T0)
         s.create("old_pending", "consult", _T0)
-        # a fresh create at +2h prunes both (TTL 1h, lease 10min both exceeded)
+        # a fresh create at +2h reaps both (TTL 1h, lease 10min both exceeded)
         s.create("fresh", "consult", _later(7200))
-        assert s.read_status("old_done", _later(7200))["status"] == "unknown"     # pruned
-        assert s.read_status("old_pending", _later(7200))["status"] == "unknown"  # pruned
+        assert s.read_status("old_done", _later(7200))["status"] == "unknown"    # terminal → dropped
+        orphan = s.read_status("old_pending", _later(7200))
+        assert orphan["status"] == "failed", "a lease-expired orphan must READ failed, not vanish"
+        assert orphan["error"] == "interrupted"
         assert s.read_status("fresh", _later(7200))["status"] == "pending"
+
+    def test_a_reaped_orphan_still_ages_out_under_the_RESULT_ttl(self, tmp_path: Path) -> None:
+        """Transitioning must not make orphans immortal — they become ordinary terminal records."""
+        s = JobStore(tmp_path / "jobs.json", result_ttl_s=3600, lease_s=600)
+        s.create("orphan", "consult", _T0)
+        s.create("reaper", "consult", _later(1200))          # +20m: past lease → transitioned
+        assert s.read_status("orphan", _later(1200))["status"] == "failed"
+        s.create("reaper2", "consult", _later(9000))         # +2.5h: past result TTL → dropped
+        assert s.read_status("orphan", _later(9000))["status"] == "unknown"
+
+    def test_the_replayed_HANDLE_and_the_STORE_agree(self, tmp_path: Path) -> None:
+        """THE ACTUAL HARM, and the reason this outranked a prose fix.
+
+        `RESULT_TTL_S` is matched to the 24h idempotency window DELIBERATELY so a replayed
+        propose can still poll its handle. Non-terminal orphans reaped at the 600s lease broke
+        exactly that composition: a same-key retry replayed a handle reading `pending` while the
+        store answered `unknown` for that job_id — a cached handle over a record the store said
+        never existed, which is the dead-handle case the TTL matching exists to prevent. And
+        `unknown` is the one status this module reserves for "the operator re-proposes", so the
+        failure mode was silently re-running an expensive job.
+        """
+        s = JobStore(tmp_path / "jobs.json", result_ttl_s=86400, lease_s=600)
+        s.create("wedged", "consult", _T0)
+        s.claim_running("wedged", _T0)
+        s.create("someone_elses_propose", "consult", _later(1200))   # +20m: runs the prune
+
+        # The replayed handle would hand the operator back "wedged". The store must not
+        # contradict it within the window the two TTLs were matched to cover.
+        for at in (_later(1200), _later(7200), _later(80000)):
+            got = s.read_status("wedged", at)["status"]
+            assert got != "unknown", (
+                f"at {at} the store said 'unknown' for a job whose handle is still replayable "
+                "— the dead-handle case RESULT_TTL_S is matched to the idempotency window to "
+                "prevent"
+            )
+            assert got == "failed"
 
 
 # --- JobRuntime (the bounded executor) -------------------------------------------------
