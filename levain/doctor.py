@@ -1444,6 +1444,7 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # parametrised the ADAPTER axis and left the pack-path axis hardcoded, so the fourth
     # occurrence simply arrived on the unparametrised axis.
     pack_hooks: dict[str, str] = {}
+    prov_source_by_rel: dict[str, str] = {}
     _PREFIX = "activation/hooks/"
     try:
         from levain.manifest import read_pack_locks_status
@@ -1479,7 +1480,11 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
         for prov in provs:
             for rel, digest in prov.files.items():
                 if rel.startswith(_PREFIX) and rel.endswith(".py"):
-                    pack_hooks[rel[len(_PREFIX):]] = digest
+                    hook_rel = rel[len(_PREFIX):]
+                    pack_hooks[hook_rel] = digest
+                    # Which pack CONTRIBUTED this hook — needed to normalise against its source
+                    # rather than against a hash of the un-substituted template.
+                    prov_source_by_rel[hook_rel] = prov.source
     except Exception:
         # A genuinely ABSENT lock is the ordinary pack-less install: nothing to compare, and
         # base-only comparison is correct rather than degraded. Only `corrupt` is the silent
@@ -1509,10 +1514,37 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                     continue
                 recorded = pack_hooks.get(rel)
                 if recorded is not None:
-                    # Pack-owned: the authority is the pack's recorded hash, not base.
-                    # Reached for pack hooks base does not ship too — that is fix (b).
-                    if _sha256_file(installed) != recorded:
-                        stale.append(rel)
+                    # ⛔ A PACK HOOK'S INSTALLED COPY NEVER EQUALS ITS SOURCE HASH IF IT CARRIES A
+                    # PLACEHOLDER, so the raw comparison that stood here reported a healthy install
+                    # as permanently stale — and the `init --force` remedy this check prints could
+                    # not clear it, because re-rendering substitutes the placeholder again.
+                    # `_substitute_hook_placeholders` runs over the COMPOSED tree RECURSIVELY (its
+                    # own docstring says so, naming nested pack hooks), while `files` records the
+                    # PRE-substitution source hash. The base branch never had this problem because
+                    # it normalises BOTH sides through `_hook_body`; the pack branch skipped that.
+                    #
+                    # ▶ SO NORMALISE BOTH SIDES HERE TOO, against the pack SOURCE, which is the
+                    # same shape the base branch already proves out. `PackProvenance.rendered`
+                    # would also solve it and is arguably the tidier home — its docstring names
+                    # this exact class ("a render file's install copy never equals its template")
+                    # — but it is populated only for seed/ renders, so it would repair FUTURE
+                    # installs and leave every existing one red.
+                    src_hook = Path(prov_source_by_rel[rel]) / _PREFIX.rstrip("/") / rel \
+                        if rel in prov_source_by_rel else None
+                    if src_hook is None or not src_hook.is_file():
+                        # ⚠ SOURCE GONE: say nothing rather than guess. A pack whose source dir
+                        # has moved cannot be compared either way, and REPORTING STALE HERE WOULD
+                        # BE THE WRONG-TREE CLASS A FOURTH TIME — doctor going red for a whole
+                        # operator class over a condition that is not their install's fault. The
+                        # pack-drift surface owns "your pack source vanished"; this check does not.
+                        continue
+                    try:
+                        if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
+                            src_hook.read_text(encoding="utf-8")
+                        ):
+                            stale.append(rel)
+                    except (OSError, UnicodeError):
+                        continue  # unreadable source — same reasoning as above
                     continue
                 shipped = base_hooks[rel]
                 if _hook_body(installed.read_text(encoding="utf-8")) != _hook_body(
