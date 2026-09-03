@@ -220,16 +220,27 @@ $(if [[ ${#DECOYS[@]} -gt 0 ]]; then
      (The hook installs itself the first time you run \`verify_lane.sh\` in a clone. Nothing to do.)
 
 ── BEFORE YOU HAND ANYTHING TO PHILL ───────────────────────────────────────────
-  ⛔ A DEVICE INSTALL BUILDS WHATEVER IS IN THE SHARED TREE — including other lanes' uncommitted,
-     ungraded work, under the name of the commit at HEAD. Build from a clean worktree:
-       git worktree add -q --detach /tmp/wisp_clean <sha>
-       cd /tmp/wisp_clean && tools/install_device.sh
+  ⛔ AN INSTALL BUILDS WHATEVER IS IN THE SHARED TREE — including other lanes' uncommitted,
+     ungraded work, under the name of the commit at HEAD. Anything the operator GRADES is built
+     from a CLEAN WORKTREE at a named SHA:
+       git worktree add -q --detach /tmp/levain_clean <sha>
+       cd /tmp/levain_clean && git status --short     # must be EMPTY before you build
+     It disturbs no lane — no stash, no checkout in the shared tree.
+
+  ⛔⛔ AND FOR ANYTHING TOUCHING \`doctor\`, \`init\` OR THE ACTIVATION LAYER, A GREEN SUITE IS NOT
+     EVIDENCE. Doctor has gone RED FOR A WHOLE OPERATOR CLASS THREE TIMES (0.4.0 codex, 0.4.2's
+     first draft, 0.4.3) and the suite was green for all three. The ONLY thing that has ever
+     caught it is running \`levain doctor\` against a REAL INSTALL OF EACH ADAPTER, in an
+     ISOLATED \$HOME — \`levain init --adapter codex\` writes \`~/.codex/hooks.json\` and will
+     clobber the operator's real wiring if HOME leaks:
+       ( unset CLAUDE_CONFIG_DIR LEVAIN_SCOPE; HOME=/tmp/lev_probe PYTHONPATH=\$PWD \
+         python3 -m levain init --path /tmp/lev_probe/e --adapter claude-code --answers A.json )
+     Falsify against a CONTROL: run it with your change and without it, on the same install.
 
 ── READ THESE ──────────────────────────────────────────────────────────────────
-  1. project_memory/world_contract.md   the FROZEN interface between the modes
-  2. project_memory/lane_log.md         its header is the lane protocol
-  3. project_memory/device_queue.md     before adding a device question, or assuming you can
-                                        answer one yourself
+  1. project_memory/lane_log.md         its header is the lane protocol
+  2. ~/Briefcase/flow/projects/levain/next.md   the keystone tracker ("▶ YOU ARE HERE")
+  3. project_memory/diogenes_*.md       the carried findings for any file you touch
   Full protocol: ~/Briefcase/flow/FLOW_DEV_PROTOCOL.md → "## Parallel Lanes"
 
 ── YOUR SCOPE ──────────────────────────────────────────────────────────────────
