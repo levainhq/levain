@@ -8,6 +8,41 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.4.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Fixed — a container daemon socket defeated the whole confinement floor
+
+If a container runtime was installed, a confined entity could read any crown jewel with one
+command — `docker run --rm -v <jewel>:/x:ro alpine cat /x`. The daemon runs as root and was never
+inside our sandbox, so no path deny and no mount could hide anything from it: on such a machine
+every other rule in the floor was decorative. No privilege escalation and no exotic technique were
+involved; the entity simply asked a more privileged process to read the file on its behalf.
+
+The known container/VM daemon sockets — docker, podman, containerd, CRI-O — are now part of the
+universal floor, denied by default. Opt out with `"allow_container_sockets": true` in
+`.levain/confinement.json` if your entity genuinely needs to drive containers and you accept that
+doing so voids the rest of the floor on that machine.
+
+**The obvious fix does not work, which is why this took three rules rather than one.** A seatbelt
+`file-read* file-write*` deny does not block `connect()` to a unix socket — with the socket paths in
+the credential denylist the profile emits correct-looking rules and the exploit still returns the
+jewel. Blocking the connect needs a `network-outbound` rule, and that rule alone is then defeated by
+renaming the socket, and *that* is defeated by relocating its parent directory. All three are
+enforced, and each was measured failing on its own before it was kept.
+
+**The banner names which sockets are covered, and which are not.** The deny is an enumeration and an
+enumeration is always incomplete, so `levain run` says so rather than claiming containers are
+fenced: a custom `$DOCKER_HOST`, a TCP daemon endpoint, or any runtime whose socket is not in the
+list remains reachable. If that describes your setup, the floor does not cover it.
+
+⚠ **macOS only in this release.** The Linux confinement floor is not in 0.4.4, so there is nothing
+here for it to apply to yet; the same three arms land with Linux support.
+
+### Fixed — `levain doctor` carried a dead import, and the release did not pass lint
+
+`_sha256_file` had been imported by the hook-freshness check since the comparison it served was
+replaced by placeholder-aware normalisation, along with a comment explaining why it was imported
+rather than reimplemented. A dead import keeps its justifying comment looking live. Both are gone,
+and `ruff` passes again.
+
 ### Fixed — `doctor` reported green on two of the three ways to write user-level wiring
 
 The dark-install detector compared each hook command token as a **literal path**, with no variable expansion and no `~` handling. So `~/lev/activation/hooks/session_start.py` and `$HOME/lev/...` — the second of which Levain's own `settings.template.json` spells inside double quotes — resolved against the current directory, never matched the install, and the scan came back empty. `levain doctor` then reported the reassuring install-scoped PASS on the exact configuration the check exists to FAIL.
