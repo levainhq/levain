@@ -428,6 +428,26 @@ class CrownJewelsPolicy:
     # an ssh vector without calling `.resolve()` inside the predicate, where a resolution error
     # would escape the fail-closed guard. Enforcement remains `deny_sockets` (resolved, arm i)
     # plus `deny_write_files` (both spellings, arms ii/iii).
+    own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
+    # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
+    # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
+    # memory.continuity.md into the always-loaded system_message_suffix and per-turn recall reads
+    # memory.crystal.json — so a raw file-write by the entity's OWN confined hands would poison the
+    # highest-trust surface on a FUTURE session, BYPASSING the GOVERNED `levain wrap` (said
+    # "human-gated" until K4a [6] — a seat may now wrap unattended; the invariant is that ONLY the
+    # validated composer writes these, never that a human ran it). Only the
+    # HOST-process capture/wrap (anneal in-process, NOT the sandboxed shell) may compose them; write-
+    # denying the sandboxed hands makes "only wrap composes the always-loaded memory" a STRUCTURAL
+    # invariant, not a docstring (L2 domain review, 2026-07-17). Distinct from config_file (read+write
+    # denied — the entity may not even READ its jail definition); here read is intentionally allowed.
+    # ⛔ APPENDED LAST, AND THE POSITION IS LOAD-BEARING (codex L3 #4, 2026-09-04). This field was
+    # first inserted between `socket_spellings` and `own_memory_files`, which silently shifted every
+    # later field's POSITIONAL index in an exported, non-kw-only dataclass. Code built against the
+    # previous signature that passed `own_memory_files` positionally would have landed the entity's
+    # own memory paths in `socket_sources` — so the memory files would be treated as socket sources
+    # (resolved and network-denied) while losing their write-deny, which is the poison-the-
+    # always-loaded-memory vector `own_memory_files` exists to close. A new field on a public
+    # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
     socket_sources: tuple[Path, ...] = ()  # the LEXICAL (expanduser'd, UN-resolved) socket paths
     # that DEFINE the socket floor — the authority `deny_sockets` is derived FROM, kept so the
     # derivation can be RE-RUN. Empty when `allow_container_sockets=True` (opt-out) — which is why
@@ -450,18 +470,6 @@ class CrownJewelsPolicy:
     # The refresh is for a listed name pointing at a target the enumeration does NOT hold.
     # `refresh_socket_denies` re-runs the derivation from THIS field at spawn. See it for what the
     # refresh does and does not buy — the residual window is stated there, not papered over.
-    own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
-    # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
-    # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
-    # memory.continuity.md into the always-loaded system_message_suffix and per-turn recall reads
-    # memory.crystal.json — so a raw file-write by the entity's OWN confined hands would poison the
-    # highest-trust surface on a FUTURE session, BYPASSING the GOVERNED `levain wrap` (said
-    # "human-gated" until K4a [6] — a seat may now wrap unattended; the invariant is that ONLY the
-    # validated composer writes these, never that a human ran it). Only the
-    # HOST-process capture/wrap (anneal in-process, NOT the sandboxed shell) may compose them; write-
-    # denying the sandboxed hands makes "only wrap composes the always-loaded memory" a STRUCTURAL
-    # invariant, not a docstring (L2 domain review, 2026-07-17). Distinct from config_file (read+write
-    # denied — the entity may not even READ its jail definition); here read is intentionally allowed.
     # NOTE: network is default-ALLOWED (a CC replacement hits the network); there is deliberately NO
     # `allow_network` knob — an unwired boolean would be false security (the exact claim>enforcement
     # gap this module refuses). Network POLICY is a slice-3 / threshold-membrane concern.
@@ -759,44 +767,18 @@ def build_policy(
     # host-side connect succeeding against the same socket while the entity's was refused.
     socket_sources_l: list[Path] = []
     if not allow_container_sockets:
-        for s in _CONTAINER_DAEMON_SOCKETS:
-            lex = Path(s).expanduser()
-            socket_sources_l.append(lex)
-            # (ii): BOTH spellings — but the reason differs per path, and the first version of
-            # this comment said only "for the lexically-matched link ops", which is FALSE for
-            # the /var- and /run-sited entries (glm-5.3 L3, 2026-09-04, CONFIRMED by measurement
-            # here rather than adopted). MEASURED on Darwin with /tmp -> /private/tmp: a
-            # write-deny naming ONLY the lexical path lets `rm` through at exit 0, while the
-            # resolved-only deny refuses it — seatbelt canonicalises ANCESTOR components for
-            # every operation, which this module's ssh block (b) already measured and states.
-            # So for /var/run/docker.sock, /run/*, /var/run/containerd/*, /var/run/crio/* the
-            # LEXICAL entry fires for NOTHING on macOS; the resolved entry carries all of the
-            # enforcement. Only the $HOME-sited spellings (~/.docker, ~/.colima, ~/.local/...)
-            # have both live, because an ordinary $HOME chain has no symlinked ancestor.
-            # ▶ THE LEXICAL ENTRIES ARE KEPT AS CROSS-PROVIDER DEFENCE-IN-DEPTH — a bwrap
-            # provider matches mount paths lexically — not because they do work here today.
-            # ⚠ Written out because this field's own comment warns that a maintainer may
-            # "believe it is the entry doing the work", and I had just given them a reason to.
-            deny_write_files_l.append(lex)
-            deny_write_files_l.append(lex.resolve())
-    # ⛔ THE RESOLUTION GOES THROUGH ``_resolve_socket_targets``, NOT AN INLINE ``.resolve()``, so
-    # that build time and SPAWN time (``refresh_socket_denies``) run the SAME derivation — spore-768.
-    # An inline resolve here would be a second implementation of a security derivation, which is the
-    # shape that produced the drift this fix exists to close.
+        socket_sources_l = [Path(s).expanduser() for s in _CONTAINER_DAEMON_SOCKETS]
     socket_sources_t = _dedup(socket_sources_l)
-    deny_sockets_t = _resolve_socket_targets(socket_sources_t)
-    # BOTH spellings of every socket, for MESSAGE classification in `crown_jewel_reason`.
-    # ⛔ PRECOMPUTED HERE SO THE PREDICATE DOES NO FILESYSTEM I/O (codex L3, 2026-09-04).
-    # It previously called `wf.resolve()` inside the classification loop — OUTSIDE the
-    # fail-closed `try` that guards the input path — so a concurrent symlink swap, a loop,
-    # or any resolution error escaped as RuntimeError/OSError and crashed the security
-    # predicate instead of returning a refusal. The SAME class as the `expanduser` gap fixed
-    # in this release, reintroduced by my own fix for it, one line away.
-    # ⚡ And the resolution was never needed: both spellings are already known HERE, at
-    # construction. Removing the I/O is strictly better than wrapping it in a handler.
-    socket_spellings_t = _dedup([q for s in _CONTAINER_DAEMON_SOCKETS
-                                 for q in (Path(s).expanduser(), Path(s).expanduser().resolve())]
-                                ) if not allow_container_sockets else ()
+    # ⛔ ONE RESOLUTION FEEDS ALL THREE ARMS (codex L3 #5 + glm, 2026-09-04). This block used to
+    # resolve the sources THREE times — once for the connect deny, once inline for the write deny,
+    # once inside the `socket_spellings` comprehension — so a concurrent retarget could give the
+    # three arms three different snapshots, and the "one place this derivation lives" claim in
+    # `_socket_arms` was false while it was written. `_socket_arms` is now that one place, and
+    # `refresh_socket_denies` re-runs THE SAME function at spawn so build and spawn cannot drift.
+    _arms = _socket_arms(socket_sources_t)
+    deny_sockets_t = _arms.targets
+    deny_write_files_l.extend(_arms.write_spellings)
+    socket_spellings_t = _arms.spellings
 
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
@@ -911,90 +893,134 @@ def build_policy(
     )
 
 
-def _resolve_socket_targets(sources: tuple[Path, ...]) -> tuple[Path, ...]:
-    """Resolve every lexical socket path in ``sources`` to the target seatbelt will canonicalise a
-    ``connect()`` to. FAIL-CLOSED: any resolution error raises :class:`ConfinementError`.
+@dataclass(frozen=True)
+class _SocketArms:
+    """The THREE arms of the socket floor, all derived from ONE resolution pass.
 
-    ⛔ THE ONE PLACE THIS DERIVATION LIVES, and that is the point. It runs TWICE per shell — once in
-    :func:`build_policy` and once in :func:`refresh_socket_denies` at spawn — and two copies of a
-    security derivation drifting apart is a class this repo has already paid for. One function, two
-    call sites.
+    ⛔ ONE RESOLUTION, NOT THREE — codex L3 #5 + glm, 2026-09-04, and it is a correctness fix and
+    not tidiness. The first version of this fix resolved the sources in three separate places
+    (``_resolve_socket_targets`` for the connect arm, an inline ``lex.resolve()`` for the write arm,
+    a third inside the ``socket_spellings`` comprehension), so under a CONCURRENT retarget the three
+    arms could derive from three different snapshots — a connect-deny naming one target while the
+    write-deny that protects it names another. It also made the docstring claim "the one place this
+    derivation lives" FALSE while it was written."""
 
-    Resolution errors (a symlink loop, an unreadable ancestor) previously escaped ``build_policy``
-    as a raw ``OSError``/``RuntimeError``. At SPAWN that is the wrong shape: the caller is
-    ``spawn_shell``, whose entire contract is to refuse rather than hand back an unfenced shell, so
-    the failure is converted HERE — at the derivation — rather than at each call site, where the
-    next call site added would be the one that forgets."""
-    out: list[Path] = []
+    targets: tuple[Path, ...]        # arm (i): resolved, for the network-outbound connect deny
+    write_spellings: tuple[Path, ...]  # arms (ii)/(iii): BOTH spellings, for the write deny
+    spellings: tuple[Path, ...]      # message classification in `crown_jewel_reason`
+
+
+def _socket_arms(sources: tuple[Path, ...]) -> _SocketArms:
+    """Derive all three socket arms from ``sources`` in a SINGLE resolution pass.
+
+    FAIL-CLOSED: any resolution error raises :class:`ConfinementError` rather than escaping as a raw
+    ``OSError``/``RuntimeError``. The caller is ultimately ``spawn_shell``, whose contract is to
+    refuse rather than hand back a shell whose socket denies may name the wrong target, so the
+    conversion happens HERE — at the derivation — instead of at each call site, where the next call
+    site added is the one that forgets.
+
+    ⚠ The lexical spelling is kept ALONGSIDE the resolved one because the arms match differently:
+    the connect arm is resolved-only (seatbelt canonicalises for ``network-outbound``), while the
+    link operations arms (ii)/(iii) are matched LEXICALLY. That asymmetry is measured and is
+    documented at the ``deny_sockets`` / ``deny_write_files`` fields."""
+    targets: list[Path] = []
+    write_spellings: list[Path] = []
+    spellings: list[Path] = []
     for lex in sources:
         try:
-            out.append(lex.resolve())
+            resolved = lex.resolve()
         except (OSError, RuntimeError, ValueError) as exc:
             raise ConfinementError(
                 f"could not resolve the container-socket path {lex} ({exc}) — refusing to build "
                 "the confinement floor rather than emit a socket deny that may name the wrong "
                 "target (fail-closed)."
             ) from exc
-    return tuple(out)
+        targets.append(resolved)
+        write_spellings.append(lex)
+        write_spellings.append(resolved)
+        spellings.append(lex)
+        spellings.append(resolved)
+    return _SocketArms(
+        targets=_dedup_paths(targets),
+        write_spellings=_dedup_paths(write_spellings),
+        spellings=_dedup_paths(spellings),
+    )
 
 
 def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
-    """Re-derive the socket CONNECT arm from ``policy.socket_sources`` as the filesystem is NOW, and
-    return a policy whose ``deny_sockets`` is the build-time set UNION the freshly-resolved set.
+    """Re-derive ALL THREE socket arms from ``policy.socket_sources`` as the filesystem is NOW, and
+    return a policy whose socket denies are the build-time sets UNION the freshly-derived ones.
 
-    Called by :meth:`ConfinementProvider.spawn_shell` immediately before the profile is rendered.
-    ``spore-768`` / codex L3 HIGH 2026-09-04.
+    Called by :meth:`ConfinementProvider.spawn_shell` immediately before the profile is rendered, and
+    by the tool executor before each (re)spawn so the union PERSISTS. ``spore-768`` / codex L3 HIGH
+    2026-09-04, corrected by a second codex L3 the same day.
 
-    ⛔ **UNION, NEVER REPLACE — this is the fail-closed property and it is the whole design.** A
-    refresh that REPLACED the set would let a symlink swap DELETE a deny that was correct at build
-    time: point a listed socket at a decoy immediately before spawn and the real target drops off
-    the list. Union makes the deny list monotonic — a re-resolution can only ever ADD an entry —
-    so the refresh cannot be turned into the attack it exists to stop. It also means the refresh is
-    safe to run unconditionally, with no "did it change?" branch to get wrong.
+    ⛔ **ALL THREE ARMS, AND THE FIRST VERSION OF THIS FUNCTION REFRESHED ONLY THE CONNECT ARM.**
+    That was wrong, and it was wrong in the way this module has already measured twice: a
+    ``network-outbound`` deny ALONE is defeated by ``mv``. Confirmed by execution before this
+    correction — after a refresh that touched only ``deny_sockets``, the freshly-resolved target was
+    in the connect deny, absent from ``deny_write_files``, its parent absent from
+    ``deny_write_dirs``, and ``crown_jewel_reason`` returned ``None`` for it, so BOTH hands would let
+    the entity rename it and connect to the new name. The comment justifying the omission reasoned
+    about the arms on the LISTED path and never about the arms on the NEW TARGET.
+    ⚡ The class is this repo's own dominant one: the arm that is visible in a deny list was
+    implemented, the two that make it hold were not, and prose was written to explain the gap.
 
-    ▶ **ONLY ARM (i) IS REFRESHED, AND THE OTHER TWO DO NOT NEED IT.** Arms (ii)/(iii) — the socket
-    write-deny and the ancestor write-deny — are stored at BOTH spellings, and the LEXICAL spelling
-    is what they match on; a symlink appearing at a listed path does not change that path's own
-    name, so those arms already fire against exactly the condition this refresh is about. That is
-    measured, not assumed: it is why creating the symlink at a listed path is refused to the entity
-    ("Operation not permitted") in the reproduction. Refreshing them would recompute
-    ``deny_write_dirs`` for no enforcement gain.
-
-    ▶ **NO TWO-HANDS DIVERGENCE.** The in-process file-editor twin holds the BUILD-time policy, and
-    the connect arm is the one field on this policy with **no in-process twin** (stated at
-    :func:`crown_jewel_reason`, which enforces the rename/unlink arm only — it has no ``connect()``
-    primitive). So a spawn-time-only refresh of ``deny_sockets`` cannot make the two enforcers
-    disagree about anything either of them enforces. ``socket_spellings`` is deliberately left
-    alone for the same reason — it is message classification, keyed on a lexical spelling that the
-    refresh does not change.
+    ⛔ **UNION, NEVER REPLACE — the fail-closed property.** A refresh that REPLACED a set would hand
+    an attacker a DELETION primitive: point a listed socket at a decoy immediately before spawn and
+    the real target drops off the deny list. Union makes every socket set monotonic, so a
+    re-resolution can only ever ADD — which is also why this needs no "did it change?" branch to get
+    wrong, and why it is safe to run unconditionally on every spawn.
+    ⚠ **AND MONOTONICITY IS ONLY REAL IF THE RESULT IS KEPT** (codex L3 #2). The first version
+    returned a refreshed policy that the caller rendered and discarded, so the next respawn started
+    from the build-time set again and a target denied at spawn 1 was reachable after spawn 2 —
+    "can only ADD" was true within one spawn and false across the respawns the comment explicitly
+    relied on. :class:`SandboxedBashExecutor` now assigns the result back to its cached policy.
 
     ⚠ **WHAT THIS DOES NOT BUY: THE WINDOW IS NARROWED TO SPAWN→CONNECT, NOT CLOSED.** A seatbelt
-    profile is fixed when the process starts and cannot be updated on a live shell, so a symlink
-    created at a listed socket path AFTER the shell spawns is still uncovered. That residual is
-    IRREDUCIBLE with seatbelt, not merely unfixed: seatbelt canonicalises the path for
-    ``network-outbound``, so a deny can only ever name a TARGET, never a NAME — there is no
-    expressible rule for "whatever this path points at, at connect time". A ``(subpath ...)`` belt
-    does not help for the same reason (the canonical target is outside the subpath), and the
-    module's existing measurement already rules out a regex belt. **A spawn-time snapshot is the
-    strongest statement this profile language can make**, which is why the honesty surfaces say
-    snapshot rather than covered.
-    ⚡ The residual is acceptable for the reason the reproduction measured rather than assumed: the
-    ENTITY cannot create that symlink (arm (ii) write-denies every listed socket at both
-    spellings), so an EXTERNAL actor must do it mid-session, and an unlisted socket it could point
-    at was already reachable under its own name — the banner declares that gap. Marginal exposure
-    was zero even before this fix; what was false was the CLAIM that a listed socket is covered.
+    profile is fixed when the process starts, so a symlink created at a listed socket path AFTER the
+    shell spawns is still uncovered. That residual is IRREDUCIBLE with seatbelt rather than merely
+    unfixed: seatbelt canonicalises the path for ``network-outbound``, so a deny can only ever name a
+    TARGET, never a NAME — there is no expressible rule for "whatever this path points at, at connect
+    time". A ``(subpath ...)`` belt fails for the same reason, and this module already measured a
+    regex belt dead. **A spawn-time snapshot is the strongest statement this profile language can
+    make**, which is why the honesty surfaces say snapshot and not covered.
+    ⚡ The residual is tolerable for a measured reason, not an argued one: the ENTITY cannot create
+    that symlink (arm (ii) write-denies every listed socket at both spellings), so an EXTERNAL actor
+    must do it mid-session, and an unlisted socket it could point at was already reachable under its
+    own name — which the banner declares. Marginal exposure was zero even before this fix; what was
+    false was the CLAIM that a listed socket is covered.
 
-    ▶ SIDE EFFECT WORTH NAMING: when a listed name does point somewhere unenumerated, the union
-    denies that target too — so the refresh closes the unlisted socket a listed name reaches. It
-    does NOT close unlisted sockets generally; that is ``spore-754`` (operator-declared
-    ``deny_sockets``) and is deliberately a separate change."""
+    ▶ SIDE EFFECT WORTH NAMING: when a listed name does point somewhere unenumerated, the union gives
+    that target the full three-arm treatment — so the refresh closes the unlisted socket a listed
+    name reaches. It does NOT close unlisted sockets generally; that is ``spore-754`` (an
+    operator-declared socket list) and is deliberately a separate change."""
     if not policy.socket_sources:
         return policy  # opt-out (`allow_container_sockets=True`) or nothing enumerated
-    fresh = _resolve_socket_targets(policy.socket_sources)
-    merged = _dedup_paths(list(policy.deny_sockets) + list(fresh))
-    if merged == policy.deny_sockets:
+
+    arms = _socket_arms(policy.socket_sources)
+    deny_sockets = _dedup_paths(list(policy.deny_sockets) + list(arms.targets))
+    write_files = _dedup_paths(list(policy.deny_write_files) + list(arms.write_spellings))
+    spellings = _dedup_paths(list(policy.socket_spellings) + list(arms.spellings))
+    # Arm (iii): the fresh target's ANCESTORS, or renaming its parent dir relocates it out from
+    # under the literal deny — measured on the built-in sockets, and it applies identically to a
+    # target the refresh just learned about.
+    write_dirs = _dedup_paths(
+        list(policy.deny_write_dirs) + list(_write_deny_ancestors(list(arms.write_spellings)))
+    )
+
+    if (deny_sockets == policy.deny_sockets
+            and write_files == policy.deny_write_files
+            and spellings == policy.socket_spellings
+            and write_dirs == policy.deny_write_dirs):
         return policy
-    return replace(policy, deny_sockets=merged)
+    return replace(
+        policy,
+        deny_sockets=deny_sockets,
+        deny_write_files=write_files,
+        socket_spellings=spellings,
+        deny_write_dirs=write_dirs,
+    )
 
 
 def _dedup_paths(items: list[Path]) -> tuple[Path, ...]:
@@ -1707,6 +1733,30 @@ class ConfinementProvider(ABC):
     fully testable without touching the system; ``spawn_shell`` shells out to the platform sandbox
     driver. The macOS provider ships first; ``bwrap`` (Linux) + a container backend are PURE ADDITIONS
     against this contract, and the macOS crown-jewels denylist is their requirements spec."""
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """⛔ REFUSE A SUBCLASS THAT OVERRIDES :meth:`spawn_shell` — the refresh seam is not
+        advisory (codex L3 #3, 2026-09-04, and self-caught the same hour).
+
+        Making ``spawn_shell`` concrete and ``_spawn_shell_impl`` abstract stops a provider
+        FORGETTING the socket refresh; it does NOT stop one from defining ``spawn_shell`` itself,
+        which overrides the wrapper and skips the refresh silently. Until this guard existed, the
+        docstring said the refresh was "impossible for a provider to skip" while the mechanism
+        merely made it inconvenient — a ``claim > enforcement`` gap, in the one module whose own
+        comments name that as the thing it refuses. ``typing.final`` is a type-checker hint and
+        would not have fired at runtime.
+
+        This fails at CLASS-DEFINITION time, which is the right moment: an external provider (levain
+        is a library, so that is a real case rather than a hypothesis about our own two) learns the
+        seam the first time it is imported, not after shipping a shell with an unrefreshed floor."""
+        super().__init_subclass__(**kwargs)
+        if "spawn_shell" in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__} overrides ConfinementProvider.spawn_shell, which would skip the "
+                "spawn-time socket re-resolution (spore-768) and silently render a stale socket "
+                "floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the policy "
+                "and delegates to it."
+            )
 
     @abstractmethod
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
