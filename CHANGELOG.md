@@ -8,6 +8,22 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.4.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Fixed — a `~user` path could throw its way past the crown-jewels check
+
+`crown_jewel_reason` — the in-process guard that decides whether the file-editor hand may touch a
+path — caught `ValueError` and `OSError` from resolving that path, but not `RuntimeError`. Python
+raises exactly `RuntimeError` from `expanduser()` for a `~someuser` spelling with no passwd entry.
+The path comes from the entity, so a model emitting `~unknownuser/...` reached a function documented
+as fail-closed and got **neither a refusal nor an allow** — it got an exception out of the security
+predicate.
+
+The same gap sat in `declared_resources`, whose docstring says *"Never raises."* and whose own
+comment explains why that matters: a raise there surfaces a raw error event and **skips the
+executor**, so the floored refusal never fires at all.
+
+Both now catch it and refuse the path. This is the same defect the `doctor` fix in this release was
+written for; it reached `doctor` and not the security twin beside it.
+
 ### Fixed — a container daemon socket defeated the whole confinement floor
 
 If a container runtime was installed, a confined entity could read any crown jewel with one
