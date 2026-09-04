@@ -906,7 +906,15 @@ def test_systemd_install_rolls_back_to_the_prior_unit_on_failure(systemd, tmp_pa
 _HAS_SYSTEMD_ANALYZE = shutil.which("systemd-analyze") is not None
 _systemd_live = pytest.mark.skipif(
     not (platform.system() == "Linux" and _HAS_SYSTEMD_ANALYZE),
-    reason="needs a Linux host with systemd-analyze",
+    # ⛔ THE REMEDY IS NAMED IN THE SKIP REASON ON PURPOSE — this is the only line the person who
+    # needs it is guaranteed to read. On 2026-09-04 the overnight reviewer skipped these two tests
+    # and reported "I HAVE NO LINUX HOST", which was TRUE and became a false constraint: an image
+    # that runs them had been on the build machine for a day. Nobody goes looking for a container
+    # they do not know exists. `tests/linux/Dockerfile` is committed for exactly this moment.
+    reason=("needs a Linux host with systemd-analyze — you can get one: "
+            "docker build -t levain-linux-systemd -f tests/linux/Dockerfile tests/linux && "
+            "docker run --rm -v \"$PWD\":/src:ro levain-linux-systemd "
+            "sh -c 'cp -r /src /tmp/w && cd /tmp/w && python3 -m pytest tests/test_daemon.py -k systemd -q'"),
 )
 
 
