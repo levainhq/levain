@@ -60,9 +60,17 @@ set carries forward into the next shell, so the denylist can only ever grow acro
 Coverage is now a spawn-time snapshot instead of a build-time one, and `levain run` says so in those
 words.
 
-The first version of this fix updated only the connect rule, which the three rules above already
-explain is not enough on its own — a review caught it before release, and the tests now pin all
-three.
+Two related consistency fixes came out of the same reviews. The re-resolution happens **once** per
+shell start and the shell reports back the exact rule set it was started with, so nothing a shell
+enforced can be lost when the next one starts. And both of the entity's hands — the shell and the
+file editor — now read **one** floor object rather than each holding its own copy, so a rule added
+for one is enforced by the other.
+
+Three rounds of review went into this; each round found something in the previous round's fix. The
+first version updated only the connect rule, which the three rules above already explain is not
+enough on its own; the second re-resolved twice and kept the earlier answer; and the guard meant to
+stop a sandbox backend from skipping the re-resolution could be sidestepped by inheriting the method
+instead of defining it. All three were caught before release, and the tests now pin each one.
 
 **What this was, honestly: a wrong claim rather than a new hole.** A confined entity cannot create
 that symlink — the socket is write-denied at both spellings, which is one of the three rules above —

@@ -486,3 +486,83 @@ def test_file_editor_refuses_case_variant_of_a_crown_jewel(tmp_path: Path, monke
     obs = _floored(ws, ent)(FileEditorAction(command="view", path=variant))
     assert obs.is_error and "REFUSED" in obs.text
     assert "flow identity" not in obs.text
+
+
+# --- spore-768 / glm L3: the two hands must not diverge as the floor evolves -----------------
+
+def test_both_hands_share_one_evolving_floor(tmp_path) -> None:
+    """⛔ glm-5.2 L3, 2026-09-04, CONFIRMED against disk. Each hand's `create` built its OWN policy
+    object. That was harmless while the spawn-time socket refresh touched only `deny_sockets` (the
+    connect arm has no in-process twin) — and the fix for the round-1 HIGH made the refresh also
+    update `deny_write_files`/`socket_spellings`/`deny_write_dirs`, which the file editor DOES
+    enforce. So the bash hand started evolving a floor the file-editor hand never saw, falsifying
+    this module's own stated invariant in two separate docstrings.
+
+    Pin it at the level that matters: a policy update made through the shared floor is visible to
+    BOTH executors, because they read through it rather than caching a copy."""
+    from levain.firing.openhands.tools import (
+        CrownJewelsFileEditorExecutor,
+        SandboxedBashExecutor,
+        _SharedFloor,
+    )
+    from levain.firing.confinement import build_policy
+    import dataclasses
+
+    ent = tmp_path / "ent"
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True)
+    floor = _SharedFloor(build_policy(ent, workspace=ws))
+
+    editor = CrownJewelsFileEditorExecutor(floor=floor)
+    bash = SandboxedBashExecutor(floor=floor)
+    assert editor._policy is bash._policy
+
+    # Simulate what a spawn does: widen the floor's socket arms.
+    newly = (tmp_path / "late.sock").resolve()
+    floor.policy = dataclasses.replace(
+        floor.policy,
+        deny_sockets=floor.policy.deny_sockets + (newly,),
+        deny_write_files=floor.policy.deny_write_files + (newly,),
+        socket_spellings=floor.policy.socket_spellings + (newly,),
+    )
+
+    assert newly in editor._policy.deny_write_files, "the file-editor hand did not see the update"
+    assert editor._policy is bash._policy, "the hands diverged"
+
+
+def test_create_wires_BOTH_hands_to_the_same_floor_object(tmp_path, monkeypatch) -> None:
+    """⛔ THE WIRING TEST, AND IT EXISTS BECAUSE MY FIRST TEST FOR THIS PASSED BOTH WAYS.
+
+    `test_both_hands_share_one_evolving_floor` constructs the two executors with an explicit shared
+    floor, so it grades the HOLDER MECHANISM and never touches `create` — where the sharing actually
+    has to happen. Reverting `create` to build separate policies left that test green. A test that
+    passes under the mutation it was written for is the exact class this whole change is about, and
+    it caught me one layer up from where I was looking.
+
+    This one drives the real `create` path for both hands and asserts they reached the SAME object."""
+    from levain.firing.openhands.tools import _FLOORS
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()  # module-level registry: isolate this test from any earlier one
+
+    editor_tool = LevainFileEditorTool.create(_FakeConvState(ws))[0]
+    bash_tool = LevainBashTool.create(_FakeConvState(ws))[0]
+
+    assert editor_tool.executor._floor is bash_tool.executor._floor, (
+        "create() built the two hands separate floors — they will diverge as the socket arms "
+        "evolve at each spawn"
+    )
+
+
+def test_a_policy_only_construction_still_works_and_is_private(tmp_path) -> None:
+    """The `policy=` form stays supported for tests and direct construction, and gets its OWN floor
+    — so two independently-constructed executors do NOT accidentally share state through the
+    module-level registry. Only `create` (via `floor_for_conv_state`) shares."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
+    from levain.firing.confinement import build_policy
+
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True)
+    a = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "a", workspace=ws))
+    b = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "b", workspace=ws))
+    assert a._floor is not b._floor

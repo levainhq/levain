@@ -30,6 +30,7 @@ from levain.firing.confinement import (
     ConfinementConfig,
     ConfinementError,
     CrownJewelsPolicy,
+    SandboxedShell,
     SeatbeltProvider,
     _sbpl_regex,
     _sbpl_string,
@@ -2006,15 +2007,13 @@ def test_a_refreshed_policy_carries_its_union_into_the_next_respawn(tmp_path, mo
 
 
 def test_a_provider_overriding_spawn_shell_is_refused_at_class_definition(tmp_path) -> None:
-    """⛔ THE CLAIM BECOMES A MECHANISM (codex L3 #3, and self-caught the same hour). Making
-    spawn_shell concrete stops a provider FORGETTING the refresh; it does not stop one from defining
-    spawn_shell itself and skipping it silently. Until `__init_subclass__` existed, the docstring
-    said "impossible for a provider to skip" while the mechanism only made it inconvenient — a
-    claim > enforcement gap, in the module whose own comments name that as what it refuses.
-    `typing.final` is a type-checker hint and does not fire at runtime."""
+    """⛔ THE CLAIM BECOMES A MECHANISM (codex L3 #3 round 1, and self-caught the same hour).
+    Making spawn_shell concrete stops a provider FORGETTING the refresh; it does not stop one from
+    defining spawn_shell itself. `typing.final` is a type-checker hint and does not fire at
+    runtime."""
     from levain.firing.confinement import ConfinementProvider
 
-    with pytest.raises(TypeError, match="overrides ConfinementProvider.spawn_shell"):
+    with pytest.raises(TypeError, match="overrides or shadows"):
         class _Sneaky(ConfinementProvider):
             def render_profile(self, policy):
                 return ""
@@ -2024,6 +2023,83 @@ def test_a_provider_overriding_spawn_shell_is_refused_at_class_definition(tmp_pa
 
             def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
                 return None  # skips the refresh entirely
+
+
+def test_a_mixin_shadowing_spawn_shell_is_refused_too(tmp_path) -> None:
+    """⛔ ROUND 2's GUARD-ON-THE-GUARD (codex L3 #2 + complement, convergent). The first version
+    checked `cls.__dict__`, so a class that INHERITS spawn_shell from an earlier base in its MRO
+    passed — while dispatch resolved to the mixin's version and skipped the refresh deterministically.
+    Test and logging mixins are an ordinary pattern, so this is the realistic bypass, and the
+    original guard's own test passed the whole time because it only exercised direct override.
+
+    ⚡ A guard written to close a claim > enforcement gap left a narrower one of the same kind —
+    third time in this change that a fix reproduced the class it was written for."""
+    from levain.firing.confinement import ConfinementProvider
+
+    class _LegacyMixin:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            return None  # no refresh at all
+
+    with pytest.raises(TypeError, match="overrides or shadows"):
+        class _Shadowed(_LegacyMixin, ConfinementProvider):
+            def render_profile(self, policy):
+                return ""
+
+            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+                return None
+
+
+def test_a_non_cooperative_init_subclass_cannot_disable_the_guard(tmp_path) -> None:
+    """⛔ THE SECOND HOLE codex NAMED: an intermediate provider defining `__init_subclass__` without
+    calling `super()` silently disabled an `__init_subclass__`-based guard for everything beneath it.
+    A METACLASS `__new__` runs at class creation regardless of what the class body does, so there is
+    nothing to forget to call — which is why the guard moved to `_ProviderMeta`."""
+    from levain.firing.confinement import ConfinementProvider
+
+    class _Rude(ConfinementProvider):
+        def __init_subclass__(cls, **kw):
+            pass  # deliberately does NOT call super()
+
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            return None
+
+    with pytest.raises(TypeError, match="overrides or shadows"):
+        class _Beneath(_Rude):
+            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+                return None
+
+
+def test_the_shell_carries_the_exact_policy_it_was_confined_by(tmp_path, monkeypatch) -> None:
+    """⛔ ONE AUTHORITATIVE REFRESH PER SPAWN (codex L3 #1). The executor used to refresh, then let
+    `spawn_shell` refresh AGAIN, and keep the FIRST answer — so a target only the provider's
+    resolution saw was enforced for that shell and gone at the next respawn, defeating the
+    monotonicity the whole design rests on. `spawn_shell` now stamps the rendered policy onto the
+    shell so the caller caches exactly what was enforced."""
+    from levain.firing.confinement import ConfinementProvider
+
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+
+    unlisted = tmp_path / "elsewhere" / "real.sock"
+    unlisted.parent.mkdir(parents=True)
+    unlisted.touch()
+    listed.symlink_to(unlisted)
+
+    class _Recorder(ConfinementProvider):
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            return SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
+
+    shell = _Recorder().spawn_shell(pol)
+    assert shell.effective_policy is not None
+    assert unlisted.resolve() in shell.effective_policy.deny_sockets
+    assert unlisted.resolve() in shell.effective_policy.deny_write_files
 
 
 def test_socket_sources_is_the_last_field_so_positional_construction_is_unbroken() -> None:

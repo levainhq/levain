@@ -86,7 +86,6 @@ from levain.firing.confinement import (
     build_policy,
     crown_jewel_reason,
     load_confinement_config,
-    refresh_socket_denies,
     select_provider,
 )
 from levain.firing.drive import current_drive_mode, resolve_cred_floor
@@ -153,10 +152,58 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         # spore-725. Passed straight through — NOT drive-resolved like the line above, because a
         # reachable container daemon is a total bypass in every drive mode (an interactive operator
         # watching the stream is not a mitigation for `docker run -v /:/host`). Both hands read the
-        # same value, so the file editor's rename-deny and the seatbelt's connect-deny cannot
-        # disagree about whether sockets are fenced.
+        # same value. ⚠ AND "the same value" IS NOW LITERALLY THE SAME OBJECT, via `_SharedFloor`:
+        # this sentence was briefly FALSE (glm L3, 2026-09-04) because each hand's `create` built
+        # its own policy and only the bash hand's evolved at spawn. Read `_SharedFloor` before
+        # weakening this — the invariant is what makes the two hands' socket rulings comparable.
         allow_container_sockets=cfg.allow_container_sockets,
     )
+
+
+class _SharedFloor:
+    """The ONE evolving :class:`CrownJewelsPolicy` that BOTH hands read.
+
+    ⛔ WHY THIS EXISTS — glm-5.2 L3, 2026-09-04, CONFIRMED against disk. Each hand's ``create``
+    called :func:`policy_for_conv_state` separately, producing two EQUAL BUT DISTINCT policy
+    objects. That was harmless while the spawn-time socket refresh touched only ``deny_sockets``
+    (the connect arm has no in-process twin) — and my own fix for the round-1 HIGH made the refresh
+    also update ``deny_write_files``, ``socket_spellings`` and ``deny_write_dirs``, which the file
+    editor DOES enforce. So the bash hand began evolving a floor the file-editor hand never saw.
+    ⚡ **THAT FALSIFIED A CLAIM THIS MODULE MAKES ABOUT ITSELF IN TWO PLACES** — the header's "built
+    by EACH hand's ``create`` from the SAME ``CrownJewelsPolicy``", and ``policy_for_conv_state``'s
+    "Both hands read the same value, so the file editor's rename-deny and the seatbelt's
+    connect-deny cannot disagree about whether sockets are fenced." A fix for a false claim about
+    socket coverage made a different claim false one file over.
+
+    ⚠ HONEST ON SEVERITY: this was an INVARIANT break rather than a bypass. The rename vector the
+    socket write-deny exists to stop is a ``mv``, the file editor has no rename primitive, and the
+    bash hand — where ``mv`` actually happens — was covered throughout. It is fixed because "one
+    policy, two enforcers" is load-bearing and stated, not because an exploit was demonstrated.
+
+    Mutable by design: :meth:`SandboxedBashExecutor._ensure_shell` assigns the policy the shell was
+    ACTUALLY confined by back into the floor, so the next respawn and the file editor both see it."""
+
+    __slots__ = ("policy",)
+
+    def __init__(self, policy: CrownJewelsPolicy) -> None:
+        self.policy = policy
+
+
+# Keyed on the pair that DEFINES an entity's floor, so two hands of one entity share a floor and two
+# different entities can never collide. Not weak-keyed on conv_state: a conv_state is not guaranteed
+# hashable or weakref-able, and the identity that matters here is the ENTITY, not the conversation.
+_FLOORS: dict[tuple[Path, Path], _SharedFloor] = {}
+
+
+def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
+    """The shared floor for this entity — created on first use, reused by the other hand."""
+    policy = policy_for_conv_state(conv_state)
+    key = (policy.entity_dir, policy.workspace)
+    floor = _FLOORS.get(key)
+    if floor is None:
+        floor = _SharedFloor(policy)
+        _FLOORS[key] = floor
+    return floor
 
 
 # --- the file-editor hand (relaxed to the crown-jewels floor) --------------------------------
@@ -183,9 +230,28 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
     never a real jail — its containment is cosmetic), NOT as a confinement; the floor is the
     confinement."""
 
-    def __init__(self, *, policy: CrownJewelsPolicy, **kwargs: Any) -> None:
-        super().__init__(workspace_root=str(policy.workspace), **kwargs)
-        self._policy = policy
+    def __init__(
+        self,
+        *,
+        policy: CrownJewelsPolicy | None = None,
+        floor: "_SharedFloor | None" = None,
+        **kwargs: Any,
+    ) -> None:
+        # `policy=` remains the simple form (tests, direct construction) and gets a PRIVATE floor,
+        # so this hand behaves exactly as before. `floor=` is what `create` passes to share the
+        # evolving floor with the bash hand (glm L3, 2026-09-04).
+        if floor is None:
+            if policy is None:
+                raise TypeError("CrownJewelsFileEditorExecutor needs either policy= or floor=")
+            floor = _SharedFloor(policy)
+        self._floor = floor
+        super().__init__(workspace_root=str(self._floor.policy.workspace), **kwargs)
+
+    @property
+    def _policy(self) -> CrownJewelsPolicy:
+        """Read THROUGH the shared floor, never a cached copy — that copy going stale while the bash
+        hand's evolved is exactly the divergence this indirection exists to prevent."""
+        return self._floor.policy
 
     def __call__(
         self,
@@ -254,7 +320,7 @@ class LevainFileEditorTool(FileEditorTool):
 
     @classmethod
     def create(cls, conv_state: "ConversationState") -> list["LevainFileEditorTool"]:  # type: ignore[override]
-        floored = CrownJewelsFileEditorExecutor(policy=policy_for_conv_state(conv_state))
+        floored = CrownJewelsFileEditorExecutor(floor=floor_for_conv_state(conv_state))
         # Build REAL LevainFileEditorTool instances (not stock via set_executor, which keeps the stock
         # class + its raising declared_resources), reusing the stock tool's rich description/schema/
         # annotations by copying its fields — so our declared_resources override is what runs.
@@ -287,16 +353,28 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
 
     def __init__(
         self,
-        policy: CrownJewelsPolicy,
+        policy: CrownJewelsPolicy | None = None,
         *,
+        floor: "_SharedFloor | None" = None,
         default_timeout: float = 120.0,
     ) -> None:
-        self._policy = policy
+        if floor is None:
+            if policy is None:
+                raise TypeError("SandboxedBashExecutor needs either a policy or floor=")
+            floor = _SharedFloor(policy)
+        self._floor = floor
         self._default_timeout = default_timeout
+
         self._shell: SandboxedShell | None = None
         # Guards the lazy spawn / teardown against interrupt()/close() from another thread. Bash calls
         # themselves are serialized by declared_resources, so this is only the cross-thread guard.
         self._lock = threading.Lock()
+
+    @property
+    def _policy(self) -> CrownJewelsPolicy:
+        """Read THROUGH the shared floor — same indirection as the file-editor hand, so the two
+        cannot drift apart as the floor evolves at each spawn (glm L3, 2026-09-04)."""
+        return self._floor.policy
 
     def _ensure_shell(self) -> SandboxedShell:
         """The live shell — spawning a fresh one on first use OR after the previous one exited
@@ -317,10 +395,18 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # provider, including a caller that does not go through this executor. The function
                 # is idempotent and monotonic, so running it twice costs a resolution and changes
                 # nothing.
-                self._policy = refresh_socket_denies(self._policy)
                 self._shell = provider.spawn_shell(
-                    self._policy, default_timeout=self._default_timeout
+                    self._floor.policy, default_timeout=self._default_timeout
                 )
+                # ⛔ CACHE WHAT WAS ACTUALLY RENDERED, AND REFRESH IN EXACTLY ONE PLACE (codex L3
+                # #1, 2026-09-04). This method used to refresh here AND let `spawn_shell` refresh
+                # again, then keep the FIRST answer — so a target that only the provider's
+                # resolution saw was enforced for that shell and gone at the next respawn. Two
+                # resolutions of the same source at two instants are not the same value, which is
+                # the whole premise of the TOCTOU this fix exists for.
+                if self._shell.effective_policy is not None:
+                    # Into the SHARED floor, so the file-editor hand sees the same evolved sets.
+                    self._floor.policy = self._shell.effective_policy
             return self._shell
 
     def _teardown(self) -> None:
@@ -460,7 +546,7 @@ class LevainBashTool(TerminalTool):
 
     @classmethod
     def create(cls, conv_state: "ConversationState") -> list["LevainBashTool"]:  # type: ignore[override]
-        executor = SandboxedBashExecutor(policy_for_conv_state(conv_state))
+        executor = SandboxedBashExecutor(floor=floor_for_conv_state(conv_state))
         # Pass our executor to the stock create so it does NOT build a host TerminalExecutor; then copy
         # its (platform-correct) description/schema/annotations into a REAL LevainBashTool so OUR
         # declared_resources override runs.
