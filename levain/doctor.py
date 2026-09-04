@@ -1429,10 +1429,16 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # against the right authority. Hooks are copied verbatim (not rendered), so the
     # source hash and the installed bytes are directly comparable.
     #
-    # `_sha256_file` is imported rather than reimplemented ON PURPOSE (`derive_dont_
-    # invent`): we are comparing against a digest the manifest computed, so the two must
-    # use one hashing definition or this check drifts back into disagreeing with the
-    # thing it consults.
+    # ⚠ THE HASH COMPARISON DESCRIBED ABOVE IS NO LONGER WHAT THIS CHECK DOES, and the
+    # paragraph that stood here explained why `_sha256_file` was imported rather than
+    # reimplemented. `d7cee34` deleted the one call (`if _sha256_file(installed) !=
+    # recorded:`) and replaced the raw-bytes/source-hash comparison with `_hook_body`
+    # normalisation on BOTH sides (a pack hook carrying an install-time placeholder
+    # hashed differently forever, and the remedy doctor printed could not clear it). The
+    # import went dead in that commit and the comment justifying it did not — so the file
+    # explained a mechanism it had stopped using. Both removed
+    # 2026-09-04; the surrounding paragraph about WHICH authority is consulted (the
+    # pack's own recorded source, not base) is still exactly right and stays.
     # ⚠ KEYED BY PATH RELATIVE TO `activation/hooks/`, **NEVER BY BASENAME** — and the loop
     # below iterates the UNION of these keys with base's. Those are two separate defects
     # with two separate fixes, and repairing either alone leaves the other alive.
@@ -1507,8 +1513,6 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
 
     stale: list[str] = []
     try:
-        from levain.manifest import _sha256_file
-
         with _templates_root() as templates_root:
             shipped_root = _base_activation_root(adapter, templates_root) / "hooks"
             if not shipped_root.is_dir() and not pack_hooks:
