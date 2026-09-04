@@ -234,7 +234,12 @@ class LevainFileEditorTool(FileEditorTool):
         assert isinstance(action, FileEditorAction)
         try:
             resolved = Path(action.path).expanduser().resolve()
-        except (ValueError, OSError):
+        # RuntimeError too — `expanduser()` raises it for a `~user` with no passwd entry, and
+        # THIS function's docstring says "Never raises." A RuntimeError escaping here does the
+        # exact harm the paragraph above describes: it surfaces a raw AgentErrorEvent and SKIPS
+        # the executor, so the floored executor's clean in-band refusal never fires — the guard
+        # written to stop that, defeated by the spelling it did not catch.
+        except (ValueError, OSError, RuntimeError):
             return DeclaredResources(keys=(), declared=True)
         if crown_jewel_reason(self._policy(), resolved) is not None:
             return DeclaredResources(keys=(), declared=True)

@@ -1713,3 +1713,27 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
         f"Wire the new provider and update this assertion, or the floor is macOS-only while the "
         f"code and the run banner both call it universal."
     )
+
+
+def test_crown_jewel_reason_fails_CLOSED_on_a_tilde_user_path_not_by_raising(tmp_path) -> None:
+    """⛔ `expanduser()` raises RuntimeError — not OSError, not ValueError — for a `~user` with no
+    passwd entry, and `path` here is supplied BY THE ENTITY. Before this clause caught it, a
+    confabulating model emitting `~unknownuser/...` reached a function whose docstring promises
+    FAIL-CLOSED and got neither a denial nor an allow: it got an exception out of the security
+    predicate.
+
+    ⚠ THE SAME RELEASE FIXED THIS CLASS IN `doctor.py` AND DID NOT REACH THE CONFINEMENT TWIN —
+    `guard_scoped_by_symptom_misses_the_class`, with the class named in the release that missed it.
+    """
+    policy = build_policy(_entity(tmp_path))
+    reason = crown_jewel_reason(policy, "~nosuchuser42/.ssh/authorized_keys")
+    assert reason is not None, "a path that cannot be resolved must be REFUSED, not allowed"
+    assert "could not be resolved" in reason
+
+
+def test_the_tilde_user_path_actually_raises_RuntimeError(tmp_path) -> None:
+    """THE PREMISE, PINNED. If a future CPython stops raising RuntimeError here — or starts raising
+    something else — the test above would pass for the wrong reason (no exception to catch). This
+    one fails loudly instead, so the guard above never becomes decorative."""
+    with pytest.raises(RuntimeError):
+        Path("~nosuchuser42/.ssh/authorized_keys").expanduser()
