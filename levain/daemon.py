@@ -1054,7 +1054,15 @@ def select_provider(system: str | None = None) -> DaemonProvider:
     if system == "Windows":
         raise NotImplementedError(
             "the Task Scheduler (schtasks /SC ONLOGON) provider is a planned pure-addition "
-            "(spore-205); macOS ships first. For now run `levain serve --write --no-open` "
+            # ⚠ THIS SENTENCE IS EXECUTABLE CODE, WHICH IS WHY IT OUTLIVED THE SWEEP. The K4c
+            # description pass (3ac52a4, "five descriptions still told the operator Linux had no
+            # floor") reached five sites and missed the sixth — the only one that is a STRING
+            # LITERAL IN A RAISE rather than a comment or a docstring. It found what a reader greps
+            # for in prose and not what an operator is actually SHOWN. It read "macOS ships first"
+            # while `select_provider`'s own docstring, fourteen lines up, already said macOS AND
+            # Linux ship. The ordering clause is dropped rather than corrected: it carries no
+            # information a Windows operator can act on.
+            "(spore-205). For now run `levain serve --write --no-open` "
             "under your own supervisor.")
     raise NotImplementedError(f"no daemon provider for platform {system!r}")
 
