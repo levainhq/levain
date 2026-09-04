@@ -295,6 +295,25 @@ _STANDARD_CRED_FILES = (
 # non-default colima profile (``colima start -p work``), or any socket outside the eight would
 # pin it, receive the rename- and ancestor-denies, and get **no connect protection at all while
 # believing it closed** — a false closure, which is worse than a known gap.
+# ⛔⛔ AND THE ENUMERATION IS A **BUILD-TIME SNAPSHOT**, SO A *LISTED* NAME IS NOT ALWAYS COVERED
+# (codex L3 HIGH, 2026-09-04, CONFIRMED BY EXECUTION here). ``deny_sockets`` stores each path
+# RESOLVED AT ``build_policy`` TIME. If a listed path is ABSENT then, it resolves to itself; if
+# something later creates it as a symlink to an UNLISTED target, ``connect()`` canonicalises to that
+# target — which is not in the set — and a lexical ``network-outbound`` literal is MEASURED INERT.
+# Measured end to end: a listed-but-absent path, later symlinked to an unlisted socket, was reachable
+# THROUGH THE LISTED NAME.
+# ⚖ WHY THIS IS AN HONESTY DEFECT AND NOT NEW EXPOSURE, measured rather than argued:
+#   · THE ENTITY CANNOT ARRANGE IT. Creating the symlink at a listed path is refused — "Operation not
+#     permitted" — because arm (ii) write-denies every listed socket at BOTH spellings. It needs an
+#     EXTERNAL actor (an operator, an installer) acting mid-session.
+#   · AND THE UNLISTED SOCKET WAS ALREADY REACHABLE UNDER ITS OWN NAME, symlink or not — verified in
+#     the same run. So the symlink adds no reachability that the unlisted socket did not already have,
+#     and which the banner already declares uncovered.
+# ▶ WHAT IT DOES COST IS THE CLAIM: an operator reads a listed socket as covered, and under this
+# condition it is not. That is why the run banner now says the coverage is a BUILD-TIME SNAPSHOT
+# rather than only that the list is incomplete. ⛔ THE REAL FIX — re-resolve at shell spawn and fail
+# closed when a listed endpoint resolves outside a pinned target set — is FILED FORWARD with the
+# operator-declared socket list; both are the same root, and neither belongs in a release freeze.
 # ▶ There is deliberately NO operator-declared socket list yet: ``ConfinementConfig`` carries only
 # the all-or-nothing ``allow_container_sockets``. Adding a ``deny_sockets`` config key (resolved
 # into ``sockets_l`` AND both spellings into ``deny_write_files_l``, so operator sockets get the
@@ -397,6 +416,11 @@ class CrownJewelsPolicy:
     # the literal denied, renaming the PARENT DIR relocates the socket and connects. This is
     # the ``_write_deny_ancestors`` rename-relocation class (apparatus L2) applying to sockets.
     # ⚠ ALL THREE ARMS ARE LOAD-BEARING; each was falsified on its own before being kept.
+    socket_spellings: tuple[Path, ...] = ()  # BOTH spellings of every denied socket — MESSAGE
+    # CLASSIFICATION ONLY, never enforcement. `crown_jewel_reason` uses it to tell a socket from
+    # an ssh vector without calling `.resolve()` inside the predicate, where a resolution error
+    # would escape the fail-closed guard. Enforcement remains `deny_sockets` (resolved, arm i)
+    # plus `deny_write_files` (both spellings, arms ii/iii).
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
@@ -535,6 +559,28 @@ def build_policy(
     close the rename-relocation bypass (apparatus L2). NOTE the entity's OWN ``<entity>/.levain/``
     store is NOT denied — the entity's memory is its own to read/write. Only the operator's memory
     store and SIBLING stores are the structural crown jewels."""
+    # ⛔ TYPE-CHECK THE OPT-OUT AT THIS BOUNDARY — IT FAILS **OPEN**, WHICH IS THE ONE
+    # DIRECTION A SECURITY FLAG MUST NOT FAIL (codex L3, 2026-09-04; MEASURED HERE).
+    # Passing the STRING "false" for this flag — exactly what an env-var-backed or
+    # hand-rolled caller does — is TRUTHY, and it
+    # removed ALL THREE ARMS: `deny_sockets` went 7 -> 0 and the socket write-denies 10 -> 0.
+    # **A value meaning "no" read as "yes" and silently deleted the floor.**
+    # The JSON loader already validates the type, so no shipping caller is affected today —
+    # which is precisely why this is worth pinning: this is the PUBLIC MECHANISM boundary,
+    # and the next caller is the one that gets it wrong. `isinstance(True, int)` is also True,
+    # so a JSON number would slip a plain int check; require a real bool.
+    # ⚠ THE ILLUSTRATIVE CALL FORM WAS DELIBERATELY REMOVED FROM THIS COMMENT. Writing the
+    # example out in literal call syntax made
+    # `test_every_production_caller_of_build_policy_declares_the_cred_floor` — a SOURCE-LEVEL
+    # scanner — count this PROSE as a production call site and fail. Two guards doing their
+    # jobs, colliding on a comment ABOUT a call rather than a call. Do not re-add the example.
+    if not isinstance(allow_container_sockets, bool):
+        raise ConfinementError(
+            f"allow_container_sockets must be a bool, got "
+            f"{type(allow_container_sockets).__name__} ({allow_container_sockets!r}) — "
+            f"fail-closed. A truthy non-bool would DISABLE the container-socket floor "
+            f"entirely (spore-725)."
+        )
     ed = Path(entity_dir).expanduser().resolve()
     ws = (Path(workspace).expanduser().resolve() if workspace is not None
           else (ed / "workspace").resolve())
@@ -705,6 +751,18 @@ def build_policy(
             deny_write_files_l.append(lex)
             deny_write_files_l.append(lex.resolve())
     deny_sockets_t = _dedup(sockets_l)
+    # BOTH spellings of every socket, for MESSAGE classification in `crown_jewel_reason`.
+    # ⛔ PRECOMPUTED HERE SO THE PREDICATE DOES NO FILESYSTEM I/O (codex L3, 2026-09-04).
+    # It previously called `wf.resolve()` inside the classification loop — OUTSIDE the
+    # fail-closed `try` that guards the input path — so a concurrent symlink swap, a loop,
+    # or any resolution error escaped as RuntimeError/OSError and crashed the security
+    # predicate instead of returning a refusal. The SAME class as the `expanduser` gap fixed
+    # in this release, reintroduced by my own fix for it, one line away.
+    # ⚡ And the resolution was never needed: both spellings are already known HERE, at
+    # construction. Removing the I/O is strictly better than wrapping it in a handler.
+    socket_spellings_t = _dedup([q for s in _CONTAINER_DAEMON_SOCKETS
+                                 for q in (Path(s).expanduser(), Path(s).expanduser().resolve())]
+                                ) if not allow_container_sockets else ()
 
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
@@ -814,6 +872,7 @@ def build_policy(
         deny_write_files=deny_write_files_t,
         own_memory_files=own_memory_files_t,
         deny_sockets=deny_sockets_t,
+        socket_spellings=socket_spellings_t,
     )
 
 
@@ -909,7 +968,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # connect arm is the seatbelt profile's ``network-outbound`` rule and has NO in-process twin
     # — stated rather than papered over, because "one policy, two enforcers" holds for every
     # OTHER field on this policy and does NOT hold for this one.
-    sockets = set(policy.deny_sockets)
+    sockets = set(policy.socket_spellings) or set(policy.deny_sockets)
     for wf in policy.deny_write_files:
         if _ci_within(p, wf):
             # WHICH KIND of write-denied file is this? Decided by MEMBERSHIP in the socket set,
@@ -921,7 +980,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
             # reported to them as an "ssh persistence/exec vector".
             # ⚠ `deny_sockets` is RESOLVED-ONLY while `deny_write_files` carries both spellings, so
             # the lexical entry must be resolved before the membership test or it never matches.
-            if wf in sockets or wf.resolve() in sockets:
+            if wf in sockets:
                 return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root "
                         f"daemon bypasses the whole floor (spore-725)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
