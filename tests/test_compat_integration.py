@@ -209,9 +209,16 @@ def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
 
 def test_record_compat_lock_ack_advance_only_force_reinstall(tmp_path, monkeypatch):
     # The normal advance-only case (codex L3): a --force re-install over a store on a
-    # NEWER anneal already acked at that newer version. installed 0.10.0, acked 0.10.0,
-    # reconciled cap 0.9.6 -> ack_target = min(0.9.6, 0.10.0) = 0.9.6; acked 0.10.0 >
-    # 0.9.6 -> no ack (never lower an already-reviewed higher marker).
+    # NEWER anneal already acked at that newer version. installed 0.10.0, acked 0.10.0;
+    # ack_target = min(TEMPLATES_RECONCILED_ANNEAL, 0.10.0) = the cap, and the acked
+    # 0.10.0 is above it -> no ack (never lower an already-reviewed higher marker).
+    #
+    # ⛔ NO CAP LITERAL HERE, BY THE RULE AT THE TOP OF THIS FILE. This comment used to
+    # spell the arithmetic out as "cap 0.9.6 -> min(0.9.6, 0.10.0) = 0.9.6" and went
+    # stale at the 0.9.7 bump. Nothing went red, because the test monkeypatches
+    # installed/acked and reads the cap FROM THE CONSTANT -- the literal lived only in
+    # the prose, which is exactly the shape that rots unwatched. The conclusion never
+    # depended on the cap's value: any cap below the acked version yields no ack.
     store = _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(anneal="0.10.0", migrate_acked="0.10.0"))
