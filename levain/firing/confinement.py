@@ -845,23 +845,29 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
     if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
         return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
-    # SOCKETS FIRST, AND ONLY FOR THE MESSAGE. Container sockets are write-denied through the
-    # same ``deny_write_files`` list as the ssh vectors (see build_policy arm (ii)), so without
-    # this branch the next one would tell an operator that ``/var/run/docker.sock`` is "an ssh
-    # persistence/exec vector (authorized_keys/config/rc)" — a refusal reason that is simply
-    # false, in the surface an operator reads to understand their own floor. The DENIAL was
-    # already correct; only its stated reason would have been wrong.
+    # Container sockets are write-denied through the SAME ``deny_write_files`` list as the ssh
+    # vectors (build_policy arm (ii)), so the loop below must say WHICH it matched or it tells an
+    # operator that ``/var/run/docker.sock`` is "an ssh persistence/exec vector
+    # (authorized_keys/config/rc)" — a refusal reason that is simply false, in the surface they
+    # read to understand their own floor. The DENIAL is correct either way; only the stated
+    # reason would have been wrong.
     # ⚠ This hand has no connect() primitive, so it enforces the RENAME/UNLINK arm only. The
-    # connect arm is the seatbelt profile's ``network-outbound`` rule and has no in-process twin
+    # connect arm is the seatbelt profile's ``network-outbound`` rule and has NO in-process twin
     # — stated rather than papered over, because "one policy, two enforcers" holds for every
     # OTHER field on this policy and does NOT hold for this one.
-    for sk in policy.deny_sockets:
-        if _ci_within(p, sk):
-            return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root daemon "
-                    f"bypasses the whole floor (spore-725)")
+    sockets = set(policy.deny_sockets)
     for wf in policy.deny_write_files:
         if _ci_within(p, wf):
-            if wf.name.endswith(".sock"):
+            # WHICH KIND of write-denied file is this? Decided by MEMBERSHIP in the socket set,
+            # never by filename. A `wf.name.endswith(".sock")` test stood here for one commit and
+            # was replaced on review: this module's whole ssh design exists because NAME-BASED
+            # reasoning about security-relevant paths is the thing it refuses (`~/.ssh` is denied
+            # by LOCATION for exactly that reason), and a socket that is not spelled `.sock` —
+            # `podman.socket`, a systemd-activated name, an operator's own path — would have been
+            # reported to them as an "ssh persistence/exec vector".
+            # ⚠ `deny_sockets` is RESOLVED-ONLY while `deny_write_files` carries both spellings, so
+            # the lexical entry must be resolved before the membership test or it never matches.
+            if wf in sockets or wf.resolve() in sockets:
                 return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root "
                         f"daemon bypasses the whole floor (spore-725)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"

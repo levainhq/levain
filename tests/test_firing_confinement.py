@@ -1566,14 +1566,27 @@ def test_live_container_socket_is_unreachable_and_cannot_be_renamed_out_of_its_d
     srv.bind(str(sock))
     srv.listen(5)
 
+    # A short accept timeout rather than a blocking accept: `srv.close()` in the finally block
+    # runs while this thread may be inside `accept()` on the same fd, and cross-thread
+    # close-under-blocking-accept is platform- and timing-dependent (usually OSError, not
+    # guaranteed). Polling a flag makes the shutdown deterministic instead of relying on the
+    # close to raise. Test-only, but a flaky security test gets muted, and a muted security test
+    # is worse than no test. (complement L3, 2026-09-04.)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
     def _serve() -> None:
-        while True:
+        while not stop.is_set():
             try:
                 conn, _ = srv.accept()
-                conn.sendall(b"JEWEL-VIA-SOCKET")
-                conn.close()
+            except TimeoutError:
+                continue
             except OSError:
                 return
+            try:
+                conn.sendall(b"JEWEL-VIA-SOCKET")
+            finally:
+                conn.close()
 
     threading.Thread(target=_serve, daemon=True).start()
     try:
@@ -1625,6 +1638,7 @@ def test_live_container_socket_is_unreachable_and_cannot_be_renamed_out_of_its_d
                                capture_output=True, text=True, timeout=30)
         assert "JEWEL-VIA-SOCKET" in after.stdout
     finally:
+        stop.set()
         srv.close()
         shutil.rmtree(short_root, ignore_errors=True)
 
@@ -1654,3 +1668,48 @@ def test_load_confinement_config_bad_allow_container_sockets_fails_closed(tmp_pa
     (ent / ".levain" / "confinement.json").write_text('{"allow_container_sockets": "yes"}')
     with pytest.raises(ConfinementError):
         load_confinement_config(ent)
+
+
+def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypatch) -> None:
+    """⛔ A TRIPWIRE FOR THE K4c MERGE, NOT A TEST OF TODAY'S CODE.
+
+    `deny_sockets` is enforced by exactly one thing: `SeatbeltProvider.render_profile`'s
+    `network-outbound` rule. `build_policy` populates the field unconditionally and this module's
+    prose calls it the UNIVERSAL floor — which is true while macOS is the only provider, and
+    becomes FALSE the moment a Linux (`bwrap`) or container provider lands without consuming it.
+    A policy field that one provider honours and another silently ignores is a floor that reports
+    itself armed on a platform where the flagship bypass still works.
+
+    ⚠ THE FAILURE MODE THIS CATCHES IS A MERGE, WHICH IS WHY IT IS SHAPED LIKE THIS. Nothing in a
+    Linux provider's own diff would look wrong; the defect is an ABSENCE, in a different file,
+    relative to a field added on another branch. Nobody re-reads `confinement.py`'s socket arms
+    while writing a mount-namespace renderer. So the guard is a hard assertion on the provider
+    ROSTER: add a provider and this fails until you have decided, explicitly, what it does about
+    sockets.
+
+    This file already states the convention it is enforcing — ``bwrap`` and a container backend
+    are PURE ADDITIONS that "MUST re-prove" the floor's properties rather than inherit the claim.
+
+    ⛔ DO NOT SATISFY THIS BY EDITING THE SET. Wire the provider, or — if a connect-deny is
+    genuinely impossible on that platform — make the honesty surfaces say so per-platform and
+    change this docstring to record that ruling. Raised by complement at L3, 2026-09-04, which
+    read the "universal floor" wording against the single enforcer and called the gap correctly.
+    """
+    from levain.firing import confinement as _conf
+
+    def _concrete(cls) -> set:
+        out = set()
+        for sub in cls.__subclasses__():
+            if not getattr(sub, "__abstractmethods__", None):
+                out.add(sub.__name__)
+            out |= _concrete(sub)
+        return out
+
+    providers = _concrete(_conf.ConfinementProvider)
+    assert providers == {"SeatbeltProvider"}, (
+        f"the ConfinementProvider roster changed to {sorted(providers)}. Every provider MUST "
+        f"enforce CrownJewelsPolicy.deny_sockets (spore-725) — a reachable container daemon is a "
+        f"total crown-jewels bypass, and only SeatbeltProvider renders the connect-deny today. "
+        f"Wire the new provider and update this assertion, or the floor is macOS-only while the "
+        f"code and the run banner both call it universal."
+    )
