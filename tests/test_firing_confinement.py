@@ -1920,7 +1920,9 @@ def test_spawn_shell_refreshes_the_socket_arm_before_any_provider_renders(tmp_pa
 
         def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
             seen.append(policy)
-            return None  # type: ignore[return-value]
+            # A REAL shell: `spawn_shell` now refuses anything else at the source (codex L3 MED),
+            # so a None sentinel here would be rejected before the recording could be checked.
+            return SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
 
     _Recorder().spawn_shell(pol)
     assert len(seen) == 1

@@ -83,6 +83,18 @@ starts, so a symlink created at a listed path *after* a shell is already running
 covered, and no rule available here would cover it. A spawn-time snapshot is the strongest statement
 this sandbox language can make, which is why the wording says snapshot and not "covered".
 
+**Both of the entity's hands read one set of rules, per conversation.** The shell and the file
+editor previously each held their own copy, so a rule the shell learned at startup was invisible to
+the editor. They now share one set for the length of a conversation, and a later conversation never
+inherits an earlier one's — which also means a run that should be more restricted than the last one
+actually is.
+
+Five rounds of review went into this section, and each round found something in the previous round's
+fix. The last of them found the real shape: the rules were cached per *entity*, which made "both
+hands see the same rules" and "the rules are current" pull against each other, so fixing either one
+broke the other. Caching per *conversation* removes the conflict rather than balancing it, because a
+conversation has one set of rules by definition. Everything found was caught before release.
+
 **The banner names which sockets are covered, and which are not.** The deny is an enumeration and an
 enumeration is always incomplete, so `levain run` says so rather than claiming containers are
 fenced: a custom `$DOCKER_HOST`, a TCP daemon endpoint, or any runtime whose socket is not in the

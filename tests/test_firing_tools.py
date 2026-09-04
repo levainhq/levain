@@ -75,9 +75,18 @@ class _FakeWorkspace:
 
 
 class _FakeConvState:
-    def __init__(self, wd: Path) -> None:
+    # uid=501(phillipclapham) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),701(com.apple.sharepoint.group.1),33(_appstore),98(_lpadmin),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae) mirrors the real ConversationState (a required UUID) — the floor registry keys on the
+    # CONVERSATION, so a fake without one would silently fall back to object identity and hide
+    # whether create() actually shares.
+    _n = 0
+
+    def __init__(self, wd: Path, conv_id: str | None = None) -> None:
         self.workspace = _FakeWorkspace(wd)
         self.agent = _FakeAgent()
+        if conv_id is None:
+            type(self)._n += 1
+            conv_id = f"fake-conv-{type(self)._n}"
+        self.id = conv_id
 
 
 def _entity(tmp_path: Path) -> tuple[Path, Path]:
@@ -491,15 +500,7 @@ def test_file_editor_refuses_case_variant_of_a_crown_jewel(tmp_path: Path, monke
 # --- spore-768 / glm L3: the two hands must not diverge as the floor evolves -----------------
 
 def test_both_hands_share_one_evolving_floor(tmp_path) -> None:
-    """⛔ glm-5.2 L3, 2026-09-04, CONFIRMED against disk. Each hand's `create` built its OWN policy
-    object. That was harmless while the spawn-time socket refresh touched only `deny_sockets` (the
-    connect arm has no in-process twin) — and the fix for the round-1 HIGH made the refresh also
-    update `deny_write_files`/`socket_spellings`/`deny_write_dirs`, which the file editor DOES
-    enforce. So the bash hand started evolving a floor the file-editor hand never saw, falsifying
-    this module's own stated invariant in two separate docstrings.
-
-    Pin it at the level that matters: a policy update made through the shared floor is visible to
-    BOTH executors, because they read through it rather than caching a copy."""
+    """Both executors read THROUGH the floor, so a merge made by one is seen by the other."""
     from levain.firing.openhands.tools import (
         CrownJewelsFileEditorExecutor,
         SandboxedBashExecutor,
@@ -517,129 +518,114 @@ def test_both_hands_share_one_evolving_floor(tmp_path) -> None:
     bash = SandboxedBashExecutor(floor=floor)
     assert editor._policy is bash._policy
 
-    # Simulate what a spawn does: widen the floor's socket arms.
     newly = (tmp_path / "late.sock").resolve()
-    floor.policy = dataclasses.replace(
-        floor.policy,
-        deny_sockets=floor.policy.deny_sockets + (newly,),
-        deny_write_files=floor.policy.deny_write_files + (newly,),
-        socket_spellings=floor.policy.socket_spellings + (newly,),
-    )
+    floor.absorb(dataclasses.replace(floor.policy, deny_write_files=(newly,)))
 
-    assert newly in editor._policy.deny_write_files, "the file-editor hand did not see the update"
+    assert newly in editor._policy.deny_write_files, "the file-editor hand did not see the merge"
     assert editor._policy is bash._policy, "the hands diverged"
 
 
-def test_create_wires_BOTH_hands_to_the_same_floor_object(tmp_path, monkeypatch) -> None:
-    """⛔ THE WIRING TEST, AND IT EXISTS BECAUSE MY FIRST TEST FOR THIS PASSED BOTH WAYS.
+def test_the_floor_merge_is_monotonic_under_concurrent_spawners(tmp_path) -> None:
+    """⛔ codex L3 MED, EXECUTION-REPRODUCED. The floor used to be ASSIGNED wholesale from one
+    executor's snapshot under THAT EXECUTOR'S OWN lock — which serializes nothing, because the object
+    being mutated is shared. Two spawners each read policy P, spawn against P+A and P+B, and the
+    later assignment DISCARDED the earlier: *"a previously denied live container socket becomes
+    reachable again"* after the losing executor respawned.
 
-    `test_both_hands_share_one_evolving_floor` constructs the two executors with an explicit shared
-    floor, so it grades the HOLDER MECHANISM and never touches `create` — where the sharing actually
-    has to happen. Reverting `create` to build separate policies left that test green. A test that
-    passes under the mutation it was written for is the exact class this whole change is about, and
-    it caught me one layer up from where I was looking.
-
-    This one drives the real `create` path for both hands and asserts they reached the SAME object."""
-    from levain.firing.openhands.tools import _FLOORS
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()  # module-level registry: isolate this test from any earlier one
-
-    editor_tool = LevainFileEditorTool.create(_FakeConvState(ws))[0]
-    bash_tool = LevainBashTool.create(_FakeConvState(ws))[0]
-
-    assert editor_tool.executor._floor is bash_tool.executor._floor, (
-        "create() built the two hands separate floors — they will diverge as the socket arms "
-        "evolve at each spawn"
-    )
-
-
-def test_a_policy_only_construction_still_works_and_is_private(tmp_path) -> None:
-    """The `policy=` form stays supported for tests and direct construction, and gets its OWN floor
-    — so two independently-constructed executors do NOT accidentally share state through the
-    module-level registry. Only `create` (via `floor_for_conv_state`) shares."""
-    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
+    `absorb` unions under the FLOOR'S lock, so the result is order-independent and no deny is ever
+    lost. Mutation-checked: replacing `absorb`'s body with `self._policy = spawned` fails this."""
+    from levain.firing.openhands.tools import _SharedFloor
     from levain.firing.confinement import build_policy
+    import dataclasses
+    import threading
 
+    ent = tmp_path / "ent"
     ws = tmp_path / "ws"
     ws.mkdir(parents=True)
-    a = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "a", workspace=ws))
-    b = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "b", workspace=ws))
-    assert a._floor is not b._floor
+    floor = _SharedFloor(build_policy(ent, workspace=ws))
+    base = floor.policy
+
+    a = (tmp_path / "a.sock").resolve()
+    b = (tmp_path / "b.sock").resolve()
+    pa = dataclasses.replace(base, deny_sockets=base.deny_sockets + (a,))
+    pb = dataclasses.replace(base, deny_sockets=base.deny_sockets + (b,))
+
+    ts = [threading.Thread(target=floor.absorb, args=(p,)) for p in (pa, pb) for _ in range(20)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert a in floor.policy.deny_sockets, "spawner A's deny was lost"
+    assert b in floor.policy.deny_sockets, "spawner B's deny was lost"
 
 
-def test_a_changed_drive_mode_rebuilds_the_floor_instead_of_inheriting_it(tmp_path, monkeypatch) -> None:
-    """⛔ THE FAIL-OPEN (complement HIGH + glm-5.2 HIGH, convergent, 2026-09-04).
+def test_two_conversations_never_share_a_floor(tmp_path) -> None:
+    """⛔ THE DESIGN CHANGE, and it dissolves TWO codex findings at once (L3, 2026-09-04).
 
-    `_FLOORS` cached on (entity_dir, workspace) with no eviction and DISCARDED the freshly-built
-    policy on a hit. `policy_for_conv_state` derives `deny_standard_creds` from the DRIVE MODE, so
-    in a long-running daemon — which K4a ships — an interactive REPL conversation (creds allowed)
-    would create the floor and a later UNATTENDED seat against the same entity would inherit it,
-    leaving ~/.config/gh, ~/.aws/credentials and ~/.netrc readable on the unattended seat. That is
-    precisely the fail-open the drive-mode tri-state exists to prevent.
+    The registry used to key on `(entity_dir, workspace)`, which made sharing and freshness the same
+    variable pulling opposite ways: share the object and a later conversation inherits a STALE cred
+    floor (fail-open); rebuild it on a changed baseline and the two hands of ONE conversation get
+    DIFFERENT floors (`view /secret` through the editor while bash denies it). Each was fixed one
+    review round apart, each breaking the other.
 
-    Comparing the BASELINE is what makes the fix correct: the live policy legitimately grows at each
-    spawn (the monotonic socket union) and carrying extra denies forward is fail-CLOSED, so only a
-    changed baseline means a different floor."""
+    A CONVERSATION HAS EXACTLY ONE BASELINE BY CONSTRUCTION — so keying on `ConversationState.id`
+    removes both failure modes rather than balancing them, and the baseline comparison is DELETED."""
     from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
-    from levain.firing import drive
 
     ent, ws = _entity(tmp_path)
     _FLOORS.clear()
 
-    monkeypatch.setattr(drive, "current_drive_mode", lambda: "interactive")
-    import levain.firing.openhands.tools as _t
-    monkeypatch.setattr(_t, "current_drive_mode", lambda: "interactive")
-    first = floor_for_conv_state(_FakeConvState(ws))
+    c1, c2 = _FakeConvState(ws), _FakeConvState(ws)   # same entity+workspace, different conversations
+    f1, f2 = floor_for_conv_state(c1), floor_for_conv_state(c2)
+    keep = (f1, f2)  # hold refs: the registry is weak-valued
+    assert f1 is not f2, "a second conversation inherited the first's floor — the stale-floor fail-open"
 
-    monkeypatch.setattr(_t, "current_drive_mode", lambda: "unattended")
-    second = floor_for_conv_state(_FakeConvState(ws))
-
-    assert second is not first, (
-        "the unattended conversation inherited the interactive conversation's floor — the cred "
-        "floor is stale in the PERMISSIVE direction"
-    )
-    assert second.policy.deny_files != first.policy.deny_files or \
-        second.policy.deny_read_write != first.policy.deny_read_write
+    # ...and the SAME conversation still gets the SAME floor, or the two hands diverge.
+    assert floor_for_conv_state(c1) is f1
+    assert len(keep) == 2
 
 
-def test_an_unchanged_baseline_still_shares_and_keeps_its_accumulation(tmp_path) -> None:
-    """The other half of the same rule: an identical baseline MUST keep sharing, or the two hands
-    stop converging and round 2's glm finding comes straight back. And the spawn-time accumulation
-    on the live policy must survive — it is fail-closed and re-deriving it would drop denies."""
-    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
-    import dataclasses
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()
-
-    a = floor_for_conv_state(_FakeConvState(ws))
-    late = (tmp_path / "late.sock").resolve()
-    a.policy = dataclasses.replace(a.policy, deny_sockets=a.policy.deny_sockets + (late,))
-
-    b = floor_for_conv_state(_FakeConvState(ws))
-    assert b is a, "an unchanged baseline must keep sharing one floor"
-    assert late in b.policy.deny_sockets, "the spawn-time accumulation was dropped"
-
-
-def test_ensure_shell_does_not_crash_when_a_provider_returns_no_shell(tmp_path, monkeypatch) -> None:
-    """⛔ complement HIGH + glm MED. `spawn_shell` guards `if shell is not None` with a comment
-    saying `_spawn_shell_impl` may return a falsy sentinel — so its own return can be None, and
-    `_ensure_shell` dereferenced it one line later. `__call__` converts ConfinementError into an
-    in-band refusal, NOT AttributeError, so it was an unhandled crash.
-
-    ⚡ Anticipating a case in one function and not at its only call site is worse than not
-    anticipating it: the existing guard reads as though the case is handled."""
-    from levain.firing.openhands.tools import SandboxedBashExecutor
+def test_an_executor_needs_exactly_one_of_policy_or_floor(tmp_path) -> None:
+    """⛔ codex L3 LOW. Accepting both and silently preferring `floor` is FAIL-OPEN: a strict policy
+    beside an accidentally permissive floor yielded the permissive one with no error."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor, _SharedFloor
     from levain.firing.confinement import build_policy
+
+    ent, ws = _entity(tmp_path)
+    pol = build_policy(ent, workspace=ws)
+    with pytest.raises(TypeError, match="EXACTLY ONE"):
+        CrownJewelsFileEditorExecutor(policy=pol, floor=_SharedFloor(pol))
+    with pytest.raises(TypeError, match="EXACTLY ONE"):
+        CrownJewelsFileEditorExecutor()
+
+
+def test_a_provider_returning_a_non_shell_is_refused_at_the_source(tmp_path, monkeypatch) -> None:
+    """⛔ codex L3 MED: my earlier `None` guard only MOVED the crash. `_ensure_shell` returned None
+    and its caller raised `AttributeError` on `.run` one line later — and `__call__` converts
+    `ConfinementError` into an in-band refusal, NOT `AttributeError`, so it stayed unhandled.
+    ⚡ A guard that relocates an unhandled crash is worse than none, because the code then READS as
+    handled. The CONTRACT was the defect: `spawn_shell` declares a non-optional return, so anything
+    else is a provider bug and is refused fail-closed at the source."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import ConfinementError, build_policy
     import levain.firing.openhands.tools as _t
 
     ent, ws = _entity(tmp_path)
     ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
 
     class _NullProvider:
-        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
             return None
 
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            from levain.firing.confinement import ConfinementProvider
+            return ConfinementProvider.spawn_shell(self, policy, env=env,
+                                                   default_timeout=default_timeout)
+
+        def render_profile(self, policy):
+            return ""
+
     monkeypatch.setattr(_t, "select_provider", lambda: _NullProvider())
-    assert ex._ensure_shell() is None  # must not raise AttributeError
+    with pytest.raises(ConfinementError, match="not a SandboxedShell"):
+        ex._ensure_shell()
