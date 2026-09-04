@@ -789,7 +789,9 @@ def _print_banner(
             print("             container daemon sockets: docker \u00b7 podman \u00b7 containerd \u00b7 CRI-O")
             print("               (a root daemon outside this sandbox would read any path for it)")
             print("             \u26a0 NOT covered: a custom $DOCKER_HOST, a TCP daemon endpoint, or a")
-            print("               runtime whose socket is not in that list — the deny is BY NAME")
+            print("               runtime whose socket is not in that list — the deny is BY NAME,")
+            print("               and pinning one in deny_files does NOT close it (that denies the")
+            print("               FILE, not the connect). No operator socket list exists yet.")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —

@@ -285,6 +285,21 @@ _STANDARD_CRED_FILES = (
 # necessarily incomplete: a custom $DOCKER_HOST, a k8s/containerd/lima/OrbStack socket, or a
 # TCP endpoint are all outside it. THEREFORE THE BANNER NAMES WHICH SOCKETS ARE COVERED AND
 # NEVER CLAIMS CONTAINERS ARE FENCED. An unqualified claim here would be worse than the hole.
+#
+# ⛔⛔ AND THE INCOMPLETENESS IS CURRENTLY **NON-REMEDIABLE BY THE OPERATOR** — SAY SO, BECAUSE
+# THE OBVIOUS REMEDY IS MEASURED-INERT (glm-5.3 L3, 2026-09-04). This module's documented answer
+# for every OTHER un-enumerated jewel is "pin it via ``deny_files``" — it says exactly that for a
+# custom ``AuthorizedKeysFile``. For a SOCKET that advice silently fails: ``deny_files`` renders
+# only ``(deny file-read* file-write* (literal ...))``, and this very field's comment records the
+# measurement that such a rule DOES NOT BLOCK ``connect()``. So an operator running OrbStack, a
+# non-default colima profile (``colima start -p work``), or any socket outside the eight would
+# pin it, receive the rename- and ancestor-denies, and get **no connect protection at all while
+# believing it closed** — a false closure, which is worse than a known gap.
+# ▶ There is deliberately NO operator-declared socket list yet: ``ConfinementConfig`` carries only
+# the all-or-nothing ``allow_container_sockets``. Adding a ``deny_sockets`` config key (resolved
+# into ``sockets_l`` AND both spellings into ``deny_write_files_l``, so operator sockets get the
+# identical three arms) is the right fix and is FILED FORWARD, not done inside a release freeze.
+# Until it lands, the honesty floor is this paragraph plus the banner line.
 _CONTAINER_DAEMON_SOCKETS = (
     "/var/run/docker.sock",                 # the canonical Docker/OCI endpoint (often a symlink)
     "~/.docker/run/docker.sock",            # Docker Desktop for Mac — what /var/run resolves TO
@@ -351,6 +366,18 @@ class CrownJewelsPolicy:
     # the attack still returned the jewel. Blocking the connect needs ``network-outbound``.
     # Folding sockets into ``deny_files`` would put them in a field whose renderer cannot deny
     # them — a guard that cannot see its own subject, in the one module where that is fatal.
+    #
+    # ✅ CASE AND UNICODE NORMALISATION ARE **NOT** A HOLE HERE — MEASURED 2026-09-04, because a
+    # reviewer reasonably raised it: this module built ``_canon``/``_ci_within`` precisely
+    # because ``Path.resolve()`` folds NEITHER, so a case- or NFD-variant path reaches the same
+    # file while comparing unequal — and nothing casefolds these SBPL literals. On a
+    # case-insensitive APFS volume (verified as the precondition), against a live socket with
+    # only the exact resolved literal denied: ``TEST.sock`` REFUSED, ``Test.Sock`` REFUSED, an
+    # NFD spelling of an NFC-bound socket REFUSED (the NFD path confirmed present on disk), and
+    # the host-side connect still succeeded throughout, so the refusals are the sandbox's doing
+    # and not a dead socket. **Seatbelt folds case and normalisation for network-outbound.**
+    # ⛔ DO NOT ADD A REGEX BELT FOR THIS. It was proposed and is a measured no-op; a regex here
+    # would be a second, weaker matcher over the one deny in this profile where a miss is total.
     #
     # ⚠ RESOLVED ONLY, and this is the opposite of ``deny_write_files`` two lines up. Seatbelt
     # CANONICALISES the path for network-outbound (as it does for read/write data ops), so a
@@ -660,7 +687,21 @@ def build_policy(
         for s in _CONTAINER_DAEMON_SOCKETS:
             lex = Path(s).expanduser()
             sockets_l.append(lex.resolve())
-            # (ii): both spellings, for the lexically-matched link ops.
+            # (ii): BOTH spellings — but the reason differs per path, and the first version of
+            # this comment said only "for the lexically-matched link ops", which is FALSE for
+            # the /var- and /run-sited entries (glm-5.3 L3, 2026-09-04, CONFIRMED by measurement
+            # here rather than adopted). MEASURED on Darwin with /tmp -> /private/tmp: a
+            # write-deny naming ONLY the lexical path lets `rm` through at exit 0, while the
+            # resolved-only deny refuses it — seatbelt canonicalises ANCESTOR components for
+            # every operation, which this module's ssh block (b) already measured and states.
+            # So for /var/run/docker.sock, /run/*, /var/run/containerd/*, /var/run/crio/* the
+            # LEXICAL entry fires for NOTHING on macOS; the resolved entry carries all of the
+            # enforcement. Only the $HOME-sited spellings (~/.docker, ~/.colima, ~/.local/...)
+            # have both live, because an ordinary $HOME chain has no symlinked ancestor.
+            # ▶ THE LEXICAL ENTRIES ARE KEPT AS CROSS-PROVIDER DEFENCE-IN-DEPTH — a bwrap
+            # provider matches mount paths lexically — not because they do work here today.
+            # ⚠ Written out because this field's own comment warns that a maintainer may
+            # "believe it is the entry doing the work", and I had just given them a reason to.
             deny_write_files_l.append(lex)
             deny_write_files_l.append(lex.resolve())
     deny_sockets_t = _dedup(sockets_l)
