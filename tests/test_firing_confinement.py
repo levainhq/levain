@@ -2146,3 +2146,26 @@ def test_every_socket_arm_comes_from_one_resolution_pass(tmp_path, monkeypatch) 
     )
     assert sock.resolve() in pol.deny_sockets
     assert sock.resolve() in pol.deny_write_files
+
+
+def test_virtual_subclassing_via_register_is_refused(tmp_path) -> None:
+    """⛔ complement HIGH, 2026-09-04, CONFIRMED BY EXECUTION before this test was written.
+    `_ProviderMeta` subclasses ABCMeta, so `ConfinementProvider` inherited `register()` — and a
+    registered class becomes an isinstance/issubclass match WITHOUT passing through `__new__`.
+    Measured: a class with its own unrefreshed `spawn_shell`, registered, returned
+    `isinstance(...) is True` while the finality check never ran.
+
+    ⚡ `register()` is THE standard idiom for a third party whose provider already has an unrelated
+    base class — which is the exact case this metaclass's docstring names as its threat model. A
+    guard that closes normal inheritance and leaves the documented workaround open is not a guard."""
+    from levain.firing.confinement import ConfinementProvider
+
+    class _Rogue:
+        def render_profile(self, policy):
+            return ""
+
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            return None  # never refreshes
+
+    with pytest.raises(TypeError, match="virtual subclassing"):
+        ConfinementProvider.register(_Rogue)

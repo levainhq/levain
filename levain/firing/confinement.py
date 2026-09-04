@@ -1740,7 +1740,8 @@ class SandboxedShell:
 # --- the provider seam (mirrors levain.daemon.DaemonProvider) --------------------------------
 
 class _ProviderMeta(ABCMeta):
-    """Metaclass that makes :meth:`ConfinementProvider.spawn_shell` genuinely final.
+    """Metaclass that makes :meth:`ConfinementProvider.spawn_shell` final against every way a
+    provider can be DEFINED — subclassing, mixin shadowing, and virtual registration.
 
     ⛔ THIS REPLACED AN ``__init_subclass__`` GUARD THAT CHECKED ``cls.__dict__`` (codex L3 #2 and
     complement, convergent, 2026-09-04). Two holes in that version, both demonstrated by the
@@ -1759,7 +1760,41 @@ class _ProviderMeta(ABCMeta):
     exercised the direct-override case the guard checked.
 
     ⚠ ``typing.final`` is deliberately NOT the answer: it is a type-checker hint with no runtime
-    effect, and this seam has to hold against a provider nobody type-checked."""
+    effect, and this seam has to hold against a provider nobody type-checked.
+
+    ⚠ **THE ONE GAP THIS DOES NOT CLOSE, STATED RATHER THAN LEFT TO A READER'S ASSUMPTION**
+    (complement LOW, 2026-09-04): the check runs at CLASS CREATION and at ``register()``. Assigning
+    ``SomeProvider.spawn_shell = other`` on an ALREADY-CREATED class is not intercepted — there is no
+    ``__setattr__`` hook here. That is a narrower path (it needs code running against an imported
+    class, not merely a class definition) and it is the same reach a ``monkeypatch.setattr`` in a
+    test has, which is legitimate. So this is "final against the ways a provider gets DEFINED", not
+    "final against arbitrary mutation" — the earlier wording said the latter, which overclaimed."""
+
+    def register(cls, subclass):  # type: ignore[override,no-untyped-def]
+        """⛔ REFUSE VIRTUAL SUBCLASSING (complement HIGH, 2026-09-04, CONFIRMED BY EXECUTION).
+
+        ``_ProviderMeta`` subclasses :class:`~abc.ABCMeta`, so ``ConfinementProvider`` inherited
+        ``register()`` — and a registered class becomes an ``isinstance``/``issubclass`` match
+        WITHOUT ever passing through :meth:`__new__`. Measured: a class with its own unrefreshed
+        ``spawn_shell``, registered, returned ``isinstance(...) is True`` while the finality check
+        never ran. Any dispatch that trusts the ABC would then accept a provider that renders a
+        STALE socket floor — the exact outcome the metaclass exists to make impossible.
+
+        ⚡ And ``register()`` is not an exotic path: it is THE standard idiom a third party reaches
+        for when their provider already has an unrelated base class, which is the case the class
+        docstring names as its own threat model. A guard that closes normal inheritance and leaves
+        the documented workaround open is not a guard.
+
+        Refused outright rather than validated, because there is nothing to validate: a virtual
+        subclass shares no code with this class, so its ``spawn_shell`` cannot be the inherited one.
+        Inherit from :class:`ConfinementProvider` properly, or wrap."""
+        raise TypeError(
+            "virtual subclassing of ConfinementProvider via register() is refused — spawn_shell "
+            "finality cannot be verified for a class that does not inherit it, and a registered "
+            "provider could render a stale socket floor (spore-768). Inherit from "
+            "ConfinementProvider and implement `_spawn_shell_impl`, or wrap your class in one that "
+            "does."
+        )
 
     def __new__(mcls, name, bases, namespace, /, **kwargs):  # type: ignore[no-untyped-def]
         cls = super().__new__(mcls, name, bases, namespace, **kwargs)
