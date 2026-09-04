@@ -39,6 +39,7 @@ from levain.firing.confinement import (
     confinement_supported,
     crown_jewel_reason,
     load_confinement_config,
+    refresh_socket_denies,
     sandbox_exec_available,
     select_provider,
 )
@@ -1777,3 +1778,162 @@ def test_socket_classification_does_no_filesystem_io(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(Path, "resolve", _boom)
     reason = crown_jewel_reason(policy, sock)
     assert reason is not None and "socket" in reason
+
+
+# --- spore-768: the socket connect arm is re-resolved AT SPAWN, not at policy build ----------
+#
+# ⛔ THE DEFECT THESE PIN (codex L3 HIGH, 2026-09-04, reproduced end to end before the fix):
+# `build_policy` resolved each listed socket and the confined shell spawned LAZILY afterwards, so a
+# listed path that was ABSENT at build resolved to itself, and a symlink created there later made
+# seatbelt canonicalise `connect()` to a target absent from `deny_sockets`. The connect THROUGH THE
+# LISTED NAME returned the payload. What it cost was the CLAIM (marginal exposure was zero — the
+# entity cannot create that symlink, and the unlisted target was already reachable under its own
+# name), which is why these tests assert the CONTENT of the deny set and the SEAM that refreshes it,
+# not an exploit outcome.
+
+
+def test_a_listed_socket_absent_at_build_is_re_resolved_at_spawn(tmp_path, monkeypatch) -> None:
+    """THE TOCTOU ITSELF. A listed path that does not exist when the policy is built resolves to
+    ITSELF; if it becomes a symlink to an unlisted target before the shell spawns, the refresh must
+    put that TARGET in the connect deny — otherwise seatbelt canonicalises the connect to a path
+    nothing names."""
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+    # Absent at build → it resolved to itself, which is INERT for network-outbound.
+    assert pol.deny_sockets == (listed.resolve(),)
+
+    unlisted = tmp_path / "elsewhere" / "evil.sock"
+    unlisted.parent.mkdir(parents=True)
+    unlisted.touch()
+    listed.symlink_to(unlisted)
+
+    fresh = refresh_socket_denies(pol)
+    assert unlisted.resolve() in fresh.deny_sockets, (
+        "the symlink target must be denied after the refresh — this is the HIGH"
+    )
+
+
+def test_the_refresh_unions_and_can_never_drop_a_build_time_deny(tmp_path, monkeypatch) -> None:
+    """⛔ THE FAIL-CLOSED PROPERTY, AND THE ONE THAT MAKES THE REFRESH SAFE TO RUN AT ALL.
+
+    A refresh that REPLACED the set would hand an attacker the deletion primitive the refresh exists
+    to deny them: point a listed socket at a decoy immediately before spawn and the real target falls
+    off the deny list. Union makes `deny_sockets` MONOTONIC — a re-resolution can only ever ADD.
+    Mutation-checked: changing `refresh_socket_denies` to `replace(policy, deny_sockets=fresh)`
+    fails exactly this test and nothing else in this file."""
+    real = tmp_path / "real.sock"
+    real.touch()
+    decoy = tmp_path / "decoy.sock"
+    decoy.touch()
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    listed.symlink_to(real)
+
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+    assert real.resolve() in pol.deny_sockets
+
+    listed.unlink()
+    listed.symlink_to(decoy)
+    fresh = refresh_socket_denies(pol)
+
+    assert real.resolve() in fresh.deny_sockets, "a re-resolution must NEVER drop an existing deny"
+    assert decoy.resolve() in fresh.deny_sockets
+
+
+def test_the_refresh_is_a_no_op_when_nothing_moved(tmp_path, monkeypatch) -> None:
+    """Idempotence, which is also the anti-drift check: `build_policy` and `refresh_socket_denies`
+    run the SAME derivation (`_resolve_socket_targets`), so a refresh over an unchanged filesystem
+    must return the identical object. If the two derivations ever diverge, this fails."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True)
+    sock.touch()
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+    assert refresh_socket_denies(pol) is pol
+
+
+def test_the_socket_opt_out_survives_the_refresh(tmp_path, monkeypatch) -> None:
+    """`allow_container_sockets=True` leaves `socket_sources` EMPTY, so the refresh is an identity —
+    it cannot resurrect a floor the operator deliberately opted out of. This is why the policy
+    carries the lexical source list rather than the refresh re-reading the module constant: reading
+    the constant would re-deny sockets for an operator who turned the floor off."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True)
+    sock.touch()
+    pol = _sock_policy(tmp_path, monkeypatch, sock, allow_container_sockets=True)
+    assert pol.socket_sources == ()
+    assert refresh_socket_denies(pol) is pol
+    assert refresh_socket_denies(pol).deny_sockets == ()
+
+
+def test_a_resolution_failure_refuses_rather_than_emitting_a_wrong_deny(tmp_path, monkeypatch) -> None:
+    """FAIL-CLOSED at the derivation. A socket path that cannot be resolved must raise
+    `ConfinementError` — `spawn_shell`'s contract is to refuse rather than hand back a shell whose
+    connect deny may name the wrong target.
+
+    ⚠ MONKEYPATCHED, NOT REPRODUCED ON DISK, AND SAID SO RATHER THAN DRESSED UP: the obvious
+    filesystem trigger does NOT fire — measured on CPython 3.13, `Path.resolve()` over a symlink LOOP
+    returns the lexical path instead of raising ELOOP. The handler is defensive depth for a resolver
+    that CAN raise (a future strict resolve, a different platform, a `~user` spelling reaching
+    expanduser); pinning it with a fake keeps the fail-closed BRANCH honest without a test that
+    claims a repro it does not have."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True)
+    sock.touch()
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+
+    def _boom(self, *a, **k):
+        raise OSError("simulated resolution failure")
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    with pytest.raises(ConfinementError, match="refusing to build the confinement floor"):
+        refresh_socket_denies(pol)
+
+
+def test_spawn_shell_refreshes_the_socket_arm_before_any_provider_renders(tmp_path, monkeypatch) -> None:
+    """⛔ THE STRUCTURAL GUARD, AND THE REASON `spawn_shell` STOPPED BEING ABSTRACT.
+
+    The refresh must be impossible for a provider to skip. `ConfinementProvider.spawn_shell` is a
+    concrete template method that refreshes and delegates to `_spawn_shell_impl`, so a provider
+    authored BEFORE this fix — `BwrapProvider` exists on the held `k4c-linux` branch and is exactly
+    that case — inherits it by merging rather than by someone remembering a docstring.
+
+    This test drives a provider that records the policy it was handed, so it fails if the template
+    method is ever reverted to `@abstractmethod` or the refresh is moved into one provider."""
+    from levain.firing.confinement import ConfinementProvider
+
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+
+    unlisted = tmp_path / "elsewhere" / "evil.sock"
+    unlisted.parent.mkdir(parents=True)
+    unlisted.touch()
+    listed.symlink_to(unlisted)
+
+    seen: list[CrownJewelsPolicy] = []
+
+    class _Recorder(ConfinementProvider):
+        def render_profile(self, policy):  # pragma: no cover — not exercised here
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            seen.append(policy)
+            return None  # type: ignore[return-value]
+
+    _Recorder().spawn_shell(pol)
+    assert len(seen) == 1
+    assert unlisted.resolve() in seen[0].deny_sockets, (
+        "the provider was handed a STALE policy — the seam did not refresh"
+    )
+
+
+def test_a_provider_cannot_implement_the_old_abstract_spawn_shell_by_accident() -> None:
+    """The rename is the enforcement: `_spawn_shell_impl` is the abstract member, so a subclass that
+    defines only the OLD `spawn_shell` name overrides the template method and loses the refresh
+    silently. Assert the ABC's abstract set names the impl, so that mistake is a TypeError at
+    instantiation rather than a quiet reopening of the HIGH."""
+    from levain.firing.confinement import ConfinementProvider
+
+    assert "_spawn_shell_impl" in ConfinementProvider.__abstractmethods__
+    assert "spawn_shell" not in ConfinementProvider.__abstractmethods__
