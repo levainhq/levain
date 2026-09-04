@@ -2549,8 +2549,29 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     if policy.config_file is not None:
         deny_both.append(policy.config_file)
     for f in deny_both:
-        if _shadowed_by(f, roots):
-            continue  # already hidden by a tmpfs; binding it back would re-expose it
+        # ⛔ NO `continue` HERE — THE SKIP'S JUSTIFICATION WAS FALSE FOR THE FORM ACTUALLY IN USE
+        # (Diogenes MEDIUM, 2026-09-04). This read `if _shadowed_by(f, roots): continue  # already
+        # hidden by a tmpfs; binding it back would re-expose it`. The bind below is
+        # `--ro-bind /dev/null <path>`, which binds **/dev/null** and re-exposes NOTHING — which is
+        # exactly why step (5) uses that same form under identical shadowing, under a comment
+        # explaining that the honesty is restored per-file on the paths that matter.
+        #
+        # WHAT THE SKIP COST, and it hit the STRICTER deny class while the weaker one stayed
+        # protected: the ssh tmpfs is the ONE tmpfs not paired with `--remount-ro`, because
+        # `known_hosts` must stay writable. So a caller-pinned `deny_files` path landing under
+        # ~/.ssh in agent mode got NO mount at all, and a WRITE to it silently SUCCEEDED into the
+        # ephemeral tmpfs and evaporated — the dishonest-refusal shape this module refuses three
+        # paragraphs earlier, and a divergence from macOS, where `SeatbeltProvider` emits an
+        # unconditional `(deny file-read* file-write*` for every `deny_files` entry.
+        #
+        # ⚠ IT IS REACHABLE BY THIS MODULE'S OWN INSTRUCTIONS: the docstring's custom
+        # `AuthorizedKeysFile` limit tells the operator to pin it via `deny_files`, and a
+        # non-default `AuthorizedKeysFile` normally lives under ~/.ssh.
+        #
+        # ⚡ AND `_shadowed_by`'s OWN DOCSTRING ALREADY DESCRIBED THE CORRECT BEHAVIOUR — it says it
+        # "SELECTS THE FORM rather than skipping the path" and points at the write-only block "for
+        # why it is applied rather than skipping outright". It described step (5) while step (4),
+        # its other call site, did the opposite. The helper was right; one caller was not.
         argv += ["--ro-bind", "/dev/null", str(f)]
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory

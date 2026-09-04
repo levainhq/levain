@@ -2742,3 +2742,44 @@ def test_apparmor_probe_is_diagnostic_only_and_never_gates(monkeypatch) -> None:
     before = bwrap_available()
     assert bwrap_available() == before
     assert calls == [], "bwrap_available consulted the AppArmor sysctl — that is the defect"
+
+
+def test_a_pinned_deny_file_under_ssh_is_bound_not_skipped(tmp_path, monkeypatch) -> None:
+    """⛔ THE SKIP DROPPED THE **STRICTER** DENY CLASS WHILE THE WEAKER ONE STAYED PROTECTED.
+
+    Step (4) used to `continue` on any path already shadowed by a tmpfs, reasoning that "binding it
+    back would re-expose it". False for the form in use: the bind is `--ro-bind /dev/null <path>`,
+    which binds /dev/null and re-exposes nothing — which is exactly why step (5) uses that same form
+    under identical shadowing.
+
+    The cost is scoped to the ssh tmpfs, and only because of a property that is correct for its own
+    reason: it is the ONE tmpfs not paired with `--remount-ro`, since `known_hosts` must stay
+    writable. So a caller-pinned `deny_files` path landing under ~/.ssh in agent mode got no mount at
+    all, and a WRITE to it silently SUCCEEDED into the ephemeral tmpfs and evaporated — a dishonest
+    refusal, and a divergence from macOS, where every `deny_files` entry gets an unconditional
+    `(deny file-read* file-write*`.
+
+    ⚠ REACHABLE BY THE MODULE'S OWN INSTRUCTIONS: the docstring's custom `AuthorizedKeysFile` limit
+    tells the operator to pin it via `deny_files`, and a non-default `AuthorizedKeysFile` normally
+    lives under ~/.ssh.
+
+    Falsified against a control when written: pre-fix the pinned path is ABSENT from the argv and
+    the step-(5) vector is present; post-fix both are present."""
+    home = tmp_path
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "authorized_keys").write_text("k")
+    custom = home / ".ssh" / "authorized_keys_custom"
+    custom.write_text("k2")
+    policy = build_policy(_entity(home), ssh_mode="agent", deny_files=(custom,))
+    argv = _bwrap_argv(policy)
+
+    dests = [dest for _src, dest in _triples(argv, "--ro-bind")]
+    assert str(custom.resolve()) in dests, (
+        "a caller-pinned deny_files path under ~/.ssh got NO bwrap mount, so a write to it "
+        "silently succeeds into the ssh tmpfs and evaporates"
+    )
+    # and it is bound from /dev/null — the form that denies without re-exposing
+    assert ("/dev/null", str(custom.resolve())) in _triples(argv, "--ro-bind")
+    # the step-(5) vector is unaffected either way; it is the CONTROL for this test
+    assert str((home / ".ssh" / "authorized_keys").resolve()) in dests
