@@ -86,6 +86,7 @@ from levain.firing.confinement import (
     build_policy,
     crown_jewel_reason,
     load_confinement_config,
+    refresh_socket_denies,
     select_provider,
 )
 from levain.firing.drive import current_drive_mode, resolve_cred_floor
@@ -304,6 +305,19 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         with self._lock:
             if self._shell is None or self._shell.closed:
                 provider = select_provider()  # raises ConfinementError off a supported platform
+                # ⛔ ASSIGN THE REFRESH BACK — THE UNION IS ONLY MONOTONIC IF THE RESULT IS KEPT
+                # (codex L3 #2, spore-768, 2026-09-04). `spawn_shell` re-resolves the socket floor
+                # and renders the refreshed policy, but the FIRST version discarded it: this method
+                # respawns after every `exit`, always from the build-time `self._policy`, so a
+                # target denied at spawn 1 fell back off the list at spawn 2 and became reachable
+                # again. The "a re-resolution can only ever ADD" property was true within one spawn
+                # and false across exactly the respawns its own comment relied on.
+                # ⚠ Deliberately BOTH here and inside `spawn_shell`: this line makes the union
+                # persist for THIS executor, and the one in the provider seam makes it apply to any
+                # provider, including a caller that does not go through this executor. The function
+                # is idempotent and monotonic, so running it twice costs a resolution and changes
+                # nothing.
+                self._policy = refresh_socket_denies(self._policy)
                 self._shell = provider.spawn_shell(
                     self._policy, default_timeout=self._default_timeout
                 )

@@ -53,9 +53,16 @@ every `exit`). A listed socket that did not exist yet resolved to itself, so if 
 as a symlink to an unlisted target in between, a connect through the **listed name** landed on a
 target nothing denied.
 
-The resolution now re-runs every time a shell starts, and the fresh targets are **added** to the
-existing set rather than replacing it, so a re-resolution can only ever widen the denylist. Coverage
-is now a spawn-time snapshot instead of a build-time one, and `levain run` says so in those words.
+The resolution now re-runs every time a shell starts, and a freshly-resolved target gets the **same
+three rules** as a socket named in the list — connect, rename, and relocation — not just the connect
+one. The fresh entries are **added** to the existing set rather than replacing it, and the widened
+set carries forward into the next shell, so the denylist can only ever grow across a session.
+Coverage is now a spawn-time snapshot instead of a build-time one, and `levain run` says so in those
+words.
+
+The first version of this fix updated only the connect rule, which the three rules above already
+explain is not enough on its own — a review caught it before release, and the tests now pin all
+three.
 
 **What this was, honestly: a wrong claim rather than a new hole.** A confined entity cannot create
 that symlink — the socket is write-denied at both spellings, which is one of the three rules above —

@@ -1937,3 +1937,136 @@ def test_a_provider_cannot_implement_the_old_abstract_spawn_shell_by_accident() 
 
     assert "_spawn_shell_impl" in ConfinementProvider.__abstractmethods__
     assert "spawn_shell" not in ConfinementProvider.__abstractmethods__
+
+
+# --- spore-768 round 2: the codex L3 on the FIX itself (2026-09-04) --------------------------
+#
+# The first version of the refresh touched ONLY the connect arm. codex filed that as a HIGH and glm
+# converged on it independently; confirmed by execution before these tests were written. Each test
+# below pins one finding from that review.
+
+
+def test_the_refresh_gives_a_fresh_target_all_three_arms_not_just_the_connect(tmp_path, monkeypatch) -> None:
+    """⛔ THE HIGH FROM THE REVIEW OF THE FIX (codex + glm, convergent). A connect deny ALONE is
+    defeated by `mv` — this module measured that for the built-in sockets and it is just as true for
+    a target the refresh has only now learned about. Version 1 put the fresh target in `deny_sockets`
+    and nowhere else, so `crown_jewel_reason` returned None for it and BOTH hands would have let the
+    entity rename it and connect to the new name — reopening the window the refresh exists to close.
+
+    All three arms, from one resolution: connect (i), write-deny at both spellings (ii), ancestor
+    write-deny (iii)."""
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+
+    unlisted = tmp_path / "elsewhere" / "real.sock"
+    unlisted.parent.mkdir(parents=True)
+    unlisted.touch()
+    listed.symlink_to(unlisted)
+
+    fresh = refresh_socket_denies(pol)
+    target = unlisted.resolve()
+
+    assert target in fresh.deny_sockets, "arm (i): connect"
+    assert target in fresh.deny_write_files, "arm (ii): rename/unlink of the socket itself"
+    assert target.parent in fresh.deny_write_dirs, "arm (iii): relocation of an ancestor"
+    assert crown_jewel_reason(fresh, target) is not None, (
+        "the in-process hand must also refuse it — otherwise the file editor renames what the "
+        "seatbelt hand cannot"
+    )
+
+
+def test_a_refreshed_policy_carries_its_union_into_the_next_respawn(tmp_path, monkeypatch) -> None:
+    """⛔ MONOTONICITY IS ONLY REAL IF THE RESULT IS KEPT (codex L3 #2). The shell respawns after
+    every `exit`, and version 1 rendered the refreshed policy then threw it away — so spawn 2 began
+    from the build-time set and a target denied at spawn 1 became reachable again. "Can only ever
+    ADD" was true within one spawn and false across the respawns the design relied on.
+
+    Simulate the executor's loop: feed each refresh's OUTPUT into the next one, repointing the
+    symlink in between, and assert nothing is ever lost."""
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    first = tmp_path / "a.sock"
+    first.touch()
+    listed.symlink_to(first)
+
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+    pol = refresh_socket_denies(pol)          # spawn 1
+
+    second = tmp_path / "b.sock"
+    second.touch()
+    listed.unlink()
+    listed.symlink_to(second)
+    pol = refresh_socket_denies(pol)          # spawn 2, carrying spawn 1's result
+
+    assert first.resolve() in pol.deny_sockets, "spawn 1's target was dropped by spawn 2"
+    assert second.resolve() in pol.deny_sockets
+    assert first.resolve() in pol.deny_write_files
+    assert second.resolve() in pol.deny_write_files
+
+
+def test_a_provider_overriding_spawn_shell_is_refused_at_class_definition(tmp_path) -> None:
+    """⛔ THE CLAIM BECOMES A MECHANISM (codex L3 #3, and self-caught the same hour). Making
+    spawn_shell concrete stops a provider FORGETTING the refresh; it does not stop one from defining
+    spawn_shell itself and skipping it silently. Until `__init_subclass__` existed, the docstring
+    said "impossible for a provider to skip" while the mechanism only made it inconvenient — a
+    claim > enforcement gap, in the module whose own comments name that as what it refuses.
+    `typing.final` is a type-checker hint and does not fire at runtime."""
+    from levain.firing.confinement import ConfinementProvider
+
+    with pytest.raises(TypeError, match="overrides ConfinementProvider.spawn_shell"):
+        class _Sneaky(ConfinementProvider):
+            def render_profile(self, policy):
+                return ""
+
+            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+                return None
+
+            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+                return None  # skips the refresh entirely
+
+
+def test_socket_sources_is_the_last_field_so_positional_construction_is_unbroken() -> None:
+    """⛔ A NEW FIELD ON AN EXPORTED DATACLASS GOES LAST (codex L3 #4). `socket_sources` was first
+    inserted before `own_memory_files`, shifting every later POSITIONAL index. Code built against
+    the old signature passing `own_memory_files` positionally would have landed the entity's own
+    memory paths in `socket_sources` — resolved and network-denied as if they were sockets, while
+    LOSING the write-deny that is the whole point of `own_memory_files` (the poison-the-always-
+    loaded-memory vector). Pin the tail order so the next added field does not repeat it."""
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(CrownJewelsPolicy)]
+    assert names[-1] == "socket_sources"
+    assert names.index("own_memory_files") < names.index("socket_sources")
+
+
+def test_every_socket_arm_comes_from_one_resolution_pass(tmp_path, monkeypatch) -> None:
+    """⛔ ONE RESOLUTION, NOT THREE (codex L3 #5 + glm). build_policy used to resolve the sources in
+    three separate places, so a concurrent retarget could give the connect arm, the write arm and the
+    message-classification arm three different snapshots — a connect-deny naming one target while
+    the write-deny protecting it named another. Count the resolutions to pin that they share one."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True)
+    sock.touch()
+
+    from levain.firing import confinement as _conf
+    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(sock),))
+
+    calls: list[Path] = []
+    real = Path.resolve
+
+    def _counting(self, *a, **k):
+        calls.append(self)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "resolve", _counting)
+    pol = build_policy(tmp_path / "ent")
+    monkeypatch.undo()
+
+    # The socket source is resolved exactly ONCE for all three arms.
+    assert sum(1 for c in calls if str(c) == str(sock)) == 1, (
+        f"the socket path was resolved {sum(1 for c in calls if str(c) == str(sock))} times; "
+        "the three arms must share one resolution"
+    )
+    assert sock.resolve() in pol.deny_sockets
+    assert sock.resolve() in pol.deny_write_files
