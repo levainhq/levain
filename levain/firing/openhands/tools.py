@@ -58,7 +58,9 @@ Requires the ``openhands`` extra.
 from __future__ import annotations
 
 import os
+import dataclasses
 import threading
+import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -161,81 +163,98 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
 
 
 class _SharedFloor:
-    """The ONE evolving :class:`CrownJewelsPolicy` that BOTH hands read.
+    """The ONE evolving :class:`CrownJewelsPolicy` for ONE CONVERSATION, read by BOTH hands.
 
-    ⛔ WHY THIS EXISTS — glm-5.2 L3, 2026-09-04, CONFIRMED against disk. Each hand's ``create``
-    called :func:`policy_for_conv_state` separately, producing two EQUAL BUT DISTINCT policy
-    objects. That was harmless while the spawn-time socket refresh touched only ``deny_sockets``
-    (the connect arm has no in-process twin) — and my own fix for the round-1 HIGH made the refresh
-    also update ``deny_write_files``, ``socket_spellings`` and ``deny_write_dirs``, which the file
-    editor DOES enforce. So the bash hand began evolving a floor the file-editor hand never saw.
-    ⚡ **THAT FALSIFIED A CLAIM THIS MODULE MAKES ABOUT ITSELF IN TWO PLACES** — the header's "built
-    by EACH hand's ``create`` from the SAME ``CrownJewelsPolicy``", and ``policy_for_conv_state``'s
-    "Both hands read the same value, so the file editor's rename-deny and the seatbelt's
-    connect-deny cannot disagree about whether sockets are fenced." A fix for a false claim about
-    socket coverage made a different claim false one file over.
+    ⛔ WHY IT EXISTS — glm-5.2 L3, 2026-09-04. Each hand's ``create`` called
+    :func:`policy_for_conv_state` separately, producing two EQUAL BUT DISTINCT policy objects. That
+    was harmless while the spawn-time socket refresh touched only ``deny_sockets`` (the connect arm
+    has no in-process twin), and stopped being harmless once the refresh also updated
+    ``deny_write_files`` / ``socket_spellings`` / ``deny_write_dirs``, which the file editor DOES
+    enforce. The bash hand then evolved a floor the file-editor hand never saw.
 
-    ⚠ HONEST ON SEVERITY: this was an INVARIANT break rather than a bypass. The rename vector the
-    socket write-deny exists to stop is a ``mv``, the file editor has no rename primitive, and the
-    bash hand — where ``mv`` actually happens — was covered throughout. It is fixed because "one
-    policy, two enforcers" is load-bearing and stated, not because an exploit was demonstrated.
+    ⛔⛔ **MUTATE THROUGH :meth:`absorb`, NEVER BY ASSIGNING ``.policy`` — codex L3 MED, 2026-09-04,
+    EXECUTION-REPRODUCED.** The previous version was assigned wholesale from the spawning executor's
+    snapshot under that executor's OWN lock. A per-instance lock does not serialize anything when the
+    object being mutated is SHARED: two executors could each read policy ``P``, spawn against ``P+A``
+    and ``P+B``, and the second assignment would discard the first — *"a previously denied live
+    container socket becomes reachable again"* after the losing executor respawned.
+    ⚡ Two independent defects in one line, and both are now structural rather than disciplinary: the
+    lock lives with the DATA it protects instead of with one of its writers, and the write is a UNION
+    MERGE instead of a replace, so a lost update is impossible rather than merely unlikely. Even with
+    per-conversation scoping (which leaves one bash mutator) this is kept — a floor that is only
+    correct because of who happens to call it is a contract, and this file's own history says
+    contracts drift."""
 
-    Mutable by design: :meth:`SandboxedBashExecutor._ensure_shell` assigns the policy the shell was
-    ACTUALLY confined by back into the floor, so the next respawn and the file editor both see it."""
-
-    __slots__ = ("policy", "baseline")
+    # ⛔ `__weakref__` MUST be in __slots__ for the WeakValueDictionary registry — without it the
+    # first `floor_for_conv_state()` raises `TypeError: cannot create weak reference`. Caught by the
+    # suite within seconds of the change, which is the argument for the suite and not for care.
+    __slots__ = ("_policy", "_lock", "__weakref__")
 
     def __init__(self, policy: CrownJewelsPolicy) -> None:
-        self.policy = policy
-        # ⛔ THE BUILD-TIME POLICY THIS FLOOR WAS CREATED FROM — kept so a cached floor can be
-        # detected as STALE (complement HIGH + glm HIGH, convergent, 2026-09-04). See
-        # `floor_for_conv_state`; without it a later conversation silently inherited an earlier
-        # one's floor, and the direction was fail-OPEN.
-        self.baseline = policy
+        self._policy = policy
+        self._lock = threading.Lock()
+
+    @property
+    def policy(self) -> CrownJewelsPolicy:
+        return self._policy
+
+    def absorb(self, spawned: CrownJewelsPolicy) -> None:
+        """UNION the four evolving socket fields of ``spawned`` into the live policy, under the
+        floor's own lock. Monotonic: a merge can only ever ADD a deny, never drop one — the same
+        fail-closed property :func:`refresh_socket_denies` provides within a single spawn, extended
+        across concurrent spawners."""
+        def _union(a: tuple[Path, ...], b: tuple[Path, ...]) -> tuple[Path, ...]:
+            seen: set[Path] = set()
+            out: list[Path] = []
+            for q in list(a) + list(b):
+                if q not in seen:
+                    seen.add(q)
+                    out.append(q)
+            return tuple(out)
+
+        with self._lock:
+            cur = self._policy
+            # Named explicitly rather than **kwargs: `dataclasses.replace` is type-checked per field,
+            # and a **dict defeats that on the one object where a wrong field is a security defect.
+            self._policy = dataclasses.replace(
+                cur,
+                deny_sockets=_union(cur.deny_sockets, spawned.deny_sockets),
+                deny_write_files=_union(cur.deny_write_files, spawned.deny_write_files),
+                socket_spellings=_union(cur.socket_spellings, spawned.socket_spellings),
+                deny_write_dirs=_union(cur.deny_write_dirs, spawned.deny_write_dirs),
+            )
 
 
-# Keyed on the pair that DEFINES an entity's floor, so two hands of one entity share a floor and two
-# different entities can never collide. Not weak-keyed on conv_state: a conv_state is not guaranteed
-# hashable or weakref-able, and the identity that matters here is the ENTITY, not the conversation.
-_FLOORS: dict[tuple[Path, Path], _SharedFloor] = {}
+# ⛔ KEYED ON THE CONVERSATION, NOT ON (entity_dir, workspace) — codex L3, 2026-09-04, and it is the
+# single change that dissolves TWO findings at once rather than patching either.
+# ⚡ THE TENSION THAT KEYING ON THE ENTITY CREATED, NAMED SO IT IS NOT RE-ENTERED: sharing a floor
+# requires ONE object; keeping it fresh requires REPLACING it. Under an entity key those are the same
+# variable pulling opposite ways, and this file satisfied each of them one review round apart — round
+# 3 shared (and inherited a STALE cred floor into a later conversation, a fail-open), round 4 rebuilt
+# on a changed baseline (and handed the two hands DIFFERENT floors, so the editor could `view /secret`
+# while bash denied it). **A CONVERSATION HAS EXACTLY ONE BASELINE BY CONSTRUCTION**, so a
+# conversation key dissolves the tension instead of balancing it: there is nothing to refresh and
+# nothing to go stale, and the baseline comparison that caused the divergence is DELETED, not tuned.
+# `ConversationState.id` is a required UUID, so the key always exists for a real conversation.
+#
+# ⚠ WeakValueDictionary for the lifecycle: an entry disappears once no executor holds the floor, so a
+# long-running daemon does not accumulate one policy per conversation forever. The theoretical window
+# — first hand's tools garbage-collected between the two `create` calls — cannot occur, because
+# `create` returns the tool to the caller that keeps it.
+_FLOORS: "weakref.WeakValueDictionary[str, _SharedFloor]" = weakref.WeakValueDictionary()
 _FLOORS_LOCK = threading.Lock()
 
 
 def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
-    """The shared floor for this entity — created on first use, reused by the OTHER HAND of the same
-    run, and REBUILT whenever a freshly-built policy differs from the one it was created from.
-
-    ⛔ **THE REBUILD IS A FAIL-OPEN FIX, NOT AN OPTIMISATION** (complement HIGH + glm-5.2 HIGH,
-    convergent, 2026-09-04; I had self-caught a narrower version of it an hour earlier and the
-    reviewers' framing is the real one). The first version cached on `(entity_dir, workspace)` with
-    no eviction and simply DISCARDED the freshly-built policy on a hit. `policy_for_conv_state`
-    derives `deny_standard_creds` from `resolve_cred_floor(..., mode=current_drive_mode())`, so in a
-    long-running `levain daemon` — which K4a ships, running scheduled seats in ONE process —
-    conversation 1 as an interactive REPL (creds ALLOWED) would create the floor, and conversation 2
-    as an UNATTENDED seat against the same entity would be handed it, inheriting the permissive cred
-    floor. `~/.config/gh`, `~/.aws/credentials`, `~/.netrc` readable on an unattended seat is exactly
-    the fail-open the drive-mode tri-state exists to prevent. The same staleness applied to any
-    `confinement.json` the operator edited between conversations.
-    ⚡ Comparing the BASELINE rather than the live policy is what makes this correct: the live policy
-    legitimately grows at each spawn (the monotonic socket union), and carrying those EXTRA denies
-    into a later conversation is fail-CLOSED and harmless. **Only a changed baseline means a
-    different floor**, so this rebuilds on exactly the security-relevant difference and on nothing
-    else. It also bounds the dict by distinct `(entity_dir, workspace)` pairs rather than growing per
-    conversation.
-
-    ⛔ **THE LOCK IS NOT DEFENSIVE POLISH** (complement MED + glm, convergent; also self-caught).
-    `get` → construct → `set` is a check-then-act across several bytecodes. Two concurrent `create`
-    calls could both miss, both construct, and the second write win — leaving the two hands holding
-    DIFFERENT floor objects while every docstring and test says they share one. The failure mode is
-    silent divergence, which is precisely the invariant this whole indirection exists to provide."""
-    policy = policy_for_conv_state(conv_state)
-    key = (policy.entity_dir, policy.workspace)
+    """The shared floor for THIS CONVERSATION — created on first use, reused by the other hand."""
+    key = str(getattr(conv_state, "id", None) or id(conv_state))
     with _FLOORS_LOCK:
         floor = _FLOORS.get(key)
-        if floor is None or floor.baseline != policy:
-            floor = _SharedFloor(policy)
+        if floor is None:
+            floor = _SharedFloor(policy_for_conv_state(conv_state))
             _FLOORS[key] = floor
         return floor
+
 
 
 # --- the file-editor hand (relaxed to the crown-jewels floor) --------------------------------
@@ -272,10 +291,17 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         # `policy=` remains the simple form (tests, direct construction) and gets a PRIVATE floor,
         # so this hand behaves exactly as before. `floor=` is what `create` passes to share the
         # evolving floor with the bash hand (glm L3, 2026-09-04).
+        # ⛔ EXACTLY ONE OF `policy` / `floor` (codex L3 LOW, 2026-09-04). Accepting both and
+        # silently preferring `floor` is fail-OPEN: a caller passing a strict policy alongside an
+        # accidentally permissive floor got the permissive one with no error. On a crown-jewels
+        # constructor, a configuration mistake must be a TypeError, not a silent preference.
+        if (policy is None) == (floor is None):
+            raise TypeError(
+                "CrownJewelsFileEditorExecutor takes EXACTLY ONE of policy= or floor= "
+                "(got both or neither) — passing both would silently ignore the policy."
+            )
         if floor is None:
-            if policy is None:
-                raise TypeError("CrownJewelsFileEditorExecutor needs either policy= or floor=")
-            floor = _SharedFloor(policy)
+            floor = _SharedFloor(policy)  # type: ignore[arg-type]
         self._floor = floor
         super().__init__(workspace_root=str(self._floor.policy.workspace), **kwargs)
 
@@ -390,10 +416,17 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         floor: "_SharedFloor | None" = None,
         default_timeout: float = 120.0,
     ) -> None:
+        # ⛔ EXACTLY ONE OF `policy` / `floor` (codex L3 LOW, 2026-09-04). Accepting both and
+        # silently preferring `floor` is fail-OPEN: a caller passing a strict policy alongside an
+        # accidentally permissive floor got the permissive one with no error. On a crown-jewels
+        # constructor, a configuration mistake must be a TypeError, not a silent preference.
+        if (policy is None) == (floor is None):
+            raise TypeError(
+                "SandboxedBashExecutor takes EXACTLY ONE of policy= or floor= "
+                "(got both or neither) — passing both would silently ignore the policy."
+            )
         if floor is None:
-            if policy is None:
-                raise TypeError("SandboxedBashExecutor needs either a policy or floor=")
-            floor = _SharedFloor(policy)
+            floor = _SharedFloor(policy)  # type: ignore[arg-type]
         self._floor = floor
         self._default_timeout = default_timeout
 
@@ -425,23 +458,26 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 self._shell = provider.spawn_shell(
                     self._floor.policy, default_timeout=self._default_timeout
                 )
-                # ⛔ CACHE WHAT WAS ACTUALLY RENDERED, AND REFRESH IN EXACTLY ONE PLACE (codex L3
-                # #1, 2026-09-04). This method used to refresh here AND let `spawn_shell` refresh
-                # again, then keep the FIRST answer — so a target that only the provider's
-                # resolution saw was enforced for that shell and gone at the next respawn. Two
-                # resolutions of the same source at two instants are not the same value, which is
-                # the whole premise of the TOCTOU this fix exists for.
-                # ⛔ BOTH GUARDS, AND THE ASYMMETRY WAS THE DEFECT (complement HIGH + glm,
-                # 2026-09-04). `spawn_shell` already guards `if shell is not None` with a comment
-                # saying `_spawn_shell_impl` may return a falsy sentinel — so the return of
-                # `spawn_shell` can be None, and dereferencing it here raised AttributeError one
-                # line later. `__call__` converts ConfinementError into an in-band refusal, NOT
-                # AttributeError, so it would have been an unhandled crash rather than a refusal.
-                # Anticipating the case in one function and not at its only call site is worse than
-                # not anticipating it at all: the guard reads as though the case is handled.
-                if self._shell is not None and self._shell.effective_policy is not None:
-                    # Into the SHARED floor, so the file-editor hand sees the same evolved sets.
-                    self._floor.policy = self._shell.effective_policy
+                # ⛔ MERGE INTO THE SHARED FLOOR, NEVER ASSIGN IT (codex L3 MED, 2026-09-04,
+                # execution-reproduced). Assigning this executor's snapshot wholesale is a lost
+                # update when a second conversation shares the floor: both read P, spawn against
+                # P+A and P+B, and the later assignment discards the earlier — a previously denied
+                # live container socket becomes reachable again after a respawn. `absorb` unions
+                # under the FLOOR'S OWN lock, so the write is monotonic and order-independent.
+                # ⚠ `spawn_shell` now REFUSES a non-shell rather than returning one, so there is no
+                # None to guard here — the contract was fixed instead of the call site.
+                # `effective_policy` is Optional on the TYPE because a SandboxedShell built
+                # directly (not via the provider seam) legitimately has none. Every shell that
+                # reaches here came from `spawn_shell`, which sets it — but assert the narrowing
+                # rather than casting it away, so a future direct-construction path fails loudly
+                # instead of silently skipping the merge.
+                effective = self._shell.effective_policy
+                if effective is None:
+                    raise ConfinementError(
+                        "the confined shell carries no effective policy — the provider seam did not "
+                        "stamp it, so the socket floor it was rendered with is unknown (fail-closed)."
+                    )
+                self._floor.absorb(effective)
             return self._shell
 
     def _teardown(self) -> None:

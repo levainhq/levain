@@ -1798,10 +1798,21 @@ class _ProviderMeta(ABCMeta):
 
     def __new__(mcls, name, bases, namespace, /, **kwargs):  # type: ignore[no-untyped-def]
         cls = super().__new__(mcls, name, bases, namespace, **kwargs)
-        base = globals().get("ConfinementProvider")
-        if base is not None and cls is not base:
-            # POST-MRO RESOLUTION, not `cls.__dict__` — that is the whole point of the fix.
-            if getattr(cls, "spawn_shell", None) is not base.spawn_shell:  # type: ignore[attr-defined]
+        # ⛔ THE ROOT IS RECOGNISED FROM ITS BASES, NEVER FROM A MODULE GLOBAL (codex L3 LOW,
+        # 2026-09-04, verified by execution). The previous version read
+        # `globals()["ConfinementProvider"]`, which during `importlib.reload` still names the OLD
+        # class while the NEW root is being created — so the guard compared two different method
+        # objects and raised `ConfinementProvider overrides or shadows
+        # ConfinementProvider.spawn_shell`: **it accused the root class of shadowing itself**, and
+        # reloading this module was deterministically impossible.
+        # ⚡ A class whose bases include no `_ProviderMeta` instance IS a root, by construction —
+        # that is a fact about the class being created, not about what a module global happens to
+        # point at right now. Same lesson as the rest of this file: ask the object, not the cache.
+        parents = [b for b in bases if isinstance(b, _ProviderMeta)]
+        if parents:
+            canonical = getattr(parents[0], "spawn_shell", None)
+            # POST-MRO RESOLUTION, not `cls.__dict__` — a mixin shadowing it must also be caught.
+            if canonical is not None and getattr(cls, "spawn_shell", None) is not canonical:
                 raise TypeError(
                     f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
                     "the spawn-time socket re-resolution (spore-768) and silently render a stale "
@@ -1850,11 +1861,21 @@ class ConfinementProvider(metaclass=_ProviderMeta):
         a mechanical rename, and it is the whole cost of making this structural."""
         refreshed = refresh_socket_denies(policy)
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
-        # ONE authoritative refresh per spawn, and the caller can read back exactly what was
-        # rendered rather than re-deriving it (codex L3 #1). `_spawn_shell_impl` may return a
-        # falsy sentinel in tests; guard rather than assume.
-        if shell is not None:
-            shell.effective_policy = refreshed
+        # ⛔ REJECT A NON-SHELL HERE, AT THE SOURCE (codex L3 MED, 2026-09-04). The previous version
+        # tolerated a `None` sentinel and guarded for it — which only MOVED the crash: `_ensure_shell`
+        # then returned None and its caller raised `AttributeError` on `.run` one line later, and
+        # `__call__` converts `ConfinementError` into an in-band refusal but NOT `AttributeError`.
+        # ⚡ A guard that relocates an unhandled crash is worse than no guard, because the code now
+        # READS as though the case is handled. The contract is what needed fixing, not the call site:
+        # this method's declared return type is non-optional, so anything else is a provider bug and
+        # is refused fail-closed rather than propagated as a shell.
+        if not isinstance(shell, SandboxedShell):
+            raise ConfinementError(
+                f"{type(self).__name__}._spawn_shell_impl returned {type(shell).__name__}, not a "
+                "SandboxedShell — refusing to hand back bash hands without a verified confined "
+                "shell (fail-closed)."
+            )
+        shell.effective_policy = refreshed
         return shell
 
     @abstractmethod
