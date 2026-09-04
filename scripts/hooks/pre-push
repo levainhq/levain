@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# levain pre-push gate — the release-stamp check, at the boundary that matters.
+#
+# ⛔ WHY THIS EXISTS, and it is a measured failure rather than a precaution.
+# 2026-09-03: this repo gained both the POLICY ("the release commit is the last
+# one on that number") and the TEST that enforces it. An hour later the anneal
+# seat committed the identical defect one commit past its own v0.9.9 tag — and
+# the flow action-boundary hook printed the governing note IN FULL, correct and
+# specific, immediately before that push. It happened anyway. Reading is not
+# acting.
+#
+# The test already existed on both sides by then. What did not exist was
+# anything that RUNS it between "the stamp is wrong" and "it is public". CI
+# fires after the push, which is after the damage; the recall hook is advisory
+# and had just failed its one job on this exact defect. This closes that window.
+#
+# ⛔ DELIBERATELY FAILS CLOSED. A guard that degrades to a pass when it cannot
+# run is the precise shape of the defect it guards — an instrument reporting
+# health because it could not look. The escape is explicit and visible:
+#     git push --no-verify
+# Ported from anneal-memory's scripts/hooks/pre-push (0903+7 anneal-seat), which
+# was verified against the real defect rather than a simulation.
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root" || exit 1
+
+PY=""
+for cand in .venv/bin/python python3; do
+    if command -v "$cand" >/dev/null 2>&1 || [ -x "$cand" ]; then PY="$cand"; break; fi
+done
+
+if [ -z "$PY" ]; then
+    echo "pre-push: no python found to run the release-stamp gate." >&2
+    echo "          Fix the environment, or push deliberately with --no-verify." >&2
+    exit 1
+fi
+
+out="$(mktemp)"
+if ! "$PY" -m pytest tests/test_manifest.py -q -p no:cacheprovider \
+        -k "ReleaseStampIsNotAPublishedVersion" >"$out" 2>&1; then
+    echo >&2
+    echo "⛔ pre-push BLOCKED — the release-stamp gate failed:" >&2
+    echo >&2
+    sed -n '/FAILED\|AssertionError\|Error/p' "$out" | head -8 >&2
+    echo >&2
+    echo "   HEAD is stamped at an already-released version, or the two stamps" >&2
+    echo "   disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2
+    echo "   .devN — or, if this IS the release commit, make the stamp bump and" >&2
+    echo "   the tag the SAME commit. See spore-710 and CHANGELOG 'Versioning'." >&2
+    echo >&2
+    echo "   To push anyway: git push --no-verify" >&2
+    rm -f "$out"
+    exit 1
+fi
+rm -f "$out"
+exit 0

@@ -170,6 +170,18 @@ Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pin
 
 Writing your own surface over a substrate? `levain.kernel` is the published seam: the data model, the terminal and web drivers, and the governed write and action dispatch. Import one namespace instead of reaching into internals. Register extra read-only panels or extra governed verbs through `make_server(...)` and they ride the same auth, confirm, and audit envelope as the built-in edits. It's a pure re-export; the governance lives in the substrate, not the surface.
 
+### Working on levain itself — run this once per clone
+
+```
+bash scripts/install_hooks.sh
+```
+
+It points `core.hooksPath` at the tracked `scripts/hooks/` and installs a `pre-push` gate that runs
+the release-stamp test before anything becomes public. ⚠ **`core.hooksPath` is local config git
+cannot ship, so a fresh clone is UNGATED until someone runs that line** — which is exactly why it is
+documented here rather than only in the script. The gate fails closed; the deliberate escape is
+`git push --no-verify`.
+
 ## License
 
 Apache 2.0. See [`LICENSE`](https://github.com/levainhq/levain/blob/main/LICENSE) and [`NOTICE`](https://github.com/levainhq/levain/blob/main/NOTICE). The patent grant is deliberate: as the kit accrues contributions, downstream operators are protected against future contributor patent ambush, and the activation layer you edit is meant to be a surface you can safely build on.
