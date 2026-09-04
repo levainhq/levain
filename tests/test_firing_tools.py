@@ -566,3 +566,80 @@ def test_a_policy_only_construction_still_works_and_is_private(tmp_path) -> None
     a = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "a", workspace=ws))
     b = CrownJewelsFileEditorExecutor(policy=build_policy(tmp_path / "b", workspace=ws))
     assert a._floor is not b._floor
+
+
+def test_a_changed_drive_mode_rebuilds_the_floor_instead_of_inheriting_it(tmp_path, monkeypatch) -> None:
+    """⛔ THE FAIL-OPEN (complement HIGH + glm-5.2 HIGH, convergent, 2026-09-04).
+
+    `_FLOORS` cached on (entity_dir, workspace) with no eviction and DISCARDED the freshly-built
+    policy on a hit. `policy_for_conv_state` derives `deny_standard_creds` from the DRIVE MODE, so
+    in a long-running daemon — which K4a ships — an interactive REPL conversation (creds allowed)
+    would create the floor and a later UNATTENDED seat against the same entity would inherit it,
+    leaving ~/.config/gh, ~/.aws/credentials and ~/.netrc readable on the unattended seat. That is
+    precisely the fail-open the drive-mode tri-state exists to prevent.
+
+    Comparing the BASELINE is what makes the fix correct: the live policy legitimately grows at each
+    spawn (the monotonic socket union) and carrying extra denies forward is fail-CLOSED, so only a
+    changed baseline means a different floor."""
+    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
+    from levain.firing import drive
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()
+
+    monkeypatch.setattr(drive, "current_drive_mode", lambda: "interactive")
+    import levain.firing.openhands.tools as _t
+    monkeypatch.setattr(_t, "current_drive_mode", lambda: "interactive")
+    first = floor_for_conv_state(_FakeConvState(ws))
+
+    monkeypatch.setattr(_t, "current_drive_mode", lambda: "unattended")
+    second = floor_for_conv_state(_FakeConvState(ws))
+
+    assert second is not first, (
+        "the unattended conversation inherited the interactive conversation's floor — the cred "
+        "floor is stale in the PERMISSIVE direction"
+    )
+    assert second.policy.deny_files != first.policy.deny_files or \
+        second.policy.deny_read_write != first.policy.deny_read_write
+
+
+def test_an_unchanged_baseline_still_shares_and_keeps_its_accumulation(tmp_path) -> None:
+    """The other half of the same rule: an identical baseline MUST keep sharing, or the two hands
+    stop converging and round 2's glm finding comes straight back. And the spawn-time accumulation
+    on the live policy must survive — it is fail-closed and re-deriving it would drop denies."""
+    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
+    import dataclasses
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()
+
+    a = floor_for_conv_state(_FakeConvState(ws))
+    late = (tmp_path / "late.sock").resolve()
+    a.policy = dataclasses.replace(a.policy, deny_sockets=a.policy.deny_sockets + (late,))
+
+    b = floor_for_conv_state(_FakeConvState(ws))
+    assert b is a, "an unchanged baseline must keep sharing one floor"
+    assert late in b.policy.deny_sockets, "the spawn-time accumulation was dropped"
+
+
+def test_ensure_shell_does_not_crash_when_a_provider_returns_no_shell(tmp_path, monkeypatch) -> None:
+    """⛔ complement HIGH + glm MED. `spawn_shell` guards `if shell is not None` with a comment
+    saying `_spawn_shell_impl` may return a falsy sentinel — so its own return can be None, and
+    `_ensure_shell` dereferenced it one line later. `__call__` converts ConfinementError into an
+    in-band refusal, NOT AttributeError, so it was an unhandled crash.
+
+    ⚡ Anticipating a case in one function and not at its only call site is worse than not
+    anticipating it: the existing guard reads as though the case is handled."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import build_policy
+    import levain.firing.openhands.tools as _t
+
+    ent, ws = _entity(tmp_path)
+    ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
+
+    class _NullProvider:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            return None
+
+    monkeypatch.setattr(_t, "select_provider", lambda: _NullProvider())
+    assert ex._ensure_shell() is None  # must not raise AttributeError

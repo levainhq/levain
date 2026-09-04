@@ -183,27 +183,59 @@ class _SharedFloor:
     Mutable by design: :meth:`SandboxedBashExecutor._ensure_shell` assigns the policy the shell was
     ACTUALLY confined by back into the floor, so the next respawn and the file editor both see it."""
 
-    __slots__ = ("policy",)
+    __slots__ = ("policy", "baseline")
 
     def __init__(self, policy: CrownJewelsPolicy) -> None:
         self.policy = policy
+        # ⛔ THE BUILD-TIME POLICY THIS FLOOR WAS CREATED FROM — kept so a cached floor can be
+        # detected as STALE (complement HIGH + glm HIGH, convergent, 2026-09-04). See
+        # `floor_for_conv_state`; without it a later conversation silently inherited an earlier
+        # one's floor, and the direction was fail-OPEN.
+        self.baseline = policy
 
 
 # Keyed on the pair that DEFINES an entity's floor, so two hands of one entity share a floor and two
 # different entities can never collide. Not weak-keyed on conv_state: a conv_state is not guaranteed
 # hashable or weakref-able, and the identity that matters here is the ENTITY, not the conversation.
 _FLOORS: dict[tuple[Path, Path], _SharedFloor] = {}
+_FLOORS_LOCK = threading.Lock()
 
 
 def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
-    """The shared floor for this entity — created on first use, reused by the other hand."""
+    """The shared floor for this entity — created on first use, reused by the OTHER HAND of the same
+    run, and REBUILT whenever a freshly-built policy differs from the one it was created from.
+
+    ⛔ **THE REBUILD IS A FAIL-OPEN FIX, NOT AN OPTIMISATION** (complement HIGH + glm-5.2 HIGH,
+    convergent, 2026-09-04; I had self-caught a narrower version of it an hour earlier and the
+    reviewers' framing is the real one). The first version cached on `(entity_dir, workspace)` with
+    no eviction and simply DISCARDED the freshly-built policy on a hit. `policy_for_conv_state`
+    derives `deny_standard_creds` from `resolve_cred_floor(..., mode=current_drive_mode())`, so in a
+    long-running `levain daemon` — which K4a ships, running scheduled seats in ONE process —
+    conversation 1 as an interactive REPL (creds ALLOWED) would create the floor, and conversation 2
+    as an UNATTENDED seat against the same entity would be handed it, inheriting the permissive cred
+    floor. `~/.config/gh`, `~/.aws/credentials`, `~/.netrc` readable on an unattended seat is exactly
+    the fail-open the drive-mode tri-state exists to prevent. The same staleness applied to any
+    `confinement.json` the operator edited between conversations.
+    ⚡ Comparing the BASELINE rather than the live policy is what makes this correct: the live policy
+    legitimately grows at each spawn (the monotonic socket union), and carrying those EXTRA denies
+    into a later conversation is fail-CLOSED and harmless. **Only a changed baseline means a
+    different floor**, so this rebuilds on exactly the security-relevant difference and on nothing
+    else. It also bounds the dict by distinct `(entity_dir, workspace)` pairs rather than growing per
+    conversation.
+
+    ⛔ **THE LOCK IS NOT DEFENSIVE POLISH** (complement MED + glm, convergent; also self-caught).
+    `get` → construct → `set` is a check-then-act across several bytecodes. Two concurrent `create`
+    calls could both miss, both construct, and the second write win — leaving the two hands holding
+    DIFFERENT floor objects while every docstring and test says they share one. The failure mode is
+    silent divergence, which is precisely the invariant this whole indirection exists to provide."""
     policy = policy_for_conv_state(conv_state)
     key = (policy.entity_dir, policy.workspace)
-    floor = _FLOORS.get(key)
-    if floor is None:
-        floor = _SharedFloor(policy)
-        _FLOORS[key] = floor
-    return floor
+    with _FLOORS_LOCK:
+        floor = _FLOORS.get(key)
+        if floor is None or floor.baseline != policy:
+            floor = _SharedFloor(policy)
+            _FLOORS[key] = floor
+        return floor
 
 
 # --- the file-editor hand (relaxed to the crown-jewels floor) --------------------------------
@@ -390,11 +422,6 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # target denied at spawn 1 fell back off the list at spawn 2 and became reachable
                 # again. The "a re-resolution can only ever ADD" property was true within one spawn
                 # and false across exactly the respawns its own comment relied on.
-                # ⚠ Deliberately BOTH here and inside `spawn_shell`: this line makes the union
-                # persist for THIS executor, and the one in the provider seam makes it apply to any
-                # provider, including a caller that does not go through this executor. The function
-                # is idempotent and monotonic, so running it twice costs a resolution and changes
-                # nothing.
                 self._shell = provider.spawn_shell(
                     self._floor.policy, default_timeout=self._default_timeout
                 )
@@ -404,7 +431,15 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # resolution saw was enforced for that shell and gone at the next respawn. Two
                 # resolutions of the same source at two instants are not the same value, which is
                 # the whole premise of the TOCTOU this fix exists for.
-                if self._shell.effective_policy is not None:
+                # ⛔ BOTH GUARDS, AND THE ASYMMETRY WAS THE DEFECT (complement HIGH + glm,
+                # 2026-09-04). `spawn_shell` already guards `if shell is not None` with a comment
+                # saying `_spawn_shell_impl` may return a falsy sentinel — so the return of
+                # `spawn_shell` can be None, and dereferencing it here raised AttributeError one
+                # line later. `__call__` converts ConfinementError into an in-band refusal, NOT
+                # AttributeError, so it would have been an unhandled crash rather than a refusal.
+                # Anticipating the case in one function and not at its only call site is worse than
+                # not anticipating it at all: the guard reads as though the case is handled.
+                if self._shell is not None and self._shell.effective_policy is not None:
                     # Into the SHARED floor, so the file-editor hand sees the same evolved sets.
                     self._floor.policy = self._shell.effective_policy
             return self._shell
