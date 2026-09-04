@@ -1737,3 +1737,43 @@ def test_the_tilde_user_path_actually_raises_RuntimeError(tmp_path) -> None:
     one fails loudly instead, so the guard above never becomes decorative."""
     with pytest.raises(RuntimeError):
         Path("~nosuchuser42/.ssh/authorized_keys").expanduser()
+
+
+@pytest.mark.parametrize("bad", ["false", "no", "0", 0, 1, None, [], {}])
+def test_allow_container_sockets_refuses_non_bools_because_it_failed_OPEN(tmp_path, bad) -> None:
+    """⛔ THE ONE DIRECTION A SECURITY FLAG MUST NOT FAIL, AND IT DID.
+
+    MEASURED before the fix (codex L3, 2026-09-04): passing the STRING ``"false"`` — which is what
+    an env-var-backed or hand-rolled caller supplies — is TRUTHY, so it removed ALL THREE ARMS.
+    `deny_sockets` went 7 -> 0 and the socket write-denies 10 -> 0. **A value meaning "no" read as
+    "yes" and silently deleted the container-socket floor.**
+
+    No shipping caller was affected: the JSON loader validates the type, and `policy_for_conv_state`
+    passes the loader's value. That is exactly why it is worth pinning here — this is the PUBLIC
+    MECHANISM boundary and the next caller is the one that gets it wrong.
+
+    ⚠ `0` and `1` are in the list on purpose: `isinstance(True, int)` is True, so a plain int check
+    would let a JSON number through as a bool."""
+    with pytest.raises(ConfinementError):
+        build_policy(_entity(tmp_path), allow_container_sockets=bad)
+
+
+def test_socket_classification_does_no_filesystem_io(tmp_path, monkeypatch) -> None:
+    """`crown_jewel_reason` must not call `.resolve()` while classifying — a resolution error there
+    escapes the fail-closed guard that wraps only the INPUT path, so a concurrent symlink swap
+    crashes the security predicate instead of refusing. Both spellings are precomputed at policy
+    construction, where the information already exists, so the predicate needs no I/O at all.
+
+    Pinned by making `Path.resolve` explode for the duration: a policy built beforehand must still
+    classify correctly."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    sock.touch()
+    policy = _sock_policy(tmp_path, monkeypatch, sock)
+
+    def _boom(self, *a, **k):  # noqa: ANN001
+        raise RuntimeError("resolve() must not be called inside the predicate")
+
+    monkeypatch.setattr(Path, "resolve", _boom)
+    reason = crown_jewel_reason(policy, sock)
+    assert reason is not None and "socket" in reason
