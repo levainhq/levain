@@ -964,7 +964,15 @@ def test_build_policy_ssh_vectors_do_not_double_up_without_symlinks(
     for name in ("authorized_keys", "authorized_keys2", "config", "rc"):
         hits = [p for p in policy.deny_write_files if p.name == name]
         assert len(hits) == 1, f"{name} duplicated in the no-symlink case: {hits}"
-    assert len(policy.deny_write_files) == 4
+    # ⚠ SCOPED TO THE SSH VECTORS, not to the whole list (2026-09-04). This read
+    # `len(policy.deny_write_files) == 4` and broke when spore-725 put the container-daemon
+    # sockets through the same write-deny machinery. The assertion's subject was the ENTIRE
+    # list; the claim its name makes is about the SSH vectors — so it failed the moment the
+    # list gained a second, unrelated population, while the property it exists to protect
+    # (lexical == resolved collapses to one entry per vector) was never in question. Counting
+    # only what the test is named for keeps it exact under a third population too.
+    ssh_names = {"authorized_keys", "authorized_keys2", "config", "rc"}
+    assert len([p for p in policy.deny_write_files if p.name in ssh_names]) == 4
 
 
 def test_build_policy_deny_standard_creds_expands_known_locations(tmp_path: Path, monkeypatch) -> None:
@@ -1441,3 +1449,208 @@ def test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it(
             "`_write_deny_ancestors` has started resolving: the anchor is load-bearing again and "
             "its justification must be restored rather than this test deleted."
         )
+
+
+# --- container/VM daemon sockets (spore-725) ------------------------------------------
+#
+# ⛔ THE DEFECT THESE PIN IS NOT "THE SOCKET WAS NOT DENIED" — it is that the OBVIOUS deny does
+# not work. Adding the socket paths to `deny_files` (the shape the spore originally proposed)
+# emits correct-looking literals into the profile, reads clean in review, and leaves the exploit
+# working, because a seatbelt `file-read* file-write*` rule does not block `connect()`. Every
+# test below exists because a version of the fix WITHOUT it was measured and lost.
+
+
+def _sock_policy(tmp_path: Path, monkeypatch, sock: Path, **kw):
+    """Build a real policy whose container-socket list is `sock`, so the live arms can be
+    exercised against a socket the test owns rather than the operator's docker daemon."""
+    from levain.firing import confinement as _conf
+    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(sock),))
+    return build_policy(tmp_path / "ent", **kw)
+
+
+def test_container_sockets_are_denied_by_default_no_opt_in_required(tmp_path, monkeypatch) -> None:
+    """The socket floor is DEFAULT-ON, unlike `deny_standard_creds`. Denying a daemon socket costs
+    the entity nothing it can legitimately do inside a floor, so there is no operational-fit reason
+    to make the operator ask for it."""
+    sock = tmp_path / "run" / "docker.sock"
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+    assert sock.resolve() in pol.deny_sockets
+
+
+def test_allow_container_sockets_removes_every_arm_not_just_the_connect(tmp_path, monkeypatch) -> None:
+    """The opt-out must clear the write-deny too. Leaving the socket write-denied while allowing the
+    connect would half-break the operator who deliberately opted in, for no security gain."""
+    sock = tmp_path / "run" / "docker.sock"
+    pol = _sock_policy(tmp_path, monkeypatch, sock, allow_container_sockets=True)
+    assert pol.deny_sockets == ()
+    assert not any("docker.sock" in str(p) for p in pol.deny_write_files)
+
+
+@live
+def test_socket_deny_renders_as_network_outbound_and_not_as_a_file_rule(tmp_path, monkeypatch) -> None:
+    """THE CLASS GUARD. If a future edit folds `deny_sockets` back into the `deny_files` block —
+    which looks like a tidy simplification and passes every other test in this file — the profile
+    loses its only `network-outbound` rule and the bypass silently reopens. Assert the VERB."""
+    sock = tmp_path / "run" / "docker.sock"
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+    profile = SeatbeltProvider().render_profile(pol)
+    assert "(deny network-outbound" in profile, (
+        "the socket deny must render as network-outbound; a file-read*/file-write* deny does NOT "
+        "block connect() to a unix socket (measured 2026-09-04) and would be a no-op"
+    )
+    net_block = profile.split("(deny network-outbound", 1)[1].split(")\n\n", 1)[0]
+    assert str(sock.resolve()) in net_block
+
+
+def test_socket_is_write_denied_at_both_spellings_and_its_ancestors(tmp_path, monkeypatch) -> None:
+    """Arms (ii) and (iii). The connect-deny ALONE loses to `mv`: after renaming the socket the
+    canonical path is one nothing names, and the daemon keeps serving the same listening inode.
+    Both spellings, because link operations are matched LEXICALLY."""
+    sock = tmp_path / "run" / "docker.sock"
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+    assert sock in pol.deny_write_files            # lexical — blocks mv/rm of the socket
+    assert sock.resolve() in pol.deny_write_files  # resolved — content target
+    # (iii) the parent dir is write-denied, or the whole dir can be relocated instead.
+    assert sock.resolve().parent in pol.deny_write_dirs
+
+
+def test_crown_jewel_reason_calls_a_socket_a_socket_not_an_ssh_vector(tmp_path, monkeypatch) -> None:
+    """Sockets ride the same `deny_write_files` list as the ssh vectors, so without its own branch
+    the in-process hand refuses a docker socket with the words "ssh persistence/exec vector
+    (authorized_keys/config/rc)" — a false reason in the surface an operator reads to understand
+    their own floor. The denial was always right; only the explanation would have lied."""
+    sock = tmp_path / "run" / "docker.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    sock.touch()
+    pol = _sock_policy(tmp_path, monkeypatch, sock)
+    reason = crown_jewel_reason(pol, sock)
+    assert reason is not None
+    assert "socket" in reason
+    assert "authorized_keys" not in reason
+
+
+@live
+def test_live_container_socket_is_unreachable_and_cannot_be_renamed_out_of_its_deny(
+    tmp_path, monkeypatch
+) -> None:
+    """THE ONLY TEST HERE THAT CAN FAIL WHEN THE FIX IS WRONG RATHER THAN MERELY ABSENT.
+
+    Every assertion above reads the policy or the rendered profile — so all of them still pass if
+    the socket paths are moved into ``deny_files`` and the profile stops denying the connect. This
+    one stands up a REAL unix socket, renders the REAL profile, and drives a REAL ``sandbox-exec``,
+    which is the only way to observe that a file-verb deny does not stop ``connect()``.
+
+    Three arms, each of which was measured failing on its own before the arm was added:
+      · CONNECT      — refused by the ``network-outbound`` rule
+      · RENAME       — the socket cannot be moved to a path nothing denies
+      · RELOCATION   — nor can its parent directory
+    Plus a liveness control: the server is still serving throughout, so a refusal is a refusal and
+    not a dead socket (an attack that fails must be shown to fail for the RIGHT reason)."""
+    import socket as _socket
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import threading
+
+    # AF_UNIX paths are capped near 104 bytes on macOS and pytest's tmp_path blows past it, so the
+    # socket lives in a SHORT dir. /tmp is a symlink to /private/tmp, which makes this stricter
+    # rather than weaker: the deny is rendered at the RESOLVED path and the client connects via the
+    # LEXICAL one, so the test also proves seatbelt canonicalises for network-outbound.
+    short_root = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvsock"))
+    sock_dir = short_root / "run"
+    sock_dir.mkdir(parents=True)
+    sock = sock_dir / "docker.sock"
+
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(str(sock))
+    srv.listen(5)
+
+    def _serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+                conn.sendall(b"JEWEL-VIA-SOCKET")
+                conn.close()
+            except OSError:
+                return
+
+    threading.Thread(target=_serve, daemon=True).start()
+    try:
+        pol = _sock_policy(tmp_path, monkeypatch, sock)
+        profile = tmp_path / "p.sb"
+        profile.write_text(SeatbeltProvider().render_profile(pol))
+
+        client = tmp_path / "client.py"
+        client.write_text(
+            "import socket, sys\n"
+            "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5)\n"
+            "s.connect(sys.argv[1]); print(s.recv(64).decode())\n"
+        )
+
+        def _in_sandbox(*argv: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["sandbox-exec", "-f", str(profile), *argv],
+                capture_output=True, text=True, timeout=30,
+            )
+
+        # LIVENESS CONTROL FIRST: prove the server answers, so a later refusal is the sandbox's
+        # doing and not a socket that was never listening.
+        ctrl = subprocess.run([sys.executable, str(client), str(sock)],
+                              capture_output=True, text=True, timeout=30)
+        assert "JEWEL-VIA-SOCKET" in ctrl.stdout, f"server not serving: {ctrl.stderr}"
+
+        # ARM 1 — connect refused.
+        r = _in_sandbox(sys.executable, str(client), str(sock))
+        assert "JEWEL-VIA-SOCKET" not in r.stdout, (
+            "the confined hand reached the daemon socket — the network-outbound deny is not in "
+            "force; a file-read*/file-write* deny does NOT block connect()"
+        )
+
+        # ARM 2 — the socket cannot be renamed to a path nothing denies.
+        moved = sock_dir / "escaped.sock"
+        r = _in_sandbox("/bin/mv", str(sock), str(moved))
+        assert r.returncode != 0 and not moved.exists(), (
+            "the socket was renamed out from under its deny; connecting to the new path would "
+            "reach the same listening inode"
+        )
+
+        # ARM 3 — nor can its parent directory be relocated.
+        r = _in_sandbox("/bin/mv", str(sock_dir), str(short_root / "escaped_dir"))
+        assert r.returncode != 0 and sock.exists()
+
+        # The server is STILL serving — none of the above broke it, so all three refusals are
+        # the floor's doing.
+        after = subprocess.run([sys.executable, str(client), str(sock)],
+                               capture_output=True, text=True, timeout=30)
+        assert "JEWEL-VIA-SOCKET" in after.stdout
+    finally:
+        srv.close()
+        shutil.rmtree(short_root, ignore_errors=True)
+
+
+def test_load_confinement_config_allow_container_sockets_defaults_to_denied(tmp_path: Path) -> None:
+    """ABSENT means DENIED, and absence collapsing to the default is only safe BECAUSE the default
+    is the safe one — the opposite of ``deny_standard_creds``, whose absence must stay a live
+    sentinel. An operator who never heard of this key keeps the socket fenced."""
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_files": []}')
+    assert load_confinement_config(ent).allow_container_sockets is False
+
+
+def test_load_confinement_config_parses_allow_container_sockets(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_container_sockets": true}')
+    assert load_confinement_config(ent).allow_container_sockets is True
+
+
+def test_load_confinement_config_bad_allow_container_sockets_fails_closed(tmp_path: Path) -> None:
+    """A null is REFUSED rather than read as absence: an explicit null is an operator typing
+    something and meaning it, and on a security floor we do not guess which thing they meant."""
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_container_sockets": null}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_container_sockets": "yes"}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)

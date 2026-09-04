@@ -731,6 +731,7 @@ def _print_banner(
     entity_dir: Path, binding, *, model: str, with_tools: bool, bash_ok: bool,
     ssh_mode: str = "agent", deny_standard_creds: bool = False, task: str | None = None,
     gate_mode: str = "gated", max_seconds: float | None = None,
+    allow_container_sockets: bool = False,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -776,6 +777,19 @@ def _print_banner(
         else:
             print("             ⚠ standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
             print("               are READABLE by this entity (deny_standard_creds is off)")
+        # CONTAINER SOCKETS (spore-725). Stated in BOTH directions, like the cred-store line
+        # above, and NEVER as "containers are fenced" — the deny is a NAMED ENUMERATION and an
+        # enumeration is always incomplete, so an unqualified claim would be worse than the hole
+        # it papers over. What is listed is what is covered, and the gaps are named too.
+        if allow_container_sockets:
+            print("             \u26a0 container daemon sockets are REACHABLE (allow_container_sockets")
+            print("               is on) — a runtime can mount and read ANY path denied above, so on")
+            print("               a machine with Docker installed the rest of this floor does NOT hold")
+        else:
+            print("             container daemon sockets: docker \u00b7 podman \u00b7 containerd \u00b7 CRI-O")
+            print("               (a root daemon outside this sandbox would read any path for it)")
+            print("             \u26a0 NOT covered: a custom $DOCKER_HOST, a TCP daemon endpoint, or a")
+            print("               runtime whose socket is not in that list — the deny is BY NAME")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —
@@ -823,6 +837,7 @@ def _banner_for(
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
         ssh_mode=session.ssh_mode, deny_standard_creds=session.deny_standard_creds, task=task,
         gate_mode=session.gate_mode, max_seconds=max_seconds,
+        allow_container_sockets=session.allow_container_sockets,
     )
 
 

@@ -316,6 +316,7 @@ class _FakeSession:
         self.bash_ok = True
         self.ssh_mode = "agent"
         self.deny_standard_creds = False
+        self.allow_container_sockets = False
         self.gate_mode = "ungated"
         self.label = tmp_path.name
         self._result = result
