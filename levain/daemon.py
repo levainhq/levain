@@ -662,20 +662,61 @@ class LaunchdProvider(DaemonProvider):
 _SYSTEMD_USER_UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
 
 
+def _systemd_refuse_control(value: str, *, field: str) -> str:
+    r"""Refuse a control character in ANY value that reaches a unit directive. Returns it unchanged.
+
+    ⛔ **THIS IS SPLIT OUT OF ``_systemd_escape`` BECAUSE THE REFUSAL AND THE ESCAPING ARE DIFFERENT
+    JOBS AND ONLY ONE OF THEM WAS EVERYWHERE IT NEEDED TO BE** (Diogenes HIGH, 2026-09-04). The
+    guard was applied to ``Environment=`` — whose values levain GENERATES (``PATH``/``HOME``/
+    ``PYTHONUNBUFFERED``, the least attacker-reachable input in the function) — and omitted from
+    ``ExecStart``, which carries ``--task``: **free text the OPERATOR types**, ``required=True`` at
+    the CLI. The one field a guard was written for was the one field it did not cover.
+
+    ``shlex.quote`` is SHELL quoting, not systemd's, and it does not help: it wraps the argument in
+    single quotes and closes them at the END, so an embedded newline leaves every line but the last
+    inside an open quote. RUN-VERIFIED against real systemd 255 (``tests/linux/Dockerfile``): an
+    ordinary multi-line ``--task`` renders an ``ExecStart`` truncated mid-task, with
+    ``--unattended``, ``--max-seconds`` and ``--consolidate`` — **the bounds on an unattended
+    agent** — on an orphan line outside every directive.
+
+    ▶ WHAT SYSTEMD ACTUALLY DOES WITH IT, measured rather than assumed, because the original finding
+    left this undetermined and both answers were bad: systemd **REFUSES** the unit —
+    ``Unbalanced quoting, ignoring: …`` then ``Unit configuration has fatal error, unit will not be
+    started``, exit 1. So the agent does not run stripped of its bounds; it does not run at all.
+    Three task shapes chosen to try to produce a balanced first line all give the same fatal result.
+
+    ⚠ AND THAT IS *WORSE* THAN IT SOUNDS FOR A PERIODIC SEAT, WHICH IS WHY THIS FAILS AT RENDER TIME
+    RATHER THAN AT INSTALL TIME. ``install()`` enables ``<label>.timer``, never the service, and
+    ``systemd-analyze verify`` on the TIMER **exits 0** while printing the service's fatal error —
+    measured, same host, same units. Nothing in a periodic install's path fails, so the seat installs
+    "successfully" and dies at its first fire, in the journal. Refusing here means the unloadable
+    unit is never written, which closes that silent path at its only known trigger instead of adding
+    a verification step that would have to be remembered.
+
+    macOS is unaffected and that is exactly why this survived: ``LaunchdProvider`` renders the same
+    spec into a plist ``<string>`` where the newline is inert — verified side by side on the
+    identical spec."""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise DaemonError(
+            f"refusing to render a systemd unit: {field} contains a control character "
+            f"({value!r}). A newline or control character ENDS the directive and puts everything "
+            f"after it outside every unit setting — for ExecStart that silently strips the bounds "
+            f"on an unattended agent, and systemd then refuses to load the unit at all. "
+            f"Fail-closed. Use a single-line value."
+        )
+    return value
+
+
 def _systemd_escape(value: str) -> str:
     r"""Escape a value for a systemd unit's double-quoted string (``Environment="K=V"``).
 
     systemd's unit parser treats ``\`` as an escape and ``"`` as a quote delimiter, so both are
-    escaped; a newline would END the directive and inject a new one, which in a file that defines
-    what runs unattended is the same class as SBPL profile injection on the macOS side. Refuse a
-    control character outright rather than trust the escaping (FAIL CLOSED — the seatbelt provider
-    makes the identical choice for the identical reason)."""
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
-        raise DaemonError(
-            f"refusing to render a systemd unit with a control character in a value ({value!r}) — "
-            "fail-closed rather than risk unit-directive injection."
-        )
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped. The control-character REFUSAL is :func:`_systemd_refuse_control` — separate because
+    every value reaching a directive needs the refusal, and only the double-quoted ones need this
+    escaping (FAIL CLOSED — the seatbelt provider makes the identical choice for the identical
+    reason)."""
+    return (_systemd_refuse_control(value, field="an Environment value")
+            .replace("\\", "\\\\").replace('"', '\\"'))
 
 
 class SystemdUserProvider(DaemonProvider):
@@ -725,9 +766,21 @@ class SystemdUserProvider(DaemonProvider):
         """The ``.service`` unit. For a periodic spec this deliberately carries NO schedule — see
         :meth:`render_timer`."""
         periodic = spec.start_interval is not None
+        # ⛔ EVERY VALUE THAT REACHES A DIRECTIVE, not just the Environment ones (Diogenes HIGH,
+        # 2026-09-04). The guard covered the field levain GENERATES and skipped the field the
+        # OPERATOR TYPES. These are refusal-only: they are not inside a double-quoted systemd
+        # string, so they need no escaping — which is precisely why the two halves were split.
+        label = _systemd_refuse_control(spec.label, field="the unit label")
+        working_dir = _systemd_refuse_control(str(spec.working_dir), field="WorkingDirectory")
+        stdout_log = _systemd_refuse_control(str(spec.stdout_log), field="StandardOutput")
+        stderr_log = _systemd_refuse_control(str(spec.stderr_log), field="StandardError")
+        argv = " ".join(
+            shlex.quote(_systemd_refuse_control(a, field="an ExecStart argument"))
+            for a in spec.argv
+        )
         lines = [
             "[Unit]",
-            f"Description=Levain {spec.label}",
+            f"Description=Levain {label}",
             # A user unit that starts at "login" should come up with the user session; for a linger-
             # enabled headless box this is also what boots it.
             "After=default.target",
@@ -736,8 +789,8 @@ class SystemdUserProvider(DaemonProvider):
             # oneshot for a seat (it runs one bounded turn and EXITS, and systemd must not treat that
             # exit as a crash); simple + Restart for the resident cockpit.
             "Type=oneshot" if periodic else "Type=simple",
-            f"ExecStart={' '.join(shlex.quote(a) for a in spec.argv)}",
-            f"WorkingDirectory={spec.working_dir}",
+            f"ExecStart={argv}",
+            f"WorkingDirectory={working_dir}",
         ]
         for key, value in spec.env.items():
             lines.append(f'Environment="{_systemd_escape(key)}={_systemd_escape(value)}"')
@@ -747,8 +800,8 @@ class SystemdUserProvider(DaemonProvider):
             # (systemd.exec(5)); what was actually VERIFIED here is that `systemd-analyze verify`
             # accepts it on systemd 255, which is what Ubuntu 24.04 ships. An older systemd is
             # untested by us — the distinction matters because the failure would be at unit LOAD.
-            f"StandardOutput=append:{spec.stdout_log}",
-            f"StandardError=append:{spec.stderr_log}",
+            f"StandardOutput=append:{stdout_log}",
+            f"StandardError=append:{stderr_log}",
         ]
         if not periodic and spec.keep_alive:
             # The launchd KeepAlive analogue: survive a crash. Deliberately NOT set for a seat —
@@ -774,14 +827,17 @@ class SystemdUserProvider(DaemonProvider):
         must not stampede them all on boot."""
         if spec.start_interval is None:
             return None
+        # The label reaches TWO directives here (Description and Unit=), and `Unit=` is the one that
+        # names the service this timer fires. Refused for the same reason as in `render_unit`.
+        label = _systemd_refuse_control(spec.label, field="the unit label")
         return "\n".join([
             "[Unit]",
-            f"Description=Levain {spec.label} schedule",
+            f"Description=Levain {label} schedule",
             "",
             "[Timer]",
             f"OnActiveSec={spec.start_interval}",
             f"OnUnitActiveSec={spec.start_interval}",
-            f"Unit={spec.label}.service",
+            f"Unit={label}.service",
             "AccuracySec=1s",
             "",
             "[Install]",

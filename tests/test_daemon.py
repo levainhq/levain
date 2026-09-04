@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from dataclasses import replace
 
 from levain import daemon
 from levain.daemon import (
@@ -960,3 +961,70 @@ def test_systemd_rendered_units_pass_systemd_analyze_verify(tmp_path, monkeypatc
         errs = [ln for ln in (proc.stderr or "").splitlines()
                 if ln.strip() and "Failed to connect to system bus" not in ln]
         assert not errs, f"{name} rejected by systemd: {errs}"
+
+
+# --- the unit-injection guard covers every directive, not just Environment= --------------------
+
+
+def _injection_seat(tmp_path, task="review the diff", interval=3600):
+    return build_seat_spec(entity_path=tmp_path, task=task, interval=interval)
+
+
+def test_a_multiline_task_is_REFUSED_not_rendered_into_a_broken_unit(tmp_path) -> None:
+    """⛔ THE FIELD THE GUARD WAS WRITTEN FOR WAS THE ONE FIELD IT DID NOT COVER.
+
+    `_systemd_escape`'s control-character refusal was applied to `Environment=`, whose values levain
+    GENERATES (PATH/HOME/PYTHONUNBUFFERED — the least attacker-reachable input in the function), and
+    omitted from `ExecStart`, which carries `--task`: free text the OPERATOR types, `required=True`
+    at the CLI.
+
+    `shlex.quote` does not save it — that is SHELL quoting, not systemd's, and it closes its quote at
+    the END of the argument, so an embedded newline leaves every earlier line inside an open quote.
+    Before this fix the render produced an `ExecStart` truncated mid-task with `--unattended`,
+    `--max-seconds` and `--consolidate` on an orphan line outside every directive."""
+    with pytest.raises(DaemonError) as exc:
+        SystemdUserProvider().render_unit(_injection_seat(tmp_path, task="review the diff\nand report"))
+    assert "ExecStart" in str(exc.value)
+    assert "control character" in str(exc.value)
+
+
+def test_launchd_is_unaffected_which_is_why_the_gap_survived(tmp_path) -> None:
+    """The IDENTICAL spec renders fine on macOS: a plist `<string>` carries a newline inertly. That
+    asymmetry is why a shared-looking `DaemonSpec` hid a Linux-only injection — and it is also why
+    the refusal lives in the systemd renderer rather than in `build_seat_spec`, which would have
+    taken a working macOS capability away to satisfy a systemd constraint."""
+    unit = LaunchdProvider().render_unit(_injection_seat(tmp_path, task="review the diff\nand report"))
+    assert "review the diff" in unit
+
+
+@pytest.mark.parametrize("field,kw", [
+    ("an ExecStart argument", {"task": "a\nb"}),
+])
+def test_every_directive_bearing_value_is_refused(tmp_path, field, kw) -> None:
+    with pytest.raises(DaemonError) as exc:
+        SystemdUserProvider().render_unit(_injection_seat(tmp_path, **kw))
+    assert field in str(exc.value)
+
+
+def test_the_timer_label_is_guarded_too_because_Unit_names_the_service(tmp_path) -> None:
+    """`render_timer` puts the label in TWO directives, and `Unit=` is the one naming the service the
+    timer fires. A guard on the service alone would leave the timer injectable."""
+    spec = _injection_seat(tmp_path)
+    bad = replace(spec, label="seat\nExecStart=/bin/sh")
+    with pytest.raises(DaemonError):
+        SystemdUserProvider().render_timer(bad)
+    with pytest.raises(DaemonError):
+        SystemdUserProvider().render_unit(bad)
+
+
+def test_an_ordinary_single_line_task_still_renders(tmp_path) -> None:
+    """The CONTROL. A refusal that also refused the normal case would be caught by nothing else
+    here — every other test in this block asserts a raise."""
+    unit = SystemdUserProvider().render_unit(_injection_seat(tmp_path, task="review the diff"))
+    assert "--task 'review the diff'" in unit
+    assert "--unattended" in unit
+    # and the governance flags are INSIDE the ExecStart line, which is the property the whole
+    # finding was about
+    exec_line = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")][0]
+    for flag in ("--unattended", "--max-seconds", "--consolidate"):
+        assert flag in exec_line, f"{flag} left the ExecStart directive"
