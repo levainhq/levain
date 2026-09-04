@@ -173,7 +173,7 @@ import threading
 import time
 import unicodedata
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Literal
 
@@ -295,25 +295,32 @@ _STANDARD_CRED_FILES = (
 # non-default colima profile (``colima start -p work``), or any socket outside the eight would
 # pin it, receive the rename- and ancestor-denies, and get **no connect protection at all while
 # believing it closed** — a false closure, which is worse than a known gap.
-# ⛔⛔ AND THE ENUMERATION IS A **BUILD-TIME SNAPSHOT**, SO A *LISTED* NAME IS NOT ALWAYS COVERED
-# (codex L3 HIGH, 2026-09-04, CONFIRMED BY EXECUTION here). ``deny_sockets`` stores each path
-# RESOLVED AT ``build_policy`` TIME. If a listed path is ABSENT then, it resolves to itself; if
+# ⛔ AND THE ENUMERATION IS A **SPAWN-TIME SNAPSHOT** — WAS A BUILD-TIME ONE, WHICH WAS THE
+# codex L3 HIGH OF 2026-09-04 (CONFIRMED BY EXECUTION, FIXED HERE — spore-768). ``deny_sockets``
+# stores each path RESOLVED. If a listed path is ABSENT at resolution it resolves to itself; if
 # something later creates it as a symlink to an UNLISTED target, ``connect()`` canonicalises to that
-# target — which is not in the set — and a lexical ``network-outbound`` literal is MEASURED INERT.
+# target — absent from the set — and a lexical ``network-outbound`` literal is MEASURED INERT.
 # Measured end to end: a listed-but-absent path, later symlinked to an unlisted socket, was reachable
 # THROUGH THE LISTED NAME.
-# ⚖ WHY THIS IS AN HONESTY DEFECT AND NOT NEW EXPOSURE, measured rather than argued:
+# ▶ ``refresh_socket_denies`` now re-runs the resolution AT EVERY SHELL SPAWN (the seam is
+# ``ConfinementProvider.spawn_shell``, made a template method so a provider cannot skip it), UNIONING
+# the fresh targets into the build-time set — union, so a re-resolution can only ADD a deny, never
+# drop one. That closes the build→spawn window, which is the long one: the policy is built at
+# tool-creation time and the shell spawns lazily, then RE-spawns after every ``exit``.
+# ⚠ **IT IS A SNAPSHOT, NOT COVERAGE, AND THE RESIDUAL IS IRREDUCIBLE HERE.** A seatbelt profile is
+# fixed when the process starts, so a symlink created at a listed path AFTER the shell spawns is
+# still not covered — and no rule in this profile language would cover it, because seatbelt
+# CANONICALISES for ``network-outbound``: a deny can name a TARGET, never a NAME. There is no
+# expressible "whatever this path points at, at connect time". A spawn-time snapshot is the
+# strongest statement available, and it is stated as a snapshot for that reason.
+# ⚖ WHY THAT RESIDUAL IS TOLERABLE, measured rather than argued:
 #   · THE ENTITY CANNOT ARRANGE IT. Creating the symlink at a listed path is refused — "Operation not
 #     permitted" — because arm (ii) write-denies every listed socket at BOTH spellings. It needs an
 #     EXTERNAL actor (an operator, an installer) acting mid-session.
 #   · AND THE UNLISTED SOCKET WAS ALREADY REACHABLE UNDER ITS OWN NAME, symlink or not — verified in
 #     the same run. So the symlink adds no reachability that the unlisted socket did not already have,
-#     and which the banner already declares uncovered.
-# ▶ WHAT IT DOES COST IS THE CLAIM: an operator reads a listed socket as covered, and under this
-# condition it is not. That is why the run banner now says the coverage is a BUILD-TIME SNAPSHOT
-# rather than only that the list is incomplete. ⛔ THE REAL FIX — re-resolve at shell spawn and fail
-# closed when a listed endpoint resolves outside a pinned target set — is FILED FORWARD with the
-# operator-declared socket list; both are the same root, and neither belongs in a release freeze.
+#     and which the banner already declares uncovered. Marginal exposure was zero; the COST WAS THE
+#     CLAIM, an operator reading a listed socket as covered when under that condition it was not.
 # ▶ There is deliberately NO operator-declared socket list yet: ``ConfinementConfig`` carries only
 # the all-or-nothing ``allow_container_sockets``. Adding a ``deny_sockets`` config key (resolved
 # into ``sockets_l`` AND both spellings into ``deny_write_files_l``, so operator sockets get the
@@ -421,6 +428,28 @@ class CrownJewelsPolicy:
     # an ssh vector without calling `.resolve()` inside the predicate, where a resolution error
     # would escape the fail-closed guard. Enforcement remains `deny_sockets` (resolved, arm i)
     # plus `deny_write_files` (both spellings, arms ii/iii).
+    socket_sources: tuple[Path, ...] = ()  # the LEXICAL (expanduser'd, UN-resolved) socket paths
+    # that DEFINE the socket floor — the authority `deny_sockets` is derived FROM, kept so the
+    # derivation can be RE-RUN. Empty when `allow_container_sockets=True` (opt-out) — which is why
+    # this field exists rather than re-reading `_CONTAINER_DAEMON_SOCKETS` at spawn: the opt-out
+    # must survive into the refresh, and inferring it from an empty `deny_sockets` would be a proxy.
+    #
+    # ⛔ WHY A SEPARATE FIELD AT ALL — THE TOCTOU (codex L3 HIGH, 2026-09-04; spore-768).
+    # `deny_sockets` is RESOLVED, and this policy is built at TOOL-CREATION time while the confined
+    # shell is spawned LAZILY afterwards (`SandboxedBashExecutor._ensure_shell`) and RE-spawned
+    # after every `exit`/reset. A path resolved when the shell does not yet exist can stop being
+    # true before the shell that the resolution fences ever starts: a listed socket ABSENT at build
+    # resolves to ITSELF, and a later symlink at that path makes seatbelt canonicalise `connect()`
+    # to a target absent from `deny_sockets` — REPRODUCED end to end 2026-09-04, the connect
+    # THROUGH THE LISTED NAME returned the payload.
+    # ⚠ THE ORDINARY "operator starts Docker after the policy was built" CASE IS **NOT** AN
+    # INSTANCE, and a first draft of this comment said it was. `/var/run/docker.sock` resolves to
+    # `~/.docker/run/docker.sock` (or `~/.colima/default/docker.sock`), and BOTH are themselves
+    # entries in `_CONTAINER_DAEMON_SOCKETS` — the enumeration lists the canonical name AND what it
+    # resolves to, so the union already covers that. Checked against the list rather than assumed.
+    # The refresh is for a listed name pointing at a target the enumeration does NOT hold.
+    # `refresh_socket_denies` re-runs the derivation from THIS field at spawn. See it for what the
+    # refresh does and does not buy — the residual window is stated there, not papered over.
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
@@ -728,11 +757,11 @@ def build_policy(
     #         stay legal by design — nor (ii) for (iii). Neither arm is redundant.
     # ⚠ The host/daemon is OUTSIDE the sandbox and is unaffected by all three; verified by a
     # host-side connect succeeding against the same socket while the entity's was refused.
-    sockets_l: list[Path] = []
+    socket_sources_l: list[Path] = []
     if not allow_container_sockets:
         for s in _CONTAINER_DAEMON_SOCKETS:
             lex = Path(s).expanduser()
-            sockets_l.append(lex.resolve())
+            socket_sources_l.append(lex)
             # (ii): BOTH spellings — but the reason differs per path, and the first version of
             # this comment said only "for the lexically-matched link ops", which is FALSE for
             # the /var- and /run-sited entries (glm-5.3 L3, 2026-09-04, CONFIRMED by measurement
@@ -750,7 +779,12 @@ def build_policy(
             # "believe it is the entry doing the work", and I had just given them a reason to.
             deny_write_files_l.append(lex)
             deny_write_files_l.append(lex.resolve())
-    deny_sockets_t = _dedup(sockets_l)
+    # ⛔ THE RESOLUTION GOES THROUGH ``_resolve_socket_targets``, NOT AN INLINE ``.resolve()``, so
+    # that build time and SPAWN time (``refresh_socket_denies``) run the SAME derivation — spore-768.
+    # An inline resolve here would be a second implementation of a security derivation, which is the
+    # shape that produced the drift this fix exists to close.
+    socket_sources_t = _dedup(socket_sources_l)
+    deny_sockets_t = _resolve_socket_targets(socket_sources_t)
     # BOTH spellings of every socket, for MESSAGE classification in `crown_jewel_reason`.
     # ⛔ PRECOMPUTED HERE SO THE PREDICATE DOES NO FILESYSTEM I/O (codex L3, 2026-09-04).
     # It previously called `wf.resolve()` inside the classification loop — OUTSIDE the
@@ -873,7 +907,107 @@ def build_policy(
         own_memory_files=own_memory_files_t,
         deny_sockets=deny_sockets_t,
         socket_spellings=socket_spellings_t,
+        socket_sources=socket_sources_t,
     )
+
+
+def _resolve_socket_targets(sources: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Resolve every lexical socket path in ``sources`` to the target seatbelt will canonicalise a
+    ``connect()`` to. FAIL-CLOSED: any resolution error raises :class:`ConfinementError`.
+
+    ⛔ THE ONE PLACE THIS DERIVATION LIVES, and that is the point. It runs TWICE per shell — once in
+    :func:`build_policy` and once in :func:`refresh_socket_denies` at spawn — and two copies of a
+    security derivation drifting apart is a class this repo has already paid for. One function, two
+    call sites.
+
+    Resolution errors (a symlink loop, an unreadable ancestor) previously escaped ``build_policy``
+    as a raw ``OSError``/``RuntimeError``. At SPAWN that is the wrong shape: the caller is
+    ``spawn_shell``, whose entire contract is to refuse rather than hand back an unfenced shell, so
+    the failure is converted HERE — at the derivation — rather than at each call site, where the
+    next call site added would be the one that forgets."""
+    out: list[Path] = []
+    for lex in sources:
+        try:
+            out.append(lex.resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"could not resolve the container-socket path {lex} ({exc}) — refusing to build "
+                "the confinement floor rather than emit a socket deny that may name the wrong "
+                "target (fail-closed)."
+            ) from exc
+    return tuple(out)
+
+
+def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
+    """Re-derive the socket CONNECT arm from ``policy.socket_sources`` as the filesystem is NOW, and
+    return a policy whose ``deny_sockets`` is the build-time set UNION the freshly-resolved set.
+
+    Called by :meth:`ConfinementProvider.spawn_shell` immediately before the profile is rendered.
+    ``spore-768`` / codex L3 HIGH 2026-09-04.
+
+    ⛔ **UNION, NEVER REPLACE — this is the fail-closed property and it is the whole design.** A
+    refresh that REPLACED the set would let a symlink swap DELETE a deny that was correct at build
+    time: point a listed socket at a decoy immediately before spawn and the real target drops off
+    the list. Union makes the deny list monotonic — a re-resolution can only ever ADD an entry —
+    so the refresh cannot be turned into the attack it exists to stop. It also means the refresh is
+    safe to run unconditionally, with no "did it change?" branch to get wrong.
+
+    ▶ **ONLY ARM (i) IS REFRESHED, AND THE OTHER TWO DO NOT NEED IT.** Arms (ii)/(iii) — the socket
+    write-deny and the ancestor write-deny — are stored at BOTH spellings, and the LEXICAL spelling
+    is what they match on; a symlink appearing at a listed path does not change that path's own
+    name, so those arms already fire against exactly the condition this refresh is about. That is
+    measured, not assumed: it is why creating the symlink at a listed path is refused to the entity
+    ("Operation not permitted") in the reproduction. Refreshing them would recompute
+    ``deny_write_dirs`` for no enforcement gain.
+
+    ▶ **NO TWO-HANDS DIVERGENCE.** The in-process file-editor twin holds the BUILD-time policy, and
+    the connect arm is the one field on this policy with **no in-process twin** (stated at
+    :func:`crown_jewel_reason`, which enforces the rename/unlink arm only — it has no ``connect()``
+    primitive). So a spawn-time-only refresh of ``deny_sockets`` cannot make the two enforcers
+    disagree about anything either of them enforces. ``socket_spellings`` is deliberately left
+    alone for the same reason — it is message classification, keyed on a lexical spelling that the
+    refresh does not change.
+
+    ⚠ **WHAT THIS DOES NOT BUY: THE WINDOW IS NARROWED TO SPAWN→CONNECT, NOT CLOSED.** A seatbelt
+    profile is fixed when the process starts and cannot be updated on a live shell, so a symlink
+    created at a listed socket path AFTER the shell spawns is still uncovered. That residual is
+    IRREDUCIBLE with seatbelt, not merely unfixed: seatbelt canonicalises the path for
+    ``network-outbound``, so a deny can only ever name a TARGET, never a NAME — there is no
+    expressible rule for "whatever this path points at, at connect time". A ``(subpath ...)`` belt
+    does not help for the same reason (the canonical target is outside the subpath), and the
+    module's existing measurement already rules out a regex belt. **A spawn-time snapshot is the
+    strongest statement this profile language can make**, which is why the honesty surfaces say
+    snapshot rather than covered.
+    ⚡ The residual is acceptable for the reason the reproduction measured rather than assumed: the
+    ENTITY cannot create that symlink (arm (ii) write-denies every listed socket at both
+    spellings), so an EXTERNAL actor must do it mid-session, and an unlisted socket it could point
+    at was already reachable under its own name — the banner declares that gap. Marginal exposure
+    was zero even before this fix; what was false was the CLAIM that a listed socket is covered.
+
+    ▶ SIDE EFFECT WORTH NAMING: when a listed name does point somewhere unenumerated, the union
+    denies that target too — so the refresh closes the unlisted socket a listed name reaches. It
+    does NOT close unlisted sockets generally; that is ``spore-754`` (operator-declared
+    ``deny_sockets``) and is deliberately a separate change."""
+    if not policy.socket_sources:
+        return policy  # opt-out (`allow_container_sockets=True`) or nothing enumerated
+    fresh = _resolve_socket_targets(policy.socket_sources)
+    merged = _dedup_paths(list(policy.deny_sockets) + list(fresh))
+    if merged == policy.deny_sockets:
+        return policy
+    return replace(policy, deny_sockets=merged)
+
+
+def _dedup_paths(items: list[Path]) -> tuple[Path, ...]:
+    """Order-preserving de-duplication. The module-level twin of ``build_policy``'s local ``_dedup``,
+    which is a closure and cannot be reached from here. Order is preserved because the rendered
+    profile is compared verbatim in tests and a set would make it nondeterministic."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in items:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return tuple(out)
 
 
 def _canon(path: str) -> str:
@@ -1578,7 +1712,6 @@ class ConfinementProvider(ABC):
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """Render ``policy`` into the platform's native sandbox profile text (no I/O)."""
 
-    @abstractmethod
     def spawn_shell(
         self,
         policy: CrownJewelsPolicy,
@@ -1587,7 +1720,39 @@ class ConfinementProvider(ABC):
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
         """Start a persistent shell confined by ``policy`` (writes the profile, spawns the sandboxed
-        bash). The returned :class:`SandboxedShell` is already ``start()``\\ ed."""
+        bash). The returned :class:`SandboxedShell` is already ``start()``\\ ed.
+
+        ⛔ **CONCRETE AND FINAL ON PURPOSE — THE SOCKET REFRESH IS STRUCTURAL, NOT A CONTRACT NOTE**
+        (spore-768). This used to be ``@abstractmethod``. It is now a template method that runs
+        :func:`refresh_socket_denies` and then delegates to :meth:`_spawn_shell_impl`, because the
+        thing a provider must not be able to forget is the re-resolution of the socket connect arm:
+        the policy is built at tool-creation time and the shell spawns LAZILY (and RE-spawns after
+        every ``exit``), so a provider that renders the build-time ``deny_sockets`` reintroduces the
+        codex L3 HIGH this release exists to close.
+
+        A docstring saying "call ``refresh_socket_denies`` first" is discipline, and discipline
+        drifts. There is a **second provider already written** — ``BwrapProvider`` on the held
+        ``k4c-linux`` branch — which is exactly the case a contract note would have missed: it was
+        authored before this fix existed, so it cannot have been written to honour a rule that did
+        not exist. Making the refresh part of the seam means it inherits the fix by merging rather
+        than by someone remembering.
+        ⚠ MERGE NOTE FOR ``k4c-linux``: both ``SeatbeltProvider.spawn_shell`` and
+        ``BwrapProvider.spawn_shell`` on that branch must be renamed to ``_spawn_shell_impl``. It is
+        a mechanical rename, and it is the whole cost of making this structural."""
+        return self._spawn_shell_impl(
+            refresh_socket_denies(policy), env=env, default_timeout=default_timeout
+        )
+
+    @abstractmethod
+    def _spawn_shell_impl(
+        self,
+        policy: CrownJewelsPolicy,
+        *,
+        env: dict[str, str] | None = None,
+        default_timeout: float = 120.0,
+    ) -> SandboxedShell:
+        """Platform half of :meth:`spawn_shell`. ``policy`` arrives with its socket connect arm
+        ALREADY re-resolved for this spawn — render it as given; do not re-derive it here."""
 
 
 def _reject_control_chars(value: str) -> None:
@@ -1771,7 +1936,7 @@ class SeatbeltProvider(ConfinementProvider):
 
         return "\n".join(lines).rstrip() + "\n"
 
-    def spawn_shell(
+    def _spawn_shell_impl(
         self,
         policy: CrownJewelsPolicy,
         *,

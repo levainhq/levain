@@ -792,9 +792,9 @@ def _print_banner(
             print("               runtime whose socket is not in that list — the deny is BY NAME,")
             print("               and pinning one in deny_files does NOT close it (that denies the")
             print("               FILE, not the connect). No operator socket list exists yet.")
-            print("             \u26a0 coverage is a BUILD-TIME SNAPSHOT: a listed socket that does not")
-            print("               exist yet, and is later created pointing somewhere unlisted, is")
-            print("               reachable through its listed name. Start your runtime first.")
+            print("             \u26a0 coverage is a SPAWN-TIME SNAPSHOT: the list is re-resolved each")
+            print("               time a shell starts, so a listed socket created BEFORE that is")
+            print("               covered. One created AFTER, pointing somewhere unlisted, is not.")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —
