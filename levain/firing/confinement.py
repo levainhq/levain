@@ -874,7 +874,20 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     moat, not this predicate, is what keeps recall/capture off flow's store."""
     try:
         p = Path(path).expanduser().resolve()
-    except (ValueError, OSError) as exc:
+    # ⛔ RuntimeError IS IN THIS CLAUSE FOR THE SAME REASON IT IS IN `doctor.py`'s, AND THIS
+    # FUNCTION IS THE ONE WHERE IT MATTERS MOST. `Path("~someuser/...").expanduser()` raises
+    # RuntimeError — not OSError, not ValueError — for a user with no passwd entry. MEASURED:
+    # `Path("~nosuchuser42/.ssh/authorized_keys").expanduser()` -> `RuntimeError: Could not
+    # determine home directory.` The `path` here is supplied BY THE ENTITY, so a confabulating
+    # model emitting a `~user` spelling reached a function whose docstring promises FAIL-CLOSED
+    # and got neither a denial nor an allow — it got an exception out of the security predicate.
+    # ⚠ THE SAME RELEASE ALREADY FIXED THIS CLASS IN `doctor.py` AND DID NOT REACH HERE. Its
+    # CHANGELOG entry even records the fix reintroducing an earlier defect "by a new door" — and
+    # the door it did not check was the in-process crown-jewels twin. `guard_scoped_by_symptom_
+    # misses_the_class`, with the class named in the same release that missed it.
+    # (glm-5.2 repo-read seat, run 8de86ccec2bd439f — a review recorded as "produced nothing"
+    # whose row was in verdicts.jsonl the whole time. Every claim re-verified here by execution.)
+    except (ValueError, OSError, RuntimeError) as exc:
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
