@@ -916,17 +916,44 @@ class SystemdUserProvider(DaemonProvider):
             if prior_service is not None:
                 # ROLL BACK to the prior good definition — the same transactional floor as launchd.
                 self._atomic_write(service_path, prior_service)
+                # ⛔ ROLL THE TIMER BACK TO ITS PRIOR **STATE**, NOT ITS PRIOR **CONTENT**, AND
+                # RECOMPUTE THE TARGET FROM THE RESTORED SHAPE (Diogenes MEDIUM, 2026-09-04).
+                # The old form restored the timer only `if prior_timer is not None`, so a
+                # resident -> periodic upgrade — where there WAS no prior timer — left the NEW
+                # timer on disk while the service was rolled back to the resident one, and then
+                # re-enabled that timer because `target` was still computed from the FAILED spec.
+                # That arrives at precisely the "two schedulers driving one service" state the
+                # shape-change branch thirty lines up exists to prevent, while telling the
+                # operator the rollback succeeded. The MIRROR case was broken the other way:
+                # periodic -> resident restored the timer FILE and never re-enabled it, leaving a
+                # disabled timer that still captures `_primary_unit`, and a timer is MainPID=0
+                # forever — which this provider's own comments say must not be read as a run signal.
+                # ⚠ Both are the same error: the rollback restored FILES and left the systemd
+                # ENABLEMENT describing a shape that no longer exists on disk.
                 if prior_timer is not None:
                     self._atomic_write(timer_path, prior_timer)
+                else:
+                    # There was no timer before this install. If we wrote one, it is ours and it
+                    # must go — disable first, because unlinking a file does not un-enable the
+                    # symlink systemd already created.
+                    _run(["systemctl", "--user", "disable", "--now", f"{spec.label}.timer"],
+                         check=False)
+                    timer_path.unlink(missing_ok=True)
+                rollback_target = (f"{spec.label}.timer" if prior_timer is not None
+                                   else f"{spec.label}.service")
                 _run(["systemctl", "--user", "daemon-reload"], check=False)
-                _run(["systemctl", "--user", "enable", "--now", target], check=False)
+                _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
                 raise DaemonError(
                     f"enabling the new unit failed: {failure} — rolled back to the prior installed "
-                    f"unit at {service_path}")
+                    f"unit at {service_path} (re-enabled {rollback_target})")
             raise DaemonError(
-                f"enabling failed: {failure} — the unit is KEPT at {service_path} (it is valid). "
-                f"A valid unit is not deleted on a transient failure; re-run the install once the "
-                f"cause is fixed.")
+                f"enabling failed: {failure} — the unit is KEPT at {service_path}. "
+                # ⚠ THIS USED TO SAY "(it is valid)". Nothing here checks that, and systemd will
+                # refuse a unit for reasons this code never inspects — an asserted property in the
+                # sentence an operator reads while deciding whether to trust the file on disk.
+                f"levain RENDERED it and is not deleting it on what may be a transient failure; "
+                f"`systemd-analyze verify {service_path}` says whether systemd accepts it. "
+                f"Re-run the install once the cause is fixed.")
 
         linger = self._enable_linger()
         st = self.status(spec.label)
