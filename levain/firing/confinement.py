@@ -2798,8 +2798,10 @@ _APPARMOR_REMEDY = (
     "install Ubuntu's own bwrap profile: `sudo apt install apparmor-profiles && sudo install -m "
     "0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo "
     "apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict` (keeps the host-wide restriction on; "
-    "reverse with `apparmor_parser -R`). Note it also denies namespace creation to bwrap's CHILDREN, "
-    "so the entity's bash cannot run rootless docker/podman, flatpak or a nested sandbox."
+    "reverse with `apparmor_parser -R`). It stacks the sandboxed process under a child profile with "
+    "NO capabilities: a child may still create a plain user namespace but cannot map root into it, so "
+    "the entity's bash cannot run a nested bwrap, rootless docker/podman, flatpak, or a browser "
+    "sandbox. Measured, with a control — not read off the profile."
 )
 
 

@@ -2703,8 +2703,11 @@ def test_diagnose_linux_missing_bwrap_says_install_it(monkeypatch) -> None:
 def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkeypatch) -> None:
     """⚡ THE CASE THIS WHOLE SURFACE EXISTS FOR, and the remedy must be UBUNTU'S OWN profile
     (`bwrap-userns-restrict`, shipped in `apparmor-profiles`), not one we hand-roll. It must also
-    carry the constraint the profile imposes — bwrap's CHILDREN cannot create namespaces, so the
-    entity's bash cannot run rootless docker/podman or a nested sandbox."""
+    carry the constraint the profile imposes. ⚠ That constraint is NOT "children cannot create
+    namespaces" — measured on a real host, a child CAN create a plain user namespace; what it cannot
+    do is map root into one (no capabilities in the stacked child profile), which is what a nested
+    bwrap, rootless docker/podman, flatpak and browser sandboxes all need. The remedy text says the
+    accurate thing, so this asserts the accurate thing."""
     monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
     monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
     monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
@@ -2713,7 +2716,8 @@ def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkey
     assert d.supported is False
     assert "AppArmor" in d.reason
     assert "bwrap-userns-restrict" in (d.remedy or "")
-    assert "CHILDREN" in (d.remedy or "")
+    assert "cannot map root" in (d.remedy or "")
+    assert "rootless docker/podman" in (d.remedy or "")
 
 
 def test_diagnose_linux_namespace_denied_without_apparmor_is_a_different_sentence(monkeypatch) -> None:

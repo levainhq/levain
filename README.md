@@ -233,7 +233,9 @@ sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /e
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 ```
 
-This keeps Ubuntu's host-wide restriction on and is reversible with `apparmor_parser -R`. Note that it also denies namespace creation to `bwrap`'s children, so the entity's shell cannot run rootless docker/podman, flatpak, or a nested sandbox.
+This keeps Ubuntu's host-wide restriction on and is reversible with `apparmor_parser -R`.
+
+**What it costs, measured rather than assumed.** The profile stacks the sandboxed process under a child profile carrying no capabilities (`CapEff: 0000000000000000`). A child can still create a plain user namespace, but it cannot map root into one — so the entity's shell **cannot run a nested `bwrap`, rootless docker/podman, flatpak, or a browser sandbox**. Ordinary development work is unaffected. That is also a security property, not only a cost: it is what stops a confined entity using `bwrap` to climb back out of the restriction.
 
 ⚠ **Don't diagnose this by reading `kernel.unprivileged_userns_clone`.** That sysctl still reports `1` on affected Ubuntu hosts while `kernel.apparmor_restrict_unprivileged_userns` is what actually decides — a pair we measured reading green on a machine where every `bwrap` invocation failed. Levain checks by running `bwrap`, not by reading either.
 
