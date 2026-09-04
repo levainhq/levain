@@ -172,7 +172,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from abc import ABC, abstractmethod
+from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Literal
@@ -1385,6 +1385,17 @@ class SandboxedShell:
         self._sent_h1 = sentinel[: len(sentinel) // 2]
         self._sent_h2 = sentinel[len(sentinel) // 2 :]
         self._proc: subprocess.Popen[str] | None = None
+        # ⛔ THE POLICY THIS SHELL WAS ACTUALLY CONFINED BY — set by the provider seam, so the
+        # caller can cache the EXACT set that got rendered (codex L3 #1, 2026-09-04). Without it the
+        # executor refreshed once and `spawn_shell` refreshed AGAIN, discarding the second result:
+        # if the source resolved to A in the executor and to B in the provider (an external
+        # retarget in between), the shell was confined by A+B while the executor cached only A, so
+        # B vanished at the next respawn. The union was NOT monotonic across respawns — the exact
+        # property the refresh exists to provide, defeated by refreshing twice and keeping the
+        # earlier answer. ⚠ My own comment claimed the double call "costs a resolution and changes
+        # nothing"; that is true only if the filesystem is identical at both instants, which is
+        # precisely what a TOCTOU fix may not assume.
+        self.effective_policy: CrownJewelsPolicy | None = None
         self._cmd_w: IO[str] | None = None   # the FIFO command channel write end (see start())
         self._fifo_dir: str | None = None    # the tempdir holding the command FIFO (cleaned on close)
         self._stdout_q: "queue.Queue[str | None]" = queue.Queue(maxsize=_MAX_QUEUE_LINES)
@@ -1728,35 +1739,48 @@ class SandboxedShell:
 
 # --- the provider seam (mirrors levain.daemon.DaemonProvider) --------------------------------
 
-class ConfinementProvider(ABC):
+class _ProviderMeta(ABCMeta):
+    """Metaclass that makes :meth:`ConfinementProvider.spawn_shell` genuinely final.
+
+    ⛔ THIS REPLACED AN ``__init_subclass__`` GUARD THAT CHECKED ``cls.__dict__`` (codex L3 #2 and
+    complement, convergent, 2026-09-04). Two holes in that version, both demonstrated by the
+    reviewers rather than argued:
+      · **MIXIN SHADOWING.** ``class P(LegacyMixin, ConfinementProvider)`` does not put
+        ``spawn_shell`` in ``P.__dict__``, so the guard passed — while the MRO resolved
+        ``spawn_shell`` to the mixin's, skipping the socket refresh deterministically. Test and
+        logging mixins are an ordinary pattern, so this is not an exotic case.
+      · **A NON-COOPERATIVE DESCENDANT.** An intermediate provider that defines
+        ``__init_subclass__`` without calling ``super()`` silently disables the guard for everything
+        below it. A metaclass ``__new__`` runs at class creation no matter what the class body does,
+        so there is nothing to forget to call.
+    ⚡ The first guard was itself written to close a ``claim > enforcement`` gap, and it left a
+    narrower one of exactly the same kind — the third time in this change that a fix reproduced the
+    class it was written for. The test for the old guard passed the whole time, because it only
+    exercised the direct-override case the guard checked.
+
+    ⚠ ``typing.final`` is deliberately NOT the answer: it is a type-checker hint with no runtime
+    effect, and this seam has to hold against a provider nobody type-checked."""
+
+    def __new__(mcls, name, bases, namespace, /, **kwargs):  # type: ignore[no-untyped-def]
+        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
+        base = globals().get("ConfinementProvider")
+        if base is not None and cls is not base:
+            # POST-MRO RESOLUTION, not `cls.__dict__` — that is the whole point of the fix.
+            if getattr(cls, "spawn_shell", None) is not base.spawn_shell:  # type: ignore[attr-defined]
+                raise TypeError(
+                    f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
+                    "the spawn-time socket re-resolution (spore-768) and silently render a stale "
+                    "socket floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the "
+                    "policy and delegates to it."
+                )
+        return cls
+
+
+class ConfinementProvider(metaclass=_ProviderMeta):
     """One thin provider per OS. ``render_profile`` is PURE (no I/O) so the generated sandbox text is
     fully testable without touching the system; ``spawn_shell`` shells out to the platform sandbox
     driver. The macOS provider ships first; ``bwrap`` (Linux) + a container backend are PURE ADDITIONS
     against this contract, and the macOS crown-jewels denylist is their requirements spec."""
-
-    def __init_subclass__(cls, **kwargs: object) -> None:
-        """⛔ REFUSE A SUBCLASS THAT OVERRIDES :meth:`spawn_shell` — the refresh seam is not
-        advisory (codex L3 #3, 2026-09-04, and self-caught the same hour).
-
-        Making ``spawn_shell`` concrete and ``_spawn_shell_impl`` abstract stops a provider
-        FORGETTING the socket refresh; it does NOT stop one from defining ``spawn_shell`` itself,
-        which overrides the wrapper and skips the refresh silently. Until this guard existed, the
-        docstring said the refresh was "impossible for a provider to skip" while the mechanism
-        merely made it inconvenient — a ``claim > enforcement`` gap, in the one module whose own
-        comments name that as the thing it refuses. ``typing.final`` is a type-checker hint and
-        would not have fired at runtime.
-
-        This fails at CLASS-DEFINITION time, which is the right moment: an external provider (levain
-        is a library, so that is a real case rather than a hypothesis about our own two) learns the
-        seam the first time it is imported, not after shipping a shell with an unrefreshed floor."""
-        super().__init_subclass__(**kwargs)
-        if "spawn_shell" in cls.__dict__:
-            raise TypeError(
-                f"{cls.__name__} overrides ConfinementProvider.spawn_shell, which would skip the "
-                "spawn-time socket re-resolution (spore-768) and silently render a stale socket "
-                "floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the policy "
-                "and delegates to it."
-            )
 
     @abstractmethod
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
@@ -1789,9 +1813,14 @@ class ConfinementProvider(ABC):
         ⚠ MERGE NOTE FOR ``k4c-linux``: both ``SeatbeltProvider.spawn_shell`` and
         ``BwrapProvider.spawn_shell`` on that branch must be renamed to ``_spawn_shell_impl``. It is
         a mechanical rename, and it is the whole cost of making this structural."""
-        return self._spawn_shell_impl(
-            refresh_socket_denies(policy), env=env, default_timeout=default_timeout
-        )
+        refreshed = refresh_socket_denies(policy)
+        shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
+        # ONE authoritative refresh per spawn, and the caller can read back exactly what was
+        # rendered rather than re-deriving it (codex L3 #1). `_spawn_shell_impl` may return a
+        # falsy sentinel in tests; guard rather than assume.
+        if shell is not None:
+            shell.effective_policy = refreshed
+        return shell
 
     @abstractmethod
     def _spawn_shell_impl(
