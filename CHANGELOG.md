@@ -44,6 +44,30 @@ jewel. Blocking the connect needs a `network-outbound` rule, and that rule alone
 renaming the socket, and *that* is defeated by relocating its parent directory. All three are
 enforced, and each was measured failing on its own before it was kept.
 
+### Fixed — a listed socket could be reported as covered while it was not
+
+The socket denies above are stored **resolved** — the profile can only name where a path *points*,
+never the path itself, because the sandbox canonicalises the target before matching. Those denies
+were computed when the policy was built, and the confined shell starts later (and starts again after
+every `exit`). A listed socket that did not exist yet resolved to itself, so if something created it
+as a symlink to an unlisted target in between, a connect through the **listed name** landed on a
+target nothing denied.
+
+The resolution now re-runs every time a shell starts, and the fresh targets are **added** to the
+existing set rather than replacing it, so a re-resolution can only ever widen the denylist. Coverage
+is now a spawn-time snapshot instead of a build-time one, and `levain run` says so in those words.
+
+**What this was, honestly: a wrong claim rather than a new hole.** A confined entity cannot create
+that symlink — the socket is write-denied at both spellings, which is one of the three rules above —
+so it takes something outside the sandbox to arrange, and the unlisted socket it would point at was
+already reachable under its own name, which the banner already told you. What it cost was your
+ability to trust the list: a socket that was named as covered was not. That is fixed.
+
+**The residual is stated rather than papered over.** A sandbox profile is fixed when the process
+starts, so a symlink created at a listed path *after* a shell is already running is still not
+covered, and no rule available here would cover it. A spawn-time snapshot is the strongest statement
+this sandbox language can make, which is why the wording says snapshot and not "covered".
+
 **The banner names which sockets are covered, and which are not.** The deny is an enumeration and an
 enumeration is always incomplete, so `levain run` says so rather than claiming containers are
 fenced: a custom `$DOCKER_HOST`, a TCP daemon endpoint, or any runtime whose socket is not in the
