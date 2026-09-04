@@ -442,6 +442,11 @@ class EntitySession:
     bash_ok: bool
     ssh_mode: str = "agent"
     deny_standard_creds: bool = False
+    allow_container_sockets: bool = False
+    """spore-725. Carried here for ONE reason: the banner must render the floor that is
+    actually in force, never a static sentence. It is read from the same
+    ``confinement.json`` the policy is built from, so the honesty line and the seatbelt
+    profile cannot disagree — the failure the cred-floor line was fixed for once already."""
     gate_mode: GateMode = "gated"
     """The resolved EFFERENT GATE posture for this session (**K3**).
 
@@ -570,6 +575,9 @@ class EntitySession:
             # Publish the drive mode AND resolve the cred floor — ONE call, because the two must
             # not drift (see `_apply_drive_policy`). Must run BEFORE any tool policy is built.
             deny_standard_creds = _apply_drive_policy(cfg, mode)
+            # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
+            # not a human is watching, so there is no mode that should soften it.
+            allow_container_sockets = cfg.allow_container_sockets if cfg is not None else False
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR
@@ -640,6 +648,7 @@ class EntitySession:
             bash_ok=with_tools and bash_ok,
             ssh_mode=ssh_mode,
             deny_standard_creds=deny_standard_creds,
+            allow_container_sockets=allow_container_sockets,
             gate_mode=gate_mode,
         )
 

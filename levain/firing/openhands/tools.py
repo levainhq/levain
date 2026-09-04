@@ -149,6 +149,12 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         deny_standard_creds=resolve_cred_floor(
             cfg.deny_standard_creds, mode=current_drive_mode()
         ),
+        # spore-725. Passed straight through — NOT drive-resolved like the line above, because a
+        # reachable container daemon is a total bypass in every drive mode (an interactive operator
+        # watching the stream is not a mitigation for `docker run -v /:/host`). Both hands read the
+        # same value, so the file editor's rename-deny and the seatbelt's connect-deny cannot
+        # disagree about whether sockets are fenced.
+        allow_container_sockets=cfg.allow_container_sockets,
     )
 
 

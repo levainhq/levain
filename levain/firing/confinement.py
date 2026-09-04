@@ -268,6 +268,34 @@ _STANDARD_CRED_FILES = (
     "~/.config/git/credentials",    # XDG-path git credential store
 )
 
+# CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
+#
+# ⛔ A REACHABLE CONTAINER DAEMON IS A TOTAL BYPASS OF EVERYTHING ELSE IN THIS MODULE, and it
+# was CONFIRMED END-TO-END on the shipping build (2026-09-03, re-reproduced independently
+# 2026-09-04 at 1e44342): with the floor denying a jewel by path, one command returns it —
+#     docker run --rm -v <jewel>:/x:ro alpine cat /x
+# The daemon runs as root and was NEVER IN OUR SANDBOX, so no path deny, no mount trick and no
+# namespace can hide anything from it. It does not escalate and needs no exotic technique: the
+# entity simply asks a more privileged process to read the file for it.
+#
+# ⚠ WHY THIS IS AN ENUMERATION WHEN THE REST OF THE FLOOR REFUSES TO GUESS. The ~/.ssh floor is
+# LOCATION-based precisely because name-based guessing is false security. These paths are the
+# same KIND of knowable location as the standard cred stores (:data:`_STANDARD_CRED_FILES`) —
+# a client looks here BY DEFINITION or it cannot find its daemon — but the list is still
+# necessarily incomplete: a custom $DOCKER_HOST, a k8s/containerd/lima/OrbStack socket, or a
+# TCP endpoint are all outside it. THEREFORE THE BANNER NAMES WHICH SOCKETS ARE COVERED AND
+# NEVER CLAIMS CONTAINERS ARE FENCED. An unqualified claim here would be worse than the hole.
+_CONTAINER_DAEMON_SOCKETS = (
+    "/var/run/docker.sock",                 # the canonical Docker/OCI endpoint (often a symlink)
+    "~/.docker/run/docker.sock",            # Docker Desktop for Mac — what /var/run resolves TO
+    "/run/docker.sock",                     # systemd-era Linux spelling of the same
+    "~/.colima/default/docker.sock",        # colima, default profile
+    "/run/podman/podman.sock",              # podman, rootful
+    "~/.local/share/containers/podman/machine/podman.sock",   # podman machine (rootless)
+    "/var/run/containerd/containerd.sock",  # containerd directly — below docker, same authority
+    "/var/run/crio/crio.sock",              # CRI-O
+)
+
 
 class ConfinementError(RuntimeError):
     """The confinement could not be established or is unavailable on this platform. FAIL-CLOSED:
@@ -315,6 +343,33 @@ class CrownJewelsPolicy:
     # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
     # (apparatus L1 — confinement.json lives in the entity-writable .levain/; a self-authored
     # ssh_mode="raw" / emptied deny_files would weaken the NEXT session's operator-declared floor).
+    deny_sockets: tuple[Path, ...] = ()  # container/VM DAEMON sockets, RESOLVED (spore-725).
+    # ⛔ A SEPARATE FIELD FROM ``deny_files`` ON PURPOSE, AND THE REASON IS THE WHOLE FINDING:
+    # the two need DIFFERENT RENDERING VERBS. A seatbelt ``file-read* file-write*`` deny does
+    # NOT block ``connect()`` to a unix socket — MEASURED 2026-09-04: with both docker socket
+    # spellings in ``deny_files``, the profile emitted the literals, read clean in review, and
+    # the attack still returned the jewel. Blocking the connect needs ``network-outbound``.
+    # Folding sockets into ``deny_files`` would put them in a field whose renderer cannot deny
+    # them — a guard that cannot see its own subject, in the one module where that is fatal.
+    #
+    # ⚠ RESOLVED ONLY, and this is the opposite of ``deny_write_files`` two lines up. Seatbelt
+    # CANONICALISES the path for network-outbound (as it does for read/write data ops), so a
+    # resolved-only deny covers every symlinked spelling — MEASURED: denying only the LEXICAL
+    # /var/run/docker.sock blocks NOTHING, not even a connect naming that exact path; denying
+    # only the resolved ~/.docker/run/docker.sock refuses BOTH. A lexical socket literal is not
+    # redundant-but-harmless, it is INERT, and a maintainer who adds one may believe it is the
+    # entry doing the work.
+    #
+    # ⛔⛔ THE NETWORK DENY ALONE IS DEFEATED BY ``mv`` — the socket is ALSO write-denied (both
+    # spellings, via ``deny_write_files``) and its ancestors write-denied (via ``all_jewels``).
+    # MEASURED: under a network-only deny, ``mv sock moved.sock`` then connecting to the new
+    # path CONNECTS, because after the rename the canonical path is one nothing names and the
+    # daemon keeps serving the same listening inode. Isolated further: the socket LITERAL
+    # write-deny is what stops that (a parent-DIR write-deny does NOT — renames inside a dir
+    # stay legal by design), and the ancestor deny is separately required, because with only
+    # the literal denied, renaming the PARENT DIR relocates the socket and connects. This is
+    # the ``_write_deny_ancestors`` rename-relocation class (apparatus L2) applying to sockets.
+    # ⚠ ALL THREE ARMS ARE LOAD-BEARING; each was falsified on its own before being kept.
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
@@ -400,6 +455,14 @@ def build_policy(
     # PRODUCTION caller that forgets — is guarded structurally instead, by a source-level
     # test asserting every production call site passes this explicitly.
     deny_standard_creds: bool = False,
+    # DEFAULT-ON, unlike ``deny_standard_creds`` above, and the asymmetry is deliberate.
+    # That one is opt-IN because denying those reads breaks the entity's own gh/aws/curl
+    # hands — a real operational cost against a real capability. Denying a container-daemon
+    # socket costs the entity NOTHING it can legitimately do inside a floor: reaching the
+    # daemon IS the bypass, since the daemon is unsandboxed and root. A floor with a live
+    # socket in it is not a weaker floor, it is a decorative one. The opt-OUT exists for the
+    # operator who genuinely runs containers from the entity and accepts that.
+    allow_container_sockets: bool = False,
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -573,6 +636,35 @@ def build_policy(
                 out.append(p)
         return tuple(out)
 
+    # CONTAINER-DAEMON SOCKETS (spore-725) — THREE ARMS, EACH MEASURED SEPARATELY 2026-09-04
+    # against a real unix-socket server under a real ``sandbox-exec`` profile, and each kept
+    # only after the profile WITHOUT it was shown to lose:
+    #   (i)   CONNECT — ``deny_sockets`` renders ``(deny network-outbound (literal <resolved>))``.
+    #         RESOLVED spelling only: seatbelt canonicalises for network-outbound, so the
+    #         resolved entry covers every symlinked path, and a LEXICAL-only entry blocks
+    #         nothing at all (measured on /var/run/docker.sock -> ~/.docker/run/docker.sock).
+    #   (ii)  RENAME/UNLINK OF THE SOCKET — the socket goes into ``deny_write_files_l`` at BOTH
+    #         spellings, because link operations ARE matched lexically (the same asymmetry this
+    #         function already documents for the ssh vectors). Without it: ``mv sock moved`` and
+    #         then connecting to ``moved`` SUCCEEDS — the canonical path is now one nothing
+    #         names, and the daemon keeps serving the same listening inode.
+    #   (iii) RELOCATION OF AN ANCESTOR — falls out free, because these entries land in
+    #         ``all_jewels`` below and ``_write_deny_ancestors`` write-denies every parent dir.
+    #         Without it: renaming the socket's PARENT DIR relocates it and connects. Measured
+    #         that a parent-dir write-deny does NOT substitute for (ii) — renames INSIDE a dir
+    #         stay legal by design — nor (ii) for (iii). Neither arm is redundant.
+    # ⚠ The host/daemon is OUTSIDE the sandbox and is unaffected by all three; verified by a
+    # host-side connect succeeding against the same socket while the entity's was refused.
+    sockets_l: list[Path] = []
+    if not allow_container_sockets:
+        for s in _CONTAINER_DAEMON_SOCKETS:
+            lex = Path(s).expanduser()
+            sockets_l.append(lex.resolve())
+            # (ii): both spellings, for the lexically-matched link ops.
+            deny_write_files_l.append(lex)
+            deny_write_files_l.append(lex.resolve())
+    deny_sockets_t = _dedup(sockets_l)
+
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
     deny_write_files_t = _dedup(deny_write_files_l)
@@ -680,6 +772,7 @@ def build_policy(
         config_file=config_file,
         deny_write_files=deny_write_files_t,
         own_memory_files=own_memory_files_t,
+        deny_sockets=deny_sockets_t,
     )
 
 
@@ -752,8 +845,25 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
         return f"{p} is the confinement config (the entity cannot rewrite its own floor)"
     if policy.ssh_dir is not None and _ci_within(p, policy.ssh_dir):
         return f"{p} is under ~/.ssh key material ({policy.ssh_dir})"
+    # SOCKETS FIRST, AND ONLY FOR THE MESSAGE. Container sockets are write-denied through the
+    # same ``deny_write_files`` list as the ssh vectors (see build_policy arm (ii)), so without
+    # this branch the next one would tell an operator that ``/var/run/docker.sock`` is "an ssh
+    # persistence/exec vector (authorized_keys/config/rc)" — a refusal reason that is simply
+    # false, in the surface an operator reads to understand their own floor. The DENIAL was
+    # already correct; only its stated reason would have been wrong.
+    # ⚠ This hand has no connect() primitive, so it enforces the RENAME/UNLINK arm only. The
+    # connect arm is the seatbelt profile's ``network-outbound`` rule and has no in-process twin
+    # — stated rather than papered over, because "one policy, two enforcers" holds for every
+    # OTHER field on this policy and does NOT hold for this one.
+    for sk in policy.deny_sockets:
+        if _ci_within(p, sk):
+            return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root daemon "
+                    f"bypasses the whole floor (spore-725)")
     for wf in policy.deny_write_files:
         if _ci_within(p, wf):
+            if wf.name.endswith(".sock"):
+                return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root "
+                        f"daemon bypasses the whole floor (spore-725)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
         # The file editor has no rename primitive and no legit reason to touch the entity's own store
@@ -794,6 +904,16 @@ class ConfinementConfig:
     # is not a graceful degrade: it bricks `levain run`. Resolution + the full argument for why the
     # floor is drive-dependent AT ALL (the rest of it deliberately is not) →
     # `levain.firing.drive.resolve_cred_floor`.
+    allow_container_sockets: bool = False
+    # spore-725. Default FALSE = the container/VM daemon sockets are DENIED (the floor's normal
+    # state). Set true ONLY if this entity genuinely needs to drive containers and the operator
+    # accepts that doing so voids the rest of the floor on that machine: the daemon is root and
+    # unsandboxed, so anything it will mount, it will read. ⚠ NOT a tri-state like
+    # ``deny_standard_creds`` above, deliberately — that one is tri-state because the right
+    # answer DIFFERS BY DRIVE MODE (an unattended seat should lose gh; an interactive one should
+    # not). A live socket is a total bypass in EVERY drive mode, including the interactive one,
+    # so there is no mode for the absent value to derive a different answer from, and a
+    # tri-state would only add a third way to spell the same two outcomes.
     efferent_gate: GateSetting = "auto"
     # The K3 EFFERENT GATE (spore-295). "auto" (default) derives the mode from whether a human is
     # driving — ungated at the REPL (the operator watching the stream IS the fan-in), gated for
@@ -814,6 +934,7 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
          "deny_subtrees": ["~/some/secrets"],
          "ssh_mode": "agent",
          "deny_standard_creds": false,
+         "allow_container_sockets": false,
          "efferent_gate": "auto"}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
@@ -887,11 +1008,26 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"{efferent_gate!r} — fail-closed."
         )
 
+    # spore-725. A plain bool, and ABSENT means FALSE (deny) — the opposite treatment from
+    # ``deny_standard_creds`` above, whose absence is a live sentinel. Absence here can safely
+    # collapse to the default precisely BECAUSE the default is the safe one: an operator who
+    # never heard of this key gets the socket denied. ⚠ A literal null is still REFUSED rather
+    # than read as absence — same reason as its sibling: a null is an operator typing something
+    # and meaning it, and on a security floor we do not guess which thing.
+    allow_container_sockets = data.get("allow_container_sockets", False)
+    if not isinstance(allow_container_sockets, bool):
+        raise ConfinementError(
+            f"{base}: allow_container_sockets must be true or false, got "
+            f"{allow_container_sockets!r} — fail-closed. Omit the key to keep container/VM "
+            f"daemon sockets DENIED (the default)."
+        )
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
         ssh_mode=ssh_mode,
         deny_standard_creds=deny_standard_creds,
+        allow_container_sockets=allow_container_sockets,
         efferent_gate=efferent_gate,
     )
 
@@ -1424,6 +1560,22 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append("(deny file-read* file-write*")
             for p in policy.deny_files:
                 lines.append(f'    (literal "{_sbpl_string(str(p))}")')
+            lines.append(")")
+            lines.append("")
+
+        if policy.deny_sockets:
+            lines.append(";; CONTAINER/VM DAEMON SOCKETS — the ONE deny in this profile that is not a")
+            lines.append(";; file rule, and it has to be. A `file-read* file-write*` deny does NOT")
+            lines.append(";; block connect() to a unix socket: MEASURED 2026-09-04 with both docker")
+            lines.append(";; socket spellings in deny_files, the exploit still returned the jewel.")
+            lines.append(";; Reaching an unsandboxed root daemon defeats every other rule here, so")
+            lines.append(";; without this line the rest of the profile is decorative wherever a")
+            lines.append(";; container runtime is installed. Paths are RESOLVED — seatbelt")
+            lines.append(";; canonicalises for network-outbound, and a lexical entry is INERT.")
+            lines.append(";; The rename/unlink half lives in the write-deny rules below.")
+            lines.append("(deny network-outbound")
+            for p_ in policy.deny_sockets:
+                lines.append(f'    (literal "{_sbpl_string(str(p_))}")')
             lines.append(")")
             lines.append("")
 
