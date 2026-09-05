@@ -1794,3 +1794,98 @@ def test_the_refresh_is_upstream_so_no_provider_can_skip_it(tmp_path, monkeypatc
         "a provider that skips the seam entirely still got a refreshed policy — that is the "
         "invariant; if this fails, deleting the guard was wrong"
     )
+
+
+def test_no_unreachable_statements_in_the_confinement_surface() -> None:
+    """⛔⛔ THE GATE MY GATES DID NOT HAVE. On 2026-09-04 a rewrite of `floor_for_conv_state` left
+    SIX LINES OF DEAD CODE after its `return` — and **2,481 tests, ruff and mypy all passed and it
+    was COMMITTED.** Both review seats flagged it (glm HIGH, complement MED) and nothing mechanical
+    did.
+
+    ⚡ It was not inert, either: the dead tail stored the WRONG dict-value type for a registry whose
+    every reader unpacks a 2-tuple, and it re-created the publish-before-finalize ordering the live
+    code above it exists to eliminate. A merge, a partial revert, or a careless edit making it
+    reachable would have reintroduced the exact fail-open this release closes.
+    ▶ So this is a real gate, not tidiness: unreachable code in a security surface is a defect that
+    every existing instrument was blind to."""
+    import ast
+    import pathlib
+
+    offenders: list[str] = []
+    for name in ("levain/firing/confinement.py", "levain/firing/openhands/tools.py"):
+        path = pathlib.Path(__file__).resolve().parents[1] / name
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list):
+                continue
+            for i, stmt in enumerate(body[:-1]):
+                if isinstance(stmt, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+                    offenders.append(f"{name}:{body[i + 1].lineno} is unreachable")
+    assert not offenders, "unreachable code in the confinement surface: " + "; ".join(offenders)
+
+
+def test_spawn_shell_refreshes_so_every_consumer_gets_it_not_just_one_call_site(
+    tmp_path, monkeypatch
+) -> None:
+    """⛔ complement MED + glm-5.2 MED, CONVERGENT (2026-09-04), and glm's sentence is the correction:
+    *"the metaclass was correctly deleted, but the template-method refresh it was protecting was
+    deleted alongside it. ONLY THE METACLASS NEEDED TO GO."*
+
+    I conflated a GUARD that tried to make the refresh unskippable (impossible in Python; seven
+    bypasses across five versions; correctly deleted) with the REFRESH ITSELF at the layer that owns
+    it. Removing the refresh left the invariant on exactly ONE call site, so any second consumer —
+    `BwrapProvider` on the held branch, a debug harness, a test — rendering `spawn_shell(policy)`
+    without refreshing first would get the BUILD-TIME `deny_sockets`: the spore-768 regression,
+    reintroduced by the fix for the guard protecting against it.
+
+    Call `spawn_shell` DIRECTLY, with no executor involved, and assert the refresh still happened."""
+    listed = tmp_path / "run" / "docker.sock"
+    listed.parent.mkdir(parents=True)
+    pol = _sock_policy(tmp_path, monkeypatch, listed)
+
+    unlisted = tmp_path / "elsewhere" / "real.sock"
+    unlisted.parent.mkdir(parents=True)
+    unlisted.touch()
+    listed.symlink_to(unlisted)          # appears AFTER the policy was built
+
+    from levain.firing.confinement import ConfinementProvider
+
+    class _Direct(ConfinementProvider):
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            return SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
+
+    shell = _Direct().spawn_shell(pol)   # no _ensure_shell anywhere in this path
+    assert shell.effective_policy is not None
+    assert unlisted.resolve() in shell.effective_policy.deny_sockets, (
+        "a direct consumer of spawn_shell got an UNREFRESHED policy — the invariant is back on one "
+        "call site only"
+    )
+
+
+def test_a_seatbelt_shell_unlinks_its_profile_even_if_the_base_close_raises(tmp_path) -> None:
+    """⛔ complement L3 LOW. `_SeatbeltShell.close` ran `super().close()` and THEN unlinked its temp
+    SBPL profile, so a raising base teardown leaked one profile file per failed shell — and nothing
+    upstream can compensate, because a generic fallback has never heard of that file.
+    ⚡ The general form: a subclass's ADDITIVE cleanup must be robust to its parent's failure."""
+    from levain.firing.confinement import SandboxedShell, _SeatbeltShell
+
+    prof = tmp_path / "levain-seatbelt-test.sb"
+    prof.write_text("(version 1)")
+    sh = _SeatbeltShell(argv=["/bin/true"], cwd=tmp_path, env={}, profile_path=prof)
+
+    def _boom(self):
+        raise OSError("base teardown failed")
+
+    original = SandboxedShell.close
+    try:
+        SandboxedShell.close = _boom  # type: ignore[method-assign]
+        with pytest.raises(OSError):
+            sh.close()
+    finally:
+        SandboxedShell.close = original  # type: ignore[method-assign]
+
+    assert not prof.exists(), "the temp seatbelt profile leaked when the base close raised"

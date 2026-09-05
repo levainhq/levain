@@ -175,8 +175,18 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     effective policy"), and — worse — an OVERRIDDEN `close()` that raises before doing any cleanup
     left the subprocess, FIFO and descriptors alive, held by the shell's own reader thread, after
     the only application reference was dropped. Repeated refusals could then exhaust resources.
-    ▶ So: try the object's own `close()`, and if that fails fall back to the BASE-CLASS primitive,
-    which a subclass cannot have replaced. Nothing here is allowed to propagate."""
+    ▶ So: try the object's own `close()`, and if that fails fall back to the base-class teardown.
+    Nothing here is allowed to propagate.
+
+    ⚠ **AND THE FALLBACK'S GUARANTEE IS NARROWER THAN AN EARLIER VERSION OF THIS DOCSTRING CLAIMED**
+    (glm-5.2 L3 LOW, 2026-09-04). It said the base path is one "a subclass cannot have replaced".
+    Not exactly: `SandboxedShell.close` dispatches to `self._signal_group()`, an ordinary overridable
+    method, so a subclass that overrode BOTH could still defeat the fallback. What is actually
+    guaranteed is that the base `close` BODY runs rather than the override's — which is what matters
+    for the case this exists for, an override that raises before doing any teardown.
+    ⚠ It also cannot run a subclass's ADDITIVE cleanup, because it does not know about it. That is
+    the subclass's problem to solve locally, and `_SeatbeltShell.close` now unlinks its profile in a
+    `finally` for exactly this reason."""
     try:
         candidate.close()
         return
@@ -324,14 +334,21 @@ def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
         # can fire a callback synchronously on this thread, and that callback takes this lock.
         finalizer = weakref.finalize(conv_state, _drop_floor, key)
         _FLOORS[key] = (weakref.ref(conv_state), floor)
-        assert finalizer.alive or conv_state is None  # keep the reference; finalize() is self-owned
+        # ⛔ A REAL CHECK, NOT AN `assert` (glm-5.2 L3 MED, 2026-09-04). The previous line was
+        # `assert finalizer.alive or conv_state is None`, which is wrong twice: **asserts are
+        # STRIPPED under `python -O`**, so in an optimized run there is no guard at all; and
+        # `conv_state is None` is a required argument, so that disjunct is dead code implying a
+        # None-path that does not exist. If `finalize` ever returns an already-dead finalizer — the
+        # object being cyclically collected on a thread that just crossed the GC threshold, which
+        # this module's own comments describe — the entry would be published with NO eviction and
+        # leak one floor per dead conversation, unbounded, in a long-running daemon.
+        if not finalizer.alive:
+            _FLOORS.pop(key, None)
+            raise ConfinementError(
+                "the conversation floor's finalizer was already dead at publish time — refusing to "
+                "publish an entry that can never be evicted (fail-closed)."
+            )
         return floor
-        floor = _SharedFloor(policy_for_conv_state(conv_state))
-        _FLOORS[key] = floor
-    # Registered OUTSIDE the lock: `finalize` can fire immediately for an already-dying object, and
-    # `_drop_floor` takes the same lock.
-    weakref.finalize(conv_state, _drop_floor, key)
-    return floor
 
 
 
