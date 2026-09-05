@@ -170,6 +170,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import types
 import time
 import unicodedata
 from abc import ABCMeta, abstractmethod
@@ -1808,11 +1809,40 @@ class _ProviderMeta(ABCMeta):
         # ⚡ A class whose bases include no `_ProviderMeta` instance IS a root, by construction —
         # that is a fact about the class being created, not about what a module global happens to
         # point at right now. Same lesson as the rest of this file: ask the object, not the cache.
-        parents = [b for b in bases if isinstance(b, _ProviderMeta)]
+        # ⛔ ANCESTRY VIA THE EXECUTING METACLASS `mcls`, NEVER THE MODULE GLOBAL (codex L3 HIGH,
+        # 2026-09-04, reproduced by me before fixing). Reading `_ProviderMeta` from module globals
+        # re-created the LOW it replaced, one level up: retain `OldProvider = ConfinementProvider`,
+        # reload the module, then subclass `OldProvider` — the old base is not an instance of the
+        # NEW `_ProviderMeta`, so `parents` came out EMPTY, the override was ACCEPTED, and the
+        # provider rendered a build-time socket policy with no refresh. `mcls` is the metaclass
+        # actually creating this class, which is the OLD one in exactly that scenario.
+        # ⚡ Third time this guard has been bypassed and every bypass had the same shape: **it asked
+        # a NAME for the identity of a CLASS.** `cls.__dict__` missed the mixin; the module global
+        # missed the reload; only the executing metaclass and the static MRO are facts about the
+        # object being created.
+        parents = [b for b in bases if isinstance(b, mcls)]
         if parents:
-            canonical = getattr(parents[0], "spawn_shell", None)
-            # POST-MRO RESOLUTION, not `cls.__dict__` — a mixin shadowing it must also be caught.
-            if canonical is not None and getattr(cls, "spawn_shell", None) is not canonical:
+            # ⛔ STATIC MRO OWNER + DESCRIPTOR TYPE, not a dynamic `getattr` compare (codex L3 MED).
+            # `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` passes a getattr
+            # comparison — class-level access unwraps the descriptor and returns the IDENTICAL
+            # function — while at runtime it never binds `self`, raising `TypeError` instead of
+            # `ConfinementError`, which `__call__` does not convert into an in-band refusal. A
+            # custom descriptor can do the same trick deliberately. So: the first class in the MRO
+            # that DEFINES `spawn_shell` must be the canonical root, and it must hold an ordinary
+            # function.
+            # ⚠ MEASURED, AND THE HONEST NOTE IS THAT THE DESCRIPTOR CHECK IS CURRENTLY REDUNDANT:
+            # removing `isinstance(raw, types.FunctionType)` leaves the whole suite GREEN, because a
+            # `staticmethod` wrapper still puts `spawn_shell` in the subclass's own `__dict__`, so
+            # the OWNER test already refuses it. I asserted it was load-bearing; the mutation says
+            # otherwise, and that is recorded rather than quietly left standing.
+            # ▶ KEPT ANYWAY, and deliberately — same posture as the ssh anchor thirty lines of this
+            # file away: it is free, it fails CLOSED, and it stops being redundant the moment anyone
+            # relaxes the owner test. Deleting a belt from a security floor to win a tidiness
+            # argument is the wrong direction of error.
+            root = next((k for k in parents[0].__mro__ if "spawn_shell" in k.__dict__), None)
+            owner = next((k for k in cls.__mro__ if "spawn_shell" in k.__dict__), None)
+            raw = owner.__dict__.get("spawn_shell") if owner is not None else None
+            if owner is not root or not isinstance(raw, types.FunctionType):
                 raise TypeError(
                     f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
                     "the spawn-time socket re-resolution (spore-768) and silently render a stale "

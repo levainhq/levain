@@ -225,35 +225,54 @@ class _SharedFloor:
             )
 
 
-# ⛔ KEYED ON THE CONVERSATION, NOT ON (entity_dir, workspace) — codex L3, 2026-09-04, and it is the
-# single change that dissolves TWO findings at once rather than patching either.
-# ⚡ THE TENSION THAT KEYING ON THE ENTITY CREATED, NAMED SO IT IS NOT RE-ENTERED: sharing a floor
-# requires ONE object; keeping it fresh requires REPLACING it. Under an entity key those are the same
-# variable pulling opposite ways, and this file satisfied each of them one review round apart — round
-# 3 shared (and inherited a STALE cred floor into a later conversation, a fail-open), round 4 rebuilt
-# on a changed baseline (and handed the two hands DIFFERENT floors, so the editor could `view /secret`
-# while bash denied it). **A CONVERSATION HAS EXACTLY ONE BASELINE BY CONSTRUCTION**, so a
-# conversation key dissolves the tension instead of balancing it: there is nothing to refresh and
-# nothing to go stale, and the baseline comparison that caused the divergence is DELETED, not tuned.
-# `ConversationState.id` is a required UUID, so the key always exists for a real conversation.
+# ⛔⛔ KEYED ON THE `ConversationState` **INSTANCE** — NOT ON ITS PERSISTED UUID, AND NOT ON
+# `(entity_dir, workspace)`. codex L3 HIGH, 2026-09-04. This is the SECOND correction to this key in
+# one evening, and both earlier choices were wrong for the SAME underlying reason: **neither
+# identified ONE RUNTIME POLICY BASELINE.**
+#   · `(entity_dir, workspace)` made sharing and freshness the same variable pulling opposite ways:
+#     share the object and a later conversation inherits a STALE permissive cred floor (fail-open);
+#     rebuild it when the baseline changes and the two hands of ONE conversation get DIFFERENT floors
+#     (`view /secret` through the editor while bash denies it). Each fix broke the other.
+#   · `ConversationState.id` LOOKED like it dissolved that, on the premise that "a conversation has
+#     exactly one baseline by construction". ⛔ **THAT PREMISE IS FALSE.**
+#     `ConversationState.create()` is documented as *"Create a new conversation state OR RESUME FROM
+#     PERSISTENCE"*, and OpenHands permits a resume under a different drive mode and even a different
+#     workspace. Start `U` interactively (creds ALLOWED), keep the old agent alive so its entry stays
+#     live, resume `U` unattended → the resumed agent never calls `policy_for_conv_state()` and
+#     inherits the permissive floor. **The identical fail-open as the entity key, through a new door.**
+# ⚡ A UUID names the LOGICAL conversation; a runtime baseline belongs to the RUNTIME. The INSTANCE
+# is the runtime — a resume constructs a NEW object, while the two tool factories of one run receive
+# the SAME object. Of the three candidate keys, only this one has that property.
 #
-# ⚠ WeakValueDictionary for the lifecycle: an entry disappears once no executor holds the floor, so a
-# long-running daemon does not accumulate one policy per conversation forever. The theoretical window
-# — first hand's tools garbage-collected between the two `create` calls — cannot occur, because
-# `create` returns the tool to the caller that keeps it.
-_FLOORS: "weakref.WeakValueDictionary[str, _SharedFloor]" = weakref.WeakValueDictionary()
+# ⚠ `ConversationState` is weakref-able but NOT hashable (pydantic default), so a
+# `WeakKeyDictionary` is unavailable. `id()` plus a `weakref.finalize` gives the same semantics: the
+# entry is evicted when THAT object is collected, **before** its `id()` can be recycled onto a
+# different object. That aliasing is the whole hazard of an `id()` key, so the finalizer is
+# load-bearing, not tidiness.
+_FLOORS: dict[int, _SharedFloor] = {}
 _FLOORS_LOCK = threading.Lock()
 
 
+def _drop_floor(key: int) -> None:
+    """Evict a dead conversation's floor; registered via `weakref.finalize`."""
+    with _FLOORS_LOCK:
+        _FLOORS.pop(key, None)
+
+
 def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
-    """The shared floor for THIS CONVERSATION — created on first use, reused by the other hand."""
-    key = str(getattr(conv_state, "id", None) or id(conv_state))
+    """The shared floor for THIS RUNTIME conversation object — created on first use, reused by the
+    other hand of the same run, and never inherited by a resume."""
+    key = id(conv_state)
     with _FLOORS_LOCK:
         floor = _FLOORS.get(key)
-        if floor is None:
-            floor = _SharedFloor(policy_for_conv_state(conv_state))
-            _FLOORS[key] = floor
-        return floor
+        if floor is not None:
+            return floor
+        floor = _SharedFloor(policy_for_conv_state(conv_state))
+        _FLOORS[key] = floor
+    # Registered OUTSIDE the lock: `finalize` can fire immediately for an already-dying object, and
+    # `_drop_floor` takes the same lock.
+    weakref.finalize(conv_state, _drop_floor, key)
+    return floor
 
 
 
@@ -448,36 +467,33 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         with self._lock:
             if self._shell is None or self._shell.closed:
                 provider = select_provider()  # raises ConfinementError off a supported platform
-                # ⛔ ASSIGN THE REFRESH BACK — THE UNION IS ONLY MONOTONIC IF THE RESULT IS KEPT
-                # (codex L3 #2, spore-768, 2026-09-04). `spawn_shell` re-resolves the socket floor
-                # and renders the refreshed policy, but the FIRST version discarded it: this method
-                # respawns after every `exit`, always from the build-time `self._policy`, so a
-                # target denied at spawn 1 fell back off the list at spawn 2 and became reachable
-                # again. The "a re-resolution can only ever ADD" property was true within one spawn
-                # and false across exactly the respawns its own comment relied on.
-                self._shell = provider.spawn_shell(
+                # ⛔ VALIDATE THE CANDIDATE BEFORE COMMITTING IT TO `self._shell` (codex L3 HIGH,
+                # 2026-09-04). The previous version assigned FIRST and raised AFTER — so the first
+                # command was refused while the LIVE shell stayed cached, and the NEXT command saw a
+                # non-closed `_shell`, skipped this branch entirely, and executed through the
+                # unverified shell. **The advertised fail-closed check was fail-once/open-next**,
+                # which is worse than no check: it emits exactly one refusal that reads as the guard
+                # working, and then silently stops guarding.
+                candidate = provider.spawn_shell(
                     self._floor.policy, default_timeout=self._default_timeout
                 )
-                # ⛔ MERGE INTO THE SHARED FLOOR, NEVER ASSIGN IT (codex L3 MED, 2026-09-04,
-                # execution-reproduced). Assigning this executor's snapshot wholesale is a lost
-                # update when a second conversation shares the floor: both read P, spawn against
-                # P+A and P+B, and the later assignment discards the earlier — a previously denied
-                # live container socket becomes reachable again after a respawn. `absorb` unions
-                # under the FLOOR'S OWN lock, so the write is monotonic and order-independent.
-                # ⚠ `spawn_shell` now REFUSES a non-shell rather than returning one, so there is no
-                # None to guard here — the contract was fixed instead of the call site.
-                # `effective_policy` is Optional on the TYPE because a SandboxedShell built
-                # directly (not via the provider seam) legitimately has none. Every shell that
-                # reaches here came from `spawn_shell`, which sets it — but assert the narrowing
-                # rather than casting it away, so a future direct-construction path fails loudly
-                # instead of silently skipping the merge.
-                effective = self._shell.effective_policy
-                if effective is None:
-                    raise ConfinementError(
-                        "the confined shell carries no effective policy — the provider seam did not "
-                        "stamp it, so the socket floor it was rendered with is unknown (fail-closed)."
-                    )
-                self._floor.absorb(effective)
+                try:
+                    # `effective_policy` is Optional on the TYPE because a SandboxedShell built
+                    # directly (not through the provider seam) legitimately has none.
+                    effective = candidate.effective_policy
+                    if effective is None:
+                        raise ConfinementError(
+                            "the confined shell carries no effective policy — the provider seam did "
+                            "not stamp it, so the socket floor it was rendered with is unknown "
+                            "(fail-closed)."
+                        )
+                    # MERGE, never assign: `absorb` unions under the FLOOR'S OWN lock, so a
+                    # concurrent spawner's denies cannot be lost to a wholesale overwrite.
+                    self._floor.absorb(effective)
+                except BaseException:
+                    candidate.close()  # never leak a LIVE unverified shell
+                    raise
+                self._shell = candidate
             return self._shell
 
     def _teardown(self) -> None:

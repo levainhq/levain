@@ -629,3 +629,86 @@ def test_a_provider_returning_a_non_shell_is_refused_at_the_source(tmp_path, mon
     monkeypatch.setattr(_t, "select_provider", lambda: _NullProvider())
     with pytest.raises(ConfinementError, match="not a SandboxedShell"):
         ex._ensure_shell()
+
+
+def test_a_resumed_conversation_never_inherits_the_live_floor(tmp_path) -> None:
+    """⛔ codex L3 HIGH round 5, and it FALSIFIED THE PREMISE OF ROUND 5's DESIGN.
+
+    Keying on `ConversationState.id` rested on "a conversation has exactly one baseline by
+    construction". That is FALSE: `ConversationState.create()` is documented as *"Create a new
+    conversation state OR RESUME FROM PERSISTENCE"*, and a resume may run under a different drive
+    mode and even a different workspace. Start `U` interactively (creds ALLOWED), keep the old agent
+    alive so its entry stays live, resume `U` unattended → the resumed agent skips
+    `policy_for_conv_state()` and inherits the permissive floor. **The identical fail-open as the
+    entity key, through a new door.**
+
+    ⚡ A UUID names the LOGICAL conversation; a runtime baseline belongs to the RUNTIME. Two objects
+    carrying the SAME id are two runs and must not share."""
+    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()
+
+    first = _FakeConvState(ws, conv_id="U")
+    resumed = _FakeConvState(ws, conv_id="U")   # SAME persisted id, a DIFFERENT runtime object
+    f1 = floor_for_conv_state(first)
+    f2 = floor_for_conv_state(resumed)
+    keep = (f1, f2, first, resumed)
+
+    assert f1 is not f2, (
+        "the resumed conversation inherited the live floor — a run that should be MORE restricted "
+        "silently keeps the earlier run's permissive floor"
+    )
+    assert floor_for_conv_state(first) is f1, "the same runtime object must still share one floor"
+    assert len(keep) == 4
+
+
+def test_a_dead_conversations_floor_is_evicted_so_a_recycled_id_cannot_alias_it(tmp_path) -> None:
+    """The `id()` key's own hazard, closed by `weakref.finalize`: the entry must disappear when the
+    ConversationState is collected, BEFORE CPython can hand that `id()` to a different object.
+    Without the finalizer this key would be strictly worse than the UUID it replaced."""
+    import gc
+    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()
+
+    cs = _FakeConvState(ws)
+    floor = floor_for_conv_state(cs)
+    key = id(cs)
+    assert key in _FLOORS
+    del cs, floor
+    gc.collect()
+    assert key not in _FLOORS, "a dead conversation's floor was left behind for a recycled id()"
+
+
+def test_an_unverified_shell_is_never_cached_fail_once_open_next(tmp_path, monkeypatch) -> None:
+    """⛔ codex L3 HIGH round 5. `_ensure_shell` committed the shell to `self._shell` BEFORE
+    validating `effective_policy`. The first command was refused while the LIVE shell stayed cached;
+    the next command saw a non-closed `_shell`, skipped the branch, and executed through the
+    unverified shell. **Fail-once/open-next** — worse than no check, because it emits exactly one
+    refusal that reads as the guard working and then stops guarding.
+
+    Assert the SECOND call refuses too, and that the rejected shell was closed rather than leaked."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import ConfinementError, SandboxedShell, build_policy
+    import levain.firing.openhands.tools as _t
+
+    ent, ws = _entity(tmp_path)
+    ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
+    made: list[SandboxedShell] = []
+
+    class _UnstampedProvider:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            sh = SandboxedShell(argv=["/bin/true"], cwd=ws, env={})
+            sh.effective_policy = None          # a live shell with no stamp
+            made.append(sh)
+            return sh
+
+    monkeypatch.setattr(_t, "select_provider", lambda: _UnstampedProvider())
+
+    for attempt in (1, 2):
+        with pytest.raises(ConfinementError, match="no effective policy"):
+            ex._ensure_shell()
+        assert ex._shell is None, f"attempt {attempt}: an unverified shell was cached"
+    assert all(sh.closed for sh in made), "a rejected live shell was leaked instead of closed"
