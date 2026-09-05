@@ -18,6 +18,7 @@ The module is a dependency-isolated stdlib leaf (like ``levain.firing.isolation`
 from __future__ import annotations
 
 import os
+import pathlib
 import platform
 import subprocess
 import sys
@@ -2171,3 +2172,79 @@ def test_virtual_subclassing_via_register_is_refused(tmp_path) -> None:
 
     with pytest.raises(TypeError, match="virtual subclassing"):
         ConfinementProvider.register(_Rogue)
+
+
+def test_a_provider_subclassed_from_a_pre_reload_base_is_still_refused() -> None:
+    """⛔ codex L3 HIGH round 5, reproduced before fixing. The guard read `_ProviderMeta` from MODULE
+    GLOBALS, so: retain `OldProvider = ConfinementProvider`, reload the module, then subclass
+    `OldProvider`. The old base is not an instance of the NEW `_ProviderMeta`, `parents` came out
+    EMPTY, the override was ACCEPTED, and the provider rendered a build-time socket policy with no
+    refresh — reopening the listed-socket retarget bypass.
+
+    ⚡ Third bypass of this guard, and all three had the same shape: **it asked a NAME for the
+    identity of a CLASS.** `cls.__dict__` missed the mixin; the module global missed the reload.
+    `mcls` is the metaclass actually creating the class, which is the OLD one in this scenario.
+
+    ⛔⛔ THIS TEST LOADS A PRIVATE COPY OF THE MODULE AND NEVER RELOADS THE REAL ONE, and that is
+    load-bearing rather than fastidious. The first version called `importlib.reload` on
+    `levain.firing.confinement` itself and **broke TEN tests across three other files** while passing
+    in isolation. A reload REBINDS the module's names to NEW class objects, and every other module
+    that did `from ... import ConfinementError` at import time still holds the OLD ones — so
+    `except ConfinementError` stopped catching, and `pytest.raises` stopped matching.
+    ⚠ My "cleanup" was a second `importlib.reload` in a `finally`, which restores the NAME and not
+    the IDENTITY: it produces a THIRD set of classes, matching neither. Same class as the defect the
+    test exists for — **an identity question answered with a name.**"""
+    import importlib.util
+
+    # Load a PRIVATE copy of the module under its own name, then reload THAT COPY IN PLACE. The
+    # in-place reload is what reproduces the defect: it rebinds the copy's `_ProviderMeta` global to
+    # a NEW metaclass while `old_base` remains an instance of the OLD one — precisely the mismatch a
+    # module-global lookup gets wrong. The real `levain.firing.confinement` is never touched.
+    # ⚠ TWO INDEPENDENT COPIES DO NOT REPRODUCE IT and I checked rather than assumed: each copy has
+    # its own namespace, so the global and the base always agree and the guard fires for the wrong
+    # reason. Mutation-verified — reverting the fix to the module global fails THIS form and passed
+    # the two-copies form. **The pollution fix had destroyed the test's ability to detect the bug.**
+    src = pathlib.Path(sys.modules["levain.firing.confinement"].__file__)
+    spec = importlib.util.spec_from_file_location("_confinement_reload_probe", src)
+    assert spec and spec.loader
+    copy = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = copy
+    spec.loader.exec_module(copy)
+
+    old_base = copy.ConfinementProvider
+    # Re-exec the loader INTO THE SAME module object: that is what `importlib.reload` does, minus the
+    # finder step, which cannot resolve a synthetic module name. The copy's globals are rebound in
+    # place — a NEW `_ProviderMeta` — while `old_base` still belongs to the old one.
+    spec.loader.exec_module(copy)
+
+    with pytest.raises(TypeError, match="overrides or shadows"):
+        class _Rogue(old_base):  # type: ignore[misc,valid-type]
+            def render_profile(self, policy):
+                return ""
+
+            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+                return None
+
+            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+                return "UNREFRESHED"
+
+    sys.modules.pop("_confinement_reload_probe", None)
+
+
+def test_a_staticmethod_wrapper_around_the_canonical_spawn_shell_is_refused() -> None:
+    """⛔ codex L3 MED round 5. `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` passes
+    a dynamic `getattr` compare — class-level access unwraps the descriptor and returns the IDENTICAL
+    function object — while at runtime it never binds `self` and raises `TypeError`, which
+    `SandboxedBashExecutor.__call__` does NOT convert into an in-band refusal. So the tool call
+    crashes instead of refusing. Fixed by checking the static MRO owner AND the descriptor type."""
+    from levain.firing.confinement import ConfinementProvider
+
+    with pytest.raises(TypeError, match="overrides or shadows"):
+        class _Sneaky(ConfinementProvider):
+            spawn_shell = staticmethod(ConfinementProvider.spawn_shell)  # type: ignore[assignment]
+
+            def render_profile(self, policy):
+                return ""
+
+            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+                return None
