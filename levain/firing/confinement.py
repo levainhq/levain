@@ -1789,7 +1789,24 @@ class ConfinementProvider(ABC):
         metaclass tried to make it impossible to SKIP a step; moving it upstream makes the step not
         exist at this layer at all. Same move as the conversation-floor key: **stop balancing,
         dissolve.**"""
-        shell = self._spawn_shell_impl(policy, env=env, default_timeout=default_timeout)
+        # ⛔⛔ THE REFRESH IS BACK HERE, AND DELETING IT WAS MY ERROR — complement MED + glm-5.2 MED,
+        # CONVERGENT (2026-09-04). glm's sentence is the correction and it is exactly right:
+        # **"the metaclass was correctly deleted (unbounded defeat surface), but the template-method
+        # refresh it was protecting was deleted alongside it. ONLY THE METACLASS NEEDED TO GO."**
+        # ⚡ I conflated two separate things — a GUARD that tried to make the refresh unskippable
+        # (impossible in Python, seven bypasses across five versions, correctly deleted) and the
+        # REFRESH ITSELF sitting at the layer that owns it (structural, cheap, correct). Removing
+        # the refresh left the invariant enforced at exactly ONE call site, so any second consumer —
+        # `BwrapProvider` on the held branch, a future debug or preview harness, a test — that calls
+        # `spawn_shell(policy)` without refreshing first renders the BUILD-TIME `deny_sockets`. That
+        # is the spore-768 regression this whole release exists to close, reintroduced by the fix
+        # for the guard that was protecting against it.
+        # ⚠ AND DOUBLE-REFRESHING IS SAFE NOW, which it was not in round 4: the caller keeps the
+        # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
+        # `refresh_socket_denies` is a monotonic union — so a second resolution can only ever widen
+        # what the first produced. Round 4's lost-update came from keeping the EARLIER answer.
+        refreshed = refresh_socket_denies(policy)
+        shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
         # convert into an in-band refusal.
@@ -1799,7 +1816,7 @@ class ConfinementProvider(ABC):
                 "SandboxedShell — refusing to hand back bash hands without a verified confined "
                 "shell (fail-closed)."
             )
-        shell.effective_policy = policy
+        shell.effective_policy = refreshed
         return shell
 
     @abstractmethod
@@ -2088,11 +2105,20 @@ class _SeatbeltShell(SandboxedShell):
         self._profile_path = profile_path
 
     def close(self) -> None:
-        super().close()
+        # ⛔ `finally`, NOT sequential (complement L3 LOW, 2026-09-04). This unlink is ADDITIVE
+        # cleanup that only this subclass knows about, and `super().close()` above it can raise —
+        # at which point the temp SBPL profile leaked, one per rejected or failed shell. Nothing
+        # upstream can compensate: a caller falling back to `SandboxedShell.close` runs the BASE
+        # teardown, which has never heard of this file.
+        # ⚡ The general form: a subclass's own additive cleanup has to be robust to its parent's
+        # failure, because no generic fallback can know what the subclass added.
         try:
-            self._profile_path.unlink()
-        except OSError:
-            pass
+            super().close()
+        finally:
+            try:
+                self._profile_path.unlink()
+            except OSError:
+                pass
 
 
 def sandbox_exec_available() -> bool:
