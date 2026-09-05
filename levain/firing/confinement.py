@@ -1780,11 +1780,28 @@ class ConfinementProvider(ABC):
         needed to override this method — it could return anything at all from ``_spawn_shell_impl``,
         or not inherit from this class. **It blocked one spelling of a thing with many spellings.**
 
-        ▶ **WHAT ACTUALLY ENFORCES THE INVARIANT NOW: the refresh happens UPSTREAM, in
-        :meth:`SandboxedBashExecutor._ensure_shell`, BEFORE this method is called. A provider never
-        receives an unrefreshed policy, so there is nothing to forget, nothing to override, and
-        nothing to guard.** ``BwrapProvider`` on the held ``k4c-linux`` branch inherits that by
-        construction rather than by remembering a rule.
+        ▶ **WHAT ACTUALLY ENFORCES THE INVARIANT NOW: the refresh happens in BOTH places that own
+        it** — upstream in :meth:`SandboxedBashExecutor._ensure_shell`, and again HERE in this
+        template method before ``_spawn_shell_impl`` runs. Double-refreshing is safe (monotonic
+        union — see the comment below), and the second one is what covers a consumer that calls
+        ``spawn_shell`` directly instead of going through ``_ensure_shell``. A provider that
+        implements the documented ``_spawn_shell_impl`` seam never receives an unrefreshed policy.
+
+        ⛔ **WHAT IS NOT ENFORCED, STATED PLAINLY BECAUSE A FALSE VERSION OF THIS STOOD HERE:** a
+        subclass overriding ``spawn_shell`` ITSELF, rather than the ``_spawn_shell_impl`` hook,
+        skips the refresh. That is the residual knowingly accepted when the metaclass was deleted
+        (the defeat surface is unbounded; enumeration cannot terminate). It is an ACCIDENTAL-override
+        risk and not only an adversarial one, because ``spawn_shell`` is the public non-underscore
+        name that looks like the thing to override.
+
+        ⛔⛔ ``BwrapProvider`` ON ``k4c-linux`` DOES **NOT** INHERIT THIS BY CONSTRUCTION, AND AN
+        EARLIER VERSION OF THIS DOCSTRING CLAIMED IT DID — in this file and in ``tools.py``, as the
+        stated justification for removing a control. MEASURED 2026-09-05 against the branch:
+        ``git show k4c-linux:levain/firing/confinement.py | grep refresh_socket_denies`` returns
+        NOTHING, and BOTH providers there (``SeatbeltProvider``, ``BwrapProvider``) override
+        ``spawn_shell`` DIRECTLY — that branch has no ``_spawn_shell_impl`` at all. **The k4c-linux
+        merge is therefore where spore-768 returns on Linux, and porting both providers onto the
+        ``_spawn_shell_impl`` seam is part of that merge, not a follow-up.**
         ⚖ This is not a reversal of "make the refresh structural" — it is a stronger form of it. The
         metaclass tried to make it impossible to SKIP a step; moving it upstream makes the step not
         exist at this layer at all. Same move as the conversation-floor key: **stop balancing,

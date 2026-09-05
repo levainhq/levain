@@ -187,13 +187,21 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     ⚠ It also cannot run a subclass's ADDITIVE cleanup, because it does not know about it. That is
     the subclass's problem to solve locally, and `_SeatbeltShell.close` now unlinks its profile in a
     `finally` for exactly this reason."""
+    # ⛔ THE BASE TEARDOWN RUNS UNCONDITIONALLY — codex L3 round 9, 2026-09-05. This used to
+    # `return` when the override's `close()` did not RAISE, so an override that silently NO-OPS
+    # (returns cleanly having torn down nothing) skipped the base path entirely and leaked the
+    # subprocess, its process group, the FIFO dir and the reader thread on every rejected spawn.
+    # The fallback covered overrides that raise and not overrides that lie, and the docstring
+    # above already conceded that narrowness rather than fixing it.
+    # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: `SandboxedShell.close` is
+    # "Idempotent, never raises" — read at confinement.py:1694, where every resource is nulled
+    # behind a None-guard, so the second call is a no-op when the override did its job.
     try:
         candidate.close()
-        return
     except BaseException:
         _log.exception("a rejected shell's close() raised; falling back to the base teardown")
     try:
-        SandboxedShell.close(candidate)     # non-overridable path
+        SandboxedShell.close(candidate)     # non-overridable path; idempotent
     except BaseException:
         _log.exception("base teardown of a rejected shell also failed; it may leak")
 
@@ -555,9 +563,17 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # (Phill ruled 2026-09-04). The provider is handed an ALREADY-REFRESHED policy, so
                 # a provider cannot skip the re-resolution: there is no step for it to omit.
                 # ⚡ The guard tried to make it impossible to SKIP a call. This makes the call not
-                # exist at that layer. `BwrapProvider` on the held k4c-linux branch — written before
-                # any of this existed — inherits the invariant by construction, which is exactly
-                # what the guard was for and never actually achieved.
+                # exist at that layer -- for a provider that implements the `_spawn_shell_impl`
+                # seam. The base `spawn_shell` refreshes again on its own behalf, so a consumer
+                # calling it directly is covered too.
+                # ⛔⛔ THIS COMMENT USED TO SAY `BwrapProvider` ON k4c-linux "inherits the invariant
+                # by construction". THAT WAS FALSE, and the same false sentence was in
+                # confinement.py as the stated reason a control could be deleted. MEASURED
+                # 2026-09-05: k4c-linux has NO `refresh_socket_denies` anywhere, and BOTH its
+                # providers override `spawn_shell` DIRECTLY (it has no `_spawn_shell_impl`) --
+                # which is exactly the one way to NOT inherit it. The k4c-linux merge must port
+                # both providers onto the `_spawn_shell_impl` seam or it reintroduces spore-768
+                # on Linux. See the ConfinementProvider.spawn_shell docstring.
                 refreshed = refresh_socket_denies(self._floor.policy)
                 candidate = provider.spawn_shell(
                     refreshed, default_timeout=self._default_timeout
