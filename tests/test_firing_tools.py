@@ -712,3 +712,52 @@ def test_an_unverified_shell_is_never_cached_fail_once_open_next(tmp_path, monke
             ex._ensure_shell()
         assert ex._shell is None, f"attempt {attempt}: an unverified shell was cached"
     assert all(sh.closed for sh in made), "a rejected live shell was leaked instead of closed"
+
+
+def test_the_floor_registry_lock_survives_a_finalizer_reentering_on_the_same_thread(tmp_path) -> None:
+    """⛔ complement L3 HIGH round 6. `_drop_floor` is a `weakref.finalize` callback and takes
+    `_FLOORS_LOCK`. A finalizer for a cyclically-collected object fires SYNCHRONOUSLY on whatever
+    thread crossed the GC threshold — and that trigger can be any allocation, including the ones
+    inside `policy_for_conv_state()` which run WHILE THE LOCK IS HELD. With a plain `threading.Lock`
+    the thread blocks acquiring a lock it already owns, forever, still holding it: every
+    `floor_for_conv_state` in the process freezes.
+
+    ⚡ The failure is SILENT — no exception, no log. A hang with no error is the worst shape a
+    security-path defect can take, because every surface reads healthy.
+
+    Drive the reentry directly rather than trying to provoke the GC: call `_drop_floor` from inside
+    a held `_FLOORS_LOCK` on this thread, which is exactly what the finalizer does."""
+    import levain.firing.openhands.tools as _t
+
+    with _t._FLOORS_LOCK:
+        # Under a non-reentrant Lock this blocks forever and the test hangs rather than fails.
+        _t._drop_floor(-12345)          # a key that is not present; the acquire is the point
+    assert True
+
+
+def test_a_failing_close_does_not_mask_the_fail_closed_reason(tmp_path, monkeypatch) -> None:
+    """⛔ complement L3 MED round 6. If `candidate.close()` raises while tearing down an unverified
+    shell, that I/O error would propagate INSTEAD of the ConfinementError — so a caller matching on
+    exception type, or a log printing only the outermost exception, sees "close failed" rather than
+    "no effective policy". The leak is prevented either way; what was degraded is the FIDELITY OF
+    THE FAIL-CLOSED SIGNAL, which is the entire point of that rewrite."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import ConfinementError, SandboxedShell, build_policy
+    import levain.firing.openhands.tools as _t
+
+    ent, ws = _entity(tmp_path)
+    ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
+
+    class _ExplodingShell(SandboxedShell):
+        def close(self) -> None:
+            raise OSError("teardown blew up")
+
+    class _BadProvider:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            sh = _ExplodingShell(argv=["/bin/true"], cwd=ws, env={})
+            sh.effective_policy = None
+            return sh
+
+    monkeypatch.setattr(_t, "select_provider", lambda: _BadProvider())
+    with pytest.raises(ConfinementError, match="no effective policy"):
+        ex._ensure_shell()          # NOT OSError

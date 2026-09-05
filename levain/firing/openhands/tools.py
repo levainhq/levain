@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import os
 import dataclasses
+import logging
 import threading
 import weakref
 from pathlib import Path
@@ -92,6 +93,8 @@ from levain.firing.confinement import (
 )
 from levain.firing.drive import current_drive_mode, resolve_cred_floor
 from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
+
+_log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
@@ -250,7 +253,19 @@ class _SharedFloor:
 # different object. That aliasing is the whole hazard of an `id()` key, so the finalizer is
 # load-bearing, not tidiness.
 _FLOORS: dict[int, _SharedFloor] = {}
-_FLOORS_LOCK = threading.Lock()
+# ⛔ RLock, NOT Lock — REENTRANT BY NECESSITY (complement L3 HIGH, 2026-09-04). `_drop_floor` is a
+# `weakref.finalize` callback and it takes this lock. A finalizer for a cyclically-collected object
+# fires SYNCHRONOUSLY, on whatever thread happened to cross the GC threshold — and that trigger can
+# be any allocation, including the ones inside `policy_for_conv_state()` / `_SharedFloor()`, which
+# run WHILE THIS LOCK IS HELD. A plain `Lock` would then self-deadlock: the thread blocks acquiring
+# a lock it already owns, forever, holding it — freezing `floor_for_conv_state` for every
+# conversation in the process.
+# ⚡ The failure is SILENT: no exception, no log, nothing to point at. A hang with no error is the
+# worst shape a security-path defect can take, because every surface reads healthy.
+# ⚠ Reentry is SAFE here as well as necessary: a nested `_drop_floor` pops a DIFFERENT (dead) key,
+# and the key being inserted by the outer frame belongs to a conversation object we hold a live
+# reference to, so it cannot be the one being finalized.
+_FLOORS_LOCK = threading.RLock()
 
 
 def _drop_floor(key: int) -> None:
@@ -491,7 +506,17 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     # concurrent spawner's denies cannot be lost to a wholesale overwrite.
                     self._floor.absorb(effective)
                 except BaseException:
-                    candidate.close()  # never leak a LIVE unverified shell
+                    # ⛔ A FAILING `close()` MUST NOT REPLACE THE REASON WE ARE REFUSING
+                    # (complement L3 MED, 2026-09-04). If tearing down the subprocess raises, that
+                    # I/O error would propagate INSTEAD of the ConfinementError — callers matching
+                    # on exception type, and any log printing only the outermost exception, would
+                    # see "close failed" rather than "no effective policy". The leak is still
+                    # prevented either way; what was degraded is the FIDELITY OF THE FAIL-CLOSED
+                    # SIGNAL, which is the entire point of this rewrite.
+                    try:
+                        candidate.close()  # never leak a LIVE unverified shell
+                    except Exception:
+                        _log.exception("failed to close an unverified candidate shell")
                     raise
                 self._shell = candidate
             return self._shell
