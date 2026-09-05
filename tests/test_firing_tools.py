@@ -831,3 +831,37 @@ def test_a_rejected_shell_is_torn_down_even_when_its_own_close_raises(tmp_path, 
         ex._ensure_shell()                     # NOT KeyboardInterrupt
     assert base_closed, "the base-class teardown never ran after the overridden close() raised"
     assert ex._shell is None
+
+
+def test_a_rejected_shell_whose_close_silently_noops_still_gets_the_base_teardown(tmp_path):
+    """The twin of the test above, for the override that LIES instead of raising.
+
+    ⛔ codex L3 round 9, 2026-09-05. ``_close_candidate_shell`` did ``candidate.close()``
+    then ``return``, so the base teardown ran ONLY when the override RAISED. An override
+    that returns cleanly having torn down nothing skipped the base path entirely and
+    leaked the subprocess, its process group, the FIFO dir and the reader thread on every
+    rejected spawn. The fallback covered overrides that raise and not overrides that lie —
+    and the docstring conceded that narrowness rather than closing it.
+
+    The assertion is on ``closed``, which ONLY the base ``SandboxedShell.close`` body sets
+    (confinement.py:1708), so it cannot be satisfied by the override running.
+    """
+    from levain.firing.confinement import SandboxedShell
+    from levain.firing.openhands import tools as _t
+
+    class _LyingShell(SandboxedShell):
+        override_ran = False
+
+        def close(self) -> None:          # tears down NOTHING, and does not raise
+            self.override_ran = True
+
+    candidate = _LyingShell(argv=["/bin/bash"], cwd=tmp_path, env={})
+    assert candidate.closed is False
+
+    _t._close_candidate_shell(candidate)
+
+    assert candidate.override_ran is True, "the subclass close() should still be attempted first"
+    assert candidate.closed is True, (
+        "the base teardown did not run after a silently no-op close() — the rejected shell's "
+        "process, process group and FIFO dir leak"
+    )
