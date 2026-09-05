@@ -460,6 +460,82 @@ class TestReleaseStampIsNotAPublishedVersion:
             f"put the changes under '## [Unreleased]'. See CHANGELOG 'Versioning'."
         )
 
+    def test_the_committed_head_stamp_is_not_a_released_version(self):
+        """The twin above, with the subject a PUSH actually publishes.
+
+        ⛔ THE TEST ABOVE READS THE WORKING TREE AND A PUSH SHIPS COMMITS.
+        ``from levain import __version__`` imports from disk, while ``git tag
+        --points-at HEAD`` reads the commit graph — two subjects in one
+        assertion, and the working-tree half is the one that answers.
+
+        RUN-VERIFIED 2026-09-05 IN BOTH DIRECTIONS on a scratch clone of this
+        repo with the hook installed (``core.hooksPath -> scripts/hooks``), a
+        bare scratch remote, and real ``git push`` invocations:
+        · CONTROL — HEAD at ``0.4.4.dev0``, clean tree -> push exit **0**, the
+          branch lands. The gate passes legitimate work.
+        · THE HOLE — HEAD COMMITTED at ``0.4.3`` (``v0.4.3`` points at
+          ``ebec171``, NOT at HEAD) plus an UNCOMMITTED bump back to
+          ``0.4.4.dev0`` in the working tree -> push exit **1**, ``⛔ pre-push
+          BLOCKED``, and the pushed ref does not exist on the remote
+          afterwards. Before this test that same state pushed at exit 0 and
+          published a commit claiming an already-released version.
+        Both directions are recorded because a gate checked only from the
+        failing side is this repo's own 2026-09-04 finding: a gate nothing can
+        pass is not a gate.
+
+        ⛔ AND THE HOOK COULD NOT HAVE CAUGHT THIS, WHICH IS THE POINT.
+        ``scripts/hooks/pre-push`` holds NO version logic — it runs ``pytest -k
+        ReleaseStampIsNotAPublishedVersion`` and delegates its entire verdict to
+        this class. It was ported from anneal-memory byte-for-byte correct and
+        was fail-open here anyway, because **a selector carries none of its own
+        correctness: porting it moved the NAME and left the PROPERTY**, which
+        lived in a test anneal had (``tests/test_integrity.py``, commit
+        ``d7b482e``) and levain did not. Nothing in the copied file was wrong;
+        no review of the copied file could have found it. The one-command
+        diagnostic is ``--collect-only`` on the selected class in both repos:
+        anneal 3, levain 2.
+
+        THIS IS AN ADDITION, NOT A REPLACEMENT, and that is anneal's ruling
+        rather than a preference: in CI the checkout IS the commit, so the
+        working-tree test is the right one there. Two tests because they are
+        two claims, not because one is a better version of the other.
+
+        ⚠ SCOPE IS HEAD-ONLY, stated rather than implied. A push of a non-HEAD
+        branch or an older range is NOT covered. HEAD is what the hook's pytest
+        run is scoped to anyway, and widening this to walk the pushed range
+        would make a GATE bigger — deliberately refused (``spore-551``: the
+        gate list is small and fixed). anneal refused the identical widening.
+        """
+        import re
+
+        root = TestReadmePinClaim()._repo_root()   # skips a non-source checkout
+
+        if self._git(root, "rev-parse", "--git-dir") is None:
+            pytest.skip("no git available / not a git checkout")
+        all_tags = self._git(root, "tag", "--list", "v*")
+        if not all_tags:
+            pytest.skip("clone carries no release tags — nothing to compare against")
+
+        blob = self._git(root, "show", "HEAD:levain/__init__.py")
+        if blob is None:
+            pytest.skip("HEAD carries no levain/__init__.py")
+        m = re.search(r'__version__ = "([^"]+)"', blob)
+        assert m, "HEAD's levain/__init__.py no longer declares __version__"
+        committed = m.group(1)
+
+        released = {t[1:] for t in all_tags.split("\n") if t.startswith("v")}
+        if committed not in released:
+            return   # a .devN or an unreleased number — correct by construction
+
+        at_head = (self._git(root, "tag", "--points-at", "HEAD") or "").split("\n")
+        assert f"v{committed}" in at_head, (
+            f"THE COMMIT AT HEAD is stamped {committed!r}, which is already the "
+            f"released tag v{committed} pointing at a DIFFERENT commit. A clean "
+            f"working tree is not the question — a push publishes THIS COMMIT. "
+            f"Bump both stamps (pyproject.toml, levain/__init__.py) to the next "
+            f".dev0 and COMMIT the bump. See spore-710 and CHANGELOG 'Versioning'."
+        )
+
     def test_the_two_version_stamps_agree(self):
         """One fact, two files. They drifted apart is the *other* way this breaks."""
         import re
