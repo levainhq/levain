@@ -761,3 +761,73 @@ def test_a_failing_close_does_not_mask_the_fail_closed_reason(tmp_path, monkeypa
     monkeypatch.setattr(_t, "select_provider", lambda: _BadProvider())
     with pytest.raises(ConfinementError, match="no effective policy"):
         ex._ensure_shell()          # NOT OSError
+
+
+def test_a_recycled_id_cannot_inherit_a_stale_floor_even_if_eviction_failed(tmp_path) -> None:
+    """⛔ codex L3 MED round 7. An `id()` is unique only among LIVE objects. The registry now stores
+    `(weakref, floor)` and verifies `ref() is conv_state` on lookup, so a stale entry — finalizer
+    failed to install, or failed to run — cannot hand a NEW conversation the OLD floor.
+    ⚡ The point is that the fail-open no longer depends on a callback firing. Simulate the worst
+    case directly: leave an entry whose weakref is dead and confirm it is not handed out."""
+    import weakref as _wr
+    from levain.firing.openhands.tools import _FLOORS, _SharedFloor, floor_for_conv_state
+    from levain.firing.confinement import build_policy
+
+    ent, ws = _entity(tmp_path)
+    _FLOORS.clear()
+
+    victim = _FakeConvState(ws)
+    key = id(victim)
+    stale_floor = _SharedFloor(build_policy(tmp_path / "OTHER", workspace=ws))
+    dead = _FakeConvState(ws)
+    ref = _wr.ref(dead)
+    del dead
+    import gc
+    gc.collect()
+    _FLOORS[key] = (ref, stale_floor)          # an entry whose object is gone, at victim's id
+
+    got = floor_for_conv_state(victim)
+    assert got is not stale_floor, "a recycled id inherited a dead conversation's floor"
+    assert got.policy.entity_dir != stale_floor.policy.entity_dir
+
+
+def test_a_rejected_shell_is_torn_down_even_when_its_own_close_raises(tmp_path, monkeypatch) -> None:
+    """⛔ codex L3 MED round 7, and the second half is the one that matters. An OVERRIDDEN `close()`
+    raising before doing any cleanup left the subprocess, FIFO and descriptors alive — held by the
+    shell's own reader thread — after the only application reference was dropped; repeated refusals
+    could exhaust resources. And `KeyboardInterrupt`/`SystemExit` from `close()` replaced the
+    original refusal entirely.
+
+    Now: try the object's own `close()`, fall back to the BASE-CLASS primitive a subclass cannot
+    have replaced, and let nothing propagate. The refusal survives either way."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import ConfinementError, SandboxedShell, build_policy
+    import levain.firing.openhands.tools as _t
+
+    ent, ws = _entity(tmp_path)
+    ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
+    base_closed: list[bool] = []
+
+    class _HostileShell(SandboxedShell):
+        def close(self) -> None:               # raises BEFORE any cleanup
+            raise KeyboardInterrupt("teardown interrupted")
+
+    real_close = SandboxedShell.close
+
+    def _tracking_close(self):
+        base_closed.append(True)
+        return real_close(self)
+
+    monkeypatch.setattr(SandboxedShell, "close", _tracking_close)
+
+    class _BadProvider:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            sh = _HostileShell(argv=["/bin/true"], cwd=ws, env={})
+            sh.effective_policy = None
+            return sh
+
+    monkeypatch.setattr(_t, "select_provider", lambda: _BadProvider())
+    with pytest.raises(ConfinementError, match="no effective policy"):
+        ex._ensure_shell()                     # NOT KeyboardInterrupt
+    assert base_closed, "the base-class teardown never ran after the overridden close() raised"
+    assert ex._shell is None

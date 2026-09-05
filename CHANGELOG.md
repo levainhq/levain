@@ -95,6 +95,13 @@ hands see the same rules" and "the rules are current" pull against each other, s
 broke the other. Caching per *conversation* removes the conflict rather than balancing it, because a
 conversation has one set of rules by definition. Everything found was caught before release.
 
+**The re-resolution now happens before the sandbox backend is asked to start a shell**, rather than
+inside it. An earlier attempt guarded the backend against skipping that step; the guard was removed
+because it could be worked around in a growing number of ways and never covered them all, while
+doing the work upstream means a backend is simply handed rules that are already current. There is no
+step left to skip. Nothing here is operator-visible — it changes which layer is responsible, not what
+the floor denies.
+
 **The banner names which sockets are covered, and which are not.** The deny is an enumeration and an
 enumeration is always incomplete, so `levain run` says so rather than claiming containers are
 fenced: a custom `$DOCKER_HOST`, a TCP daemon endpoint, or any runtime whose socket is not in the

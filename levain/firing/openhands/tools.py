@@ -89,6 +89,7 @@ from levain.firing.confinement import (
     build_policy,
     crown_jewel_reason,
     load_confinement_config,
+    refresh_socket_denies,
     select_provider,
 )
 from levain.firing.drive import current_drive_mode, resolve_cred_floor
@@ -164,6 +165,27 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         allow_container_sockets=cfg.allow_container_sockets,
     )
 
+
+
+def _close_candidate_shell(candidate: SandboxedShell) -> None:
+    """Tear down a rejected shell without ever letting the teardown replace the refusal.
+
+    ⛔ codex L3 MED, 2026-09-04. Two defects in the previous one-liner: a raising `close()` MASKED
+    the original `ConfinementError` (a caller matching on type saw "close failed" rather than "no
+    effective policy"), and — worse — an OVERRIDDEN `close()` that raises before doing any cleanup
+    left the subprocess, FIFO and descriptors alive, held by the shell's own reader thread, after
+    the only application reference was dropped. Repeated refusals could then exhaust resources.
+    ▶ So: try the object's own `close()`, and if that fails fall back to the BASE-CLASS primitive,
+    which a subclass cannot have replaced. Nothing here is allowed to propagate."""
+    try:
+        candidate.close()
+        return
+    except BaseException:
+        _log.exception("a rejected shell's close() raised; falling back to the base teardown")
+    try:
+        SandboxedShell.close(candidate)     # non-overridable path
+    except BaseException:
+        _log.exception("base teardown of a rejected shell also failed; it may leak")
 
 class _SharedFloor:
     """The ONE evolving :class:`CrownJewelsPolicy` for ONE CONVERSATION, read by BOTH hands.
@@ -252,7 +274,7 @@ class _SharedFloor:
 # entry is evicted when THAT object is collected, **before** its `id()` can be recycled onto a
 # different object. That aliasing is the whole hazard of an `id()` key, so the finalizer is
 # load-bearing, not tidiness.
-_FLOORS: dict[int, _SharedFloor] = {}
+_FLOORS: dict[int, tuple["weakref.ref[ConversationState]", _SharedFloor]] = {}
 # ⛔ RLock, NOT Lock — REENTRANT BY NECESSITY (complement L3 HIGH, 2026-09-04). `_drop_floor` is a
 # `weakref.finalize` callback and it takes this lock. A finalizer for a cyclically-collected object
 # fires SYNCHRONOUSLY, on whatever thread happened to cross the GC threshold — and that trigger can
@@ -269,7 +291,8 @@ _FLOORS_LOCK = threading.RLock()
 
 
 def _drop_floor(key: int) -> None:
-    """Evict a dead conversation's floor; registered via `weakref.finalize`."""
+    """Evict a dead conversation's floor. Registered via `weakref.finalize`, so it runs when the
+    ConversationState is collected — BEFORE its `id()` can be handed to a different object."""
     with _FLOORS_LOCK:
         _FLOORS.pop(key, None)
 
@@ -279,9 +302,30 @@ def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
     other hand of the same run, and never inherited by a resume."""
     key = id(conv_state)
     with _FLOORS_LOCK:
-        floor = _FLOORS.get(key)
-        if floor is not None:
-            return floor
+        entry = _FLOORS.get(key)
+        if entry is not None:
+            ref, floor = entry
+            # ⛔ VERIFY THE IDENTITY, DO NOT TRUST THE KEY (codex L3 MED, 2026-09-04). An `id()` is
+            # only unique among LIVE objects. If an entry ever outlives its conversation — the
+            # finalizer failed to install, or failed to run — a recycled `id()` would silently hand
+            # a NEW conversation the OLD, possibly permissive floor. Comparing the stored weakref
+            # against the caller makes that impossible regardless of whether eviction worked, so
+            # the fail-open does not depend on a callback firing.
+            if ref() is conv_state:
+                return floor
+            _FLOORS.pop(key, None)          # stale: the id was recycled
+
+        floor = _SharedFloor(policy_for_conv_state(conv_state))
+        # ⛔ FINALIZER FIRST, THEN PUBLISH (codex L3 MED). The previous order published the entry and
+        # then installed the finalizer, so if `weakref.finalize()` raised — an async
+        # KeyboardInterrupt, an allocation failure — the entry was live with NO eviction callback at
+        # all. Registering first means a failure leaves nothing published to leak.
+        # ⚠ Safe to register inside the lock ONLY because `_FLOORS_LOCK` is reentrant: `finalize`
+        # can fire a callback synchronously on this thread, and that callback takes this lock.
+        finalizer = weakref.finalize(conv_state, _drop_floor, key)
+        _FLOORS[key] = (weakref.ref(conv_state), floor)
+        assert finalizer.alive or conv_state is None  # keep the reference; finalize() is self-owned
+        return floor
         floor = _SharedFloor(policy_for_conv_state(conv_state))
         _FLOORS[key] = floor
     # Registered OUTSIDE the lock: `finalize` can fire immediately for an already-dying object, and
@@ -489,8 +533,17 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # unverified shell. **The advertised fail-closed check was fail-once/open-next**,
                 # which is worse than no check: it emits exactly one refusal that reads as the guard
                 # working, and then silently stops guarding.
+                # ⛔⛔ THE REFRESH HAPPENS HERE, UPSTREAM OF THE PROVIDER — AND THAT IS WHAT
+                # REPLACED A METACLASS GUARD THAT WAS DEFEATED SEVEN TIMES ACROSS FIVE VERSIONS
+                # (Phill ruled 2026-09-04). The provider is handed an ALREADY-REFRESHED policy, so
+                # a provider cannot skip the re-resolution: there is no step for it to omit.
+                # ⚡ The guard tried to make it impossible to SKIP a call. This makes the call not
+                # exist at that layer. `BwrapProvider` on the held k4c-linux branch — written before
+                # any of this existed — inherits the invariant by construction, which is exactly
+                # what the guard was for and never actually achieved.
+                refreshed = refresh_socket_denies(self._floor.policy)
                 candidate = provider.spawn_shell(
-                    self._floor.policy, default_timeout=self._default_timeout
+                    refreshed, default_timeout=self._default_timeout
                 )
                 try:
                     # `effective_policy` is Optional on the TYPE because a SandboxedShell built
@@ -505,20 +558,18 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     # MERGE, never assign: `absorb` unions under the FLOOR'S OWN lock, so a
                     # concurrent spawner's denies cannot be lost to a wholesale overwrite.
                     self._floor.absorb(effective)
+                    # ⛔ THE COMMIT IS INSIDE THE PROTECTED BLOCK (codex L3 LOW, 2026-09-04). An
+                    # asynchronous exception landing after validation but before the assignment
+                    # would otherwise leave a LIVE shell that is neither cached nor closed — its
+                    # reader thread keeps it, and the subprocess outlives the refusal.
+                    self._shell = candidate
                 except BaseException:
-                    # ⛔ A FAILING `close()` MUST NOT REPLACE THE REASON WE ARE REFUSING
-                    # (complement L3 MED, 2026-09-04). If tearing down the subprocess raises, that
-                    # I/O error would propagate INSTEAD of the ConfinementError — callers matching
-                    # on exception type, and any log printing only the outermost exception, would
-                    # see "close failed" rather than "no effective policy". The leak is still
-                    # prevented either way; what was degraded is the FIDELITY OF THE FAIL-CLOSED
-                    # SIGNAL, which is the entire point of this rewrite.
-                    try:
-                        candidate.close()  # never leak a LIVE unverified shell
-                    except Exception:
-                        _log.exception("failed to close an unverified candidate shell")
+                    # ⛔ BaseException, NOT Exception (codex L3 MED). A KeyboardInterrupt or
+                    # SystemExit raised by `close()` would otherwise REPLACE the original refusal,
+                    # which is the one signal this whole path exists to preserve.
+                    self._shell = None
+                    _close_candidate_shell(candidate)
                     raise
-                self._shell = candidate
             return self._shell
 
     def _teardown(self) -> None:
