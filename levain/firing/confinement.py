@@ -1125,9 +1125,18 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # read to understand their own floor. The DENIAL is correct either way; only the stated
     # reason would have been wrong.
     # ⚠ This hand has no connect() primitive, so it enforces the RENAME/UNLINK arm only. The
-    # connect arm is the seatbelt profile's ``network-outbound`` rule and has NO in-process twin
-    # — stated rather than papered over, because "one policy, two enforcers" holds for every
-    # OTHER field on this policy and does NOT hold for this one.
+    # connect arm is the seatbelt profile's ``network-outbound`` rule and has NO in-process twin.
+    # ⛔ AND THE REASON THAT USED TO BE GIVEN FOR ACCEPTING THE GAP WAS A FALSE UNIVERSAL
+    # (Diogenes 2026-09-05). It read: "one policy, two enforcers" holds for every OTHER field on
+    # this policy and does NOT hold for this one. It does not hold for `deny_write_dirs` either —
+    # MEASURED by calling this predicate against every entry: **30 entries, exactly 1 matched**
+    # (`~/.ssh`, via the `ssh_dir` arm above). The other 29 are enforced by the seatbelt hand
+    # alone. So the connect arm is not the lone exception; partial coverage is the NORM across
+    # this object, and the honest statement of the gap is that the two hands enforce DIFFERENT
+    # SUBSETS by construction — the file editor has no connect and no rename-of-a-directory
+    # primitive, so it can only ever cover what its own primitives reach.
+    # ⚠ A single-instance claim is what makes a gap look exceptional; naming it as the norm is
+    # what stops the next reader treating an uncovered field as an anomaly worth "fixing" here.
     sockets = set(policy.socket_spellings) or set(policy.deny_sockets)
     for wf in policy.deny_write_files:
         if _ci_within(p, wf):
@@ -2001,14 +2010,42 @@ class SeatbeltProvider(ConfinementProvider):
             # these to ``all_jewels`` — the codex raw-mode-bypass fix). In agent-mode the whole ~/.ssh
             # subtree already denies these (redundant-but-explicit); rendering in both modes makes the
             # persistence-vector floor ssh_mode-independent and self-documenting.
-            lines.append(";; ssh persistence/exec vectors (authorized_keys*, config, rc) — ALWAYS write-")
-            lines.append(";; denied (both ssh_modes): a planted key / ProxyCommand config / rc is code the")
-            lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
-            lines.append("(deny file-write*")
-            for p in policy.deny_write_files:
-                lines.append(f'    (literal "{_sbpl_string(str(p))}")')
-            lines.append(")")
-            lines.append("")
+            # ⛔ TWO CLASSES SHARE THIS LIST, SO IT RENDERS AS TWO BLOCKS WITH TWO ACCURATE
+            # HEADERS (Diogenes 2026-09-05). One "ssh persistence/exec vectors (authorized_keys*,
+            # config, rc)" header used to stand over the WHOLE list while 10 of the 20 literals
+            # under it were container/VM daemon sockets — MEASURED BY RENDERING A REAL PROFILE,
+            # not by reading. `crown_jewel_reason` had already been fixed to say WHICH kind it
+            # matched; this renderer was the other surface saying it and kept the false sentence.
+            # ⚠ AND THIS IS THE MORE AUTHORITATIVE SURFACE: the in-process message is transient,
+            # the .sbpl is written to a file and is what the kernel enforces. An operator auditing
+            # why `docker.sock` is write-denied read that it is an ssh persistence vector.
+            # ⚠ SPLIT BY MEMBERSHIP IN THE SOCKET SET, NEVER BY FILENAME — mirroring
+            # `crown_jewel_reason` exactly. A `.sock` endswith test stood there for one commit and
+            # was replaced on review: `podman.socket`, a systemd-activated name or an operator's
+            # own path would be misfiled, and name-based reasoning about security-relevant paths
+            # is the thing this module refuses.
+            _sockets = set(policy.socket_spellings) or set(policy.deny_sockets)
+            _ssh_vectors = [f for f in policy.deny_write_files if f not in _sockets]
+            _socket_files = [f for f in policy.deny_write_files if f in _sockets]
+            if _ssh_vectors:
+                lines.append(";; ssh persistence/exec vectors (authorized_keys*, config, rc) — ALWAYS write-")
+                lines.append(";; denied (both ssh_modes): a planted key / ProxyCommand config / rc is code the")
+                lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
+                lines.append("(deny file-write*")
+                for f in _ssh_vectors:
+                    lines.append(f'    (literal "{_sbpl_string(str(f))}")')
+                lines.append(")")
+                lines.append("")
+            if _socket_files:
+                lines.append(";; container/VM daemon sockets — write-denied so the socket FILE cannot be")
+                lines.append(";; renamed or unlinked and re-pointed at an unlisted target. Reaching an")
+                lines.append(";; unsandboxed root daemon bypasses the whole floor (spore-725). The CONNECT")
+                lines.append(";; half is the network-outbound rule above; this is the rename/unlink arm.")
+                lines.append("(deny file-write*")
+                for f in _socket_files:
+                    lines.append(f'    (literal "{_sbpl_string(str(f))}")')
+                lines.append(")")
+                lines.append("")
 
         if policy.own_memory_files:
             # The entity's OWN store (memory.continuity.md / crystal.json / db) — WRITE-only denied so a
