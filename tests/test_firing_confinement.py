@@ -1755,6 +1755,23 @@ def test_the_refresh_is_upstream_so_no_provider_can_skip_it(tmp_path, monkeypatc
     ALREADY-REFRESHED policy, because `_ensure_shell` refreshed it before calling. There is nothing
     to skip. That is what this test pins, and it is why the guard could be deleted rather than
     rewritten a sixth time."""
+    # ⛔ SKIPPING HERE IS NOT NEUTRAL, WHICH IS WHY THIS REASON IS NOT THE SIBLING'S.
+    # This is the test that pins the invariant the deleted `spawn_shell` guard was
+    # traded for (five versions, seven bypasses — fd653cd). `openhands` is an EXTRA:
+    # it is absent from a base install, absent from the `dev` extra, and this repo has
+    # NO CI. It therefore does NOT run under `pip install levain` or `pip install -e
+    # '.[dev]'`, which is how a bare `python3 -m pytest` reads this repo — and a plain
+    # "1 skipped" would report that absence as health.
+    # ⚠ IT DOES RUN where the extra is present, and that is not hypothetical: this
+    # clone's `.venv` carries it, and `scripts/hooks/pre-push` prefers `.venv/bin/python`,
+    # so the push gate exercises this test while a bare `python3` run skips it. Executed
+    # green there 2026-09-05 (`.venv/bin/python -m pytest -k ...` -> 1 passed). Which
+    # interpreter you use decides whether this invariant is checked at all.
+    pytest.importorskip(
+        "openhands.tools.terminal",
+        reason="openhands extra absent — the post-guard-deletion invariant is NOT "
+               "exercised in this environment (pip install -e '.[openhands]' to run it)",
+    )
     from levain.firing.openhands.tools import SandboxedBashExecutor
     from levain.firing.confinement import build_policy
 
