@@ -170,10 +170,9 @@ import signal
 import subprocess
 import tempfile
 import threading
-import types
 import time
 import unicodedata
-from abc import ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Literal
@@ -1740,121 +1739,7 @@ class SandboxedShell:
 
 # --- the provider seam (mirrors levain.daemon.DaemonProvider) --------------------------------
 
-class _ProviderMeta(ABCMeta):
-    """Metaclass that makes :meth:`ConfinementProvider.spawn_shell` final against every way a
-    provider can be DEFINED — subclassing, mixin shadowing, and virtual registration.
-
-    ⛔ THIS REPLACED AN ``__init_subclass__`` GUARD THAT CHECKED ``cls.__dict__`` (codex L3 #2 and
-    complement, convergent, 2026-09-04). Two holes in that version, both demonstrated by the
-    reviewers rather than argued:
-      · **MIXIN SHADOWING.** ``class P(LegacyMixin, ConfinementProvider)`` does not put
-        ``spawn_shell`` in ``P.__dict__``, so the guard passed — while the MRO resolved
-        ``spawn_shell`` to the mixin's, skipping the socket refresh deterministically. Test and
-        logging mixins are an ordinary pattern, so this is not an exotic case.
-      · **A NON-COOPERATIVE DESCENDANT.** An intermediate provider that defines
-        ``__init_subclass__`` without calling ``super()`` silently disables the guard for everything
-        below it. A metaclass ``__new__`` runs at class creation no matter what the class body does,
-        so there is nothing to forget to call.
-    ⚡ The first guard was itself written to close a ``claim > enforcement`` gap, and it left a
-    narrower one of exactly the same kind — the third time in this change that a fix reproduced the
-    class it was written for. The test for the old guard passed the whole time, because it only
-    exercised the direct-override case the guard checked.
-
-    ⚠ ``typing.final`` is deliberately NOT the answer: it is a type-checker hint with no runtime
-    effect, and this seam has to hold against a provider nobody type-checked.
-
-    ⚠ **THE ONE GAP THIS DOES NOT CLOSE, STATED RATHER THAN LEFT TO A READER'S ASSUMPTION**
-    (complement LOW, 2026-09-04): the check runs at CLASS CREATION and at ``register()``. Assigning
-    ``SomeProvider.spawn_shell = other`` on an ALREADY-CREATED class is not intercepted — there is no
-    ``__setattr__`` hook here. That is a narrower path (it needs code running against an imported
-    class, not merely a class definition) and it is the same reach a ``monkeypatch.setattr`` in a
-    test has, which is legitimate. So this is "final against the ways a provider gets DEFINED", not
-    "final against arbitrary mutation" — the earlier wording said the latter, which overclaimed."""
-
-    def register(cls, subclass):  # type: ignore[override,no-untyped-def]
-        """⛔ REFUSE VIRTUAL SUBCLASSING (complement HIGH, 2026-09-04, CONFIRMED BY EXECUTION).
-
-        ``_ProviderMeta`` subclasses :class:`~abc.ABCMeta`, so ``ConfinementProvider`` inherited
-        ``register()`` — and a registered class becomes an ``isinstance``/``issubclass`` match
-        WITHOUT ever passing through :meth:`__new__`. Measured: a class with its own unrefreshed
-        ``spawn_shell``, registered, returned ``isinstance(...) is True`` while the finality check
-        never ran. Any dispatch that trusts the ABC would then accept a provider that renders a
-        STALE socket floor — the exact outcome the metaclass exists to make impossible.
-
-        ⚡ And ``register()`` is not an exotic path: it is THE standard idiom a third party reaches
-        for when their provider already has an unrelated base class, which is the case the class
-        docstring names as its own threat model. A guard that closes normal inheritance and leaves
-        the documented workaround open is not a guard.
-
-        Refused outright rather than validated, because there is nothing to validate: a virtual
-        subclass shares no code with this class, so its ``spawn_shell`` cannot be the inherited one.
-        Inherit from :class:`ConfinementProvider` properly, or wrap."""
-        raise TypeError(
-            "virtual subclassing of ConfinementProvider via register() is refused — spawn_shell "
-            "finality cannot be verified for a class that does not inherit it, and a registered "
-            "provider could render a stale socket floor (spore-768). Inherit from "
-            "ConfinementProvider and implement `_spawn_shell_impl`, or wrap your class in one that "
-            "does."
-        )
-
-    def __new__(mcls, name, bases, namespace, /, **kwargs):  # type: ignore[no-untyped-def]
-        cls = super().__new__(mcls, name, bases, namespace, **kwargs)
-        # ⛔ THE ROOT IS RECOGNISED FROM ITS BASES, NEVER FROM A MODULE GLOBAL (codex L3 LOW,
-        # 2026-09-04, verified by execution). The previous version read
-        # `globals()["ConfinementProvider"]`, which during `importlib.reload` still names the OLD
-        # class while the NEW root is being created — so the guard compared two different method
-        # objects and raised `ConfinementProvider overrides or shadows
-        # ConfinementProvider.spawn_shell`: **it accused the root class of shadowing itself**, and
-        # reloading this module was deterministically impossible.
-        # ⚡ A class whose bases include no `_ProviderMeta` instance IS a root, by construction —
-        # that is a fact about the class being created, not about what a module global happens to
-        # point at right now. Same lesson as the rest of this file: ask the object, not the cache.
-        # ⛔⛔ THE CANONICAL ROOT IS CARRIED AS AN INHERITED MARKER — the FOURTH version of this
-        # guard, and the first written after enumerating every case instead of fixing whichever one
-        # was currently broken. The three before it each asked a PROXY for "who owns `spawn_shell`",
-        # and each proxy failed on a different composition:
-        #   v1 `cls.__dict__`     — a NAME.     Missed a mixin shadowing it.
-        #   v2 the module global  — a NAME.     Missed a reload (the old base is not an instance of
-        #                                       the NEW metaclass, so ancestry came out empty).
-        #   v3 `parents[0]`       — a POSITION. FALSE-POSITIVED on multiple inheritance: a mixin that
-        #                                       merely shares the metaclass made `root` None and
-        #                                       broke module import for a valid class.
-        #   v4 `cls.__mro__[1:]`  — a WALK.     Missed the mixin AGAIN, because a shadowing mixin is
-        #                                       itself in that MRO, so root == owner and it matched.
-        # ⚡ **Each fix broke a case an earlier one held. `__levain_provider_root__` is an OBJECT
-        # REFERENCE inherited down the hierarchy, so it is immune to naming (survives reload),
-        # to ordering (no `parents[0]`), and to the MRO walk (the marker names the ROOT, never
-        # whatever happens to appear first).**
-        parents = [b for b in bases if isinstance(b, mcls)]
-        root = next(
-            (r for r in (getattr(b, "__levain_provider_root__", None) for b in parents)
-             if r is not None),
-            None,
-        )
-        if root is None:
-            # A new root hierarchy. It becomes canonical only if it actually defines `spawn_shell`;
-            # a bare mixin that merely shares the metaclass must NOT be mistaken for a provider root.
-            if "spawn_shell" in namespace:
-                cls.__levain_provider_root__ = cls
-            return cls
-        # The first class in the MRO that DEFINES `spawn_shell` must be that root, holding an
-        # ordinary function. `getattr` is not used: it unwraps descriptors, so
-        # `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` compares EQUAL while failing
-        # to bind `self` at runtime — a `TypeError` that `__call__` does not convert into an in-band
-        # refusal.
-        owner = next((k for k in cls.__mro__ if "spawn_shell" in k.__dict__), None)
-        raw = owner.__dict__.get("spawn_shell") if owner is not None else None
-        if owner is not root or not isinstance(raw, types.FunctionType):
-            raise TypeError(
-                f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
-                "the spawn-time socket re-resolution (spore-768) and silently render a stale "
-                "socket floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the "
-                "policy and delegates to it."
-            )
-        return cls
-
-
-class ConfinementProvider(metaclass=_ProviderMeta):
+class ConfinementProvider(ABC):
     """One thin provider per OS. ``render_profile`` is PURE (no I/O) so the generated sandbox text is
     fully testable without touching the system; ``spawn_shell`` shells out to the platform sandbox
     driver. The macOS provider ships first; ``bwrap`` (Linux) + a container backend are PURE ADDITIONS
@@ -1871,43 +1756,50 @@ class ConfinementProvider(metaclass=_ProviderMeta):
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
-        """Start a persistent shell confined by ``policy`` (writes the profile, spawns the sandboxed
-        bash). The returned :class:`SandboxedShell` is already ``start()``\\ ed.
+        """Start a persistent shell confined by ``policy``. The returned :class:`SandboxedShell` is
+        already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
 
-        ⛔ **CONCRETE AND FINAL ON PURPOSE — THE SOCKET REFRESH IS STRUCTURAL, NOT A CONTRACT NOTE**
-        (spore-768). This used to be ``@abstractmethod``. It is now a template method that runs
-        :func:`refresh_socket_denies` and then delegates to :meth:`_spawn_shell_impl`, because the
-        thing a provider must not be able to forget is the re-resolution of the socket connect arm:
-        the policy is built at tool-creation time and the shell spawns LAZILY (and RE-spawns after
-        every ``exit``), so a provider that renders the build-time ``deny_sockets`` reintroduces the
-        codex L3 HIGH this release exists to close.
+        ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
+        TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
+        (Phill ruled 2026-09-04, on codex L3 round 7). The history is the argument, so it is kept:
 
-        A docstring saying "call ``refresh_socket_denies`` first" is discipline, and discipline
-        drifts. There is a **second provider already written** — ``BwrapProvider`` on the held
-        ``k4c-linux`` branch — which is exactly the case a contract note would have missed: it was
-        authored before this fix existed, so it cannot have been written to honour a rule that did
-        not exist. Making the refresh part of the seam means it inherits the fix by merging rather
-        than by someone remembering.
-        ⚠ MERGE NOTE FOR ``k4c-linux``: both ``SeatbeltProvider.spawn_shell`` and
-        ``BwrapProvider.spawn_shell`` on that branch must be renamed to ``_spawn_shell_impl``. It is
-        a mechanical rename, and it is the whole cost of making this structural."""
-        refreshed = refresh_socket_denies(policy)
-        shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
-        # ⛔ REJECT A NON-SHELL HERE, AT THE SOURCE (codex L3 MED, 2026-09-04). The previous version
-        # tolerated a `None` sentinel and guarded for it — which only MOVED the crash: `_ensure_shell`
-        # then returned None and its caller raised `AttributeError` on `.run` one line later, and
-        # `__call__` converts `ConfinementError` into an in-band refusal but NOT `AttributeError`.
-        # ⚡ A guard that relocates an unhandled crash is worse than no guard, because the code now
-        # READS as though the case is handled. The contract is what needed fixing, not the call site:
-        # this method's declared return type is non-optional, so anything else is a provider bug and
-        # is refused fail-closed rather than propagated as a shell.
+        | v | mechanism | defeated by |
+        |---|-----------|-------------|
+        | 1 | ``cls.__dict__``      | a mixin shadowing ``spawn_shell`` |
+        | 2 | the module global     | ``importlib.reload`` |
+        | 3 | ``parents[0]``        | *over*-refused valid multiple inheritance (broke import) |
+        | 4 | ``cls.__mro__[1:]``   | a mixin shadowing it AGAIN |
+        | 5 | an inherited marker   | marker poisoning · a derived metaclass · multiple marked roots |
+
+        …plus post-definition assignment, which no version ever closed. ⚡ **The defeat surface is
+        UNBOUNDED: Python does not support making a class hierarchy tamper-proof against its own
+        subclasses, so there is no closed set of ways to shadow an attribute and every version was
+        defeated in a NEW way.** Seven cases were enumerated into a table and an outside lineage
+        immediately found three more. Enumeration cannot terminate here.
+        ⚠ And the guard bought almost nothing even when it worked: an adversarial provider never
+        needed to override this method — it could return anything at all from ``_spawn_shell_impl``,
+        or not inherit from this class. **It blocked one spelling of a thing with many spellings.**
+
+        ▶ **WHAT ACTUALLY ENFORCES THE INVARIANT NOW: the refresh happens UPSTREAM, in
+        :meth:`SandboxedBashExecutor._ensure_shell`, BEFORE this method is called. A provider never
+        receives an unrefreshed policy, so there is nothing to forget, nothing to override, and
+        nothing to guard.** ``BwrapProvider`` on the held ``k4c-linux`` branch inherits that by
+        construction rather than by remembering a rule.
+        ⚖ This is not a reversal of "make the refresh structural" — it is a stronger form of it. The
+        metaclass tried to make it impossible to SKIP a step; moving it upstream makes the step not
+        exist at this layer at all. Same move as the conversation-floor key: **stop balancing,
+        dissolve.**"""
+        shell = self._spawn_shell_impl(policy, env=env, default_timeout=default_timeout)
+        # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
+        # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
+        # convert into an in-band refusal.
         if not isinstance(shell, SandboxedShell):
             raise ConfinementError(
                 f"{type(self).__name__}._spawn_shell_impl returned {type(shell).__name__}, not a "
                 "SandboxedShell — refusing to hand back bash hands without a verified confined "
                 "shell (fail-closed)."
             )
-        shell.effective_policy = refreshed
+        shell.effective_policy = policy
         return shell
 
     @abstractmethod

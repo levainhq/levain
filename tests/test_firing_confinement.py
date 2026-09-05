@@ -18,7 +18,6 @@ The module is a dependency-isolated stdlib leaf (like ``levain.firing.isolation`
 from __future__ import annotations
 
 import os
-import pathlib
 import platform
 import subprocess
 import sys
@@ -41,7 +40,6 @@ from levain.firing.confinement import (
     confinement_supported,
     crown_jewel_reason,
     load_confinement_config,
-    refresh_socket_denies,
     sandbox_exec_available,
     select_provider,
 )
@@ -1742,601 +1740,57 @@ def test_the_tilde_user_path_actually_raises_RuntimeError(tmp_path) -> None:
         Path("~nosuchuser42/.ssh/authorized_keys").expanduser()
 
 
-@pytest.mark.parametrize("bad", ["false", "no", "0", 0, 1, None, [], {}])
-def test_allow_container_sockets_refuses_non_bools_because_it_failed_OPEN(tmp_path, bad) -> None:
-    """⛔ THE ONE DIRECTION A SECURITY FLAG MUST NOT FAIL, AND IT DID.
+def test_the_refresh_is_upstream_so_no_provider_can_skip_it(tmp_path, monkeypatch) -> None:
+    """⛔⛔ THE INVARIANT THAT REPLACED A METACLASS GUARD DEFEATED SEVEN TIMES ACROSS FIVE VERSIONS
+    (Phill ruled 2026-09-04, on codex L3 round 7).
 
-    MEASURED before the fix (codex L3, 2026-09-04): passing the STRING ``"false"`` — which is what
-    an env-var-backed or hand-rolled caller supplies — is TRUTHY, so it removed ALL THREE ARMS.
-    `deny_sockets` went 7 -> 0 and the socket write-denies 10 -> 0. **A value meaning "no" read as
-    "yes" and silently deleted the container-socket floor.**
+    The guard tried to make it IMPOSSIBLE TO SKIP a call, and Python does not support making a class
+    hierarchy tamper-proof against its own subclasses — v1 `cls.__dict__` fell to a mixin, v2 the
+    module global fell to a reload, v3 `parents[0]` over-refused valid multiple inheritance, v4
+    `cls.__mro__[1:]` fell to the mixin again, v5's inherited marker fell to marker poisoning, a
+    derived metaclass, and multiple marked roots. Post-definition assignment was never closed at all.
 
-    No shipping caller was affected: the JSON loader validates the type, and `policy_for_conv_state`
-    passes the loader's value. That is exactly why it is worth pinning here — this is the PUBLIC
-    MECHANISM boundary and the next caller is the one that gets it wrong.
+    ⚡ Moving the refresh UPSTREAM makes the call not exist at that layer. A provider that overrides
+    `spawn_shell` **entirely** — the exact thing five guards tried to forbid — still receives an
+    ALREADY-REFRESHED policy, because `_ensure_shell` refreshed it before calling. There is nothing
+    to skip. That is what this test pins, and it is why the guard could be deleted rather than
+    rewritten a sixth time."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor
+    from levain.firing.confinement import build_policy
 
-    ⚠ `0` and `1` are in the list on purpose: `isinstance(True, int)` is True, so a plain int check
-    would let a JSON number through as a bool."""
-    with pytest.raises(ConfinementError):
-        build_policy(_entity(tmp_path), allow_container_sockets=bad)
+    ent = tmp_path / "ent"
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True)
 
-
-def test_socket_classification_does_no_filesystem_io(tmp_path, monkeypatch) -> None:
-    """`crown_jewel_reason` must not call `.resolve()` while classifying — a resolution error there
-    escapes the fail-closed guard that wraps only the INPUT path, so a concurrent symlink swap
-    crashes the security predicate instead of refusing. Both spellings are precomputed at policy
-    construction, where the information already exists, so the predicate needs no I/O at all.
-
-    Pinned by making `Path.resolve` explode for the duration: a policy built beforehand must still
-    classify correctly."""
-    sock = tmp_path / "run" / "docker.sock"
-    sock.parent.mkdir(parents=True, exist_ok=True)
-    sock.touch()
-    policy = _sock_policy(tmp_path, monkeypatch, sock)
-
-    def _boom(self, *a, **k):  # noqa: ANN001
-        raise RuntimeError("resolve() must not be called inside the predicate")
-
-    monkeypatch.setattr(Path, "resolve", _boom)
-    reason = crown_jewel_reason(policy, sock)
-    assert reason is not None and "socket" in reason
-
-
-# --- spore-768: the socket connect arm is re-resolved AT SPAWN, not at policy build ----------
-#
-# ⛔ THE DEFECT THESE PIN (codex L3 HIGH, 2026-09-04, reproduced end to end before the fix):
-# `build_policy` resolved each listed socket and the confined shell spawned LAZILY afterwards, so a
-# listed path that was ABSENT at build resolved to itself, and a symlink created there later made
-# seatbelt canonicalise `connect()` to a target absent from `deny_sockets`. The connect THROUGH THE
-# LISTED NAME returned the payload. What it cost was the CLAIM (marginal exposure was zero — the
-# entity cannot create that symlink, and the unlisted target was already reachable under its own
-# name), which is why these tests assert the CONTENT of the deny set and the SEAM that refreshes it,
-# not an exploit outcome.
-
-
-def test_a_listed_socket_absent_at_build_is_re_resolved_at_spawn(tmp_path, monkeypatch) -> None:
-    """THE TOCTOU ITSELF. A listed path that does not exist when the policy is built resolves to
-    ITSELF; if it becomes a symlink to an unlisted target before the shell spawns, the refresh must
-    put that TARGET in the connect deny — otherwise seatbelt canonicalises the connect to a path
-    nothing names."""
     listed = tmp_path / "run" / "docker.sock"
     listed.parent.mkdir(parents=True)
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-    # Absent at build → it resolved to itself, which is INERT for network-outbound.
-    assert pol.deny_sockets == (listed.resolve(),)
+    from levain.firing import confinement as _conf
+    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(listed),))
+    ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
 
-    unlisted = tmp_path / "elsewhere" / "evil.sock"
+    # The socket appears AFTER the policy was built — the whole point of the refresh.
+    unlisted = tmp_path / "elsewhere" / "real.sock"
     unlisted.parent.mkdir(parents=True)
     unlisted.touch()
     listed.symlink_to(unlisted)
 
-    fresh = refresh_socket_denies(pol)
-    assert unlisted.resolve() in fresh.deny_sockets, (
-        "the symlink target must be denied after the refresh — this is the HIGH"
-    )
+    seen: list = []
 
+    class _RogueProvider:
+        """Overrides spawn_shell completely and never refreshes anything — what the guard forbade."""
 
-def test_the_refresh_unions_and_can_never_drop_a_build_time_deny(tmp_path, monkeypatch) -> None:
-    """⛔ THE FAIL-CLOSED PROPERTY, AND THE ONE THAT MAKES THE REFRESH SAFE TO RUN AT ALL.
-
-    A refresh that REPLACED the set would hand an attacker the deletion primitive the refresh exists
-    to deny them: point a listed socket at a decoy immediately before spawn and the real target falls
-    off the deny list. Union makes `deny_sockets` MONOTONIC — a re-resolution can only ever ADD.
-    Mutation-checked: changing `refresh_socket_denies` to `replace(policy, deny_sockets=fresh)`
-    fails exactly this test and nothing else in this file."""
-    real = tmp_path / "real.sock"
-    real.touch()
-    decoy = tmp_path / "decoy.sock"
-    decoy.touch()
-    listed = tmp_path / "run" / "docker.sock"
-    listed.parent.mkdir(parents=True)
-    listed.symlink_to(real)
-
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-    assert real.resolve() in pol.deny_sockets
-
-    listed.unlink()
-    listed.symlink_to(decoy)
-    fresh = refresh_socket_denies(pol)
-
-    assert real.resolve() in fresh.deny_sockets, "a re-resolution must NEVER drop an existing deny"
-    assert decoy.resolve() in fresh.deny_sockets
-
-
-def test_the_refresh_is_a_no_op_when_nothing_moved(tmp_path, monkeypatch) -> None:
-    """Idempotence, which is also the anti-drift check: `build_policy` and `refresh_socket_denies`
-    run the SAME derivation (`_resolve_socket_targets`), so a refresh over an unchanged filesystem
-    must return the identical object. If the two derivations ever diverge, this fails."""
-    sock = tmp_path / "run" / "docker.sock"
-    sock.parent.mkdir(parents=True)
-    sock.touch()
-    pol = _sock_policy(tmp_path, monkeypatch, sock)
-    assert refresh_socket_denies(pol) is pol
-
-
-def test_the_socket_opt_out_survives_the_refresh(tmp_path, monkeypatch) -> None:
-    """`allow_container_sockets=True` leaves `socket_sources` EMPTY, so the refresh is an identity —
-    it cannot resurrect a floor the operator deliberately opted out of. This is why the policy
-    carries the lexical source list rather than the refresh re-reading the module constant: reading
-    the constant would re-deny sockets for an operator who turned the floor off."""
-    sock = tmp_path / "run" / "docker.sock"
-    sock.parent.mkdir(parents=True)
-    sock.touch()
-    pol = _sock_policy(tmp_path, monkeypatch, sock, allow_container_sockets=True)
-    assert pol.socket_sources == ()
-    assert refresh_socket_denies(pol) is pol
-    assert refresh_socket_denies(pol).deny_sockets == ()
-
-
-def test_a_resolution_failure_refuses_rather_than_emitting_a_wrong_deny(tmp_path, monkeypatch) -> None:
-    """FAIL-CLOSED at the derivation. A socket path that cannot be resolved must raise
-    `ConfinementError` — `spawn_shell`'s contract is to refuse rather than hand back a shell whose
-    connect deny may name the wrong target.
-
-    ⚠ MONKEYPATCHED, NOT REPRODUCED ON DISK, AND SAID SO RATHER THAN DRESSED UP: the obvious
-    filesystem trigger does NOT fire — measured on CPython 3.13, `Path.resolve()` over a symlink LOOP
-    returns the lexical path instead of raising ELOOP. The handler is defensive depth for a resolver
-    that CAN raise (a future strict resolve, a different platform, a `~user` spelling reaching
-    expanduser); pinning it with a fake keeps the fail-closed BRANCH honest without a test that
-    claims a repro it does not have."""
-    sock = tmp_path / "run" / "docker.sock"
-    sock.parent.mkdir(parents=True)
-    sock.touch()
-    pol = _sock_policy(tmp_path, monkeypatch, sock)
-
-    def _boom(self, *a, **k):
-        raise OSError("simulated resolution failure")
-
-    monkeypatch.setattr(Path, "resolve", _boom)
-    with pytest.raises(ConfinementError, match="refusing to build the confinement floor"):
-        refresh_socket_denies(pol)
-
-
-def test_spawn_shell_refreshes_the_socket_arm_before_any_provider_renders(tmp_path, monkeypatch) -> None:
-    """⛔ THE STRUCTURAL GUARD, AND THE REASON `spawn_shell` STOPPED BEING ABSTRACT.
-
-    The refresh must be impossible for a provider to skip. `ConfinementProvider.spawn_shell` is a
-    concrete template method that refreshes and delegates to `_spawn_shell_impl`, so a provider
-    authored BEFORE this fix — `BwrapProvider` exists on the held `k4c-linux` branch and is exactly
-    that case — inherits it by merging rather than by someone remembering a docstring.
-
-    This test drives a provider that records the policy it was handed, so it fails if the template
-    method is ever reverted to `@abstractmethod` or the refresh is moved into one provider."""
-    from levain.firing.confinement import ConfinementProvider
-
-    listed = tmp_path / "run" / "docker.sock"
-    listed.parent.mkdir(parents=True)
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-
-    unlisted = tmp_path / "elsewhere" / "evil.sock"
-    unlisted.parent.mkdir(parents=True)
-    unlisted.touch()
-    listed.symlink_to(unlisted)
-
-    seen: list[CrownJewelsPolicy] = []
-
-    class _Recorder(ConfinementProvider):
-        def render_profile(self, policy):  # pragma: no cover — not exercised here
-            return ""
-
-        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
             seen.append(policy)
-            # A REAL shell: `spawn_shell` now refuses anything else at the source (codex L3 MED),
-            # so a None sentinel here would be rejected before the recording could be checked.
-            return SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
+            sh = SandboxedShell(argv=["/bin/true"], cwd=ws, env={})
+            sh.effective_policy = policy
+            return sh
 
-    _Recorder().spawn_shell(pol)
+    import levain.firing.openhands.tools as _t
+    monkeypatch.setattr(_t, "select_provider", lambda: _RogueProvider())
+    ex._ensure_shell()
+
     assert len(seen) == 1
     assert unlisted.resolve() in seen[0].deny_sockets, (
-        "the provider was handed a STALE policy — the seam did not refresh"
+        "a provider that skips the seam entirely still got a refreshed policy — that is the "
+        "invariant; if this fails, deleting the guard was wrong"
     )
-
-
-def test_a_provider_cannot_implement_the_old_abstract_spawn_shell_by_accident() -> None:
-    """The rename is the enforcement: `_spawn_shell_impl` is the abstract member, so a subclass that
-    defines only the OLD `spawn_shell` name overrides the template method and loses the refresh
-    silently. Assert the ABC's abstract set names the impl, so that mistake is a TypeError at
-    instantiation rather than a quiet reopening of the HIGH."""
-    from levain.firing.confinement import ConfinementProvider
-
-    assert "_spawn_shell_impl" in ConfinementProvider.__abstractmethods__
-    assert "spawn_shell" not in ConfinementProvider.__abstractmethods__
-
-
-# --- spore-768 round 2: the codex L3 on the FIX itself (2026-09-04) --------------------------
-#
-# The first version of the refresh touched ONLY the connect arm. codex filed that as a HIGH and glm
-# converged on it independently; confirmed by execution before these tests were written. Each test
-# below pins one finding from that review.
-
-
-def test_the_refresh_gives_a_fresh_target_all_three_arms_not_just_the_connect(tmp_path, monkeypatch) -> None:
-    """⛔ THE HIGH FROM THE REVIEW OF THE FIX (codex + glm, convergent). A connect deny ALONE is
-    defeated by `mv` — this module measured that for the built-in sockets and it is just as true for
-    a target the refresh has only now learned about. Version 1 put the fresh target in `deny_sockets`
-    and nowhere else, so `crown_jewel_reason` returned None for it and BOTH hands would have let the
-    entity rename it and connect to the new name — reopening the window the refresh exists to close.
-
-    All three arms, from one resolution: connect (i), write-deny at both spellings (ii), ancestor
-    write-deny (iii)."""
-    listed = tmp_path / "run" / "docker.sock"
-    listed.parent.mkdir(parents=True)
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-
-    unlisted = tmp_path / "elsewhere" / "real.sock"
-    unlisted.parent.mkdir(parents=True)
-    unlisted.touch()
-    listed.symlink_to(unlisted)
-
-    fresh = refresh_socket_denies(pol)
-    target = unlisted.resolve()
-
-    assert target in fresh.deny_sockets, "arm (i): connect"
-    assert target in fresh.deny_write_files, "arm (ii): rename/unlink of the socket itself"
-    assert target.parent in fresh.deny_write_dirs, "arm (iii): relocation of an ancestor"
-    assert crown_jewel_reason(fresh, target) is not None, (
-        "the in-process hand must also refuse it — otherwise the file editor renames what the "
-        "seatbelt hand cannot"
-    )
-
-
-def test_a_refreshed_policy_carries_its_union_into_the_next_respawn(tmp_path, monkeypatch) -> None:
-    """⛔ MONOTONICITY IS ONLY REAL IF THE RESULT IS KEPT (codex L3 #2). The shell respawns after
-    every `exit`, and version 1 rendered the refreshed policy then threw it away — so spawn 2 began
-    from the build-time set and a target denied at spawn 1 became reachable again. "Can only ever
-    ADD" was true within one spawn and false across the respawns the design relied on.
-
-    Simulate the executor's loop: feed each refresh's OUTPUT into the next one, repointing the
-    symlink in between, and assert nothing is ever lost."""
-    listed = tmp_path / "run" / "docker.sock"
-    listed.parent.mkdir(parents=True)
-    first = tmp_path / "a.sock"
-    first.touch()
-    listed.symlink_to(first)
-
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-    pol = refresh_socket_denies(pol)          # spawn 1
-
-    second = tmp_path / "b.sock"
-    second.touch()
-    listed.unlink()
-    listed.symlink_to(second)
-    pol = refresh_socket_denies(pol)          # spawn 2, carrying spawn 1's result
-
-    assert first.resolve() in pol.deny_sockets, "spawn 1's target was dropped by spawn 2"
-    assert second.resolve() in pol.deny_sockets
-    assert first.resolve() in pol.deny_write_files
-    assert second.resolve() in pol.deny_write_files
-
-
-def test_a_provider_overriding_spawn_shell_is_refused_at_class_definition(tmp_path) -> None:
-    """⛔ THE CLAIM BECOMES A MECHANISM (codex L3 #3 round 1, and self-caught the same hour).
-    Making spawn_shell concrete stops a provider FORGETTING the refresh; it does not stop one from
-    defining spawn_shell itself. `typing.final` is a type-checker hint and does not fire at
-    runtime."""
-    from levain.firing.confinement import ConfinementProvider
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Sneaky(ConfinementProvider):
-            def render_profile(self, policy):
-                return ""
-
-            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-                return None
-
-            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-                return None  # skips the refresh entirely
-
-
-def test_a_mixin_shadowing_spawn_shell_is_refused_too(tmp_path) -> None:
-    """⛔ ROUND 2's GUARD-ON-THE-GUARD (codex L3 #2 + complement, convergent). The first version
-    checked `cls.__dict__`, so a class that INHERITS spawn_shell from an earlier base in its MRO
-    passed — while dispatch resolved to the mixin's version and skipped the refresh deterministically.
-    Test and logging mixins are an ordinary pattern, so this is the realistic bypass, and the
-    original guard's own test passed the whole time because it only exercised direct override.
-
-    ⚡ A guard written to close a claim > enforcement gap left a narrower one of the same kind —
-    third time in this change that a fix reproduced the class it was written for."""
-    from levain.firing.confinement import ConfinementProvider
-
-    class _LegacyMixin:
-        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-            return None  # no refresh at all
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Shadowed(_LegacyMixin, ConfinementProvider):
-            def render_profile(self, policy):
-                return ""
-
-            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-                return None
-
-
-def test_a_non_cooperative_init_subclass_cannot_disable_the_guard(tmp_path) -> None:
-    """⛔ THE SECOND HOLE codex NAMED: an intermediate provider defining `__init_subclass__` without
-    calling `super()` silently disabled an `__init_subclass__`-based guard for everything beneath it.
-    A METACLASS `__new__` runs at class creation regardless of what the class body does, so there is
-    nothing to forget to call — which is why the guard moved to `_ProviderMeta`."""
-    from levain.firing.confinement import ConfinementProvider
-
-    class _Rude(ConfinementProvider):
-        def __init_subclass__(cls, **kw):
-            pass  # deliberately does NOT call super()
-
-        def render_profile(self, policy):
-            return ""
-
-        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-            return None
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Beneath(_Rude):
-            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-                return None
-
-
-def test_the_shell_carries_the_exact_policy_it_was_confined_by(tmp_path, monkeypatch) -> None:
-    """⛔ ONE AUTHORITATIVE REFRESH PER SPAWN (codex L3 #1). The executor used to refresh, then let
-    `spawn_shell` refresh AGAIN, and keep the FIRST answer — so a target only the provider's
-    resolution saw was enforced for that shell and gone at the next respawn, defeating the
-    monotonicity the whole design rests on. `spawn_shell` now stamps the rendered policy onto the
-    shell so the caller caches exactly what was enforced."""
-    from levain.firing.confinement import ConfinementProvider
-
-    listed = tmp_path / "run" / "docker.sock"
-    listed.parent.mkdir(parents=True)
-    pol = _sock_policy(tmp_path, monkeypatch, listed)
-
-    unlisted = tmp_path / "elsewhere" / "real.sock"
-    unlisted.parent.mkdir(parents=True)
-    unlisted.touch()
-    listed.symlink_to(unlisted)
-
-    class _Recorder(ConfinementProvider):
-        def render_profile(self, policy):
-            return ""
-
-        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-            return SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
-
-    shell = _Recorder().spawn_shell(pol)
-    assert shell.effective_policy is not None
-    assert unlisted.resolve() in shell.effective_policy.deny_sockets
-    assert unlisted.resolve() in shell.effective_policy.deny_write_files
-
-
-def test_socket_sources_is_the_last_field_so_positional_construction_is_unbroken() -> None:
-    """⛔ A NEW FIELD ON AN EXPORTED DATACLASS GOES LAST (codex L3 #4). `socket_sources` was first
-    inserted before `own_memory_files`, shifting every later POSITIONAL index. Code built against
-    the old signature passing `own_memory_files` positionally would have landed the entity's own
-    memory paths in `socket_sources` — resolved and network-denied as if they were sockets, while
-    LOSING the write-deny that is the whole point of `own_memory_files` (the poison-the-always-
-    loaded-memory vector). Pin the tail order so the next added field does not repeat it."""
-    import dataclasses
-
-    names = [f.name for f in dataclasses.fields(CrownJewelsPolicy)]
-    assert names[-1] == "socket_sources"
-    assert names.index("own_memory_files") < names.index("socket_sources")
-
-
-def test_every_socket_arm_comes_from_one_resolution_pass(tmp_path, monkeypatch) -> None:
-    """⛔ ONE RESOLUTION, NOT THREE (codex L3 #5 + glm). build_policy used to resolve the sources in
-    three separate places, so a concurrent retarget could give the connect arm, the write arm and the
-    message-classification arm three different snapshots — a connect-deny naming one target while
-    the write-deny protecting it named another. Count the resolutions to pin that they share one."""
-    sock = tmp_path / "run" / "docker.sock"
-    sock.parent.mkdir(parents=True)
-    sock.touch()
-
-    from levain.firing import confinement as _conf
-    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(sock),))
-
-    calls: list[Path] = []
-    real = Path.resolve
-
-    def _counting(self, *a, **k):
-        calls.append(self)
-        return real(self, *a, **k)
-
-    monkeypatch.setattr(Path, "resolve", _counting)
-    pol = build_policy(tmp_path / "ent")
-    monkeypatch.undo()
-
-    # The socket source is resolved exactly ONCE for all three arms.
-    assert sum(1 for c in calls if str(c) == str(sock)) == 1, (
-        f"the socket path was resolved {sum(1 for c in calls if str(c) == str(sock))} times; "
-        "the three arms must share one resolution"
-    )
-    assert sock.resolve() in pol.deny_sockets
-    assert sock.resolve() in pol.deny_write_files
-
-
-def test_virtual_subclassing_via_register_is_refused(tmp_path) -> None:
-    """⛔ complement HIGH, 2026-09-04, CONFIRMED BY EXECUTION before this test was written.
-    `_ProviderMeta` subclasses ABCMeta, so `ConfinementProvider` inherited `register()` — and a
-    registered class becomes an isinstance/issubclass match WITHOUT passing through `__new__`.
-    Measured: a class with its own unrefreshed `spawn_shell`, registered, returned
-    `isinstance(...) is True` while the finality check never ran.
-
-    ⚡ `register()` is THE standard idiom for a third party whose provider already has an unrelated
-    base class — which is the exact case this metaclass's docstring names as its threat model. A
-    guard that closes normal inheritance and leaves the documented workaround open is not a guard."""
-    from levain.firing.confinement import ConfinementProvider
-
-    class _Rogue:
-        def render_profile(self, policy):
-            return ""
-
-        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-            return None  # never refreshes
-
-    with pytest.raises(TypeError, match="virtual subclassing"):
-        ConfinementProvider.register(_Rogue)
-
-
-def test_a_provider_subclassed_from_a_pre_reload_base_is_still_refused() -> None:
-    """⛔ codex L3 HIGH round 5, reproduced before fixing. The guard read `_ProviderMeta` from MODULE
-    GLOBALS, so: retain `OldProvider = ConfinementProvider`, reload the module, then subclass
-    `OldProvider`. The old base is not an instance of the NEW `_ProviderMeta`, `parents` came out
-    EMPTY, the override was ACCEPTED, and the provider rendered a build-time socket policy with no
-    refresh — reopening the listed-socket retarget bypass.
-
-    ⚡ Third bypass of this guard, and all three had the same shape: **it asked a NAME for the
-    identity of a CLASS.** `cls.__dict__` missed the mixin; the module global missed the reload.
-    `mcls` is the metaclass actually creating the class, which is the OLD one in this scenario.
-
-    ⛔⛔ THIS TEST LOADS A PRIVATE COPY OF THE MODULE AND NEVER RELOADS THE REAL ONE, and that is
-    load-bearing rather than fastidious. The first version called `importlib.reload` on
-    `levain.firing.confinement` itself and **broke TEN tests across three other files** while passing
-    in isolation. A reload REBINDS the module's names to NEW class objects, and every other module
-    that did `from ... import ConfinementError` at import time still holds the OLD ones — so
-    `except ConfinementError` stopped catching, and `pytest.raises` stopped matching.
-    ⚠ My "cleanup" was a second `importlib.reload` in a `finally`, which restores the NAME and not
-    the IDENTITY: it produces a THIRD set of classes, matching neither. Same class as the defect the
-    test exists for — **an identity question answered with a name.**"""
-    import importlib.util
-
-    # Load a PRIVATE copy of the module under its own name, then reload THAT COPY IN PLACE. The
-    # in-place reload is what reproduces the defect: it rebinds the copy's `_ProviderMeta` global to
-    # a NEW metaclass while `old_base` remains an instance of the OLD one — precisely the mismatch a
-    # module-global lookup gets wrong. The real `levain.firing.confinement` is never touched.
-    # ⚠ TWO INDEPENDENT COPIES DO NOT REPRODUCE IT and I checked rather than assumed: each copy has
-    # its own namespace, so the global and the base always agree and the guard fires for the wrong
-    # reason. Mutation-verified — reverting the fix to the module global fails THIS form and passed
-    # the two-copies form. **The pollution fix had destroyed the test's ability to detect the bug.**
-    src = pathlib.Path(sys.modules["levain.firing.confinement"].__file__)
-    spec = importlib.util.spec_from_file_location("_confinement_reload_probe", src)
-    assert spec and spec.loader
-    copy = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = copy
-    spec.loader.exec_module(copy)
-
-    old_base = copy.ConfinementProvider
-    # Re-exec the loader INTO THE SAME module object: that is what `importlib.reload` does, minus the
-    # finder step, which cannot resolve a synthetic module name. The copy's globals are rebound in
-    # place — a NEW `_ProviderMeta` — while `old_base` still belongs to the old one.
-    spec.loader.exec_module(copy)
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Rogue(old_base):  # type: ignore[misc,valid-type]
-            def render_profile(self, policy):
-                return ""
-
-            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-                return None
-
-            def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-                return "UNREFRESHED"
-
-    sys.modules.pop("_confinement_reload_probe", None)
-
-
-def test_a_staticmethod_wrapper_around_the_canonical_spawn_shell_is_refused() -> None:
-    """⛔ codex L3 MED round 5. `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` passes
-    a dynamic `getattr` compare — class-level access unwraps the descriptor and returns the IDENTICAL
-    function object — while at runtime it never binds `self` and raises `TypeError`, which
-    `SandboxedBashExecutor.__call__` does NOT convert into an in-band refusal. So the tool call
-    crashes instead of refusing. Fixed by checking the static MRO owner AND the descriptor type."""
-    from levain.firing.confinement import ConfinementProvider
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Sneaky(ConfinementProvider):
-            spawn_shell = staticmethod(ConfinementProvider.spawn_shell)  # type: ignore[assignment]
-
-            def render_profile(self, policy):
-                return ""
-
-            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-                return None
-
-
-# --- THE spawn_shell GUARD: EVERY CASE IN ONE TABLE -------------------------------------------
-#
-# ⛔⛔ THIS TABLE EXISTS BECAUSE THE GUARD WAS REWRITTEN FOUR TIMES AND EACH REWRITE FIXED THE POLE
-# THAT WAS BROKEN WHILE BREAKING ANOTHER — every version passed its own new test:
-#   v1 `cls.__dict__`    (a NAME)     — missed a mixin shadowing it
-#   v2 the module global (a NAME)     — missed a reload
-#   v3 `parents[0]`      (a POSITION) — FALSE-POSITIVED on multiple inheritance, breaking import
-#   v4 `cls.__mro__[1:]` (a WALK)     — missed the mixin AGAIN (root == owner == the mixin)
-# ⚡ **A single-case test cannot see an oscillation. A table can**, because every case is graded on
-# every change. Add a case here rather than adding another one-off test.
-@pytest.mark.parametrize("label,build,expected", [
-    ("normal subclass", "normal", "ACCEPT"),
-    ("direct override", "direct", "REFUSE"),
-    ("plain mixin shadowing spawn_shell", "mixin", "REFUSE"),
-    ("staticmethod wrapper", "static", "REFUSE"),
-    ("metaclass-sharing mixin without spawn_shell", "metamixin", "ACCEPT"),
-    ("descendant of a non-cooperative __init_subclass__", "rude", "REFUSE"),
-])
-def test_the_spawn_shell_guard_holds_every_case_at_once(label, build, expected) -> None:
-    from levain.firing.confinement import ConfinementProvider as CP, _ProviderMeta
-
-    def _impl(ns):
-        ns["render_profile"] = lambda self, policy: ""
-        ns["_spawn_shell_impl"] = lambda self, policy, **k: None
-        return ns
-
-    def _make():
-        if build == "normal":
-            return type("N", (CP,), _impl({}))
-        if build == "direct":
-            return type("D", (CP,), _impl({"spawn_shell": lambda self, p, **k: None}))
-        if build == "mixin":
-            shadow = type("_Shadow", (), {"spawn_shell": lambda self, p, **k: None})
-            return type("S", (shadow, CP), _impl({}))
-        if build == "static":
-            return type("T", (CP,), _impl({"spawn_shell": staticmethod(CP.spawn_shell)}))
-        if build == "metamixin":
-            mm = _ProviderMeta("_MetaMixin", (), {})
-            return type("V", (mm, CP), _impl({}))
-        if build == "rude":
-            rude = type("_Rude", (CP,), _impl(
-                {"__init_subclass__": classmethod(lambda cls, **kw: None)}))
-            return type("B", (rude,), {"spawn_shell": lambda self, p, **k: None})
-        raise AssertionError(build)
-
-    if expected == "ACCEPT":
-        _make()
-    else:
-        with pytest.raises(TypeError, match="overrides or shadows"):
-            _make()
-
-
-
-def test_a_mixin_sharing_the_metaclass_does_not_false_positive(tmp_path) -> None:
-    """⛔ complement MED + glm-5.2 HIGH round 6 — CONVERGENT on independent lineages, reproduced
-    before fixing. `root` was derived from `parents[0]`, a POSITIONAL choice, so
-    `class SSHProvider(SomeMixin, ConfinementProvider)` — where `SomeMixin` merely shares the
-    metaclass — gave `root=None` while `owner` resolved to `ConfinementProvider`, and the guard
-    raised `TypeError` for a class that overrides nothing. **A false-positive fail-closed that
-    breaks module import for a valid composition.**
-
-    ⚡⚡ Third version of this guard, third proxy for the same question: `cls.__dict__` (a NAME)
-    missed the mixin · the module global (a NAME) missed the reload · `parents[0]` (a POSITION)
-    misses multiple inheritance. `cls.__mro__[1:]` asks it directly."""
-    from levain.firing.confinement import ConfinementProvider, _ProviderMeta
-
-    class _SomeMixin(metaclass=_ProviderMeta):
-        pass
-
-    class _SSHProvider(_SomeMixin, ConfinementProvider):   # must NOT raise
-        def render_profile(self, policy):
-            return ""
-
-        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-            return None
-
-    assert _SSHProvider.spawn_shell is ConfinementProvider.spawn_shell
-
-    # ...and the guard still fires when such a composition ACTUALLY shadows it.
-    class _Shadowing:
-        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
-            return None
-
-    with pytest.raises(TypeError, match="overrides or shadows"):
-        class _Bad(_Shadowing, ConfinementProvider):
-            def render_profile(self, policy):
-                return ""
-
-            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
-                return None
