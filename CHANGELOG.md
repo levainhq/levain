@@ -66,11 +66,14 @@ enforced can be lost when the next one starts. And both of the entity's hands �
 file editor — now read **one** floor object rather than each holding its own copy, so a rule added
 for one is enforced by the other.
 
-Three rounds of review went into this; each round found something in the previous round's fix. The
-first version updated only the connect rule, which the three rules above already explain is not
-enough on its own; the second re-resolved twice and kept the earlier answer; and the guard meant to
-stop a sandbox backend from skipping the re-resolution could be sidestepped by inheriting the method
-instead of defining it. All three were caught before release, and the tests now pin each one.
+The first version of this fix updated only the connect rule, which the three rules above already
+explain is not enough on its own; the next re-resolved twice and kept the earlier answer. The guard
+meant to stop a sandbox backend from skipping the re-resolution was rewritten five times and
+sidestepped seven ways, and was ultimately **deleted rather than rewritten a sixth time** — the ways
+to shadow a method in Python are not a closed set, so enumerating them cannot terminate. What
+replaces it is structural: the re-resolution now happens in the base method itself, so a backend
+implementing the documented seam cannot receive stale rules. Each of these was caught before release
+and the tests pin them. (The single review count for this whole section is stated at its end.)
 
 **What this was, honestly: a wrong claim rather than a new hole.** A confined entity cannot create
 that symlink — the socket is write-denied at both spellings, which is one of the three rules above —
@@ -89,11 +92,18 @@ the editor. They now share one set for the length of a conversation, and a later
 inherits an earlier one's — which also means a run that should be more restricted than the last one
 actually is.
 
-Five rounds of review went into this section, and each round found something in the previous round's
-fix. The last of them found the real shape: the rules were cached per *entity*, which made "both
-hands see the same rules" and "the rules are current" pull against each other, so fixing either one
-broke the other. Caching per *conversation* removes the conflict rather than balancing it, because a
-conversation has one set of rules by definition. Everything found was caught before release.
+**Nine rounds of review went into this section, and every one of them found something in the
+previous round's fix — a rate that did not bend once.** That number is the count of the review
+rounds recorded in this repository's own commit trail for the change, not an estimate; earlier
+drafts of these notes said "three" in one place and "five" in another for the same span, and both
+understated it. Round nine ran on 2026-09-05 against an outside model
+lineage and still returned findings; one was a real resource leak on a rejected-shell path and is
+fixed here, and the others did not hold against the code as it now stands. One of the
+rounds found the real shape of the shared-rules problem: the rules were cached per *entity*, which
+made "both hands see the same rules" and "the rules are current" pull against each other, so fixing
+either one broke the other. Caching per *conversation* removes the conflict rather than balancing
+it, because a conversation has one set of rules by definition. Everything found was caught before
+release.
 
 **The re-resolution now happens before the sandbox backend is asked to start a shell**, rather than
 inside it. An earlier attempt guarded the backend against skipping that step; the guard was removed
