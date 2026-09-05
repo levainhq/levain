@@ -2248,3 +2248,95 @@ def test_a_staticmethod_wrapper_around_the_canonical_spawn_shell_is_refused() ->
 
             def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
                 return None
+
+
+# --- THE spawn_shell GUARD: EVERY CASE IN ONE TABLE -------------------------------------------
+#
+# ⛔⛔ THIS TABLE EXISTS BECAUSE THE GUARD WAS REWRITTEN FOUR TIMES AND EACH REWRITE FIXED THE POLE
+# THAT WAS BROKEN WHILE BREAKING ANOTHER — every version passed its own new test:
+#   v1 `cls.__dict__`    (a NAME)     — missed a mixin shadowing it
+#   v2 the module global (a NAME)     — missed a reload
+#   v3 `parents[0]`      (a POSITION) — FALSE-POSITIVED on multiple inheritance, breaking import
+#   v4 `cls.__mro__[1:]` (a WALK)     — missed the mixin AGAIN (root == owner == the mixin)
+# ⚡ **A single-case test cannot see an oscillation. A table can**, because every case is graded on
+# every change. Add a case here rather than adding another one-off test.
+@pytest.mark.parametrize("label,build,expected", [
+    ("normal subclass", "normal", "ACCEPT"),
+    ("direct override", "direct", "REFUSE"),
+    ("plain mixin shadowing spawn_shell", "mixin", "REFUSE"),
+    ("staticmethod wrapper", "static", "REFUSE"),
+    ("metaclass-sharing mixin without spawn_shell", "metamixin", "ACCEPT"),
+    ("descendant of a non-cooperative __init_subclass__", "rude", "REFUSE"),
+])
+def test_the_spawn_shell_guard_holds_every_case_at_once(label, build, expected) -> None:
+    from levain.firing.confinement import ConfinementProvider as CP, _ProviderMeta
+
+    def _impl(ns):
+        ns["render_profile"] = lambda self, policy: ""
+        ns["_spawn_shell_impl"] = lambda self, policy, **k: None
+        return ns
+
+    def _make():
+        if build == "normal":
+            return type("N", (CP,), _impl({}))
+        if build == "direct":
+            return type("D", (CP,), _impl({"spawn_shell": lambda self, p, **k: None}))
+        if build == "mixin":
+            shadow = type("_Shadow", (), {"spawn_shell": lambda self, p, **k: None})
+            return type("S", (shadow, CP), _impl({}))
+        if build == "static":
+            return type("T", (CP,), _impl({"spawn_shell": staticmethod(CP.spawn_shell)}))
+        if build == "metamixin":
+            mm = _ProviderMeta("_MetaMixin", (), {})
+            return type("V", (mm, CP), _impl({}))
+        if build == "rude":
+            rude = type("_Rude", (CP,), _impl(
+                {"__init_subclass__": classmethod(lambda cls, **kw: None)}))
+            return type("B", (rude,), {"spawn_shell": lambda self, p, **k: None})
+        raise AssertionError(build)
+
+    if expected == "ACCEPT":
+        _make()
+    else:
+        with pytest.raises(TypeError, match="overrides or shadows"):
+            _make()
+
+
+
+def test_a_mixin_sharing_the_metaclass_does_not_false_positive(tmp_path) -> None:
+    """⛔ complement MED + glm-5.2 HIGH round 6 — CONVERGENT on independent lineages, reproduced
+    before fixing. `root` was derived from `parents[0]`, a POSITIONAL choice, so
+    `class SSHProvider(SomeMixin, ConfinementProvider)` — where `SomeMixin` merely shares the
+    metaclass — gave `root=None` while `owner` resolved to `ConfinementProvider`, and the guard
+    raised `TypeError` for a class that overrides nothing. **A false-positive fail-closed that
+    breaks module import for a valid composition.**
+
+    ⚡⚡ Third version of this guard, third proxy for the same question: `cls.__dict__` (a NAME)
+    missed the mixin · the module global (a NAME) missed the reload · `parents[0]` (a POSITION)
+    misses multiple inheritance. `cls.__mro__[1:]` asks it directly."""
+    from levain.firing.confinement import ConfinementProvider, _ProviderMeta
+
+    class _SomeMixin(metaclass=_ProviderMeta):
+        pass
+
+    class _SSHProvider(_SomeMixin, ConfinementProvider):   # must NOT raise
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            return None
+
+    assert _SSHProvider.spawn_shell is ConfinementProvider.spawn_shell
+
+    # ...and the guard still fires when such a composition ACTUALLY shadows it.
+    class _Shadowing:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0):
+            return None
+
+    with pytest.raises(TypeError, match="overrides or shadows"):
+        class _Bad(_Shadowing, ConfinementProvider):
+            def render_profile(self, policy):
+                return ""
+
+            def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+                return None

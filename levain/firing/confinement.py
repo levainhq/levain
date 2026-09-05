@@ -1809,46 +1809,48 @@ class _ProviderMeta(ABCMeta):
         # ⚡ A class whose bases include no `_ProviderMeta` instance IS a root, by construction —
         # that is a fact about the class being created, not about what a module global happens to
         # point at right now. Same lesson as the rest of this file: ask the object, not the cache.
-        # ⛔ ANCESTRY VIA THE EXECUTING METACLASS `mcls`, NEVER THE MODULE GLOBAL (codex L3 HIGH,
-        # 2026-09-04, reproduced by me before fixing). Reading `_ProviderMeta` from module globals
-        # re-created the LOW it replaced, one level up: retain `OldProvider = ConfinementProvider`,
-        # reload the module, then subclass `OldProvider` — the old base is not an instance of the
-        # NEW `_ProviderMeta`, so `parents` came out EMPTY, the override was ACCEPTED, and the
-        # provider rendered a build-time socket policy with no refresh. `mcls` is the metaclass
-        # actually creating this class, which is the OLD one in exactly that scenario.
-        # ⚡ Third time this guard has been bypassed and every bypass had the same shape: **it asked
-        # a NAME for the identity of a CLASS.** `cls.__dict__` missed the mixin; the module global
-        # missed the reload; only the executing metaclass and the static MRO are facts about the
-        # object being created.
+        # ⛔⛔ THE CANONICAL ROOT IS CARRIED AS AN INHERITED MARKER — the FOURTH version of this
+        # guard, and the first written after enumerating every case instead of fixing whichever one
+        # was currently broken. The three before it each asked a PROXY for "who owns `spawn_shell`",
+        # and each proxy failed on a different composition:
+        #   v1 `cls.__dict__`     — a NAME.     Missed a mixin shadowing it.
+        #   v2 the module global  — a NAME.     Missed a reload (the old base is not an instance of
+        #                                       the NEW metaclass, so ancestry came out empty).
+        #   v3 `parents[0]`       — a POSITION. FALSE-POSITIVED on multiple inheritance: a mixin that
+        #                                       merely shares the metaclass made `root` None and
+        #                                       broke module import for a valid class.
+        #   v4 `cls.__mro__[1:]`  — a WALK.     Missed the mixin AGAIN, because a shadowing mixin is
+        #                                       itself in that MRO, so root == owner and it matched.
+        # ⚡ **Each fix broke a case an earlier one held. `__levain_provider_root__` is an OBJECT
+        # REFERENCE inherited down the hierarchy, so it is immune to naming (survives reload),
+        # to ordering (no `parents[0]`), and to the MRO walk (the marker names the ROOT, never
+        # whatever happens to appear first).**
         parents = [b for b in bases if isinstance(b, mcls)]
-        if parents:
-            # ⛔ STATIC MRO OWNER + DESCRIPTOR TYPE, not a dynamic `getattr` compare (codex L3 MED).
-            # `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` passes a getattr
-            # comparison — class-level access unwraps the descriptor and returns the IDENTICAL
-            # function — while at runtime it never binds `self`, raising `TypeError` instead of
-            # `ConfinementError`, which `__call__` does not convert into an in-band refusal. A
-            # custom descriptor can do the same trick deliberately. So: the first class in the MRO
-            # that DEFINES `spawn_shell` must be the canonical root, and it must hold an ordinary
-            # function.
-            # ⚠ MEASURED, AND THE HONEST NOTE IS THAT THE DESCRIPTOR CHECK IS CURRENTLY REDUNDANT:
-            # removing `isinstance(raw, types.FunctionType)` leaves the whole suite GREEN, because a
-            # `staticmethod` wrapper still puts `spawn_shell` in the subclass's own `__dict__`, so
-            # the OWNER test already refuses it. I asserted it was load-bearing; the mutation says
-            # otherwise, and that is recorded rather than quietly left standing.
-            # ▶ KEPT ANYWAY, and deliberately — same posture as the ssh anchor thirty lines of this
-            # file away: it is free, it fails CLOSED, and it stops being redundant the moment anyone
-            # relaxes the owner test. Deleting a belt from a security floor to win a tidiness
-            # argument is the wrong direction of error.
-            root = next((k for k in parents[0].__mro__ if "spawn_shell" in k.__dict__), None)
-            owner = next((k for k in cls.__mro__ if "spawn_shell" in k.__dict__), None)
-            raw = owner.__dict__.get("spawn_shell") if owner is not None else None
-            if owner is not root or not isinstance(raw, types.FunctionType):
-                raise TypeError(
-                    f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
-                    "the spawn-time socket re-resolution (spore-768) and silently render a stale "
-                    "socket floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the "
-                    "policy and delegates to it."
-                )
+        root = next(
+            (r for r in (getattr(b, "__levain_provider_root__", None) for b in parents)
+             if r is not None),
+            None,
+        )
+        if root is None:
+            # A new root hierarchy. It becomes canonical only if it actually defines `spawn_shell`;
+            # a bare mixin that merely shares the metaclass must NOT be mistaken for a provider root.
+            if "spawn_shell" in namespace:
+                cls.__levain_provider_root__ = cls
+            return cls
+        # The first class in the MRO that DEFINES `spawn_shell` must be that root, holding an
+        # ordinary function. `getattr` is not used: it unwraps descriptors, so
+        # `spawn_shell = staticmethod(ConfinementProvider.spawn_shell)` compares EQUAL while failing
+        # to bind `self` at runtime — a `TypeError` that `__call__` does not convert into an in-band
+        # refusal.
+        owner = next((k for k in cls.__mro__ if "spawn_shell" in k.__dict__), None)
+        raw = owner.__dict__.get("spawn_shell") if owner is not None else None
+        if owner is not root or not isinstance(raw, types.FunctionType):
+            raise TypeError(
+                f"{name} overrides or shadows ConfinementProvider.spawn_shell, which would skip "
+                "the spawn-time socket re-resolution (spore-768) and silently render a stale "
+                "socket floor. Implement `_spawn_shell_impl` instead — spawn_shell refreshes the "
+                "policy and delegates to it."
+            )
         return cls
 
 
