@@ -8,6 +8,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Fixed — a rejected confined shell could leak if logging the rejection failed
+
+A shell that fails the confinement check is torn down before the refusal is raised. That teardown was reached only by falling off the end of the handler that logs a failed `close()` — and a logging call is not guaranteed not to raise, since a custom handler whose `emit` raises propagates straight out of it. A broken logging handler therefore skipped the teardown entirely, leaking the subprocess, its process group, the FIFO directory and the reader thread on every rejected spawn, **and** replaced the confinement refusal with the logging error. The teardown now runs from a `finally`, so no logging failure can strand it.
+
 ## [0.4.4] — 2026-09-06
 
 **The crown-jewels confinement floor stops reporting coverage it does not have.** Three ways a path or a socket could sit outside the floor while the tooling said it was fenced: a `~user` path that threw its way past the check, a container daemon socket that defeated the floor entirely, and a listed socket resolved before the shell it fences existed. The `levain run` banner now names which sockets are covered **and which are not** — the deny is an enumeration, and an enumeration is always incomplete.
