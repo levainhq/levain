@@ -393,6 +393,58 @@ whatever is decided about D.
 
 ---
 
+## 5b. ⛔⛔ AN APPROVED, UNBUILT REDESIGN OF THIS EXACT CHECK IS 18 DAYS OVERDUE AND WOULD DELETE WHAT §6 SAYS MUST NEVER BE DELETED
+
+**Found at close, not during the analysis, and it is the single most important thing on this page
+that I nearly missed.** `spore-492` — **"LEVAIN — BUILD THE DOCTOR REDESIGN. APPROVED by Phill
+2026-08-09"** — is a Phill-approved rebuild of `_check_hook_freshness` and its helpers. It is **18
+days overdue and BUILD NOT STARTED.** Nobody had connected it to this question.
+
+**Its shape:** `install` records the winner per relpath plus the hash of the bytes it wrote; doctor
+becomes one loop over that map, deleting six things including `_hook_body` and the branch split.
+
+⛔ **AND LEVAIN'S OWN RECORD ALREADY FOUND THE COLLISION, ON 2026-08-12, IN THE BLOCK DIRECTLY ABOVE
+THE DESIGN** (`projects/levain/next.md`, the 🔴 HIGH at `:952`) [FROM THE RECORD — I read it, I did
+not re-run its reproduction]:
+
+> *"**THE REDESIGN DELETES THE ONE THING THE CHECK WAS BUILT TO DETECT.** … **An init-time receipt of
+> what init wrote can never notice the package moved.** RUN-REPRODUCED side by side on a scratch
+> install: CURRENT → `ok=False`, "installed hook script(s) differ from the package"; REDESIGNED →
+> `stale=[]` → "hook scripts match the package" — **green on an install whose hooks demonstrably
+> predate the package.**"*
+
+⚡⚡ **THAT IS THIS DOCUMENT'S SUBJECT, REACHED FOUR WEEKS EARLIER BY A DIFFERENT ROUTE.** §6 says
+*"what I would NOT do under any option: soften, downgrade, or exempt `hook freshness`."* **The
+approved redesign, as written in the spore, does exactly that — not by changing a severity, but by
+making the check structurally unable to ask the question.** Two independent analyses, one conclusion.
+
+⛔ **AND THE SECOND HALF IS WORSE AND LANDS ON PRECISELY THIS POPULATION:** the same block records
+that after the redesign **a pre-redesign lock yields an EMPTY resolved map → zero iterations →
+GREEN**, *"landing on exactly the upgrader population the check serves."* **The upgraders are who
+this whole document is about.**
+
+▶ **THE LIVE HAZARD, AND IT IS CHEAP TO CLOSE:** `spore-492`'s body says the design *"does NOT need
+re-deriving"* and points at `next.md`. **That is true, and it does not mention that its design has
+since been materially corrected by a HIGH.** A seat that trusts that line and builds from the spore
+body ships the softening. ⚠ **`a_true_statement_standing_where_a_thing_should_be`, in an approved
+work item, pointed at a live build.** The correction already exists and is reasoned — record BOTH
+maps (`files` = source hash, `rendered` = bytes written); two comparisons, two questions — so the
+fix is to make the spore carry that pointer, not to re-derive anything.
+
+⚖ **WHAT THIS MEANS FOR THE DECISION:**
+- **It is not a new option.** It is a constraint on every option: **whatever is decided here,
+  `hook freshness` must retain the ability to notice the PACKAGE moved, not merely that the DISK
+  changed.**
+- ⭐ **It also partly REFUNDS D2's cost.** §5-D3 charged D2 for needing a resolved-tree map that does
+  not exist. **`spore-492` already plans exactly that map**, corrected to two maps. If both are built,
+  the map is paid for once and serves both — which makes *"design the doctor redesign and the upgrade
+  path together"* a real option that neither `spore-492` nor this document proposed alone.
+- ⛔ **And it sharpens §7's sequencing question a third time:** the install-path pass, the upgrade
+  path, and `spore-492` all rewrite the same region of `install.py`/`doctor.py`. **Three approved-or-
+  proposed pieces of work on one surface, none aware of the others until now.**
+
+---
+
 ## 6. ▶ RECOMMENDATION (a recommendation, not a decision)
 
 **E: close the upgrade path (D), keep the CHANGELOG correction as the transitional note (A), and
