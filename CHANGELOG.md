@@ -184,7 +184,7 @@ No behaviour change; the enforcement was correct throughout and is stricter than
 
 ### Fixed — the suite has zero permanent failures for the first time
 
-Eight tests failed on every run, on any machine without the optional `mcp` and `openhands` extras, because two import sites lacked the `importorskip` guard used at a dozen others. A permanent red is indistinguishable from a real regression, which made "the suite is green" unusable as evidence. Same passing count, zero failures, and the eight now skip and say why.
+Nine tests failed on every run, on any machine without the optional `mcp` and `openhands` extras, because three sites lacked the guard used at a dozen others — seven in an unguarded `build_app` test class, two at `openhands` import sites. A permanent red is indistinguishable from a real regression, which made "the suite is green" unusable as evidence. A base install now runs the suite to zero failures, and the nine skip and say why.
 
 ### Changed — `[wrap blocked]` no longer names a shell command or a false count
 
