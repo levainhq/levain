@@ -196,8 +196,11 @@ by me — the anneal seat was stopped at ~11:00. Re-derive before building on it
 The option the measurement actually points at, and the only one that shrinks the family in §2.
 
 - **D1 — a `levain upgrade` command.** One step that re-renders the install and reconciles the set.
-  The documented path becomes `pip install -U levain && levain upgrade`; doctor goes green after it;
-  a red doctor means what it says again.
+  The documented path becomes `pip install -U levain && levain upgrade`.
+  ⚠ **"Doctor goes green after it" is the GOAL, not a property the option confers** — it holds only if
+  the command covers EVERY init-only artifact. Cover hooks and leave the carrier and the expected path
+  is still red, one release later, for a different population. That is why the carrier question below
+  is part of this option and not a follow-up.
   - *Cost:* a new CLI verb (surface growth on a product whose discipline is subtraction), and it must
     carry `init --force`'s fail-loud backup contract. Docs, operator manual, README, and the shipped
     adapter READMEs all move together.
