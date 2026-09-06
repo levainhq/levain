@@ -298,6 +298,41 @@ happening to a real operator now.
 
 ---
 
+## 6b. ⚖ THE STRONGEST CASE AGAINST §6, STATED PROPERLY BECAUSE I AM THE ONE ARGUING THE OTHER SIDE
+
+A decision document that only argues its own recommendation is a closing argument, not an aid. This is
+the position I would take if I wanted to beat §6, and **I think it is genuinely strong:**
+
+> **§1 proves the urgency away.** If doctor is telling the truth — and §1 argues exactly that — then
+> the red is *correct*, the operator is *correctly informed* by the `[Unreleased]` note, and nobody is
+> currently harmed by the exit code. What remains is that the red is **annoying and pedagogically
+> corrosive over many releases**. That is real, and it is not urgent.
+>
+> **Meanwhile §3 IS urgent and D is not what fixes it.** A patched hook is being deleted with no
+> backup, against the one named live operator. **F and D3 fix that. Neither requires deciding the
+> design question at all.**
+>
+> **And D is a substantial build on a repo one decision away from release.** `spore-840` was filed
+> as *"written down, deliberately not built"* precisely so it would not become the thing that holds
+> the cut. Choosing E makes the design question the release's dependency — which is the outcome the
+> spore was written to avoid.
+
+▶ **THE ORDER THAT POSITION IMPLIES: D3 → F → release → D as its own piece of work later.**
+
+⚖ **I do not think it beats §6 on the merits, and I do think it beats §6 on SEQUENCING — and Phill's
+own sentence ends with *"or get Levain released."*** My honest position: **§6 is the right answer to
+the question asked; the case above is the right answer to the question of what to do THIS WEEK.**
+They are not in conflict unless someone treats D as a release blocker, and **nothing here should.**
+
+⛔ **What would change my mind about §6 itself** (as opposed to its timing): evidence that operators
+DO read `$?` — i.e. that anyone has scripted `levain doctor` into a pipeline where a maintenance-
+pending exit would misfire. That would make Option C load-bearing rather than cosmetic, and I have
+no such evidence either way. **The README ships the pipeline promise (`README.md:113`), so the
+capability is advertised; whether it is used is unmeasured, and Alex is the only person who could
+answer it.**
+
+---
+
 ## 7. ⚖ WHAT NEEDS PHILL
 
 1. **D or not-D**, and if D, **D1 (new verb) or D2 (fold into `update`)**. This is a product-surface
