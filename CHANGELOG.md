@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+
 ## [0.4.4] — 2026-09-06
 
 **The crown-jewels confinement floor stops reporting coverage it does not have.** Three ways a path or a socket could sit outside the floor while the tooling said it was fenced: a `~user` path that threw its way past the check, a container daemon socket that defeated the floor entirely, and a listed socket resolved before the shell it fences existed. The `levain run` banner now names which sockets are covered **and which are not** — the deny is an enumeration, and an enumeration is always incomplete.
