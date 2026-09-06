@@ -8,6 +8,46 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+**`levain init --force` is the command our own upgrade instructions tell you to run, and in 0.4.4 it deleted operator edits to the activation tree without a backup and without a word.** It copied aside exactly two files — `posture.md` and `recency_directives.md` — while replacing everything else, so a patched hook script was destroyed on the documented upgrade path. That happened to a real operator.
+
+This release widens what survives that command, and corrects the operator-facing messages that described a system slightly better-behaved than the one we shipped.
+
+### Changed — `init --force` now preserves everything under `activation/` it cannot rebuild, not two filenames
+
+Anything at `activation/` whose bytes this install cannot reproduce — because you edited it, or because no layer provides it any more — is copied to `.levain/backups/activation/<timestamp>/`, keeping its relative path, **before** the tree is replaced. Hooks included. Files you added yourself included.
+
+Membership is decided by whether the bytes are reproducible, never by filename, so this does not need updating when the tree gains a file.
+
+⚠ **It preserves; it does not always announce.** Where a difference is one `init` itself wrote — the `_INSTALL_ANNEAL_BIN` line, which is re-resolved on every run — the copy is still made but no "operator-edited" notice is printed, because an edit of your own confined to that same line is indistinguishable from our substitution. If that copy cannot be made, `init` says so and names the file rather than continuing silently. **Where the difference is one we cannot explain, `init` refuses rather than overwrite it.**
+
+⛔ **Stated exception: symlinks are not handled.** A symlink to a directory inside `activation/` is never examined and is removed with the tree; a symlink to a file is compared by its target's contents and replaced by a regular file. Neither is backed up. If you have symlinked anything under `activation/`, copy it aside yourself before upgrading.
+
+### Fixed — `doctor` told you what `init --force` keeps, and left out what it does not
+
+Two checks — `hook freshness` and the carrier check (`CLAUDE.md freshness` on a Claude Code install, `AGENTS.md freshness` on Codex) — ended their advice with a list of what survives the re-render. Every item was true, and the list read as complete: it named your store, your seed answers and your activation markdown edits, and did not mention that the whole `activation/` tree is rewritten or that the interview runs again.
+
+Both now say the interview re-runs, say the tree is rewritten, and name where edits are copied. **The "seed answers are kept" clause is gone because it was false** — `init --force` starts the interview with no answers pre-filled and clears the saved checkpoint, so working through it accepts new answers over your recorded ones.
+
+### Fixed — a hook you had not touched could be reported as operator-edited
+
+`init` resolves the `anneal-memory` binary on the `PATH` fresh on every run and writes the result into the hook. Running `init --force` from a shell that resolves it differently — a virtualenv versus a plain login shell is enough — changed those bytes with no involvement from you, and the new backup then reported the hook as an operator edit.
+
+It also recurred: each run wrote its own resolution in, so alternating between two shells re-triggered it indefinitely, and on an install whose backup directory was not writable it turned a routine re-install into a refusal.
+
+Hook scripts are now compared with that one substituted line normalised out, so only differences we did not write are reported.
+
+### Fixed — `init --adapter codex` repointed Codex's machine-wide memory without saying so
+
+The `[mcp_servers.anneal_memory]` block in `~/.codex/config.toml` is global by design: it is what every Codex session on the machine reads, not just the install you ran `init` from. Replacing it was silent and left no copy, so running `init` against a second install — or a scratch directory — moved every Codex session onto that install's store with nothing printed.
+
+`init` now names the store it is leaving and the store it is adopting, says the registration is machine-wide, and copies `config.toml` aside first. It still performs the repoint, because pointing Codex at a different install is a legitimate thing to want and is the documented way to undo this. Re-running against the store already registered stays silent.
+
+The config file is now written atomically and the notice is printed only once the write has landed.
+
+### Known issue — an install path containing `\`, `"` or a newline produces an unparseable Codex config
+
+Not new in this release and not introduced by it. `init --adapter codex` substitutes the install path into `config.toml` without escaping it for TOML, so those characters produce a file that is **not valid TOML** — a backslash is an escape introducer inside a basic string and a quote ends it early. What Codex does with a config it cannot parse is its business and we have not measured it; what we can say is that levain wrote the file wrong. All three characters are legal in POSIX paths and all three are rare. Avoid them in an install path until this is fixed.
+
 ### Correction to 0.4.4's upgrade note — a normal upgrade leaves `doctor` red, and 0.4.4 did not say so
 
 ⛔ **`pip install -U levain` to 0.4.4 leaves `levain doctor` at exit 1 with two failures, for every operator, on the correct upgrade path.** Measured against the published wheels — 0.4.3 and 0.4.4 installed side by side in clean virtualenvs, upgraded the way an operator upgrades:
@@ -21,7 +61,7 @@ Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the release
 
 **Both failures are correct, and neither check is new.** 0.4.3 carries both and passes them (`hook scripts match the package`, `levain 0.4.3 (matches last composed)`). They turn red *because the version moved* — the hook scripts on disk were rendered by the previous release's templates, and the compatibility set was composed against the previous release. **Nothing is broken.** The remedies are the two commands the failures already name:
 
-- `levain init --force --path <install>` — re-renders the activation tree (your store, seed answers and edits to `posture.md` / `recency_directives.md` are preserved);
+- `levain init --force --path <install>` — re-renders the activation tree. ⚠ **It re-runs the interview**, and anything you have edited under `activation/` is copied to `.levain/backups/activation/<timestamp>/` first (see *Changed* below; in 0.4.4 that backup covered only `posture.md` and `recency_directives.md`). Your store is untouched;
 - `levain update` — reconciles the anneal + schema + migration set to the new known-good.
 
 ⚠ **What 0.4.4's own `Upgrading` note got wrong**, and it is why this correction exists: it says to run `doctor` after upgrading and then warns about exactly ONE possible new failure — `activation scope` — which only affects operators whose hooks are wired at the user level. It presents `levain init --force` as what you need *additionally*, for three named features, rather than as a required step. **An operator who follows it exactly is prepared for one specific failure and receives two different ones.** That section is left as published; this entry is the correction.
