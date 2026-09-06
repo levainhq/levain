@@ -23,6 +23,7 @@ from levain.install import (
     _clear_checkpoint,
     _compose_activation_layers,
     _copy_activation_tree,
+    _same_contents,
     _behavior_note_lines,
     _fill_seed_imports,
     _fill_seed_on_demand,
@@ -1857,6 +1858,48 @@ def test_copy_activation_patched_hook_still_caught_under_substitution(tmp_path: 
         [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory"
     )
     assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unreadable-dir permission")
+def test_copy_activation_unscannable_dir_REFUSES_instead_of_destroying(tmp_path: Path):
+    """⛔ `Path.rglob` SILENTLY SWALLOWS SCAN ERRORS — measured: an unreadable
+    subdirectory simply does not appear in the results. Enumerating with it meant a
+    file we could not scan was never backed up AND the swap proceeded anyway,
+    destroying it with no backup and no warning. That is the precise contract this
+    backup exists to hold, defeated by the traversal chosen to implement it.
+
+    MUTATION CONTROL: revert the enumeration to `dst.rglob("*")` and this test fails
+    — no InitError is raised and the operator's file is gone."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {"posture.md": "P\n", "private/notes.md": "OPERATOR CONTENT\n"})
+    locked = dst / "private"
+    os.chmod(locked, 0o000)
+    try:
+        with pytest.raises(InitError, match="could not scan"):
+            _copy_activation_tree([base], dst, base_activation=base)
+    finally:
+        os.chmod(locked, 0o755)
+    # Refused BEFORE the cutover — the operator's unreadable content still exists.
+    assert (dst / "private" / "notes.md").read_text(encoding="utf-8") == "OPERATOR CONTENT\n"
+
+
+def test_same_contents_is_bounded_and_correct_across_chunk_boundaries(tmp_path: Path):
+    """The comparison must be correct AND never allocate a whole file. Correctness
+    is the part a test can pin: equal-but-large, differing only in the final byte
+    (so a chunked loop must reach the tail), and a pure size mismatch (which must
+    short-circuit before any read)."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    big = b"\xa5" * (1 << 17) + b"tail"          # 2 chunks + remainder
+    a.write_bytes(big); b.write_bytes(big)
+    assert _same_contents(a, b) is True
+    b.write_bytes(big[:-1] + b"X")                # same size, differs at the very end
+    assert _same_contents(a, b) is False
+    b.write_bytes(big + b"!")                     # size mismatch
+    assert _same_contents(a, b) is False
+    a.write_bytes(b""); b.write_bytes(b"")        # both empty
+    assert _same_contents(a, b) is True
 
 
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):

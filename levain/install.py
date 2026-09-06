@@ -1608,6 +1608,25 @@ def _activation_excluded(rel: Path) -> bool:
     )
 
 
+def _same_contents(a: Path, b: Path, *, chunk: int = 1 << 16) -> bool:
+    """Whether two files hold identical bytes, compared in BOUNDED chunks.
+
+    ⛔ Never loads a whole file. An operator can put an artifact of any size in the
+    activation tree, and deciding whether to back it up must not OOM the install:
+    `read_bytes()` on both sides allocates BOTH files at once. Size is checked
+    first, which settles the common case without reading anything.
+    """
+    if a.stat().st_size != b.stat().st_size:
+        return False
+    with a.open("rb") as fa, b.open("rb") as fb:
+        while True:
+            block = fa.read(chunk)
+            if block != fb.read(chunk):
+                return False
+            if not block:
+                return True
+
+
 def _compose_activation_layers(layer_roots: Sequence[Path]) -> dict[str, Path]:
     """Compose an ordered STACK of activation-tree roots into one
     ``{relative_posix_path: winning_source_path}`` map.
@@ -1786,7 +1805,26 @@ def _copy_activation_tree(
             except OSError:
                 backup_staging = None  # can't stage — see the fail-loud guard below
 
-            for current in sorted(dst.rglob("*")):
+            # ⛔ NOT `dst.rglob("*")`: pathlib SILENTLY SWALLOWS scan errors —
+            # MEASURED on this interpreter, an unreadable subdirectory simply does
+            # not appear in the results. A file we cannot enumerate would then be
+            # destroyed by the swap with no backup and no warning, which is the
+            # exact contract this backup exists to hold. `os.walk` with a raising
+            # `onerror` turns an unscannable directory into a refusal BEFORE the
+            # cutover. Found by codex at L3 round 2.
+            def _scan_failed(err: OSError) -> None:
+                raise InitError(
+                    f"could not scan {err.filename} for operator edits before "
+                    f"replacing the activation tree ({err}). Refusing to destroy "
+                    f"files that cannot be enumerated; resolve the error and re-run."
+                ) from err
+
+            current_files: list[Path] = []
+            for walk_root, walk_dirs, walk_files in os.walk(dst, onerror=_scan_failed):
+                walk_dirs.sort()
+                current_files.extend(Path(walk_root) / f for f in sorted(walk_files))
+
+            for current in current_files:
                 if not current.is_file():
                     continue
                 rel = current.relative_to(dst)
@@ -1797,25 +1835,27 @@ def _copy_activation_tree(
                 name = rel.as_posix()
                 staged = new_tree / rel
                 # Survives byte-identically? A missing staged file means nothing
-                # provides it → the swap DELETES it → always preserve, and we never
-                # read it: `copy2` streams, so an operator-added artifact of any size
-                # costs no memory here. Only the compare path reads (codex L3 MED —
-                # the widened traversal must not pull arbitrary files into memory).
+                # provides it → the swap DELETES it → always preserve, and it is
+                # never read at all (`copy2` streams). When there IS a counterpart,
+                # `_same_contents` compares in bounded chunks after a size check.
+                # ⚠ This comment previously claimed reads were bounded while the
+                # code beside it called `read_bytes()` on BOTH sides — caught by glm
+                # and codex at L3 round 2. A comment asserting a property the
+                # adjacent code lacks is the class this apparatus exists to catch,
+                # and it was written in the act of fixing that class.
                 if staged.is_file():
                     try:
-                        current_bytes = current.read_bytes()
-                    except OSError as e:
-                        # About to replace it but can't inspect it — don't destroy blind.
-                        raise InitError(
-                            f"could not read {current} to check for operator edits before "
-                            f"replacing the activation tree ({e}). Refusing to overwrite a "
-                            f"possibly-edited file; resolve the read error and re-run."
-                        ) from e
-                    try:
-                        if current_bytes == staged.read_bytes():
+                        if _same_contents(current, staged):
                             continue
-                    except OSError:
-                        pass  # can't read the staged result → preserve the current bytes
+                    except OSError as e:
+                        # About to replace it and can't compare it — don't destroy
+                        # blind. A failure on either side is equally a reason to keep
+                        # the operator's bytes, so this refuses rather than guessing.
+                        raise InitError(
+                            f"could not compare {current} against its replacement to "
+                            f"check for operator edits ({e}). Refusing to overwrite a "
+                            f"possibly-edited file; resolve the error and re-run."
+                        ) from e
                 # About to be overwritten or deleted, and these bytes are not
                 # reproducible from the install — so they are the operator's.
                 if backup_staging is None:
