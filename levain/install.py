@@ -1758,7 +1758,14 @@ def _copy_activation_tree(
     `levain doctor`'s job; here we guard that base is a real, non-empty source —
     BEFORE any destructive write.
 
-    On a re-install, EVERY file present at `dst` whose content will NOT survive
+    ⚠ SYMLINKS ARE THE STATED EXCEPTION, and it is stated because a reviewer showed
+    the sentence below was broader than the code. `os.walk` does not follow directory
+    symlinks, so a symlink-to-a-directory inside `dst` is never enumerated, never
+    compared, never copied — and the swap unlinks it with no notice. A FILE symlink is
+    followed by `is_file()`, so it is compared by TARGET CONTENT and silently replaced
+    by a regular file. Neither is handled; both are routed (spore-860), not claimed.
+
+    On a re-install, every REGULAR file present at `dst` whose content will NOT survive
     byte-identically — it differs from the bytes about to be written, OR nothing
     provides it (so the swap would delete it) — is backed up OUTSIDE the dst tree
     (`<install>/.levain/backups/activation/<timestamp>/`, preserving relative
@@ -1964,7 +1971,18 @@ def _copy_activation_tree(
                         staging_failed = True  # see the fail-loud guard below
                 if backup_staging is None:
                     if not notify:
-                        continue  # best-effort copy — never block a pristine reinstall
+                        # Best-effort: never block a pristine reinstall — but SAY SO.
+                        # A silent skip here would lose an edit confined to the
+                        # substituted line with no trace at all, which is the failure
+                        # mode of "act safely, stay quiet". The copy is allowed to
+                        # fail; the SILENCE is not.
+                        emit(
+                            f"  note: could not stage a copy of {name} (backup dir under "
+                            f"{dst.parent / '.levain' / 'backups'} could not be created). "
+                            f"Proceeding — but if you had edited that file, the edit is "
+                            f"not recoverable."
+                        )
+                        continue
                     raise InitError(
                         f"operator-edited {name} would be replaced by this re-install, "
                         f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
@@ -1977,7 +1995,12 @@ def _copy_activation_tree(
                     shutil.copy2(current, bak)
                 except OSError as e:
                     if not notify:
-                        continue  # best-effort copy — never block a pristine reinstall
+                        emit(
+                            f"  note: could not stage a copy of {name} ({e}). Proceeding "
+                            f"— but if you had edited that file, the edit is not "
+                            f"recoverable."
+                        )
+                        continue
                     raise InitError(
                         f"operator-edited {name} could not be backed up to {bak} ({e}). "
                         f"Refusing to overwrite your edit; back {current} up yourself and "
@@ -2077,10 +2100,19 @@ def _codex_block_store(block: str) -> str | None:
     args = server.get("args")
     if not isinstance(args, list):
         return None
-    for i, arg in enumerate(args[:-1]):
-        if arg == "--db" and isinstance(args[i + 1], str):
-            return args[i + 1]
-    return None
+    # ARGV SEMANTICS, NOT FIRST-MATCH. anneal-memory parses these with argparse, so a
+    # repeated flag means the LAST one wins — returning the first would name a store
+    # the server is not using and skip the warning for a real repoint. Both spellings
+    # are accepted on a command line, so both are read here. codex L3 MED.
+    store: str | None = None
+    for i, arg in enumerate(args):
+        if not isinstance(arg, str):
+            continue
+        if arg == "--db" and i + 1 < len(args) and isinstance(args[i + 1], str):
+            store = args[i + 1]
+        elif arg.startswith("--db="):
+            store = arg[len("--db="):]
+    return store
 
 
 def _merge_codex_config(
@@ -2124,19 +2156,23 @@ def _merge_codex_config(
 
     new_block = new_block_match.group(0).rstrip() + "\n"
 
+    repoint: tuple[str, str, Path] | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
         old_store = _codex_block_store(old_block_match.group(0))
         new_store = _codex_block_store(new_block)
         if old_store and new_store and old_store != new_store:
             bak = _timestamped_backup_path(path)
-            shutil.copy2(path, bak)
-            emit(f"  ! Codex's GLOBAL anneal memory was pointed at {old_store}")
-            emit(f"    and now points at {new_store}.")
-            emit(f"    {path} backed up to {bak}")
-            emit("    (Every codex session on this machine reads that store, not")
-            emit("     just this install. Re-run init from the install you want it")
-            emit("     reading if this was not what you meant.)")
+            try:
+                shutil.copy2(path, bak)
+            except OSError as e:
+                raise InitError(
+                    f"could not back up {path} ({e}) before repointing Codex's global "
+                    f"anneal memory from {old_store} to {new_store}. Refusing to repoint "
+                    f"the machine-wide registration without a copy; fix the permissions "
+                    f"and re-run."
+                ) from e
+            repoint = (old_store, new_store, bak)
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2147,7 +2183,31 @@ def _merge_codex_config(
             existing += "\n"
         existing += new_block
 
-    path.write_text(existing, encoding="utf-8")
+    # ATOMIC, and announced only AFTER it lands. A partial `write_text` can truncate
+    # the operator's whole global codex config, and announcing "now points at X"
+    # before the write means a failure leaves a notice describing a repoint that
+    # never happened — a true-sounding statement about a world that does not exist.
+    # codex L3 MED + glm L3 MED, convergent.
+    tmp = path.with_name(f"{path.name}.levain-new-{time.time_ns()}")
+    try:
+        tmp.write_text(existing, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        raise InitError(
+            f"could not write {path} ({e}). Codex's registration is unchanged"
+            + (f"; your previous config is also copied at {repoint[2]}." if repoint
+               else ".")
+        ) from e
+
+    if repoint:
+        old_store, new_store, bak = repoint
+        emit(f"  ! Codex's GLOBAL anneal memory was pointed at {old_store}")
+        emit(f"    and now points at {new_store}.")
+        emit(f"    {path} backed up to {bak}")
+        emit("    (Every codex session on this machine reads that store, not")
+        emit("     just this install. Re-run init from the install you want it")
+        emit("     reading if this was not what you meant.)")
 
 
 def _run_anneal_cmd(
