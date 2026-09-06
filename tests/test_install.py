@@ -1807,6 +1807,58 @@ def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
     assert bak.read_text(encoding="utf-8") == "OPERATOR PATCHED HOOK\n"
 
 
+def test_copy_activation_pristine_substituted_hook_is_NOT_backed_up(tmp_path: Path):
+    """⛔ THE REGRESSION WIDENING THE SCOPE NEARLY SHIPPED. Install substitutes
+    `{{ANNEAL_MEMORY}}` into hooks, so the INSTALLED hook never equals its package
+    SOURCE. While the backup covered only two placeholder-free markdown files this
+    was latent; covering hooks made it live, and it would have reported the pristine
+    `_levain_hook.py` as operator-edited on EVERY re-install — spurious noise on
+    exactly the file class the backup exists for, training operators to ignore the
+    one warning that matters. Found by codex + complement at L3.
+
+    MUTATION CONTROL: fails if the comparison is moved back to the composed source.
+    """
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": 'BIN = "{{ANNEAL_MEMORY}}"\n',   # unsubstituted source
+    })
+    install = tmp_path / "install"
+    dst = install / "activation"
+    # A PRISTINE previous install: the placeholder is already resolved on disk.
+    _mk_layer(dst, {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": 'BIN = "/usr/local/bin/anneal-memory"\n',
+    })
+    _copy_activation_tree(
+        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory"
+    )
+    assert _backed_up_files(install) == [], (
+        "a pristine substituted hook is not an operator edit — compare against the "
+        "STAGED bytes, not the composed source")
+    # And the substitution still actually happened.
+    assert "/usr/local/bin/anneal-memory" in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+
+
+def test_copy_activation_patched_hook_still_caught_under_substitution(tmp_path: Path):
+    """The other half, and what makes the fix a correction rather than a mute button:
+    a REAL patch to a placeholder-bearing hook must still be caught once the
+    comparison moves to the staged bytes."""
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": 'BIN = "{{ANNEAL_MEMORY}}"\n',
+    })
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": 'BIN = "/usr/local/bin/anneal-memory"\n# operator patch\n',
+    })
+    _copy_activation_tree(
+        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory"
+    )
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+
+
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):
     """A file the OPERATOR added anywhere in the tree (no layer provides it → rmtree
     DELETES it) is preserved. Unambiguous: it cannot be a pristine package file."""
