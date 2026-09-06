@@ -22,8 +22,10 @@ from levain.install import (
     _checkpoint_path,
     _clear_checkpoint,
     _compose_activation_layers,
+    _codex_block_store,
     _copy_activation_tree,
     _is_hook_script,
+    _merge_codex_config,
     _same_contents,
     _behavior_note_lines,
     _fill_seed_imports,
@@ -1975,6 +1977,70 @@ def test_the_normalisation_is_scoped_to_hook_scripts_only(tmp_path: Path):
     _mk_layer(dst, {"posture.md": '_INSTALL_ANNEAL_BIN = "/opt/a/anneal-memory"\n'})
     _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
     assert _backed_up_files(install) == ["posture.md"]
+
+
+def _codex_cfg(store: str) -> str:
+    return (
+        '[mcp_servers.anneal_memory]\n'
+        'command = "/usr/local/bin/anneal-memory"\n'
+        'args = ["--db", "%s", "serve"]\n' % store
+    )
+
+
+def test_repointing_codex_to_a_DIFFERENT_store_warns_and_backs_up(tmp_path: Path):
+    """⛔ THE CODEX MCP REGISTRATION IS GLOBAL BY DESIGN, so replacing this block
+    repoints EVERY codex session on the machine. It used to happen SILENTLY: on
+    2026-09-04 an install against a temp entity dir (a manual e2e that isolated the
+    entity but not CODEX_HOME) left every codex invocation reading a 4KB throwaway
+    fixture for hours. A reviewer consulting memory got nothing and would read
+    nothing as "not known" — absence_of_signal_rendered_as_health, inside the
+    shared review apparatus.
+
+    ⚡ `hooks.json`, written eight lines up in the SAME directory, has always been
+    backed up and announced. `config.toml` — larger, shared, global — was not.
+    Same defect as `init --force` eating a patched hook: our own procedure destroys
+    operator state without saying so."""
+    path = tmp_path / "config.toml"
+    path.write_text("[other]\nkeep = true\n\n" + _codex_cfg("/home/op/real/memory.db"), encoding="utf-8")
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/tmp/throwaway/memory.db"), emit=said.append)
+
+    blob = "\n".join(said)
+    assert "/home/op/real/memory.db" in blob, "the store being LEFT must be named"
+    assert "/tmp/throwaway/memory.db" in blob, "the store being ADOPTED must be named"
+    assert "GLOBAL" in blob, "the operator must learn this is machine-wide"
+
+    baks = list(tmp_path.glob("config.toml.bak.*"))
+    assert len(baks) == 1, "the previous config must be recoverable"
+    assert "/home/op/real/memory.db" in baks[0].read_text(encoding="utf-8")
+    # It WARNS, it does not refuse — repointing is the documented repair for this
+    # very defect, so refusing would block the fix for the problem it guards.
+    assert "/tmp/throwaway/memory.db" in path.read_text(encoding="utf-8")
+    assert "keep = true" in path.read_text(encoding="utf-8"), "unrelated config preserved"
+
+
+def test_reinstalling_the_SAME_store_is_silent_and_makes_no_backup(tmp_path: Path):
+    """Idempotent re-runs are the common path. Announcing and copying on every
+    `levain init --adapter codex` would accrete backups and train the operator to
+    ignore the notice that matters."""
+    path = tmp_path / "config.toml"
+    path.write_text(_codex_cfg("/home/op/real/memory.db"), encoding="utf-8")
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/home/op/real/memory.db"), emit=said.append)
+    assert said == []
+    assert list(tmp_path.glob("config.toml.bak.*")) == []
+
+
+def test_a_store_path_with_a_backslash_cannot_corrupt_the_config(tmp_path: Path):
+    """`re.sub` interprets backslash escapes in its REPLACEMENT. The block being
+    written is DATA, not a template, so a store path containing `\\g` or `\\1` would
+    have been read as a group reference and mangled the file (or raised). Latent —
+    backslashes are legal but rare in POSIX paths — and free to close while here."""
+    path = tmp_path / "config.toml"
+    path.write_text(_codex_cfg("/home/op/old.db"), encoding="utf-8")
+    weird = "/home/op/we\\g<1>ird/memory.db"
+    _merge_codex_config(path, _codex_cfg(weird), emit=lambda _m: None)
+    assert _codex_block_store(path.read_text(encoding="utf-8")) == weird
 
 
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):
