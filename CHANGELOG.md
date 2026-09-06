@@ -8,6 +8,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Correction to 0.4.4's upgrade note — a normal upgrade leaves `doctor` red, and 0.4.4 did not say so
+
+⛔ **`pip install -U levain` to 0.4.4 leaves `levain doctor` at exit 1 with two failures, for every operator, on the correct upgrade path.** Measured against the published wheels — 0.4.3 and 0.4.4 installed side by side in clean virtualenvs, upgraded the way an operator upgrades:
+
+```
+0.4.3   All checks passed.                                                    exit 0
+0.4.4   [FAIL] hook freshness: installed hook script(s) differ from the package
+        [FAIL] compat: levain: levain upgraded 0.4.3 -> 0.4.4 since the set was last composed
+                                                                              exit 1
+```
+
+**Both failures are correct, and neither check is new.** 0.4.3 carries both and passes them (`hook scripts match the package`, `levain 0.4.3 (matches last composed)`). They turn red *because the version moved* — the hook scripts on disk were rendered by the previous release's templates, and the compatibility set was composed against the previous release. **Nothing is broken.** The remedies are the two commands the failures already name:
+
+- `levain init --force --path <install>` — re-renders the activation tree (your store, seed answers and edits to `posture.md` / `recency_directives.md` are preserved);
+- `levain update` — reconciles the anneal + schema + migration set to the new known-good.
+
+⚠ **What 0.4.4's own `Upgrading` note got wrong**, and it is why this correction exists: it says to run `doctor` after upgrading and then warns about exactly ONE possible new failure — `activation scope` — which only affects operators whose hooks are wired at the user level. It presents `levain init --force` as what you need *additionally*, for three named features, rather than as a required step. **An operator who follows it exactly is prepared for one specific failure and receives two different ones.** That section is left as published; this entry is the correction.
+
+⚠ Measured upgrading **from 0.4.3**. The mechanism is version movement rather than anything specific to 0.4.3, so earlier versions are expected to behave the same way — that expectation is reasoning, not a measurement.
+
+▶ **The design question underneath this is open and deliberately not answered here:** `doctor` exits 1 identically for *"something is broken"* and for *"a routine post-upgrade step is pending."* An instrument that goes red on the expected path teaches its operator to discount it, which is expensive for the one tool we ask operators to trust when something genuinely is wrong.
+
 ### Fixed — a rejected confined shell could leak if logging the rejection failed
 
 A shell that fails the confinement check is torn down before the refusal is raised. That teardown was reached only by falling off the end of the handler that logs a failed `close()` — and a logging call is not guaranteed not to raise, since a custom handler whose `emit` raises propagates straight out of it. A broken logging handler therefore skipped the teardown entirely, leaking the subprocess, its process group, the FIFO directory and the reader thread on every rejected spawn, **and** replaced the confinement refusal with the logging error. The teardown now runs from a `finally`, so no logging failure can strand it.
