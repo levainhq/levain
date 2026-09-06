@@ -2005,6 +2005,84 @@ def test_a_pristine_reinstall_is_never_BLOCKED_by_an_unwritable_backup_dir(tmp_p
     assert '"/usr/local/bin/anneal-memory"' in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unwritable-dir permission")
+def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
+    """⛔ codex L3 HIGH + complement L3 LOW, convergent — and the failure mode I had
+    just described in the abstract while shipping it in the concrete.
+
+    "Preserve always, claim only when sure" put the copy on the unconditional path,
+    but the copy can still FAIL. The branch then did a bare `continue`: the operator's
+    edit was neither preserved NOR reported. Silence is the defect, not the failure —
+    a safe branch that can fail must leave a trace, or a weak heuristic runs forever
+    with nothing to indict it."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+
+    hook = dst / "hooks" / "_levain_hook.py"
+    hook.write_text('X = 1\n_INSTALL_ANNEAL_BIN = "/home/op/bin/my-wrapper"\n', encoding="utf-8")
+    backups_root = install / ".levain" / "backups" / "activation"
+    backups_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(backups_root, 0o500)
+    said: list[str] = []
+    try:
+        _copy_activation_tree([base], dst, base_activation=base,
+                              anneal_path="/opt/a/anneal-memory", emit=said.append)
+    finally:
+        os.chmod(backups_root, 0o700)
+
+    blob = "\n".join(said)
+    assert "could not stage a copy" in blob, "a failed preservation must be announced"
+    assert "not recoverable" in blob, "and must say what it costs the operator"
+    # Still not a refusal — a pristine reinstall is not blocked.
+    assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
+
+
+def test_codex_store_uses_ARGV_semantics_last_wins_and_both_spellings(tmp_path: Path):
+    """codex L3 MED. anneal-memory parses these with argparse, so a repeated `--db`
+    means the LAST one is what the server actually reads. Returning the first names a
+    store nobody is using and skips the warning for a real repoint. `--db=X` is equally
+    valid on a command line and returned None."""
+    last_wins = ("[mcp_servers.anneal_memory]\n"
+                 'args = ["--db", "/decoy.db", "--db", "/actually-used.db", "serve"]\n')
+    assert _codex_block_store(last_wins) == "/actually-used.db"
+
+    equals_form = ("[mcp_servers.anneal_memory]\n"
+                   'args = ["--db=/via-equals.db", "serve"]\n')
+    assert _codex_block_store(equals_form) == "/via-equals.db"
+
+
+def test_the_repoint_notice_is_emitted_only_AFTER_the_write_lands(tmp_path: Path):
+    """codex L3 MED + glm L3 MED, convergent. The notice said "now points at X" BEFORE
+    `write_text`, so a failed write left a notice describing a repoint that never
+    happened — a true-sounding statement about a world that does not exist. And an
+    un-caught OSError escaped as a raw traceback, bypassing the partial-state report.
+
+    Now: atomic temp-file + os.replace, InitError on failure, notice only on success."""
+    path = tmp_path / "config.toml"
+    path.write_text(_codex_cfg("/home/op/real.db"), encoding="utf-8")
+    said: list[str] = []
+
+    import levain.install as inst
+    real_replace = inst.os.replace
+
+    def boom(src, dstp):
+        raise OSError(28, "No space left on device")
+
+    inst.os.replace = boom
+    try:
+        with pytest.raises(InitError, match="could not write"):
+            _merge_codex_config(path, _codex_cfg("/tmp/new.db"), emit=said.append)
+    finally:
+        inst.os.replace = real_replace
+
+    assert not [m for m in said if "now points at" in m], (
+        "a repoint that did not happen must not be announced")
+    assert "/home/op/real.db" in path.read_text(encoding="utf-8"), "config untouched"
+    assert not list(tmp_path.glob("config.toml.levain-new-*")), "temp file cleaned up"
+
+
 def test_codex_store_is_read_from_TOML_not_from_quote_matching(tmp_path: Path):
     """codex L3 MED. `args = ['--db', '/real/store.db', 'serve']` is valid TOML using
     literal strings. A regex keyed to `"` returns None for it — so the warning and the
