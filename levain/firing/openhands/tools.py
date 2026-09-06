@@ -167,6 +167,23 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
 
 
 
+def _log_never_raises(msg: str) -> None:
+    """``_log.exception(msg)`` that cannot propagate — for use inside teardown paths.
+
+    ⛔ A LOGGING CALL IS NOT A SAFE STATEMENT. `logging.Handler.emit` implementations are expected
+    to route their own failures through `handleError` (which prints and swallows), but that is a
+    convention of the stdlib handlers, not a guarantee of the interface: a custom handler whose
+    `emit` raises directly propagates out of `_log.exception`. Anywhere a log call sits between a
+    failure and the cleanup for that failure, it is a second failure point that can strand the
+    cleanup — which is precisely how `_close_candidate_shell` could leak a rejected shell while
+    reporting that it was falling back.
+    """
+    try:
+        _log.exception(msg)
+    except BaseException:  # noqa: BLE001 — a teardown path may never be replaced by its own logging
+        pass
+
+
 def _close_candidate_shell(candidate: SandboxedShell) -> None:
     """Tear down a rejected shell without ever letting the teardown replace the refusal.
 
@@ -193,17 +210,36 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     # subprocess, its process group, the FIFO dir and the reader thread on every rejected spawn.
     # The fallback covered overrides that raise and not overrides that lie, and the docstring
     # above already conceded that narrowness rather than fixing it.
-    # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: `SandboxedShell.close` is
-    # "Idempotent, never raises" — read at confinement.py:1694, where every resource is nulled
-    # behind a None-guard, so the second call is a no-op when the override did its job.
+    # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: read `SandboxedShell.close` in
+    # confinement.py — it is "Idempotent, never raises", sets `_closed` first and nulls every
+    # resource behind a None-guard, so the second call is a no-op when the override did its job.
+    # ⛔ CITE THE SYMBOL, NOT THE LINE (Diogenes LOW, 2026-09-06). This said "read at
+    # confinement.py:1694" and was EXACT when written — the next commit, six minutes later, added
+    # nine lines to `crown_jewel_reason` above it and :1694 became a blank line while the real
+    # definition moved to :1703. A symbol survives an insertion above it; a line number is
+    # invalidated by any edit anywhere earlier in the file.
+    #
+    # ⛔⛔ THE BASE TEARDOWN IS IN A `finally` — codex L3 round 10, 2026-09-06, and it is THIS
+    # RELEASE'S OWN CLASS ARRIVING ONE LAYER UP. Round 9 removed a `return` so the base path could
+    # not be skipped by an override that lies. But the base path was still reached only by falling
+    # off the end of the `except` below, and `_log.exception` IS NOT GUARANTEED NOT TO RAISE: a
+    # custom handler whose `emit` raises without routing through `handleError` propagates straight
+    # out of the logging call. A logging failure would then skip the teardown and leak the shell —
+    # exactly the defect round 9 closed, reintroduced through the line that REPORTS it.
+    # ▶ So the guarantee is now STRUCTURAL rather than resting on the logging call's good
+    # behaviour: `finally` runs whatever happens above it, and `_log_never_raises` cannot
+    # propagate. Either alone would do; together the invariant does not depend on the helper
+    # being correct, which is the point.
     try:
-        candidate.close()
-    except BaseException:
-        _log.exception("a rejected shell's close() raised; falling back to the base teardown")
-    try:
-        SandboxedShell.close(candidate)     # non-overridable path; idempotent
-    except BaseException:
-        _log.exception("base teardown of a rejected shell also failed; it may leak")
+        try:
+            candidate.close()
+        except BaseException:
+            _log_never_raises("a rejected shell's close() raised; falling back to the base teardown")
+    finally:
+        try:
+            SandboxedShell.close(candidate)     # non-overridable path; idempotent
+        except BaseException:
+            _log_never_raises("base teardown of a rejected shell also failed; it may leak")
 
 class _SharedFloor:
     """The ONE evolving :class:`CrownJewelsPolicy` for ONE CONVERSATION, read by BOTH hands.
