@@ -760,3 +760,86 @@ class TestPackCompose:
         assert body["error"] == "pack"
         assert "partial" not in body  # pre-write fault → no partial leak
         assert not (install / "CLAUDE.md").exists()  # nothing written
+
+
+# --------------------------------------------------------------------------
+# oversize body with a LYING Content-Length
+# --------------------------------------------------------------------------
+
+class TestOversizeWithALyingContentLength:
+    """The 413 must arrive even when Content-Length OVERSTATES the body.
+
+    ⛔ WHY THIS TEST EXISTS ON *THIS* SERVER, WHICH NEVER HAD THE BUG. The 2026-08-19 probe
+    found `web_server` silently answering NOTHING to a lying Content-Length while THIS server
+    answered `413` correctly. Only `web_server` got a regression test for it
+    (`test_web_server.py::TestOversizeWithALyingContentLength`). So the drain guard here — the
+    `try/except OSError` around `self._drain(clen)` — was correct, load-bearing, and covered by
+    NO test that could fail if it were deleted.
+
+    ⚡ `test_post_oversize_body_413` cannot cover it, by the same argument its `web_server` twin
+    makes: it builds an HONEST body through urllib, which sends every declared byte, so the
+    drain always completes and the 413 always arrives. It is a passing assertion that excludes
+    the variable the bug lives in — `a_gate_nothing_can_pass_is_not_a_gate`.
+
+    ⛔ AND THE PORT IS THE POINT. levain has three times carried a guard between files by
+    copying its NAME and leaving the PROPERTY behind. This test was verified to FAIL against a
+    mutated `init_server` (drain guard removed → no response, `assert raw` fires) before being
+    committed, not merely to pass against the correct one. A ported test that has only ever
+    been seen green proves nothing about the code it was ported to defend.
+
+    Raw socket, because urllib cannot lie about Content-Length — which is exactly why the
+    defect survived a suite that only ever spoke through urllib.
+    """
+
+    def _post_with_lying_length(self, base: str, declared: int, actually_send: bytes,
+                                timeout: float = 15.0) -> bytes:
+        import socket as _socket
+        from urllib.parse import urlparse
+        u = urlparse(base)
+        s = _socket.create_connection((u.hostname, u.port), timeout=timeout)
+        try:
+            s.sendall(
+                f"POST /init HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n".encode()
+                + actually_send
+            )
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    b = s.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not b:
+                    break
+                chunks.append(b)
+                if b"\r\n\r\n" in b"".join(chunks):
+                    break
+            return b"".join(chunks)
+        finally:
+            s.close()
+
+    def test_a_413_still_arrives_when_the_body_is_short(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from levain import init_server as init_server_mod
+        from levain.init_server import _DRAIN_CAP, _MAX_INIT_BODY
+
+        declared = _MAX_INIT_BODY + 1024
+        assert declared <= _DRAIN_CAP, "this test must exercise the DRAINABLE oversize branch"
+
+        # Shorten the handler's own socket timeout so the stalled drain trips in ~1s instead of
+        # 30. This exercises the REAL timeout path — the drain still raises — it just does so
+        # promptly, which is what makes this a 1-second regression test rather than a
+        # 30-second one nobody keeps.
+        monkeypatch.setattr(init_server_mod._InitHandler, "timeout", 1.0)
+
+        with _serving(tmp_path / "i") as (base, _port):
+            raw = self._post_with_lying_length(base, declared, b"zzzzzzzzzz", timeout=15.0)
+
+        assert raw, (
+            "the server answered NOTHING to an oversize request whose Content-Length overstated "
+            "the body — the drain stranded on the socket timeout"
+        )
+        assert b"413" in raw.split(b"\r\n", 1)[0], (
+            f"expected a 413 status line, got: {raw[:120]!r}"
+        )
