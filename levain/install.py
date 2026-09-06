@@ -14,10 +14,20 @@ Walks a stranger through standing up a new Levain install:
   8. Print next-steps banner.
 
 Idempotency: a non-empty install dir is refused unless `--force`. With
-`--force`, operator-edited activation files (`posture.md`,
-`recency_directives.md`) are backed up with a timestamped suffix before the
-activation tree is replaced; the anneal-memory store is preserved as-is;
-the Codex global `~/.codex/hooks.json` is backed up before being overwritten.
+`--force` the whole `activation/` tree is REPLACED, and anything in it whose
+bytes are not reproducible from the install is copied to a timestamped
+DIRECTORY (`.levain/backups/activation/<ts>/`, relative paths preserved)
+first — every file, hooks included, not a name allowlist. The anneal-memory
+store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
+before being overwritten, and `~/.codex/config.toml` is backed up and the
+change announced when the MCP block is repointed at a DIFFERENT store.
+
+⚠ This paragraph said "operator-edited activation files (`posture.md`,
+`recency_directives.md`) ... with a timestamped suffix" until 2026-09-06, which
+was wrong in BOTH the scope (two names, when the backup now covers the tree)
+and the shape (a suffixed file, when it is a directory). A maintainer trusting
+it over `_copy_activation_tree`'s own docstring would misjudge what survives a
+re-install. Found by complement at L3, in the same diff that made it stale.
 """
 
 from __future__ import annotations
@@ -31,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1867,12 +1878,7 @@ def _copy_activation_tree(
             # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch
             # them. Inside this try, so a later failure cleans them up: a backup left
             # behind next to an untouched dst looks like work that happened.
-            candidate = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
-            try:
-                candidate.mkdir(parents=True, exist_ok=True)
-                backup_staging = candidate
-            except OSError:
-                backup_staging = None  # can't stage — see the fail-loud guard below
+            staging_failed = False  # mkdir tried once and failed; don't retry per file
 
             # ⛔ NOT `dst.rglob("*")`: pathlib SILENTLY SWALLOWS scan errors —
             # MEASURED on this interpreter, an unreadable subdirectory simply does
@@ -1903,6 +1909,9 @@ def _copy_activation_tree(
                     continue
                 name = rel.as_posix()
                 staged = new_tree / rel
+                # Is this worth TELLING the operator about? Separate from whether it
+                # gets copied — see the substitution branch below.
+                notify = True
                 # Survives byte-identically? A missing staged file means nothing
                 # provides it → the swap DELETES it → always preserve, and it is
                 # never read at all (`copy2` streams). When there IS a counterpart,
@@ -1921,7 +1930,18 @@ def _copy_activation_tree(
                         # PATH lookup that is not stable between runs, so ask the sharper
                         # question — do these differ in anything INSTALL DID NOT WRITE?
                         if _is_hook_script(rel) and _hook_bodies_match(current, staged):
-                            continue
+                            # Differs ONLY in what install itself substitutes. Still
+                            # COPIED — an operator edit confined to that very line
+                            # (pointing `_INSTALL_ANNEAL_BIN` at a wrapper, say) is
+                            # indistinguishable from install's own output without a
+                            # record of what install last wrote, and there is none.
+                            # ⛔ So the safe half is preserved and only the CLAIM is
+                            # dropped: silent, best-effort, never a refusal. The
+                            # spore-859 defect was never "we copy too much", it was
+                            # "we tell the operator they edited something they did
+                            # not" — and a false notice is the only part worth
+                            # removing. codex L3 HIGH.
+                            notify = False
                     except OSError as e:
                         # About to replace it and can't compare it — don't destroy
                         # blind. A failure on either side is equally a reason to keep
@@ -1933,7 +1953,18 @@ def _copy_activation_tree(
                         ) from e
                 # About to be overwritten or deleted, and these bytes are not
                 # reproducible from the install — so they are the operator's.
+                if backup_staging is None and not staging_failed:
+                    candidate = (
+                        dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
+                    )
+                    try:
+                        candidate.mkdir(parents=True, exist_ok=True)
+                        backup_staging = candidate
+                    except OSError:
+                        staging_failed = True  # see the fail-loud guard below
                 if backup_staging is None:
+                    if not notify:
+                        continue  # best-effort copy — never block a pristine reinstall
                     raise InitError(
                         f"operator-edited {name} would be replaced by this re-install, "
                         f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
@@ -1945,12 +1976,15 @@ def _copy_activation_tree(
                     bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
                     shutil.copy2(current, bak)
                 except OSError as e:
+                    if not notify:
+                        continue  # best-effort copy — never block a pristine reinstall
                     raise InitError(
                         f"operator-edited {name} could not be backed up to {bak} ({e}). "
                         f"Refusing to overwrite your edit; back {current} up yourself and "
                         f"re-run."
                     ) from e
-                backups.append((name, bak))
+                if notify:
+                    backups.append((name, bak))
     except BaseException:
         # Any build failure (vanished source, collision, interrupt) leaves dst
         # untouched. Clean the staged tree AND this run's backups — the originals
@@ -2023,14 +2057,30 @@ _CODEX_MCP_BLOCK_RE = re.compile(
     r"(?ms)^\[mcp_servers\.anneal_memory\][^\n]*\n(?:(?!^\[)[^\n]*\n?)*",
 )
 
-# The `--db` inside `args = ["--db", "<store>", "serve"]`.
-_CODEX_MCP_DB_RE = re.compile(r'"--db"\s*,\s*"([^"]+)"')
-
 
 def _codex_block_store(block: str) -> str | None:
-    """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None."""
-    m = _CODEX_MCP_DB_RE.search(block)
-    return m.group(1) if m else None
+    """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None.
+
+    ⛔ PARSES TOML; does not pattern-match quotes. `args = ['--db', '/x', 'serve']` is
+    perfectly valid TOML — literal (single-quoted) strings — and a regex keyed to `"`
+    returns None for it, which would skip the warning AND the backup and perform the
+    exact silent repoint this guard exists to stop. A guard that does not fire on a
+    valid input is worse than no guard, because the absence reads as approval.
+    Parsing also means a commented-out `args` line cannot be mistaken for the live
+    value. codex L3 MED.
+    """
+    try:
+        data = tomllib.loads(block)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+    server = (data.get("mcp_servers") or {}).get("anneal_memory") or {}
+    args = server.get("args")
+    if not isinstance(args, list):
+        return None
+    for i, arg in enumerate(args[:-1]):
+        if arg == "--db" and isinstance(args[i + 1], str):
+            return args[i + 1]
+    return None
 
 
 def _merge_codex_config(

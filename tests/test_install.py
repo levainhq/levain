@@ -1928,17 +1928,98 @@ def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Pat
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
-    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
-    assert _backed_up_files(install) == []
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/opt/a/anneal-memory", emit=said.append)
 
     # PATH moves: same tree, same package, different resolution. Three more flips,
     # because two runs would miss the recurrence.
+    # ⚠ THE ORACLE IS THE NOTICE, NOT THE BACKUP DIRECTORY. The file is still COPIED
+    # (an operator edit confined to the substituted line is indistinguishable from
+    # install's own output without a record of what install wrote, and there is none
+    # — codex L3 HIGH). What must not happen is levain CLAIMING the operator edited
+    # it. Asserting on the backup dir here would re-encode the defect codex found.
     for path in ("/usr/local/bin/anneal-memory", "/opt/a/anneal-memory", "/usr/local/bin/anneal-memory"):
-        _copy_activation_tree([base], dst, base_activation=base, anneal_path=path)
-        assert _backed_up_files(install) == [], f"pristine hook staged after moving to {path}"
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=path,
+                              emit=said.append)
+    assert not [m for m in said if "Operator-edited" in m], (
+        f"pristine hook reported as operator-edited: {said}")
     # The substitution still happened — this is not passing by doing nothing.
     body = (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
     assert '"/usr/local/bin/anneal-memory"' in body
+
+
+def test_an_edit_CONFINED_to_the_substituted_line_is_still_PRESERVED(tmp_path: Path):
+    """⛔ codex L3 HIGH, and it is the case the first version of this fix lost. An
+    operator edits ONLY `_INSTALL_ANNEAL_BIN` — pointing it at a wrapper script, say.
+    Normalising that line on both sides declares the hook pristine, and the swap then
+    deletes the edit with no backup, contradicting doctor's own printed promise that
+    "any activation file you have edited" is copied first.
+
+    ⚠ It CANNOT be distinguished from install's own output by inspection: without a
+    record of what install last wrote, "/home/op/bin/wrapper" written by a human and
+    written by `shutil.which` are the same bytes. So the fix is not a better heuristic
+    — it is to stop conditioning the COPY on the guess and condition only the NOTICE.
+    Preserve always; claim only when sure.
+
+    MUTATION CONTROL: make the substitution branch `continue` instead of setting
+    `notify = False` and this fails — the wrapper edit vanishes with no backup."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+
+    hook = dst / "hooks" / "_levain_hook.py"
+    hook.write_text('X = 1\n_INSTALL_ANNEAL_BIN = "/home/op/bin/my-wrapper"\n', encoding="utf-8")
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/opt/a/anneal-memory", emit=said.append)
+
+    # The bytes survive somewhere recoverable...
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
+    assert "my-wrapper" in bak.read_text(encoding="utf-8")
+    # ...and levain does NOT claim they edited it, because it cannot know.
+    assert not [m for m in said if "Operator-edited" in m]
+
+
+def test_a_pristine_reinstall_is_never_BLOCKED_by_an_unwritable_backup_dir(tmp_path: Path):
+    """The copy is best-effort exactly when the notice is suppressed. A pristine tree
+    whose only difference is install's own substitution must not turn an unwritable
+    backup directory into a refused reinstall — that was one of the two harms measured
+    on real installs, and it fires on operators with NO edits at all."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+
+    backups_root = install / ".levain" / "backups" / "activation"
+    backups_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(backups_root, 0o500)
+    try:
+        # Must NOT raise, and must still install the new substitution.
+        _copy_activation_tree([base], dst, base_activation=base,
+                              anneal_path="/usr/local/bin/anneal-memory")
+    finally:
+        os.chmod(backups_root, 0o700)
+    assert '"/usr/local/bin/anneal-memory"' in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+
+
+def test_codex_store_is_read_from_TOML_not_from_quote_matching(tmp_path: Path):
+    """codex L3 MED. `args = ['--db', '/real/store.db', 'serve']` is valid TOML using
+    literal strings. A regex keyed to `"` returns None for it — so the warning and the
+    backup are both skipped and the silent repoint happens anyway. ⛔ A guard that does
+    not fire on a valid input is worse than no guard: the silence reads as approval."""
+    single = ("[mcp_servers.anneal_memory]\n"
+              "args = ['--db', '/real/store.db', 'serve']\n")
+    assert _codex_block_store(single) == "/real/store.db"
+
+    path = tmp_path / "config.toml"
+    path.write_text(single, encoding="utf-8")
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/tmp/other.db"), emit=said.append)
+    assert any("/real/store.db" in m for m in said), "single-quoted TOML must still warn"
+    assert list(tmp_path.glob("config.toml.bak.*")), "and must still be backed up"
 
 
 def test_a_REAL_patch_is_still_caught_when_the_anneal_path_also_moves(tmp_path: Path):
@@ -2031,16 +2112,26 @@ def test_reinstalling_the_SAME_store_is_silent_and_makes_no_backup(tmp_path: Pat
     assert list(tmp_path.glob("config.toml.bak.*")) == []
 
 
-def test_a_store_path_with_a_backslash_cannot_corrupt_the_config(tmp_path: Path):
+def test_a_store_path_with_a_backslash_is_inserted_LITERALLY(tmp_path: Path):
     """`re.sub` interprets backslash escapes in its REPLACEMENT. The block being
-    written is DATA, not a template, so a store path containing `\\g` or `\\1` would
-    have been read as a group reference and mangled the file (or raised). Latent —
-    backslashes are legal but rare in POSIX paths — and free to close while here."""
+    written is DATA, not a template, so a store path containing `\\g<1>` would have
+    been read as a group reference and mangled the file (or raised `error: invalid
+    group reference`). The replacement is now a lambda, so it is inserted verbatim.
+
+    ⚠ ASSERTED BY SUBSTRING, NOT BY PARSING, AND THAT IS THE POINT. An earlier version
+    of this test round-tripped the path through `_codex_block_store` and failed — for
+    a reason that is NOT this bug: `args = ["...\\g<1>..."]` is INVALID TOML (an
+    unescaped backslash in a basic string), so levain writes a config codex cannot
+    parse for ANY backslash-containing install path. Pre-existing, latent, out of
+    scope here, and routed — but the test asserting a round-trip was itself claiming
+    a behaviour the product does not have."""
     path = tmp_path / "config.toml"
     path.write_text(_codex_cfg("/home/op/old.db"), encoding="utf-8")
     weird = "/home/op/we\\g<1>ird/memory.db"
     _merge_codex_config(path, _codex_cfg(weird), emit=lambda _m: None)
-    assert _codex_block_store(path.read_text(encoding="utf-8")) == weird
+    written = path.read_text(encoding="utf-8")
+    assert weird in written, "the store path must be inserted literally, not expanded"
+    assert "old.db" not in written
 
 
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):
