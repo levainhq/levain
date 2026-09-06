@@ -687,6 +687,34 @@ def test_a_pack_layer_does_not_mute_the_OTHER_hooks(tmp_path: Path):
     assert "_levain_hook.py" in r.detail
 
 
+def test_stale_hook_hint_does_not_reassure_past_what_init_force_preserves(tmp_path: Path):
+    """⛔ `a_true_statement_standing_where_a_thing_should_be`, in shipped
+    operator-facing copy. The hint used to end "(your store, seed answers and
+    activation markdown edits are kept)". Every clause was TRUE — and by
+    enumerating what survives, it let the reader supply "…so nothing of mine is
+    lost." What it did not name is that `init --force` rewrites the whole
+    activation/ tree, which is where a patched hook lives. The one named external
+    operator lost a patched hook to exactly this remedy.
+
+    The hint must now name the backup, because that is what makes the
+    reassurance TRUE rather than merely accurate."""
+    install, _pack, _body = _pack_layered_install(tmp_path)
+    f = install / "activation" / "hooks" / "_levain_hook.py"
+    f.write_text(f.read_text(encoding="utf-8") + "\n# operator patch\n", encoding="utf-8")
+    r = _check_hook_freshness(install)[0]
+    assert not r.ok
+    hint = r.hint or ""
+    assert ".levain/backups/activation/" in hint, (
+        "the remedy rewrites the activation tree — it must say where edits go")
+    assert "hooks included" in hint, (
+        "hooks are the file class this hint's omission actually cost an operator")
+    # The old shape must not come back: an enumeration of survivors with no
+    # mention of the tree being rewritten.
+    assert "are kept" not in hint, (
+        "enumerating survivors invites 'so nothing of mine is lost' — name the "
+        "rewrite and the backup instead")
+
+
 def test_a_corrupt_lock_falls_back_instead_of_hard_failing(tmp_path: Path):
     """LOCK integrity belongs to the LOCK check. A corrupt manifest must not turn a
     CONTENT check into a hard error — degrading to base-only is the pre-fix behaviour,

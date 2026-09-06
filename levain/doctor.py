@@ -1288,8 +1288,11 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
                 "eagerly loads seed file(s) now classified on-demand: "
                 + ", ".join(stale),
                 f"This install predates the change. Re-render the carrier with "
-                f"`levain init --force --path {install}` (your store, seed answers "
-                f"and operator edits are kept). `levain update` does NOT rewrite it.",
+                f"`levain init --force --path {install}` — it rewrites the whole "
+                f"activation/ tree. Your store and seed answers are untouched, and "
+                f"any activation file you have edited (hooks included) is copied to "
+                f".levain/backups/activation/ first. `levain update` does NOT "
+                f"rewrite the carrier.",
             )
         ]
     return [CheckResult(f"{carrier.name} freshness", True, "matches current seed classification")]
@@ -1581,8 +1584,10 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                 + ", ".join(sorted(set(stale))),
                 f"Your hooks predate the installed levain version, and hook fixes "
                 f"do NOT arrive via `pip install -U` or `levain update`. Re-render "
-                f"with `levain init --force --path {install}` (your store, seed "
-                f"answers and activation markdown edits are kept).",
+                f"with `levain init --force --path {install}` — it rewrites the "
+                f"whole activation/ tree. Your store and seed answers are "
+                f"untouched, and any activation file you have edited (hooks "
+                f"included) is copied to .levain/backups/activation/ first.",
             )
         ]
     return [CheckResult("hook freshness", True, "hook scripts match the package")]

@@ -1594,9 +1594,6 @@ def _timestamped_backup_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + f".bak.{time.time_ns()}")
 
 
-_OPERATOR_EDITABLE = ("posture.md", "recency_directives.md")
-
-
 def _activation_excluded(rel: Path) -> bool:
     """Whether a relative activation path matches the copytree
     `ignore_patterns("__pycache__", "*.pyc")` semantics — a basename fnmatch at ANY
@@ -1662,16 +1659,31 @@ def _copy_activation_tree(
     `levain doctor`'s job; here we guard that base is a real, non-empty source —
     BEFORE any destructive write.
 
-    `posture.md` and `recency_directives.md` are documented as operator-editable
-    (the "second sourdough surface" — the activation block accretes as the operator
-    finds their own RLHF-leakage patterns). On a re-install, any such file present
-    at `dst` whose content will NOT survive byte-identically — it differs from the
-    WINNING layer's version, OR no layer provides it (so `rmtree` would delete it)
-    — is backed up OUTSIDE the dst tree
-    (`<install>/.levain/backups/activation/<timestamp>/`) BEFORE the `rmtree`. If
-    such an edit cannot be preserved (the backup dir won't create, the read/copy
-    fails), this raises rather than silently destroying it — fail loud beats data
-    loss.
+    On a re-install, EVERY file present at `dst` whose content will NOT survive
+    byte-identically — it differs from the WINNING layer's version, OR no layer
+    provides it (so `rmtree` would delete it) — is backed up OUTSIDE the dst tree
+    (`<install>/.levain/backups/activation/<timestamp>/`, preserving relative
+    paths) BEFORE the `rmtree`. If such an edit cannot be preserved (the backup
+    dir won't create, the read/copy fails), this raises rather than silently
+    destroying it — fail loud beats data loss.
+
+    The scope is the WHOLE TREE, not a name allowlist, and that is the point:
+    `posture.md` and `recency_directives.md` are the files we DOCUMENT as
+    operator-editable (the "second sourdough surface" — the activation block
+    accretes as the operator finds their own RLHF-leakage patterns), but they are
+    not the only files operators edit. Hooks are machinery we do not invite edits
+    to, and operators patch them anyway — levain's own shipped hook says so in a
+    comment, and the one named external operator lost a patched hook to
+    `levain init --force`, the remedy `levain doctor` itself prints. Scoping the
+    backup to what we documented, rather than to what `rmtree` destroys, is what
+    let that happen. Membership in this backup is decided by REPRODUCIBILITY (can
+    these bytes be rebuilt from a layer?), never by a filename.
+
+    ⚠ A pristine file whose PACKAGE version moved is therefore also copied — it
+    differs from the winning layer and we cannot tell it from a patch without a
+    record of what we wrote. That is deliberate: the tree is small (five files
+    base, ~67KB), over-backup costs bytes in a timestamped dir, and under-backup
+    costs an operator their work irrecoverably.
 
     `anneal_path`, when provided, is substituted into the `{{ANNEAL_MEMORY}}`
     placeholder in any hook .py file under `dst/hooks/` (recursively, so a pack's
@@ -1709,10 +1721,23 @@ def _copy_activation_tree(
         except OSError:
             backup_staging = None  # can't stage — see the fail-loud guard below
 
-        for name in _OPERATOR_EDITABLE:
-            current = dst / name
+        # EVERY file in the tree, not an allowlist of names. The scope used to be
+        # two markdown files, which left a patched `hooks/*.py` destroyed with no
+        # backup and no warning — the harm levain's OWN shipped hook documents
+        # ("a file operators demonstrably patch"). Scoping the guard to the two
+        # files we DOCUMENT as editable missed the class: operators patch hooks,
+        # packs contribute activation files, and operators add files of their own.
+        # The test below is unchanged and already correct — only the enumeration
+        # it runs over was too narrow.
+        for current in sorted(dst.rglob("*")):
             if not current.is_file():
                 continue
+            rel = current.relative_to(dst)
+            # `__pycache__`/`*.pyc` are build residue no layer provides; without
+            # this they would look operator-added and be backed up on every run.
+            if _activation_excluded(rel):
+                continue
+            name = rel.as_posix()  # matches `composed`'s keys
             try:
                 current_bytes = current.read_bytes()
             except OSError as e:
@@ -1731,7 +1756,8 @@ def _copy_activation_tree(
                         continue
                 except OSError:
                     pass  # can't read the winning source → treat current as needing preservation
-            # This operator-editable file is about to be overwritten or deleted.
+            # This file is about to be overwritten or deleted and its current bytes
+            # are not reproducible from any layer — so they are the operator's.
             if backup_staging is None:
                 raise InitError(
                     f"operator-edited {name} would be replaced by this re-install, "
@@ -1741,6 +1767,7 @@ def _copy_activation_tree(
                 )
             bak = backup_staging / name
             try:
+                bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
                 shutil.copy2(current, bak)
             except OSError as e:
                 raise InitError(

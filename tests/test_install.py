@@ -1757,6 +1757,101 @@ def test_copy_activation_winning_none_operator_file_backed_up(tmp_path: Path):
     assert backups[0].read_text(encoding="utf-8") == "OPERATOR RECENCY\n"
 
 
+def _backed_up_files(install: Path) -> list[str]:
+    """Relative posix paths of every FILE staged under this install's activation
+    backups (across all timestamped run dirs)."""
+    root = install / ".levain" / "backups" / "activation"
+    if not root.is_dir():
+        return []
+    out = []
+    for run_dir in root.iterdir():
+        if run_dir.is_dir():
+            out += [
+                q.relative_to(run_dir).as_posix()
+                for q in run_dir.rglob("*") if q.is_file()
+            ]
+    return sorted(out)
+
+
+def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
+    """⛔ THE ALEX DE GROODT CASE. A patched `hooks/*.py` differs from the winning
+    layer, so `rmtree` destroys it — and the backup used to cover only two markdown
+    files, so it went with NO backup and NO warning, via `levain init --force`: the
+    remedy `levain doctor` itself prints. The nested relative path must be preserved
+    in the backup. ⚠ The `bak.parent.mkdir` is load-bearing, and WALKED IN EXECUTION
+    ORDER rather than read for agreement: without it `copy2` raises FileNotFoundError,
+    which IS an OSError, so it is caught and re-raised as `InitError: ... could not be
+    backed up`. The operator does not get a crash — they get `init --force` REFUSING,
+    every time, for every patched nested hook. Widening the backup scope without the
+    mkdir would have traded silent data loss for a hard universal init failure.
+
+    MUTATION CONTROL: fails against the pre-fix tree, where the enumeration was
+    `for name in _OPERATOR_EDITABLE` — the hook is simply never looked at."""
+    base = _mk_layer(tmp_path / "base", {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": "NEW PACKAGE HOOK\n",
+    })
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {
+        "posture.md": "P\n",                                    # pristine
+        "hooks/_levain_hook.py": "OPERATOR PATCHED HOOK\n",      # the patch
+    })
+    _copy_activation_tree([base], dst, base_activation=base)
+
+    # The package version won the install...
+    assert (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8") == "NEW PACKAGE HOOK\n"
+    # ...but the operator's patch survives, at its relative path.
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
+    assert bak.read_text(encoding="utf-8") == "OPERATOR PATCHED HOOK\n"
+
+
+def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):
+    """A file the OPERATOR added anywhere in the tree (no layer provides it → rmtree
+    DELETES it) is preserved. Unambiguous: it cannot be a pristine package file."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {
+        "posture.md": "P\n",
+        "hooks/my_own_hook.py": "OPERATOR'S OWN HOOK\n",
+    })
+    _copy_activation_tree([base], dst, base_activation=base)
+
+    assert not (dst / "hooks" / "my_own_hook.py").exists()   # rmtree took it
+    assert _backed_up_files(install) == ["hooks/my_own_hook.py"]
+
+
+def test_copy_activation_pristine_tree_backs_up_nothing(tmp_path: Path):
+    """Widening the scope to the whole tree must NOT mean backing the whole tree up:
+    a dst that already matches the winning layers byte-for-byte stages ZERO files.
+    Membership is decided by reproducibility, not by filename."""
+    files = {"posture.md": "P\n", "hooks/h.py": "H\n", "recency_directives.md": "R\n"}
+    base = _mk_layer(tmp_path / "base", files)
+    install = tmp_path / "install"
+    _mk_layer(install / "activation", dict(files))
+    _copy_activation_tree([base], install / "activation", base_activation=base)
+    assert _backed_up_files(install) == []
+
+
+def test_copy_activation_pyc_residue_is_not_backed_up(tmp_path: Path):
+    """`__pycache__`/`*.pyc` in the installed tree are build residue no layer
+    provides. Without the `_activation_excluded` skip they would read as
+    operator-added and be copied on EVERY run — the noise class the exclusion
+    exists to prevent."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n", "hooks/h.py": "H\n"})
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {
+        "posture.md": "P\n",
+        "hooks/h.py": "H\n",
+        "hooks/__pycache__/h.cpython-313.pyc": "RESIDUE\n",
+    })
+    _copy_activation_tree([base], dst, base_activation=base)
+    assert _backed_up_files(install) == []
+
+
 def test_copy_activation_unbackuppable_operator_edit_raises(tmp_path: Path, monkeypatch):
     """If an operator edit can't be backed up (copy2 fails), refuse — don't rmtree
     over it (codex HIGH-2). Simulated by making shutil.copy2 raise during backup."""
