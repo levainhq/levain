@@ -169,8 +169,21 @@ backup does not cover it:
 **The pre-`rmtree` backup covers exactly two markdown files. A patched hook script is deleted with no
 backup and no warning.**
 
-⚠ That is *correct policy* — hooks are machinery, the product's answer to Alex's need was a config
-channel (`.levain/config.json {"scope": "global"}`) and it shipped. It is not a policy defect.
+⛔⛔ **AND IT IS NOT ONE OPERATOR ONCE — LEVAIN'S OWN SHIPPED CODE SAYS SO.** Added after
+`0906+8 fanin` verified this section independently and found evidence I had missed; **coordinates
+re-derived by me with `grep -n`, not adopted:**
+`levain/templates/activation/hooks/_levain_hook.py:316` — *"an operator carrying local edits to their
+installed hooks (Alex De Groodt was…)"* · **`:319` — *"Removing it is a breaking change to a file
+operators demonstrably patch."***
+
+⚡ **So the shipped hook DOCUMENTS that operators demonstrably patch this file, and reasons about
+backward compatibility on that basis — while the pre-`rmtree` backup covers two markdown files that
+are not it.** The product knows the behaviour exists, protects the wrong artifacts, and prints a
+remedy whose reassurance enumerates only what it does protect.
+
+⚠ That is *correct policy* on the narrow question — hooks are machinery, and the product's answer to
+Alex's need was a config channel (`.levain/config.json {"scope": "global"}`) which shipped. It is not
+a policy defect.
 **It is a NOTICE defect, and it is `a_true_statement_standing_where_a_thing_should_be` in a shipped
 operator-facing string.** `_check_hook_freshness`'s printed hint says:
 
