@@ -713,6 +713,17 @@ def test_stale_hook_hint_does_not_reassure_past_what_init_force_preserves(tmp_pa
     assert "are kept" not in hint, (
         "enumerating survivors invites 'so nothing of mine is lost' — name the "
         "rewrite and the backup instead")
+    # ⛔ AND THE CLAUSE THE FIRST FIX PRESERVED WHILE CORRECTING ITS NEIGHBOUR.
+    # The old hint also said seed answers "are kept". codex found that false at L3:
+    # `init --force` runs the interview from blank (install.py `initial_answers = {}`)
+    # and clears the checkpoint precisely so the NEXT force run does not offer to
+    # resume. An operator hitting enter through it overwrites their recorded answers.
+    # Knowing the class does not immunise you against producing it — this assertion
+    # exists because the fix for a false reassurance carried a false reassurance.
+    assert "seed answers" not in hint, (
+        "`init --force` re-runs the interview; promising seed answers survive is false")
+    assert "RE-RUNS THE INTERVIEW" in hint, (
+        "the interview re-run is the operator-visible consequence and must be named")
 
 
 def test_a_corrupt_lock_falls_back_instead_of_hard_failing(tmp_path: Path):

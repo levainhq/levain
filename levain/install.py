@@ -1660,12 +1660,19 @@ def _copy_activation_tree(
     BEFORE any destructive write.
 
     On a re-install, EVERY file present at `dst` whose content will NOT survive
-    byte-identically — it differs from the WINNING layer's version, OR no layer
-    provides it (so `rmtree` would delete it) — is backed up OUTSIDE the dst tree
+    byte-identically — it differs from the bytes about to be written, OR nothing
+    provides it (so the swap would delete it) — is backed up OUTSIDE the dst tree
     (`<install>/.levain/backups/activation/<timestamp>/`, preserving relative
-    paths) BEFORE the `rmtree`. If such an edit cannot be preserved (the backup
-    dir won't create, the read/copy fails), this raises rather than silently
+    paths) BEFORE the swap. If such an edit cannot be preserved (the backup dir
+    won't create, the read/copy fails), this raises rather than silently
     destroying it — fail loud beats data loss.
+
+    ⛔ The comparison is against the STAGED TREE, never the composed source. Hooks
+    have `{{ANNEAL_MEMORY}}` substituted into them at install time, so an installed
+    hook never equals its package source — comparing against the source would report
+    every pristine hook as operator-edited on every re-install. Comparing against
+    the staged result is also the only form that needs no copy of the substitution
+    rule, so it cannot drift when that rule changes.
 
     The scope is the WHOLE TREE, not a name allowlist, and that is the point:
     `posture.md` and `recency_directives.md` are the files we DOCUMENT as
@@ -1710,72 +1717,8 @@ def _copy_activation_tree(
             f"activation/; reinstall with `pip install --force-reinstall levain`."
         )
 
-    backups: list[tuple[Path, Path]] = []
+    backups: list[tuple[str, Path]] = []
     backup_staging: Path | None = None  # this run's backup dir; cleaned on any failure
-    if dst.exists():
-        # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch them.
-        candidate = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            backup_staging = candidate
-        except OSError:
-            backup_staging = None  # can't stage — see the fail-loud guard below
-
-        # EVERY file in the tree, not an allowlist of names. The scope used to be
-        # two markdown files, which left a patched `hooks/*.py` destroyed with no
-        # backup and no warning — the harm levain's OWN shipped hook documents
-        # ("a file operators demonstrably patch"). Scoping the guard to the two
-        # files we DOCUMENT as editable missed the class: operators patch hooks,
-        # packs contribute activation files, and operators add files of their own.
-        # The test below is unchanged and already correct — only the enumeration
-        # it runs over was too narrow.
-        for current in sorted(dst.rglob("*")):
-            if not current.is_file():
-                continue
-            rel = current.relative_to(dst)
-            # `__pycache__`/`*.pyc` are build residue no layer provides; without
-            # this they would look operator-added and be backed up on every run.
-            if _activation_excluded(rel):
-                continue
-            name = rel.as_posix()  # matches `composed`'s keys
-            try:
-                current_bytes = current.read_bytes()
-            except OSError as e:
-                # We're about to rmtree it but can't inspect it — don't destroy blind.
-                raise InitError(
-                    f"could not read {current} to check for operator edits before "
-                    f"replacing the activation tree ({e}). Refusing to overwrite a "
-                    f"possibly-edited file; resolve the read error and re-run."
-                ) from e
-            winning = composed.get(name)
-            # Survives byte-identically? (winning present AND equal). winning is None
-            # means no layer provides it → rmtree would DELETE it → must preserve.
-            if winning is not None:
-                try:
-                    if current_bytes == winning.read_bytes():
-                        continue
-                except OSError:
-                    pass  # can't read the winning source → treat current as needing preservation
-            # This file is about to be overwritten or deleted and its current bytes
-            # are not reproducible from any layer — so they are the operator's.
-            if backup_staging is None:
-                raise InitError(
-                    f"operator-edited {name} would be replaced by this re-install, "
-                    f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
-                    f"could not be created. Refusing to overwrite your edit; fix the "
-                    f"backup-dir permissions (or back {current} up yourself) and re-run."
-                )
-            bak = backup_staging / name
-            try:
-                bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
-                shutil.copy2(current, bak)
-            except OSError as e:
-                raise InitError(
-                    f"operator-edited {name} could not be backed up to {bak} ({e}). "
-                    f"Refusing to overwrite your edit; back {current} up yourself and "
-                    f"re-run."
-                ) from e
-            backups.append((current, bak))
 
     # Build the new tree in a STAGING dir, then swap it into place atomically — so
     # NO build failure (a cross-layer file/dir name collision, a vanished source)
@@ -1815,6 +1758,84 @@ def _copy_activation_tree(
             shutil.copy2(source, target)
         if anneal_path is not None:
             _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
+
+        # Operator content is backed up HERE — after the staged tree is built and
+        # substituted — and compared against the STAGED bytes, i.e. the exact bytes
+        # about to be written.
+        #
+        # ⛔ Comparing against the composed SOURCE was wrong, and only latently so
+        # while this loop covered two markdown files. Install substitutes
+        # `{{ANNEAL_MEMORY}}` into hooks (the line above), so an INSTALLED hook can
+        # never equal its package source: widening the scope to the whole tree would
+        # have reported the pristine `_levain_hook.py` as operator-edited on EVERY
+        # re-install — spurious noise on exactly the file class this backup exists
+        # for, plus a hard InitError for anyone whose backup dir won't stage.
+        # Found by codex + complement at L3, confirmed on disk.
+        #
+        # Comparing against the staged RESULT needs no knowledge of the substitution
+        # rule, so it cannot drift when that rule changes. Duplicating the layering
+        # rule instead of reusing it is a defect this file has already shipped twice.
+        if dst.exists():
+            # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch
+            # them. Inside this try, so a later failure cleans them up: a backup left
+            # behind next to an untouched dst looks like work that happened.
+            candidate = dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                backup_staging = candidate
+            except OSError:
+                backup_staging = None  # can't stage — see the fail-loud guard below
+
+            for current in sorted(dst.rglob("*")):
+                if not current.is_file():
+                    continue
+                rel = current.relative_to(dst)
+                # `__pycache__`/`*.pyc` are build residue no layer provides; without
+                # this they would look operator-added and be backed up every run.
+                if _activation_excluded(rel):
+                    continue
+                name = rel.as_posix()
+                staged = new_tree / rel
+                # Survives byte-identically? A missing staged file means nothing
+                # provides it → the swap DELETES it → always preserve, and we never
+                # read it: `copy2` streams, so an operator-added artifact of any size
+                # costs no memory here. Only the compare path reads (codex L3 MED —
+                # the widened traversal must not pull arbitrary files into memory).
+                if staged.is_file():
+                    try:
+                        current_bytes = current.read_bytes()
+                    except OSError as e:
+                        # About to replace it but can't inspect it — don't destroy blind.
+                        raise InitError(
+                            f"could not read {current} to check for operator edits before "
+                            f"replacing the activation tree ({e}). Refusing to overwrite a "
+                            f"possibly-edited file; resolve the read error and re-run."
+                        ) from e
+                    try:
+                        if current_bytes == staged.read_bytes():
+                            continue
+                    except OSError:
+                        pass  # can't read the staged result → preserve the current bytes
+                # About to be overwritten or deleted, and these bytes are not
+                # reproducible from the install — so they are the operator's.
+                if backup_staging is None:
+                    raise InitError(
+                        f"operator-edited {name} would be replaced by this re-install, "
+                        f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
+                        f"could not be created. Refusing to overwrite your edit; fix the "
+                        f"backup-dir permissions (or back {current} up yourself) and re-run."
+                    )
+                bak = backup_staging / name
+                try:
+                    bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
+                    shutil.copy2(current, bak)
+                except OSError as e:
+                    raise InitError(
+                        f"operator-edited {name} could not be backed up to {bak} ({e}). "
+                        f"Refusing to overwrite your edit; back {current} up yourself and "
+                        f"re-run."
+                    ) from e
+                backups.append((name, bak))
     except BaseException:
         # Any build failure (vanished source, collision, interrupt) leaves dst
         # untouched. Clean the staged tree AND this run's backups — the originals
@@ -1844,8 +1865,8 @@ def _copy_activation_tree(
     if old_aside is not None:
         shutil.rmtree(old_aside, ignore_errors=True)
 
-    for current, bak in backups:
-        emit(f"  ! Operator-edited {current.name} preserved at {bak}")
+    for name, bak in backups:
+        emit(f"  ! Operator-edited {name} preserved at {bak}")
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:
