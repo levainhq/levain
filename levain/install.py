@@ -1537,7 +1537,7 @@ def _install_codex(
     mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
     mcp_fragment = mcp_fragment.replace("{{ANNEAL_MEMORY}}", anneal_path)
     mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
-    _merge_codex_config(codex_home / "config.toml", mcp_fragment)
+    _merge_codex_config(codex_home / "config.toml", mcp_fragment, emit=emit)
 
     emit("  Codex adapter installed.")
 
@@ -2023,13 +2023,45 @@ _CODEX_MCP_BLOCK_RE = re.compile(
     r"(?ms)^\[mcp_servers\.anneal_memory\][^\n]*\n(?:(?!^\[)[^\n]*\n?)*",
 )
 
+# The `--db` inside `args = ["--db", "<store>", "serve"]`.
+_CODEX_MCP_DB_RE = re.compile(r'"--db"\s*,\s*"([^"]+)"')
 
-def _merge_codex_config(path: Path, fragment: str) -> None:
+
+def _codex_block_store(block: str) -> str | None:
+    """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None."""
+    m = _CODEX_MCP_DB_RE.search(block)
+    return m.group(1) if m else None
+
+
+def _merge_codex_config(
+    path: Path, fragment: str, *, emit: Callable[[str], None] = print
+) -> None:
     """Insert/replace the `[mcp_servers.anneal_memory]` block in config.toml.
 
     Idempotent — re-running init replaces the block in place rather than
     appending a duplicate section header (which TOML-parse-fails on next
     Codex startup).
+
+    ⛔ THIS REGISTRATION IS GLOBAL BY DESIGN (`templates/adapters/codex/README.md`),
+    so replacing the block REPOINTS EVERY CODEX SESSION ON THE MACHINE at a
+    different store. That used to happen SILENTLY. On 2026-09-04 an install run
+    against a temp entity dir — a manual e2e that isolated the entity but not
+    `CODEX_HOME` — left every codex invocation reading a 4KB throwaway fixture for
+    hours; a reviewer that consulted memory got nothing and would read nothing as
+    "not known". `absence_of_signal_rendered_as_health`, inside the shared apparatus.
+
+    ⚡ SAME SHAPE AS THE ACTIVATION BACKUP EIGHT LINES UP, AND THAT IS THE POINT:
+    `hooks.json` in this very directory has always been copied aside and announced
+    before being replaced, while `config.toml` — larger, shared, and global — was
+    overwritten without either. Our own documented procedure destroyed operator
+    state without saying so, which is the defect `init --force` had for a patched
+    hook. Fixed the same way: preserve it, and SAY SO.
+
+    ⚖ IT WARNS, IT DOES NOT REFUSE, and that is deliberate rather than timid.
+    Repointing codex at a different install is a legitimate operator action — it is
+    the DOCUMENTED REPAIR for this very defect (`levain init --adapter codex` from
+    whichever install you want codex reading). A refusal would block the fix for the
+    problem it is guarding.
     """
     if not path.is_file():
         path.write_text(fragment.rstrip() + "\n", encoding="utf-8")
@@ -2042,8 +2074,22 @@ def _merge_codex_config(path: Path, fragment: str) -> None:
 
     new_block = new_block_match.group(0).rstrip() + "\n"
 
-    if _CODEX_MCP_BLOCK_RE.search(existing):
-        existing = _CODEX_MCP_BLOCK_RE.sub(new_block, existing, count=1)
+    old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
+    if old_block_match:
+        old_store = _codex_block_store(old_block_match.group(0))
+        new_store = _codex_block_store(new_block)
+        if old_store and new_store and old_store != new_store:
+            bak = _timestamped_backup_path(path)
+            shutil.copy2(path, bak)
+            emit(f"  ! Codex's GLOBAL anneal memory was pointed at {old_store}")
+            emit(f"    and now points at {new_store}.")
+            emit(f"    {path} backed up to {bak}")
+            emit("    (Every codex session on this machine reads that store, not")
+            emit("     just this install. Re-run init from the install you want it")
+            emit("     reading if this was not what you meant.)")
+        # `new_block` is data, not a template: a literal replacement, so a store path
+        # containing a backslash cannot be read as a group reference and corrupt the file.
+        existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
     else:
         if not existing.endswith("\n"):
             existing += "\n"
