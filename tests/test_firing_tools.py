@@ -843,8 +843,16 @@ def test_a_rejected_shell_whose_close_silently_noops_still_gets_the_base_teardow
     rejected spawn. The fallback covered overrides that raise and not overrides that lie —
     and the docstring conceded that narrowness rather than closing it.
 
-    The assertion is on ``closed``, which ONLY the base ``SandboxedShell.close`` body sets
-    (confinement.py:1708), so it cannot be satisfied by the override running.
+    The assertion is on ``closed``, which ONLY the base ``SandboxedShell.close`` body sets, so it
+    cannot be satisfied by the override running.
+
+    ⛔ THAT USED TO CITE ``confinement.py:1708`` AND WAS EXACT WHEN WRITTEN (Diogenes LOW,
+    2026-09-06). The next commit, six minutes later, added nine lines above the region and :1708
+    became a sentence inside ``close``'s docstring about daemonized children escaping ``killpg`` —
+    a KNOWN NON-TEARDOWN CASE. A reader following it to "the line that sets closed" would have
+    landed on prose arguing the opposite of the property being cited. **A citation that lands on
+    plausible wrong content is worse than one that lands on whitespace**, which is why the fix is
+    to name the symbol rather than to correct the number.
     """
     from levain.firing.confinement import SandboxedShell
     from levain.firing.openhands import tools as _t
@@ -864,4 +872,59 @@ def test_a_rejected_shell_whose_close_silently_noops_still_gets_the_base_teardow
     assert candidate.closed is True, (
         "the base teardown did not run after a silently no-op close() — the rejected shell's "
         "process, process group and FIFO dir leak"
+    )
+
+
+def test_a_raising_log_handler_cannot_strand_the_base_teardown(tmp_path):
+    """The third override-shaped way to leak a rejected shell, and it is not the override.
+
+    ⛔ codex L3 round 10, 2026-09-06 — THIS RELEASE'S OWN CLASS ARRIVING ONE LAYER UP. Round 9
+    removed a ``return`` so the base teardown could not be skipped by an override that lies. But
+    the base path was still reached only by FALLING OFF THE END of the ``except`` that handles a
+    raising ``close()``, and ``_log.exception`` IS NOT GUARANTEED NOT TO RAISE: ``Handler.handle``
+    calls ``emit`` with no try/except of its own, so a custom handler whose ``emit`` raises without
+    routing through ``handleError`` propagates straight out of the logging call.
+
+    Both failures then compound in the worst direction: the base teardown never runs (the
+    subprocess, process group, FIFO dir and reader thread leak), AND the logging error REPLACES the
+    original ConfinementError, which is the one signal the whole path exists to preserve. The line
+    that REPORTS the fallback was the line that prevented it.
+
+    ⚠ ``emitted`` is asserted so this test cannot pass vacuously by never reaching the handler —
+    a green that proves the handler was never installed would be the same defect one level up.
+    """
+    import logging
+
+    from levain.firing.confinement import SandboxedShell
+    from levain.firing.openhands import tools as _t
+
+    class _ExplodingHandler(logging.Handler):
+        emitted = 0
+
+        def emit(self, record: logging.LogRecord) -> None:
+            type(self).emitted += 1
+            raise RuntimeError("the logging handler itself is broken")
+
+    class _RaisingShell(SandboxedShell):
+        def close(self) -> None:
+            raise RuntimeError("override close() failed before tearing anything down")
+
+    candidate = _RaisingShell(argv=["/bin/bash"], cwd=tmp_path, env={})
+    assert candidate.closed is False
+
+    logger = logging.getLogger("levain.firing.tools")
+    handler = _ExplodingHandler()
+    logger.addHandler(handler)
+    try:
+        _t._close_candidate_shell(candidate)   # must not raise, whatever the handler does
+    finally:
+        logger.removeHandler(handler)
+
+    assert _ExplodingHandler.emitted >= 1, (
+        "the exploding handler was never invoked — this test would pass without exercising the "
+        "defect at all"
+    )
+    assert candidate.closed is True, (
+        "the base teardown did not run because the log call reporting the fallback raised — the "
+        "rejected shell's process, process group and FIFO dir leak"
     )

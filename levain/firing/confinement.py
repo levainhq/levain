@@ -1129,9 +1129,23 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # ⛔ AND THE REASON THAT USED TO BE GIVEN FOR ACCEPTING THE GAP WAS A FALSE UNIVERSAL
     # (Diogenes 2026-09-05). It read: "one policy, two enforcers" holds for every OTHER field on
     # this policy and does NOT hold for this one. It does not hold for `deny_write_dirs` either —
-    # MEASURED by calling this predicate against every entry: **30 entries, exactly 1 matched**
-    # (`~/.ssh`, via the `ssh_dir` arm above). The other 29 are enforced by the seatbelt hand
-    # alone. So the connect arm is not the lone exception; partial coverage is the NORM across
+    # MEASURED by calling this predicate against every entry: **exactly ONE entry matches** — always
+    # `~/.ssh`, via the `ssh_dir` arm above — and every other entry is enforced by the seatbelt hand
+    # alone.
+    # ⚠ THE COUNT IS DELIBERATELY ABSENT (Diogenes LOW, 2026-09-06). This used to read "**30
+    # entries, exactly 1 matched** ... the other 29", and the total is not a property of the policy —
+    # it is a property of WHERE THE ENTITY DIRECTORY SITS, because `deny_write_dirs` holds the
+    # entity's ANCESTOR directories. It moves with path DEPTH (measured 26..33 across four
+    # locations) and the `deny_standard_creds=True` cells shift it again.
+    # ⚡⚡ AND THE STRONGEST EVIDENCE THAT IT DOES NOT BELONG HERE IS THAT THREE CAREFUL
+    # MEASUREMENTS PRODUCED THREE DIFFERENT ANSWERS AGAINST IDENTICAL CODE: 28, then 30, then a
+    # four-location sweep of 26/30/33/33, then an independent re-run of that same sweep giving
+    # 26/30/30/33. Nobody was wrong and nothing changed — each harness placed its probe directory
+    # at a different depth. A number that three correct measurements disagree about is a number
+    # describing the MEASURER.
+    # ⭐ **The invariant is what survives all of it: exactly ONE entry matches, in every cell, and
+    # it is always `~/.ssh` via the `ssh_dir` arm.** That is the whole of what this argument needs,
+    # and it is re-runnable by anyone from any directory. So the connect arm is not the lone exception; partial coverage is the NORM across
     # this object, and the honest statement of the gap is that the two hands enforce DIFFERENT
     # SUBSETS by construction — the file editor has no connect and no rename-of-a-directory
     # primitive, so it can only ever cover what its own primitives reach.
@@ -2012,9 +2026,17 @@ class SeatbeltProvider(ConfinementProvider):
             # persistence-vector floor ssh_mode-independent and self-documenting.
             # ⛔ TWO CLASSES SHARE THIS LIST, SO IT RENDERS AS TWO BLOCKS WITH TWO ACCURATE
             # HEADERS (Diogenes 2026-09-05). One "ssh persistence/exec vectors (authorized_keys*,
-            # config, rc)" header used to stand over the WHOLE list while 10 of the 20 literals
-            # under it were container/VM daemon sockets — MEASURED BY RENDERING A REAL PROFILE,
-            # not by reading. `crown_jewel_reason` had already been fixed to say WHICH kind it
+            # config, rc)" header used to stand over the WHOLE list while TEN OF ITS LITERALS were
+            # container/VM daemon sockets — MEASURED BY RENDERING A REAL PROFILE, not by reading.
+            # ⚠ THIS SAID "10 of the 20 literals" AND NO CONFIGURATION PRODUCES 20 (Diogenes LOW,
+            # 2026-09-06; re-measured independently 2026-09-06). Swept all 16 cells of
+            # `build_policy` — ssh_mode x deny_standard_creds x allow_container_sockets:
+            # `len(deny_write_files)` is 14 in the eight allow_container_sockets=False cells and 4
+            # in the eight True ones. The rendered split is 4 ssh + 10 socket = 14. The RATIO is
+            # what this sentence needs and the TOTAL is what rots, so the total is gone: a reader
+            # checking the new two-block render against "20" finds 14 and has to conclude six
+            # literals were dropped from a security floor. The false figure manufactured a phantom
+            # gap in the very thing the sentence was written to reassure about. `crown_jewel_reason` had already been fixed to say WHICH kind it
             # matched; this renderer was the other surface saying it and kept the false sentence.
             # ⚠ AND THIS IS THE MORE AUTHORITATIVE SURFACE: the in-process message is transient,
             # the .sbpl is written to a file and is what the kernel enforces. An operator auditing
