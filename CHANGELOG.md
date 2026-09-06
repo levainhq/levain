@@ -26,7 +26,7 @@ Stamped `0.4.5.dev0`. **The tree past a release tag no longer claims the release
 
 ⚠ **What 0.4.4's own `Upgrading` note got wrong**, and it is why this correction exists: it says to run `doctor` after upgrading and then warns about exactly ONE possible new failure — `activation scope` — which only affects operators whose hooks are wired at the user level. It presents `levain init --force` as what you need *additionally*, for three named features, rather than as a required step. **An operator who follows it exactly is prepared for one specific failure and receives two different ones.** That section is left as published; this entry is the correction.
 
-⚠ Measured upgrading **from 0.4.3**. The mechanism is version movement rather than anything specific to 0.4.3, so earlier versions are expected to behave the same way — that expectation is reasoning, not a measurement.
+⚠ **Measured from every 0.4.x release, not inferred.** Each of 0.4.0, 0.4.1, 0.4.2 and 0.4.3 passes its own `doctor` at exit 0, and each one gives the identical two failures and exit 1 under 0.4.4 — the `compat` message naming the version it came from in each case. So this is the whole 0.4.x upgrade surface, measured rather than generalised from one path.
 
 ▶ **The design question underneath this is open and deliberately not answered here:** `doctor` exits 1 identically for *"something is broken"* and for *"a routine post-upgrade step is pending."* An instrument that goes red on the expected path teaches its operator to discount it, which is expensive for the one tool we ask operators to trust when something genuinely is wrong.
 
