@@ -205,7 +205,7 @@ The option the measurement actually points at, and the only one that shrinks the
     carry `init --force`'s fail-loud backup contract. Docs, operator manual, README, and the shipped
     adapter READMEs all move together.
 - **D2 — fold the hook re-render into `levain update`, scoped to `activation/hooks/` only.**
-  Cheaper: no new verb. The machinery/operator-owned split is enforced by **directory** — `hooks/` is
+  No new verb. The machinery/operator-owned split is enforced by **directory** — `hooks/` is
   machinery, `activation/*.md` is operator-owned — so the shipped promise in
   `levain/templates/docs/operator-manual.md:139` (*"It does not rewrite your partner's activation
   files"*) survives intact, because `posture.md` and `recency_directives.md` are not under `hooks/`.
@@ -221,6 +221,25 @@ The option the measurement actually points at, and the only one that shrinks the
     `_check_hook_freshness` docstring records that **taking half that chain shipped twice** — 0.4.0
     (wrong-tree for every codex install, permanent exit 1) and 0.4.1 (pack-owned hooks reported stale,
     `init --force` unable to clear it). Reuse the helper whole; do not re-derive it.
+- ⛔ **D3 — AND THIS IS THE PREREQUISITE BOTH OF THEM NEED, WHICH I HAD WRONG UNTIL I MEASURED THE
+  RENDER PATH. `levain/install.py:1640` `_copy_activation_tree` composes the WHOLE activation tree and
+  swaps it in atomically (its own docstring: staging dir, atomic swap, fail-loud on a vanished source).
+  It has NO subtree filter** — `_activation_excluded` (`levain/install.py:1600`) skips only
+  `__pycache__` and `*.pyc`. Its two callers are `levain/install.py:1458` and `:1503`.
+  - ⚖ **So "scoped to `hooks/` only" is not a narrower call to an existing function.** It needs either
+    a new mode on a function whose atomic-swap and fail-loud contracts are load-bearing, **or** a
+    second, narrower render path — and a SECOND COPY OF THE LAYERING RULE is precisely what shipped
+    as a defect twice (`_check_hook_freshness`'s docstring, 0.4.0 and 0.4.1).
+  - ⚡ **That inverts the comparison I wrote one bullet up: THE VERB IS THE CHEAP PART, THE NARROWING
+    IS THE EXPENSIVE PART.** D1 can reuse the atomic path unchanged; D2 cannot.
+  - ⛔ **But the binding constraint is neither, and it is the same for both: §3.** D1 is "run
+    `init --force` for you automatically", which makes the known patch-destruction automatic. D2 hits
+    it too the moment it writes `hooks/`. **The backup covers two markdown files
+    (`install.py:1597`), and a hook is not one of them.**
+  - ▶ **THEREFORE: WIDEN THE BACKUP BEFORE AUTOMATING ANY RE-RENDER.** Small, independently valuable,
+    and it is the honest first step of D whichever shape D takes. It is also the only part of D that
+    is worth doing even if D is declined.
+
 - **Either D also needs a decision on the CARRIER** (`_check_carrier_freshness`, `doctor.py:1248`) —
   same family, currently latent. Covering hooks and leaving the carrier is
   `guard_scoped_by_symptom_misses_the_class`, which this file has already shipped twice.
@@ -255,15 +274,29 @@ Because:
 ⛔ **What I would NOT do under any option: soften, downgrade, or exempt `hook freshness`.** It is the
 carrier for shipped fixes reaching operators; it exists because one did not.
 
+▶ **AND D HAS AN ORDER, WHICH THE MEASUREMENT SETTLED RATHER THAN PREFERENCE:**
+**D3 first — widen the backup past two markdown files.** Automating a re-render on top of today's
+backup scope automates §3's silent patch-destruction, and that is true of D1 and D2 equally. D3 is
+small, it is the only part of D worth doing even if D is declined, and it is the difference between
+"we shipped an upgrade path" and "we shipped a thing that eats operator patches faster."
+Then the shape: **D1 reuses the atomic render unchanged; D2 must either modify it or duplicate the
+layering rule that has already shipped as a defect twice.** If both are on the table, D1 is the
+cheaper build and D2 is the tidier product surface — that trade is Phill's, not mine.
+
 **If the answer is "not now":** A alone is coherent and costs nothing. `spore-840` stays open, and the
-`[Unreleased]` note keeps operators correctly informed in the meantime.
+`[Unreleased]` note keeps operators correctly informed in the meantime. ⭐ **D3 and F still stand on
+their own in that world** — both are small, neither commits to a design, and both address harm that is
+happening to a real operator now.
 
 ---
 
 ## 7. ⚖ WHAT NEEDS PHILL
 
 1. **D or not-D**, and if D, **D1 (new verb) or D2 (fold into `update`)**. This is a product-surface
-   decision, not a code one.
+   decision, not a code one. ⚠ Note the build costs run OPPOSITE to the surface costs (§5 D3): D2 is
+   the tidier surface and the more expensive build.
+   ⛔ **And D3 — widening the activation backup past two markdown files — is a YES-OR-NO of its own,
+   worth taking even if D is declined.**
 2. **Does D cover the carrier as well as the hooks**, or hooks only?
 3. **Option F on its own** — authorise the hint correction independently of everything above?
 4. **Sequencing against the install-path pass** (`spore-751` + `spore-775` + `spore-724`). §4 shows
