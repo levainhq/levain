@@ -209,7 +209,15 @@ The option the measurement actually points at, and the only one that shrinks the
   machinery, `activation/*.md` is operator-owned — so the shipped promise in
   `levain/templates/docs/operator-manual.md:139` (*"It does not rewrite your partner's activation
   files"*) survives intact, because `posture.md` and `recency_directives.md` are not under `hooks/`.
-  - ⛔ *Cost, and it is real:* it makes `update` mutate the install tree. Today `update` is the SAFE
+  - ⛔ *Cost, and it is real — but stated precisely, because the loose version overstates it:* `update`
+    ALREADY writes files (`.levain/manifest.json`, and pack reconciles under `seed/`). **What it has
+    never written is `activation/`** — verified, not quoted: `levain/update.py` contains ZERO
+    references to `apply_init`, `_install_adapter`, `_copy_activation_tree` or any `levain.install`
+    import, and `levain/reconcile.py:296–297` SURFACES an `activation/` change rather than applying
+    it (`:375` — *"the adapter @import list is NOT regenerated"*). So D2 does not make a read-only
+    command destructive; it extends a writing command across the one boundary it has always
+    respected. That is a smaller step than "mutate the install tree" implies, and still a real one:
+    today `update` is the SAFE
     command and `init --force` is the destructive one, and operators are told so. Automating the hook
     re-render makes §3's silent patch-destruction **automatic and less visible** — so D2 must ship a
     hook backup, which does not exist today (`_OPERATOR_EDITABLE` is two markdown files).
