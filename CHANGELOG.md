@@ -6,7 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-Stamped `0.4.4.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+## [0.4.4] — 2026-09-06
+
+**The crown-jewels confinement floor stops reporting coverage it does not have.** Three ways a path or a socket could sit outside the floor while the tooling said it was fenced: a `~user` path that threw its way past the check, a container daemon socket that defeated the floor entirely, and a listed socket resolved before the shell it fences existed. The `levain run` banner now names which sockets are covered **and which are not** — the deny is an enumeration, and an enumeration is always incomplete.
+
+Alongside it: `doctor` stops reporting green on two of the three ways to write user-level wiring, both local servers stop mishandling two `Content-Length` cases, and the test suite has zero permanent failures for the first time.
 
 ### Fixed — a `~user` path could throw its way past the crown-jewels check
 
@@ -185,6 +189,10 @@ No behaviour change; the enforcement was correct throughout and is stricter than
 ### Fixed — the suite has zero permanent failures for the first time
 
 Nine tests failed on every run, on any machine without the optional `mcp` and `openhands` extras, because three sites lacked the guard used at a dozen others — seven in an unguarded `build_app` test class, two at `openhands` import sites. A permanent red is indistinguishable from a real regression, which made "the suite is green" unusable as evidence. A base install now runs the suite to zero failures, and the nine skip and say why.
+
+### Changed — the tree between releases is stamped `.devN`
+
+**A release tag names a tree, and the commit after it no longer claims the same version.** For one window in 0.4.3 the tag and the commit after it both read `version = "0.4.3"` while that commit had rewritten the `[wrap blocked]` message the shipped hook emits — so `0.4.3` named two different trees, and what a developer cloned was not what an adopter installed, with nothing in the tree saying so. **The release commit is now the last one on its number**; the next commit bumps both stamps (`pyproject.toml` and `levain/__init__.py`) to the next `.dev0`. Asserted by the test suite rather than left to a release checklist — the checklist is what missed it. See *Versioning* at the foot of this file.
 
 ### Changed — `[wrap blocked]` no longer names a shell command or a false count
 
