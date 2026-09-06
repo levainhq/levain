@@ -23,6 +23,7 @@ from levain.install import (
     _clear_checkpoint,
     _compose_activation_layers,
     _copy_activation_tree,
+    _is_hook_script,
     _same_contents,
     _behavior_note_lines,
     _fill_seed_imports,
@@ -1900,6 +1901,80 @@ def test_same_contents_is_bounded_and_correct_across_chunk_boundaries(tmp_path: 
     assert _same_contents(a, b) is False
     a.write_bytes(b""); b.write_bytes(b"")        # both empty
     assert _same_contents(a, b) is True
+
+
+def _hook_layer(root: Path) -> Path:
+    """A layer whose hook carries the install-time placeholder, like the shipped one."""
+    return _mk_layer(root, {
+        "posture.md": "P\n",
+        "hooks/_levain_hook.py": 'X = 1\n_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"\n',
+    })
+
+
+def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Path):
+    """⛔ `anneal_path` is `shutil.which("anneal-memory")`, re-resolved EVERY run
+    (spore-751). So a PRISTINE installed hook's `_INSTALL_ANNEAL_BIN` line legitimately
+    differs from the line about to replace it whenever PATH resolution moves — a venv
+    vs a plain shell. Comparing raw bytes called that an operator edit and printed
+    "! Operator-edited hooks/_levain_hook.py" on a tree nobody had touched.
+
+    ⚠ AND IT RECURS: each run writes its OWN resolution in, so alternating shells
+    re-trigger it forever. Measured on real installs 2026-09-06 before the fix.
+
+    MUTATION CONTROL: drop the `_is_hook_script`/`_hook_bodies_match` branch and this
+    fails — the hook is staged with no operator involvement."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+    assert _backed_up_files(install) == []
+
+    # PATH moves: same tree, same package, different resolution. Three more flips,
+    # because two runs would miss the recurrence.
+    for path in ("/usr/local/bin/anneal-memory", "/opt/a/anneal-memory", "/usr/local/bin/anneal-memory"):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=path)
+        assert _backed_up_files(install) == [], f"pristine hook staged after moving to {path}"
+    # The substitution still happened — this is not passing by doing nothing.
+    body = (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+    assert '"/usr/local/bin/anneal-memory"' in body
+
+
+def test_a_REAL_patch_is_still_caught_when_the_anneal_path_also_moves(tmp_path: Path):
+    """⛔ THE MUTE-BUTTON CONTROL, and it is the half that makes the fix a correction
+    rather than a silencer. Normalising the substituted line must not blind the backup
+    to a genuine edit that happens to land in the same file during the same PATH move."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+
+    hook = dst / "hooks" / "_levain_hook.py"
+    hook.write_text(hook.read_text(encoding="utf-8") + "# REAL PATCH\n", encoding="utf-8")
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory")
+
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
+    assert "# REAL PATCH" in bak.read_text(encoding="utf-8")
+
+
+def test_the_normalisation_is_scoped_to_hook_scripts_only(tmp_path: Path):
+    """`_is_hook_script` must mirror `_substitute_hook_placeholders`, which walks
+    `hooks/` RECURSIVELY over `.py` — so a pack's nested hook counts and nothing
+    outside `hooks/` does. A markdown file that happens to contain the line is NOT
+    normalised: install never substitutes into it, so a difference there is real."""
+    assert _is_hook_script(Path("hooks/_levain_hook.py")) is True
+    assert _is_hook_script(Path("hooks/sub/nested.py")) is True      # packs ship these
+    assert _is_hook_script(Path("hooks/notes.md")) is False
+    assert _is_hook_script(Path("posture.md")) is False
+    assert _is_hook_script(Path("other/x.py")) is False
+
+    # End-to-end: a markdown file carrying the same line IS backed up when it differs.
+    base = _mk_layer(tmp_path / "base", {"posture.md": '_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"\n'})
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {"posture.md": '_INSTALL_ANNEAL_BIN = "/opt/a/anneal-memory"\n'})
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+    assert _backed_up_files(install) == ["posture.md"]
 
 
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):

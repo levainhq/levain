@@ -1608,6 +1608,75 @@ def _activation_excluded(rel: Path) -> bool:
     )
 
 
+_HOOK_NORMALISE_MAX_BYTES = 8 << 20  # a hook script is ~30KB; see _hook_bodies_match
+
+
+def hook_body(text: str) -> str:
+    """A hook script's comparable body: the ONE install-time substitution normalised
+    away, so a healthy install is not reported as drifted.
+
+    ⛔ SINGULAR, DELIBERATELY. This used to say "placeholder substitutionS", which promised more
+    than the regex below delivers — it normalises exactly `_INSTALL_ANNEAL_BIN`, the line
+    `{{ANNEAL_MEMORY}}` becomes. `_substitute_hook_placeholders` is called with a dict
+    (`{"{{ANNEAL_MEMORY}}": anneal_path}`) and its own docstring says "and potentially more keys
+    later" — so the day a second key ships, this function silently UNDER-normalises and every
+    install reads stale. The plural was a description of an intention, and it would have read as
+    coverage.
+
+    ⚠ AND THE BLAST RADIUS DOUBLED 2026-09-03: the pack branch of `doctor._check_hook_freshness`
+    normalises through here too, so an under-normalisation would false-red pack hooks as well as
+    base ones. `test_hook_body_normalises_every_placeholder_install_substitutes` pins the coupling
+    so adding a key without teaching this function fails loudly instead of shipping.
+
+    ⚠ IT LIVES HERE, NOT IN `doctor`, AS OF 2026-09-06 — beside the substitution it inverts.
+    The docstring above worried about staying in lockstep with `_substitute_hook_placeholders`
+    while sitting in a different module; that is the coupling, and adjacency is the cheapest
+    guard for it. TWO consumers now: `doctor`'s freshness check (imports it under the old
+    private name, unchanged) and `_copy_activation_tree`'s operator-edit backup below.
+    """
+    return re.sub(
+        r"^_INSTALL_ANNEAL_BIN = .*$", "_INSTALL_ANNEAL_BIN = <>", text, flags=re.M
+    ).strip()
+
+
+def _is_hook_script(rel: Path) -> bool:
+    """Whether a relative activation path is a hook `.py` that install substitutes into.
+
+    Mirrors `_substitute_hook_placeholders(new_tree / "hooks", ...)`, which walks
+    `hooks/` RECURSIVELY over `.py` files — so a pack's nested `hooks/sub/x.py`
+    counts, exactly as the substitution reaches it.
+    """
+    return bool(rel.parts) and rel.parts[0] == "hooks" and rel.suffix == ".py"
+
+
+def _hook_bodies_match(current: Path, staged: Path) -> bool:
+    """Whether two hook scripts differ ONLY in what install itself substitutes.
+
+    ⛔ THE QUESTION THIS EXISTS TO ASK. `anneal_path` is `shutil.which("anneal-memory")`,
+    re-resolved on EVERY run, so the `_INSTALL_ANNEAL_BIN` line of a PRISTINE installed
+    hook legitimately differs from the line about to replace it whenever PATH resolution
+    moves between installs (a venv vs a plain shell — `spore-751`). Comparing raw bytes
+    calls that an operator edit and backs the file up with a false "Operator-edited"
+    notice. MEASURED 2026-09-06: it also recurs, because each run writes its own
+    resolution in, so alternating shells re-trigger it indefinitely.
+
+    ⚠ Only reached when the bytes ALREADY differ, so the whole-file read is off the
+    common path — and capped, because `_copy_activation_tree` must not load an arbitrary
+    file into memory. Over the cap, or not decodable as text, returns False: not
+    normalisable, so preserve it. Every uncertain answer here errs toward keeping the
+    operator's bytes.
+    """
+    if (current.stat().st_size > _HOOK_NORMALISE_MAX_BYTES
+            or staged.stat().st_size > _HOOK_NORMALISE_MAX_BYTES):
+        return False
+    try:
+        return hook_body(current.read_text(encoding="utf-8")) == hook_body(
+            staged.read_text(encoding="utf-8")
+        )
+    except UnicodeError:
+        return False
+
+
 def _same_contents(a: Path, b: Path, *, chunk: int = 1 << 16) -> bool:
     """Whether two files hold identical bytes, compared in BOUNDED chunks.
 
@@ -1846,6 +1915,12 @@ def _copy_activation_tree(
                 if staged.is_file():
                     try:
                         if _same_contents(current, staged):
+                            continue
+                        # The bytes differ. For a hook, that is not yet an answer:
+                        # install rewrites the `_INSTALL_ANNEAL_BIN` line itself from a
+                        # PATH lookup that is not stable between runs, so ask the sharper
+                        # question — do these differ in anything INSTALL DID NOT WRITE?
+                        if _is_hook_script(rel) and _hook_bodies_match(current, staged):
                             continue
                     except OSError as e:
                         # About to replace it and can't compare it — don't destroy
