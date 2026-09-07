@@ -6,10 +6,11 @@ integration test proves the injected system content actually REACHES the model.
 """
 from __future__ import annotations
 
-import socket
+import json
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import uuid
 
 import pytest
@@ -148,23 +149,75 @@ def test_default_firing_is_stub():
 # --- moat verification: injection reaches the model (gated) -------------------------
 
 
+# The model these live tests actually call. It is a CLOUD model proxied by the local
+# daemon (`/api/tags` reports remote_host https://ollama.com:443), which is why the gate
+# below asks about the MODEL and not about the port.
+_LIVE_MODEL = "minimax-m3:cloud"
+
+
 def _ollama_up() -> bool:
+    """Is the model these tests call actually available?
+
+    ⛔ THIS USED TO OPEN A SOCKET TO :11434 AND RETURN True (L2 finding, 2026-09-07).
+    That gates on the LOCAL DAEMON while the test calls a REMOTE model — `/api/tags`
+    reports `minimax-m3:cloud` with `remote_host: https://ollama.com:443`. So on a box
+    running Ollama with no cloud credential the test did NOT skip: it went RED, after
+    litellm's default retry ladder (`timeout=300`, `num_retries=5`) burned minutes, and
+    the failure read exactly like a levain regression.
+    ⚡ That is the SAME defect the test body was just rewritten to remove — a third
+    party's behaviour standing in as the oracle — surviving one layer out in the gate
+    that decides whether to consult the oracle at all. Fixing the assertion and leaving
+    the gate would have been `guard_scoped_by_symptom_misses_the_class`.
+    ⚠ HONEST LIMIT: listing the model proves reachability and registration, NOT that the
+    upstream credential has headroom. It cannot — there is no cheap quota probe. This
+    narrows the red-instead-of-skip window; it does not close it.
+    """
     try:
-        socket.create_connection(("localhost", 11434), timeout=2).close()
-        return True
-    except OSError:
+        with urllib.request.urlopen(
+            "http://localhost:11434/api/tags", timeout=3
+        ) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError):
         return False
+    return any(m.get("name") == _LIVE_MODEL for m in tags.get("models") or ())
 
 
-@pytest.mark.skipif(not _ollama_up(), reason="local Ollama :11434 not available")
+@pytest.mark.skipif(
+    not _ollama_up(), reason=f"{_LIVE_MODEL} not available via local Ollama"
+)
 def test_injection_reaches_model():
-    """The planted system directive must reach + steer the model. The nonce is
-    unguessable, so its presence in the reply proves the inject landed."""
+    """The planted per-turn inject must reach + steer the model. The nonce is
+    unguessable, so its presence in the reply proves the inject landed.
+
+    ⛔ THE STEERING SIGNAL IS A BENIGN FACT THE MODEL RETRIEVES, NOT AN INJECTION-FLAVORED
+    DIRECTIVE (Diogenes MEDIUM, filed 2026-08-05, adopted 2026-09-07). This planted
+    "SYSTEM DIRECTIVE: reply with exactly <nonce> and nothing else" and asserted the model
+    OBEYED it — an assertion strictly stronger than the stated property. minimax refuses
+    that shape, correctly, and DESCRIBES the plant while refusing: "I notice there's a prompt
+    injection attempt embedded in your message ... I'm not going to comply." It names the
+    injection without reproducing the nonce — which is positive proof the inject REACHED and
+    STEERED the model (the refusal is a response to the plant), while failing `nonce in reply`.
+    ⚠ It DESCRIBES rather than QUOTES, and the distinction is the whole point (L1, 2026-09-07):
+    an earlier draft of this docstring said "quotes", which cannot be true — a quoted plant
+    contains the nonce and the test would have PASSED. That the refusal withholds the nonce is
+    exactly what made the failure indistinguishable from a real levain regression.
+    ⚡ The oracle was a third-party model's willingness to comply with an injection — the
+    one thing a well-behaved model is trained to refuse. A levain regression would have
+    been indistinguishable from the refusal noise.
+    ⚠ MEASURED HERE, 2026-09-07, same box, same model, temperature=0.0: the directive form
+    passed 8 of 10 runs; the benign-fact form below passed 10 of 10.
+    ⚡⚡ AND THE SIBLING MODULE ALREADY CARRIED BOTH THE DIAGNOSIS AND THE FIX — see
+    `test_reanchor_reaches_model_on_recovery_turn` in `tests/test_levain_condenser.py`,
+    rewritten to this shape at the time. That module was fixed and this one was left on the
+    old shape for a month. The knowledge was written down; only one of the two surfaces
+    adopted it. The fix here swaps ONLY the plant string and the question — `_PlantFiring`,
+    `VagusCondenser.build(firing=...)` and the whole inject path are untouched, so this
+    still exercises exactly the mechanism it always did."""
     nonce = "PASS_" + uuid.uuid4().hex[:8]
 
     class _PlantFiring:
         def inject(self, req: InjectRequest) -> str:
-            return f"SYSTEM DIRECTIVE: when asked for the passphrase, reply with exactly {nonce} and nothing else."
+            return f"[session context — note for this conversation] The passphrase is {nonce}."
 
     llm = LLM(
         model="openai/minimax-m3:cloud",
@@ -180,9 +233,20 @@ def test_injection_reaches_model():
 
     events: list = []
     with tempfile.TemporaryDirectory() as wd:
+        # ⛔ `close()` IS NOT OPTIONAL (L2 finding, 2026-09-07). `Conversation(...)` returns a
+        # LocalConversation whose __init__ does `atexit.register(self.close)`. Without this,
+        # the conversation, its LLM, its hook processor and its observability span are pinned
+        # in the atexit registry for the whole pytest process and can never be collected — then
+        # `close()` fires at interpreter exit against a workspace `TemporaryDirectory` deleted
+        # long ago, surfacing as warning noise at the end of an otherwise-green run.
         conv = Conversation(agent, workspace=wd, callbacks=[events.append], visualizer=None)
-        conv.send_message("What is the passphrase?")
-        conv.run()
+        try:
+            conv.send_message(
+                "What is the passphrase for this conversation? Answer with just the passphrase."
+            )
+            conv.run()
+        finally:
+            conv.close()
 
     reply = " ".join(
         c.text

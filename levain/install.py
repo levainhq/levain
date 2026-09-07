@@ -725,6 +725,24 @@ def _atomic_write_text(target: Path, payload: str) -> None:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
+        # ⛔ CARRY THE EXISTING MODE ACROSS THE INODE SWAP — the SAME class as the codex
+        # `config.toml` widening, running in the OPPOSITE direction (Diogenes MEDIUM
+        # 2026-09-07 found that one; L2 found this one by asking what else swaps inodes).
+        # `mkstemp` always creates 0o600 REGARDLESS OF UMASK, so `os.replace` silently
+        # NARROWS an operator's mode here rather than widening it. MEASURED on this helper:
+        # 0o644 -> 0o600 and 0o640 -> 0o600, on `.levain/config.json`, which this function's
+        # own docstring calls the SHARED operator file. An operator who opened it up so a
+        # second account could read the dashboard config had it closed again by the next
+        # `levain update`, with an unrelated-looking permission error at the reader.
+        # ⚖ FIXED IN THE HELPER, NOT AT THE CALL SITES, because the defect belongs to the
+        # inode swap and every caller inherits it — `guard_scoped_by_symptom_misses_the_class`
+        # is what fixing this at `_write_brand_config` would have been.
+        # ⚠ Only when the target EXISTS: for a new file `mkstemp`'s 0o600 is the safer
+        # default and there is no operator intent to preserve. `copymode` and not `copystat`
+        # — restore the property that was lost, not every property the API offers; the
+        # mtime MUST advance here, the file changed.
+        if target.exists():
+            shutil.copymode(target, tmp)
         os.replace(tmp, target)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -1824,6 +1842,17 @@ def _copy_activation_tree(
         )
 
     backups: list[tuple[str, Path]] = []
+    # ⛔ BUFFERED FOR THE SAME REASON `backups` IS (glm-5.3 L3 LOW, 2026-09-07). These
+    # best-effort notes used to be emitted inside the backup loop — i.e. BEFORE the swap and
+    # before any LATER file could abort the run. A file whose staging failed printed "the edit
+    # is not recoverable", then a different file's `copy2` raised, `InitError` aborted, `dst`
+    # was left untouched, and the file the operator was told about was fully intact. The same
+    # false statement lands if the swap itself fails and the tree is restored from `old_aside`.
+    # ⚡ `a_true_statement_standing_where_a_thing_should_be` — a claim about a world that never
+    # happens. It is precisely the defect `_merge_codex_config` was corrected for on 09-06
+    # ("announced only AFTER it lands"), still live in the sibling function, which is why the
+    # success notices below were already buffered and these were not.
+    unstaged_notes: list[str] = []
     backup_staging: Path | None = None  # this run's backup dir; cleaned on any failure
 
     # Build the new tree in a STAGING dir, then swap it into place atomically — so
@@ -1976,7 +2005,7 @@ def _copy_activation_tree(
                         # substituted line with no trace at all, which is the failure
                         # mode of "act safely, stay quiet". The copy is allowed to
                         # fail; the SILENCE is not.
-                        emit(
+                        unstaged_notes.append(
                             f"  note: could not stage a copy of {name} (backup dir under "
                             f"{dst.parent / '.levain' / 'backups'} could not be created). "
                             f"Proceeding — but if you had edited that file, the edit is "
@@ -2037,6 +2066,8 @@ def _copy_activation_tree(
     if old_aside is not None:
         shutil.rmtree(old_aside, ignore_errors=True)
 
+    for note in unstaged_notes:
+        emit(note)
     for name, bak in backups:
         emit(f"  ! Operator-edited {name} preserved at {bak}")
 
@@ -2157,22 +2188,47 @@ def _merge_codex_config(
     new_block = new_block_match.group(0).rstrip() + "\n"
 
     repoint: tuple[str, str, Path] | None = None
+    unknown_prior: Path | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
         old_store = _codex_block_store(old_block_match.group(0))
         new_store = _codex_block_store(new_block)
-        if old_store and new_store and old_store != new_store:
+        # ⛔ THE BACKUP IS KEYED ON REPLACING A BLOCK, NOT ON HAVING PARSED THE OLD STORE
+        # (glm-5.3 L3 MED, 2026-09-07, reproduced on disk). This used to require BOTH stores
+        # to parse. `_codex_block_store` returns None whenever the block is not the shape we
+        # write — `args` absent, not a list, or carrying no `--db`, e.g. an operator who moved
+        # their store into a wrapper `command`. The `sub` below replaced that block ANYWAY,
+        # in the machine-global config, with NO backup and NO message: measured, an operator
+        # block naming its own store via a wrapper was destroyed with EMPTY output.
+        # ⚡ So the guard did not fire on exactly the HAND-EDITED input it exists for, and
+        # this function's own docstring already states the rule it was breaking: "a guard that
+        # does not fire on a valid input is worse than no guard, because the absence reads as
+        # approval." Not-parsing is LESS reason to proceed silently, not more — an unreadable
+        # prior state is the case where a copy matters most.
+        # ⚖ Still warn-not-refuse, unchanged: repointing is a legitimate operator action and
+        # the documented repair for this very defect. Re-running against the store already
+        # registered stays silent, because nothing is being taken away.
+        replacing_unknown = old_store is None
+        if replacing_unknown or (old_store and new_store and old_store != new_store):
             bak = _timestamped_backup_path(path)
             try:
                 shutil.copy2(path, bak)
             except OSError as e:
+                whither = (
+                    "whose current store could not be read"
+                    if replacing_unknown
+                    else f"from {old_store} to {new_store}"
+                )
                 raise InitError(
-                    f"could not back up {path} ({e}) before repointing Codex's global "
-                    f"anneal memory from {old_store} to {new_store}. Refusing to repoint "
+                    f"could not back up {path} ({e}) before replacing Codex's global "
+                    f"anneal memory registration {whither}. Refusing to change "
                     f"the machine-wide registration without a copy; fix the permissions "
                     f"and re-run."
                 ) from e
-            repoint = (old_store, new_store, bak)
+            if replacing_unknown:
+                unknown_prior = bak
+            else:
+                repoint = (old_store, new_store, bak)
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2188,17 +2244,96 @@ def _merge_codex_config(
     # before the write means a failure leaves a notice describing a repoint that
     # never happened — a true-sounding statement about a world that does not exist.
     # codex L3 MED + glm L3 MED, convergent.
-    tmp = path.with_name(f"{path.name}.levain-new-{time.time_ns()}")
+    # ⛔ `copymode` IS LOAD-BEARING, NOT TIDINESS (Diogenes MEDIUM, 2026-09-07, reproduced
+    # here in both directions). `os.replace` swaps the INODE, so without it the file's mode
+    # is whatever the fresh `tmp` inherited from the umask and the operator's is discarded.
+    # The `write_text` this block replaced truncated the EXISTING inode and so preserved the
+    # mode for free — the atomicity fix silently traded it away. MEASURED, real repoint of a
+    # 0o600 config: 0o600 -> 0o644 without this line, 0o600 -> 0o600 with it.
+    # ⚖ `copymode` AND NOT `copystat`, MEASURED RATHER THAN ASSUMED. The first fix here used
+    # `copystat`, which restores the mode AND the timestamps: the repointed file then claims
+    # it was never modified. Probed side by side on this box — `copystat` leaves `st_mtime`
+    # UNCHANGED across a real content change, `copymode` lets it advance. The target is the
+    # pre-0.4.5 `write_text` semantics, which preserved the mode and moved the mtime, so
+    # restoring the mode ALONE is the whole correction; carrying timestamps and macOS
+    # `st_flags` across is a second deviation dressed as thoroughness. **Restore exactly the
+    # property that was lost, not every property the API offers.**
+    # ⚡ AND THE REPOINT BACKUP EARLIER IN THIS FUNCTION ALREADY GOT IT RIGHT: it uses
+    # `shutil.copy2`, which carries the mode, so on the same run `config.toml.bak.<ns>`
+    # stayed 0o600 while the live `config.toml` beside it went 0o644. The copy made to
+    # protect operator state was better protected than the file itself.
+    # ⛔ CITED BY SYMBOL, NOT BY DISTANCE, AND THIS IS THE THIRD TIME THE SAME FIGURE WENT
+    # WRONG IN THE SAME PARAGRAPH. The finding said "the backup ELEVEN LINES UP"; at the
+    # commit it was filed against, `shutil.copy2` was at :2167 and `os.replace` at :2194 —
+    # 27, so it was NEVER true, not even of the file it described. The first draft of this
+    # comment copied "eleven" forward AND excused it as once-correct; both were wrong.
+    # ⚡ THEN THE REPLACEMENT FIGURE ROTTED THREE TIMES WHILE THIS PARAGRAPH WAS BEING
+    # WRITTEN — each measurement correct when taken and stale by the next keystroke,
+    # because the thing being measured is the distance to the sentence doing the measuring.
+    # No current figure is stated here for that reason. The only stable distance is one
+    # anchored to a COMMIT (27, at 0d09703), because that file cannot change.
+    # ⚖ A DISTANCE IS A COORDINATE WEARING A DIFFERENT WORD — and it is WORSE than a line
+    # number, because it rots on the writer's OWN keystrokes rather than on someone else's
+    # later edit. `tools.py` already ruled "cite the symbol, not the line"; that rule was
+    # obeyed to the letter here and broken anyway, because "eleven lines up" did not read
+    # as a coordinate. `shutil.copy2` is greppable and survives every edit above it.
+    # ⛔ THE MODE IS RESTORED; ACLs AND XATTRS ARE NOT, AND THIS COMMENT MUST NOT READ AS
+    # "PERMISSIONS ARE PRESERVED" (L2 finding, 2026-09-07, measured on this box). `os.replace`
+    # drops both, and nothing in the `shutil.copy*` family restores an ACL on macOS —
+    # `shutil._copyxattr` is a NO-OP on darwin because `os.listxattr` does not exist there.
+    # Verified: a `chmod +a "group:staff allow read"` ACE on the config is GONE after the
+    # swap, and this machine's real `~/.codex/config.toml` carries a `com.apple.provenance`
+    # xattr that does not survive either. So an operator who restricted this file with
+    # `chmod +a` rather than a mode bit still gets it silently unrestricted here.
+    # ⚠ Named rather than fixed, deliberately: the repair is a different shape (write through
+    # the existing inode, or re-apply the ACL explicitly) and it trades against the atomicity
+    # this block exists to provide. Routed, not taken. A false "permissions preserved" claim
+    # would be worse than the documented gap — that is this repo's own rule about the
+    # activation tree's symlink exception, applied here.
+    # ⚠ This file is machine-global by this function's own docstring and sits beside
+    # `~/.codex/auth.json`. An operator who chmod'ed it 0o600 meant it, and this is the
+    # DOCUMENTED REPAIR path — the one place we are guaranteed to touch it.
+    # ⚖ INSIDE the `try` on purpose: a copymode failure aborts before `os.replace`, so the
+    # existing error's "Codex's registration is unchanged" stays TRUE. Fail-closed matches
+    # this module's stance; best-effort here would restore the silent widening it fixes.
+    # ⛔ REPLACE THE SYMLINK'S TARGET, NOT THE SYMLINK (L1 finding, 2026-09-07, reproduced).
+    # `os.replace` onto a symlink REPLACES THE LINK WITH A REGULAR FILE. Measured: a
+    # `~/.codex/config.toml` symlinked into a dotfiles repo came back `is_symlink=False`
+    # with the repointed content, while THE REAL FILE STILL HELD THE OLD REGISTRATION — so
+    # the operator's next `stow`/`chezmoi apply` silently reverts the repoint we just
+    # announced. `a_true_statement_standing_where_a_thing_should_be`: the notice was
+    # accurate at the moment it printed and describes a world that ends at the next re-stow.
+    # ⚠ `resolve()` is safe here: the `not path.is_file()` early-return above already
+    # rejected a broken link, and on a regular file it is a no-op. The operator-facing
+    # messages keep saying `path` — the name they typed — while the write lands on the
+    # inode that name actually refers to.
+    # ⚠ KNOWN-OPEN, NOT FIXED HERE: a HARDLINKED config still loses its link (nlink 2 -> 1)
+    # and the other name keeps the old content. There is no atomic-rename form that
+    # preserves a hardlink; fixing it means writing through the existing inode, which is
+    # exactly the truncation risk this block exists to remove. Documented in the CHANGELOG
+    # rather than silently traded.
+    target = path.resolve()
+    tmp = target.with_name(f"{target.name}.levain-new-{time.time_ns()}")
     try:
         tmp.write_text(existing, encoding="utf-8")
-        os.replace(tmp, path)
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
     except OSError as e:
         tmp.unlink(missing_ok=True)
         raise InitError(
             f"could not write {path} ({e}). Codex's registration is unchanged"
             + (f"; your previous config is also copied at {repoint[2]}." if repoint
-               else ".")
+               else f"; your previous config is also copied at {unknown_prior}."
+               if unknown_prior is not None else ".")
         ) from e
+
+    if unknown_prior is not None:
+        emit(f"  ! Codex's GLOBAL anneal_memory block was replaced in {path}.")
+        emit("    Its previous store could not be read, so it was not a shape levain")
+        emit("    wrote — if you had customised that block, that customisation is gone.")
+        emit(f"    Your previous config is copied at {unknown_prior}")
+        emit("    (Every codex session on this machine reads that block, not just this")
+        emit("     install.)")
 
     if repoint:
         old_store, new_store, bak = repoint

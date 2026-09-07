@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 
 import pytest
 
 from levain.install import (
+    _atomic_write_text,
     InitError,
     _base_activation_root,
     _checkpoint_path,
@@ -2210,6 +2212,209 @@ def test_a_store_path_with_a_backslash_is_inserted_LITERALLY(tmp_path: Path):
     written = path.read_text(encoding="utf-8")
     assert weird in written, "the store path must be inserted literally, not expanded"
     assert "old.db" not in written
+
+
+def test_an_UNPARSEABLE_codex_block_is_backed_up_and_announced_before_replacement(tmp_path: Path):
+    """⛔ glm-5.3 L3 MED, 2026-09-07, reproduced on disk before fixing. The repoint backup used
+    to require BOTH the old and new store to PARSE. `_codex_block_store` returns None whenever
+    the block is not the shape levain writes — `args` absent, not a list, or carrying no
+    `--db` — e.g. an operator who moved their store into a wrapper `command`. The block was
+    replaced anyway, in the MACHINE-GLOBAL config, with no backup and EMPTY output.
+
+    ⚡ So the guard failed to fire on precisely the hand-edited input it exists to protect,
+    and `_merge_codex_config`'s own docstring already states the rule being broken: "a guard
+    that does not fire on a valid input is worse than no guard, because the absence reads as
+    approval." An unreadable prior state is the case where a copy matters MOST.
+
+    ⚖ Warn, do not refuse — unchanged. The point is the copy and the words, not a block.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[mcp_servers.anneal_memory]\n'
+        'command = "/opt/my-wrapper --db /home/op/precious.db"\n'
+        'args = ["serve"]\n',
+        encoding="utf-8",
+    )
+    assert _codex_block_store(path.read_text(encoding="utf-8")) is None, (
+        "fixture must be a block whose store does NOT parse — that is the whole case"
+    )
+
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/home/op/new.db"), emit=said.append)
+
+    baks = list(tmp_path.glob("config.toml.bak.*"))
+    assert len(baks) == 1, "an unreadable prior block must still be copied aside"
+    assert "precious.db" in baks[0].read_text(encoding="utf-8"), (
+        "the backup must hold the operator's original block"
+    )
+    assert said, "replacing an operator's customised global block must not be silent"
+    assert any("replaced" in m for m in said)
+    assert any(str(baks[0]) in m for m in said), "the notice must name where the copy is"
+    assert "/home/op/new.db" in path.read_text(encoding="utf-8")
+
+
+def test_re_running_against_the_SAME_store_stays_silent_and_makes_no_backup(tmp_path: Path):
+    """The documented no-op: re-running `init --adapter codex` against the store already
+    registered takes nothing away, so it must neither warn nor litter backups. Pinned because
+    the fix above widened WHEN a backup is taken, and the obvious over-correction is to back
+    up on every run — which would turn the ordinary re-install into backup spam and train the
+    operator to ignore the notice that matters."""
+    path = tmp_path / "config.toml"
+    path.write_text(_codex_cfg("/home/op/same.db"), encoding="utf-8")
+
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/home/op/same.db"), emit=said.append)
+
+    assert not list(tmp_path.glob("config.toml.bak.*")), "no-op run must not create a backup"
+    assert said == [], f"no-op run must be silent, said: {said!r}"
+
+
+def test_repointing_codex_writes_THROUGH_a_symlinked_config(tmp_path: Path):
+    """⛔ L1 finding, 2026-09-07. `os.replace` onto a symlink REPLACES THE LINK with a regular
+    file. Measured before the fix: a `~/.codex/config.toml` symlinked into a dotfiles repo
+    came back `is_symlink=False` carrying the new registration, while THE REAL FILE STILL HELD
+    THE OLD ONE.
+
+    ⚡ The consequence is worse than a lost symlink. `init` prints "now points at <store>",
+    which is true at that instant — and the operator's next `stow` / `chezmoi apply` restores
+    the real file over it and silently reverts the repoint. A machine-wide registration that
+    un-does itself later, having been correctly announced.
+    `a_true_statement_standing_where_a_thing_should_be`.
+
+    ⚠ HARDLINKS ARE NOT COVERED and that is deliberate, not an oversight: `os.replace` breaks
+    a hardlink (nlink 2 -> 1) and no atomic-rename form preserves one. Fixing it means writing
+    through the existing inode, which reintroduces the truncation risk the atomic write exists
+    to remove. Documented in the CHANGELOG as known-open rather than silently traded away.
+    """
+    real_dir = tmp_path / "dotfiles"
+    real_dir.mkdir()
+    real = real_dir / "codex_config.toml"
+    real.write_text(_codex_cfg("/home/op/old.db"), encoding="utf-8")
+    os.chmod(real, 0o600)
+
+    link = tmp_path / "config.toml"
+    link.symlink_to(real)
+
+    _merge_codex_config(link, _codex_cfg("/home/op/new.db"), emit=lambda _m: None)
+
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    assert "/home/op/new.db" in real.read_text(encoding="utf-8"), (
+        "the repoint landed on the link and not on the file it points at, so the operator's "
+        "next dotfile re-stow silently reverts it"
+    )
+    assert "old.db" not in real.read_text(encoding="utf-8")
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+    assert not list(real_dir.glob("*.levain-new-*")), "temp file left beside the real config"
+
+
+def test_atomic_write_text_PRESERVES_an_existing_files_mode(tmp_path: Path):
+    """⛔ THE SAME CLASS AS THE CODEX CONFIG WIDENING, RUNNING IN THE OPPOSITE DIRECTION
+    (L2 finding, 2026-09-07). `_atomic_write_text` is the helper behind `.levain/config.json`
+    — the file its own docstring calls the SHARED operator file. It writes via
+    `tempfile.mkstemp`, which creates `0o600` REGARDLESS OF UMASK, then `os.replace`s it. So
+    where the codex path WIDENED an operator's mode, this one NARROWED it.
+
+    Measured before the fix: `0o644 -> 0o600` and `0o640 -> 0o600`. An operator who opened
+    `.levain/config.json` up so a second account could read it had it closed again by the
+    next `levain update`, and the resulting permission error at the reader points nowhere
+    near this code.
+
+    ⚖ FIXED IN THE HELPER, NOT AT THE TWO CALL SITES, because the defect belongs to the
+    inode swap and every caller inherits it. Patching `_write_brand_config` alone would have
+    been `guard_scoped_by_symptom_misses_the_class` — which is the finding that produced
+    this one, so fixing it that way would have been the joke telling itself.
+
+    ⚠ NO UMASK PIN NEEDED HERE, unlike the codex test: `mkstemp` ignores the umask, so the
+    pre-fix result is `0o600` on every machine and the control is real everywhere.
+    """
+    target = tmp_path / "config.json"
+    target.write_text('{"entity_name": "old"}', encoding="utf-8")
+
+    for mode in (0o644, 0o640):
+        os.chmod(target, mode)
+        _atomic_write_text(target, '{"entity_name": "new"}')
+        assert stat.S_IMODE(target.stat().st_mode) == mode, (
+            f"the inode swap narrowed the operator's mode {mode:04o} to "
+            f"{stat.S_IMODE(target.stat().st_mode):04o} on the shared operator file"
+        )
+        assert target.read_text(encoding="utf-8") == '{"entity_name": "new"}'
+
+    # A file that does NOT exist yet keeps mkstemp's 0o600 — the safer default when there is
+    # no operator intent to carry over. Pinned so "preserve the mode" is never widened into
+    # "inherit the umask" by a later edit.
+    fresh = tmp_path / "brand_new.json"
+    _atomic_write_text(fresh, "{}")
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
+
+
+def test_repointing_codex_PRESERVES_the_config_mode_the_operator_set(tmp_path: Path):
+    """⛔ Diogenes MEDIUM 2026-09-07. The atomic-write fix landed the day before wrote a
+    fresh `tmp` and `os.replace`d it into position — and `os.replace` swaps the INODE, so
+    the mode came from the umask and the operator's was discarded. The `write_text` it
+    replaced truncated the EXISTING inode and preserved the mode for free; atomicity was
+    bought with a silent permission widening on `~/.codex/config.toml`, which is
+    machine-global by this function's own docstring and sits beside `auth.json`.
+
+    ⚡ THE BACKUP IS ASSERTED TOO, BECAUSE THE ASYMMETRY IS THE FINDING: the repoint backup
+    earlier in `_merge_codex_config` uses `shutil.copy2`, which always carried the mode, so
+    the same run left `config.toml.bak.<ns>` at 0o600 while the live file the operator
+    actually uses went 0o644. The copy made to protect operator state was better protected
+    than the file itself.
+
+    ⛔ THIS ASSERTS THE MODE AND ONLY THE MODE. `os.replace` also drops ACLs and xattrs, and
+    nothing restores them on macOS (`shutil._copyxattr` is a no-op on darwin) — so a green
+    test with this name must not be read as "permissions are preserved". The gap is real,
+    measured, and documented at the fix site; it is not covered here. L2, 2026-09-07.
+    ⚠ Coverage: this exercises the REPOINT branch (`old_store != new_store`). The same-store
+    and first-install branches fall through to the identical write/copymode/replace, so they
+    had the same widening and are fixed by the same line — untested by this one.
+
+    ⚠ THE UMASK IS PINNED so this is a real mutation control. Under a 0o077 umask the
+    fresh temp file would come out 0o600 by luck and the pre-fix code would PASS — the
+    test would assert nothing on the machine most likely to run it. Measured against the
+    pre-fix tree with the umask pinned: 0o600 -> 0o644, fails as it must."""
+    path = tmp_path / "config.toml"
+    path.write_text(_codex_cfg("/home/op/old.db"), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+    # Backdate the file so the mtime assertion below cannot be defeated by filesystem
+    # timestamp granularity — this is about WHICH shutil call is used, not about clock
+    # resolution, so the gap is made explicit rather than slept for.
+    os.utime(path, (1_600_000_000, 1_600_000_000))
+    mtime_before = path.stat().st_mtime_ns
+
+    old_umask = os.umask(0o022)
+    try:
+        _merge_codex_config(path, _codex_cfg("/home/op/new.db"), emit=lambda _m: None)
+    finally:
+        os.umask(old_umask)
+
+    # ⛔ THE mtime MUST ADVANCE, AND THIS IS WHY THE FIX IS `copymode` AND NOT `copystat`
+    # (L1, 2026-09-07). The comment at the fix site spends eight lines arguing that
+    # `copystat` would carry the OLD timestamps onto newly written content, so the repointed
+    # file claims it was never modified — and with only a mode assertion, swapping `copymode`
+    # back to `copystat` is a ONE-WORD edit that passes every test in the suite. The most
+    # heavily defended claim in the change was the one nothing checked. Where the claim is
+    # load-bearing it should be an assertion; this is that assertion.
+    # ⚡ It also protects a real operator behaviour: with the old mtime stamped back on, a
+    # same-length store swap leaves size AND mtime identical, so `rsync -a`'s quick-check
+    # skips the file and the backup keeps the superseded machine-global registration.
+    assert path.stat().st_mtime_ns > mtime_before, (
+        "the config's mtime did not advance across a real content change — this is the "
+        "`copystat` behaviour the fix site's comment explicitly rejects"
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, (
+        "os.replace discarded the operator's mode on the machine-wide codex config"
+    )
+    # The repoint still actually happened — a fix that preserved the mode by not writing
+    # would satisfy the assertion above and break the function.
+    written = path.read_text(encoding="utf-8")
+    assert "/home/op/new.db" in written and "old.db" not in written
+    baks = list(tmp_path.glob("config.toml.bak.*"))
+    assert len(baks) == 1
+    assert stat.S_IMODE(baks[0].stat().st_mode) == 0o600
+    assert not list(tmp_path.glob("config.toml.levain-new-*")), "temp file left behind"
 
 
 def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path):

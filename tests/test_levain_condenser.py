@@ -16,10 +16,11 @@ in ``levain.firing`` — there is NO vagus dependency; the extra needs only open
 from __future__ import annotations
 
 import asyncio
-import socket
+import json
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import uuid
 
 import pytest
@@ -459,15 +460,42 @@ def test_inherited_firing_directive_still_rotates():
 # --- moat: the re-anchor reaches + steers the model on the recovery turn (gated) -----
 
 
+# The model these live tests actually call. It is a CLOUD model proxied by the local
+# daemon (`/api/tags` reports remote_host https://ollama.com:443), which is why the gate
+# below asks about the MODEL and not about the port.
+_LIVE_MODEL = "minimax-m3:cloud"
+
+
 def _ollama_up() -> bool:
+    """Is the model these tests call actually available?
+
+    ⛔ THIS USED TO OPEN A SOCKET TO :11434 AND RETURN True (L2 finding, 2026-09-07).
+    That gates on the LOCAL DAEMON while the test calls a REMOTE model — `/api/tags`
+    reports `minimax-m3:cloud` with `remote_host: https://ollama.com:443`. So on a box
+    running Ollama with no cloud credential the test did NOT skip: it went RED, after
+    litellm's default retry ladder (`timeout=300`, `num_retries=5`) burned minutes, and
+    the failure read exactly like a levain regression.
+    ⚡ That is the SAME defect the test body was just rewritten to remove — a third
+    party's behaviour standing in as the oracle — surviving one layer out in the gate
+    that decides whether to consult the oracle at all. Fixing the assertion and leaving
+    the gate would have been `guard_scoped_by_symptom_misses_the_class`.
+    ⚠ HONEST LIMIT: listing the model proves reachability and registration, NOT that the
+    upstream credential has headroom. It cannot — there is no cheap quota probe. This
+    narrows the red-instead-of-skip window; it does not close it.
+    """
     try:
-        socket.create_connection(("localhost", 11434), timeout=2).close()
-        return True
-    except OSError:
+        with urllib.request.urlopen(
+            "http://localhost:11434/api/tags", timeout=3
+        ) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError):
         return False
+    return any(m.get("name") == _LIVE_MODEL for m in tags.get("models") or ())
 
 
-@pytest.mark.skipif(not _ollama_up(), reason="local Ollama :11434 not available")
+@pytest.mark.skipif(
+    not _ollama_up(), reason=f"{_LIVE_MODEL} not available via local Ollama"
+)
 def test_reanchor_reaches_model_on_recovery_turn():
     """L4 moat: the behavioral re-anchor injected on the recovery turn must reach + steer the model.
 
@@ -506,9 +534,20 @@ def test_reanchor_reaches_model_on_recovery_turn():
 
     events: list = []
     with tempfile.TemporaryDirectory() as wd:
+        # ⛔ `close()` IS NOT OPTIONAL (L2 finding, 2026-09-07). `Conversation(...)` returns a
+        # LocalConversation whose __init__ does `atexit.register(self.close)`. Without this,
+        # the conversation, its LLM, its hook processor and its observability span are pinned
+        # in the atexit registry for the whole pytest process and can never be collected — then
+        # `close()` fires at interpreter exit against a workspace `TemporaryDirectory` deleted
+        # long ago, surfacing as warning noise at the end of an otherwise-green run.
         conv = Conversation(agent, workspace=wd, callbacks=[events.append], visualizer=None)
-        conv.send_message("What is the project codename for this conversation? Answer with just the codename.")
-        conv.run()  # compaction + recovery (with the re-anchor) both happen in this run
+        try:
+            conv.send_message(
+                "What is the project codename for this conversation? Answer with just the codename."
+            )
+            conv.run()  # compaction + recovery (with the re-anchor) both happen in this run
+        finally:
+            conv.close()
 
     reply = " ".join(
         c.text
