@@ -1129,9 +1129,11 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # ⛔ AND THE REASON THAT USED TO BE GIVEN FOR ACCEPTING THE GAP WAS A FALSE UNIVERSAL
     # (Diogenes 2026-09-05). It read: "one policy, two enforcers" holds for every OTHER field on
     # this policy and does NOT hold for this one. It does not hold for `deny_write_dirs` either —
-    # MEASURED by calling this predicate against every entry: **exactly ONE entry matches** — always
-    # `~/.ssh`, via the `ssh_dir` arm above — and every other entry is enforced by the seatbelt hand
-    # alone.
+    # MEASURED by calling this predicate against every entry: **under `ssh_mode="agent"` exactly ONE
+    # entry matches** — always `~/.ssh`, via the `ssh_dir` arm above — and every other entry is
+    # enforced by the seatbelt hand alone. **Under `"raw"` NOTHING matches**, because `build_policy`
+    # sets `ssh_dir=None` there and the arm is guarded on it, so the seatbelt hand enforces the
+    # whole list alone.
     # ⚠ THE COUNT IS DELIBERATELY ABSENT (Diogenes LOW, 2026-09-06). This used to read "**30
     # entries, exactly 1 matched** ... the other 29", and the total is not a property of the policy —
     # it is a property of WHERE THE ENTITY DIRECTORY SITS, because `deny_write_dirs` holds the
@@ -1143,10 +1145,26 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # 26/30/30/33. Nobody was wrong and nothing changed — each harness placed its probe directory
     # at a different depth. A number that three correct measurements disagree about is a number
     # describing the MEASURER.
-    # ⭐ **The invariant is what survives all of it: exactly ONE entry matches, in every cell, and
-    # it is always `~/.ssh` via the `ssh_dir` arm.** That is the whole of what this argument needs,
-    # and it is re-runnable by anyone from any directory. So the connect arm is not the lone exception; partial coverage is the NORM across
-    # this object, and the honest statement of the gap is that the two hands enforce DIFFERENT
+    # ⭐ **The invariant is what survives all of it: AT MOST ONE entry matches, and when one does it
+    # is always `~/.ssh` via the `ssh_dir` arm.** That is the whole of what this argument needs, and
+    # it is re-runnable by anyone from any directory.
+    # ⛔ "IN EVERY CELL" STOOD HERE AND WAS FALSE IN HALF THE CONFIGURATION SPACE (Diogenes DRIFT,
+    # 2026-09-07, re-measured here). `SshMode = Literal["agent", "raw"]`, and sweeping the full
+    # product of ssh_mode x deny_standard_creds x allow_container_sockets returns ONE match in every
+    # `"agent"` cell and ZERO in every `"raw"` one — raw is half the space, not an exotic corner.
+    # ⚠ THE CODE IS RIGHT AND ONLY THE SENTENCE OVERSTATED: `ssh_dir` is None in raw mode by
+    # design, so there is no key-confinement target for the arm to name. But it overstated toward
+    # the REASSURING reading — a maintainer would have concluded this predicate always covers
+    # `~/.ssh`, then used it as a "does the file-editor hand refuse this?" check and got a blanket
+    # no-reason in a mode the comment said was impossible. In the file that defines the security
+    # floor.
+    # ⚠ Stated by DIMENSION and not by cell count on purpose, and the first draft of this very
+    # sentence said "the eight-cell sweep ... the four agent cells" before catching itself — the
+    # same self-vouching cardinality being deleted at the `deny_write_files` renderer below, in the
+    # paragraph written to delete it. The class is easier to name than to avoid.
+    # ⚡ The zero cells make the argument below STRONGER, not weaker. So the connect arm is not
+    # the lone exception; partial coverage is the NORM across this object, and the honest
+    # statement of the gap is that the two hands enforce DIFFERENT
     # SUBSETS by construction — the file editor has no connect and no rename-of-a-directory
     # primitive, so it can only ever cover what its own primitives reach.
     # ⚠ A single-instance claim is what makes a gap look exceptional; naming it as the norm is
@@ -2029,15 +2047,25 @@ class SeatbeltProvider(ConfinementProvider):
             # config, rc)" header used to stand over the WHOLE list while TEN OF ITS LITERALS were
             # container/VM daemon sockets — MEASURED BY RENDERING A REAL PROFILE, not by reading.
             # ⚠ THIS SAID "10 of the 20 literals" AND NO CONFIGURATION PRODUCES 20 (Diogenes LOW,
-            # 2026-09-06; re-measured independently 2026-09-06). Swept all 16 cells of
-            # `build_policy` — ssh_mode x deny_standard_creds x allow_container_sockets:
-            # `len(deny_write_files)` is 14 in the eight allow_container_sockets=False cells and 4
-            # in the eight True ones. The rendered split is 4 ssh + 10 socket = 14. The RATIO is
+            # 2026-09-06; re-measured independently 2026-09-06 and again 2026-09-07). Swept the
+            # full product of `build_policy`'s ssh_mode x deny_standard_creds x
+            # allow_container_sockets: `len(deny_write_files)` is 14 wherever
+            # allow_container_sockets is False and 4 wherever it is True. The rendered split is
+            # 4 ssh + 10 socket = 14. The RATIO is
             # what this sentence needs and the TOTAL is what rots, so the total is gone: a reader
             # checking the new two-block render against "20" finds 14 and has to conclude six
             # literals were dropped from a security floor. The false figure manufactured a phantom
             # gap in the very thing the sentence was written to reassure about. `crown_jewel_reason` had already been fixed to say WHICH kind it
             # matched; this renderer was the other surface saying it and kept the false sentence.
+            # ⛔ AND THE SWEEP IS NOW NAMED BY ITS DIMENSIONS, NOT BY A CELL COUNT (Diogenes
+            # DRIFT, 2026-09-07). The paragraph above said "all 16 cells" and "the eight ... cells".
+            # All three dimensions are binary, so the product is 8 and each half is 4 — wrong by
+            # exactly a factor of two, in the one number nobody re-derives, because a cardinality
+            # describing the author's own sweep reads as provenance rather than as a claim. Every
+            # figure a reader would check was exact; only the figure vouching for how hard the
+            # author looked was wrong. Dimensions are readable off the signature and cannot disagree
+            # with it; a cardinality must be recomputed by hand the moment a dimension gains a
+            # value. This block's own thesis, applied to the block.
             # ⚠ AND THIS IS THE MORE AUTHORITATIVE SURFACE: the in-process message is transient,
             # the .sbpl is written to a file and is what the kernel enforces. An operator auditing
             # why `docker.sock` is write-denied read that it is an ssh persistence vector.

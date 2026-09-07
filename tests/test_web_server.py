@@ -1934,3 +1934,98 @@ class TestOversizeWithALyingContentLength:
             "the body — the drain stranded on the socket timeout and handle_error swallowed it"
         )
         assert b"413" in raw.split(b"\r\n", 1)[0], f"expected a 413 status line, got: {raw[:120]!r}"
+
+
+# The methods `_InitHandler` (init_server) and `_Handler` (web_server) duplicate verbatim.
+# MEASURED with the AST comparison below, not assumed: `_route`, `_send` and `do_POST` differ
+# legitimately (different route sets), and these five do not.
+_DUPLICATED_HANDLER_METHODS = (
+    "_drain", "_host_ok", "_reject", "_send_json", "log_message", "do_GET", "do_HEAD",
+    "version_string",
+)
+
+
+class TestHandlerParityAcrossTheTwoServers:
+    """⛔ Diogenes CARRIED finding, closed structurally 2026-09-07.
+
+    `levain/init_server.py`'s `_InitHandler` and `levain/web_server.py`'s `_Handler` duplicate
+    a request preamble verbatim, with no shared module between them. The finding was never
+    "a guard is missing": it is that **the remedy for a fix landing in one of two duplicated
+    handlers was to DUPLICATE the fix**, which leaves the class exactly as armed as before.
+    A later correction to one copy silently misses the other and nothing fails.
+
+    ⛔ THE FIRST VERSION OF THIS PINNED ONLY `_drain` AND ITS DOCSTRING SAID THE CLASS WAS
+    CLOSED (L1, 2026-09-07). Five methods are duplicated, not two. `_host_ok` is the
+    DNS-rebinding Host allowlist and `_send_json` writes the response headers — so a
+    hardening fix could land on `_Handler._host_ok`, never reach `_InitHandler._host_ok`,
+    and `levain init --web` would serve the old check with every test green. **That is the
+    original finding reproduced verbatim on a sibling method, past a test whose docstring
+    claimed the class was closed** — `guard_scoped_by_symptom_misses_the_class`, committed
+    inside the fix for it. Pinning one member of a duplicated set is not closing the set.
+
+    ⚖ WHY A PARITY PIN AND NOT A DEDUPLICATION. Extracting a shared request preamble across
+    two web-facing servers is a structural change with real blast radius and it is a DESIGN
+    decision, so it is routed rather than taken here. What is taken is the invariant:
+    **structural invariants beat discipline** — "remember to fix both" is the discipline that
+    already failed once.
+
+    ⚠ THE COMPARISON IS THE AST, NOT THE BYTES, AND THAT IS DELIBERATE. The docstrings
+    legitimately differ — the two `_drain` docstrings describe different routes. Pinning the
+    source text would force a false identity on prose that SHOULD describe its own server;
+    pinning the executable body catches the only drift that can hurt. `ast.dump` is called
+    without `include_attributes`, so it carries no line numbers and cannot fail on a shift.
+
+    ⚠ NO LINE NUMBER NAMES THE FINDING, deliberately. The first draft cited the source by
+    `file:line` — a CROSS-FILE coordinate into a 2000-line module under active edit, written
+    in the same session whose whole subject was retiring exactly that (L1). The methods are
+    named instead; a name survives every edit above it.
+    """
+
+    @staticmethod
+    def _body_ast(fn) -> str:
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        body = tree.body[0].body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]
+        return "\n".join(ast.dump(node) for node in body)
+
+    @staticmethod
+    def _handler_class(module):
+        """The BaseHTTPRequestHandler subclass this module defines, found by the marker
+        method rather than by name — the two classes are named differently and either may
+        be renamed."""
+        import inspect
+
+        for _, obj in inspect.getmembers(module, inspect.isclass):
+            if obj.__module__ == module.__name__ and "_drain" in obj.__dict__:
+                return obj
+        return None
+
+    @pytest.mark.parametrize("name", _DUPLICATED_HANDLER_METHODS)
+    def test_duplicated_handler_methods_have_identical_logic(self, name: str):
+        import levain.init_server as init_server
+        import levain.web_server as web_server
+
+        init_cls = self._handler_class(init_server)
+        web_cls = self._handler_class(web_server)
+        assert init_cls is not None, "no handler class found in levain.init_server"
+        assert web_cls is not None, "no handler class found in levain.web_server"
+
+        init_fn = init_cls.__dict__.get(name)
+        web_fn = web_cls.__dict__.get(name)
+        assert init_fn is not None, f"{init_cls.__name__}.{name} is gone"
+        assert web_fn is not None, f"{web_cls.__name__}.{name} is gone"
+
+        assert self._body_ast(init_fn) == self._body_ast(web_fn), (
+            f"`{name}` has diverged between {init_cls.__name__} and {web_cls.__name__}. "
+            "These handlers are duplicated on purpose (no shared request-preamble module "
+            "exists yet), so a fix to one MUST be applied to the other — that duplication "
+            "of the fix IS the standing finding. Either re-sync them, or deduplicate them "
+            "properly and delete this pin."
+        )

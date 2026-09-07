@@ -213,11 +213,28 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: read `SandboxedShell.close` in
     # confinement.py — it is "Idempotent, never raises", sets `_closed` first and nulls every
     # resource behind a None-guard, so the second call is a no-op when the override did its job.
-    # ⛔ CITE THE SYMBOL, NOT THE LINE (Diogenes LOW, 2026-09-06). This said "read at
-    # confinement.py:1694" and was EXACT when written — the next commit, six minutes later, added
-    # nine lines to `crown_jewel_reason` above it and :1694 became a blank line while the real
-    # definition moved to :1703. A symbol survives an insertion above it; a line number is
-    # invalidated by any edit anywhere earlier in the file.
+    # ⛔ CITE THE SYMBOL, NOT THE LINE (Diogenes LOW, 2026-09-06). This used to name a line in
+    # confinement.py, and it was EXACT when written — the next commit, six minutes later, inserted
+    # into `crown_jewel_reason` above it, and the cited line became a blank one while the real
+    # definition moved down. A symbol survives an insertion above it; a line number is invalidated
+    # by any edit anywhere earlier in the file.
+    # ⛔ AND THE FIRST VERSION OF THIS PARAGRAPH RESTATED THE TWO COORDINATES IT WAS RETIRING
+    # (Diogenes LOW, 2026-09-07) — "…:1694 became a blank line while the real definition moved to
+    # :1703". ⚡ THE SECOND NUMBER WAS NEVER EXACT AT ALL, AND GIT SAYS SO (L1, 2026-09-07).
+    # Tracing `SandboxedShell.close` in confinement.py across the commits that moved it:
+    # `bdb4b2f` had it at 1694 and wrote ":1694" — correct · `23fedaf`, six minutes later,
+    # moved it to 1703 and killed that citation · `fd7c4d4` moved it to 1717 AND IS THE COMMIT
+    # THAT WROTE ":1703". `git log -S"1703" -- <this file>` returns that commit alone.
+    # ⛔ So the replacement coordinate was FOURTEEN LINES WRONG AT THE INSTANT IT WAS COMMITTED:
+    # the same edit invalidated the number and wrote the sentence about the number. That is
+    # strictly sharper than the "went stale later" story it replaced, and the earlier claim that
+    # "both were exact when written" was false for one of the two.
+    # ▶ The numbers survive here only as the QUOTED dead claim, deliberately not refreshed, and
+    # the distance is stated in words for the same reason: a fresh figure inside the paragraph
+    # retiring a figure is how this defect keeps regenerating.
+    # ▶ The coordinates are GONE rather than corrected: updating them to today's numbers only
+    # reproduces the defect on a two-week timer, and the narrative carries its whole argument
+    # without them.
     #
     # ⛔⛔ THE BASE TEARDOWN IS IN A `finally` — codex L3 round 10, 2026-09-06, and it is THIS
     # RELEASE'S OWN CLASS ARRIVING ONE LAYER UP. Round 9 removed a `return` so the base path could

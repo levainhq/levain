@@ -8,6 +8,90 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.6.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Fixed — `init --adapter codex` widened the permissions on your global Codex config, and `levain update` narrowed them on `.levain/config.json`
+
+⚠ **This affects 0.4.5, which is published.** If you ran `levain init --adapter codex` under 0.4.5
+against an existing `~/.codex/config.toml` that already had an `[mcp_servers.anneal_memory]` block,
+its permissions were reset to your shell's default — **whether or not anything was repointed**, and
+whether or not you saw any output about it. Run:
+
+```
+ls -l ~/.codex/config.toml
+```
+
+If that is more open than you set it, restore it with `chmod 600 ~/.codex/config.toml` (or whatever
+you had). Upgrading does not repair a file already changed; it stops it happening again.
+
+⚠ **How open it became depends on your `umask`, so there is no single number to look for.** Under
+the common `022` it is `-rw-r--r--`, readable by every account on the machine. **Under `002` it is
+`-rw-rw-r--` — group-WRITABLE**, which for a file that tells every Codex session on the machine
+which memory store to read is worse than it sounds. Under `077` nothing changed.
+
+⛔ **The earlier wording of this entry said "if it repointed Codex's memory", and that was wrong.**
+Only the *backup* is conditional on a repoint; the write happens on every run. Re-running `init
+--adapter codex` against the store already registered — the ordinary re-install — widened the file
+silently, with no backup and nothing printed. That is the case least likely to have been noticed,
+and the first version of this advisory excluded exactly those people.
+
+0.4.5 made that write atomic, correctly — a partial write could otherwise truncate your whole
+global Codex config. But writing a new file and moving it into place replaces the file itself, so
+the permissions came from the process default rather than from the file being replaced. The
+previous version wrote through the existing file and so kept them without trying.
+
+The file sits beside `~/.codex/auth.json` and is machine-wide, so an operator who set `0600` on it
+meant it. The **mode** of the file being replaced is now carried across, and nothing else is — the
+modification time still moves, because the file genuinely did change.
+
+### Fixed — a Codex block Levain could not read was replaced silently, with no backup
+
+The warning and the backup that guard Codex's machine-wide `anneal_memory` registration only fired
+when Levain could read **both** the old store path and the new one out of the block. If your block
+was not the shape Levain writes — you moved the store into a wrapper `command`, or restructured
+`args` so it no longer carries `--db` — Levain could not read the old store, took no backup, said
+nothing, and replaced your block anyway.
+
+That is backwards: a block Levain cannot read is the one most likely to have been edited by hand,
+and the least safe to overwrite without a copy. Replacing a block Levain does not recognise now
+copies the file aside first and says so, naming where the copy is.
+
+Re-running against the store already registered still does nothing and still says nothing — that
+case takes nothing away, and turning it into backup spam would train you to ignore the notice that
+matters.
+
+### Fixed — repointing Codex replaced a symlinked `config.toml` instead of writing through it
+
+If `~/.codex/config.toml` is a symlink into a dotfiles repo — stow, chezmoi, or a hand-rolled
+setup — 0.4.5 replaced **the symlink** with a regular file and left the real file holding the old
+registration. Levain then correctly printed that Codex now points at the new store, and the
+operator's next re-stow silently put the old one back. A registration that undoes itself later,
+having been accurately announced at the time.
+
+The write now lands on the file the symlink points at, and the symlink survives.
+
+⚠ **Known-open: a hardlinked `config.toml` still loses its link.** The atomic replace breaks it
+(the other name keeps the old contents), and there is no atomic-rename form that preserves a
+hardlink — the alternative is writing through the existing inode, which is the torn-write risk the
+atomic write exists to remove. If you hardlink your Codex config, check the other name after
+running `init --adapter codex`.
+
+⚠ **Stated limit: the mode is restored, ACLs and extended attributes are not.** Replacing a file
+drops them and there is no macOS API in this path that puts them back. If you restricted
+`~/.codex/config.toml` with `chmod +a` rather than with a mode bit, that restriction is still lost
+when Levain repoints Codex. Use a mode bit if you need it to survive.
+
+⚡ The backup taken moments earlier in the same operation had always preserved the mode. So a single
+run left `config.toml.bak.<timestamp>` at `0600` and the live `config.toml` beside it at `0644` —
+the copy made to protect the file was better protected than the file.
+
+**The same defect was live in the opposite direction and is fixed too.** Every atomic write in
+Levain replaces the file rather than writing through it, so every one of them can move the mode.
+`.levain/config.json` — the file your entity name and brand settings live in — is written through a
+helper whose temporary file is always created `0600`, so an operator who had opened it up to `0644`
+or `0640` (to let a second account or a service read it) had it closed back to `0600` by the next
+`levain update`, surfacing later as an unrelated-looking permission error at the reader. That helper
+now carries the existing mode across as well. A file being created for the first time still gets
+`0600`, which is the safer default when there is no operator intent to preserve.
+
 ## [0.4.5] — 2026-09-06
 
 **`levain init --force` is the command our own upgrade instructions tell you to run, and in 0.4.4 it deleted operator edits to the activation tree without a backup and without a word.** It copied aside exactly two files — `posture.md` and `recency_directives.md` — while replacing everything else, so a patched hook script was destroyed on the documented upgrade path. That happened to a real operator.
