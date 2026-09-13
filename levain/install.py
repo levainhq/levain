@@ -2245,10 +2245,18 @@ def _merge_codex_config(
         # ⚖ Still warn-not-refuse, unchanged: repointing is a legitimate operator action and
         # the documented repair for this very defect. Re-running against the store already
         # registered stays silent, because nothing is being taken away.
-        replacing_unknown = old_dict is None
+        # ⛔ KEYED ON `old_store`, NOT `old_dict` (L3 codex+complement+glm, all three, HIGH,
+        # 2026-09-13, reproduced against `test_an_UNPARSEABLE_codex_block_is_backed_up_...`).
+        # A first version of this keyed `replacing_unknown` on `old_dict is None` — but a
+        # wrapper-`command` block (no `args`/`--db`) is perfectly valid TOML, so `old_dict`
+        # parses while `old_store` stays None. That routed the genuinely-unknown-store case
+        # into `content_changed` instead, and the operator was told "it still points at the
+        # same store" — a FALSE claim about a machine-global config, worse than the lost-note
+        # this whole guard exists to prevent. `replacing_unknown` must stay store-keyed;
+        # `content_changed` only fires once a store IS known and unchanged.
+        replacing_unknown = old_store is None
         store_changed = (
             not replacing_unknown
-            and old_store is not None
             and new_store is not None
             and old_store != new_store
         )

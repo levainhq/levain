@@ -305,6 +305,49 @@ def test_pip_floor_reads_PYPROJECT_at_release_cut_not_the_stale_egg_info(
     assert manifest.pip_floor() == "0.9.9"
 
 
+def test_pip_floor_reports_UNKNOWN_not_stale_dist_when_pyproject_is_broken(
+    monkeypatch, tmp_path
+):
+    """L3 codex HIGH, 2026-09-13, reproduced. A first version of `_pyproject_requires`
+    returned `None` on EVERY failure — file absent, parse error, or a missing/malformed
+    `dependencies` array — and `_levain_requires` treats `None` as "no pyproject beside the
+    package, use dist metadata". So a release checkout whose `pyproject.toml` still exists
+    but lost its `dependencies` array (still valid TOML) silently fell through to
+    `importlib.metadata` / stale `levain.egg-info` — the exact artifact this whole function
+    exists to stop trusting at cut time. If the stale metadata happened to agree with
+    `KNOWN_GOOD_ANNEAL`, the gate reported `in_sync` while the real, present pyproject had no
+    pin at all.
+
+    A present-but-broken pyproject must report `unknown`, never silently defer to dist
+    metadata as if no pyproject were there."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[project]\nname = "levain"\n', encoding="utf-8")  # no dependencies
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", pyproject)
+
+    assert manifest._pyproject_requires() == [], (
+        "a present-but-broken pyproject must return [], not None — None means ABSENT"
+    )
+    assert manifest.pip_floor() is None
+    v = manifest.pip_floor_verdict()
+    assert v.status == "unknown", (
+        f"a broken pyproject must report unknown, not silently defer to dist metadata: {v!r}"
+    )
+
+
+def test_pip_floor_reports_UNKNOWN_when_project_key_is_not_a_table(monkeypatch, tmp_path):
+    """L3 codex MED, 2026-09-13, reproduced. `[project]` as a bare string
+    (`project = "levain"`) is valid TOML; `data.get("project", {}).get("dependencies")`
+    then raises `AttributeError` on a `str`, so `pip_floor_verdict()` and `levain doctor`
+    crashed on this input instead of reporting `unknown`."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('project = "levain"\n', encoding="utf-8")
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", pyproject)
+
+    assert manifest._pyproject_requires() == []
+    v = manifest.pip_floor_verdict()  # must not raise
+    assert v.status == "unknown"
+
+
 def test_pip_floor_falls_back_to_dist_metadata_when_no_pyproject_beside_it(monkeypatch):
     """The installed-wheel case: no source tree sits beside the package, so
     `_levain_requires` must defer to `importlib.metadata` rather than silently
