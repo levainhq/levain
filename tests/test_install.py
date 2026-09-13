@@ -1819,39 +1819,28 @@ def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
 
 
 def test_copy_activation_pristine_substituted_hook_is_NOT_announced(tmp_path: Path):
-    """⛔ THE REGRESSION WIDENING THE SCOPE NEARLY SHIPPED. Install substitutes
-    `{{ANNEAL_MEMORY}}` into hooks, so the INSTALLED hook never equals its package
-    SOURCE. While the backup covered only two placeholder-free markdown files this
-    was latent; covering hooks made it live, and it would have reported the pristine
-    `_levain_hook.py` as operator-edited on EVERY re-install — spurious noise on
-    exactly the file class the backup exists for, training operators to ignore the
-    one warning that matters. Found by codex + complement at L3.
+    """⛔ Install substitutes `{{ANNEAL_MEMORY}}` into hooks, so the INSTALLED hook never
+    equals its package SOURCE; a pristine hook must never be reported as operator-edited.
+    Since spore-900 the claim comes from the install receipt, so the tree is installed first
+    (L1 MED: built by hand it had no receipt, and the no-receipt branch can never claim an
+    edit, so this test could not fail).
 
-    Since spore-861 the whole previous tree is kept regardless, so the oracle is the
-    NOTICE: a pristine hook must not be reported as operator-edited.
-
-    MUTATION CONTROL: fails if the comparison is moved back to the composed source.
-    """
+    MUTATION CONTROL: record the SOURCE hash as `installed` and this fails."""
     base = _mk_layer(tmp_path / "base", {
         "posture.md": "P\n",
         "hooks/_levain_hook.py": 'BIN = "{{ANNEAL_MEMORY}}"\n',   # unsubstituted source
     })
     install = tmp_path / "install"
     dst = install / "activation"
-    # A PRISTINE previous install: the placeholder is already resolved on disk.
-    _mk_layer(dst, {
-        "posture.md": "P\n",
-        "hooks/_levain_hook.py": 'BIN = "/usr/local/bin/anneal-memory"\n',
-    })
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/usr/local/bin/anneal-memory")
     said: list[str] = []
     _copy_activation_tree(
         [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory",
         emit=said.append,
     )
-    assert not [m for m in said if "Operator-edited" in m], (
-        "a pristine substituted hook is not an operator edit — compare against the "
-        f"STAGED bytes, not the composed source: {said}")
-    # And the substitution still actually happened.
+    assert [m for m in said if "Previous activation/ kept whole" in m and "cannot tell" not in m], said
+    assert not [m for m in said if "Operator-edited" in m], said
     assert "/usr/local/bin/anneal-memory" in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
 
 
@@ -2611,34 +2600,34 @@ def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path)
 
 
 def test_copy_activation_pristine_tree_announces_nothing(tmp_path: Path):
-    """The whole previous tree is kept (spore-861), so the property left to grade is
-    the notice: a dst that already matches the winning layers byte-for-byte must not
-    produce a single "Operator-edited" line."""
+    """The whole previous tree is kept (spore-861), so the property left to grade is the
+    notice: a reinstall over an untouched install must not produce a single
+    "Operator-edited" line. Installed first so a receipt exists (L1 MED)."""
     files = {"posture.md": "P\n", "hooks/h.py": "H\n", "recency_directives.md": "R\n"}
     base = _mk_layer(tmp_path / "base", files)
     install = tmp_path / "install"
-    _mk_layer(install / "activation", dict(files))
+    _copy_activation_tree([base], install / "activation", base_activation=base)
     said: list[str] = []
     _copy_activation_tree([base], install / "activation", base_activation=base,
                           emit=said.append)
+    assert [m for m in said if "kept whole" in m and "cannot tell" not in m], said
     assert not [m for m in said if "Operator-edited" in m], said
     assert _backed_up_files(install) == sorted(files)
 
 
 def test_copy_activation_pyc_residue_is_not_announced(tmp_path: Path):
-    """`__pycache__`/`*.pyc` in the installed tree are build residue no layer
-    provides. Without the `_activation_excluded` skip they would be reported as
-    operator-added on EVERY run — the noise class the exclusion exists to prevent."""
+    """Bytecode Python writes beside a hook is not an operator edit. Installed first so a
+    receipt exists (L1 MED).
+
+    MUTATION CONTROL: stop skipping bytecode residue and this fails."""
     base = _mk_layer(tmp_path / "base", {"posture.md": "P\n", "hooks/h.py": "H\n"})
     install = tmp_path / "install"
     dst = install / "activation"
-    _mk_layer(dst, {
-        "posture.md": "P\n",
-        "hooks/h.py": "H\n",
-        "hooks/__pycache__/h.cpython-313.pyc": "RESIDUE\n",
-    })
+    _copy_activation_tree([base], dst, base_activation=base)
+    _mk_layer(dst, {"hooks/__pycache__/h.cpython-313.pyc": "RESIDUE\n"})
     said: list[str] = []
     _copy_activation_tree([base], dst, base_activation=base, emit=said.append)
+    assert [m for m in said if "kept whole" in m and "cannot tell" not in m], said
     assert not [m for m in said if "Operator-edited" in m], said
 
 
@@ -2663,7 +2652,7 @@ def test_copy_activation_refuses_when_the_previous_tree_cannot_be_moved_anywhere
         return real_replace(src, d)
 
     monkeypatch.setattr(inst.os, "replace", _boom)
-    with pytest.raises(OSError, match="No space left on device"):
+    with pytest.raises(InitError, match="Nothing was moved or deleted"):
         _copy_activation_tree([base], dst, base_activation=base)
     assert (dst / "posture.md").read_text(encoding="utf-8") == "OPERATOR EDIT\n"
     assert not list(install.glob(".levain-activation-new-*"))

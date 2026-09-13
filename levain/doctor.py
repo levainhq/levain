@@ -887,6 +887,8 @@ def _check_compat_set(install: Path) -> list[CheckResult]:
         and bool(lock.levain)
         and manifest._cmp(installed.levain, lock.levain) > 0
     )
+    installed_anneal: str | None = getattr(installed, "anneal", None)
+    locked_anneal: str | None = getattr(lock, "anneal", None) if lock is not None else None
     for v in drift.verdicts:
         if v.status in advisory:
             results.append(CheckResult(
@@ -898,10 +900,16 @@ def _check_compat_set(install: Path) -> list[CheckResult]:
             # NEWER than the set last composed, and the anneal lock moved with that same
             # upgrade (a new levain raises its anneal floor, so pip moves anneal too; L2
             # HIGH, reproduced). A DOWNGRADE is not routine, so neither axis is pending.
-            pending_axis = (
-                levain_upgraded
-                and v.status == "drift"
-                and v.axis in ("levain", "anneal-lock")
+            pending_axis = levain_upgraded and v.status == "drift" and (
+                v.axis == "levain"
+                or (
+                    # Only an anneal that moved FORWARD with the upgrade; an anneal downgrade
+                    # alongside it is not routine (complement MED).
+                    v.axis == "anneal-lock"
+                    and installed_anneal is not None
+                    and locked_anneal is not None
+                    and manifest._cmp(installed_anneal, locked_anneal) > 0
+                )
             )
             results.append(
                 CheckResult(
@@ -1663,7 +1671,11 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                 False,
                 "installed hook script(s) changed since `levain init` wrote them: "
                 + ", ".join(edited)
-                + " — the hooks that run are these edited copies, not the package's",
+                + " — the hooks that run are these edited copies, not the package's"
+                + (
+                    "; also differing from the package, with no install receipt to tell "
+                    "outdated from edited: " + ", ".join(unproven) if unproven else ""
+                ),
                 f"If you did not make these changes, treat them as tampering. To return to "
                 f"the package's hooks run `levain init --force --path {install}` — it RE-RUNS "
                 f"THE INTERVIEW and replaces the whole activation/ tree. Your store is kept, "
@@ -2091,24 +2103,50 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
     if not isinstance(args, list):
         return CheckResult(check, False, f"args is not a list: {args!r}",
                            f"Re-run `levain init --force --path {install}`.")
-    module_form = False
-    if "-m" in args:
-        i = args.index("-m")
-        module_form = i + 1 < len(args) and args[i + 1] == "anneal_memory" and "-P" in args[:i]
+    # The shape `init` writes: `<levain python> -P -m anneal_memory --db <store> serve`.
+    # Exact argv, not "-P somewhere before -m": `-P -c pass -m anneal_memory` and a `status`
+    # subcommand both passed a looser test while never starting the server (codex HIGH).
+    module_form = (
+        [str(a) for a in args[:3]] == ["-P", "-m", "anneal_memory"]
+        and bool(args) and str(args[-1]) == "serve"
+    )
     if not module_form:
+        # Only the registration every pre-spore-751 install carries — an `anneal-memory`
+        # console script — is a pending upgrade step. Any other command is not something
+        # `init` ever wrote, so doctor cannot vouch for it (codex MED).
+        if Path(command).name.startswith("anneal-memory"):
+            return CheckResult(
+                check,
+                False,
+                f"launches `{command}`, not `{sys.executable} -P -m anneal_memory` — the "
+                f"anneal serving your memory may not be the one levain checks and upgrades",
+                f"Registrations written before levain pinned the memory server to its own "
+                f"interpreter look like this. `levain init --force --path {install}` rewrites "
+                f"it (it RE-RUNS THE INTERVIEW; your store is kept).",
+                upgrade_pending=True,
+            )
         return CheckResult(
-            check,
-            False,
-            f"launches `{command}`, not `{sys.executable} -P -m anneal_memory` — the anneal "
-            f"serving your memory may not be the one levain checks and upgrades",
-            f"Registrations written before levain pinned the memory server to its own "
-            f"interpreter look like this. `levain init --force --path {install}` rewrites it "
-            f"(it RE-RUNS THE INTERVIEW; your store is kept).",
-            upgrade_pending=True,
+            check, False,
+            f"`{command}` with args {args!r} is not a registration `levain init` writes",
+            f"Re-run `levain init --force --path {install}`.",
         )
-    # Module form: ask the registered interpreter itself rather than comparing path
-    # spellings — a venv's `python` and `python3` are one environment (L1 + L2 MED). It must
-    # also import anneal_memory at all, or the server cannot start (L2 MED).
+    # ⛔ DOCTOR NEVER EXECUTES A COMMAND IT DID NOT CHOOSE (complement + codex HIGH): the
+    # command comes from a config file, and a static check that runs it hands code execution
+    # to that file. Only a command that is this interpreter's own binary is probed, and the
+    # probe then tells two venvs over that binary apart by their prefix.
+    try:
+        same_binary = os.path.realpath(command) == os.path.realpath(sys.executable)
+    except (OSError, ValueError):
+        same_binary = False
+    if not same_binary:
+        return CheckResult(
+            check, False,
+            f"`{command}` is not this levain's Python ({sys.executable}); doctor does not run "
+            f"it, so it cannot confirm which anneal serves your memory",
+            f"If that is the levain you use, run `levain doctor` with it. Otherwise "
+            f"`levain init --force --path {install}` registers this one (it RE-RUNS THE "
+            f"INTERVIEW; your store is kept).",
+        )
     ran, out = _probe([command, "-P", "-c", "import sys, anneal_memory; print(sys.prefix)"])
     if not ran:
         return CheckResult(

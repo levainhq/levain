@@ -35,11 +35,12 @@ The failures are still printed as `FAIL`, because they are real: until you apply
 
 - **The previous tree is moved whole** to `.levain/backups/activation/tree-<timestamp>/`. Every file, symlink and directory you had is in it, exactly as it was.
 - **`init` now records what it installed** in `.levain/activation-manifest.json`: for each file under `activation/`, the sha256 of the bytes as installed and of the package file they came from. A copy travels beside each kept tree as `tree-<timestamp>.receipt.json`.
-- **An old tree is deleted only if it matches that record exactly**, with nothing added: then it holds nothing of yours. The newest three such trees are kept. Any tree that differs, has extra files or symlinks, or has no readable record (every tree kept from an install made before this release) is **never deleted**, and `init` names it.
+- **An old tree is deleted only if every file in it matches that record**, with nothing added and no symlinks: then it holds nothing of yours. The newest three such trees are kept. Any tree that differs, has extra files or symlinks, or has no readable record (every tree kept from an install made before this release) is **never deleted**, and `init` names it.
 - The "Operator-edited … preserved at" lines are worked out from that record, so they now also catch an edit made only to the `_INSTALL_ANNEAL_BIN` line of a hook. Where there is no record, `init` says it cannot tell.
 - If `.levain/backups/activation/` cannot take the move, the previous tree is kept beside `activation/` as `.levain-activation-prev-<timestamp>`, `init` tells you so, and levain never removes it. A reinstall is never blocked by this.
 - Backup directories written by earlier releases (named with a bare timestamp) are never removed.
 - This supersedes 0.4.5's stated exception for symlinks under `activation/`: they are now kept as symlinks.
+- If `activation/` itself is a symlink, the link is kept beside it as `.levain-activation-prev-<timestamp>` (where it still resolves) and its target is left untouched; `init` says so.
 
 ## [0.4.6] — 2026-09-13
 
