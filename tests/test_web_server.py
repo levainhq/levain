@@ -1938,7 +1938,7 @@ class TestOversizeWithALyingContentLength:
 
 # The methods `_InitHandler` (init_server) and `_Handler` (web_server) duplicate verbatim.
 # MEASURED with the AST comparison below, not assumed: `_route`, `_send` and `do_POST` differ
-# legitimately (different route sets), and these five do not.
+# legitimately (different route sets), and the rest, listed below, do not.
 _DUPLICATED_HANDLER_METHODS = (
     "_drain", "_host_ok", "_reject", "_send_json", "log_message", "do_GET", "do_HEAD",
     "version_string",
@@ -1955,8 +1955,10 @@ class TestHandlerParityAcrossTheTwoServers:
     A later correction to one copy silently misses the other and nothing fails.
 
     ⛔ THE FIRST VERSION OF THIS PINNED ONLY `_drain` AND ITS DOCSTRING SAID THE CLASS WAS
-    CLOSED (L1, 2026-09-07). Five methods are duplicated, not two. `_host_ok` is the
-    DNS-rebinding Host allowlist and `_send_json` writes the response headers — so a
+    CLOSED (L1, 2026-09-07). Far more than that one method are duplicated — see
+    `_DUPLICATED_HANDLER_METHODS` above, whose `len()` is the count, not a number restated
+    here. `_host_ok` is the DNS-rebinding Host allowlist and `_send_json` writes the
+    response headers — so a
     hardening fix could land on `_Handler._host_ok`, never reach `_InitHandler._host_ok`,
     and `levain init --web` would serve the old check with every test green. **That is the
     original finding reproduced verbatim on a sibling method, past a test whose docstring

@@ -716,6 +716,14 @@ def _atomic_write_text(target: Path, payload: str) -> None:
     target truncated: the old bytes stay until the atomic rename. Raises ``OSError``
     on failure (caller decides fatal-vs-best-effort). [codex L3: config.json is the
     SHARED operator file — a plain write_text could blank entity_name on a torn write.]"""
+    # ⛔ REPLACE THE SYMLINK'S TARGET, NOT THE SYMLINK (Diogenes MEDIUM, 2026-09-09,
+    # reproduced on disk) — the same class `_merge_codex_config` was fixed for on 2026-09-07,
+    # at the other atomic-replace site: `os.replace` onto a symlinked `.levain/config.json`
+    # replaces the LINK with a regular file, leaving the dotfiles-managed real file holding
+    # the OLD content, restored over the top on the next `stow`/`chezmoi apply`. Resolved
+    # before `mkdir`/`mkstemp` so the temp file lands beside the REAL file (same filesystem,
+    # so `os.replace` stays atomic) and `copymode`/`exists()` below read the real inode.
+    target = target.resolve()
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(parent))
@@ -2112,6 +2120,24 @@ _CODEX_MCP_BLOCK_RE = re.compile(
 )
 
 
+def _codex_block_dict(block: str) -> dict | None:
+    """The parsed TOML of a codex `[mcp_servers.anneal_memory]` block, or None if
+    it does not parse.
+
+    Used to detect ANY change to the block, not just a `--db` repoint (Diogenes
+    HIGH, 2026-09-09, reproduced on disk). `_codex_block_store` reads one field
+    out of the block; everything else an operator put there — `env`,
+    `startup_timeout_ms`, extra keys — was outside the store-only guard's field
+    of view and got silently dropped on re-init whenever `--db` happened to
+    match. Comparing the full parsed dict answers the actual question: is
+    anything being taken away.
+    """
+    try:
+        return tomllib.loads(block)
+    except (tomllib.TOMLDecodeError, ValueError):
+        return None
+
+
 def _codex_block_store(block: str) -> str | None:
     """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None.
 
@@ -2189,8 +2215,11 @@ def _merge_codex_config(
 
     repoint: tuple[str, str, Path] | None = None
     unknown_prior: Path | None = None
+    customized: Path | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
+        old_dict = _codex_block_dict(old_block_match.group(0))
+        new_dict = _codex_block_dict(new_block)
         old_store = _codex_block_store(old_block_match.group(0))
         new_store = _codex_block_store(new_block)
         # ⛔ THE BACKUP IS KEYED ON REPLACING A BLOCK, NOT ON HAVING PARSED THE OLD STORE
@@ -2205,11 +2234,26 @@ def _merge_codex_config(
         # does not fire on a valid input is worse than no guard, because the absence reads as
         # approval." Not-parsing is LESS reason to proceed silently, not more — an unreadable
         # prior state is the case where a copy matters most.
+        # ⛔ AND STORE-EQUALITY WAS ITSELF TOO NARROW A QUESTION (Diogenes HIGH, 2026-09-09,
+        # reproduced on disk). The old guard compared `--db` alone, so an operator's `env` or
+        # `startup_timeout_ms` on the SAME store vanished with no backup and no message —
+        # `_codex_block_store` reads one field; everything else in the block was outside the
+        # guard's field of view. Comparing the full parsed dict (`_codex_block_dict`) asks the
+        # actual question — is anything being taken away — and still stays silent on a true
+        # re-run of levain's own identical block, since that block compares dict-equal to
+        # itself.
         # ⚖ Still warn-not-refuse, unchanged: repointing is a legitimate operator action and
         # the documented repair for this very defect. Re-running against the store already
         # registered stays silent, because nothing is being taken away.
-        replacing_unknown = old_store is None
-        if replacing_unknown or (old_store and new_store and old_store != new_store):
+        replacing_unknown = old_dict is None
+        store_changed = (
+            not replacing_unknown
+            and old_store is not None
+            and new_store is not None
+            and old_store != new_store
+        )
+        content_changed = not replacing_unknown and not store_changed and old_dict != new_dict
+        if replacing_unknown or store_changed or content_changed:
             bak = _timestamped_backup_path(path)
             try:
                 shutil.copy2(path, bak)
@@ -2218,6 +2262,8 @@ def _merge_codex_config(
                     "whose current store could not be read"
                     if replacing_unknown
                     else f"from {old_store} to {new_store}"
+                    if store_changed
+                    else "whose settings would be overwritten"
                 )
                 raise InitError(
                     f"could not back up {path} ({e}) before replacing Codex's global "
@@ -2227,8 +2273,11 @@ def _merge_codex_config(
                 ) from e
             if replacing_unknown:
                 unknown_prior = bak
-            else:
+            elif store_changed:
+                assert old_store is not None and new_store is not None  # store_changed implies it
                 repoint = (old_store, new_store, bak)
+            else:
+                customized = bak
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2324,7 +2373,9 @@ def _merge_codex_config(
             f"could not write {path} ({e}). Codex's registration is unchanged"
             + (f"; your previous config is also copied at {repoint[2]}." if repoint
                else f"; your previous config is also copied at {unknown_prior}."
-               if unknown_prior is not None else ".")
+               if unknown_prior is not None
+               else f"; your previous config is also copied at {customized}."
+               if customized is not None else ".")
         ) from e
 
     if unknown_prior is not None:
@@ -2332,6 +2383,15 @@ def _merge_codex_config(
         emit("    Its previous store could not be read, so it was not a shape levain")
         emit("    wrote — if you had customised that block, that customisation is gone.")
         emit(f"    Your previous config is copied at {unknown_prior}")
+        emit("    (Every codex session on this machine reads that block, not just this")
+        emit("     install.)")
+
+    if customized is not None:
+        emit(f"  ! Codex's GLOBAL anneal_memory block was replaced in {path}.")
+        emit("    It still points at the same store, but other settings in that block")
+        emit("    (env vars, timeouts, or other keys) were not preserved — if you had")
+        emit("    customised it, that customisation is gone.")
+        emit(f"    Your previous config is copied at {customized}")
         emit("    (Every codex session on this machine reads that block, not just this")
         emit("     install.)")
 

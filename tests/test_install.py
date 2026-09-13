@@ -2041,6 +2041,62 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
     assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
 
 
+def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Diogenes MEDIUM, 2026-09-09 — closing a gap named, not a defect fixed. The window's
+    own commit body claimed "every fix carries a mutation control that fails against the
+    pre-fix tree", and reverting the `unstaged_notes` buffering (introduced by
+    `test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed` above) to its exact pre-fix
+    form left the full suite green — nothing graded the deferred-flush property.
+
+    The code is already right: `unstaged_notes` are appended when a best-effort copy is
+    skipped, but only `emit()`ted AFTER `os.replace(new_tree, dst)` succeeds (see the loop
+    right after the swap, below). If the swap itself then fails, the buffered notes must
+    never reach the operator — a note describing a file that (thanks to the swap failing)
+    was never actually replaced would be a true-sounding claim about a world that did not
+    happen.
+
+    Forces BOTH halves in one run: an unwritable backups dir (buffers a note, same fixture
+    as the sibling test above) AND a failing final swap (monkeypatched `os.replace`, keyed
+    on the synthetic `new_tree` name so the `old_aside` restore swap is untouched)."""
+    base = _hook_layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+
+    hook = dst / "hooks" / "_levain_hook.py"
+    hook.write_text('X = 1\n_INSTALL_ANNEAL_BIN = "/home/op/bin/my-wrapper"\n', encoding="utf-8")
+    backups_root = install / ".levain" / "backups" / "activation"
+    backups_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(backups_root, 0o500)
+
+    import levain.install as inst
+    real_replace = inst.os.replace
+
+    def flaky_replace(src, dst_):
+        if ".levain-activation-new-" in str(src):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst_)
+
+    said: list[str] = []
+    inst.os.replace = flaky_replace
+    try:
+        with pytest.raises(OSError, match="No space left on device"):
+            _copy_activation_tree([base], dst, base_activation=base,
+                                  anneal_path="/opt/a/anneal-memory", emit=said.append)
+    finally:
+        inst.os.replace = real_replace
+        os.chmod(backups_root, 0o700)
+
+    assert not [m for m in said if "could not stage a copy" in m], (
+        "a note about a skipped preservation must not be emitted when the swap "
+        f"describing it never happened, said: {said!r}"
+    )
+    # The original tree must be intact — the swap failed before it touched `dst`.
+    assert '"/home/op/bin/my-wrapper"' in hook.read_text(encoding="utf-8")
+
+
 def test_codex_store_uses_ARGV_semantics_last_wins_and_both_spellings(tmp_path: Path):
     """codex L3 MED. anneal-memory parses these with argparse, so a repeated `--db`
     means the LAST one is what the server actually reads. Returning the first names a
@@ -2269,6 +2325,43 @@ def test_re_running_against_the_SAME_store_stays_silent_and_makes_no_backup(tmp_
     assert said == [], f"no-op run must be silent, said: {said!r}"
 
 
+def test_same_store_but_lost_customisation_IS_backed_up_and_announced(tmp_path: Path):
+    """Diogenes HIGH, 2026-09-09, reproduced on disk. The old guard compared `--db` ALONE,
+    so an operator's `env`/`startup_timeout_ms` on the SAME store vanished with NO backup
+    and NO message whenever levain's own re-write happened to match the store — the exact
+    silent-destruction class this function exists to stop, at the one field the store-only
+    guard could not see.
+
+    Pre-fix this reproduces: `said == []`, no backup file, and `env`/`startup_timeout_ms`
+    gone from the written config."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[mcp_servers.anneal_memory]\n'
+        'args = ["--db", "/home/op/same.db", "serve"]\n'
+        'env = { ANNEAL_LOG = "debug", HTTP_PROXY = "http://corp:8080" }\n'
+        'startup_timeout_ms = 60000\n'
+        '\n'
+        '[mcp_servers.other]\n'
+        'args = ["x"]\n',
+        encoding="utf-8",
+    )
+
+    said: list[str] = []
+    _merge_codex_config(path, _codex_cfg("/home/op/same.db"), emit=said.append)
+
+    backups = list(tmp_path.glob("config.toml.bak.*"))
+    assert backups, "losing env/startup_timeout_ms on the same store must be backed up"
+    backed_up = backups[0].read_text(encoding="utf-8")
+    assert "HTTP_PROXY" in backed_up, "the backup must hold the customisation that was lost"
+
+    assert said, "losing settings on the same store must not stay silent"
+    assert any("same store" in m or "not preserved" in m for m in said)
+
+    written = path.read_text(encoding="utf-8")
+    assert "HTTP_PROXY" not in written, "the write itself still overwrites (warn, not refuse)"
+    assert "[mcp_servers.other]" in written, "the sibling table survives untouched"
+
+
 def test_repointing_codex_writes_THROUGH_a_symlinked_config(tmp_path: Path):
     """⛔ L1 finding, 2026-09-07. `os.replace` onto a symlink REPLACES THE LINK with a regular
     file. Measured before the fix: a `~/.codex/config.toml` symlinked into a dotfiles repo
@@ -2345,6 +2438,33 @@ def test_atomic_write_text_PRESERVES_an_existing_files_mode(tmp_path: Path):
     fresh = tmp_path / "brand_new.json"
     _atomic_write_text(fresh, "{}")
     assert stat.S_IMODE(fresh.stat().st_mode) == 0o600
+
+
+def test_atomic_write_text_writes_THROUGH_a_symlink(tmp_path: Path):
+    """Diogenes MEDIUM, 2026-09-09, reproduced on disk. Same class as
+    `test_repointing_codex_writes_THROUGH_a_symlinked_config` below — `_atomic_write_text`
+    is the OTHER atomic-replace site the fix for that one was scoped to (per that commit's
+    own `guard_scoped_by_symptom_misses_the_class` argument, applied to itself): `os.replace`
+    onto a symlinked `.levain/config.json` replaces the LINK with a regular file, leaving
+    the operator's real file (owned by a dotfiles manager) holding the OLD content — restored
+    over the top on the next `stow`/`chezmoi apply`.
+
+    Pre-fix this reproduces: `is_symlink()` False after the write, and the real file's
+    content stale."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real = real_dir / "config.json"
+    real.write_text('{"a": 1}', encoding="utf-8")
+    link = tmp_path / "config.json"
+    link.symlink_to(real)
+
+    _atomic_write_text(link, '{"a": 2}')
+
+    assert link.is_symlink(), "the link itself must survive the write"
+    assert link.resolve() == real, "still pointing at the same real file"
+    assert real.read_text(encoding="utf-8") == '{"a": 2}', (
+        "the write must land on the real file, not replace the link with a copy"
+    )
 
 
 def test_repointing_codex_PRESERVES_the_config_mode_the_operator_set(tmp_path: Path):
