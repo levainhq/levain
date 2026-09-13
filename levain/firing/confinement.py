@@ -113,6 +113,49 @@ three).
     unsandboxed helper via ``launchd`` is plausible (L2 could not confirm it under a non-GUI shell).
     Same class as network-exfil: gated-drive halt + human-in-the-loop where present, ``spore-417``
     for the per-domain policy. ⚠ An unattended seat has no human in this class either.
+    ⛔ sshd ON THIS HOST IS THE SHARPEST INSTANCE OF THIS CLASS, AND ``ssh_mode="agent"`` MAKES IT
+    WORSE, NOT TIGHTER (spore-755, REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD). Agent-mode
+    forwards ``SSH_AUTH_SOCK`` by design; so with Remote Login on and a key the agent holds in
+    ``authorized_keys``, ``ssh localhost cat <jewel>`` has sshd — unsandboxed, root — read a file the
+    floor denies, authorised by the very socket agent-mode forwards. The forwarded agent socket is
+    the SOLE carrier (disable it and the attack fails "Permission denied (publickey)"; the key FILE
+    stays floor-denied). This is spore-725's "a floor that forwards a credential to an unsandboxed
+    root reader is decorative for that file" applied one step over, and it reaches the host by ANY of
+    its own addresses (loopback AND the LAN IP — seatbelt's ``localhost`` keyword covers every
+    local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in
+    ``ssh_mode="agent"`` by ``deny_localhost_outbound`` (renders ``(deny network-outbound (remote ip
+    "localhost:*"))``), DEFAULT-ON in agent mode at ``policy_for_conv_state`` (Phill's ruled A,
+    2026-09-13), operator opt-out ``allow_localhost_outbound``.
+    ⚠ RESIDUAL, NOT CLOSED — RAW MODE (codex L3 HIGH#1, REPRODUCED 2026-09-13). The deny is currently
+    agent-mode-only. In ``ssh_mode="raw"`` the entity reads its OWN key directly, but the OTHER jewels
+    (~/.anneal-memory, sibling stores, deny_files) stay floor-denied and a local sshd authenticated
+    with that key reads THEM as unsandboxed root just the same. A both-modes tightening is UNDER
+    REVIEW — Phill 2026-09-13 asked for web research + a first-principles options doc on how harnesses
+    should handle agent-forwarding, rather than flipping it reflexively; see spore-1005.
+    ⛔ RESIDUAL, NOT CLOSED — THE FORWARDED AGENT IS A SIGNING ORACLE (codex L3 HIGH#2, and this is
+    the deepest limit). It signs for ANY sshd that authorises the agent's key, reached through ANY hop
+    the floor allows. A REMOTE relay defeats the localhost deny entirely: ``ssh -o ProxyCommand='ssh
+    relay nc %h %p' <this-host>`` reaches this host's own sshd from the OUTSIDE, so the only connection
+    the sandbox sees is to the (allowed) relay. A Tailscale peer is exactly such a hop — so a Tailscale
+    address is NOT "covered" (an earlier note wrongly said it was). This is not closeable by a network
+    deny; the real closures are agent MEDIATION (destination/host-key constraints) or not forwarding
+    the agent. ⚠ On THIS machine the precondition is currently absent — ~/.ssh/authorized_keys does
+    not authorise the agent's key (MEASURED 2026-09-13) — but that is a fact about this Mac, not the
+    class. Tracked in spore-1005.
+    ⚠ RESIDUAL, NOT CLOSED — ssh CONNECTION MULTIPLEXING (spore-755 follow-up, REPRODUCED
+    2026-09-13). If a ssh ControlMaster/mux socket to LOCALHOST already exists (operator runs
+    ``ControlMaster auto``/``yes`` and has a live master to this host) and the entity can NAME the
+    ControlPath (it may read ``~/.ssh/config`` in agent mode, or guess a default/tmp path), then
+    ``ssh -S <ctlpath> localhost cat <jewel>`` rides the EXISTING authenticated master: an AF_UNIX
+    connect the IP deny above cannot see, and the master is already authenticated so disabling the
+    agent does not help. Placing the control socket under the (denied) ``~/.ssh`` does NOT save it —
+    the entity cannot ``ls`` the socket but CAN ``connect()`` to it (connect ≠ read, the docker-socket
+    class). The only BLANKET floor-side block is denying all AF_UNIX outbound, which was MEASURED to
+    break ``getaddrinfo``/HTTPS/git-https/pip (macOS resolves through an mDNSResponder unix socket;
+    exempting that socket's literal did NOT restore resolution), so it is not the default. The
+    practical precondition is narrow — ssh multiplexing to LOCALHOST specifically is rare. Scoped
+    closure (a resolver-preserving deny, or forcing ``ControlPath=none`` in the entity's own ssh
+    invocation) is a follow-up; see the handoff spore.
   - CROWN-JEWEL DIRECTORY NAMES leak: ``ls ~`` lists ``.anneal-memory`` as a NAME (the parent's
     metadata is allowed; the subtree's CONTENTS + the jewel dir's own stat are denied). Names are
     already public; informational.
@@ -472,7 +515,45 @@ class CrownJewelsPolicy:
     # refresh does and does not buy — the residual window is stated there, not papered over.
     # NOTE: network is default-ALLOWED (a CC replacement hits the network); there is deliberately NO
     # `allow_network` knob — an unwired boolean would be false security (the exact claim>enforcement
-    # gap this module refuses). Network POLICY is a slice-3 / threshold-membrane concern.
+    # gap this module refuses). Network POLICY is a slice-3 / threshold-membrane concern. The ONE
+    # targeted network deny is `deny_localhost_outbound` below — WIRED (it renders and enforces),
+    # not an `allow_network`-style promise, and off by default so the connect-to-self side-channel
+    # is closed only where a drive-layer caller opts in.
+    deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
+    # class, for a FRESH connection. If this host runs sshd (Remote Login) and it authorises a key
+    # the entity can use, ``ssh localhost cat <jewel>`` has sshd — root, OUTSIDE the sandbox — read a
+    # file the floor denies. REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD. In ``ssh_mode="agent"``
+    # the carrier is the forwarded ``SSH_AUTH_SOCK`` (proven sole carrier: disable it and the attack
+    # fails "Permission denied (publickey)"). This flag is mode-AGNOSTIC — it renders the deny
+    # whenever True — but its CALL SITE (`policy_for_conv_state`) currently sets it in agent mode only
+    # (Phill's ruled A). ⚠ codex L3 HIGH#1 REPRODUCED a raw-mode variant too (the entity reads its own
+    # key, but the OTHER jewels — ~/.anneal-memory, sibling stores, deny_files — stay floor-denied and
+    # a local sshd reads THEM as root just the same); a both-modes tightening is UNDER REVIEW pending
+    # Phill's agent-forwarding options doc (spore-1005), so raw is a documented residual for now.
+    # Same class as the container-daemon socket (spore-725): a floor
+    # that denies the FILE but lets an unsandboxed root reader be reached is decorative for that file.
+    # Renders ``(deny network-outbound (remote ip "localhost:*"))``.
+    # ⚠ MEASURED SEMANTICS, not the name's face value: seatbelt's ``localhost`` keyword matches
+    # EVERY address bound to a LOCAL INTERFACE on this host — 127.0.0.1, ::1, AND the machine's own
+    # LAN address (MEASURED 2026-09-13 against a throwaway sshd bound on all interfaces) — while
+    # leaving REMOTE hosts reachable (github.com:443 still connected). So this closes the FRESH-
+    # connection self-sshd path by ANY of the host's own addresses, not loopback only.
+    # Per-port / per-IP granularity is IMPOSSIBLE here: ``(remote ip "127.0.0.1:22")`` is a hard
+    # sandbox error ("host must be * or localhost"), so the ruled ":22-only" deny is unbuildable and
+    # the real choice is all-local-outbound or nothing. COST when opted in: the entity loses ALL
+    # in-floor connect() to local services it might legitimately use (a dev server it started,
+    # argushub on :8420) — MEASURED denied. Does NOT touch remote network.
+    # ⛔ WHAT THIS DOES NOT CLOSE (codex L3 HIGH#2, and it is NOT closeable by a localhost deny): the
+    # forwarded agent is a SIGNING ORACLE. It signs for ANY sshd that authorises the agent's key,
+    # reached through ANY hop the floor allows — a REMOTE relay/ProxyCommand (`ssh -o
+    # ProxyCommand='ssh relay nc %h %p' <this-host>`) reaches this host's own sshd from the outside,
+    # so the connection the sandbox sees is to the (allowed) relay, not to a local address. A Tailscale
+    # 100.x peer is exactly such a hop. So a Tailscale address is NOT "covered" — an earlier comment
+    # wrongly claimed it was. The honest closure is agent MEDIATION (destination/host-key constraints)
+    # or not forwarding the agent, not this deny. Also not covered: an off-interface address (NAT
+    # hairpin to the router's external IP). And ssh CONNECTION MULTIPLEXING — a live localhost
+    # ControlMaster socket the entity can name (AF_UNIX, unseen by this IP deny). Both tracked in
+    # spore-1005 / the honest-limits block above.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -551,6 +632,7 @@ def build_policy(
     # socket in it is not a weaker floor, it is a decorative one. The opt-OUT exists for the
     # operator who genuinely runs containers from the entity and accepts that.
     allow_container_sockets: bool = False,
+    deny_localhost_outbound: bool = False,
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -617,6 +699,16 @@ def build_policy(
             f"{type(allow_container_sockets).__name__} ({allow_container_sockets!r}) — "
             f"fail-closed. A truthy non-bool would DISABLE the container-socket floor "
             f"entirely (spore-725)."
+        )
+    # Same boundary guard for the spore-755 opt-*in* deny. Unlike the flag above this one fails
+    # CLOSED (a truthy non-bool turns the deny ON, over-restrictive, not a bypass) — but passing the
+    # STRING "false" would still flip a caller's intended OFF to ON and silently break localhost, so
+    # the public boundary is held to the same bool contract (glm L3, 2026-09-13). `isinstance(True,
+    # int)` is True, so require a real bool, not a plain int check.
+    if not isinstance(deny_localhost_outbound, bool):
+        raise ConfinementError(
+            f"deny_localhost_outbound must be a bool, got "
+            f"{type(deny_localhost_outbound).__name__} ({deny_localhost_outbound!r}) — fail-closed."
         )
     ed = Path(entity_dir).expanduser().resolve()
     ws = (Path(workspace).expanduser().resolve() if workspace is not None
@@ -890,6 +982,7 @@ def build_policy(
         deny_sockets=deny_sockets_t,
         socket_spellings=socket_spellings_t,
         socket_sources=socket_sources_t,
+        deny_localhost_outbound=deny_localhost_outbound,
     )
 
 
@@ -1240,6 +1333,24 @@ class ConfinementConfig:
     # `--task` and any unattended seat. "gated" / "ungated" pin it explicitly. It lives HERE, beside
     # the crown-jewels floor, because the two answer one operator question — what may this entity do
     # to the world — and splitting that answer across two files is how half of it stops being read.
+    allow_localhost_outbound: bool = False
+    # spore-755. The OPT-OUT of the connect-to-self deny, and the exact sibling of
+    # ``allow_container_sockets`` above (allow_* = opt out of a default deny; absent means False =
+    # the deny stays on). Default FALSE means the floor denies outbound connect() to THIS host in
+    # ``ssh_mode="agent"`` (the ruled A; a raw-mode extension is under review — see the policy field's
+    # RESIDUAL note), closing the FRESH-CONNECTION local-sshd bypass (REPRODUCED 2026-09-13; ruled by
+    # Phill, loopback-loss ACCEPTED). Set true ONLY if this entity genuinely needs to reach a LOCAL
+    # service (a dev server it started, argushub on :8420) and the operator accepts that a local sshd
+    # can then be asked to read a floor-denied file. NOT a tri-state like ``deny_standard_creds`` —
+    # the answer does not vary by DRIVE mode.
+    # ⛔ APPENDED LAST, AND THE POSITION IS LOAD-BEARING (codex L3 HIGH#3, 2026-09-13). This field was
+    # first inserted BEFORE ``efferent_gate``, which silently shifted every later field's POSITIONAL
+    # index in this exported, non-kw-only dataclass: ``ConfinementConfig((), (), "agent", None, False,
+    # "gated")`` would then land "gated" in ``allow_localhost_outbound`` (truthy → the connect-to-self
+    # deny SILENTLY OFF) and leave ``efferent_gate="auto"`` (an intended-gated run turned auto). This
+    # is the EXACT ``own_memory_files`` class from the sibling dataclass; a new field on a public
+    # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
+    # ``test_confinement_config_field_order_is_append_only`` pins it.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -1255,6 +1366,7 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
          "ssh_mode": "agent",
          "deny_standard_creds": false,
          "allow_container_sockets": false,
+         "allow_localhost_outbound": false,
          "efferent_gate": "auto"}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
@@ -1342,12 +1454,23 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"daemon sockets DENIED (the default)."
         )
 
+    # spore-755. Same absent-means-False/deny treatment as allow_container_sockets — a null is still
+    # REFUSED, not read as absence, on the same fail-closed grounds.
+    allow_localhost_outbound = data.get("allow_localhost_outbound", False)
+    if not isinstance(allow_localhost_outbound, bool):
+        raise ConfinementError(
+            f"{base}: allow_localhost_outbound must be true or false, got "
+            f"{allow_localhost_outbound!r} — fail-closed. Omit the key to keep the connect-to-self "
+            f"deny ON in ssh_mode=\"agent\" (the default)."
+        )
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
         ssh_mode=ssh_mode,
         deny_standard_creds=deny_standard_creds,
         allow_container_sockets=allow_container_sockets,
+        allow_localhost_outbound=allow_localhost_outbound,
         efferent_gate=efferent_gate,
     )
 
@@ -1995,6 +2118,20 @@ class SeatbeltProvider(ConfinementProvider):
             for p_ in policy.deny_sockets:
                 lines.append(f'    (literal "{_sbpl_string(str(p_))}")')
             lines.append(")")
+            lines.append("")
+
+        if policy.deny_localhost_outbound:
+            lines.append(";; CONNECT-TO-SELF (spore-755) — deny outbound to THIS host so a local")
+            lines.append(";; sshd (Remote Login) can't be asked, as unsandboxed root, to read a file")
+            lines.append(";; the floor denies via the agent socket agent-mode forwards. Same class as")
+            lines.append(";; the daemon-socket deny above: forwarding a credential to an unsandboxed")
+            lines.append(";; root reader makes a file-deny decorative. ``localhost`` is a seatbelt")
+            lines.append(";; KEYWORD matching every LOCAL-INTERFACE address (127.x, ::1, the LAN IP —")
+            lines.append(";; MEASURED 2026-09-13), so this covers the host's own addresses, not")
+            lines.append(";; loopback only; remote hosts stay reachable. ``:*`` = every port —")
+            lines.append(";; seatbelt rejects a per-port loopback literal, so all-or-nothing is the")
+            lines.append(";; only granularity it offers.")
+            lines.append('(deny network-outbound (remote ip "localhost:*"))')
             lines.append("")
 
         if policy.config_file is not None:

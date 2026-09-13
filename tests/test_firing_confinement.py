@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import os
 import platform
+import shutil
+import socket
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import pytest
@@ -1671,6 +1674,58 @@ def test_load_confinement_config_bad_allow_container_sockets_fails_closed(tmp_pa
         load_confinement_config(ent)
 
 
+def test_load_confinement_config_allow_localhost_outbound_defaults_to_denied(tmp_path: Path) -> None:
+    """spore-755. ABSENT means the connect-to-self deny stays ON (in agent mode) — same safe-default
+    treatment as ``allow_container_sockets``."""
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"deny_files": []}')
+    assert load_confinement_config(ent).allow_localhost_outbound is False
+
+
+def test_load_confinement_config_parses_allow_localhost_outbound(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    assert load_confinement_config(ent).allow_localhost_outbound is True
+
+
+def test_load_confinement_config_bad_allow_localhost_outbound_fails_closed(tmp_path: Path) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": null}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+    (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": "yes"}')
+    with pytest.raises(ConfinementError):
+        load_confinement_config(ent)
+
+
+def test_confinement_config_field_order_is_append_only() -> None:
+    """⛔ codex L3 HIGH#3, 2026-09-13 — the ``own_memory_files`` positional-shift class, recurring.
+    ``ConfinementConfig`` is EXPORTED and NOT keyword-only, so inserting a field anywhere but the END
+    silently reassigns every later positional argument. ``allow_localhost_outbound`` was first
+    inserted BEFORE ``efferent_gate``; a positional ``ConfinementConfig((), (), "agent", None, False,
+    "gated")`` then landed "gated" in ``allow_localhost_outbound`` (truthy → the connect-to-self deny
+    SILENTLY OFF) and left ``efferent_gate="auto"``. This pins BOTH the invariant (new fields append)
+    and the concrete construction that broke.
+    """
+    from dataclasses import fields
+
+    names = [f.name for f in fields(ConfinementConfig)]
+    # efferent_gate must precede the spore-755 opt-out (which is append-only at the tail)
+    assert names.index("efferent_gate") < names.index("allow_localhost_outbound")
+    assert names[-1] == "allow_localhost_outbound", (
+        f"a new field was inserted before the end of the exported ConfinementConfig: {names}. "
+        f"Append at the END (or make the class keyword-only in a deliberate break) — otherwise "
+        f"positional callers silently reassign every later field (the own_memory_files class)."
+    )
+    # the historical positional construction must still land each value in its intended field
+    cfg = ConfinementConfig((), (), "raw", True, False, "gated")
+    assert cfg.ssh_mode == "raw"
+    assert cfg.deny_standard_creds is True
+    assert cfg.allow_container_sockets is False
+    assert cfg.efferent_gate == "gated"  # NOT shifted into allow_localhost_outbound
+    assert cfg.allow_localhost_outbound is False  # the default, not a positional spillover
+
+
 def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypatch) -> None:
     """⛔ A TRIPWIRE FOR THE K4c MERGE, NOT A TEST OF TODAY'S CODE.
 
@@ -1709,9 +1764,12 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
     providers = _concrete(_conf.ConfinementProvider)
     assert providers == {"SeatbeltProvider"}, (
         f"the ConfinementProvider roster changed to {sorted(providers)}. Every provider MUST "
-        f"enforce CrownJewelsPolicy.deny_sockets (spore-725) — a reachable container daemon is a "
-        f"total crown-jewels bypass, and only SeatbeltProvider renders the connect-deny today. "
-        f"Wire the new provider and update this assertion, or the floor is macOS-only while the "
+        f"enforce the network-outbound denies that only SeatbeltProvider renders today — "
+        f"CrownJewelsPolicy.deny_sockets (spore-725, a reachable container daemon is a total "
+        f"crown-jewels bypass) AND CrownJewelsPolicy.deny_localhost_outbound (spore-755, a local "
+        f"sshd reached via the forwarded agent socket is the same class). Both are connect-denies "
+        f"with NO in-process twin, so a provider that ignores either fails OPEN silently. Wire the "
+        f"new provider for BOTH and update this assertion, or the floor is macOS-only while the "
         f"code and the run banner both call it universal."
     )
 
@@ -1906,3 +1964,173 @@ def test_a_seatbelt_shell_unlinks_its_profile_even_if_the_base_close_raises(tmp_
         SandboxedShell.close = original  # type: ignore[method-assign]
 
     assert not prof.exists(), "the temp seatbelt profile leaked when the base close raised"
+
+
+# =============================================================================================
+# CONNECT-TO-SELF (spore-755) — the loopback/local-interface sshd bypass and its deny
+# =============================================================================================
+
+
+def test_localhost_outbound_deny_is_gated_by_the_flag(tmp_path: Path, monkeypatch) -> None:
+    """RENDER-LAYER (always on): the ``deny_localhost_outbound`` flag is the ONLY thing that emits
+    the ``(deny network-outbound (remote ip "localhost:*"))`` rule — off by default, on when asked.
+    This grades the profile STRING; the actual closure is graded by the live attack test below
+    (a render assertion cannot prove a connect() is refused — spore-938)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    prov = SeatbeltProvider()
+    line = '(deny network-outbound (remote ip "localhost:*"))'
+    off = prov.render_profile(build_policy(_entity(tmp_path, "off"), ssh_mode="agent"))
+    on = prov.render_profile(
+        build_policy(_entity(tmp_path, "on"), ssh_mode="agent", deny_localhost_outbound=True)
+    )
+    assert line not in off  # default off: behaviour unchanged
+    assert line in on  # opted in: the self-connect deny is rendered
+
+
+@live
+def test_live_localhost_outbound_deny_blocks_the_self_sshd_bypass(tmp_path: Path) -> None:
+    """⛔ spore-755, THE LIVE PROOF (reproduced end to end 2026-09-13, ruled by Phill). A sshd this
+    host runs reads, as unsandboxed root, a file the floor denies — the container-daemon-socket class
+    (spore-725). Fully self-contained: a THROWAWAY non-root sshd on a spare port authorising a FRESH
+    key held by a DEDICATED agent (never the operator's real sshd / Remote Login / agent).
+
+    The attack is agent-ONLY — no ``-i``, ``IdentitiesOnly=yes`` + ``IdentityAgent`` pointed at the
+    dedicated socket — AND the key FILE is floor-denied, so the FORWARDED AGENT is provably the sole
+    carrier (codex L3 HIGH#4: an ``-i`` attack could authenticate off a readable key file and would
+    not prove that). Three arms:
+      · CONTROL (agent OFF, deny OFF): attack must FAIL "Permission denied" — no agent, key unreadable,
+        so nothing authenticates. This is what proves the agent, not the key file, carries the leak.
+      · deny OFF (agent on): the bypass LEAKS (so a pass with it on is the deny working, not a dead
+        channel).
+      · deny ON (agent on): REFUSED by EVERY local-interface address — 127.0.0.1, ::1, and the LAN IP
+        when present (the coverage the whole fix rests on) — while the direct read stays denied.
+    """
+    sshd = shutil.which("sshd") or "/usr/sbin/sshd"
+    if not (Path(sshd).exists() and shutil.which("ssh") and shutil.which("ssh-keygen")):
+        pytest.skip("needs sshd + ssh + ssh-keygen on PATH")
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    rig = tmp_path / "rig"
+    rig.mkdir()
+    key = rig / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+    host = rig / "hostkey"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(host)], check=True)
+    authorized = rig / "authorized_keys"
+    authorized.write_text((key.with_suffix(".pub")).read_text())
+    authorized.chmod(0o600)
+    known = rig / "known_hosts"
+    sshd_conf = rig / "sshd_config"
+    # bind ALL interfaces so the attack can be aimed at loopback AND the machine's own LAN address —
+    # the fix's load-bearing claim is that seatbelt's "localhost" covers every LOCAL-INTERFACE
+    # address, not loopback only, and a 127.0.0.1-only test would never exercise that (L1 W2).
+    sshd_conf.write_text(
+        f"Port {port}\nListenAddress 0.0.0.0\nListenAddress ::\nHostKey {host}\nPidFile {rig / 'pid'}\n"
+        f"AuthorizedKeysFile {authorized}\nPubkeyAuthentication yes\nPasswordAuthentication no\n"
+        f"KbdInteractiveAuthentication no\nUsePAM no\nStrictModes no\n"
+    )
+
+    canary_dir = rig / "jewel"
+    canary_dir.mkdir()
+    canary = canary_dir / "secret.txt"
+    token = "CANARY-" + os.urandom(8).hex()
+    canary.write_text(token)
+
+    agent_pid = None
+    sshd_proc = None
+    try:
+        # a DEDICATED agent holding only the fresh key (started INSIDE the try so a failure here still
+        # cleans up — codex L3 LOW / glm / complement: an agent started before the try orphans)
+        agent = subprocess.run(["ssh-agent", "-s"], capture_output=True, text=True, check=True).stdout
+        auth_sock = next(
+            ln.split("=", 1)[1].split(";", 1)[0] for ln in agent.splitlines() if "SSH_AUTH_SOCK=" in ln
+        )
+        agent_pid = next(
+            ln.split("=", 1)[1].split(";", 1)[0] for ln in agent.splitlines() if "SSH_AGENT_PID=" in ln
+        )
+        agent_env = {**os.environ, "SSH_AUTH_SOCK": auth_sock}
+        subprocess.run(["ssh-add", str(key)], env=agent_env, check=True, capture_output=True)
+
+        sshd_proc = subprocess.Popen([sshd, "-D", "-f", str(sshd_conf)])
+        for _ in range(50):
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.1)
+        else:
+            pytest.skip("throwaway sshd did not come up")
+
+        # every LOCAL address the host answers on: loopback v4/v6 always, plus the LAN IP when this
+        # box has one. ::1 is the always-present NON-v4 coverage; the LAN case is opportunistic and is
+        # reported as skipped rather than silently dropped (glm L3) so a LAN-less run cannot masquerade
+        # as having exercised the LAN path.
+        lan = subprocess.run(
+            ["ipconfig", "getifaddr", "en0"], capture_output=True, text=True
+        ).stdout.strip() or subprocess.run(
+            ["ipconfig", "getifaddr", "en1"], capture_output=True, text=True
+        ).stdout.strip()
+        targets = [("127.0.0.1", "127.0.0.1"), ("::1", "::1")] + ([("LAN", lan)] if lan else [])
+        if not lan:
+            warnings.warn("no en0/en1 LAN address — the LAN-interface coverage was NOT exercised")
+
+        # agent-only: no -i, and `-F /dev/null` ignores the operator's ~/.ssh/config (whose `Host *
+        # IdentityFile` would otherwise, under IdentitiesOnly, pin a key FILE instead of the agent),
+        # so the forwarded agent socket is the ONLY identity source. use_agent=False points
+        # IdentityAgent at nothing → no identities at all.
+        def atk(host: str, *, use_agent: bool) -> str:
+            ident = f"-o IdentityAgent={auth_sock}" if use_agent else "-o IdentityAgent=none"
+            return (
+                f"ssh -F /dev/null -p {port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+                f"-o UserKnownHostsFile={known} -o ConnectTimeout=6 {ident} "
+                f"{host} 'cat {canary}' 2>&1"
+            )
+
+        entity = _entity(tmp_path)
+
+        def run(deny: bool, host: str, *, use_agent: bool = True):
+            pol = build_policy(
+                entity,
+                deny_files=(canary, key),  # the KEY FILE is floor-denied → agent is the only carrier
+                extra_deny_read_write=(canary_dir,),
+                ssh_mode="agent",
+                deny_localhost_outbound=deny,
+            )
+            with select_provider().spawn_shell(
+                pol, env={**agent_env, "HOME": str(Path.home())}
+            ) as sh:
+                direct = sh.run(f"cat {canary} 2>&1", timeout=15)
+                attacked = sh.run(atk(host, use_agent=use_agent), timeout=25)
+            return direct, attacked
+
+        # CONTROL: agent OFF, deny OFF — key file denied, no agent → cannot authenticate at all.
+        # This is the proof that the AGENT is the carrier (not the readable key file).
+        _direct, atk_noagent = run(False, "127.0.0.1", use_agent=False)
+        assert token not in atk_noagent.output, "leaked without the agent — key file was the carrier"
+        assert "permission denied" in atk_noagent.output.lower(), atk_noagent.output
+
+        # deny OFF (agent on) — the bypass is real (else an ON pass proves nothing)
+        direct_off, atk_off = run(False, "127.0.0.1")
+        assert "not permitted" in direct_off.output.lower()  # floor denies the direct read
+        assert token in atk_off.output  # ... the forwarded agent carries the leak
+
+        # deny ON — closed by EVERY local-interface address; direct read still denied. A future macOS
+        # change to how "localhost" resolves must break this loudly, per address.
+        for label, host in targets:
+            direct_on, atk_on = run(True, host)
+            assert "not permitted" in direct_on.output.lower(), label
+            assert token not in atk_on.output, f"{label}: token leaked with deny ON"
+            assert "not permitted" in atk_on.output.lower(), (
+                f"{label}: expected a sandbox refusal, got {atk_on.output!r}"
+            )
+    finally:
+        if sshd_proc is not None:
+            sshd_proc.terminate()
+            try:
+                sshd_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                sshd_proc.kill()
+        if agent_pid is not None:
+            subprocess.run(["kill", agent_pid], capture_output=True)

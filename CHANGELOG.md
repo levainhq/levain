@@ -8,6 +8,59 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.6.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Security — a local `sshd` could be used to read a confined entity's crown jewels through the forwarded ssh-agent (`ssh_mode="agent"`)
+
+⚠ **This affects 0.4.5 and every earlier release with the seatbelt floor.** If you run a confined
+entity in the default `ssh_mode="agent"` **and** macOS **Remote Login** is on (System Settings →
+General → Sharing → Remote Login) **and** a key your ssh-agent holds is in your
+`~/.ssh/authorized_keys`, then a confined entity could run `ssh localhost cat <a crown-jewel file>`
+and get the file back — even though the floor denies reading that file directly. `sshd` runs as
+root, was never inside the sandbox, and was authorised by the very agent socket that agent-mode
+forwards by design. This is the same total-bypass class as reaching a container daemon socket (fixed
+in 0.4.x): a floor that denies a *file* but forwards a *credential* to an unsandboxed root reader is
+decorative for that file. **Reproduced end to end**; the forwarded agent socket is the sole carrier.
+
+**Fixed:** in `ssh_mode="agent"` the floor now denies outbound network connections to *this host* —
+`(deny network-outbound (remote ip "localhost:*"))`. macOS seatbelt's `localhost` covers **every
+address bound to a local interface** (loopback `127.0.0.1`/`::1` *and* the machine's own LAN
+address), so the entity can no longer reach a `sshd` this machine runs by any of its own addresses,
+while **remote** hosts stay reachable — ssh/git to real remotes over the forwarded agent is
+unaffected.
+
+- **Cost, and it is real:** a confined entity in agent mode can no longer reach a **local service**
+  either — a dev server it started, a database, an `argushub` on `127.0.0.1:8420`. If an entity
+  genuinely needs that, set `"allow_localhost_outbound": true` in its `.levain/confinement.json` and
+  accept that the `sshd` vector is reopened for that entity.
+- **Scope, and a residual under review:** the deny applies in `ssh_mode="agent"` only. In
+  `ssh_mode="raw"` the entity can read its *own* key directly — but the **other** crown jewels
+  (`~/.anneal-memory`, sibling stores, your declared secrets) stay floor-denied, and a local `sshd`
+  authenticated with that key reads *them* as root just the same, so a raw-mode variant is real
+  (reproduced). Whether to extend the deny to raw mode — and more broadly how a sandbox should handle
+  a forwarded ssh-agent at all — is under review rather than flipped reflexively; a scoped decision
+  is tracked for a later release.
+- **Not covered — ssh connection multiplexing (a documented residual, not closed).** This deny
+  stops a *fresh* connection to a local `sshd`. It does **not** stop reuse of an **existing** ssh
+  `ControlMaster`/mux socket to localhost: if you run `ControlMaster auto`/`yes` and have a live
+  master to this host, a confined entity that can name the `ControlPath` can ride that already
+  authenticated master over its unix socket — which the IP deny cannot see, and which needs no
+  agent. Denying *all* outbound unix-socket connects would close it but was measured to break
+  `getaddrinfo`/HTTPS/`git`/`pip` (macOS resolves DNS through an mDNSResponder unix socket), so it is
+  not the default. The precondition is narrow (ssh multiplexing *to localhost* specifically is
+  unusual); a scoped fix is tracked for a later release. If this matters to you now, set
+  `ControlMaster no` for the confined entity or don't keep localhost masters alive.
+- **Not covered — the forwarded agent is a signing oracle (relay/`ProxyCommand`).** A forwarded
+  agent signs for *any* `sshd` that authorises its key, reached through *any* hop the floor allows.
+  An entity can go `ssh -o ProxyCommand='ssh <relay> nc %h %p' <this-host>` — the sandbox sees only
+  the allowed connection to the relay, which connects back to this host's `sshd`. So a **Tailscale**
+  peer (or any reachable relay) defeats the localhost deny; a Tailscale address is **not** covered by
+  it (an earlier draft wrongly claimed it was). This is not closeable by a network deny — it needs
+  agent *mediation* or not forwarding the agent, part of the agent-forwarding review above.
+- **Not covered — off-interface addresses:** a `sshd` reachable only through an address **not** bound
+  to a local interface (e.g. a NAT hairpin to your router's external IP).
+- **Why not just deny port 22:** macOS seatbelt has no per-port or per-IP loopback filter
+  (`(remote ip "127.0.0.1:22")` is rejected outright), so denying all outbound-to-self is the only
+  enforcement it offers.
+
 ### Fixed — `init --adapter codex` widened the permissions on your global Codex config, and `levain update` narrowed them on `.levain/config.json`
 
 ⚠ **This affects 0.4.5, which is published.** If you ran `levain init --adapter codex` under 0.4.5

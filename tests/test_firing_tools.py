@@ -158,6 +158,24 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
 
 
+def test_policy_for_conv_state_wires_deny_localhost_outbound_agent_mode(tmp_path: Path, monkeypatch):
+    """spore-755. policy_for_conv_state turns the connect-to-self deny ON by default in
+    ssh_mode="agent" (Phill's ruled A, 2026-09-13), OFF when the operator opts out with
+    allow_localhost_outbound. ⚠ raw mode is currently False: codex L3 HIGH#1 REPRODUCED a raw-mode
+    variant (documented residual, spore-1005), and a both-modes tightening is UNDER REVIEW pending
+    Phill's agent-forwarding options doc — this test pins the SHIPPED behavior, not the end state.
+    A dropped pass-through in tools.py would silently leave even the agent-mode bypass open."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent, ws = _entity(tmp_path)  # no config → ssh_mode defaults to "agent"
+    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is True
+
+    (ent / ".levain" / "confinement.json").write_text('{"ssh_mode": "raw"}')
+    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False  # residual
+
+    (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False
+
+
 def test_policy_for_conv_state_denies_standard_creds_on_an_UNATTENDED_drive(tmp_path: Path,
                                                                             monkeypatch):
     """K4a: with no declaration, an UNATTENDED seat folds the standard cred stores into the floor
