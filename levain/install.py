@@ -1704,6 +1704,7 @@ def hook_body(text: str) -> str:
 # install made before this receipt existed reads as absent.
 ACTIVATION_RECEIPT_REL = (".levain", "activation-manifest.json")
 ACTIVATION_RECEIPT_SCHEMA = 1
+_RECEIPT_MAX_BYTES = 16 << 20
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -1743,6 +1744,10 @@ def read_activation_receipt_file(
     record exists to remove.
     """
     try:
+        # Bounded (codex MED): a damaged or hostile receipt of any size must read as corrupt,
+        # never exhaust memory. A real one is a few KB per hundred files.
+        if path.stat().st_size > _RECEIPT_MAX_BYTES:
+            return None, "corrupt"
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None, "absent"
@@ -1750,7 +1755,7 @@ def read_activation_receipt_file(
         return None, "corrupt"
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError, MemoryError):
         return None, "corrupt"
     if not isinstance(data, dict) or data.get("schema") != ACTIVATION_RECEIPT_SCHEMA:
         return None, "corrupt"
@@ -1857,6 +1862,19 @@ def _tree_receipt_path(tree: Path) -> Path:
     return tree.parent / f"{tree.name}.receipt.json"
 
 
+def _is_bytecode_residue(rel: Path, tree: Path) -> bool:
+    """True only for bytecode Python itself writes: a `.pyc` directly inside `__pycache__`,
+    named for a `.py` beside that `__pycache__` (`hooks/__pycache__/x.cpython-312.pyc` for
+    `hooks/x.py`). ⛔ Anything else under an excluded-looking name — `hooks/__pycache__/notes.md`,
+    a directory called `research.pyc/` — is operator content: the proof skipping it while
+    `rmtree` deletes it was an L2 HIGH, reproduced 2026-09-13."""
+    parts = rel.parts
+    if len(parts) < 2 or parts[-2] != "__pycache__" or not parts[-1].endswith(".pyc"):
+        return False
+    stem = parts[-1].split(".", 1)[0]
+    return tree.joinpath(*parts[:-2], f"{stem}.py").is_file()
+
+
 def _edits_against_receipt(
     tree: Path, receipt: Mapping[str, Mapping[str, str]]
 ) -> tuple[list[str], list[str]]:
@@ -1865,10 +1883,10 @@ def _edits_against_receipt(
     Returns ``(edited, unexamined)`` as relative posix paths. ``edited`` holds every file
     whose bytes differ from its receipt entry, every file the receipt does not list (install
     never wrote it), and every symlink or non-regular entry (install writes neither).
-    ``unexamined`` holds anything that could not be read or listed. Build residue
-    (`__pycache__`, `*.pyc`) is skipped: hooks import `_levain_hook` from their own
-    directory, so a tree whose hooks ever ran contains it, and it is reproducible.
-    Nothing here raises."""
+    ``unexamined`` holds anything that could not be read or listed. Only bytecode Python
+    wrote itself is skipped (`_is_bytecode_residue`): hooks import `_levain_hook` from their
+    own directory, so a tree whose hooks ever ran contains it. Every filesystem call is
+    inside a guard, because this runs after the swap has completed."""
     edited: list[str] = []
     unexamined: list[str] = []
 
@@ -1879,17 +1897,20 @@ def _edits_against_receipt(
         walk_dirs.sort()
         root = Path(walk_root)
         for dname in list(walk_dirs):
-            if (root / dname).is_symlink():
-                rel = (root / dname).relative_to(tree)
-                if not _activation_excluded(rel):
-                    edited.append(rel.as_posix())
+            drel = (root / dname).relative_to(tree).as_posix()
+            try:
+                if (root / dname).is_symlink():
+                    edited.append(drel)
+            except OSError:
+                # A listable but unsearchable parent (L1 HIGH, reproduced): lstat raises.
+                unexamined.append(drel)
         for fname in sorted(walk_files):
             path = root / fname
             rel = path.relative_to(tree)
-            if _activation_excluded(rel):
-                continue
             name = rel.as_posix()
             try:
+                if not path.is_symlink() and _is_bytecode_residue(rel, tree):
+                    continue
                 if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
                     edited.append(name)
                     continue
@@ -1937,6 +1958,9 @@ def _prune_activation_backups(backups_root: Path, keep: int) -> list[str]:
     pristine = [t for _, t in trees if _tree_proves_pristine(t)]
     unproven = [t for _, t in trees if t not in pristine]
     for old in pristine[:-keep] if keep > 0 else pristine:
+        if not _tree_proves_pristine(old):  # re-proved at the moment of deletion (L2 LOW)
+            unproven.append(old)
+            continue
         try:
             shutil.rmtree(old)
         except OSError as e:
@@ -2053,22 +2077,25 @@ def _copy_activation_tree(
     tree_backup = backups_root / f"{_TREE_BACKUP_PREFIX}{stamp}"
     carried_receipt: Path | None = None
 
-    # The previous tree's receipt travels with it, copied BEFORE the invalidation below
-    # removes the live one. A failed copy leaves that tree unproven, so it is kept.
-    if had_previous and prior_status == "ok":
-        try:
-            backups_root.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(live_receipt, _tree_receipt_path(tree_backup))
-            carried_receipt = _tree_receipt_path(tree_backup)
-        except OSError:
-            carried_receipt = None
-
     def _drop_carried() -> None:
         if carried_receipt is not None:
             try:
                 carried_receipt.unlink()
             except OSError:
                 pass
+
+    # The previous tree's receipt travels with it, copied BEFORE the invalidation below
+    # removes the live one. A failed copy leaves that tree unproven, so it is kept. The
+    # path is recorded before copying, so a partial copy is removed rather than orphaned
+    # (L1 LOW, reproduced). A symlinked activation/ carries none; see the swap.
+    if had_previous and prior_status == "ok" and not dst.is_symlink():
+        carried_receipt = _tree_receipt_path(tree_backup)
+        try:
+            backups_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(live_receipt, carried_receipt)
+        except OSError:
+            _drop_carried()
+            carried_receipt = None
 
     # ⛔ INVALIDATE THE LIVE RECEIPT BEFORE THE SWAP (L1 + L2 HIGH, reproduced
     # 2026-09-13): removed only afterwards, it outlived any interrupt, kill or unwritable
@@ -2094,9 +2121,17 @@ def _copy_activation_tree(
             ) from e
 
     moved_to: Path | None = None
+    link_target: str | None = None
     notes: list[str] = []
     try:
-        if had_previous:
+        if had_previous and dst.is_symlink():
+            # A symlinked activation/ moves as the LINK. Renamed into backups, a relative
+            # link dangles and the notice points at nothing (L1 MED, L2 LOW, reproduced).
+            # Kept beside activation/ it still resolves; the content stays at its target.
+            link_target = os.readlink(dst)
+            moved_to = dst.parent / f".levain-activation-prev-{stamp}"
+            os.replace(dst, moved_to)
+        elif had_previous:
             moved_to = tree_backup
             try:
                 backups_root.mkdir(parents=True, exist_ok=True)
@@ -2105,7 +2140,15 @@ def _copy_activation_tree(
                 if not (dst.exists() or dst.is_symlink()):
                     raise
                 moved_to = dst.parent / f".levain-activation-prev-{stamp}"
-                os.replace(dst, moved_to)
+                try:
+                    os.replace(dst, moved_to)
+                except OSError as e2:
+                    moved_to = None
+                    raise InitError(
+                        f"could not keep the previous activation/ under {backups_root} "
+                        f"({e}) or beside it ({e2}). Nothing was moved or deleted; fix the "
+                        f"permissions and re-run."
+                    ) from e2
                 _drop_carried()
                 notes.append(
                     f"  note: could not keep the previous activation/ under {backups_root} "
@@ -2117,6 +2160,14 @@ def _copy_activation_tree(
         if (moved_to is not None and not (dst.exists() or dst.is_symlink())
                 and (moved_to.exists() or moved_to.is_symlink())):
             os.replace(moved_to, dst)  # put the original tree back
+        # The tree is back where it was, so its receipt goes back too (L2 LOW): dropped, it
+        # would leave that tree permanently unable to prove itself and rotate.
+        if carried_receipt is not None and not live_receipt.exists():
+            try:
+                os.replace(carried_receipt, live_receipt)
+                carried_receipt = None
+            except OSError:
+                pass
         _drop_carried()
         raise
 
@@ -2131,6 +2182,32 @@ def _copy_activation_tree(
             f"install's own files, and that backup will be kept rather than rotated."
         )
 
+    try:
+        _report_and_rotate(moved_to, link_target, prior_status, prior_installed,
+                           backups_root, emit, notes)
+    except OSError as e:
+        # The install is complete; nothing after the swap may turn it into a traceback that
+        # repeats on every later run (L1 HIGH, reproduced).
+        notes.append(f"  note: the install is complete, but reporting on or rotating old "
+                     f"backups failed ({e}); no backup was rotated by that step.")
+    for note in notes:
+        emit(note)
+
+
+def _report_and_rotate(
+    moved_to: Path | None,
+    link_target: str | None,
+    prior_status: str,
+    prior_installed: Mapping[str, Mapping[str, str]] | None,
+    backups_root: Path,
+    emit: Callable[[str], None],
+    notes: list[str],
+) -> None:
+    """Post-swap notices for the retained tree, then receipt-gated rotation."""
+    if moved_to is not None and link_target is not None:
+        emit(f"  activation/ was a symlink to {link_target}; that content is untouched at "
+             f"its target, and the link itself is kept at {moved_to}")
+        return
     if moved_to is not None:
         if prior_status == "ok" and prior_installed is not None:
             edited, unexamined = _edits_against_receipt(moved_to, prior_installed)
@@ -2147,8 +2224,6 @@ def _copy_activation_tree(
             )
         if moved_to.parent == backups_root:
             notes.extend(_prune_activation_backups(backups_root, _ACTIVATION_TREES_KEPT))
-    for note in notes:
-        emit(note)
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:

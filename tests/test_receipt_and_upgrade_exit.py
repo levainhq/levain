@@ -232,8 +232,10 @@ def test_a_pre_751_mcp_registration_is_PENDING_not_broken(tmp_path: Path):
     r = _check_mcp_command("m", str(script), ["--db", "x", "serve"], tmp_path)
     assert not r.ok and r.upgrade_pending
     # Same interpreter but without -P is also the pre-fix shape, not a pass.
+    # Same interpreter without -P is not a shape `init` ever wrote: broken, not pending
+    # (L3 codex MED: only the pre-751 anneal-memory script shape is a pending step).
     r2 = _check_mcp_command("m", sys.executable, ["-m", "anneal_memory", "serve"], tmp_path)
-    assert not r2.ok and r2.upgrade_pending
+    assert not r2.ok and not r2.upgrade_pending
 
 
 def test_an_unresolvable_mcp_command_is_BROKEN(tmp_path: Path):
@@ -411,12 +413,16 @@ def test_a_hook_EDITED_since_install_is_BROKEN_not_pending(tmp_path: Path):
     assert "changed since `levain init` wrote them" in r.detail
 
 
-@pytest.mark.parametrize("lock_version, pending", [("0.0.1", True), ("999.0.0", False)])
+@pytest.mark.parametrize("lock_version, lock_anneal, pending", [
+    ("0.0.1", "0.0.1", True),        # levain AND anneal moved forward: routine
+    ("999.0.0", "0.0.1", False),     # levain downgraded: not routine
+    ("0.0.1", "999.0.0", False),     # anneal downgraded alongside a levain upgrade (L3 MED)
+])
 def test_anneal_lock_drift_is_pending_only_alongside_a_levain_UPGRADE(
-    monkeypatch, tmp_path: Path, lock_version: str, pending: bool
+    monkeypatch, tmp_path: Path, lock_version: str, lock_anneal: str, pending: bool
 ):
     """L2 HIGH, reproduced: the routine upgrade also moves the anneal lock and still exited
-    1. MUTATION: drop "anneal-lock" from the pending axes."""
+    1. MUTATION: drop "anneal-lock" from the pending axes, or its anneal-direction guard."""
     from levain import __version__, manifest
 
     install = tmp_path / "ent"
@@ -427,9 +433,9 @@ def test_anneal_lock_drift_is_pending_only_alongside_a_levain_UPGRADE(
     monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: "anneal-memory")
     monkeypatch.setattr(manifest, "declared_set", lambda: None)
     monkeypatch.setattr(manifest, "discover_installed_set",
-                        lambda *_a: SimpleNamespace(levain=__version__))
+                        lambda *_a: SimpleNamespace(levain=__version__, anneal="1.0.0"))
     monkeypatch.setattr(manifest, "read_lock_status",
-                        lambda _p: (SimpleNamespace(levain=lock_version), "ok"))
+                        lambda _p: (SimpleNamespace(levain=lock_version, anneal=lock_anneal), "ok"))
     monkeypatch.setattr(manifest, "compute_drift", lambda *_a: SimpleNamespace(verdicts=verdicts))
     monkeypatch.setattr(manifest, "pip_floor_verdict",
                         lambda: manifest.AxisVerdict("pip-pin", "in_sync", "ok"))
@@ -437,25 +443,38 @@ def test_anneal_lock_drift_is_pending_only_alongside_a_levain_UPGRADE(
     assert rows["compat: anneal-lock"].upgrade_pending is pending
 
 
-def test_a_module_form_command_that_CANNOT_IMPORT_anneal_is_BROKEN(tmp_path: Path):
-    """L2 MED, reproduced with a system python lacking anneal. MUTATION: skip the probe
-    -> a server that cannot start is reported as a pending step or OK."""
+def test_doctor_NEVER_EXECUTES_a_foreign_mcp_command(tmp_path: Path):
+    """L3 HIGH, complement + codex: static doctor ran whatever `.mcp.json` named. MUTATION:
+    probe any resolvable command -> the payload runs and leaves its marker."""
+    marker = tmp_path / "ran"
     fake = tmp_path / "python"
-    fake.write_text("#!/bin/sh\necho 'No module named anneal_memory' >&2\nexit 1\n",
-                    encoding="utf-8")
+    fake.write_text(f"#!/bin/sh\ntouch {marker}\necho /some/venv\n", encoding="utf-8")
     fake.chmod(0o755)
-    r = _check_mcp_command("m", str(fake), ["-P", "-m", "anneal_memory", "serve"], tmp_path)
-    assert not r.ok and not r.upgrade_pending and "cannot start" in r.detail
+    r = _check_mcp_command("m", str(fake), ["-P", "-m", "anneal_memory", "--db", "x", "serve"],
+                           tmp_path)
+    assert not marker.exists(), "doctor executed a command it did not choose"
+    assert not r.ok and not r.upgrade_pending and "does not run it" in r.detail
 
 
-def test_a_module_form_command_in_ANOTHER_environment_is_not_OK(tmp_path: Path):
-    """L1 + L2 MED: compare the environment, not the path spelling. MUTATION: accept any
-    probe success -> another venv's registration reads as this levain's."""
-    fake = tmp_path / "python"
-    fake.write_text("#!/bin/sh\necho /some/other/venv\n", encoding="utf-8")
+@pytest.mark.parametrize("args", [
+    ["-P", "-c", "pass", "-m", "anneal_memory", "--db", "x", "serve"],
+    ["-P", "-m", "anneal_memory", "--db", "x", "status"],
+])
+def test_the_registered_argv_must_be_EXACTLY_what_init_writes(tmp_path: Path, args):
+    """L3 codex HIGH, reproduced: both of these passed while never starting the server.
+    MUTATION: accept -P anywhere before -m, or skip the `serve` check."""
+    r = _check_mcp_command("m", sys.executable, args, tmp_path)
+    assert not r.ok and not r.upgrade_pending
+
+
+def test_a_non_anneal_script_command_is_BROKEN_not_pending(tmp_path: Path):
+    """L3 codex MED: `/usr/bin/false`-shaped registrations exited 6. MUTATION: treat every
+    non-module command as the pre-751 shape."""
+    fake = tmp_path / "false"
+    fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     fake.chmod(0o755)
-    r = _check_mcp_command("m", str(fake), ["-P", "-m", "anneal_memory", "serve"], tmp_path)
-    assert not r.ok and "/some/other/venv" in r.detail
+    r = _check_mcp_command("m", str(fake), ["--db", "x", "serve"], tmp_path)
+    assert not r.ok and not r.upgrade_pending
 
 
 # ---------- spore-861 ruling B: receipt-gated pruning ----------
@@ -472,7 +491,7 @@ def _hook_text(tree: Path) -> str:
 
 def test_pristine_trees_rotate_to_the_newest_three_WITH_their_receipts(tmp_path: Path):
     """MUTATION: drop the rotation -> five trees; drop the receipt unlink -> orphan receipts;
-    drop the `tree-` filter -> the legacy dir is removed."""
+    drop the `tree-` filter -> the legacy dir is named as a tree that may hold edits."""
     base = _layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
@@ -584,6 +603,156 @@ def test_the_receipt_beside_a_tree_is_the_one_that_installed_it(tmp_path: Path):
     _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal")
     (tree,) = _trees(install)
     assert (tree.parent / f"{tree.name}.receipt.json").read_text(encoding="utf-8") == live_before
+
+
+# ---------- L1/L2 round on 861 ----------
+
+
+@pytest.mark.parametrize("hidden", ["hooks/__pycache__/MY_NOTES.md", "research.pyc/findings.md"])
+def test_an_operator_file_at_a_bytecode_LOOKING_path_blocks_the_proof(tmp_path: Path, hidden):
+    """L2 HIGH, reproduced: the proof skipped these while rmtree deleted them. MUTATION:
+    skip every `__pycache__`/`*.pyc` path again -> the tree is pruned."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    (dst / hidden).parent.mkdir(parents=True, exist_ok=True)
+    (dst / hidden).write_text("ONLY COPY\n", encoding="utf-8")
+    for n in range(1, 6):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=f"/opt/{n}/anneal")
+    assert [t for t in _trees(install) if (t / hidden).is_file()], "the operator file was deleted"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_an_unsearchable_dir_never_raises_after_the_swap(tmp_path: Path):
+    """L1 HIGH, reproduced: a listable, unsearchable dir raised PermissionError after the swap,
+    on this run and every later one. MUTATION: drop the post-swap guard or the lstat guard."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    (dst / "locked" / "sub").mkdir(parents=True)
+    (dst / "locked" / "sub" / "x.md").write_text("X\n", encoding="utf-8")
+    os.chmod(dst / "locked", 0o644)
+    try:
+        said: list[str] = []
+        for n in range(1, 3):
+            _copy_activation_tree([base], dst, base_activation=base,
+                                  anneal_path=f"/opt/{n}/anneal", emit=said.append)
+        assert [m for m in said if "could not compare" in m], said
+    finally:
+        for d in (install / ".levain" / "backups" / "activation").glob("tree-*/locked"):
+            os.chmod(d, 0o755)
+    assert len(_trees(install)) == 2
+
+
+def test_a_SYMLINKED_activation_is_kept_where_it_still_resolves(tmp_path: Path):
+    """L1 MED / L2 LOW, reproduced: the link moved into backups dangled and the notice named
+    it. MUTATION: drop the symlink branch -> the kept link does not resolve."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    install.mkdir()
+    shared = install / "shared_act"
+    (shared / "hooks").mkdir(parents=True)
+    (shared / "posture.md").write_text("SHARED\n", encoding="utf-8")
+    (install / "activation").symlink_to("shared_act")
+    said: list[str] = []
+    _copy_activation_tree([base], install / "activation", base_activation=base, emit=said.append)
+    (kept,) = list(install.glob(".levain-activation-prev-*"))
+    assert kept.is_symlink() and kept.exists(), "the kept link must still resolve"
+    assert (shared / "posture.md").read_text(encoding="utf-8") == "SHARED\n"
+    assert not (install / "activation").is_symlink()
+    assert [m for m in said if "was a symlink to shared_act" in m], said
+
+
+def test_a_FAILED_swap_puts_the_receipt_back_with_the_tree(tmp_path: Path, monkeypatch):
+    """L2 LOW, reproduced: the tree came back and its receipt did not. MUTATION: drop the
+    receipt restore -> the live receipt is gone."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    before = activation_receipt_path(install).read_text(encoding="utf-8")
+    real_replace = inst.os.replace
+
+    def flaky(src, dst_):
+        if ".levain-activation-new-" in str(src):
+            raise OSError(5, "Input/output error")
+        return real_replace(src, dst_)
+
+    monkeypatch.setattr(inst.os, "replace", flaky)
+    with pytest.raises(OSError):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal")
+    monkeypatch.setattr(inst.os, "replace", real_replace)
+    assert activation_receipt_path(install).read_text(encoding="utf-8") == before
+    assert not list((install / ".levain" / "backups" / "activation").glob("*.receipt.json"))
+
+
+def test_a_PARTIAL_receipt_copy_is_not_left_orphaned(tmp_path: Path, monkeypatch):
+    """L1 LOW, reproduced. MUTATION: record the carried path only after a successful copy ->
+    the half-written sibling receipt stays."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    real_copy2 = inst.shutil.copy2
+
+    def half(src, d, *a, **k):
+        if str(d).endswith(".receipt.json"):
+            Path(d).write_text("{", encoding="utf-8")
+            raise OSError(28, "No space left on device")
+        return real_copy2(src, d, *a, **k)
+
+    monkeypatch.setattr(inst.shutil, "copy2", half)
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal")
+    assert not list((install / ".levain" / "backups" / "activation").glob("*.receipt.json"))
+    assert len(_trees(install)) == 1
+
+
+def test_an_error_AFTER_the_swap_becomes_a_note_never_a_traceback(tmp_path: Path, monkeypatch):
+    """L1 HIGH's defence in depth: whatever the inner guards miss, a completed install must
+    not raise. MUTATION: narrow the post-swap `except OSError` -> the OSError escapes."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+
+    def boom(*_a, **_k):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(inst, "_prune_activation_backups", boom)
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal",
+                          emit=said.append)
+    assert '"/opt/1/anneal"' in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+    assert [m for m in said if "the install is complete" in m], said
+
+
+def test_an_OVERSIZED_receipt_reads_as_corrupt_without_being_parsed(tmp_path: Path, monkeypatch):
+    """L3 codex MED. MUTATION: drop the size cap -> json.loads is reached."""
+    path = tmp_path / "activation-manifest.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(inst, "_RECEIPT_MAX_BYTES", 1)
+    monkeypatch.setattr(inst.json, "loads", lambda *_a, **_k: pytest.fail("parsed an oversized receipt"))
+    assert read_activation_receipt_file(path) == (None, "corrupt")
+
+
+def test_EDITED_and_UNPROVEN_stale_hooks_are_both_named(tmp_path: Path):
+    """L3 complement LOW. MUTATION: drop the unproven clause from the edited detail."""
+    from levain.install import _write_activation_receipt
+
+    install = _receipted_hooked_install(tmp_path)
+    hooks = install / "activation" / "hooks"
+    edited = hooks / "_levain_hook.py"
+    edited.write_text(edited.read_text(encoding="utf-8") + "import os\n", encoding="utf-8")
+    other = next(p for p in sorted(hooks.glob("*.py")) if p.name != "_levain_hook.py")
+    other.write_text(other.read_text(encoding="utf-8") + "\n# older\n", encoding="utf-8")
+    files, _ = read_activation_receipt(install)
+    assert files is not None
+    files.pop(f"hooks/{other.name}")
+    _write_activation_receipt(install, files)
+    r = doctor._check_hook_freshness(install)[0]
+    assert "_levain_hook.py" in r.detail and other.name in r.detail and not r.upgrade_pending
 
 
 def test_receipt_json_is_a_stable_shape(tmp_path: Path):
