@@ -274,6 +274,48 @@ def test_pip_floor_verdict_flags_drift(monkeypatch):
     assert v.status == "drift"
 
 
+def test_pip_floor_reads_PYPROJECT_at_release_cut_not_the_stale_egg_info(
+    monkeypatch, tmp_path
+):
+    """Diogenes MEDIUM, 2026-09-09, reproduced on disk. `_levain_requires` used to read
+    ONLY `importlib.metadata.requires("levain")`, which answers from `levain.egg-info/` —
+    a gitignored build artifact NOT regenerated when `pyproject.toml` changes. At
+    release-cut time nobody has reinstalled the wheel; they are running the repo. Bumping
+    the pin and cutting the release without reinstalling reported `in_sync` on a genuinely
+    drifted pair — the gate this function feeds never opened.
+
+    Pre-fix this reproduces exactly the finding's own repro: point KNOWN_GOOD_ANNEAL at
+    0.9.8, write a `pyproject.toml` pinning 0.9.9 beside a FAKE `manifest.__file__`, leave
+    `importlib.metadata` alone (a real installed dist, unrelated to the fake pyproject) —
+    the pre-fix code never looks at the pyproject at all, so it can only see the dist
+    metadata's floor and reports whatever that says instead of drift."""
+    pkg_dir = tmp_path / "levain"
+    pkg_dir.mkdir()
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["anneal-memory>=0.9.9,<0.10"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", tmp_path / "pyproject.toml")
+    monkeypatch.setattr(manifest, "KNOWN_GOOD_ANNEAL", "0.9.8")
+
+    v = manifest.pip_floor_verdict()
+
+    assert v.status == "drift", (
+        f"pyproject pins 0.9.9 while KNOWN_GOOD_ANNEAL is 0.9.8 — must drift, got {v!r}"
+    )
+    assert manifest.pip_floor() == "0.9.9"
+
+
+def test_pip_floor_falls_back_to_dist_metadata_when_no_pyproject_beside_it(monkeypatch):
+    """The installed-wheel case: no source tree sits beside the package, so
+    `_levain_requires` must defer to `importlib.metadata` rather than silently
+    reporting nothing (which `pip_floor_verdict` would read as `unknown`, not `in_sync`,
+    on a perfectly healthy wheel install)."""
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", Path("/nonexistent/pyproject.toml"))
+    assert manifest._pyproject_requires() is None
+    # The real environment has levain installed (editable), so dist metadata is real.
+    assert manifest.pip_floor() == "0.9.8"
+
+
 # --------------------------------------------------------------------------
 # discover_installed_set — unit (monkeypatched) + integration (real store)
 # --------------------------------------------------------------------------

@@ -239,7 +239,7 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     # Tracing `SandboxedShell.close` in confinement.py across the commits that moved it:
     # `bdb4b2f` had it at 1694 and wrote ":1694" — correct · `23fedaf`, six minutes later,
     # moved it to 1703 and killed that citation · `fd7c4d4` moved it to 1717 AND IS THE COMMIT
-    # THAT WROTE ":1703". `git log -S"1703" -- <this file>` returns that commit alone.
+    # THAT WROTE ":1703" — `git log -S"1703" -- <this file>` finds it.
     # ⛔ So the replacement coordinate was FOURTEEN LINES WRONG AT THE INSTANT IT WAS COMMITTED:
     # the same edit invalidated the number and wrote the sentence about the number. That is
     # strictly sharper than the "went stale later" story it replaced, and the earlier claim that

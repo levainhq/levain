@@ -49,6 +49,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -556,7 +557,44 @@ def _anneal_spec_clauses(req: str) -> list[str]:
     return [c.strip() for c in rest.split(",") if c.strip()]
 
 
+_PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+
+def _pyproject_requires() -> list[str] | None:
+    """The ``project.dependencies`` array from a ``pyproject.toml`` beside this
+    package, or ``None`` if none is present or it doesn't parse — the
+    release-cut case (a repo checkout), distinguished from the installed-wheel
+    case by whether the source tree is even there."""
+    if not _PYPROJECT_PATH.is_file():
+        return None
+    try:
+        data = tomllib.loads(_PYPROJECT_PATH.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+        return None
+    deps = data.get("project", {}).get("dependencies")
+    if not isinstance(deps, list):
+        return None
+    return [d for d in deps if isinstance(d, str)]
+
+
 def _levain_requires() -> list[str]:
+    """levain's declared dependency specs — repo-first, dist-fallback.
+
+    ⛔ THIS USED TO READ ONLY THE INSTALLED DIST METADATA (Diogenes MEDIUM,
+    2026-09-09, reproduced on disk). At release-cut time nobody has reinstalled
+    the wheel — they are running the repo — and ``importlib.metadata.requires``
+    answers from ``levain.egg-info/``, a gitignored build artifact that is NOT
+    regenerated when ``pyproject.toml`` changes. Bumping the pin and cutting the
+    release without reinstalling reported ``in_sync`` on a genuinely drifted
+    pair; the gate this function feeds never opened. Reading ``pyproject.toml``
+    when it sits beside the package (a repo checkout) answers the question the
+    gate is actually being asked at cut time; falling back to
+    ``importlib.metadata`` keeps ``pip_floor()`` correct for an installed wheel
+    with no source tree beside it, where the dist metadata IS the truth
+    (``pip_floor``'s own docstring)."""
+    pyproject_deps = _pyproject_requires()
+    if pyproject_deps is not None:
+        return pyproject_deps
     try:
         import importlib.metadata as md
 
