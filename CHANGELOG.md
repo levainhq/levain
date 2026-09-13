@@ -29,15 +29,17 @@ The failures are still printed as `FAIL`, because they are real: until you apply
 
 ⚠ **If a script branches on specific codes** (`case $? in 1) ...`), exit 6 no longer matches the `1` branch. Scripts that only test for nonzero (`levain doctor || alert`) behave as before.
 
-### Changed — `levain init --force` records what it installed, and uses that record to tell your edits from its own files
+### Changed — `levain init --force` keeps your whole previous `activation/` tree, and deletes an old one only when it can prove you never edited it
 
-`init` now writes `.levain/activation-manifest.json`: for each file it puts in `activation/`, the sha256 of the bytes as installed and of the package file they came from. On the next `init --force`, a file that is about to be replaced is compared with that record:
+`init --force` used to look at each file under `activation/` before replacing the tree, and copy the ones it judged to be yours into `.levain/backups/activation/<timestamp>/`. Anything that judgement could not handle was lost: an edit saved in the moment between the check and the replacement, a symlink, a directory it could not read.
 
-- unchanged since install → copied to `.levain/backups/activation/` without a notice;
-- changed since install → copied, and reported as `Operator-edited`;
-- not covered by a record (every install made before this release, or a damaged record) → copied, and reported as preserved without claiming whether you edited it.
-
-This replaces the old comparison, which ignored the substituted `_INSTALL_ANNEAL_BIN` line in hooks and so could not report an edit made to that line.
+- **The previous tree is moved whole** to `.levain/backups/activation/tree-<timestamp>/`. Every file, symlink and directory you had is in it, exactly as it was.
+- **`init` now records what it installed** in `.levain/activation-manifest.json`: for each file under `activation/`, the sha256 of the bytes as installed and of the package file they came from. A copy travels beside each kept tree as `tree-<timestamp>.receipt.json`.
+- **An old tree is deleted only if it matches that record exactly**, with nothing added: then it holds nothing of yours. The newest three such trees are kept. Any tree that differs, has extra files or symlinks, or has no readable record (every tree kept from an install made before this release) is **never deleted**, and `init` names it.
+- The "Operator-edited … preserved at" lines are worked out from that record, so they now also catch an edit made only to the `_INSTALL_ANNEAL_BIN` line of a hook. Where there is no record, `init` says it cannot tell.
+- If `.levain/backups/activation/` cannot take the move, the previous tree is kept beside `activation/` as `.levain-activation-prev-<timestamp>`, `init` tells you so, and levain never removes it. A reinstall is never blocked by this.
+- Backup directories written by earlier releases (named with a bare timestamp) are never removed.
+- This supersedes 0.4.5's stated exception for symlinks under `activation/`: they are now kept as symlinks.
 
 ## [0.4.6] — 2026-09-13
 

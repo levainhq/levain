@@ -112,7 +112,8 @@ def test_a_damaged_or_empty_receipt_is_UNKNOWN_never_pristine(tmp_path: Path, da
     said: list[str] = []
     _copy_activation_tree([base], dst, base_activation=base,
                           anneal_path="/usr/local/bin/anneal-memory", emit=said.append)
-    assert [m for m in said if "_levain_hook.py preserved at" in m and "cannot tell" in m], said
+    assert [m for m in said if "Previous activation/ kept whole" in m and "cannot tell" in m], said
+    assert not [m for m in said if "Operator-edited" in m], said
 
 
 def test_ONE_malformed_entry_voids_the_WHOLE_receipt(tmp_path: Path):
@@ -455,6 +456,134 @@ def test_a_module_form_command_in_ANOTHER_environment_is_not_OK(tmp_path: Path):
     fake.chmod(0o755)
     r = _check_mcp_command("m", str(fake), ["-P", "-m", "anneal_memory", "serve"], tmp_path)
     assert not r.ok and "/some/other/venv" in r.detail
+
+
+# ---------- spore-861 ruling B: receipt-gated pruning ----------
+
+
+def _trees(install: Path) -> list[Path]:
+    root = install / ".levain" / "backups" / "activation"
+    return sorted(p for p in root.iterdir() if p.name.startswith("tree-") and p.is_dir())
+
+
+def _hook_text(tree: Path) -> str:
+    return (tree / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+
+
+def test_pristine_trees_rotate_to_the_newest_three_WITH_their_receipts(tmp_path: Path):
+    """MUTATION: drop the rotation -> five trees; drop the receipt unlink -> orphan receipts;
+    drop the `tree-` filter -> the legacy dir is removed."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    legacy = install / ".levain" / "backups" / "activation" / "1700000000000000000"
+    legacy.mkdir(parents=True)
+    (legacy / "posture.md").write_text("AN EDIT ONLY THIS DIR HOLDS\n", encoding="utf-8")
+    said: list[str] = []
+    for n in range(6):
+        _copy_activation_tree([base], dst, base_activation=base,
+                              anneal_path=f"/opt/{n}/anneal", emit=said.append)
+
+    # A bare-timestamp dir is not a tree in this scheme, so it is neither pruned nor
+    # reported as a tree that "may hold edits" (MUTATION: drop the `tree-` filter).
+    assert not [m for m in said if "may hold edits" in m], said
+    trees = _trees(install)
+    assert [f'"/opt/{n}/anneal"' in _hook_text(t) for n, t in zip((2, 3, 4), trees)] == [True] * 3
+    assert len(trees) == 3
+    receipts = sorted((install / ".levain" / "backups" / "activation").glob("tree-*.receipt.json"))
+    assert [r.name for r in receipts] == [f"{t.name}.receipt.json" for t in trees]
+    assert (legacy / "posture.md").read_text(encoding="utf-8") == "AN EDIT ONLY THIS DIR HOLDS\n"
+
+
+def test_a_tree_holding_an_EDIT_is_never_pruned_and_is_named(tmp_path: Path):
+    """⚖ Ruling B. MUTATION: prune by count regardless of proof -> the edited tree is gone."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    (dst / "posture.md").write_text("MY TUNED POSTURE\n", encoding="utf-8")
+    said: list[str] = []
+    for n in range(1, 6):
+        _copy_activation_tree([base], dst, base_activation=base,
+                              anneal_path=f"/opt/{n}/anneal", emit=said.append)
+    kept = [t for t in _trees(install)
+            if (t / "posture.md").read_text(encoding="utf-8") == "MY TUNED POSTURE\n"]
+    assert len(kept) == 1
+    assert len(_trees(install)) == 4       # the edited tree + the newest three pristine
+    assert [m for m in said if "may hold edits" in m and str(kept[0]) in m], said
+
+
+def test_a_RECEIPTLESS_tree_is_never_pruned(tmp_path: Path):
+    """Every tree from an install made before the receipt existed. MUTATION: treat an
+    absent sibling receipt as pristine -> it is pruned."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    (dst / "hooks").mkdir(parents=True)
+    (dst / "posture.md").write_text("P\n", encoding="utf-8")
+    (dst / "hooks" / "_levain_hook.py").write_text('_INSTALL_ANNEAL_BIN = "/old"\n',
+                                                    encoding="utf-8")
+    for n in range(5):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=f"/opt/{n}/anneal")
+    oldest = _trees(install)[0]
+    assert '"/old"' in _hook_text(oldest)
+    assert not (oldest.parent / f"{oldest.name}.receipt.json").exists()
+    assert len(_trees(install)) == 4
+
+
+def test_a_tree_whose_sibling_receipt_is_CORRUPT_is_never_pruned(tmp_path: Path):
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal")
+    (first,) = _trees(install)
+    (first.parent / f"{first.name}.receipt.json").write_text("truncated", encoding="utf-8")
+    for n in range(2, 6):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=f"/opt/{n}/anneal")
+    assert first in _trees(install)
+
+
+def test_pycache_residue_does_not_block_the_proof(tmp_path: Path):
+    """Hooks import `_levain_hook` from their own directory, so a used tree has
+    `__pycache__`. MUTATION: stop skipping excluded residue -> no tree ever proves pristine."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    for n in range(1, 6):
+        (dst / "hooks" / "__pycache__").mkdir(exist_ok=True)
+        (dst / "hooks" / "__pycache__" / "_levain_hook.cpython-312.pyc").write_bytes(b"x")
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=f"/opt/{n}/anneal")
+    assert len(_trees(install)) == 3
+
+
+def test_a_SYMLINK_in_a_tree_blocks_the_proof(tmp_path: Path):
+    """Install never writes a symlink. MUTATION: follow symlinks in the proof -> a
+    symlinked file matching its target's hash reads as pristine and is pruned."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    real = tmp_path / "posture_real.md"
+    real.write_text((dst / "posture.md").read_text(encoding="utf-8"), encoding="utf-8")
+    (dst / "posture.md").unlink()
+    (dst / "posture.md").symlink_to(real)
+    for n in range(1, 6):
+        _copy_activation_tree([base], dst, base_activation=base, anneal_path=f"/opt/{n}/anneal")
+    assert any((t / "posture.md").is_symlink() for t in _trees(install))
+
+
+def test_the_receipt_beside_a_tree_is_the_one_that_installed_it(tmp_path: Path):
+    """MUTATION: copy the receipt AFTER the pre-swap invalidation -> no sibling receipt."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/0/anneal")
+    live_before = activation_receipt_path(install).read_text(encoding="utf-8")
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/1/anneal")
+    (tree,) = _trees(install)
+    assert (tree.parent / f"{tree.name}.receipt.json").read_text(encoding="utf-8") == live_before
 
 
 def test_receipt_json_is_a_stable_shape(tmp_path: Path):

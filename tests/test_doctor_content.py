@@ -706,8 +706,9 @@ def test_stale_hook_hint_does_not_reassure_past_what_init_force_preserves(tmp_pa
     hint = r.hint or ""
     assert ".levain/backups/activation/" in hint, (
         "the remedy rewrites the activation tree — it must say where edits go")
-    assert "hooks included" in hint, (
-        "hooks are the file class this hint's omission actually cost an operator")
+    assert "hooks and all" in hint and "moved whole" in hint, (
+        "hooks are the file class this hint's omission actually cost an operator; "
+        "since spore-861 the whole previous tree is what is kept")
     # The old shape must not come back: an enumeration of survivors with no
     # mention of the tree being rewritten.
     assert "are kept" not in hint, (
