@@ -160,7 +160,10 @@ def main(argv: list[str] | None = None) -> int:
             "Check that an install is wired correctly: interpreter resolves, "
             "MCP server is registered for the detected adapter(s), the store "
             "is reachable, the hook scripts are present and runnable. Exits "
-            "nonzero on any failure so it composes with shell pipelines."
+            "nonzero on any failure so it composes with shell pipelines: 1 when "
+            "something is wrong, 6 when every failure is a post-upgrade step not "
+            "yet applied (until then the install keeps running what an earlier "
+            "levain set up)."
         ),
     )
     doc_p.add_argument(

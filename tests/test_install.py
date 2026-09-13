@@ -26,7 +26,6 @@ from levain.install import (
     _compose_activation_layers,
     _codex_block_store,
     _copy_activation_tree,
-    _is_hook_script,
     _merge_codex_config,
     _same_contents,
     _behavior_note_lines,
@@ -1926,8 +1925,11 @@ def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Pat
     ⚠ AND IT RECURS: each run writes its OWN resolution in, so alternating shells
     re-trigger it forever. Measured on real installs 2026-09-06 before the fix.
 
-    MUTATION CONTROL: drop the `_is_hook_script`/`_hook_bodies_match` branch and this
-    fails — the hook is staged with no operator involvement."""
+    Since spore-900 the answer comes from the install receipt rather than from normalising
+    the substituted line: each run's hook matches the receipt the previous run wrote.
+
+    MUTATION CONTROL: drop the receipt's `notify = False` branch and this fails — the
+    pristine hook is claimed as operator-edited."""
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
@@ -1952,21 +1954,18 @@ def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Pat
     assert '"/usr/local/bin/anneal-memory"' in body
 
 
-def test_an_edit_CONFINED_to_the_substituted_line_is_still_PRESERVED(tmp_path: Path):
-    """⛔ codex L3 HIGH, and it is the case the first version of this fix lost. An
+def test_an_edit_CONFINED_to_the_substituted_line_is_PRESERVED_AND_NAMED(tmp_path: Path):
+    """⛔ codex L3 HIGH (2026-09-06), and the case the first normalising fix lost. An
     operator edits ONLY `_INSTALL_ANNEAL_BIN` — pointing it at a wrapper script, say.
-    Normalising that line on both sides declares the hook pristine, and the swap then
-    deletes the edit with no backup, contradicting doctor's own printed promise that
-    "any activation file you have edited" is copied first.
+    Normalising that line on both sides declared the hook pristine and the swap deleted
+    the edit with no backup.
 
-    ⚠ It CANNOT be distinguished from install's own output by inspection: without a
-    record of what install last wrote, "/home/op/bin/wrapper" written by a human and
-    written by `shutil.which` are the same bytes. So the fix is not a better heuristic
-    — it is to stop conditioning the COPY on the guess and condition only the NOTICE.
-    Preserve always; claim only when sure.
+    The 09-06 answer preserved it silently, because by inspection a human-written wrapper
+    path and install's own output are the same bytes. spore-900 adds the missing record:
+    the receipt holds what install wrote, so the edit is now both preserved AND claimed.
 
-    MUTATION CONTROL: make the substitution branch `continue` instead of setting
-    `notify = False` and this fails — the wrapper edit vanishes with no backup."""
+    MUTATION CONTROL: drop `known_edit = True` and the notice assertion fails; make the
+    receipt branch `continue` and the backup assertion fails."""
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
@@ -1982,8 +1981,8 @@ def test_an_edit_CONFINED_to_the_substituted_line_is_still_PRESERVED(tmp_path: P
     assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
     bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
     assert "my-wrapper" in bak.read_text(encoding="utf-8")
-    # ...and levain does NOT claim they edited it, because it cannot know.
-    assert not [m for m in said if "Operator-edited" in m]
+    # ...and the receipt lets levain say so truthfully.
+    assert [m for m in said if "Operator-edited hooks/_levain_hook.py" in m], said
 
 
 def test_a_pristine_reinstall_is_never_BLOCKED_by_an_unwritable_backup_dir(tmp_path: Path):
@@ -2018,28 +2017,30 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
     edit was neither preserved NOR reported. Silence is the defect, not the failure —
     a safe branch that can fail must leave a trace, or a weak heuristic runs forever
     with nothing to indict it."""
+    # Since spore-900 a receipt-proven EDIT is never best-effort (it refuses instead), so
+    # the best-effort branch is reached by a file that matches its receipt and differs from
+    # the new tree: the same pristine hook, installed again with a different anneal path.
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
     _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
 
     hook = dst / "hooks" / "_levain_hook.py"
-    hook.write_text('X = 1\n_INSTALL_ANNEAL_BIN = "/home/op/bin/my-wrapper"\n', encoding="utf-8")
     backups_root = install / ".levain" / "backups" / "activation"
     backups_root.mkdir(parents=True, exist_ok=True)
     os.chmod(backups_root, 0o500)
     said: list[str] = []
     try:
         _copy_activation_tree([base], dst, base_activation=base,
-                              anneal_path="/opt/a/anneal-memory", emit=said.append)
+                              anneal_path="/usr/local/bin/anneal-memory", emit=said.append)
     finally:
         os.chmod(backups_root, 0o700)
 
     blob = "\n".join(said)
     assert "could not stage a copy" in blob, "a failed preservation must be announced"
-    assert "not recoverable" in blob, "and must say what it costs the operator"
+    assert "no edit of yours is lost" in blob, "and must say why proceeding is safe"
     # Still not a refusal — a pristine reinstall is not blocked.
-    assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
+    assert '"/usr/local/bin/anneal-memory"' in hook.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unwritable-dir permission")
@@ -2068,7 +2069,6 @@ def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
     _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
 
     hook = dst / "hooks" / "_levain_hook.py"
-    hook.write_text('X = 1\n_INSTALL_ANNEAL_BIN = "/home/op/bin/my-wrapper"\n', encoding="utf-8")
     backups_root = install / ".levain" / "backups" / "activation"
     backups_root.mkdir(parents=True, exist_ok=True)
     os.chmod(backups_root, 0o500)
@@ -2086,7 +2086,7 @@ def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
     try:
         with pytest.raises(OSError, match="No space left on device"):
             _copy_activation_tree([base], dst, base_activation=base,
-                                  anneal_path="/opt/a/anneal-memory", emit=said.append)
+                                  anneal_path="/usr/local/bin/anneal-memory", emit=said.append)
     finally:
         inst.os.replace = real_replace
         os.chmod(backups_root, 0o700)
@@ -2096,7 +2096,7 @@ def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
         f"describing it never happened, said: {said!r}"
     )
     # The original tree must be intact — the swap failed before it touched `dst`.
-    assert '"/home/op/bin/my-wrapper"' in hook.read_text(encoding="utf-8")
+    assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
 
 
 def test_codex_store_uses_ARGV_semantics_last_wins_and_both_spellings(tmp_path: Path):
@@ -2178,24 +2178,23 @@ def test_a_REAL_patch_is_still_caught_when_the_anneal_path_also_moves(tmp_path: 
     assert "# REAL PATCH" in bak.read_text(encoding="utf-8")
 
 
-def test_the_normalisation_is_scoped_to_hook_scripts_only(tmp_path: Path):
-    """`_is_hook_script` must mirror `_substitute_hook_placeholders`, which walks
-    `hooks/` RECURSIVELY over `.py` — so a pack's nested hook counts and nothing
-    outside `hooks/` does. A markdown file that happens to contain the line is NOT
-    normalised: install never substitutes into it, so a difference there is real."""
-    assert _is_hook_script(Path("hooks/_levain_hook.py")) is True
-    assert _is_hook_script(Path("hooks/sub/nested.py")) is True      # packs ship these
-    assert _is_hook_script(Path("hooks/notes.md")) is False
-    assert _is_hook_script(Path("posture.md")) is False
-    assert _is_hook_script(Path("other/x.py")) is False
+def test_a_receiptless_tree_is_preserved_WITHOUT_a_claim_either_way(tmp_path: Path):
+    """⛔ No receipt = UNKNOWN (spore-900). Every install made before the receipt existed
+    looks like this on its first `init --force`. The changed file is backed up, but levain
+    must neither call it operator-edited nor stay silent about it.
 
-    # End-to-end: a markdown file carrying the same line IS backed up when it differs.
+    MUTATION CONTROL: treat a missing receipt entry as `notify = False` and the notice
+    assertion fails; treat it as `known_edit = True` and the no-claim assertion fails."""
     base = _mk_layer(tmp_path / "base", {"posture.md": '_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"\n'})
     install = tmp_path / "install"
     dst = install / "activation"
     _mk_layer(dst, {"posture.md": '_INSTALL_ANNEAL_BIN = "/opt/a/anneal-memory"\n'})
-    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/opt/a/anneal-memory", emit=said.append)
     assert _backed_up_files(install) == ["posture.md"]
+    assert not [m for m in said if "Operator-edited" in m], said
+    assert [m for m in said if "posture.md preserved at" in m and "cannot tell" in m], said
 
 
 def _codex_cfg(store: str) -> str:

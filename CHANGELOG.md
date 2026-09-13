@@ -15,7 +15,29 @@ Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the release
 - The MCP registration (`.mcp.json` for Claude Code, `[mcp_servers.anneal_memory]` in `~/.codex/config.toml` for Codex) now runs `<Levain's Python> -P -m anneal_memory`. `-P` keeps the directory the client was started in off Python's import path, so an `anneal_memory/` source checkout there cannot stand in for the installed package.
 - The hooks, `doctor`, `update` and `init --web` use the `anneal-memory` script that belongs to the anneal package Levain's own Python imports. They find it through that package's install record, not through `PATH`. If that script cannot be run, they fall back to `<Levain's Python> -P -m anneal_memory`. The hooks no longer try a bare `anneal-memory` from `PATH` at all.
 
-**Existing installs keep their old registration until you re-run `levain init --force`.** Nothing breaks if you don't; you keep whichever anneal the old lookup picked.
+**Existing installs keep their old registration until you re-run `levain init --force`.** Nothing breaks if you don't; you keep whichever anneal the old lookup picked. `levain doctor` now reports such a registration as a pending post-upgrade step (below).
+
+### Changed — `levain doctor` exits 6 when the only failures are post-upgrade steps not yet applied
+
+`doctor` used to exit 1 both when something was broken and when a routine post-upgrade step was still pending, so the expected upgrade path looked like a broken install. It now exits:
+
+- `0` — every check passed;
+- `1` — at least one failure that is not a pending upgrade step (and whenever `--invoke`'s live-fire check fails);
+- `6` — every failure is a post-upgrade step not yet applied: hooks or the adapter carrier that predate the installed levain, the version set last composed by an older levain (`levain update` pending), or a memory-server registration that does not run Levain's own interpreter (`levain init --force` pending).
+
+The failures are still printed as `FAIL`, because they are real: until you apply the named remedy, the install keeps running the activation layer from the release it was last set up with.
+
+⚠ **If a script branches on specific codes** (`case $? in 1) ...`), exit 6 no longer matches the `1` branch. Scripts that only test for nonzero (`levain doctor || alert`) behave as before.
+
+### Changed — `levain init --force` records what it installed, and uses that record to tell your edits from its own files
+
+`init` now writes `.levain/activation-manifest.json`: for each file it puts in `activation/`, the sha256 of the bytes as installed and of the package file they came from. On the next `init --force`, a file that is about to be replaced is compared with that record:
+
+- unchanged since install → copied to `.levain/backups/activation/` without a notice;
+- changed since install → copied, and reported as `Operator-edited`;
+- not covered by a record (every install made before this release, or a damaged record) → copied, and reported as preserved without claiming whether you edited it.
+
+This replaces the old comparison, which ignored the substituted `_INSTALL_ANNEAL_BIN` line in hooks and so could not report an edit made to that line.
 
 ## [0.4.6] — 2026-09-13
 
