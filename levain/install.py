@@ -14,20 +14,16 @@ Walks a stranger through standing up a new Levain install:
   8. Print next-steps banner.
 
 Idempotency: a non-empty install dir is refused unless `--force`. With
-`--force` the whole `activation/` tree is REPLACED, and anything in it whose
-bytes are not reproducible from the install is copied to a timestamped
-DIRECTORY (`.levain/backups/activation/<ts>/`, relative paths preserved)
-first — every file, hooks included, not a name allowlist. The anneal-memory
-store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
+`--force` the whole `activation/` tree is REPLACED, and the previous tree is
+first moved whole to `.levain/backups/activation/tree-<ts>/`, the newest three
+of which are kept (spore-861). The anneal-memory store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
 before being overwritten, and `~/.codex/config.toml` is backed up and the
 change announced when the MCP block is repointed at a DIFFERENT store.
 
-⚠ This paragraph said "operator-edited activation files (`posture.md`,
-`recency_directives.md`) ... with a timestamped suffix" until 2026-09-06, which
-was wrong in BOTH the scope (two names, when the backup now covers the tree)
-and the shape (a suffixed file, when it is a directory). A maintainer trusting
-it over `_copy_activation_tree`'s own docstring would misjudge what survives a
-re-install. Found by complement at L3, in the same diff that made it stale.
+⚠ This paragraph has described the backup wrongly twice: as two named files
+with a timestamped suffix (until 2026-09-06), then as a per-file copy of what
+looked edited (until 2026-09-13). `_copy_activation_tree`'s docstring is the
+contract; read it rather than trusting this summary.
 """
 
 from __future__ import annotations
@@ -1759,6 +1755,77 @@ def _compose_activation_layers(layer_roots: Sequence[Path]) -> dict[str, Path]:
     return composed
 
 
+_ACTIVATION_TREES_KEPT = 3  # spore-861, ruled by Phill 2026-09-13: keep the last three
+_TREE_BACKUP_PREFIX = "tree-"
+
+
+def _operator_edit_names(previous: Path, installed: Path) -> tuple[list[str], list[str]]:
+    """Which files in the PREVIOUS activation tree did the new one not reproduce?
+
+    Used only to decide what to TELL the operator, never what to keep: by the time
+    this runs, the whole previous tree has already been moved into a backup. Returns
+    ``(changed, unexamined)`` as relative posix paths. ``changed`` lists files the new
+    tree lacks or holds different bytes for. A hook differing only in the line install
+    substitutes is left out, because an edit confined to that line cannot be told apart
+    from install's own output. ``unexamined`` lists anything that could not be read or
+    compared. Nothing here raises: a failure leaves a file unexamined, and it is still
+    preserved.
+    """
+    changed: list[str] = []
+    unexamined: list[str] = []
+
+    def _walk_error(err: OSError) -> None:
+        unexamined.append(str(err.filename))
+
+    for walk_root, walk_dirs, walk_files in os.walk(previous, onerror=_walk_error):
+        walk_dirs.sort()
+        for fname in sorted(walk_files):
+            current = Path(walk_root) / fname
+            rel = current.relative_to(previous)
+            if _activation_excluded(rel) or not current.is_file():
+                continue
+            staged = installed / rel
+            try:
+                if staged.is_file() and (
+                    _same_contents(current, staged)
+                    or (_is_hook_script(rel) and _hook_bodies_match(current, staged))
+                ):
+                    continue
+            except OSError:
+                unexamined.append(rel.as_posix())
+                continue
+            changed.append(rel.as_posix())
+    return changed, unexamined
+
+
+def _prune_activation_backups(backups_root: Path, keep: int) -> list[str]:
+    """Delete all but the newest ``keep`` whole-tree backups under ``backups_root``.
+
+    Only directories named ``tree-<time_ns>`` are candidates. Anything else in that
+    directory, including the per-file backup dirs older releases wrote (named with a
+    bare timestamp), is never touched: those can hold the only surviving copy of an
+    edit. Returns operator notes for anything that could not be removed.
+    """
+    notes: list[str] = []
+    try:
+        entries = list(backups_root.iterdir())
+    except OSError as e:
+        return [f"  note: could not list {backups_root} to rotate old backups ({e})."]
+    trees: list[tuple[int, Path]] = []
+    for p in entries:
+        suffix = p.name[len(_TREE_BACKUP_PREFIX):]
+        if (p.name.startswith(_TREE_BACKUP_PREFIX) and suffix.isdigit()
+                and p.is_dir() and not p.is_symlink()):
+            trees.append((int(suffix), p))
+    trees.sort()
+    for _, old in trees[:-keep]:
+        try:
+            shutil.rmtree(old)
+        except OSError as e:
+            notes.append(f"  note: could not remove the old backup {old} ({e}).")
+    return notes
+
+
 def _copy_activation_tree(
     layer_roots: Sequence[Path],
     dst: Path,
@@ -1768,7 +1835,7 @@ def _copy_activation_tree(
     emit: Callable[[str], None] = print,
 ) -> None:
     """Compose the ordered activation-tree layer STACK `layer_roots` into `dst`,
-    preserving operator edits to known editable files.
+    keeping the whole previous tree as a backup.
 
     `layer_roots` (base first, then composing packs by `pack.toml` order — see
     `packs.order_activation_roots`) is merged per relative path, LAST layer wins,
@@ -1784,45 +1851,19 @@ def _copy_activation_tree(
     `levain doctor`'s job; here we guard that base is a real, non-empty source —
     BEFORE any destructive write.
 
-    ⚠ SYMLINKS ARE THE STATED EXCEPTION, and it is stated because a reviewer showed
-    the sentence below was broader than the code. `os.walk` does not follow directory
-    symlinks, so a symlink-to-a-directory inside `dst` is never enumerated, never
-    compared, never copied — and the swap unlinks it with no notice. A FILE symlink is
-    followed by `is_file()`, so it is compared by TARGET CONTENT and silently replaced
-    by a regular file. Neither is handled; both are routed (spore-860), not claimed.
+    On a re-install the WHOLE previous `dst` tree is renamed into
+    `<install>/.levain/backups/activation/tree-<time_ns>/` before the staged tree takes
+    its place, and only the newest three such trees are kept (spore-861). Membership in
+    the backup is therefore not decided at all: every file, symlink and directory the
+    operator had is in it. The "Operator-edited ... preserved at" notices are computed
+    AFTER the swap by comparing that retained tree with the new one, so a wrong guess
+    there costs a line of output, never a file. A hook whose only difference is the
+    `_INSTALL_ANNEAL_BIN` line install writes gets no notice, because an edit confined
+    to that line is indistinguishable from install's own substitution.
 
-    On a re-install, every REGULAR file present at `dst` whose content will NOT survive
-    byte-identically — it differs from the bytes about to be written, OR nothing
-    provides it (so the swap would delete it) — is backed up OUTSIDE the dst tree
-    (`<install>/.levain/backups/activation/<timestamp>/`, preserving relative
-    paths) BEFORE the swap. If such an edit cannot be preserved (the backup dir
-    won't create, the read/copy fails), this raises rather than silently
-    destroying it — fail loud beats data loss.
-
-    ⛔ The comparison is against the STAGED TREE, never the composed source. Hooks
-    have `{{ANNEAL_MEMORY}}` substituted into them at install time, so an installed
-    hook never equals its package source — comparing against the source would report
-    every pristine hook as operator-edited on every re-install. Comparing against
-    the staged result is also the only form that needs no copy of the substitution
-    rule, so it cannot drift when that rule changes.
-
-    The scope is the WHOLE TREE, not a name allowlist, and that is the point:
-    `posture.md` and `recency_directives.md` are the files we DOCUMENT as
-    operator-editable (the "second sourdough surface" — the activation block
-    accretes as the operator finds their own RLHF-leakage patterns), but they are
-    not the only files operators edit. Hooks are machinery we do not invite edits
-    to, and operators patch them anyway — levain's own shipped hook says so in a
-    comment, and the one named external operator lost a patched hook to
-    `levain init --force`, the remedy `levain doctor` itself prints. Scoping the
-    backup to what we documented, rather than to what `rmtree` destroys, is what
-    let that happen. Membership in this backup is decided by REPRODUCIBILITY (can
-    these bytes be rebuilt from a layer?), never by a filename.
-
-    ⚠ A pristine file whose PACKAGE version moved is therefore also copied — it
-    differs from the winning layer and we cannot tell it from a patch without a
-    record of what we wrote. That is deliberate: the tree is small (five files
-    base, ~67KB), over-backup costs bytes in a timestamped dir, and under-backup
-    costs an operator their work irrecoverably.
+    If the backup directory cannot take the rename, the previous tree is renamed to a
+    sibling `.levain-activation-prev-<time_ns>` beside `dst` instead and the operator
+    is told where it went; if that fails too, nothing has moved and this raises.
 
     `anneal_path`, when provided, is substituted into the `{{ANNEAL_MEMORY}}`
     placeholder in any hook .py file under `dst/hooks/` (recursively, so a pack's
@@ -1849,19 +1890,6 @@ def _copy_activation_tree(
             f"activation/; reinstall with `pip install --force-reinstall levain`."
         )
 
-    backups: list[tuple[str, Path]] = []
-    # ⛔ BUFFERED FOR THE SAME REASON `backups` IS (glm-5.3 L3 LOW, 2026-09-07). These
-    # best-effort notes used to be emitted inside the backup loop — i.e. BEFORE the swap and
-    # before any LATER file could abort the run. A file whose staging failed printed "the edit
-    # is not recoverable", then a different file's `copy2` raised, `InitError` aborted, `dst`
-    # was left untouched, and the file the operator was told about was fully intact. The same
-    # false statement lands if the swap itself fails and the tree is restored from `old_aside`.
-    # ⚡ `a_true_statement_standing_where_a_thing_should_be` — a claim about a world that never
-    # happens. It is precisely the defect `_merge_codex_config` was corrected for on 09-06
-    # ("announced only AFTER it lands"), still live in the sibling function, which is why the
-    # success notices below were already buffered and these were not.
-    unstaged_notes: list[str] = []
-    backup_staging: Path | None = None  # this run's backup dir; cleaned on any failure
 
     # Build the new tree in a STAGING dir, then swap it into place atomically — so
     # NO build failure (a cross-layer file/dir name collision, a vanished source)
@@ -1902,182 +1930,62 @@ def _copy_activation_tree(
         if anneal_path is not None:
             _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
 
-        # Operator content is backed up HERE — after the staged tree is built and
-        # substituted — and compared against the STAGED bytes, i.e. the exact bytes
-        # about to be written.
-        #
-        # ⛔ Comparing against the composed SOURCE was wrong, and only latently so
-        # while this loop covered two markdown files. Install substitutes
-        # `{{ANNEAL_MEMORY}}` into hooks (the line above), so an INSTALLED hook can
-        # never equal its package source: widening the scope to the whole tree would
-        # have reported the pristine `_levain_hook.py` as operator-edited on EVERY
-        # re-install — spurious noise on exactly the file class this backup exists
-        # for, plus a hard InitError for anyone whose backup dir won't stage.
-        # Found by codex + complement at L3, confirmed on disk.
-        #
-        # Comparing against the staged RESULT needs no knowledge of the substitution
-        # rule, so it cannot drift when that rule changes. Duplicating the layering
-        # rule instead of reusing it is a defect this file has already shipped twice.
-        if dst.exists():
-            # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch
-            # them. Inside this try, so a later failure cleans them up: a backup left
-            # behind next to an untouched dst looks like work that happened.
-            staging_failed = False  # mkdir tried once and failed; don't retry per file
-
-            # ⛔ NOT `dst.rglob("*")`: pathlib SILENTLY SWALLOWS scan errors —
-            # MEASURED on this interpreter, an unreadable subdirectory simply does
-            # not appear in the results. A file we cannot enumerate would then be
-            # destroyed by the swap with no backup and no warning, which is the
-            # exact contract this backup exists to hold. `os.walk` with a raising
-            # `onerror` turns an unscannable directory into a refusal BEFORE the
-            # cutover. Found by codex at L3 round 2.
-            def _scan_failed(err: OSError) -> None:
-                raise InitError(
-                    f"could not scan {err.filename} for operator edits before "
-                    f"replacing the activation tree ({err}). Refusing to destroy "
-                    f"files that cannot be enumerated; resolve the error and re-run."
-                ) from err
-
-            current_files: list[Path] = []
-            for walk_root, walk_dirs, walk_files in os.walk(dst, onerror=_scan_failed):
-                walk_dirs.sort()
-                current_files.extend(Path(walk_root) / f for f in sorted(walk_files))
-
-            for current in current_files:
-                if not current.is_file():
-                    continue
-                rel = current.relative_to(dst)
-                # `__pycache__`/`*.pyc` are build residue no layer provides; without
-                # this they would look operator-added and be backed up every run.
-                if _activation_excluded(rel):
-                    continue
-                name = rel.as_posix()
-                staged = new_tree / rel
-                # Is this worth TELLING the operator about? Separate from whether it
-                # gets copied — see the substitution branch below.
-                notify = True
-                # Survives byte-identically? A missing staged file means nothing
-                # provides it → the swap DELETES it → always preserve, and it is
-                # never read at all (`copy2` streams). When there IS a counterpart,
-                # `_same_contents` compares in bounded chunks after a size check.
-                # ⚠ This comment previously claimed reads were bounded while the
-                # code beside it called `read_bytes()` on BOTH sides — caught by glm
-                # and codex at L3 round 2. A comment asserting a property the
-                # adjacent code lacks is the class this apparatus exists to catch,
-                # and it was written in the act of fixing that class.
-                if staged.is_file():
-                    try:
-                        if _same_contents(current, staged):
-                            continue
-                        # The bytes differ. For a hook, that is not yet an answer:
-                        # install rewrites the `_INSTALL_ANNEAL_BIN` line itself from a
-                        # PATH lookup that is not stable between runs, so ask the sharper
-                        # question — do these differ in anything INSTALL DID NOT WRITE?
-                        if _is_hook_script(rel) and _hook_bodies_match(current, staged):
-                            # Differs ONLY in what install itself substitutes. Still
-                            # COPIED — an operator edit confined to that very line
-                            # (pointing `_INSTALL_ANNEAL_BIN` at a wrapper, say) is
-                            # indistinguishable from install's own output without a
-                            # record of what install last wrote, and there is none.
-                            # ⛔ So the safe half is preserved and only the CLAIM is
-                            # dropped: silent, best-effort, never a refusal. The
-                            # spore-859 defect was never "we copy too much", it was
-                            # "we tell the operator they edited something they did
-                            # not" — and a false notice is the only part worth
-                            # removing. codex L3 HIGH.
-                            notify = False
-                    except OSError as e:
-                        # About to replace it and can't compare it — don't destroy
-                        # blind. A failure on either side is equally a reason to keep
-                        # the operator's bytes, so this refuses rather than guessing.
-                        raise InitError(
-                            f"could not compare {current} against its replacement to "
-                            f"check for operator edits ({e}). Refusing to overwrite a "
-                            f"possibly-edited file; resolve the error and re-run."
-                        ) from e
-                # About to be overwritten or deleted, and these bytes are not
-                # reproducible from the install — so they are the operator's.
-                if backup_staging is None and not staging_failed:
-                    candidate = (
-                        dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
-                    )
-                    try:
-                        candidate.mkdir(parents=True, exist_ok=True)
-                        backup_staging = candidate
-                    except OSError:
-                        staging_failed = True  # see the fail-loud guard below
-                if backup_staging is None:
-                    if not notify:
-                        # Best-effort: never block a pristine reinstall — but SAY SO.
-                        # A silent skip here would lose an edit confined to the
-                        # substituted line with no trace at all, which is the failure
-                        # mode of "act safely, stay quiet". The copy is allowed to
-                        # fail; the SILENCE is not.
-                        unstaged_notes.append(
-                            f"  note: could not stage a copy of {name} (backup dir under "
-                            f"{dst.parent / '.levain' / 'backups'} could not be created). "
-                            f"Proceeding — but if you had edited that file, the edit is "
-                            f"not recoverable."
-                        )
-                        continue
-                    raise InitError(
-                        f"operator-edited {name} would be replaced by this re-install, "
-                        f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
-                        f"could not be created. Refusing to overwrite your edit; fix the "
-                        f"backup-dir permissions (or back {current} up yourself) and re-run."
-                    )
-                bak = backup_staging / name
-                try:
-                    bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
-                    shutil.copy2(current, bak)
-                except OSError as e:
-                    if not notify:
-                        emit(
-                            f"  note: could not stage a copy of {name} ({e}). Proceeding "
-                            f"— but if you had edited that file, the edit is not "
-                            f"recoverable."
-                        )
-                        continue
-                    raise InitError(
-                        f"operator-edited {name} could not be backed up to {bak} ({e}). "
-                        f"Refusing to overwrite your edit; back {current} up yourself and "
-                        f"re-run."
-                    ) from e
-                if notify:
-                    backups.append((name, bak))
     except BaseException:
-        # Any build failure (vanished source, collision, interrupt) leaves dst
-        # untouched. Clean the staged tree AND this run's backups — the originals
-        # still live in the untouched dst, so the backups would be misleading.
+        # Any build failure (vanished source, collision, interrupt) leaves dst untouched.
         shutil.rmtree(new_tree, ignore_errors=True)
-        if backup_staging is not None:
-            shutil.rmtree(backup_staging, ignore_errors=True)
         raise
 
-    # Atomic swap with rollback: move the old tree ASIDE (atomic rename), move the
-    # new one into place (atomic rename), delete the old on success. A swap failure
-    # restores the original — `dst` is never left missing or partial. Both renames
-    # are same-filesystem (all under `dst.parent`). codex L3 re-verify MED.
-    old_aside: Path | None = None
+    # ⛔ THE PREVIOUS TREE IS THE BACKUP (spore-861, ruled by Phill 2026-09-13). It is
+    # RENAMED whole into `.levain/backups/activation/tree-<ns>/`, and the staged tree is
+    # renamed into its place. Nothing is classified before anything is destroyed, which
+    # is the design this replaces: that one compared each file and copied the ones it
+    # judged the operator's, so whatever it could not classify was lost (an edit saved
+    # between the compare and the swap, a symlink, an unscannable directory).
+    #
+    # If the backup location cannot take the rename, the tree is renamed to a sibling
+    # beside `activation/` instead, so a reinstall is never blocked and never loses the
+    # previous tree. If that rename fails too, nothing has moved and this raises.
+    moved_to: Path | None = None
+    notes: list[str] = []
+    backups_root = dst.parent / ".levain" / "backups" / "activation"
     try:
-        if dst.exists():
-            old_aside = dst.parent / f".levain-activation-old-{time.time_ns()}"
-            os.replace(dst, old_aside)
+        if dst.exists() or dst.is_symlink():
+            stamp = time.time_ns()
+            moved_to = backups_root / f"{_TREE_BACKUP_PREFIX}{stamp}"
+            try:
+                backups_root.mkdir(parents=True, exist_ok=True)
+                os.replace(dst, moved_to)
+            except OSError as e:
+                if not (dst.exists() or dst.is_symlink()):
+                    raise
+                moved_to = dst.parent / f".levain-activation-prev-{stamp}"
+                os.replace(dst, moved_to)
+                notes.append(
+                    f"  note: could not keep the previous activation/ under {backups_root} "
+                    f"({e}). It is kept at {moved_to} instead, which the automatic "
+                    f"last-{_ACTIVATION_TREES_KEPT} rotation does not manage."
+                )
         os.replace(new_tree, dst)
     except BaseException:
         shutil.rmtree(new_tree, ignore_errors=True)
-        if old_aside is not None and not dst.exists():
-            os.replace(old_aside, dst)  # restore the original tree
-        if backup_staging is not None:
-            shutil.rmtree(backup_staging, ignore_errors=True)
+        if (moved_to is not None and not (dst.exists() or dst.is_symlink())
+                and (moved_to.exists() or moved_to.is_symlink())):
+            os.replace(moved_to, dst)  # put the original tree back
         raise
-    if old_aside is not None:
-        shutil.rmtree(old_aside, ignore_errors=True)
 
-    for note in unstaged_notes:
+    # Everything below runs only after the new tree is in place. It is best-effort and
+    # never raises into a completed install.
+    if moved_to is not None:
+        changed, unexamined = _operator_edit_names(moved_to, dst)
+        for name in changed:
+            emit(f"  ! Operator-edited {name} preserved at {moved_to / name}")
+        for name in unexamined:
+            emit(f"  note: could not compare {name} with the new tree; it is preserved in {moved_to}")
+        emit(f"  Previous activation/ kept whole at {moved_to}")
+        if moved_to.parent == backups_root:
+            notes.extend(_prune_activation_backups(backups_root, _ACTIVATION_TREES_KEPT))
+    for note in notes:
         emit(note)
-    for name, bak in backups:
-        emit(f"  ! Operator-edited {name} preserved at {bak}")
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:

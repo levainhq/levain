@@ -8,6 +8,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Changed — `init --force` keeps your whole previous `activation/` tree, and the last three of them
+
+Until now, `init --force` looked at each file under `activation/` before replacing the tree and copied the ones it judged to be yours into `.levain/backups/activation/<timestamp>/`. Anything that judgement could not handle was lost: an edit saved in the moment between the check and the replacement, a symlink, a directory it could not read.
+
+It no longer judges. The previous `activation/` tree is **moved whole** to `.levain/backups/activation/tree-<timestamp>/` and the new tree takes its place. Every file, symlink and directory you had is in there, exactly as it was. The newest three `tree-*` backups are kept and older ones are removed.
+
+- The "Operator-edited … preserved at" lines are still printed, but they are now only a pointer to what differs. Nothing depends on them being right.
+- If `.levain/backups/activation/` cannot take the move, the previous tree is kept beside `activation/` as `.levain-activation-prev-<timestamp>` and `init` tells you so. That copy is not rotated. A reinstall is never blocked by this.
+- ⚠ Backup directories written by earlier releases (named with a bare timestamp) are **never removed** by the rotation, because one of them may hold the only copy of an edit.
+- This supersedes 0.4.5's stated exception for symlinks under `activation/`: they are now kept as symlinks in the backup.
+
 ## [0.4.6] — 2026-09-13
 
 ### Security — a local `sshd` could be used to read a confined entity's crown jewels via the forwarded agent (agent mode) or a readable key (raw mode)
