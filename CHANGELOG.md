@@ -6,7 +6,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-Stamped `0.4.6.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+
+## [0.4.6] — 2026-09-13
 
 ### Security — a local `sshd` could be used to read a confined entity's crown jewels via the forwarded agent (agent mode) or a readable key (raw mode)
 
