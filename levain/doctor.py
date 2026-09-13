@@ -45,12 +45,37 @@ _OK = "\033[32m✓\033[0m" if _COLOR else "[OK]"
 _FAIL = "\033[31m✗\033[0m" if _COLOR else "[FAIL]"
 
 
+EXIT_HEALTHY = 0
+"""Every check passed."""
+
+EXIT_BROKEN = 1
+"""At least one check failed for a reason that is NOT a pending post-upgrade step."""
+
+EXIT_UPGRADE_PENDING = 6
+"""Every failing check is a routine post-upgrade step that has not been applied yet
+(``spore-840``, ruled by Phill 2026-09-13).
+
+Its own code because the two states want opposite responses: ``1`` means something is
+wrong, ``6`` means run the remedy the output names. ⛔ It is NOT a success. Until the step
+is applied the PREVIOUS release's activation layer is what runs — that is why these checks
+fail at all (a shipped hook fix reaches nobody who merely upgraded). The value is chosen to
+stay clear of the ``levain run`` codes in ``levain.session``, asserted by
+``test_the_pending_code_does_not_collide_with_levain_run_codes``.
+
+⚠ A consumer that enumerates codes (``case $? in 1) repair ;; esac``) no longer matches this
+state. That is the intended de-alert for alerting pipelines and a behaviour change for
+repair scripts; the CHANGELOG says so."""
+
+
 @dataclass(frozen=True)
 class CheckResult:
     name: str
     ok: bool
     detail: str
     hint: str | None = None
+    # Meaningful only when ``ok`` is False: the failure is a post-upgrade step still
+    # pending, not a broken install. It changes the exit code, never the badge.
+    upgrade_pending: bool = False
 
 
 def _emit(r: CheckResult) -> None:
@@ -134,6 +159,9 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
         from levain.verify import run_verify_hooks
         verify_rc = run_verify_hooks(install)
 
+    broken = [r for r in failed if not r.upgrade_pending]
+    pending = [r for r in failed if r.upgrade_pending]
+
     print()
     if failed and verify_rc != 0:
         print(f"{len(failed)} static check(s) FAILED + live-fire verify-hooks FAILED.")
@@ -143,6 +171,25 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
         print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
         print("All checks passed.")
+    if pending and not broken and verify_rc == 0:
+        print(
+            f"  Every failure above is a post-upgrade step not yet applied "
+            f"(exit {EXIT_UPGRADE_PENDING}, not {EXIT_BROKEN}).\n"
+            "  None of them is classed as broken, but until you apply them this install\n"
+            "  is still running what an earlier levain set up (its activation layer,\n"
+            "  adapter carrier or memory-server registration), not what the installed\n"
+            "  levain ships."
+        )
+    elif pending and broken:
+        print(
+            f"  {len(pending)} of the failures are post-upgrade steps not yet applied; "
+            f"the rest are not, so doctor exits {EXIT_BROKEN}."
+        )
+    elif pending:
+        print(
+            f"  Every static failure is a post-upgrade step not yet applied, but the "
+            f"live-fire check failed, so doctor exits {EXIT_BROKEN}."
+        )
     if not invoke and not hookless:
         # A hookless install has no activation hooks — the verify-hooks nudge would mislead.
         print(
@@ -151,7 +198,11 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
             "        or `levain doctor --invoke`.\n"
             "        Also: hooks no-op when LEVAIN_HOOK_SUPPRESS=1 is in the env."
         )
-    return 1 if failed or verify_rc != 0 else 0
+    if broken or verify_rc != 0:
+        return EXIT_BROKEN
+    if pending:
+        return EXIT_UPGRADE_PENDING
+    return EXIT_HEALTHY
 
 
 # The base-install REQUIRED-minimum seed set (a static check on an installed
@@ -831,6 +882,11 @@ def _check_compat_set(install: Path) -> list[CheckResult]:
     # `pip install -U anneal-memory` within the pin is `ahead` — failing doctor on
     # either would false-alarm a healthy install. Report loudly, green.
     advisory = {"pending", "ahead"}
+    levain_upgraded = (
+        lock is not None
+        and bool(lock.levain)
+        and manifest._cmp(installed.levain, lock.levain) > 0
+    )
     for v in drift.verdicts:
         if v.status in advisory:
             results.append(CheckResult(
@@ -838,8 +894,20 @@ def _check_compat_set(install: Path) -> list[CheckResult]:
                 f"{v.detail} — advisory (run `levain update`); not a set failure",
             ))
         else:
+            # The routine upgrade state (`levain update` pending): the running levain is
+            # NEWER than the set last composed, and the anneal lock moved with that same
+            # upgrade (a new levain raises its anneal floor, so pip moves anneal too; L2
+            # HIGH, reproduced). A DOWNGRADE is not routine, so neither axis is pending.
+            pending_axis = (
+                levain_upgraded
+                and v.status == "drift"
+                and v.axis in ("levain", "anneal-lock")
+            )
             results.append(
-                CheckResult(f"compat: {v.axis}", v.status == "in_sync", v.detail, v.hint)
+                CheckResult(
+                    f"compat: {v.axis}", v.status == "in_sync", v.detail, v.hint,
+                    upgrade_pending=pending_axis,
+                )
             )
     # Release-gate: the reviewed known-good constant vs the actual pip floor. This
     # is a RELEASE-INTEGRITY check, not an operator-actionable one — a drift
@@ -1293,6 +1361,7 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
                 f"activation file you have edited (hooks included) is copied to "
                 f".levain/backups/activation/ first. `levain update` does NOT "
                 f"rewrite the carrier.",
+                upgrade_pending=True,
             )
         ]
     return [CheckResult(f"{carrier.name} freshness", True, "matches current seed classification")]
@@ -1563,19 +1632,63 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     except (OSError, UnicodeError, RuntimeError) as e:
         return [CheckResult("hook freshness", False, f"could not compare: {e}")]
 
+    # ⚖ WHICH KIND OF DIFFERENT (L2 HIGH, reproduced 2026-09-13: a hook with an appended
+    # `os.system(...)` exited 6 under "post-upgrade step"). The package comparison above
+    # still decides stale-vs-fresh; the install receipt only splits a stale hook into
+    # "exactly what init wrote, and the package has since moved" (pending) and "changed
+    # since init wrote it" (an edit, never routine). With no receipt entry — every install
+    # made before the receipt existed — the hook stays pending and the text says doctor
+    # cannot tell which it is.
+    edited: list[str] = []
+    unproven: list[str] = []
+    if stale:
+        from levain.install import _sha256_stream, read_activation_receipt
+
+        receipt_files, _status = read_activation_receipt(install)
+        for rel in sorted(set(stale)):
+            entry = (receipt_files or {}).get(f"hooks/{rel}")
+            if entry is None:
+                unproven.append(rel)
+                continue
+            try:
+                if _sha256_stream(hooks_dir / rel) != entry["installed"]:
+                    edited.append(rel)
+            except OSError:
+                edited.append(rel)
+    if edited:
+        return [
+            CheckResult(
+                "hook freshness",
+                False,
+                "installed hook script(s) changed since `levain init` wrote them: "
+                + ", ".join(edited)
+                + " — the hooks that run are these edited copies, not the package's",
+                f"If you did not make these changes, treat them as tampering. To return to "
+                f"the package's hooks run `levain init --force --path {install}` — it RE-RUNS "
+                f"THE INTERVIEW and rewrites the whole activation/ tree. Your store is kept; "
+                f"any activation file you have edited (hooks included) is copied to "
+                f".levain/backups/activation/ first.",
+            )
+        ]
     if stale:
         return [
             CheckResult(
                 "hook freshness",
                 False,
                 "installed hook script(s) differ from the package: "
-                + ", ".join(sorted(set(stale))),
-                f"Your hooks predate the installed levain version, and hook fixes "
+                + ", ".join(sorted(set(stale)))
+                + " — the hooks that run are these installed copies, not the package's"
+                + (
+                    " (no install receipt covers them, so doctor cannot tell an outdated "
+                    "hook from an edited one)" if unproven else ""
+                ),
+                f"Your hooks predate the installed levain version (or were edited), and hook fixes "
                 f"do NOT arrive via `pip install -U` or `levain update`. Re-render "
                 f"with `levain init --force --path {install}` — it RE-RUNS THE "
                 f"INTERVIEW and rewrites the whole activation/ tree. Your store is "
                 f"kept; any activation file you have edited (hooks included) is "
                 f"copied to .levain/backups/activation/ first.",
+                upgrade_pending=True,
             )
         ]
     return [CheckResult("hook freshness", True, "hook scripts match the package")]
@@ -1826,6 +1939,9 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
         )
     else:
         results.append(_match_store(".mcp.json anneal_memory", install, server.get("args", [])))
+        results.append(_check_mcp_command(
+            ".mcp.json anneal_memory", server.get("command"), server.get("args", []), install
+        ))
 
     return results
 
@@ -1942,8 +2058,73 @@ def _check_codex(install: Path) -> list[CheckResult]:
         results.append(
             _match_store("config.toml [mcp_servers.anneal_memory]", install, server.get("args", []))
         )
+        results.append(_check_mcp_command(
+            "config.toml [mcp_servers.anneal_memory]", server.get("command"),
+            server.get("args", []), install,
+        ))
 
     return results
+
+
+def _check_mcp_command(name: str, command: object, args: list, install: Path) -> CheckResult:
+    """Is the memory server registration launched by THIS levain's interpreter?
+
+    `spore-751` (ruled 2026-09-13): `init` registers `<levain python> -P -m anneal_memory`,
+    so the anneal that serves memory is the one levain imports, checks and upgrades. A
+    registration naming any other command can start a different anneal from the one every
+    other doctor line describes. Deferred from item 1 into `spore-840` because every install
+    written before that change fails it on upgrade — an upgrade step pending, so it carries
+    that exit code; an unresolvable command is broken and does not.
+    """
+    check = f"{name} command"
+    if not isinstance(command, str) or not command:
+        return CheckResult(check, False, "no command in registration",
+                           f"Re-run `levain init --force --path {install}`.")
+    if not _python_resolvable(command):
+        return CheckResult(
+            check, False, f"unresolvable: {command} — the memory server cannot start",
+            f"Re-run `levain init --force --path {install}`.",
+        )
+    if not isinstance(args, list):
+        return CheckResult(check, False, f"args is not a list: {args!r}",
+                           f"Re-run `levain init --force --path {install}`.")
+    module_form = False
+    if "-m" in args:
+        i = args.index("-m")
+        module_form = i + 1 < len(args) and args[i + 1] == "anneal_memory" and "-P" in args[:i]
+    if not module_form:
+        return CheckResult(
+            check,
+            False,
+            f"launches `{command}`, not `{sys.executable} -P -m anneal_memory` — the anneal "
+            f"serving your memory may not be the one levain checks and upgrades",
+            f"Registrations written before levain pinned the memory server to its own "
+            f"interpreter look like this. `levain init --force --path {install}` rewrites it "
+            f"(it RE-RUNS THE INTERVIEW; your store is kept).",
+            upgrade_pending=True,
+        )
+    # Module form: ask the registered interpreter itself rather than comparing path
+    # spellings — a venv's `python` and `python3` are one environment (L1 + L2 MED). It must
+    # also import anneal_memory at all, or the server cannot start (L2 MED).
+    ran, out = _probe([command, "-P", "-c", "import sys, anneal_memory; print(sys.prefix)"])
+    if not ran:
+        return CheckResult(
+            check, False, f"`{command} -P -m anneal_memory` cannot start: {out}",
+            f"Re-run `levain init --force --path {install}` from the environment levain is "
+            f"installed in.",
+        )
+    prefix = out.strip()
+    if os.path.realpath(prefix) == os.path.realpath(sys.prefix):
+        return CheckResult(check, True, f"{command} -P -m anneal_memory (this levain's environment)")
+    return CheckResult(
+        check,
+        False,
+        f"serves memory from the Python environment at {prefix}, not the one running this "
+        f"doctor ({sys.prefix}) — every other line here describes this environment's anneal",
+        f"If that environment is the levain you use, run `levain doctor` from it. Otherwise "
+        f"`levain init --force --path {install}` registers this one (it RE-RUNS THE "
+        f"INTERVIEW; your store is kept).",
+    )
 
 
 def _match_store(name: str, install: Path, args: list) -> CheckResult:
