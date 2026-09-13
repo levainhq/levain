@@ -1380,28 +1380,33 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
     legitimately do not care, pin the thing that matters: PRODUCTION callers decide explicitly.
     Tests may omit it; shipped code may not.
     """
-    import re
+    import ast
     from pathlib import Path
 
+    # AST, not a substring/paren scan (codex L3 MED, fix-pass): the old regex passed a call that
+    # merely MENTIONED the arg name in a comment, string, or a DIFFERENT argument — e.g.
+    # build_policy(entity, extra_deny_read_write=(Path("deny_localhost_outbound"),)) — while runtime
+    # used the permissive default. We now require the names as actual top-level keyword arguments of
+    # the real build_policy call node. A **kwargs unpack (kw.arg is None) does NOT count as declaring
+    # them — production must pass them explicitly.
     required = ("deny_standard_creds", "deny_localhost_outbound")
     pkg = Path(__file__).resolve().parent.parent / "levain"
     offenders: list[str] = []
     for path in pkg.rglob("*.py"):
         if "templates" in path.parts:      # shipped template scripts, not the confinement core
             continue
-        text = path.read_text(encoding="utf-8")
-        for m in re.finditer(r"build_policy\(", text):
-            if text[:m.start()].rstrip().endswith("def"):
-                continue                    # the definition itself
-            i, depth = m.end(), 1
-            while i < len(text) and depth:
-                depth += (text[i] == "(") - (text[i] == ")")
-                i += 1
-            call = text[m.end():i]
-            missing = [a for a in required if a not in call]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else fn.attr if isinstance(fn, ast.Attribute) else None
+            if name != "build_policy":
+                continue
+            kwargs = {kw.arg for kw in node.keywords if kw.arg is not None}
+            missing = [a for a in required if a not in kwargs]
             if missing:
-                line = text[: m.start()].count("\n") + 1
-                offenders.append(f"{path.relative_to(pkg.parent)}:{line} (missing {'+'.join(missing)})")
+                offenders.append(f"{path.relative_to(pkg.parent)}:{node.lineno} (missing {'+'.join(missing)})")
     assert not offenders, (
         "production call(s) to build_policy() omit a security floor argument — it would silently "
         "default to PERMISSIVE (deny_standard_creds → ~/.config/gh readable; deny_localhost_outbound "
@@ -1719,16 +1724,21 @@ def test_confinement_config_field_order_is_append_only() -> None:
     # The FROZEN historical prefix (positional indices existing callers depend on). New fields may be
     # appended AFTER this prefix — that is correct append-only evolution and must NOT fail the test
     # (codex L3 LOW#3); what must fail is INSERTING before it, which shifts every later index.
-    historical = [
+    # Freeze the ENTIRE current positional prefix, allow_localhost_outbound INCLUDED (codex L3 LOW,
+    # fix-pass): freezing only the 6 fields before it would still permit inserting a field BETWEEN
+    # efferent_gate and allow_localhost_outbound — the 6-prefix would match and membership would pass,
+    # yet the current 7-position constructor `ConfinementConfig((), (), "raw", True, False, "gated",
+    # True)` would silently land True in the inserted field. Future fields may follow position 7.
+    frozen_prefix = [
         "deny_files", "deny_subtrees", "ssh_mode", "deny_standard_creds",
-        "allow_container_sockets", "efferent_gate",
+        "allow_container_sockets", "efferent_gate", "allow_localhost_outbound",
     ]
-    assert names[: len(historical)] == historical, (
-        f"a field was inserted into the frozen prefix of the exported ConfinementConfig: {names}. "
-        f"Append new fields at the END (or make the class keyword-only in a deliberate break) — "
-        f"otherwise positional callers silently reassign every later field (the own_memory_files class)."
+    assert names[: len(frozen_prefix)] == frozen_prefix, (
+        f"the frozen positional prefix of the exported ConfinementConfig changed: {names}. "
+        f"Append new fields AFTER position {len(frozen_prefix)} (or make the class keyword-only in a "
+        f"deliberate break) — inserting anywhere in the prefix silently reassigns every later "
+        f"positional field (the own_memory_files class)."
     )
-    assert "allow_localhost_outbound" in names[len(historical):]  # appended after the prefix
     # the historical positional construction must still land each value in its intended field
     cfg = ConfinementConfig((), (), "raw", True, False, "gated")
     assert cfg.ssh_mode == "raw"
