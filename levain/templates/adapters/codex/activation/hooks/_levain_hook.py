@@ -200,7 +200,8 @@ def read_blocks(path: Path) -> list[str]:
     return [b for b in blocks if b]
 
 
-# Install-time-resolved anneal-memory binary path. `levain init` substitutes
+# Install-time-resolved anneal-memory binary path: the script of the anneal
+# package levain's own interpreter imports (spore-751). `levain init` substitutes
 # this placeholder after copying the hook scripts into the operator's install
 # dir, so the hooks don't depend on PATH at fire time (Codex sanitizes hook
 # env aggressively). The `"{{" in ...` guard skips this entry when the
@@ -219,7 +220,10 @@ def _anneal_json(
     failure. The store is pinned explicitly with `--db` to this install's store
     (see store_path) — never anneal-memory's machine-global default, which would
     silently merge two installs' memories. Tries the install-resolved binary
-    first, then the PATH console script, then the module form.
+    first, then the module form on this interpreter (`-P`, so the working
+    directory cannot shadow the package). It never tries a bare `anneal-memory`
+    from PATH: that is how a second anneal used to answer these queries while a
+    different one served memory (spore-751).
 
     No-stall (the load-bearing invariant): a ``TimeoutExpired`` ABORTS the
     candidate loop and returns None. A timeout means this anneal invocation is
@@ -236,10 +240,7 @@ def _anneal_json(
     candidates = []
     if "{{" not in _INSTALL_ANNEAL_BIN:
         candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, *sub_args])
-    candidates.extend([
-        ["anneal-memory", "--db", db, *sub_args],
-        [sys.executable, "-m", "anneal_memory", "--db", db, *sub_args],
-    ])
+    candidates.append([sys.executable, "-P", "-m", "anneal_memory", "--db", db, *sub_args])
     for cmd in candidates:
         try:
             result = subprocess.run(

@@ -57,9 +57,7 @@ def run_update(
     apparatus / tests can drive it without a TTY."""
     install = Path(str(path)).expanduser().resolve()
     store = install / ".levain" / "memory.db"
-    import shutil
-
-    anneal_path = shutil.which("anneal-memory") or "anneal-memory"
+    anneal_path = manifest.resolve_anneal_bin()  # spore-751
 
     if confirm is None:
         confirm = _make_confirm(yes)
@@ -358,7 +356,7 @@ def _run_anneal(
     module form. Returns (ok, stdout-or-error-tail)."""
     candidates = [
         [anneal_path, "--db", str(store), *sub_args],
-        [sys.executable, "-m", "anneal_memory", "--db", str(store), *sub_args],
+        [sys.executable, "-P", "-m", "anneal_memory", "--db", str(store), *sub_args],
     ]
     last = ""
     for cmd in candidates:

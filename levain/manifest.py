@@ -43,11 +43,14 @@ The honesty floor is load-bearing throughout: a discovery that FAILS yields an
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import tomllib
 from collections.abc import Mapping, Sequence
@@ -263,6 +266,51 @@ def declared_set() -> CompatSet:
 # Discovery — read the INSTALLED set from anneal's own JSON CLI
 # ---------------------------------------------------------------------------
 
+def resolve_anneal_bin() -> str:
+    """The ``anneal-memory`` console script of the anneal THIS interpreter imports.
+
+    ``spore-751``, ruled by Phill 2026-09-13: exactly one anneal is authoritative, and it
+    is the one levain's own interpreter (``sys.executable``) resolves. It used to be
+    ``shutil.which("anneal-memory")``, which returns whatever PATH finds first. On a
+    machine with a second anneal earlier on PATH, init wired THAT one into the hooks
+    while doctor reported it next to levain's own interpreter.
+
+    The script is found through the distribution's own RECORD, so it follows the
+    installed package whether that install is editable or a pinned wheel. It is never
+    derived from a source checkout or from PATH order. When more than one
+    ``anneal-memory`` distribution is visible (a stale dist-info left beside the real
+    one), the one whose RECORD contains the module file that actually imports is tried
+    first.
+
+    If no distribution yields the script, this returns the interpreter's scripts-dir
+    path anyway: an ABSOLUTE path, never a bare name that a PATH search would resolve.
+    """
+    name = "anneal-memory.exe" if os.name == "nt" else "anneal-memory"
+    try:
+        spec = importlib.util.find_spec("anneal_memory")
+    except (ImportError, ValueError):
+        spec = None
+    origin = Path(spec.origin).resolve() if spec is not None and spec.origin else None
+
+    def _owns_module(d: importlib.metadata.Distribution) -> bool:
+        return origin is not None and any(
+            Path(str(f.locate())).resolve() == origin for f in d.files or ()
+        )
+
+    dists = sorted(
+        importlib.metadata.distributions(name="anneal-memory"),
+        key=lambda d: 0 if _owns_module(d) else 1,
+    )
+    for dist in dists:
+        for f in dist.files or ():
+            if f.name != name:
+                continue
+            candidate = os.path.abspath(str(f.locate()))
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return os.path.join(sysconfig.get_path("scripts"), name)
+
+
 def _run_anneal_json(
     store: Path,
     anneal_path: str,
@@ -282,7 +330,7 @@ def _run_anneal_json(
     db = str(store)
     candidates = [
         [anneal_path, "--db", db, *sub_args],
-        [sys.executable, "-m", "anneal_memory", "--db", db, *sub_args],
+        [sys.executable, "-P", "-m", "anneal_memory", "--db", db, *sub_args],
     ]
     for cmd in candidates:
         try:

@@ -1916,10 +1916,11 @@ def _hook_layer(root: Path) -> Path:
 
 
 def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Path):
-    """⛔ `anneal_path` is `shutil.which("anneal-memory")`, re-resolved EVERY run
-    (spore-751). So a PRISTINE installed hook's `_INSTALL_ANNEAL_BIN` line legitimately
-    differs from the line about to replace it whenever PATH resolution moves — a venv
-    vs a plain shell. Comparing raw bytes called that an operator edit and printed
+    """⛔ `anneal_path` is re-resolved EVERY run. It was `shutil.which("anneal-memory")`
+    until spore-751 and is now the script of the anneal the running interpreter imports,
+    which still moves when init runs from a different venv. So a PRISTINE installed hook's
+    `_INSTALL_ANNEAL_BIN` line legitimately differs from the line about to replace it
+    whenever that resolution moves — a venv vs a plain shell. Comparing raw bytes called that an operator edit and printed
     "! Operator-edited hooks/_levain_hook.py" on a tree nobody had touched.
 
     ⚠ AND IT RECURS: each run writes its OWN resolution in, so alternating shells

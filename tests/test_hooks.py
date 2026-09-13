@@ -142,6 +142,9 @@ class TestAnnealJsonRobustness:
         assert calls["n"] == 1
 
     def test_validator_skips_wrong_shape_candidate(self, monkeypatch):
+        # Two candidates need a substituted install bin: since spore-751 the hook no longer
+        # tries a PATH anneal, so an unsubstituted placeholder leaves only the module form.
+        monkeypatch.setattr(hook, "_INSTALL_ANNEAL_BIN", "/opt/levain/bin/anneal-memory")
         results = iter([self._FakeResult('{"wrong": 1}'), self._FakeResult("[]")])
         monkeypatch.setattr(hook.subprocess, "run", lambda *a, **k: next(results))
         out = hook._anneal_json(

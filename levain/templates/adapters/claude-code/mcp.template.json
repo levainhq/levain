@@ -2,8 +2,8 @@
   "mcpServers": {
     "anneal_memory": {
       "type": "stdio",
-      "command": "{{ANNEAL_MEMORY}}",
-      "args": ["--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]
+      "command": "{{PYTHON}}",
+      "args": ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]
     }
   }
 }
