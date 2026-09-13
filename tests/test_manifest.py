@@ -292,7 +292,8 @@ def test_pip_floor_reads_PYPROJECT_at_release_cut_not_the_stale_egg_info(
     pkg_dir = tmp_path / "levain"
     pkg_dir.mkdir()
     (tmp_path / "pyproject.toml").write_text(
-        '[project]\ndependencies = ["anneal-memory>=0.9.9,<0.10"]\n', encoding="utf-8"
+        '[project]\nname = "levain"\ndependencies = ["anneal-memory>=0.9.9,<0.10"]\n',
+        encoding="utf-8",
     )
     monkeypatch.setattr(manifest, "_PYPROJECT_PATH", tmp_path / "pyproject.toml")
     monkeypatch.setattr(manifest, "KNOWN_GOOD_ANNEAL", "0.9.8")
@@ -356,6 +357,60 @@ def test_pip_floor_falls_back_to_dist_metadata_when_no_pyproject_beside_it(monke
     monkeypatch.setattr(manifest, "_PYPROJECT_PATH", Path("/nonexistent/pyproject.toml"))
     assert manifest._pyproject_requires() is None
     # The real environment has levain installed (editable), so dist metadata is real.
+    assert manifest.pip_floor() == "0.9.8"
+
+
+def test_pip_floor_rejects_a_nonstring_dependency_entry(monkeypatch, tmp_path):
+    """L3 codex fix-diff re-pass MED, 2026-09-13, reproduced. `dependencies = [..., 7]` is
+    valid TOML but invalid project metadata; a version that filtered non-string entries with
+    a list comprehension silently dropped the `7` and reported `in_sync` on a genuinely
+    malformed manifest. The whole array must be rejected, same polarity as every other
+    broken-schema case in this function."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "levain"\ndependencies = ["anneal-memory>=0.9.8,<0.10", 7]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", pyproject)
+
+    assert manifest._pyproject_requires() == [], "a non-string entry must reject the WHOLE array"
+    v = manifest.pip_floor_verdict()
+    assert v.status == "unknown", f"a malformed dependencies array must not read in_sync: {v!r}"
+
+
+def test_pip_floor_reports_UNKNOWN_not_crash_when_is_file_raises(monkeypatch, tmp_path):
+    """L3 codex fix-diff re-pass MED, 2026-09-13, reproduced. `_PYPROJECT_PATH.is_file()`
+    can raise `OSError` (a permission-denied parent dir, an NFS hiccup) OUTSIDE a `try` that
+    only wrapped the read — crashing `pip_floor_verdict()`/`levain doctor` instead of
+    reporting `unknown`."""
+    class _BoomPath:
+        def is_file(self):
+            raise PermissionError("denied")
+
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", _BoomPath())
+    assert manifest._pyproject_requires() == []  # present-but-unreadable, not absent
+    v = manifest.pip_floor_verdict()  # must not raise
+    assert v.status == "unknown"
+
+
+def test_pip_floor_ignores_an_UNRELATED_pyproject_at_the_installed_wheel_path(
+    monkeypatch, tmp_path
+):
+    """L3 codex fix-diff re-pass LOW, 2026-09-13, reproduced. For an installed wheel,
+    `_PYPROJECT_PATH` resolves one level above the package dir (`site-packages/`, not a
+    per-package subdir) — a path a stray, unrelated package's `pyproject.toml` could occupy.
+    A version that trusted any present file there would silently suppress valid dist
+    metadata for an entirely different project. The project NAME must match before the file
+    is trusted; a mismatch is the ABSENT case (fall back to dist metadata), not the
+    present-but-broken one."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[project]\nname = "someone-else"\n', encoding="utf-8")
+    monkeypatch.setattr(manifest, "_PYPROJECT_PATH", pyproject)
+
+    assert manifest._pyproject_requires() is None, (
+        "an unrelated pyproject.toml must be treated as ABSENT, not trusted"
+    )
+    # Falls through to the real installed dist metadata, same as the no-file case.
     assert manifest.pip_floor() == "0.9.8"
 
 
