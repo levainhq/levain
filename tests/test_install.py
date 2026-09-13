@@ -1701,10 +1701,13 @@ def test_activation_operator_edit_backed_up_against_winning_source(tmp_path: Pat
     assert backups[0].read_text(encoding="utf-8") == "OPERATOR EDIT\n"
 
 
-def test_activation_no_backup_when_current_matches_winning_pack(tmp_path: Path, monkeypatch):
-    """No spurious backup when the installed posture.md already matches the WINNING
-    pack override (even though it DIFFERS from base) — proves the backup compares
-    against the winning source, not base."""
+def test_activation_no_edit_notice_when_current_matches_winning_pack(
+    tmp_path: Path, monkeypatch, capsys
+):
+    """No spurious "Operator-edited" notice when the installed posture.md already matches
+    the WINNING pack override (even though it DIFFERS from base) — proves the notice
+    compares against the winning source, not base. The previous tree is still kept whole
+    (spore-861); only the claim is at stake here."""
     monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
     pack = _make_activation_pack(
         tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE\n"}
@@ -1712,10 +1715,12 @@ def test_activation_no_backup_when_current_matches_winning_pack(tmp_path: Path, 
     install = tmp_path / "install"
     install.mkdir()
     _apply_with_packs(install, "claude-code", [pack])          # installs pack posture.md
+    capsys.readouterr()
     _apply_with_packs(install, "claude-code", [pack])          # re-install, no operator edit
 
+    assert "Operator-edited" not in capsys.readouterr().out
     backups = list((install / ".levain" / "backups" / "activation").rglob("posture.md"))
-    assert backups == []
+    assert [b.read_text(encoding="utf-8") for b in backups] == ["PACK POSTURE\n"]
 
 
 # --- Slice 4a hardening: _copy_activation_tree / _compose_activation_layers ----
@@ -1806,13 +1811,14 @@ def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
 
     # The package version won the install...
     assert (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8") == "NEW PACKAGE HOOK\n"
-    # ...but the operator's patch survives, at its relative path.
-    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    # ...but the operator's patch survives, at its relative path, inside the whole
+    # previous tree (spore-861).
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py", "posture.md"]
     bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
     assert bak.read_text(encoding="utf-8") == "OPERATOR PATCHED HOOK\n"
 
 
-def test_copy_activation_pristine_substituted_hook_is_NOT_backed_up(tmp_path: Path):
+def test_copy_activation_pristine_substituted_hook_is_NOT_announced(tmp_path: Path):
     """⛔ THE REGRESSION WIDENING THE SCOPE NEARLY SHIPPED. Install substitutes
     `{{ANNEAL_MEMORY}}` into hooks, so the INSTALLED hook never equals its package
     SOURCE. While the backup covered only two placeholder-free markdown files this
@@ -1820,6 +1826,9 @@ def test_copy_activation_pristine_substituted_hook_is_NOT_backed_up(tmp_path: Pa
     `_levain_hook.py` as operator-edited on EVERY re-install — spurious noise on
     exactly the file class the backup exists for, training operators to ignore the
     one warning that matters. Found by codex + complement at L3.
+
+    Since spore-861 the whole previous tree is kept regardless, so the oracle is the
+    NOTICE: a pristine hook must not be reported as operator-edited.
 
     MUTATION CONTROL: fails if the comparison is moved back to the composed source.
     """
@@ -1834,59 +1843,67 @@ def test_copy_activation_pristine_substituted_hook_is_NOT_backed_up(tmp_path: Pa
         "posture.md": "P\n",
         "hooks/_levain_hook.py": 'BIN = "/usr/local/bin/anneal-memory"\n',
     })
+    said: list[str] = []
     _copy_activation_tree(
-        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory"
+        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory",
+        emit=said.append,
     )
-    assert _backed_up_files(install) == [], (
+    assert not [m for m in said if "Operator-edited" in m], (
         "a pristine substituted hook is not an operator edit — compare against the "
-        "STAGED bytes, not the composed source")
+        f"STAGED bytes, not the composed source: {said}")
     # And the substitution still actually happened.
     assert "/usr/local/bin/anneal-memory" in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
 
 
 def test_copy_activation_patched_hook_still_caught_under_substitution(tmp_path: Path):
     """The other half, and what makes the fix a correction rather than a mute button:
-    a REAL patch to a placeholder-bearing hook must still be caught once the
-    comparison moves to the staged bytes."""
+    a REAL patch to a placeholder-bearing hook must still be named. Since spore-900 the
+    claim comes from the install receipt, so the tree is installed first."""
     base = _mk_layer(tmp_path / "base", {
         "posture.md": "P\n",
         "hooks/_levain_hook.py": 'BIN = "{{ANNEAL_MEMORY}}"\n',
     })
     install = tmp_path / "install"
     dst = install / "activation"
-    _mk_layer(dst, {
-        "posture.md": "P\n",
-        "hooks/_levain_hook.py": 'BIN = "/usr/local/bin/anneal-memory"\n# operator patch\n',
-    })
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/usr/local/bin/anneal-memory")
+    hook = dst / "hooks" / "_levain_hook.py"
+    hook.write_text(hook.read_text(encoding="utf-8") + "# operator patch\n", encoding="utf-8")
+    said: list[str] = []
     _copy_activation_tree(
-        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory"
+        [base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory",
+        emit=said.append,
     )
-    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    assert [m for m in said if "Operator-edited hooks/_levain_hook.py" in m], said
+    assert not [m for m in said if "Operator-edited posture.md" in m], said
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unreadable-dir permission")
-def test_copy_activation_unscannable_dir_REFUSES_instead_of_destroying(tmp_path: Path):
-    """⛔ `Path.rglob` SILENTLY SWALLOWS SCAN ERRORS — measured: an unreadable
-    subdirectory simply does not appear in the results. Enumerating with it meant a
-    file we could not scan was never backed up AND the swap proceeded anyway,
-    destroying it with no backup and no warning. That is the precise contract this
-    backup exists to hold, defeated by the traversal chosen to implement it.
+def test_copy_activation_unreadable_dir_is_KEPT_in_the_backup(tmp_path: Path):
+    """⛔ An unreadable subdirectory used to be a problem only because the old design had
+    to SCAN every file to decide what to copy. Since spore-861 nothing is scanned before
+    the swap: the whole previous tree is renamed into the backup, unreadable directory and
+    all, and the reinstall proceeds. The post-swap comparison against the receipt cannot
+    read it, so it names it, and the tree cannot prove unedited, so it is never pruned.
 
-    MUTATION CONTROL: revert the enumeration to `dst.rglob("*")` and this test fails
-    — no InitError is raised and the operator's file is gone."""
+    MUTATION CONTROL: delete the previous tree instead of renaming it into the backup and
+    this fails — the operator's unreadable content is gone."""
     base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
     install = tmp_path / "install"
     dst = install / "activation"
-    _mk_layer(dst, {"posture.md": "P\n", "private/notes.md": "OPERATOR CONTENT\n"})
-    locked = dst / "private"
-    os.chmod(locked, 0o000)
+    _copy_activation_tree([base], dst, base_activation=base)
+    _mk_layer(dst, {"private/notes.md": "OPERATOR CONTENT\n"})
+    os.chmod(dst / "private", 0o000)
+    said: list[str] = []
     try:
-        with pytest.raises(InitError, match="could not scan"):
-            _copy_activation_tree([base], dst, base_activation=base)
+        _copy_activation_tree([base], dst, base_activation=base, emit=said.append)
     finally:
-        os.chmod(locked, 0o755)
-    # Refused BEFORE the cutover — the operator's unreadable content still exists.
-    assert (dst / "private" / "notes.md").read_text(encoding="utf-8") == "OPERATOR CONTENT\n"
+        for locked in (install / ".levain" / "backups" / "activation").glob("tree-*/private"):
+            os.chmod(locked, 0o755)
+    assert not (dst / "private").exists()
+    kept = list((install / ".levain" / "backups" / "activation").glob("tree-*/private/notes.md"))
+    assert [k.read_text(encoding="utf-8") for k in kept] == ["OPERATOR CONTENT\n"]
+    assert [m for m in said if "could not compare" in m], "the unexamined dir must be named"
 
 
 def test_same_contents_is_bounded_and_correct_across_chunk_boundaries(tmp_path: Path):
@@ -1978,7 +1995,7 @@ def test_an_edit_CONFINED_to_the_substituted_line_is_PRESERVED_AND_NAMED(tmp_pat
                           anneal_path="/opt/a/anneal-memory", emit=said.append)
 
     # The bytes survive somewhere recoverable...
-    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py", "posture.md"]
     bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
     assert "my-wrapper" in bak.read_text(encoding="utf-8")
     # ...and the receipt lets levain say so truthfully.
@@ -2005,6 +2022,9 @@ def test_a_pristine_reinstall_is_never_BLOCKED_by_an_unwritable_backup_dir(tmp_p
     finally:
         os.chmod(backups_root, 0o700)
     assert '"/usr/local/bin/anneal-memory"' in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
+    # And the previous tree was still kept, beside activation/ instead (spore-861).
+    kept = list(install.glob(".levain-activation-prev-*/hooks/_levain_hook.py"))
+    assert len(kept) == 1 and '"/opt/a/anneal-memory"' in kept[0].read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unwritable-dir permission")
@@ -2017,9 +2037,8 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
     edit was neither preserved NOR reported. Silence is the defect, not the failure —
     a safe branch that can fail must leave a trace, or a weak heuristic runs forever
     with nothing to indict it."""
-    # Since spore-900 a receipt-proven EDIT is never best-effort (it refuses instead), so
-    # the best-effort branch is reached by a file that matches its receipt and differs from
-    # the new tree: the same pristine hook, installed again with a different anneal path.
+    # spore-861: the whole previous tree is moved, never classified; an unwritable backups
+    # dir sends it to a sibling beside activation/ instead of blocking the reinstall.
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
     dst = install / "activation"
@@ -2037,8 +2056,11 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
         os.chmod(backups_root, 0o700)
 
     blob = "\n".join(said)
-    assert "could not stage a copy" in blob, "a failed preservation must be announced"
-    assert "no edit of yours is lost" in blob, "and must say why proceeding is safe"
+    assert "could not keep the previous activation/" in blob, (
+        "a backup that could not go where it normally goes must be announced")
+    kept = list(install.glob(".levain-activation-prev-*/hooks/_levain_hook.py"))
+    assert len(kept) == 1 and '"/opt/a/anneal-memory"' in kept[0].read_text(encoding="utf-8")
+    assert str(kept[0].parents[1]) in blob, "and must say where the tree went"
     # Still not a refusal — a pristine reinstall is not blocked.
     assert '"/usr/local/bin/anneal-memory"' in hook.read_text(encoding="utf-8")
 
@@ -2091,12 +2113,33 @@ def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
         inst.os.replace = real_replace
         os.chmod(backups_root, 0o700)
 
-    assert not [m for m in said if "could not stage a copy" in m], (
-        "a note about a skipped preservation must not be emitted when the swap "
+    assert not [m for m in said if "could not keep the previous" in m], (
+        "a note about where the previous tree went must not be emitted when the swap "
         f"describing it never happened, said: {said!r}"
     )
-    # The original tree must be intact — the swap failed before it touched `dst`.
+    # The original tree is back in place: the failed swap renamed it back.
     assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
+    assert not list(install.glob(".levain-activation-prev-*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
+def test_a_symlink_in_the_previous_tree_is_kept_AS_A_SYMLINK(tmp_path: Path):
+    """spore-860's cases were losses of classification: a directory symlink was never
+    enumerated and a file symlink was replaced by a copy of its target. Renaming the whole
+    tree keeps both exactly as they were."""
+    base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _mk_layer(dst, {"posture.md": "P\n"})
+    target = _mk_layer(tmp_path / "elsewhere", {"notes.md": "N\n"})
+    (dst / "linked_dir").symlink_to(target, target_is_directory=True)
+    (dst / "linked_file.md").symlink_to(target / "notes.md")
+    _copy_activation_tree([base], dst, base_activation=base)
+
+    (tree,) = (install / ".levain" / "backups" / "activation").glob("tree-*")
+    assert (tree / "linked_dir").is_symlink()
+    assert (tree / "linked_file.md").is_symlink()
+    assert os.readlink(tree / "linked_file.md") == str(target / "notes.md")
 
 
 def test_codex_store_uses_ARGV_semantics_last_wins_and_both_spellings(tmp_path: Path):
@@ -2171,9 +2214,12 @@ def test_a_REAL_patch_is_still_caught_when_the_anneal_path_also_moves(tmp_path: 
 
     hook = dst / "hooks" / "_levain_hook.py"
     hook.write_text(hook.read_text(encoding="utf-8") + "# REAL PATCH\n", encoding="utf-8")
-    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/usr/local/bin/anneal-memory")
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/usr/local/bin/anneal-memory", emit=said.append)
 
-    assert _backed_up_files(install) == ["hooks/_levain_hook.py"]
+    assert [m for m in said if "Operator-edited hooks/_levain_hook.py" in m]
+    assert _backed_up_files(install) == ["hooks/_levain_hook.py", "posture.md"]
     bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
     assert "# REAL PATCH" in bak.read_text(encoding="utf-8")
 
@@ -2194,7 +2240,7 @@ def test_a_receiptless_tree_is_preserved_WITHOUT_a_claim_either_way(tmp_path: Pa
                           anneal_path="/opt/a/anneal-memory", emit=said.append)
     assert _backed_up_files(install) == ["posture.md"]
     assert not [m for m in said if "Operator-edited" in m], said
-    assert [m for m in said if "posture.md preserved at" in m and "cannot tell" in m], said
+    assert [m for m in said if "Previous activation/ kept whole" in m and "cannot tell" in m], said
 
 
 def _codex_cfg(store: str) -> str:
@@ -2560,27 +2606,29 @@ def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path)
     })
     _copy_activation_tree([base], dst, base_activation=base)
 
-    assert not (dst / "hooks" / "my_own_hook.py").exists()   # rmtree took it
-    assert _backed_up_files(install) == ["hooks/my_own_hook.py"]
+    assert not (dst / "hooks" / "my_own_hook.py").exists()   # the new tree lacks it
+    assert _backed_up_files(install) == ["hooks/my_own_hook.py", "posture.md"]
 
 
-def test_copy_activation_pristine_tree_backs_up_nothing(tmp_path: Path):
-    """Widening the scope to the whole tree must NOT mean backing the whole tree up:
-    a dst that already matches the winning layers byte-for-byte stages ZERO files.
-    Membership is decided by reproducibility, not by filename."""
+def test_copy_activation_pristine_tree_announces_nothing(tmp_path: Path):
+    """The whole previous tree is kept (spore-861), so the property left to grade is
+    the notice: a dst that already matches the winning layers byte-for-byte must not
+    produce a single "Operator-edited" line."""
     files = {"posture.md": "P\n", "hooks/h.py": "H\n", "recency_directives.md": "R\n"}
     base = _mk_layer(tmp_path / "base", files)
     install = tmp_path / "install"
     _mk_layer(install / "activation", dict(files))
-    _copy_activation_tree([base], install / "activation", base_activation=base)
-    assert _backed_up_files(install) == []
+    said: list[str] = []
+    _copy_activation_tree([base], install / "activation", base_activation=base,
+                          emit=said.append)
+    assert not [m for m in said if "Operator-edited" in m], said
+    assert _backed_up_files(install) == sorted(files)
 
 
-def test_copy_activation_pyc_residue_is_not_backed_up(tmp_path: Path):
+def test_copy_activation_pyc_residue_is_not_announced(tmp_path: Path):
     """`__pycache__`/`*.pyc` in the installed tree are build residue no layer
-    provides. Without the `_activation_excluded` skip they would read as
-    operator-added and be copied on EVERY run — the noise class the exclusion
-    exists to prevent."""
+    provides. Without the `_activation_excluded` skip they would be reported as
+    operator-added on EVERY run — the noise class the exclusion exists to prevent."""
     base = _mk_layer(tmp_path / "base", {"posture.md": "P\n", "hooks/h.py": "H\n"})
     install = tmp_path / "install"
     dst = install / "activation"
@@ -2589,31 +2637,37 @@ def test_copy_activation_pyc_residue_is_not_backed_up(tmp_path: Path):
         "hooks/h.py": "H\n",
         "hooks/__pycache__/h.cpython-313.pyc": "RESIDUE\n",
     })
-    _copy_activation_tree([base], dst, base_activation=base)
-    assert _backed_up_files(install) == []
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base, emit=said.append)
+    assert not [m for m in said if "Operator-edited" in m], said
 
 
-def test_copy_activation_unbackuppable_operator_edit_raises(tmp_path: Path, monkeypatch):
-    """If an operator edit can't be backed up (copy2 fails), refuse — don't rmtree
-    over it (codex HIGH-2). Simulated by making shutil.copy2 raise during backup."""
+def test_copy_activation_refuses_when_the_previous_tree_cannot_be_moved_anywhere(
+    tmp_path: Path, monkeypatch
+):
+    """If neither the backup directory nor the sibling fallback can take the previous
+    tree, nothing may be destroyed: the install raises, `dst` is untouched, and the
+    staged tree is cleaned up."""
     base = _mk_layer(tmp_path / "base", {"posture.md": "NEW BASE POSTURE\n"})
-    dst = tmp_path / "install" / "activation"
+    install = tmp_path / "install"
+    dst = install / "activation"
     dst.mkdir(parents=True)
-    (dst / "posture.md").write_text("OPERATOR EDIT\n", encoding="utf-8")  # differs from winning
+    (dst / "posture.md").write_text("OPERATOR EDIT\n", encoding="utf-8")
 
-    import shutil as _shutil
-    real_copy2 = _shutil.copy2
+    import levain.install as inst
+    real_replace = inst.os.replace
 
-    def _boom(src, d, *a, **k):
-        if str(d).endswith("posture.md") and "backups" in str(d):
-            raise OSError("disk full")
-        return real_copy2(src, d, *a, **k)
+    def _boom(src, d):
+        if Path(src) == dst:
+            raise OSError(28, "No space left on device")
+        return real_replace(src, d)
 
-    monkeypatch.setattr("levain.install.shutil.copy2", _boom)
-    with pytest.raises(InitError, match="could not be backed up"):
+    monkeypatch.setattr(inst.os, "replace", _boom)
+    with pytest.raises(OSError, match="No space left on device"):
         _copy_activation_tree([base], dst, base_activation=base)
-    # The operator's edit was NOT destroyed (raise came before rmtree).
     assert (dst / "posture.md").read_text(encoding="utf-8") == "OPERATOR EDIT\n"
+    assert not list(install.glob(".levain-activation-new-*"))
+    assert not list(install.glob(".levain-activation-prev-*"))
 
 
 def test_copy_activation_pack_overrides_base_hook(tmp_path: Path):
