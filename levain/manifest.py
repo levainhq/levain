@@ -294,18 +294,21 @@ def resolve_anneal_bin() -> str:
 
     def _owns_module(d: importlib.metadata.Distribution) -> bool:
         return origin is not None and any(
-            Path(str(f.locate())).resolve() == origin for f in d.files or ()
+            Path(str(d.locate_file(f))).resolve() == origin for f in d.files or ()
         )
 
-    dists = sorted(
-        importlib.metadata.distributions(name="anneal-memory"),
-        key=lambda d: 0 if _owns_module(d) else 1,
-    )
+    # Only the distribution that owns the imported module may supply the script (codex
+    # L3 MED). An editable install's RECORD does not list the module, so when nothing is
+    # identifiable as the owner, the sole visible distribution is accepted; with several
+    # and no owner, none is trusted and the interpreter's scripts dir is used instead.
+    visible = list(importlib.metadata.distributions(name="anneal-memory"))
+    owners = [d for d in visible if _owns_module(d)]
+    dists = owners if owners else (visible if len(visible) == 1 else [])
     for dist in dists:
         for f in dist.files or ():
             if f.name != name:
                 continue
-            candidate = os.path.abspath(str(f.locate()))
+            candidate = os.path.abspath(str(dist.locate_file(f)))
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                 return candidate
     return os.path.join(sysconfig.get_path("scripts"), name)
