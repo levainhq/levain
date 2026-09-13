@@ -27,7 +27,6 @@ answers}``, so a page can never redirect the install target.
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 import threading
 from collections.abc import Sequence
@@ -680,7 +679,9 @@ def make_init_server(
     httpd.pack_dirs = resolved_packs
     httpd.pack_names = pack_names
     httpd.python_path = sys.executable
-    httpd.anneal_path = shutil.which("anneal-memory") or "anneal-memory"
+    from levain.manifest import resolve_anneal_bin
+
+    httpd.anneal_path = resolve_anneal_bin()  # spore-751
     httpd.assets = assets
     # Re-verify the ACTUAL bound address is loopback (verify-the-bound-address, not
     # the resolver — a tampered hosts file could map 'localhost' off-box). Refuse

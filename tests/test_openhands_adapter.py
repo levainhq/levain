@@ -11,7 +11,6 @@ CLI (the base dep). Only `levain run` itself needs the SDK (see test_run.py).
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -30,13 +29,16 @@ from levain.install import (
     hosted_artifacts,
 )
 from levain.interview import build_field_plan, parse_template
+from levain.manifest import resolve_anneal_bin
 from levain.packs import compose_roster, render_entries, verbatim_entries
 from levain.verify import run_verify_hooks
 
 
 def _openhands_install(install: Path) -> None:
     """A real base (no-pack) openhands install — real seed render + real anneal store."""
-    anneal = shutil.which("anneal-memory") or "anneal-memory"
+    # The same resolution production init and doctor use (spore-751). A PATH lookup here
+    # recorded the lock against a different anneal than doctor then reads.
+    anneal = resolve_anneal_bin()
     with _templates_root() as templates_root:
         roster = compose_roster([templates_root])
         specs = [parse_template(e.path) for e in render_entries(roster)]

@@ -686,8 +686,12 @@ def _check_runtime(install: Path) -> list[CheckResult]:
         CheckResult("python interpreter", True, f"{py} ({py_version})")
     )
 
-    am_cli = shutil.which("anneal-memory")
-    if am_cli:
+    from levain.manifest import resolve_anneal_bin
+
+    # spore-751: report the ONE anneal levain's interpreter resolves, which is the one init
+    # wires, instead of whatever PATH finds first.
+    am_cli = resolve_anneal_bin()
+    if os.path.isfile(am_cli):
         ok, out = _probe([am_cli, "--version"])
         if ok:
             version = (out.strip().splitlines() or ["present"])[0]
@@ -705,7 +709,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             )
         return results
 
-    ok, out = _probe([sys.executable, "-m", "anneal_memory", "--version"])
+    ok, out = _probe([sys.executable, "-P", "-m", "anneal_memory", "--version"])
     if ok:
         version = (out.strip().splitlines() or ["present"])[0]
         results.append(
@@ -720,8 +724,8 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             CheckResult(
                 "anneal-memory",
                 False,
-                "not on PATH and not importable as a Python module",
-                "Install with: pip install anneal-memory",
+                f"not installed for levain's interpreter ({sys.executable})",
+                f"Install with: {sys.executable} -m pip install anneal-memory",
             )
         )
     return results
@@ -808,7 +812,7 @@ def _check_compat_set(install: Path) -> list[CheckResult]:
     if not store.is_file():
         return []
 
-    anneal_path = shutil.which("anneal-memory") or "anneal-memory"
+    anneal_path = manifest.resolve_anneal_bin()
     declared = manifest.declared_set()
     installed = manifest.discover_installed_set(store, anneal_path)
     lock, lock_status = manifest.read_lock_status(install)
@@ -1950,7 +1954,8 @@ def _match_store(name: str, install: Path, args: list) -> CheckResult:
     """Verify the MCP server args point at this install's anneal-memory store.
 
     Compares resolved paths so symlinked prefixes (e.g. macOS /tmp -> /private/tmp)
-    match correctly. Args shape is `--db <path> serve` (Levain template convention).
+    match correctly. The store is read from the `--db <path>` pair wherever it sits in
+    the args, so the pre-spore-751 shape and the `-P -m anneal_memory` shape both parse.
     """
     expected = (install / ".levain" / "memory.db").resolve()
     configured: str | None = None

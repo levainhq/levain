@@ -64,10 +64,13 @@ substitute them by hand per the steps below.
 | Token | In | Resolves to |
 |-------|----|-------------|
 | `{{INSTALL_DIR}}` | `hooks.json.template`, `mcp.template.toml` | absolute path of the partnership directory |
-| `{{PYTHON}}` | `hooks.json.template` | the working Python 3 interpreter (`python3`, or its absolute path) |
-| `{{ANNEAL_MEMORY}}` | `mcp.template.toml` | the `anneal-memory` executable (`anneal-memory`, or its absolute path) |
+| `{{PYTHON}}` | `hooks.json.template`, `mcp.template.toml` | the Python 3 interpreter Levain and anneal-memory are installed in (its absolute path) |
 
-`{{PYTHON}}` and `{{ANNEAL_MEMORY}}` are environment-dependent on purpose:
+The MCP server runs as `{{PYTHON}} -m anneal_memory`, so the anneal that
+serves memory is the one installed alongside Levain, not whichever
+`anneal-memory` comes first on `PATH`.
+
+`{{PYTHON}}` is environment-dependent on purpose:
 a bare command name resolves against `PATH`, and Codex CLI launched from a
 GUI app or `cron` inherits a *minimal* `PATH` that often omits `pip --user`
 script directories. Resolving them to absolute paths at install time removes
@@ -144,9 +147,9 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
 
 ## Install (manual — `levain init` automates this at build step 4)
 
-1. **Install anneal-memory** and confirm it runs: `anneal-memory --help`.
-   Note its absolute path (`command -v anneal-memory`) and your Python 3
-   path (`command -v python3`).
+1. **Install anneal-memory** into the interpreter you will use and confirm
+   it runs: `<python> -m anneal_memory --help`. Note that interpreter's
+   absolute path (for example `command -v python3`).
 2. **Place `seed/`, `activation/`, and `AGENTS.md`** (from
    `AGENTS.md.template`) in the partnership directory.
 3. **Wire the hooks globally:** copy `hooks.json.template` to
@@ -160,8 +163,8 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
    are shell-quoted in the template, so paths containing spaces work
    correctly.
 4. **Register the MCP server:** append the contents of `mcp.template.toml`
-   to `~/.codex/config.toml`, replacing `{{ANNEAL_MEMORY}}` with the
-   anneal-memory path from step 1 and `{{INSTALL_DIR}}` with the absolute
+   to `~/.codex/config.toml`, replacing `{{PYTHON}}` with the
+   interpreter path from step 1 and `{{INSTALL_DIR}}` with the absolute
    install path. **Idempotency note:** if `[mcp_servers.anneal_memory]`
    already exists in `~/.codex/config.toml` (e.g. from a prior install
    attempt), replace its body in place — do *not* append a duplicate

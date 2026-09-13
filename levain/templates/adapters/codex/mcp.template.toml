@@ -1,8 +1,11 @@
 # Levain — Codex MCP server registration (fragment for ~/.codex/config.toml)
 #
-# Appends the anneal_memory MCP server registration. {{ANNEAL_MEMORY}} resolves
-# to the anneal-memory executable (typically `anneal-memory` on PATH, or an
-# absolute path on GUI-launched Codex where the PATH is minimal).
+# Appends the anneal_memory MCP server registration. {{PYTHON}} resolves to
+# the Python interpreter Levain is installed in, and the server runs as
+# `<that interpreter> -P -m anneal_memory`, so the anneal serving memory is the
+# one Levain imports and not whichever `anneal-memory` a PATH lookup finds.
+# `-P` keeps the directory Codex was started in off sys.path, so an
+# `anneal_memory/` source checkout there cannot stand in for the installed one.
 # {{INSTALL_DIR}} resolves to the operator's Levain install (the absolute path
 # of the partnership directory) so the memory store is install-scoped.
 #
@@ -11,5 +14,5 @@
 # name. Do not rename.
 
 [mcp_servers.anneal_memory]
-command = "{{ANNEAL_MEMORY}}"
-args = ["--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]
+command = "{{PYTHON}}"
+args = ["-P", "-m", "anneal_memory", "--db", "{{INSTALL_DIR}}/.levain/memory.db", "serve"]

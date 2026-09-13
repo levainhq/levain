@@ -58,10 +58,13 @@ substitute them by hand per the steps below.
 | Token | In | Resolves to |
 |-------|----|-------------|
 | `{{INSTALL_DIR}}` | `mcp.template.json` | absolute path of the partnership directory |
-| `{{PYTHON}}` | `settings.template.json` | the working Python 3 interpreter (`python3`, or its absolute path) |
-| `{{ANNEAL_MEMORY}}` | `mcp.template.json` | the `anneal-memory` executable (`anneal-memory`, or its absolute path) |
+| `{{PYTHON}}` | `settings.template.json`, `mcp.template.json` | the Python 3 interpreter Levain and anneal-memory are installed in (its absolute path) |
 
-`{{PYTHON}}` and `{{ANNEAL_MEMORY}}` are environment-dependent on purpose:
+The MCP server runs as `{{PYTHON}} -m anneal_memory`, so the anneal that
+serves memory is the one installed alongside Levain, not whichever
+`anneal-memory` comes first on `PATH`.
+
+`{{PYTHON}}` is environment-dependent on purpose:
 a bare command name resolves against `PATH`, and Claude Code launched from a
 GUI app (VS Code / JetBrains / desktop) inherits a *minimal* `PATH` that often
 omits `pip --user` script directories. Resolving them to absolute paths at
@@ -115,14 +118,14 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 
 ## Install (manual — `levain init` automates this at build step 4)
 
-1. **Install anneal-memory** and confirm it runs: `anneal-memory --help`.
-   Note its absolute path (`command -v anneal-memory`) and your Python 3 path
-   (`command -v python3`).
+1. **Install anneal-memory** into the interpreter you will use and confirm it
+   runs: `<python> -m anneal_memory --help`. Note that interpreter's absolute
+   path (for example `command -v python3`).
 2. **Place `seed/`, `activation/`, and `CLAUDE.md`** (from `CLAUDE.md.template`)
    in the partnership directory.
 3. **Create `.mcp.json`** at the directory root from `mcp.template.json`:
    replace `{{INSTALL_DIR}}` with the **absolute path** of the partnership
-   directory and `{{ANNEAL_MEMORY}}` with the anneal-memory path from step 1.
+   directory and `{{PYTHON}}` with the interpreter path from step 1.
 4. **Create `.claude/settings.json`** from `settings.template.json`: replace
    `{{PYTHON}}` with the Python 3 path from step 1. If the directory already
    has a `.claude/settings.json`, do not overwrite it — merge: append the

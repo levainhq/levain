@@ -340,8 +340,10 @@ def run_init(
         )
         return 1
 
+    from levain.manifest import resolve_anneal_bin
+
     python_path = sys.executable
-    anneal_path = shutil.which("anneal-memory") or "anneal-memory"
+    anneal_path = resolve_anneal_bin()  # spore-751: the interpreter's anneal, never PATH's
 
     print()
     print(f"Levain init — installing to {install}")
@@ -1516,7 +1518,10 @@ def _install_claude_code(
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     mcp_text = mcp_text.replace("{{INSTALL_DIR}}", str(install))
-    mcp_text = mcp_text.replace("{{ANNEAL_MEMORY}}", anneal_path)
+    # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
+    # that serves memory is structurally the one levain imports. Escaped as a JSON string
+    # body because an interpreter path can carry `\` or `"`.
+    mcp_text = mcp_text.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
     (install / ".mcp.json").write_text(mcp_text, encoding="utf-8")
 
     emit("  Claude Code adapter installed.")
@@ -1572,7 +1577,12 @@ def _install_codex(
     hooks_target.write_text(hooks_text, encoding="utf-8")
 
     mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    mcp_fragment = mcp_fragment.replace("{{ANNEAL_MEMORY}}", anneal_path)
+    # spore-751: see _install_claude_code. With ensure_ascii=False the only escapes left are
+    # `\"`, `\\`, `\b \f \n \r \t` and `\u00XX` for control characters, all of which TOML
+    # basic strings accept. The ASCII form would emit surrogate pairs that TOML rejects.
+    mcp_fragment = mcp_fragment.replace(
+        "{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1]
+    )
     mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
     _merge_codex_config(codex_home / "config.toml", mcp_fragment, emit=emit)
 
@@ -1689,10 +1699,12 @@ def _is_hook_script(rel: Path) -> bool:
 def _hook_bodies_match(current: Path, staged: Path) -> bool:
     """Whether two hook scripts differ ONLY in what install itself substitutes.
 
-    ⛔ THE QUESTION THIS EXISTS TO ASK. `anneal_path` is `shutil.which("anneal-memory")`,
-    re-resolved on EVERY run, so the `_INSTALL_ANNEAL_BIN` line of a PRISTINE installed
-    hook legitimately differs from the line about to replace it whenever PATH resolution
-    moves between installs (a venv vs a plain shell — `spore-751`). Comparing raw bytes
+    ⛔ THE QUESTION THIS EXISTS TO ASK. `anneal_path` is re-resolved on EVERY run, so the
+    `_INSTALL_ANNEAL_BIN` line of a PRISTINE installed hook legitimately differs from the
+    line about to replace it whenever that resolution moves between installs. Until
+    `spore-751` it was a PATH lookup (a venv vs a plain shell); it is now the script of the
+    anneal the running interpreter imports, which still moves when init runs from a
+    different interpreter or venv. Comparing raw bytes
     calls that an operator edit and backs the file up with a false "Operator-edited"
     notice. MEASURED 2026-09-06: it also recurs, because each run writes its own
     resolution in, so alternating shells re-trigger it indefinitely.
@@ -2423,13 +2435,13 @@ def _run_anneal_cmd(
     """
     candidates = [
         [anneal_path, "--db", str(store), *sub_args],
-        [sys.executable, "-m", "anneal_memory", "--db", str(store), *sub_args],
+        [sys.executable, "-P", "-m", "anneal_memory", "--db", str(store), *sub_args],
     ]
     errors: list[str] = []
     for cmd in candidates:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        except FileNotFoundError as e:
+        except OSError as e:
             errors.append(f"{cmd[0]}: {e}")
             continue
         except subprocess.TimeoutExpired:

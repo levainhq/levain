@@ -8,6 +8,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Changed — the memory server is now the anneal installed alongside Levain, not the first one on `PATH`
+
+`levain init` used to look up `anneal-memory` with a `PATH` search and write whatever it found into the MCP registration and the hooks. If a second anneal sat earlier on `PATH` (say an old `~/.local/bin/anneal-memory`), that one served your memory, while `levain doctor` and `levain update` checked a version chosen by the same lookup. Levain itself imported a different anneal again.
+
+- The MCP registration (`.mcp.json` for Claude Code, `[mcp_servers.anneal_memory]` in `~/.codex/config.toml` for Codex) now runs `<Levain's Python> -P -m anneal_memory`. `-P` keeps the directory the client was started in off Python's import path, so an `anneal_memory/` source checkout there cannot stand in for the installed package.
+- The hooks, `doctor`, `update` and `init --web` use the `anneal-memory` script that belongs to the anneal package Levain's own Python imports. They find it through that package's install record, not through `PATH`. If that script cannot be run, they fall back to `<Levain's Python> -P -m anneal_memory`. The hooks no longer try a bare `anneal-memory` from `PATH` at all.
+
+**Existing installs keep their old registration until you re-run `levain init --force`.** Nothing breaks if you don't; you keep whichever anneal the old lookup picked.
+
 ## [0.4.6] — 2026-09-13
 
 ### Security — a local `sshd` could be used to read a confined entity's crown jewels via the forwarded agent (agent mode) or a readable key (raw mode)
