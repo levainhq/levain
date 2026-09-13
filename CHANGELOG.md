@@ -8,7 +8,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.6.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
-### Security — a local `sshd` could be used to read a confined entity's crown jewels through the forwarded ssh-agent (`ssh_mode="agent"`)
+### Security — a local `sshd` could be used to read a confined entity's crown jewels via the forwarded agent (agent mode) or a readable key (raw mode)
 
 ⚠ **This affects 0.4.5 and every earlier release with the seatbelt floor.** If you run a confined
 entity in the default `ssh_mode="agent"` **and** macOS **Remote Login** is on (System Settings →
@@ -20,24 +20,26 @@ forwards by design. This is the same total-bypass class as reaching a container 
 in 0.4.x): a floor that denies a *file* but forwards a *credential* to an unsandboxed root reader is
 decorative for that file. **Reproduced end to end**; the forwarded agent socket is the sole carrier.
 
-**Fixed:** in `ssh_mode="agent"` the floor now denies outbound network connections to *this host* —
+**Fixed:** in **both** ssh modes the floor now denies outbound network connections to *this host* —
 `(deny network-outbound (remote ip "localhost:*"))`. macOS seatbelt's `localhost` covers **every
 address bound to a local interface** (loopback `127.0.0.1`/`::1` *and* the machine's own LAN
 address), so the entity can no longer reach a `sshd` this machine runs by any of its own addresses,
 while **remote** hosts stay reachable — ssh/git to real remotes over the forwarded agent is
-unaffected.
+unaffected. (It also blocks the entity reaching a local service that re-exposes jewels, e.g. a
+loopback API, independent of ssh.)
 
 - **Cost, and it is real:** a confined entity in agent mode can no longer reach a **local service**
   either — a dev server it started, a database, an `argushub` on `127.0.0.1:8420`. If an entity
   genuinely needs that, set `"allow_localhost_outbound": true` in its `.levain/confinement.json` and
   accept that the `sshd` vector is reopened for that entity.
-- **Scope, and a residual under review:** the deny applies in `ssh_mode="agent"` only. In
-  `ssh_mode="raw"` the entity can read its *own* key directly — but the **other** crown jewels
+- **Scope:** the deny applies in **both** ssh modes. The reason it is not agent-only: in
+  `ssh_mode="raw"` the entity can read its *own* key directly, but the **other** crown jewels
   (`~/.anneal-memory`, sibling stores, your declared secrets) stay floor-denied, and a local `sshd`
-  authenticated with that key reads *them* as root just the same, so a raw-mode variant is real
-  (reproduced). Whether to extend the deny to raw mode — and more broadly how a sandbox should handle
-  a forwarded ssh-agent at all — is under review rather than flipped reflexively; a scoped decision
-  is tracked for a later release.
+  authenticated with that key reads *them* as root just the same (reproduced) — so raw mode needs the
+  deny too. ⚠ A separate raw-mode exposure remains for a later release: raw mode still lets the entity
+  *read the operator's `~/.ssh` private keys directly*. The loopback deny stops those keys reaching a
+  **local** `sshd`, not a remote one; retiring or redefining raw mode as scoped-credential-only is
+  part of the credential redesign below.
 - **Not covered — ssh connection multiplexing (a documented residual, not closed).** This deny
   stops a *fresh* connection to a local `sshd`. It does **not** stop reuse of an **existing** ssh
   `ControlMaster`/mux socket to localhost: if you run `ControlMaster auto`/`yes` and have a live

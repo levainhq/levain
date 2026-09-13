@@ -122,16 +122,17 @@ three).
     stays floor-denied). This is spore-725's "a floor that forwards a credential to an unsandboxed
     root reader is decorative for that file" applied one step over, and it reaches the host by ANY of
     its own addresses (loopback AND the LAN IP — seatbelt's ``localhost`` keyword covers every
-    local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in
-    ``ssh_mode="agent"`` by ``deny_localhost_outbound`` (renders ``(deny network-outbound (remote ip
-    "localhost:*"))``), DEFAULT-ON in agent mode at ``policy_for_conv_state`` (Phill's ruled A,
-    2026-09-13), operator opt-out ``allow_localhost_outbound``.
-    ⚠ RESIDUAL, NOT CLOSED — RAW MODE (codex L3 HIGH#1, REPRODUCED 2026-09-13). The deny is currently
-    agent-mode-only. In ``ssh_mode="raw"`` the entity reads its OWN key directly, but the OTHER jewels
-    (~/.anneal-memory, sibling stores, deny_files) stay floor-denied and a local sshd authenticated
-    with that key reads THEM as unsandboxed root just the same. A both-modes tightening is UNDER
-    REVIEW — Phill 2026-09-13 asked for web research + a first-principles options doc on how harnesses
-    should handle agent-forwarding, rather than flipping it reflexively; see spore-1005.
+    local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in BOTH
+    ssh_modes by ``deny_localhost_outbound`` (renders ``(deny network-outbound (remote ip
+    "localhost:*"))``), DEFAULT-ON at ``policy_for_conv_state`` (Phill 2026-09-13, 0.4.6 = A+B),
+    operator opt-out ``allow_localhost_outbound``. Both modes because raw mode has the same
+    fresh-connection exposure (codex L3 HIGH#1, REPRODUCED): the entity reads its OWN key but the
+    OTHER jewels stay floor-denied and a local sshd reads THEM as root just the same. This deny also
+    closes the local-service side channel (argushub:8420 etc.) in both modes, independent of ssh.
+    ⚠ RESIDUAL for 0.5 — raw mode still lets the entity READ the operator's ~/.ssh key material
+    directly (worse than the agent socket, which never yields the key). The loopback deny stops that
+    key reaching a LOCAL sshd, but not a remote one; the 0.5 redesign (default F / D2, and retiring or
+    redefining raw mode as scoped-credential-only) is the real fix. See spore-1005.
     ⛔ RESIDUAL, NOT CLOSED — THE FORWARDED AGENT IS A SIGNING ORACLE (codex L3 HIGH#2, and this is
     the deepest limit). It signs for ANY sshd that authorises the agent's key, reached through ANY hop
     the floor allows. A REMOTE relay defeats the localhost deny entirely: ``ssh -o ProxyCommand='ssh
@@ -525,11 +526,10 @@ class CrownJewelsPolicy:
     # file the floor denies. REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD. In ``ssh_mode="agent"``
     # the carrier is the forwarded ``SSH_AUTH_SOCK`` (proven sole carrier: disable it and the attack
     # fails "Permission denied (publickey)"). This flag is mode-AGNOSTIC — it renders the deny
-    # whenever True — but its CALL SITE (`policy_for_conv_state`) currently sets it in agent mode only
-    # (Phill's ruled A). ⚠ codex L3 HIGH#1 REPRODUCED a raw-mode variant too (the entity reads its own
+    # whenever True — and its CALL SITE (`policy_for_conv_state`) sets it in BOTH ssh_modes (Phill
+    # 2026-09-13, 0.4.6 = A+B). codex L3 HIGH#1 REPRODUCED a raw-mode variant (the entity reads its own
     # key, but the OTHER jewels — ~/.anneal-memory, sibling stores, deny_files — stay floor-denied and
-    # a local sshd reads THEM as root just the same); a both-modes tightening is UNDER REVIEW pending
-    # Phill's agent-forwarding options doc (spore-1005), so raw is a documented residual for now.
+    # a local sshd reads THEM as root just the same), so both modes get the deny.
     # Same class as the container-daemon socket (spore-725): a floor
     # that denies the FILE but lets an unsandboxed root reader be reached is decorative for that file.
     # Renders ``(deny network-outbound (remote ip "localhost:*"))``.
@@ -1337,9 +1337,8 @@ class ConfinementConfig:
     # spore-755. The OPT-OUT of the connect-to-self deny, and the exact sibling of
     # ``allow_container_sockets`` above (allow_* = opt out of a default deny; absent means False =
     # the deny stays on). Default FALSE means the floor denies outbound connect() to THIS host in
-    # ``ssh_mode="agent"`` (the ruled A; a raw-mode extension is under review — see the policy field's
-    # RESIDUAL note), closing the FRESH-CONNECTION local-sshd bypass (REPRODUCED 2026-09-13; ruled by
-    # Phill, loopback-loss ACCEPTED). Set true ONLY if this entity genuinely needs to reach a LOCAL
+    # BOTH ssh_modes (Phill 2026-09-13, 0.4.6 = A+B), closing the FRESH-CONNECTION local-sshd bypass
+    # (REPRODUCED 2026-09-13; loopback-loss ACCEPTED). Set true ONLY if this entity genuinely needs a LOCAL
     # service (a dev server it started, argushub on :8420) and the operator accepts that a local sshd
     # can then be asked to read a floor-denied file. NOT a tri-state like ``deny_standard_creds`` —
     # the answer does not vary by DRIVE mode.

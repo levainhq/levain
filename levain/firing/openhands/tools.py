@@ -163,19 +163,21 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         # its own policy and only the bash hand's evolved at spawn. Read `_SharedFloor` before
         # weakening this — the invariant is what makes the two hands' socket rulings comparable.
         allow_container_sockets=cfg.allow_container_sockets,
-        # spore-755. Deny outbound connect() to THIS host so a local sshd can't be asked, via the
-        # forwarded agent socket, to read a floor-denied file as unsandboxed root (REPRODUCED
-        # 2026-09-13; ruled by Phill A, loopback-loss accepted). ssh_mode="agent" ONLY for now — the
-        # forwarded-agent carrier is agent-mode-specific.
-        # ⚠ codex L3 HIGH#1 REPRODUCED a RAW-MODE variant too (the entity reads its own key, but the
-        # OTHER jewels stay floor-denied and a local sshd reads THEM as root just the same), so a
-        # both-modes tightening is UNDER REVIEW — Phill 2026-09-13 asked for web research + a
-        # first-principles options doc on agent-forwarding before deciding, rather than flipping it
-        # reflexively. Until then this stays agent-only and the raw-mode + relay/signing-oracle +
-        # ControlMaster variants are DOCUMENTED RESIDUALS (confinement.py honest-limits; spore-1005).
-        # The operator opt-out (allow_localhost_outbound=true) is for an entity that needs a local
-        # service. NOT drive-resolved: the carrier does not vary by drive mode.
-        deny_localhost_outbound=(cfg.ssh_mode == "agent" and not cfg.allow_localhost_outbound),
+        # spore-755. Deny outbound connect() to THIS host so a local sshd can't be asked to read a
+        # floor-denied file as unsandboxed root (REPRODUCED 2026-09-13). BOTH ssh_modes (Phill
+        # 2026-09-13, 0.4.6 = A+B): codex L3 HIGH#1 reproduced a raw-mode variant — the entity reads
+        # its OWN key directly, but the OTHER jewels (~/.anneal-memory, sibling stores, deny_files)
+        # stay floor-denied and a local sshd authenticated with that key reads THEM as unsandboxed
+        # root just the same. It ALSO closes the local-service side channel (argushub:8420 etc.) in
+        # both modes, independent of the ssh oracle. The carrier does not vary by ssh_mode or drive
+        # mode, so neither gates the deny; the only switch is the operator opt-out
+        # (allow_localhost_outbound=true) for an entity that genuinely needs a local service.
+        # ⚠ This closes the FRESH-CONNECTION self-sshd path only. It does NOT close the class — the
+        # forwarded agent is a signing oracle reachable via a REMOTE relay/ProxyCommand, and a live
+        # localhost ssh ControlMaster socket is an AF_UNIX path this IP deny can't see. Both are
+        # DOCUMENTED RESIDUALS (confinement.py honest-limits; spore-1005), and the root fix — a
+        # scoped credential instead of the forwarded agent — is 0.5 work (default F, D2 opt-in).
+        deny_localhost_outbound=(not cfg.allow_localhost_outbound),
     )
 
 
