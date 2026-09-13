@@ -691,6 +691,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     # spore-751: report the ONE anneal levain's interpreter resolves, which is the one init
     # wires, instead of whatever PATH finds first.
     am_cli = resolve_anneal_bin()
+    script_failure = ""
     if os.path.isfile(am_cli):
         ok, out = _probe([am_cli, "--version"])
         if ok:
@@ -698,16 +699,11 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             results.append(
                 CheckResult("anneal-memory CLI", True, f"{am_cli} ({version})")
             )
-        else:
-            results.append(
-                CheckResult(
-                    "anneal-memory CLI",
-                    False,
-                    f"{am_cli} ran but failed: {out}",
-                    "pip install --upgrade anneal-memory",
-                )
-            )
-        return results
+            return results
+        # A script that exists but cannot run (a moved venv's stale shebang) is not the
+        # end of the question: every consumer falls back to the module form, so doctor
+        # does too before declaring anneal unavailable (codex L3 LOW).
+        script_failure = f"; the script {am_cli} failed: {out}"
 
     ok, out = _probe([sys.executable, "-P", "-m", "anneal_memory", "--version"])
     if ok:
@@ -716,7 +712,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
             CheckResult(
                 "anneal-memory module",
                 True,
-                f"importable via {sys.executable} ({version})",
+                f"importable via {sys.executable} ({version}){script_failure}",
             )
         )
     else:

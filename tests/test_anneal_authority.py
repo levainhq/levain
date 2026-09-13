@@ -156,3 +156,72 @@ def test_hooks_never_ask_a_path_anneal(tmp_path, monkeypatch, template):
     heads = [cmd[0] for cmd in tried]
     assert "anneal-memory" not in heads
     assert [sys.executable, "-P", "-m", "anneal_memory"] in [cmd[:4] for cmd in tried]
+
+
+class _FakeFile:
+    def __init__(self, rel: str) -> None:
+        self.rel = rel
+        self.name = rel.rsplit("/", 1)[-1]
+
+
+class _FakeDist:
+    def __init__(self, root: Path, rels: list[str]) -> None:
+        self.root = root
+        self.files = [_FakeFile(r) for r in rels]
+
+    def locate_file(self, f: _FakeFile) -> Path:
+        return self.root / f.rel
+
+
+def _executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+@posix_only
+def test_a_script_from_a_distribution_that_does_not_own_the_module_is_never_used(
+    tmp_path, monkeypatch
+):
+    """codex L3 MED: with two visible anneal-memory distributions, the one listed first
+    must not supply the script unless it owns the module the interpreter imports."""
+    stray_root, owner_root = tmp_path / "stray", tmp_path / "owner"
+    _executable(stray_root / "bin" / "anneal-memory")
+    owner_script = _executable(owner_root / "bin" / "anneal-memory")
+    module = owner_root / "anneal_memory" / "__init__.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("", encoding="utf-8")
+
+    stray = _FakeDist(stray_root, ["bin/anneal-memory"])
+    owner = _FakeDist(owner_root, ["anneal_memory/__init__.py", "bin/anneal-memory"])
+    monkeypatch.setattr(manifest.importlib.metadata, "distributions",
+                        lambda **k: iter([stray, owner]))
+    monkeypatch.setattr(manifest.importlib.util, "find_spec",
+                        lambda name: type("S", (), {"origin": str(module)})())
+
+    assert manifest.resolve_anneal_bin() == str(owner_script)
+
+    # And with several distributions but no identifiable owner, none is trusted.
+    monkeypatch.setattr(manifest.importlib.metadata, "distributions",
+                        lambda **k: iter([stray, _FakeDist(owner_root, ["bin/anneal-memory"])]))
+    monkeypatch.setattr(manifest.sysconfig, "get_path", lambda *a, **k: str(tmp_path / "none"))
+    assert manifest.resolve_anneal_bin() == str(tmp_path / "none" / "anneal-memory")
+
+
+@posix_only
+def test_doctor_falls_back_to_the_module_when_the_script_cannot_run(tmp_path, monkeypatch):
+    """codex L3 LOW: a stale-shebang script must not fail doctor while the module works."""
+    from levain import doctor
+
+    broken = tmp_path / "bin" / "anneal-memory"
+    broken.parent.mkdir()
+    broken.write_text("#!/nonexistent/python\n", encoding="utf-8")
+    broken.chmod(0o755)
+    monkeypatch.setattr(manifest, "resolve_anneal_bin", lambda: str(broken))
+
+    results = doctor._check_runtime(tmp_path)
+
+    anneal = [r for r in results if r.name.startswith("anneal-memory")]
+    assert len(anneal) == 1 and anneal[0].ok, anneal
+    assert str(broken) in anneal[0].detail
