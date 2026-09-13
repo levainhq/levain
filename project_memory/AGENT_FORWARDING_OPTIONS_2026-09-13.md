@@ -175,6 +175,23 @@ credential that opens exactly one door — and keeping even that credential out 
 
 ---
 
+## ⚖ RULED by Phill, 2026-09-13 (relayed through the fan-in)
+
+- **0.4.6 = A + B** — the localhost-outbound deny in **both** ssh modes. **SHIPPED** at `53b58fa`
+  (+ round-2 fix pass); publish granted conditional on a clean codex round.
+- **0.5 default = F** — no remote credential in the floor; the entity commits, the operator pushes.
+- **0.5 opt-in = D2** — a scoped credential kept **outside** the floor, made an **easy** opt-in.
+- **Raw mode: KEPT, REDEFINED as scoped-credential-only.** It must **never** read the operator's
+  `~/.ssh`. **D2's scoped agent is the preferred path**; a **scoped key file** (per-entity,
+  repo-limited, revocable, stored outside the floor) is the **fallback** for tools that need a key
+  file. This retires the raw-mode `~/.ssh`-read exposure named above.
+- **NOT chosen:** C (constrained agent — doesn't bind a non-cooperating client). E (egress proxy)
+  remains the long-term destination, not scheduled.
+
+These settle the residuals in `spore-1005` at the design level; the 0.5 build is future work.
+
+---
+
 ### Sources (fetched 2026-09-13; ⚠ = corrected/unverified per the desk challenge)
 - Claude Code sandboxing: `code.claude.com/docs/en/sandboxing` (⚠ re-read by the desk: pre-allows no
   domains; NO built-in credential deny list, env inherited incl. credentials, `~/.ssh` protected only when
