@@ -1368,19 +1368,22 @@ def test_caller_denies_is_case_insensitive_for_ssh_convenience_allow(
 
 def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> None:
     """SOURCE-LEVEL invariant: no shipped code may call ``build_policy`` without saying what the
-    credential floor is.
+    SECURITY floors are — both ``deny_standard_creds`` AND ``deny_localhost_outbound``.
 
-    ``deny_standard_creds`` defaults to ``False`` because this function is the MECHANISM and the
-    drive-aware POLICY lives in ``levain.firing.drive.resolve_cred_floor``. That split is right,
-    but it leaves a real hole (glm L3): a future production path that builds a floor directly and
-    forgets the argument would silently allow ~/.config/gh on an unattended seat. Rather than make
-    the mechanism opinionated — duplicating policy into two places that can disagree — or churn 70+
-    test call sites that legitimately do not care, pin the thing that actually matters: PRODUCTION
-    callers decide explicitly. Tests may omit it; shipped code may not.
+    Both default to ``False`` because this function is the MECHANISM and the POLICY lives one layer
+    up (``resolve_cred_floor`` for creds; ``policy_for_conv_state`` for the localhost deny). That
+    split is right, but it leaves a real hole (glm L3 for creds; codex L3 HIGH#1 2026-09-13 for the
+    localhost deny): a future production path that builds a floor directly and forgets an argument
+    would silently ship the PERMISSIVE default — allowing ~/.config/gh on an unattended seat, or
+    leaving the spore-755 self-sshd bypass open. Rather than make the mechanism opinionated
+    (duplicating policy into two places that can disagree) or churn 70+ test call sites that
+    legitimately do not care, pin the thing that matters: PRODUCTION callers decide explicitly.
+    Tests may omit it; shipped code may not.
     """
     import re
     from pathlib import Path
 
+    required = ("deny_standard_creds", "deny_localhost_outbound")
     pkg = Path(__file__).resolve().parent.parent / "levain"
     offenders: list[str] = []
     for path in pkg.rglob("*.py"):
@@ -1394,13 +1397,16 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
             while i < len(text) and depth:
                 depth += (text[i] == "(") - (text[i] == ")")
                 i += 1
-            if "deny_standard_creds" not in text[m.end():i]:
+            call = text[m.end():i]
+            missing = [a for a in required if a not in call]
+            if missing:
                 line = text[: m.start()].count("\n") + 1
-                offenders.append(f"{path.relative_to(pkg.parent)}:{line}")
+                offenders.append(f"{path.relative_to(pkg.parent)}:{line} (missing {'+'.join(missing)})")
     assert not offenders, (
-        "production call(s) to build_policy() omit deny_standard_creds — the credential floor "
-        "would silently default to PERMISSIVE. Resolve it via "
-        "levain.firing.drive.resolve_cred_floor(cfg.deny_standard_creds, mode=...): "
+        "production call(s) to build_policy() omit a security floor argument — it would silently "
+        "default to PERMISSIVE (deny_standard_creds → ~/.config/gh readable; deny_localhost_outbound "
+        "→ the spore-755 self-sshd bypass open). Declare both explicitly "
+        "(resolve_cred_floor(...) for the creds; `not cfg.allow_localhost_outbound` for the deny): "
         + ", ".join(offenders)
     )
 
@@ -1710,19 +1716,25 @@ def test_confinement_config_field_order_is_append_only() -> None:
     from dataclasses import fields
 
     names = [f.name for f in fields(ConfinementConfig)]
-    # efferent_gate must precede the spore-755 opt-out (which is append-only at the tail)
-    assert names.index("efferent_gate") < names.index("allow_localhost_outbound")
-    assert names[-1] == "allow_localhost_outbound", (
-        f"a new field was inserted before the end of the exported ConfinementConfig: {names}. "
-        f"Append at the END (or make the class keyword-only in a deliberate break) — otherwise "
-        f"positional callers silently reassign every later field (the own_memory_files class)."
+    # The FROZEN historical prefix (positional indices existing callers depend on). New fields may be
+    # appended AFTER this prefix — that is correct append-only evolution and must NOT fail the test
+    # (codex L3 LOW#3); what must fail is INSERTING before it, which shifts every later index.
+    historical = [
+        "deny_files", "deny_subtrees", "ssh_mode", "deny_standard_creds",
+        "allow_container_sockets", "efferent_gate",
+    ]
+    assert names[: len(historical)] == historical, (
+        f"a field was inserted into the frozen prefix of the exported ConfinementConfig: {names}. "
+        f"Append new fields at the END (or make the class keyword-only in a deliberate break) — "
+        f"otherwise positional callers silently reassign every later field (the own_memory_files class)."
     )
+    assert "allow_localhost_outbound" in names[len(historical):]  # appended after the prefix
     # the historical positional construction must still land each value in its intended field
     cfg = ConfinementConfig((), (), "raw", True, False, "gated")
     assert cfg.ssh_mode == "raw"
     assert cfg.deny_standard_creds is True
     assert cfg.allow_container_sockets is False
-    assert cfg.efferent_gate == "gated"  # NOT shifted into allow_localhost_outbound
+    assert cfg.efferent_gate == "gated"  # NOT shifted into a later field
     assert cfg.allow_localhost_outbound is False  # the default, not a positional spillover
 
 
@@ -2054,14 +2066,28 @@ def test_live_localhost_outbound_deny_blocks_the_self_sshd_bypass(tmp_path: Path
         agent_env = {**os.environ, "SSH_AUTH_SOCK": auth_sock}
         subprocess.run(["ssh-add", str(key)], env=agent_env, check=True, capture_output=True)
 
-        sshd_proc = subprocess.Popen([sshd, "-D", "-f", str(sshd_conf)])
+        # capture sshd stderr so a rig failure is DIAGNOSABLE, not silent (codex L3 MED#2). The
+        # tool-absence skip is preflight (above); once we have decided to start sshd, a failure to
+        # come up is a TEST FAILURE with diagnostics — a broken rig must NOT quietly delete the only
+        # end-to-end enforcement proof while CI stays green.
+        sshd_err = rig / "sshd.stderr"
+        with open(sshd_err, "wb") as errf:
+            sshd_proc = subprocess.Popen([sshd, "-D", "-e", "-f", str(sshd_conf)], stderr=errf)
         for _ in range(50):
+            if sshd_proc.poll() is not None:  # the daemon exited before listening
+                pytest.fail(
+                    f"throwaway sshd exited rc={sshd_proc.returncode} before listening:\n"
+                    f"{sshd_err.read_text(errors='replace')}"
+                )
             with socket.socket() as s:
                 if s.connect_ex(("127.0.0.1", port)) == 0:
                     break
             time.sleep(0.1)
         else:
-            pytest.skip("throwaway sshd did not come up")
+            pytest.fail(
+                f"throwaway sshd did not accept a connection on :{port} within the deadline; "
+                f"stderr:\n{sshd_err.read_text(errors='replace')}"
+            )
 
         # every LOCAL address the host answers on: loopback v4/v6 always, plus the LAN IP when this
         # box has one. ::1 is the always-present NON-v4 coverage; the LAN case is opportunistic and is
@@ -2132,5 +2158,6 @@ def test_live_localhost_outbound_deny_blocks_the_self_sshd_bypass(tmp_path: Path
                 sshd_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 sshd_proc.kill()
+                sshd_proc.wait(timeout=5)  # reap after SIGKILL so it can't linger as a zombie (codex L3 #4)
         if agent_pid is not None:
             subprocess.run(["kill", agent_pid], capture_output=True)

@@ -1460,7 +1460,7 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
         raise ConfinementError(
             f"{base}: allow_localhost_outbound must be true or false, got "
             f"{allow_localhost_outbound!r} — fail-closed. Omit the key to keep the connect-to-self "
-            f"deny ON in ssh_mode=\"agent\" (the default)."
+            f"deny ON in both ssh_modes (the default)."
         )
 
     return ConfinementConfig(
