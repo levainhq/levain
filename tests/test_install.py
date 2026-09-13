@@ -2041,6 +2041,7 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
     assert '"/opt/a/anneal-memory"' in hook.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unwritable-dir permission")
 def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2306,6 +2307,16 @@ def test_an_UNPARSEABLE_codex_block_is_backed_up_and_announced_before_replacemen
     assert said, "replacing an operator's customised global block must not be silent"
     assert any("replaced" in m for m in said)
     assert any(str(baks[0]) in m for m in said), "the notice must name where the copy is"
+    # ⛔ L3 HIGH, all three seats convergent, 2026-09-13, reproduced against THIS fixture:
+    # a wrapper-`command` block is valid TOML (parses fine), so a version keyed on
+    # "did the whole block parse" instead of "is the store readable" misrouted this exact
+    # case into the "same store, other settings lost" message — false, since the store was
+    # never known to be the same. The message must be the UNKNOWN-PRIOR one specifically.
+    assert any("previous store could not be read" in m for m in said), (
+        f"an operator whose store cannot be read must get the unknown-prior message, "
+        f"not the same-store-content-changed one, said: {said!r}"
+    )
+    assert not any("still points at the same store" in m for m in said)
     assert "/home/op/new.db" in path.read_text(encoding="utf-8")
 
 

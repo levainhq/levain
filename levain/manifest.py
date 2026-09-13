@@ -562,18 +562,34 @@ _PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 def _pyproject_requires() -> list[str] | None:
     """The ``project.dependencies`` array from a ``pyproject.toml`` beside this
-    package, or ``None`` if none is present or it doesn't parse — the
-    release-cut case (a repo checkout), distinguished from the installed-wheel
-    case by whether the source tree is even there."""
+    package. ``None`` ONLY means the file is absent — the installed-wheel case,
+    where ``_levain_requires`` should fall back to dist metadata. A PRESENT but
+    broken file (parse error, or a missing/malformed ``dependencies`` array)
+    returns ``[]`` instead of ``None``.
+
+    ⛔ L3 codex HIGH + MED, 2026-09-13, reproduced. A first version returned
+    ``None`` for every failure mode, so a release checkout whose
+    `pyproject.toml` had its `dependencies` array accidentally deleted (still
+    valid TOML) silently fell through to `importlib.metadata` — the exact stale
+    `egg-info` this function exists to stop trusting at cut time — and a broken
+    `project` key (present but not a table) raised `AttributeError` out of
+    `pip_floor_verdict()`/`levain doctor` instead of reporting `unknown`. A
+    present-but-unusable pyproject must never be silently equivalent to an
+    absent one: `[]` carries no anneal-memory clause, so `pip_floor()` returns
+    `None` and the verdict is honestly `unknown`, not a falsely-green `in_sync`
+    read off a stale artifact."""
     if not _PYPROJECT_PATH.is_file():
         return None
     try:
         data = tomllib.loads(_PYPROJECT_PATH.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
-        return None
-    deps = data.get("project", {}).get("dependencies")
+        return []
+    project = data.get("project")
+    if not isinstance(project, Mapping):
+        return []
+    deps = project.get("dependencies")
     if not isinstance(deps, list):
-        return None
+        return []
     return [d for d in deps if isinstance(d, str)]
 
 
