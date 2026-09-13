@@ -577,20 +577,42 @@ def _pyproject_requires() -> list[str] | None:
     present-but-unusable pyproject must never be silently equivalent to an
     absent one: `[]` carries no anneal-memory clause, so `pip_floor()` returns
     `None` and the verdict is honestly `unknown`, not a falsely-green `in_sync`
-    read off a stale artifact."""
-    if not _PYPROJECT_PATH.is_file():
-        return None
+    read off a stale artifact.
+
+    ⛔ L3 codex fix-diff re-pass, 2026-09-13, three further gaps in this same
+    function: (1) a non-string entry in `dependencies` (a malformed pyproject
+    that still parses) was silently FILTERED rather than treated as broken —
+    now the whole array is rejected on any non-string element, same polarity
+    as every other malformed-schema case here. (2) `_PYPROJECT_PATH.is_file()`
+    could raise `OSError` (permission, NFS) OUTSIDE the `try` that follows it,
+    crashing `pip_floor_verdict()`/`levain doctor` instead of reporting
+    `unknown` — now inside the same boundary. (3) an INSTALLED WHEEL resolves
+    `_PYPROJECT_PATH` to `site-packages/pyproject.toml` (one level up from the
+    package dir) — a path a stray unrelated package could occupy, which would
+    silently suppress valid dist metadata; now verified against the project
+    NAME before being trusted."""
     try:
+        if not _PYPROJECT_PATH.is_file():
+            return None
         data = tomllib.loads(_PYPROJECT_PATH.read_text(encoding="utf-8"))
-    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError):
+    except FileNotFoundError:
+        return None  # a TOCTOU race with the is_file() check above — still "absent"
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        # Present (is_file() said so) but unreadable/unparseable — broken, not absent.
         return []
     project = data.get("project")
     if not isinstance(project, Mapping):
         return []
+    name = project.get("name")
+    if not isinstance(name, str) or name.replace("_", "-").lower() != "levain":
+        # Not OUR pyproject.toml (an unrelated file happens to sit where an
+        # installed wheel's lookup lands) — this is the "absent" case, not the
+        # "present but broken" one; fall back to dist metadata.
+        return None
     deps = project.get("dependencies")
-    if not isinstance(deps, list):
+    if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
         return []
-    return [d for d in deps if isinstance(d, str)]
+    return list(deps)
 
 
 def _levain_requires() -> list[str]:
