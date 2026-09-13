@@ -158,21 +158,25 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
 
 
-def test_policy_for_conv_state_wires_deny_localhost_outbound_agent_mode(tmp_path: Path, monkeypatch):
-    """spore-755. policy_for_conv_state turns the connect-to-self deny ON by default in
-    ssh_mode="agent" (Phill's ruled A, 2026-09-13), OFF when the operator opts out with
-    allow_localhost_outbound. ⚠ raw mode is currently False: codex L3 HIGH#1 REPRODUCED a raw-mode
-    variant (documented residual, spore-1005), and a both-modes tightening is UNDER REVIEW pending
-    Phill's agent-forwarding options doc — this test pins the SHIPPED behavior, not the end state.
-    A dropped pass-through in tools.py would silently leave even the agent-mode bypass open."""
+def test_policy_for_conv_state_wires_deny_localhost_outbound_both_modes(tmp_path: Path, monkeypatch):
+    """spore-755. policy_for_conv_state turns the connect-to-self deny ON by default in BOTH
+    ssh_modes (Phill 2026-09-13, 0.4.6 = A+B; codex L3 HIGH#1 reproduced the raw-mode variant — the
+    entity's own key is readable there but the OTHER jewels stay denied and a local sshd reads them
+    just the same), and OFF only when the operator opts out with allow_localhost_outbound. A dropped
+    pass-through in tools.py would silently leave the bypass open with every other test still green."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ent, ws = _entity(tmp_path)  # no config → ssh_mode defaults to "agent"
     assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is True
 
     (ent / ".levain" / "confinement.json").write_text('{"ssh_mode": "raw"}')
-    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False  # residual
+    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is True  # raw too now
 
     (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False
+
+    (ent / ".levain" / "confinement.json").write_text(
+        '{"ssh_mode": "raw", "allow_localhost_outbound": true}'
+    )
     assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False
 
 
