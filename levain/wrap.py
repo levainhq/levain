@@ -536,7 +536,7 @@ def _consolidate(
                 "levain wrap: this entity's store is not on the 6-section partnership schema, "
                 "so it cannot consolidate.\n"
                 f"  got:      {headings}\n  expected: {expected}\n"
-                f"  Fix:  {anneal_invocation()} --db {episodic_path} set-schema partnership"
+                f"  Fix:  {anneal_invocation('--db', str(episodic_path), 'set-schema', 'partnership')}"
             )
             return 2
 

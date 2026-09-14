@@ -27,15 +27,19 @@ def _layer(root: Path, files: dict[str, str]) -> Path:
     return root
 
 
-@pytest.mark.parametrize("shape", ["refused", "sibling_then_swap_fails", "symlink_swap_fails"])
+@pytest.mark.parametrize(
+    "shape",
+    ["refused", "sibling_then_swap_fails", "symlink_swap_fails", "symlink_rename_fails"],
+)
 def test_a_swap_that_does_not_go_through_leaves_the_live_receipt(tmp_path: Path, monkeypatch, shape):
-    """complement HIGH + glm MED ×2: each shape left the previous tree intact and its receipt
-    deleted. MUTATION: drop the receipt restore in `_copy_activation_tree`'s rollback."""
+    """complement HIGH + glm MED ×2, and round 2's complement + glm HIGH (`symlink_rename_fails`):
+    each shape left the previous tree intact and its receipt deleted. MUTATION: drop the receipt
+    restore in `_copy_activation_tree`'s rollback, or assign `moved_to` before the rename."""
     old = _layer(tmp_path / "old", {"posture.md": "OLD\n"})
     new = _layer(tmp_path / "new", {"posture.md": "NEW\n"})
     install = tmp_path / "install"
     dst = install / "activation"
-    if shape == "symlink_swap_fails":
+    if shape.startswith("symlink"):
         install.mkdir()
         _copy_activation_tree([old], install / "real", base_activation=old, emit=lambda s: None)
         os.symlink("real", dst)
@@ -51,6 +55,8 @@ def test_a_swap_that_does_not_go_through_leaves_the_live_receipt(tmp_path: Path,
         s, t = Path(src), Path(d)
         if shape == "refused" and s == dst:
             raise OSError(28, "No space left on device")
+        if shape == "symlink_rename_fails" and s == dst:
+            raise PermissionError(13, "Permission denied")
         if shape == "sibling_then_swap_fails" and s == dst and "backups" in str(t):
             raise OSError(18, "cross-device")
         if shape != "refused" and s.name.startswith(".levain-activation-new-"):
@@ -90,6 +96,10 @@ def test_only_importlibs_own_cache_name_counts_as_bytecode_residue(tmp_path: Pat
     (tmp_path / "hooks").mkdir()
     (tmp_path / "hooks" / "h.py").write_text("x", encoding="utf-8")
     assert not _is_bytecode_residue(Path("hooks/__pycache__/h.notes.pyc"), tmp_path)
+    # Round 2 (codex HIGH, reproduced): a tag that is not a cache tag, and a dotted source stem.
+    assert not _is_bytecode_residue(Path("hooks/__pycache__/h.notes-1.pyc"), tmp_path)
+    (tmp_path / "hooks" / "foo.bar.py").write_text("x", encoding="utf-8")
+    assert _is_bytecode_residue(Path("hooks/__pycache__/foo.bar.cpython-313.pyc"), tmp_path)
     assert _is_bytecode_residue(Path("hooks/__pycache__/h.cpython-312.pyc"), tmp_path)
     assert _is_bytecode_residue(Path("hooks/__pycache__/h.cpython-313.opt-1.pyc"), tmp_path)
 
@@ -111,6 +121,28 @@ def test_a_command_merely_prefixed_anneal_memory_is_broken_not_pending(tmp_path:
     fake.chmod(0o755)
     r = _check_mcp_command("m", str(fake), ["--db", "x", "serve"], tmp_path)
     assert not r.ok and not r.upgrade_pending
+
+
+def test_a_customised_launcher_on_the_same_store_is_still_backed_up(tmp_path: Path):
+    """codex HIGH, round 2, reproduced: once levain's own keys were excluded from the compare,
+    an operator wrapper plus `--trace` on the same store was replaced with no backup and no
+    warning. MUTATION: drop `_is_levain_launcher` from the `relaunched` test."""
+    install = tmp_path / "inst"
+    store = install / ".levain" / "memory.db"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[mcp_servers.anneal_memory]\n"
+        'command = "/opt/wrap/anneal-with-trace"\n'
+        f'args = ["--trace", "--db", "{store}", "serve"]\n',
+        encoding="utf-8",
+    )
+    template = Path(inst.__file__).parent / "templates" / "adapters" / "codex" / "mcp.template.toml"
+    fragment = (template.read_text(encoding="utf-8")
+                .replace("{{PYTHON}}", sys.executable).replace("{{INSTALL_DIR}}", str(install)))
+    said: list[str] = []
+    _merge_codex_config(cfg, fragment, emit=said.append)
+    assert [m for m in said if "customisation is gone" in m], said
+    assert len(list(tmp_path.glob("config.toml.bak*"))) == 1
 
 
 def test_a_pristine_pre_751_codex_block_upgrades_without_a_lost_customisation_alarm(tmp_path: Path):
