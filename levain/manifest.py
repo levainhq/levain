@@ -266,15 +266,19 @@ def declared_set() -> CompatSet:
 # Discovery — read the INSTALLED set from anneal's own JSON CLI
 # ---------------------------------------------------------------------------
 
-def anneal_invocation() -> str:
+def anneal_invocation(*args: str) -> str:
     """The command an operator should TYPE to reach the anneal levain's interpreter imports.
 
     For advice strings only. A bare `anneal-memory` resolves through PATH, which can name a
     different anneal from the one serving the store: the split `spore-751` ended in the
-    code and left standing in the remediation text (Diogenes LOW, 2026-09-14)."""
+    code and left standing in the remediation text (Diogenes LOW, 2026-09-14).
+
+    Pass the real arguments: all of them are shell-quoted together, so an install path
+    holding a space pastes as one `--db` value (codex MED, 2026-09-14). A caller showing a
+    placeholder such as `<store>` passes none and appends it as display text."""
     import shlex
 
-    return f"{shlex.quote(sys.executable)} -P -m anneal_memory"
+    return shlex.join([sys.executable, "-P", "-m", "anneal_memory", *args])
 
 
 def pip_invocation() -> str:

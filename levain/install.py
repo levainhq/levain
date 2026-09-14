@@ -1894,7 +1894,13 @@ def _is_bytecode_residue(rel: Path, tree: Path) -> bool:
     return tree.joinpath(*parts[:-2], f"{match['stem']}.py").is_file()
 
 
-_BYTECODE_NAME = re.compile(r"(?P<stem>[^.]+)\.[a-z]+-\d+(?:\.opt-[12])?\.pyc")
+# The tag must be a CPython cache tag or this interpreter's own: `[a-z]+-\d+` accepted
+# `h.notes-1.pyc` (codex HIGH, round 2, reproduced). The stem may hold dots, as a dotted
+# source name's cache file does.
+_CACHE_TAGS = r"cpython-3\d+" + (
+    f"|{re.escape(sys.implementation.cache_tag)}" if sys.implementation.cache_tag else ""
+)
+_BYTECODE_NAME = re.compile(rf"(?P<stem>.+)\.(?:{_CACHE_TAGS})(?:\.opt-[12])?\.pyc")
 
 
 def _edits_against_receipt(
@@ -2159,21 +2165,28 @@ def _copy_activation_tree(
             # link dangles and the notice points at nothing (L1 MED, L2 LOW, reproduced).
             # Kept beside activation/ it still resolves; the content stays at its target.
             link_target = os.readlink(dst)
-            moved_to = dst.parent / f".levain-activation-prev-{stamp}"
-            os.replace(dst, moved_to)
+            # ⛔ `moved_to` IS ASSIGNED ONLY AFTER A RENAME SUCCEEDS, in every branch: the
+            # rollback reads `moved_to is None` as "the original never left activation/"
+            # (complement + glm HIGH, reproduced 2026-09-14: a symlink whose own rename failed
+            # kept its link and lost its receipt).
+            sibling = dst.parent / f".levain-activation-prev-{stamp}"
+            os.replace(dst, sibling)
+            moved_to = sibling
         elif had_previous:
-            moved_to = tree_backup
             try:
                 backups_root.mkdir(parents=True, exist_ok=True)
-                os.replace(dst, moved_to)
+                os.replace(dst, tree_backup)
+                moved_to = tree_backup
             except OSError as e:
                 if not (dst.exists() or dst.is_symlink()):
+                    if tree_backup.exists() or tree_backup.is_symlink():
+                        moved_to = tree_backup
                     raise
-                moved_to = dst.parent / f".levain-activation-prev-{stamp}"
+                sibling = dst.parent / f".levain-activation-prev-{stamp}"
                 try:
-                    os.replace(dst, moved_to)
+                    os.replace(dst, sibling)
+                    moved_to = sibling
                 except OSError as e2:
-                    moved_to = None
                     raise InitError(
                         f"could not keep the previous activation/ under {backups_root} "
                         f"({e}) or beside it ({e2}). Nothing was moved or deleted; fix the "
@@ -2208,9 +2221,16 @@ def _copy_activation_tree(
         # already unlinked once the sibling fallback ran, and never exists for a symlinked
         # activation/; each path left an intact tree with no receipt, and on the refusal path
         # beside an error saying nothing was deleted.
-        if original_at_dst and prior_receipt_text is not None and not live_receipt.exists():
+        # The carried copy is preferred when it exists: the in-memory text is only the fallback
+        # for the paths where no copy survives (codex MED, round 2).
+        if (original_at_dst and not live_receipt.exists()
+                and (dst.exists() or dst.is_symlink())):
             try:
-                _atomic_write_text(live_receipt, prior_receipt_text)
+                if carried_receipt is not None and carried_receipt.exists():
+                    os.replace(carried_receipt, live_receipt)
+                    carried_receipt = None
+                elif prior_receipt_text is not None:
+                    _atomic_write_text(live_receipt, prior_receipt_text)
             except OSError:
                 pass
         _drop_carried()
@@ -2346,6 +2366,22 @@ def _without_levain_keys(parsed: dict | None) -> dict | None:
     return {**parsed, "mcp_servers": servers}
 
 
+def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
+    """Whether the anneal_memory server table launches `store` exactly as a levain `init`
+    wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, or the current
+    `<python> -P -m anneal_memory --db <store> serve`. Any other launcher was chosen by
+    someone, and replacing it is replacing their customisation."""
+    if parsed is None or store is None:
+        return False
+    server = (parsed.get("mcp_servers") or {}).get("anneal_memory") or {}
+    command, args = server.get("command"), server.get("args")
+    if not isinstance(command, str) or not isinstance(args, list):
+        return False
+    if args == ["--db", store, "serve"]:
+        return Path(command).name in ("anneal-memory", "anneal-memory.exe")
+    return args == ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+
+
 def _codex_block_store(block: str) -> str | None:
     """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None.
 
@@ -2475,13 +2511,17 @@ def _merge_codex_config(
         # writes, so they change on every pre-spore-751 upgrade and on a re-init from another
         # interpreter; compared whole, the dicts always differed and the operator was told a
         # customisation was gone when nothing of theirs was touched.
-        content_changed = (
-            not replacing_unknown and not store_changed
-            and _without_levain_keys(old_dict) != _without_levain_keys(new_dict)
-        )
+        # ⛔ AND ONLY WHILE THE OLD LAUNCHER IS ONE LEVAIN ITSELF WROTE (codex HIGH, round 2,
+        # reproduced 2026-09-14): a customisation can live INSIDE `command`/`args` — a wrapper
+        # command plus `--trace` on the same store was replaced with no backup and no warning.
         relaunched = (
-            not replacing_unknown and not store_changed and not content_changed
-            and old_dict != new_dict
+            not replacing_unknown and not store_changed and old_dict != new_dict
+            and _without_levain_keys(old_dict) == _without_levain_keys(new_dict)
+            and _is_levain_launcher(old_dict, old_store)
+        )
+        content_changed = (
+            not replacing_unknown and not store_changed and old_dict != new_dict
+            and not relaunched
         )
         if replacing_unknown or store_changed or content_changed:
             bak = _timestamped_backup_path(path)
@@ -2720,7 +2760,7 @@ def _init_store(
         emit("    The memory is preserved, but the schema may still be the ops")
         emit("    default — a partnership entity needs the 6-section schema.")
         emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
-        emit(f"    Then: {anneal_invocation()} --db {store} set-schema partnership")
+        emit(f"    Then: {anneal_invocation('--db', str(store), 'set-schema', 'partnership')}")
         return False
 
     emit(f"Initializing anneal-memory store at {store}...")
@@ -2742,7 +2782,7 @@ def _init_store(
     emit("    or is older than the release that supports `init --schema` /")
     emit("    `set-schema` (the 6-section partnership schema).")
     emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
-    emit(f"    Then: {anneal_invocation()} --db {store} init --schema partnership")
+    emit(f"    Then: {anneal_invocation('--db', str(store), 'init', '--schema', 'partnership')}")
     return False
 
 

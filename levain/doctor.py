@@ -778,10 +778,10 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     return results
 
 
-def _anneal_invocation() -> str:
+def _anneal_invocation(*args: str) -> str:
     from levain.manifest import anneal_invocation
 
-    return anneal_invocation()
+    return anneal_invocation(*args)
 
 
 def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
@@ -816,7 +816,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 "missing",
-                f"Initialize: {_anneal_invocation()} --db {store} init --schema partnership",
+                f"Initialize: {_anneal_invocation('--db', str(store), 'init', '--schema', 'partnership')}",
             )
         ]
 
@@ -833,7 +833,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 f"sqlite open failed: {e}",
-                f"Check perms; try `{_anneal_invocation()} --db {store} status`.",
+                f"Check perms; try `{_anneal_invocation('--db', str(store), 'status')}`.",
             )
         ]
 
@@ -843,7 +843,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 "empty (no tables)",
-                f"Initialize: {_anneal_invocation()} --db {store} init --schema partnership",
+                f"Initialize: {_anneal_invocation('--db', str(store), 'init', '--schema', 'partnership')}",
             )
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
