@@ -2157,6 +2157,12 @@ def _copy_activation_tree(
             ) from e
 
     moved_to: Path | None = None
+    # Where the rename in flight would put the previous tree. Set BEFORE each `os.replace`, so
+    # the rollback decides from DISK whether that rename landed, never from which statement ran
+    # last. Assigning `moved_to` before the rename lost the receipt when the rename failed
+    # (complement + glm HIGH, round 2); assigning it after lost `activation/` when an interrupt
+    # landed between the two (codex HIGH, round 3). Both reproduced 2026-09-14.
+    candidate: Path | None = None
     link_target: str | None = None
     notes: list[str] = []
     try:
@@ -2165,27 +2171,22 @@ def _copy_activation_tree(
             # link dangles and the notice points at nothing (L1 MED, L2 LOW, reproduced).
             # Kept beside activation/ it still resolves; the content stays at its target.
             link_target = os.readlink(dst)
-            # ⛔ `moved_to` IS ASSIGNED ONLY AFTER A RENAME SUCCEEDS, in every branch: the
-            # rollback reads `moved_to is None` as "the original never left activation/"
-            # (complement + glm HIGH, reproduced 2026-09-14: a symlink whose own rename failed
-            # kept its link and lost its receipt).
-            sibling = dst.parent / f".levain-activation-prev-{stamp}"
-            os.replace(dst, sibling)
-            moved_to = sibling
+            candidate = dst.parent / f".levain-activation-prev-{stamp}"
+            os.replace(dst, candidate)
+            moved_to = candidate
         elif had_previous:
             try:
                 backups_root.mkdir(parents=True, exist_ok=True)
+                candidate = tree_backup
                 os.replace(dst, tree_backup)
                 moved_to = tree_backup
             except OSError as e:
                 if not (dst.exists() or dst.is_symlink()):
-                    if tree_backup.exists() or tree_backup.is_symlink():
-                        moved_to = tree_backup
-                    raise
-                sibling = dst.parent / f".levain-activation-prev-{stamp}"
+                    raise  # the rollback's reconcile finds the tree where the rename left it
+                candidate = dst.parent / f".levain-activation-prev-{stamp}"
                 try:
-                    os.replace(dst, sibling)
-                    moved_to = sibling
+                    os.replace(dst, candidate)
+                    moved_to = candidate
                 except OSError as e2:
                     raise InitError(
                         f"could not keep the previous activation/ under {backups_root} "
@@ -2200,6 +2201,12 @@ def _copy_activation_tree(
         os.replace(new_tree, dst)
     except BaseException as exc:
         shutil.rmtree(new_tree, ignore_errors=True)
+        # Decided from DISK: a rename that landed before the interrupt did leaves the tree at
+        # `candidate` and nothing at `dst`, whatever `moved_to` says (codex HIGH, round 3).
+        if (moved_to is None and candidate is not None
+                and (candidate.exists() or candidate.is_symlink())
+                and not (dst.exists() or dst.is_symlink())):
+            moved_to = candidate
         original_at_dst = moved_to is None and had_previous
         if (moved_to is not None and not (dst.exists() or dst.is_symlink())
                 and (moved_to.exists() or moved_to.is_symlink())):
@@ -2215,14 +2222,13 @@ def _copy_activation_tree(
                     f"previous one back failed too ({e3}). The previous activation/ is intact "
                     f"at {moved_to}; move it back to {dst} by hand. Nothing was deleted."
                 ) from exc
-        # ⛔ THE ORIGINAL TREE IS BACK, SO ITS RECEIPT GOES BACK — FROM THE TEXT READ BEFORE
-        # THE INVALIDATION, NOT FROM THE CARRIED COPY (complement HIGH + glm MED ×2, all three
-        # reproduced 2026-09-14). The copy is absent whenever `backups_root` refused it, is
-        # already unlinked once the sibling fallback ran, and never exists for a symlinked
-        # activation/; each path left an intact tree with no receipt, and on the refusal path
-        # beside an error saying nothing was deleted.
-        # The carried copy is preferred when it exists: the in-memory text is only the fallback
-        # for the paths where no copy survives (codex MED, round 2).
+        # ⛔ THE ORIGINAL TREE IS BACK, SO ITS RECEIPT GOES BACK (complement HIGH + glm MED ×2,
+        # reproduced 2026-09-14). The carried copy is used when it still exists (codex MED,
+        # round 2). The text read before the invalidation is the fallback, because the copy is
+        # absent whenever `backups_root` refused it, is already unlinked once the sibling fallback
+        # ran, and never exists for a symlinked activation/. Relying on the copy alone left an
+        # intact tree with no receipt on each of those paths, and on the refusal path beside an
+        # error saying nothing was deleted.
         if (original_at_dst and not live_receipt.exists()
                 and (dst.exists() or dst.is_symlink())):
             try:
@@ -2379,7 +2385,19 @@ def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
         return False
     if args == ["--db", store, "serve"]:
         return Path(command).name in ("anneal-memory", "anneal-memory.exe")
-    return args == ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+    # The current shape's command is the interpreter `init` ran under, so it differs between
+    # venvs and cannot be compared for equality without re-raising Diogenes' false alarm on a
+    # re-init from another venv. It must at least BE a Python interpreter (complement + glm +
+    # codex HIGH, round 3, reproduced 2026-09-14: a wrapper keeping levain's exact args read
+    # as levain's own). ⚠ This picks the NOTICE only; `_merge_codex_config` backs the block
+    # up whatever this returns, so a misjudged launcher costs a wrong sentence, not the block.
+    return (
+        args == ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+        and _PYTHON_NAME.fullmatch(Path(command).name) is not None
+    )
+
+
+_PYTHON_NAME = re.compile(r"python(?:3(?:\.\d+)?)?(?:\.exe)?")
 
 
 def _codex_block_store(block: str) -> str | None:
@@ -2461,6 +2479,7 @@ def _merge_codex_config(
     unknown_prior: Path | None = None
     customized: Path | None = None
     relaunched = False
+    relaunched_bak: Path | None = None
     new_dict: dict | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
@@ -2523,7 +2542,12 @@ def _merge_codex_config(
             not replacing_unknown and not store_changed and old_dict != new_dict
             and not relaunched
         )
-        if replacing_unknown or store_changed or content_changed:
+        # ⛔ PRESERVE ALWAYS; THE HEURISTIC CHOOSES ONLY THE WORDING (spore-865, applied 2026-09-14
+        # after three review rounds each found a launcher the classifier misjudged). Any change
+        # to the block is backed up, including a levain-only relaunch. `_is_levain_launcher` now
+        # decides only whether the notice says "customisation is gone", so a misjudged wrapper
+        # costs a wrong sentence, never the only copy of the operator's block.
+        if replacing_unknown or store_changed or content_changed or relaunched:
             bak = _timestamped_backup_path(path)
             try:
                 shutil.copy2(path, bak)
@@ -2534,6 +2558,8 @@ def _merge_codex_config(
                     else f"from {old_store} to {new_store}"
                     if store_changed
                     else "whose settings would be overwritten"
+                    if content_changed
+                    else "whose launcher would be updated"
                 )
                 raise InitError(
                     f"could not back up {path} ({e}) before replacing Codex's global "
@@ -2546,8 +2572,10 @@ def _merge_codex_config(
             elif store_changed:
                 assert old_store is not None and new_store is not None  # store_changed implies it
                 repoint = (old_store, new_store, bak)
-            else:
+            elif content_changed:
                 customized = bak
+            else:
+                relaunched_bak = bak
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2644,8 +2672,8 @@ def _merge_codex_config(
             + (f"; your previous config is also copied at {repoint[2]}." if repoint
                else f"; your previous config is also copied at {unknown_prior}."
                if unknown_prior is not None
-               else f"; your previous config is also copied at {customized}."
-               if customized is not None else ".")
+               else f"; your previous config is also copied at {customized or relaunched_bak}."
+               if (customized or relaunched_bak) is not None else ".")
         ) from e
 
     if unknown_prior is not None:
@@ -2679,6 +2707,7 @@ def _merge_codex_config(
         emit(f"  Codex's GLOBAL anneal_memory registration in {path} keeps its store and now")
         emit(f"    starts the memory server as: {server.get('command')} "
              f"{' '.join(str(a) for a in server.get('args') or [])}")
+        emit(f"    Your previous config is copied at {relaunched_bak}")
 
 
 def _run_anneal_cmd(
