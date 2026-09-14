@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.4.7.dev0"
+version = "0.4.7"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -85,11 +85,17 @@ dependencies = [
     # levain does not import it. (Both clauses are scoped to 0.9.7 and are true as history. The
     # sentence that stood here — "the floor is the published-known-good, not a runtime
     # requirement" — was a generalisation over a MOVING value: "the floor" is a definite
-    # reference to the specifier below, which is now 0.9.8, and the comment at the head of this
-    # block states that floor IS a contract gate. Two answers in one file, the wrong one sitting
-    # last before the specifier. Deleted rather than re-worded: the current floor is described
-    # once, above.)
-    "anneal-memory>=0.9.8,<0.10",
+    # reference to the specifier below, and the comment at the head of this block states that
+    # floor IS a contract gate. Two answers in one file, the wrong one sitting last before the
+    # specifier. Deleted rather than re-worded.)
+    #
+    # `>=0.9.10` (2026-09-14, spore-1022): a CORRECTNESS floor, not an API gate; levain calls no
+    # 0.9.10-only API. Per anneal's own 0.9.10 CHANGELOG, both defects reproduced on tag v0.9.9:
+    # `verify()` returned `valid=True` with no entries once the sealed file its manifest names and
+    # the active file were deleted (total audit loss read as a clean empty trail), and
+    # `anneal-memory audit` could omit a whole sealed week while reporting `anchor_trusted: true`.
+    # A levain install must not resolve to the anneal that reads a destroyed history as healthy.
+    "anneal-memory>=0.9.10,<0.10",
 ]
 
 [project.optional-dependencies]
