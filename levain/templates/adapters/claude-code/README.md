@@ -133,7 +133,7 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
    object's arrays for those events (each event's value is an *array* of
    matcher groups; appending a group is safe, replacing the array is not).
 5. **Initialize the memory store:**
-   `anneal-memory --db <absolute-install-path>/.levain/memory.db init`
+   `<levain python> -P -m anneal_memory --db <absolute-install-path>/.levain/memory.db init --schema partnership`
 6. **Make the hooks executable:** `chmod +x activation/hooks/*.py` (optional —
    the wired command invokes the interpreter explicitly — but good hygiene).
 7. **Start a Claude Code session** in the partnership directory.

@@ -778,6 +778,12 @@ def _check_runtime(install: Path) -> list[CheckResult]:
     return results
 
 
+def _anneal_invocation() -> str:
+    from levain.manifest import anneal_invocation
+
+    return anneal_invocation()
+
+
 def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     """Run a command; return (ok, stdout-or-truncated-stderr).
 
@@ -810,7 +816,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 "missing",
-                f"Initialize: anneal-memory --db {store} init",
+                f"Initialize: {_anneal_invocation()} --db {store} init --schema partnership",
             )
         ]
 
@@ -827,7 +833,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 f"sqlite open failed: {e}",
-                "Check perms; try `anneal-memory --db <path> status`.",
+                f"Check perms; try `{_anneal_invocation()} --db {store} status`.",
             )
         ]
 
@@ -837,7 +843,7 @@ def _check_store(install: Path) -> list[CheckResult]:
                 ".levain/memory.db",
                 False,
                 "empty (no tables)",
-                f"Initialize: anneal-memory --db {store} init",
+                f"Initialize: {_anneal_invocation()} --db {store} init --schema partnership",
             )
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
@@ -2103,18 +2109,24 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
     if not isinstance(args, list):
         return CheckResult(check, False, f"args is not a list: {args!r}",
                            f"Re-run `levain init --force --path {install}`.")
-    # The shape `init` writes: `<levain python> -P -m anneal_memory --db <store> serve`.
-    # Exact argv, not "-P somewhere before -m": `-P -c pass -m anneal_memory` and a `status`
-    # subcommand both passed a looser test while never starting the server (codex HIGH).
+    # The shape `init` writes, element for element:
+    # `<levain python> -P -m anneal_memory --db <store> serve`. A looser test passed
+    # `-P -c pass -m anneal_memory`, a `status` subcommand (codex HIGH), and a `--version`
+    # ahead of `--db` (codex HIGH, reproduced 2026-09-14); none of them starts the server.
+    strs = [a for a in args if isinstance(a, str)]
     module_form = (
-        [str(a) for a in args[:3]] == ["-P", "-m", "anneal_memory"]
-        and bool(args) and str(args[-1]) == "serve"
+        len(strs) == len(args) == 6
+        and strs[:4] == ["-P", "-m", "anneal_memory", "--db"] and strs[5] == "serve"
     )
     if not module_form:
-        # Only the registration every pre-spore-751 install carries — an `anneal-memory`
-        # console script — is a pending upgrade step. Any other command is not something
-        # `init` ever wrote, so doctor cannot vouch for it (codex MED).
-        if Path(command).name.startswith("anneal-memory"):
+        # Only the registration every pre-spore-751 install carries is a pending upgrade
+        # step: a console script named exactly `anneal-memory` with argv exactly
+        # `--db <store> serve`. Any other command is not something `init` ever wrote, so
+        # doctor cannot vouch for it (codex MED); a name PREFIX let `anneal-memory-<anything>`
+        # read as routine (codex HIGH, reproduced 2026-09-14).
+        if (Path(command).name in ("anneal-memory", "anneal-memory.exe")
+                and len(strs) == len(args) == 3
+                and strs[0] == "--db" and strs[2] == "serve"):
             return CheckResult(
                 check,
                 False,
@@ -2132,10 +2144,19 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
         )
     # ⛔ DOCTOR NEVER EXECUTES A COMMAND IT DID NOT CHOOSE (complement + codex HIGH): the
     # command comes from a config file, and a static check that runs it hands code execution
-    # to that file. Only a command that is this interpreter's own binary is probed, and the
-    # probe then tells two venvs over that binary apart by their prefix.
+    # to that file. A realpath match alone is not "this interpreter": every venv's
+    # `bin/python` can resolve to one base binary, and starting it from another venv's
+    # `bin/` runs that venv's `.pth` files even under `-P` (codex HIGH, reproduced
+    # 2026-09-14). The directory a binary is started from picks its `pyvenv.cfg`, so the
+    # command must be this path, or the same binary in this directory; the probe then runs
+    # `sys.executable` itself, never the configured spelling.
+    here = os.path.abspath(sys.executable)
     try:
-        same_binary = os.path.realpath(command) == os.path.realpath(sys.executable)
+        cmd_abs = os.path.abspath(command)
+        same_binary = cmd_abs == here or (
+            os.path.dirname(cmd_abs) == os.path.dirname(here)
+            and os.path.realpath(cmd_abs) == os.path.realpath(here)
+        )
     except (OSError, ValueError):
         same_binary = False
     if not same_binary:
@@ -2147,7 +2168,7 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
             f"`levain init --force --path {install}` registers this one (it RE-RUNS THE "
             f"INTERVIEW; your store is kept).",
         )
-    ran, out = _probe([command, "-P", "-c", "import sys, anneal_memory; print(sys.prefix)"])
+    ran, out = _probe([sys.executable, "-P", "-c", "import sys, anneal_memory; print(sys.prefix)"])
     if not ran:
         return CheckResult(
             check, False, f"`{command} -P -m anneal_memory` cannot start: {out}",
