@@ -2480,6 +2480,7 @@ def _merge_codex_config(
     customized: Path | None = None
     relaunched = False
     relaunched_bak: Path | None = None
+    reformatted_bak: Path | None = None
     new_dict: dict | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
@@ -2542,12 +2543,17 @@ def _merge_codex_config(
             not replacing_unknown and not store_changed and old_dict != new_dict
             and not relaunched
         )
+        # Settings identical, TEXT not: comments or formatting an operator put inside the block,
+        # which the replacement below deletes (codex MED, round 4, reproduced 2026-09-14: a
+        # `# corporate runbook` line vanished with no backup and no notice).
+        raw_changed = old_block_match.group(0).rstrip() + "\n" != new_block
         # ⛔ PRESERVE ALWAYS; THE HEURISTIC CHOOSES ONLY THE WORDING (spore-865, applied 2026-09-14
-        # after three review rounds each found a launcher the classifier misjudged). Any change
-        # to the block is backed up, including a levain-only relaunch. `_is_levain_launcher` now
-        # decides only whether the notice says "customisation is gone", so a misjudged wrapper
-        # costs a wrong sentence, never the only copy of the operator's block.
-        if replacing_unknown or store_changed or content_changed or relaunched:
+        # after three review rounds each found a launcher the classifier misjudged, and a fourth
+        # found a comment-only change no named case covered). The gate is the two FACTS, not the
+        # named cases: back up whenever the parsed block or its raw text differs, so a gap in the
+        # classification below can only produce an extra backup or a wrong notice, never a lost
+        # block. A byte-identical re-run stays silent.
+        if raw_changed or old_dict != new_dict:
             bak = _timestamped_backup_path(path)
             try:
                 shutil.copy2(path, bak)
@@ -2560,6 +2566,8 @@ def _merge_codex_config(
                     else "whose settings would be overwritten"
                     if content_changed
                     else "whose launcher would be updated"
+                    if relaunched
+                    else "whose comments or formatting would be replaced"
                 )
                 raise InitError(
                     f"could not back up {path} ({e}) before replacing Codex's global "
@@ -2574,8 +2582,10 @@ def _merge_codex_config(
                 repoint = (old_store, new_store, bak)
             elif content_changed:
                 customized = bak
-            else:
+            elif relaunched:
                 relaunched_bak = bak
+            else:
+                reformatted_bak = bak
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2672,8 +2682,9 @@ def _merge_codex_config(
             + (f"; your previous config is also copied at {repoint[2]}." if repoint
                else f"; your previous config is also copied at {unknown_prior}."
                if unknown_prior is not None
-               else f"; your previous config is also copied at {customized or relaunched_bak}."
-               if (customized or relaunched_bak) is not None else ".")
+               else f"; your previous config is also copied at "
+               f"{customized or relaunched_bak or reformatted_bak}."
+               if (customized or relaunched_bak or reformatted_bak) is not None else ".")
         ) from e
 
     if unknown_prior is not None:
@@ -2708,6 +2719,11 @@ def _merge_codex_config(
         emit(f"    starts the memory server as: {server.get('command')} "
              f"{' '.join(str(a) for a in server.get('args') or [])}")
         emit(f"    Your previous config is copied at {relaunched_bak}")
+
+    if reformatted_bak is not None:
+        emit(f"  Codex's GLOBAL anneal_memory block in {path} keeps its settings, but comments or")
+        emit("    formatting inside that block were not kept.")
+        emit(f"    Your previous config is copied at {reformatted_bak}")
 
 
 def _run_anneal_cmd(
