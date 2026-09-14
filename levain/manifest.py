@@ -266,6 +266,24 @@ def declared_set() -> CompatSet:
 # Discovery — read the INSTALLED set from anneal's own JSON CLI
 # ---------------------------------------------------------------------------
 
+def anneal_invocation() -> str:
+    """The command an operator should TYPE to reach the anneal levain's interpreter imports.
+
+    For advice strings only. A bare `anneal-memory` resolves through PATH, which can name a
+    different anneal from the one serving the store: the split `spore-751` ended in the
+    code and left standing in the remediation text (Diogenes LOW, 2026-09-14)."""
+    import shlex
+
+    return f"{shlex.quote(sys.executable)} -P -m anneal_memory"
+
+
+def pip_invocation() -> str:
+    """`<levain python> -m pip`, for advice strings: a bare `pip` can belong to another Python."""
+    import shlex
+
+    return f"{shlex.quote(sys.executable)} -m pip"
+
+
 def resolve_anneal_bin() -> str:
     """The ``anneal-memory`` console script of the anneal THIS interpreter imports.
 
@@ -460,8 +478,8 @@ def compute_drift(
         verdicts.append(AxisVerdict(
             "anneal", "unknown",
             "could not determine the installed anneal-memory version",
-            "Check `anneal-memory --version`; install/repair with "
-            "`pip install -U anneal-memory`.",
+            f"Check `{anneal_invocation()} --version`; install/repair with "
+            f"`{pip_invocation()} install -U anneal-memory`.",
         ))
     else:
         cmp = _cmp(installed.anneal, declared.anneal)
@@ -475,7 +493,7 @@ def compute_drift(
                 "anneal", "behind",
                 f"anneal-memory {installed.anneal} is BEHIND known-good "
                 f"{declared.anneal}",
-                f"Run `levain update` (or `pip install 'anneal-memory=="
+                f"Run `levain update` (or `{pip_invocation()} install 'anneal-memory=="
                 f"{declared.anneal}'`).",
             ))
         else:
@@ -484,7 +502,8 @@ def compute_drift(
                 f"anneal-memory {installed.anneal} is AHEAD of this levain "
                 f"release's known-good {declared.anneal} — untested together",
                 "Run `levain doctor` after upgrading levain "
-                "(`pip install -U levain`); review `anneal-memory migrate check` "
+                f"(`{pip_invocation()} install -U levain`); review "
+                f"`{anneal_invocation()} --db <store> migrate check` "
                 "for instruction edits the newer anneal implies.",
             ))
 
@@ -509,7 +528,7 @@ def compute_drift(
         verdicts.append(AxisVerdict(
             "schema", "unknown",
             "could not determine the store's section schema",
-            "Check `anneal-memory --db <store> status --json`.",
+            f"Check `{anneal_invocation()} --db <store> status --json`.",
         ))
     elif installed.schema == declared.schema:
         verdicts.append(AxisVerdict(
@@ -539,9 +558,9 @@ def compute_drift(
             "migrate", "pending",
             f"{n} unreviewed anneal migration proposal(s) — your instruction "
             f"files may have drifted from the substrate",
-            "Run `anneal-memory migrate check` to review, apply the edits that "
-            "fit (under operator review — anneal never clobbers), then "
-            "`anneal-memory migrate ack`. `levain update` walks this.",
+            f"Run `{anneal_invocation()} --db <store> migrate check` to review, apply "
+            f"the edits that fit (under operator review — anneal never clobbers), then "
+            f"`{anneal_invocation()} --db <store> migrate ack`. `levain update` walks this.",
         ))
 
     return SetDrift(verdicts=verdicts)

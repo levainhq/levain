@@ -530,11 +530,13 @@ def _consolidate(
         headings = [s["heading"] for s in store.section_schema]
         expected = [s["heading"] for s in FLOW_SCHEMA]
         if headings != expected:
+            from levain.manifest import anneal_invocation
+
             print(
                 "levain wrap: this entity's store is not on the 6-section partnership schema, "
                 "so it cannot consolidate.\n"
                 f"  got:      {headings}\n  expected: {expected}\n"
-                f"  Fix:  anneal-memory --db {episodic_path} set-schema partnership"
+                f"  Fix:  {anneal_invocation()} --db {episodic_path} set-schema partnership"
             )
             return 2
 

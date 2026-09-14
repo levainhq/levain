@@ -1730,6 +1730,17 @@ def read_activation_receipt(
     return read_activation_receipt_file(activation_receipt_path(install))
 
 
+def _read_receipt_text(path: Path) -> str:
+    """A receipt's text from ONE open, reading at most `_RECEIPT_MAX_BYTES` (codex MED: a
+    `stat` followed by a separate `read_text` let a file grow between the two). Raises
+    OSError, or ValueError (UnicodeDecodeError included) for oversize or undecodable bytes."""
+    with path.open("rb") as fh:
+        raw = fh.read(_RECEIPT_MAX_BYTES + 1)
+    if len(raw) > _RECEIPT_MAX_BYTES:
+        raise ValueError(f"{path} is larger than a receipt can be")
+    return raw.decode("utf-8")
+
+
 def read_activation_receipt_file(
     path: Path,
 ) -> tuple[dict[str, dict[str, str]] | None, str]:
@@ -1869,10 +1880,21 @@ def _is_bytecode_residue(rel: Path, tree: Path) -> bool:
     a directory called `research.pyc/` — is operator content: the proof skipping it while
     `rmtree` deletes it was an L2 HIGH, reproduced 2026-09-13."""
     parts = rel.parts
-    if len(parts) < 2 or parts[-2] != "__pycache__" or not parts[-1].endswith(".pyc"):
+    if len(parts) < 2 or parts[-2] != "__pycache__":
         return False
-    stem = parts[-1].split(".", 1)[0]
-    return tree.joinpath(*parts[:-2], f"{stem}.py").is_file()
+    # Exactly the name `importlib` gives a cache file — `<stem>.<impl>-<ver>[.opt-N].pyc`. A
+    # looser `<stem>.*.pyc` let `h.notes.pyc` beside `h.py` pass as residue, so a tree holding
+    # it proved pristine and rotation deleted the only copy (codex HIGH, reproduced
+    # 2026-09-14). ⚠ A file an operator writes UNDER that exact name is still skipped; a
+    # filename cannot prove provenance, and closing that means keeping every tree whose
+    # hooks ever ran.
+    match = _BYTECODE_NAME.fullmatch(parts[-1])
+    if match is None:
+        return False
+    return tree.joinpath(*parts[:-2], f"{match['stem']}.py").is_file()
+
+
+_BYTECODE_NAME = re.compile(r"(?P<stem>[^.]+)\.[a-z]+-\d+(?:\.opt-[12])?\.pyc")
 
 
 def _edits_against_receipt(
@@ -2071,6 +2093,14 @@ def _copy_activation_tree(
         raise
 
     live_receipt = activation_receipt_path(dst.parent)
+    # Held in memory so a swap that does not go through can restore the live receipt
+    # exactly as it was; see the rollback below.
+    prior_receipt_text: str | None = None
+    if prior_status == "ok":
+        try:
+            prior_receipt_text = _read_receipt_text(live_receipt)
+        except (OSError, ValueError):
+            pass
     backups_root = dst.parent / ".levain" / "backups" / "activation"
     had_previous = dst.exists() or dst.is_symlink()
     stamp = time.time_ns()
@@ -2155,17 +2185,32 @@ def _copy_activation_tree(
                     f"({e}). It is kept at {moved_to} instead, which levain never removes."
                 )
         os.replace(new_tree, dst)
-    except BaseException:
+    except BaseException as exc:
         shutil.rmtree(new_tree, ignore_errors=True)
+        original_at_dst = moved_to is None and had_previous
         if (moved_to is not None and not (dst.exists() or dst.is_symlink())
                 and (moved_to.exists() or moved_to.is_symlink())):
-            os.replace(moved_to, dst)  # put the original tree back
-        # The tree is back where it was, so its receipt goes back too (L2 LOW): dropped, it
-        # would leave that tree permanently unable to prove itself and rotate.
-        if carried_receipt is not None and not live_receipt.exists():
             try:
-                os.replace(carried_receipt, live_receipt)
-                carried_receipt = None
+                os.replace(moved_to, dst)  # put the original tree back
+                original_at_dst = True
+            except OSError as e3:
+                # Raised in place of `exc` so the operator learns where the tree is (codex
+                # MED). `_drop_carried` is skipped: a carried receipt that still exists sits
+                # beside the tree under `backups_root`, which can still prove itself.
+                raise InitError(
+                    f"the new activation/ could not be installed ({exc}), and putting the "
+                    f"previous one back failed too ({e3}). The previous activation/ is intact "
+                    f"at {moved_to}; move it back to {dst} by hand. Nothing was deleted."
+                ) from exc
+        # ⛔ THE ORIGINAL TREE IS BACK, SO ITS RECEIPT GOES BACK — FROM THE TEXT READ BEFORE
+        # THE INVALIDATION, NOT FROM THE CARRIED COPY (complement HIGH + glm MED ×2, all three
+        # reproduced 2026-09-14). The copy is absent whenever `backups_root` refused it, is
+        # already unlinked once the sibling fallback ran, and never exists for a symlinked
+        # activation/; each path left an intact tree with no receipt, and on the refusal path
+        # beside an error saying nothing was deleted.
+        if original_at_dst and prior_receipt_text is not None and not live_receipt.exists():
+            try:
+                _atomic_write_text(live_receipt, prior_receipt_text)
             except OSError:
                 pass
         _drop_carried()
@@ -2284,6 +2329,23 @@ def _codex_block_dict(block: str) -> dict | None:
         return None
 
 
+_LEVAIN_OWNED_CODEX_KEYS = ("command", "args")
+
+
+def _without_levain_keys(parsed: dict | None) -> dict | None:
+    """`parsed` with the keys `init` itself writes removed from the anneal_memory server
+    table, so only what an operator added is compared. None stays None."""
+    if parsed is None:
+        return None
+    servers = dict(parsed.get("mcp_servers") or {})
+    server = servers.get("anneal_memory")
+    if isinstance(server, dict):
+        servers["anneal_memory"] = {
+            k: v for k, v in server.items() if k not in _LEVAIN_OWNED_CODEX_KEYS
+        }
+    return {**parsed, "mcp_servers": servers}
+
+
 def _codex_block_store(block: str) -> str | None:
     """The store path a codex `[mcp_servers.anneal_memory]` block points at, or None.
 
@@ -2362,6 +2424,8 @@ def _merge_codex_config(
     repoint: tuple[str, str, Path] | None = None
     unknown_prior: Path | None = None
     customized: Path | None = None
+    relaunched = False
+    new_dict: dict | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
         old_dict = _codex_block_dict(old_block_match.group(0))
@@ -2406,7 +2470,19 @@ def _merge_codex_config(
             and new_store is not None
             and old_store != new_store
         )
-        content_changed = not replacing_unknown and not store_changed and old_dict != new_dict
+        # ⛔ LEVAIN'S OWN KEYS ARE NOT A CUSTOMISATION (Diogenes MEDIUM, 2026-09-14, his
+        # signature reproduced: 7 lines and a backup). `command` and `args` are what `init`
+        # writes, so they change on every pre-spore-751 upgrade and on a re-init from another
+        # interpreter; compared whole, the dicts always differed and the operator was told a
+        # customisation was gone when nothing of theirs was touched.
+        content_changed = (
+            not replacing_unknown and not store_changed
+            and _without_levain_keys(old_dict) != _without_levain_keys(new_dict)
+        )
+        relaunched = (
+            not replacing_unknown and not store_changed and not content_changed
+            and old_dict != new_dict
+        )
         if replacing_unknown or store_changed or content_changed:
             bak = _timestamped_backup_path(path)
             try:
@@ -2558,6 +2634,12 @@ def _merge_codex_config(
         emit("     just this install. Re-run init from the install you want it")
         emit("     reading if this was not what you meant.)")
 
+    if relaunched:
+        server = ((new_dict or {}).get("mcp_servers") or {}).get("anneal_memory") or {}
+        emit(f"  Codex's GLOBAL anneal_memory registration in {path} keeps its store and now")
+        emit(f"    starts the memory server as: {server.get('command')} "
+             f"{' '.join(str(a) for a in server.get('args') or [])}")
+
 
 def _run_anneal_cmd(
     store: Path, anneal_path: str, sub_args: list[str]
@@ -2608,6 +2690,8 @@ def _init_store(
 
     `emit` (default `print`) sinks the progress + failure-remediation lines so a
     web init can surface them in the browser; the CLI is byte-unchanged."""
+    from levain.manifest import anneal_invocation, pip_invocation
+
     emit("")
     if store.is_file() and store.stat().st_size > 0:
         # An existing store carries the entity's memory + identity; --force
@@ -2635,8 +2719,8 @@ def _init_store(
             emit(f"    - {e}")
         emit("    The memory is preserved, but the schema may still be the ops")
         emit("    default — a partnership entity needs the 6-section schema.")
-        emit("    Fix: pip install -U anneal-memory")
-        emit(f"    Then: anneal-memory --db {store} set-schema partnership")
+        emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
+        emit(f"    Then: {anneal_invocation()} --db {store} set-schema partnership")
         return False
 
     emit(f"Initializing anneal-memory store at {store}...")
@@ -2657,8 +2741,8 @@ def _init_store(
     emit("    Most likely cause: anneal-memory is not installed in this Python,")
     emit("    or is older than the release that supports `init --schema` /")
     emit("    `set-schema` (the 6-section partnership schema).")
-    emit("    Fix: pip install -U anneal-memory")
-    emit(f"    Then: anneal-memory --db {store} init --schema partnership")
+    emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
+    emit(f"    Then: {anneal_invocation()} --db {store} init --schema partnership")
     return False
 
 
