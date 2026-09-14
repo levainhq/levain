@@ -349,6 +349,21 @@ def test_pip_floor_reports_UNKNOWN_when_project_key_is_not_a_table(monkeypatch, 
     assert v.status == "unknown"
 
 
+def _installed_dist_anneal_floor() -> str:
+    """The anneal-memory `>=` floor the INSTALLED levain distribution declares, read from its
+    own metadata. The fallback tests compare against this rather than a written version, so
+    they check "falls back to dist metadata" in whatever environment runs them."""
+    import importlib.metadata
+    import re
+
+    for req in importlib.metadata.distribution("levain").requires or []:
+        if req.startswith("anneal-memory"):
+            match = re.search(r">=\s*([0-9][^,;\s]*)", req)
+            if match:
+                return match.group(1)
+    raise AssertionError("the installed levain distribution declares no anneal-memory floor")
+
+
 def test_pip_floor_falls_back_to_dist_metadata_when_no_pyproject_beside_it(monkeypatch):
     """The installed-wheel case: no source tree sits beside the package, so
     `_levain_requires` must defer to `importlib.metadata` rather than silently
@@ -356,8 +371,10 @@ def test_pip_floor_falls_back_to_dist_metadata_when_no_pyproject_beside_it(monke
     on a perfectly healthy wheel install)."""
     monkeypatch.setattr(manifest, "_PYPROJECT_PATH", Path("/nonexistent/pyproject.toml"))
     assert manifest._pyproject_requires() is None
-    # The real environment has levain installed (editable), so dist metadata is real.
-    assert manifest.pip_floor() == "0.9.8"
+    # The real environment has levain installed, so dist metadata is real. The expected floor
+    # is READ from that metadata, not written as a number: a literal "0.9.8" here failed the
+    # 0.4.7 floor raise while the fallback itself worked.
+    assert manifest.pip_floor() == _installed_dist_anneal_floor()
 
 
 def test_pip_floor_rejects_a_nonstring_dependency_entry(monkeypatch, tmp_path):
@@ -411,7 +428,7 @@ def test_pip_floor_ignores_an_UNRELATED_pyproject_at_the_installed_wheel_path(
         "an unrelated pyproject.toml must be treated as ABSENT, not trusted"
     )
     # Falls through to the real installed dist metadata, same as the no-file case.
-    assert manifest.pip_floor() == "0.9.8"
+    assert manifest.pip_floor() == _installed_dist_anneal_floor()
 
 
 # --------------------------------------------------------------------------

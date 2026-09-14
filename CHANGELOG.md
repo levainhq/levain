@@ -4,9 +4,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased]
+## [0.4.7] — 2026-09-14
 
-Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+### Changed — Levain now requires anneal-memory 0.9.10 or later
+
+The anneal floor moves from `>=0.9.8` to `>=0.9.10`. Per anneal's own 0.9.10 changelog, the published 0.9.9 could report a destroyed audit history as healthy: once the sealed audit file its manifest names and the active file were deleted, `verify()` returned `valid=True` with no entries, and `anneal-memory audit` could leave out a whole sealed week while still reporting the trail trusted. Levain calls no new anneal API; the floor exists so a Levain install cannot resolve to that anneal. `pip install -U levain` brings anneal along.
+
+### Changed — `levain init` backs up `~/.codex/config.toml` whenever it would change the memory-server block at all
+
+The Codex adapter rewrites the global `[mcp_servers.anneal_memory]` block. It used to copy `config.toml` aside only when it judged that something you had customised was about to be lost, and that judgement missed cases: a wrapper `command` that kept Levain's arguments, or a comment you had written inside the block. Now any change to that block's text writes `config.toml.bak.<timestamp>` first, and the notice says what kind of change it was:
+
+- upgrading an install made before this release: "keeps its store and now starts the memory server as …", plus where the copy is;
+- a comment or formatting inside the block: "keeps its settings, but comments or formatting inside that block were not kept", plus where the copy is;
+- anything else that differs: the existing "customisation is gone" warning, plus where the copy is.
+
+Re-running `init` against a block Levain wrote, byte for byte, still does nothing and says nothing.
+
+### Changed — `levain doctor` explains the anneal-version mismatch on installs set up by an older Levain
+
+Levain releases before 0.4.7 recorded the version of whichever `anneal-memory` came first on `PATH`, which was not always the anneal Levain itself runs. After upgrading such an install, `doctor`'s `compat: anneal-lock` line could call that mismatch "an out-of-band upgrade". For an install last composed by a Levain older than 0.4.7 it now says the recorded version most likely belonged to a different `anneal-memory` on `PATH`, and points at `levain init --force` or `levain update`, either of which records the anneal Levain actually imports. The check and `doctor`'s exit code are unchanged.
 
 ### Changed — the memory server is now the anneal installed alongside Levain, not the first one on `PATH`
 

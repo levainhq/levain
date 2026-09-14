@@ -164,7 +164,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 ## What it's built on
 
-Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=0.9.8,<0.10`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
+Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=0.9.10,<0.10`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
 
 ## Build on it
 
