@@ -169,6 +169,33 @@ def test_a_pristine_pre_751_codex_block_upgrades_without_a_lost_customisation_al
     assert '"-P", "-m", "anneal_memory"' in cfg.read_text(encoding="utf-8")
 
 
+def test_a_comment_inside_an_otherwise_identical_block_is_backed_up(tmp_path: Path):
+    """Round 4, codex MED, reproduced: a block that parses identically but carries an operator
+    comment was replaced with no backup and no notice, deleting the comment. MUTATION: drop the
+    raw-text comparison from `_merge_codex_config`'s backup gate."""
+    install = tmp_path / "inst"
+    cfg = tmp_path / "config.toml"
+    template = Path(inst.__file__).parent / "templates" / "adapters" / "codex" / "mcp.template.toml"
+    fragment = (template.read_text(encoding="utf-8")
+                .replace("{{PYTHON}}", sys.executable).replace("{{INSTALL_DIR}}", str(install)))
+    block_lines = fragment[fragment.index("[mcp_servers.anneal_memory]"):].splitlines()
+    cfg.write_text(
+        block_lines[0] + "\n# corporate runbook: owner is platform-team\n"
+        + "\n".join(block_lines[1:]) + "\n",
+        encoding="utf-8",
+    )
+    said: list[str] = []
+    _merge_codex_config(cfg, fragment, emit=said.append)
+    baks = list(tmp_path.glob("config.toml.bak*"))
+    assert len(baks) == 1 and "corporate runbook" in baks[0].read_text(encoding="utf-8")
+    assert [m for m in said if str(baks[0]) in m], said
+
+    # A true re-run of levain's own identical block stays silent and writes nothing.
+    said.clear()
+    _merge_codex_config(cfg, fragment, emit=said.append)
+    assert len(list(tmp_path.glob("config.toml.bak*"))) == 1 and not said
+
+
 def test_a_wrapper_command_with_levains_exact_args_is_still_a_customisation(tmp_path: Path):
     """Round 3, all three seats, reproduced: the current-shape branch never checked `command`,
     so this wrapper was overwritten with no backup and no warning. MUTATION: drop the
