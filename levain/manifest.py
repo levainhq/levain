@@ -266,6 +266,13 @@ def declared_set() -> CompatSet:
 # Discovery — read the INSTALLED set from anneal's own JSON CLI
 # ---------------------------------------------------------------------------
 
+# The first levain release whose lock records the anneal its own interpreter imports
+# (spore-751). Locks from earlier releases recorded whichever `anneal-memory` PATH found.
+# ⚠ `_cmp` ignores `.devN`, so a lock written by a 0.4.7.dev0 build from before 751 merged
+# is treated as post-751; that affects dev installs only.
+_FIRST_SINGLE_ANNEAL_LEVAIN = "0.4.7"
+
+
 def anneal_invocation(*args: str) -> str:
     """The command an operator should TYPE to reach the anneal levain's interpreter imports.
 
@@ -518,14 +525,29 @@ def compute_drift(
         and installed.anneal is not None
         and _cmp(installed.anneal, lock.anneal) != 0
     ):
-        verdicts.append(AxisVerdict(
-            "anneal-lock", "drift",
-            f"anneal-memory changed {lock.anneal} -> {installed.anneal} since this "
-            f"install was last composed (an out-of-band upgrade)",
-            "Run `levain update` so the methodology layer reconciles with the new "
-            "anneal (this is the exact drift that lands a new feature as a conflict "
-            "with stale instructions).",
-        ))
+        if lock.levain and _cmp(lock.levain, _FIRST_SINGLE_ANNEAL_LEVAIN) < 0:
+            # ⚖ Phill 2026-09-14, option 3: the exit code stays, the TEXT names the likely
+            # cause. A pre-spore-751 levain recorded whichever `anneal-memory` came first on
+            # PATH, so a mismatch here is most likely a second anneal on PATH at lock-write
+            # time, not an upgrade (measured on a scratch-HOME upgrade from published 0.4.6).
+            verdicts.append(AxisVerdict(
+                "anneal-lock", "drift",
+                f"anneal-memory {lock.anneal} -> {installed.anneal}: this install's lock was "
+                f"written by levain {lock.levain}, which recorded whichever anneal-memory came "
+                f"first on PATH. That was most likely a different anneal from the one levain "
+                f"runs, not an out-of-band upgrade",
+                "Run `levain init --force` (it RE-RUNS THE INTERVIEW; your store is kept) or "
+                "`levain update`; either records the anneal levain's own interpreter imports.",
+            ))
+        else:
+            verdicts.append(AxisVerdict(
+                "anneal-lock", "drift",
+                f"anneal-memory changed {lock.anneal} -> {installed.anneal} since this "
+                f"install was last composed (an out-of-band upgrade)",
+                "Run `levain update` so the methodology layer reconciles with the new "
+                "anneal (this is the exact drift that lands a new feature as a conflict "
+                "with stale instructions).",
+            ))
 
     # -- schema (the store's section schema) --
     if installed.schema is None:
