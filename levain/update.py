@@ -191,7 +191,8 @@ def run_update(
                 installed = manifest.discover_installed_set(store, anneal_path)
         else:
             emit("\n  After applying the edits, run `levain update --ack` (or "
-                 "`anneal-memory migrate ack`) to record them as reconciled.")
+                 f"`{manifest.anneal_invocation('--db', str(store), 'migrate', 'ack')}`) to record "
+                 f"them as reconciled.")
     elif ack:
         # --ack requested but nothing readable to acknowledge — say so rather than
         # silently no-op the operator's flag.

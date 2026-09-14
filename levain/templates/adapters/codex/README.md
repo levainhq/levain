@@ -170,7 +170,7 @@ map, expected a sequence in `hooks`"). The JSON sidecar at
    attempt), replace its body in place — do *not* append a duplicate
    section header, which produces a TOML parse error on Codex startup.
 5. **Initialize the memory store:**
-   `anneal-memory --db <absolute-install-path>/.levain/memory.db init`
+   `<levain python> -P -m anneal_memory --db <absolute-install-path>/.levain/memory.db init --schema partnership`
 6. **Make the hooks executable:** `chmod +x activation/hooks/*.py`
    (optional — the wired command invokes the interpreter explicitly — but
    good hygiene).

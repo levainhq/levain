@@ -14,11 +14,10 @@ Walks a stranger through standing up a new Levain install:
   8. Print next-steps banner.
 
 Idempotency: a non-empty install dir is refused unless `--force`. With
-`--force` the whole `activation/` tree is REPLACED, and anything in it whose
-bytes are not reproducible from the install is copied to a timestamped
-DIRECTORY (`.levain/backups/activation/<ts>/`, relative paths preserved)
-first — every file, hooks included, not a name allowlist. The anneal-memory
-store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
+`--force` the whole `activation/` tree is REPLACED, and the previous tree is
+first moved whole to `.levain/backups/activation/tree-<ts>/`; old trees are
+removed only when they prove unedited against their install receipt
+(spore-861, spore-900). The anneal-memory store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
 before being overwritten, and `~/.codex/config.toml` is backed up and the
 change announced when the MCP block is repointed at a DIFFERENT store.
 
@@ -42,7 +41,8 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator, Sequence
+import stat
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.resources import as_file, files
@@ -1655,7 +1655,6 @@ def _activation_excluded(rel: Path) -> bool:
     )
 
 
-_HOOK_NORMALISE_MAX_BYTES = 8 << 20  # a hook script is ~30KB; see _hook_bodies_match
 
 
 def hook_body(text: str) -> str:
@@ -1678,52 +1677,143 @@ def hook_body(text: str) -> str:
     ⚠ IT LIVES HERE, NOT IN `doctor`, AS OF 2026-09-06 — beside the substitution it inverts.
     The docstring above worried about staying in lockstep with `_substitute_hook_placeholders`
     while sitting in a different module; that is the coupling, and adjacency is the cheapest
-    guard for it. TWO consumers now: `doctor`'s freshness check (imports it under the old
-    private name, unchanged) and `_copy_activation_tree`'s operator-edit backup below.
+    guard for it. `_copy_activation_tree`'s operator-edit backup used it too until
+    `spore-900` (2026-09-13), which replaced the normalisation there with the install receipt.
     """
     return re.sub(
         r"^_INSTALL_ANNEAL_BIN = .*$", "_INSTALL_ANNEAL_BIN = <>", text, flags=re.M
     ).strip()
 
 
-def _is_hook_script(rel: Path) -> bool:
-    """Whether a relative activation path is a hook `.py` that install substitutes into.
+# ---------------------------------------------------------------------------
+# The activation install receipt — `spore-900`, ruled by Phill 2026-09-13.
+#
+# What install WROTE into `activation/`, per file: the sha256 of the installed bytes
+# (after placeholder substitution) and of the composed layer source they came from.
+#
+# ⛔ WHAT IT IS FOR, AND WHAT IT IS NOT. It answers "has this file changed since install
+# wrote it?" — the question `init --force`'s backup notice needs, and one no normalisation
+# of line shapes can answer (an edit confined to a substituted line is byte-identical to
+# install's own output). It CANNOT answer "has the PACKAGE moved since install?": a receipt
+# agrees with the install it describes by construction. That second question stays with
+# `doctor._check_hook_freshness`, which compares against the live package tree. Diogenes'
+# 2026-08-12 HIGH against `spore-492` is the reason both maps are recorded and neither
+# check replaces the other.
+#
+# ⛔ An ABSENT, CORRUPT or EMPTY receipt is UNKNOWN, never "nothing was edited". Every
+# install made before this receipt existed reads as absent.
+ACTIVATION_RECEIPT_REL = (".levain", "activation-manifest.json")
+ACTIVATION_RECEIPT_SCHEMA = 1
+_RECEIPT_MAX_BYTES = 16 << 20
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
-    Mirrors `_substitute_hook_placeholders(new_tree / "hooks", ...)`, which walks
-    `hooks/` RECURSIVELY over `.py` files — so a pack's nested `hooks/sub/x.py`
-    counts, exactly as the substitution reaches it.
+
+def _sha256_stream(path: Path) -> str:
+    """sha256 of a file read in bounded chunks (an operator file can be any size)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def activation_receipt_path(install: Path) -> Path:
+    return install.joinpath(*ACTIVATION_RECEIPT_REL)
+
+
+def read_activation_receipt(
+    install: Path,
+) -> tuple[dict[str, dict[str, str]] | None, str]:
+    """The install's live receipt; see :func:`read_activation_receipt_file`."""
+    return read_activation_receipt_file(activation_receipt_path(install))
+
+
+def _read_receipt_text(path: Path) -> str:
+    """A receipt's text from ONE open, reading at most `_RECEIPT_MAX_BYTES` (codex MED: a
+    `stat` followed by a separate `read_text` let a file grow between the two). Raises
+    OSError, or ValueError (UnicodeDecodeError included) for oversize or undecodable bytes."""
+    with path.open("rb") as fh:
+        raw = fh.read(_RECEIPT_MAX_BYTES + 1)
+    if len(raw) > _RECEIPT_MAX_BYTES:
+        raise ValueError(f"{path} is larger than a receipt can be")
+    return raw.decode("utf-8")
+
+
+def read_activation_receipt_file(
+    path: Path,
+) -> tuple[dict[str, dict[str, str]] | None, str]:
+    """Read a receipt as ``({relpath: {"installed": sha, "source": sha}}, status)``.
+
+    Takes a file path, not an install, so a receipt copied beside a retained backup tree
+    (``spore-861`` ruling B, 2026-09-13) is read by the same validation as the live one.
+
+    ``status`` is ``"ok"``, ``"absent"``, ``"corrupt"`` or ``"empty"``; the map is None
+    unless ``"ok"``. A receipt that parses but carries a malformed entry is CORRUPT as a
+    whole — a partial trust decision about a file that was half-written is the guess this
+    record exists to remove.
     """
-    return bool(rel.parts) and rel.parts[0] == "hooks" and rel.suffix == ".py"
-
-
-def _hook_bodies_match(current: Path, staged: Path) -> bool:
-    """Whether two hook scripts differ ONLY in what install itself substitutes.
-
-    ⛔ THE QUESTION THIS EXISTS TO ASK. `anneal_path` is re-resolved on EVERY run, so the
-    `_INSTALL_ANNEAL_BIN` line of a PRISTINE installed hook legitimately differs from the
-    line about to replace it whenever that resolution moves between installs. Until
-    `spore-751` it was a PATH lookup (a venv vs a plain shell); it is now the script of the
-    anneal the running interpreter imports, which still moves when init runs from a
-    different interpreter or venv. Comparing raw bytes
-    calls that an operator edit and backs the file up with a false "Operator-edited"
-    notice. MEASURED 2026-09-06: it also recurs, because each run writes its own
-    resolution in, so alternating shells re-trigger it indefinitely.
-
-    ⚠ Only reached when the bytes ALREADY differ, so the whole-file read is off the
-    common path — and capped, because `_copy_activation_tree` must not load an arbitrary
-    file into memory. Over the cap, or not decodable as text, returns False: not
-    normalisable, so preserve it. Every uncertain answer here errs toward keeping the
-    operator's bytes.
-    """
-    if (current.stat().st_size > _HOOK_NORMALISE_MAX_BYTES
-            or staged.stat().st_size > _HOOK_NORMALISE_MAX_BYTES):
-        return False
     try:
-        return hook_body(current.read_text(encoding="utf-8")) == hook_body(
-            staged.read_text(encoding="utf-8")
-        )
-    except UnicodeError:
-        return False
+        # Bounded (codex MED): a damaged or hostile receipt of any size must read as corrupt,
+        # never exhaust memory. A real one is a few KB per hundred files.
+        if path.stat().st_size > _RECEIPT_MAX_BYTES:
+            return None, "corrupt"
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "absent"
+    except (OSError, UnicodeError):
+        return None, "corrupt"
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError, MemoryError):
+        return None, "corrupt"
+    if not isinstance(data, dict) or data.get("schema") != ACTIVATION_RECEIPT_SCHEMA:
+        return None, "corrupt"
+    files = data.get("files")
+    if not isinstance(files, dict):
+        return None, "corrupt"
+    out: dict[str, dict[str, str]] = {}
+    for rel, entry in files.items():
+        if not (
+            isinstance(rel, str)
+            and isinstance(entry, dict)
+            and isinstance(entry.get("installed"), str)
+            and isinstance(entry.get("source"), str)
+            and _SHA256_HEX.fullmatch(entry["installed"])
+            and _SHA256_HEX.fullmatch(entry["source"])
+        ):
+            return None, "corrupt"
+        out[rel] = {"installed": entry["installed"], "source": entry["source"]}
+    if not out:
+        return None, "empty"
+    return out, "ok"
+
+
+def _write_activation_receipt(install: Path, files: dict[str, dict[str, str]]) -> None:
+    """Atomically write the receipt (unique temp + fsync + ``os.replace``). Raises OSError."""
+    from levain import __version__
+
+    path = activation_receipt_path(install)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(
+        {"schema": ACTIVATION_RECEIPT_SCHEMA, "written_by": f"levain {__version__}",
+         "files": dict(sorted(files.items()))},
+        indent=2,
+    ) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".activation-manifest.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _same_contents(a: Path, b: Path, *, chunk: int = 1 << 16) -> bool:
@@ -1771,6 +1861,153 @@ def _compose_activation_layers(layer_roots: Sequence[Path]) -> dict[str, Path]:
     return composed
 
 
+_ACTIVATION_TREES_KEPT = 3  # spore-861: the newest three trees that PROVE pristine are kept
+_TREE_BACKUP_PREFIX = "tree-"
+
+
+def _tree_receipt_path(tree: Path) -> Path:
+    """Where a retained tree's receipt lives: BESIDE it, never inside (spore-861 ruling B).
+
+    Inside the tree it would be one more file every reader of `activation/` has to exclude,
+    including the pristine proof's own "no extra files" rule."""
+    return tree.parent / f"{tree.name}.receipt.json"
+
+
+def _is_bytecode_residue(rel: Path, tree: Path) -> bool:
+    """True only for bytecode Python itself writes: a `.pyc` directly inside `__pycache__`,
+    named for a `.py` beside that `__pycache__` (`hooks/__pycache__/x.cpython-312.pyc` for
+    `hooks/x.py`). ⛔ Anything else under an excluded-looking name — `hooks/__pycache__/notes.md`,
+    a directory called `research.pyc/` — is operator content: the proof skipping it while
+    `rmtree` deletes it was an L2 HIGH, reproduced 2026-09-13."""
+    parts = rel.parts
+    if len(parts) < 2 or parts[-2] != "__pycache__":
+        return False
+    # Exactly the name `importlib` gives a cache file — `<stem>.<impl>-<ver>[.opt-N].pyc`. A
+    # looser `<stem>.*.pyc` let `h.notes.pyc` beside `h.py` pass as residue, so a tree holding
+    # it proved pristine and rotation deleted the only copy (codex HIGH, reproduced
+    # 2026-09-14). ⚠ A file an operator writes UNDER that exact name is still skipped; a
+    # filename cannot prove provenance, and closing that means keeping every tree whose
+    # hooks ever ran.
+    match = _BYTECODE_NAME.fullmatch(parts[-1])
+    if match is None:
+        return False
+    return tree.joinpath(*parts[:-2], f"{match['stem']}.py").is_file()
+
+
+# The tag must be a CPython cache tag or this interpreter's own: `[a-z]+-\d+` accepted
+# `h.notes-1.pyc` (codex HIGH, round 2, reproduced). The stem may hold dots, as a dotted
+# source name's cache file does.
+_CACHE_TAGS = r"cpython-3\d+" + (
+    f"|{re.escape(sys.implementation.cache_tag)}" if sys.implementation.cache_tag else ""
+)
+_BYTECODE_NAME = re.compile(rf"(?P<stem>.+)\.(?:{_CACHE_TAGS})(?:\.opt-[12])?\.pyc")
+
+
+def _edits_against_receipt(
+    tree: Path, receipt: Mapping[str, Mapping[str, str]]
+) -> tuple[list[str], list[str]]:
+    """Compare a whole activation tree with the receipt of the install that wrote it.
+
+    Returns ``(edited, unexamined)`` as relative posix paths. ``edited`` holds every file
+    whose bytes differ from its receipt entry, every file the receipt does not list (install
+    never wrote it), and every symlink or non-regular entry (install writes neither).
+    ``unexamined`` holds anything that could not be read or listed. Only bytecode Python
+    wrote itself is skipped (`_is_bytecode_residue`): hooks import `_levain_hook` from their
+    own directory, so a tree whose hooks ever ran contains it. Every filesystem call is
+    inside a guard, because this runs after the swap has completed."""
+    edited: list[str] = []
+    unexamined: list[str] = []
+
+    def _walk_error(err: OSError) -> None:
+        unexamined.append(str(err.filename))
+
+    for walk_root, walk_dirs, walk_files in os.walk(tree, onerror=_walk_error):
+        walk_dirs.sort()
+        root = Path(walk_root)
+        for dname in list(walk_dirs):
+            drel = (root / dname).relative_to(tree).as_posix()
+            try:
+                if (root / dname).is_symlink():
+                    edited.append(drel)
+            except OSError:
+                # A listable but unsearchable parent (L1 HIGH, reproduced): lstat raises.
+                unexamined.append(drel)
+        for fname in sorted(walk_files):
+            path = root / fname
+            rel = path.relative_to(tree)
+            name = rel.as_posix()
+            try:
+                if not path.is_symlink() and _is_bytecode_residue(rel, tree):
+                    continue
+                if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+                    edited.append(name)
+                    continue
+                entry = receipt.get(name)
+                if entry is None or _sha256_stream(path) != entry["installed"]:
+                    edited.append(name)
+            except OSError:
+                unexamined.append(name)
+    return edited, unexamined
+
+
+def _tree_proves_pristine(tree: Path) -> bool:
+    """True only if the tree matches, file for file, the receipt copied beside it.
+
+    ⛔ An absent, corrupt or empty sibling receipt is UNPROVEN, never pristine (spore-861
+    ruling B; spore-492's "an empty receipt is never OK")."""
+    files, status = read_activation_receipt_file(_tree_receipt_path(tree))
+    if status != "ok" or files is None:
+        return False
+    edited, unexamined = _edits_against_receipt(tree, files)
+    return not edited and not unexamined
+
+
+def _prune_activation_backups(backups_root: Path, keep: int) -> list[str]:
+    """Remove whole-tree backups that PROVE pristine, beyond the newest ``keep`` of them.
+
+    ⚖ spore-861, ruling B (Phill 2026-09-13). A tree may be deleted only if it matches the
+    receipt of the install that wrote it, with no extra files. Every other tree, including
+    every one without a readable receipt, is kept and named. Only ``tree-<digits>``
+    directories are candidates; the bare-timestamp directories older releases wrote can
+    hold the only copy of an edit and are never touched. Deleting a tree also deletes its
+    receipt. Returns operator lines; never raises."""
+    notes: list[str] = []
+    try:
+        entries = list(backups_root.iterdir())
+    except OSError as e:
+        return [f"  note: could not list {backups_root} to remove old backups ({e})."]
+    trees: list[tuple[int, Path]] = []
+    for p in entries:
+        suffix = p.name[len(_TREE_BACKUP_PREFIX):]
+        if (p.name.startswith(_TREE_BACKUP_PREFIX) and suffix.isdigit()
+                and p.is_dir() and not p.is_symlink()):
+            trees.append((int(suffix), p))
+    trees.sort()
+    pristine = [t for _, t in trees if _tree_proves_pristine(t)]
+    unproven = [t for _, t in trees if t not in pristine]
+    for old in pristine[:-keep] if keep > 0 else pristine:
+        if not _tree_proves_pristine(old):  # re-proved at the moment of deletion (L2 LOW)
+            unproven.append(old)
+            continue
+        try:
+            shutil.rmtree(old)
+        except OSError as e:
+            notes.append(f"  note: could not remove the old backup {old} ({e}).")
+            continue
+        try:
+            _tree_receipt_path(old).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            notes.append(f"  note: removed {old} but not its receipt ({e}).")
+    if unproven:
+        notes.append(
+            "  Kept, because they may hold edits (levain deletes a backup only when it "
+            "proves unedited): " + ", ".join(str(t) for t in unproven)
+        )
+    return notes
+
+
 def _copy_activation_tree(
     layer_roots: Sequence[Path],
     dst: Path,
@@ -1779,81 +2016,40 @@ def _copy_activation_tree(
     anneal_path: str | None = None,
     emit: Callable[[str], None] = print,
 ) -> None:
-    """Compose the ordered activation-tree layer STACK `layer_roots` into `dst`,
-    preserving operator edits to known editable files.
+    """Compose the ordered activation-tree layer STACK `layer_roots` into `dst`, keeping
+    the whole previous tree as a backup and recording an install receipt.
 
     `layer_roots` (base first, then composing packs by `pack.toml` order — see
-    `packs.order_activation_roots`) is merged per relative path, LAST layer wins,
-    so a pack's `activation/posture.md` overrides base's. A single base root (no
-    pack ships an `activation/` tree) is the base-only case, byte-identical (file
-    content + directory structure, including empty dirs) to the pre-layering
-    copytree.
+    `packs.order_activation_roots`) is merged per relative path, LAST layer wins, so a
+    pack's `activation/posture.md` overrides base's. A single base root is the base-only
+    case, byte-identical to the pre-layering copytree.
 
-    Honesty floor — `base_activation` (the adapter's OWN base tree) must itself
-    contribute files: a present-but-empty base (a corrupt wheel) must not be masked
-    by a pack contributing files (which would slip past an aggregate-only check and
-    install a base-less tree). Finer per-file completeness of the INSTALLED tree is
-    `levain doctor`'s job; here we guard that base is a real, non-empty source —
-    BEFORE any destructive write.
+    Honesty floor — `base_activation` (the adapter's OWN base tree) must itself contribute
+    files, so a present-but-empty base (a corrupt wheel) cannot be masked by a pack. The new
+    tree is assembled in a staging dir, so ANY build failure leaves `dst` untouched.
 
-    ⚠ SYMLINKS ARE THE STATED EXCEPTION, and it is stated because a reviewer showed
-    the sentence below was broader than the code. `os.walk` does not follow directory
-    symlinks, so a symlink-to-a-directory inside `dst` is never enumerated, never
-    compared, never copied — and the swap unlinks it with no notice. A FILE symlink is
-    followed by `is_file()`, so it is compared by TARGET CONTENT and silently replaced
-    by a regular file. Neither is handled; both are routed (spore-860), not claimed.
+    `anneal_path`, when provided, is substituted into `{{ANNEAL_MEMORY}}` in every hook .py
+    under `dst/hooks/` (recursively, so a pack's nested hook is reached).
 
-    On a re-install, every REGULAR file present at `dst` whose content will NOT survive
-    byte-identically — it differs from the bytes about to be written, OR nothing
-    provides it (so the swap would delete it) — is backed up OUTSIDE the dst tree
-    (`<install>/.levain/backups/activation/<timestamp>/`, preserving relative
-    paths) BEFORE the swap. If such an edit cannot be preserved (the backup dir
-    won't create, the read/copy fails), this raises rather than silently
-    destroying it — fail loud beats data loss.
+    ⛔ THE PREVIOUS TREE IS THE BACKUP (spore-861). On a re-install the whole previous `dst`
+    is RENAMED into `<install>/.levain/backups/activation/tree-<time_ns>/`, so nothing is
+    classified before anything is destroyed: every file, symlink and directory the operator
+    had is kept, including an edit saved a moment before the swap. If that location cannot
+    take the rename, the tree goes to a sibling `.levain-activation-prev-<time_ns>` and the
+    operator is told; if that fails too, nothing has moved and this raises.
 
-    ⛔ The comparison is against the STAGED TREE, never the composed source. Hooks
-    have `{{ANNEAL_MEMORY}}` substituted into them at install time, so an installed
-    hook never equals its package source — comparing against the source would report
-    every pristine hook as operator-edited on every re-install. Comparing against
-    the staged result is also the only form that needs no copy of the substitution
-    rule, so it cannot drift when that rule changes.
+    THE RECEIPT (spore-900). `.levain/activation-manifest.json` records, per file, the
+    sha256 of the bytes installed and of the winning source. It is copied BESIDE the
+    retained tree as `tree-<ns>.receipt.json` before the swap, so that tree can later be
+    proved unedited (`_tree_proves_pristine`), and the live receipt is removed before the
+    swap so it can never outlive the tree it describes. The new receipt is written after.
 
-    The scope is the WHOLE TREE, not a name allowlist, and that is the point:
-    `posture.md` and `recency_directives.md` are the files we DOCUMENT as
-    operator-editable (the "second sourdough surface" — the activation block
-    accretes as the operator finds their own RLHF-leakage patterns), but they are
-    not the only files operators edit. Hooks are machinery we do not invite edits
-    to, and operators patch them anyway — levain's own shipped hook says so in a
-    comment, and the one named external operator lost a patched hook to
-    `levain init --force`, the remedy `levain doctor` itself prints. Scoping the
-    backup to what we documented, rather than to what `rmtree` destroys, is what
-    let that happen. Membership in this backup is decided by REPRODUCIBILITY (can
-    these bytes be rebuilt from a layer?), never by a filename.
-
-    ⚠ A pristine file whose PACKAGE version moved is therefore also copied — it
-    differs from the winning layer and we cannot tell it from a patch without a
-    record of what we wrote. That is deliberate: the tree is small (five files
-    base, ~67KB), over-backup costs bytes in a timestamped dir, and under-backup
-    costs an operator their work irrecoverably.
-
-    `anneal_path`, when provided, is substituted into the `{{ANNEAL_MEMORY}}`
-    placeholder in any hook .py file under `dst/hooks/` (recursively, so a pack's
-    nested hook is reached). The hooks use the substituted absolute path as their
-    first CLI candidate so hook firing doesn't depend on PATH (which Claude Code +
-    Codex sanitize aggressively).
-
-    Honesty floor: a winning source that vanishes between scan and copy raises (a
-    silent skip would yield an install missing an activation file — the same
-    fail-loud contract the verbatim seed copy in `apply_init` holds). The new tree
-    is assembled in a staging dir and swapped in atomically, so ANY build failure
-    (a vanished source, a cross-layer file/dir name collision) leaves the existing
-    `dst` untouched — never a partial activation tree.
+    The "Operator-edited ... preserved at" lines are computed AFTER the swap, from the
+    retained tree against its own receipt; with no usable receipt they say levain cannot
+    tell. Rotation (`_prune_activation_backups`) deletes only trees that prove unedited.
     """
     composed = _compose_activation_layers(layer_roots)
 
-    # Base must itself contribute files — a pack must not mask an empty/missing base
-    # (which would pass an aggregate-only check yet install a base-less tree). Since
-    # base is always in `layer_roots`, base-non-empty implies `composed` non-empty.
     if not _compose_activation_layers([base_activation]):
         raise InitError(
             f"the base activation tree at {base_activation} contributes no files "
@@ -1861,29 +2057,9 @@ def _copy_activation_tree(
             f"activation/; reinstall with `pip install --force-reinstall levain`."
         )
 
-    backups: list[tuple[str, Path]] = []
-    # ⛔ BUFFERED FOR THE SAME REASON `backups` IS (glm-5.3 L3 LOW, 2026-09-07). These
-    # best-effort notes used to be emitted inside the backup loop — i.e. BEFORE the swap and
-    # before any LATER file could abort the run. A file whose staging failed printed "the edit
-    # is not recoverable", then a different file's `copy2` raised, `InitError` aborted, `dst`
-    # was left untouched, and the file the operator was told about was fully intact. The same
-    # false statement lands if the swap itself fails and the tree is restored from `old_aside`.
-    # ⚡ `a_true_statement_standing_where_a_thing_should_be` — a claim about a world that never
-    # happens. It is precisely the defect `_merge_codex_config` was corrected for on 09-06
-    # ("announced only AFTER it lands"), still live in the sibling function, which is why the
-    # success notices below were already buffered and these were not.
-    unstaged_notes: list[str] = []
-    backup_staging: Path | None = None  # this run's backup dir; cleaned on any failure
-
-    # Build the new tree in a STAGING dir, then swap it into place atomically — so
-    # NO build failure (a cross-layer file/dir name collision, a vanished source)
-    # can leave `dst` partial: `dst` is untouched until the whole tree is assembled
-    # and is replaced in a single rename. codex L3 re-verify HIGH.
     new_tree = dst.parent / f".levain-activation-new-{time.time_ns()}"
     try:
-        # Directory structure first (including EMPTY dirs — copytree did) so the
-        # base-only stack is byte-identical to the legacy copy. Dirs are structure,
-        # not content: they don't "win", so create every non-excluded dir.
+        # Directory structure first (including EMPTY dirs, as copytree did).
         for root in layer_roots:
             if not root.is_dir():
                 continue
@@ -1896,200 +2072,229 @@ def _copy_activation_tree(
         for rel_str, source in composed.items():
             target = new_tree / rel_str
             target.parent.mkdir(parents=True, exist_ok=True)
-            # Cross-layer file/dir collision: another layer contributed `x/...`, so
-            # the dir pass created `target` as a DIRECTORY. shutil.copy2 would copy
-            # the file INTO it (a silently malformed tree) — fail loud instead (the
-            # staging keeps dst intact). The inverse (a parent that's a file) is
-            # caught by the parent mkdir above raising. codex L3 re-verify MED.
+            # Cross-layer file/dir collision: fail loud instead of copying INTO a dir.
             if target.is_dir():
                 raise InitError(
                     f"activation layer conflict: {rel_str!r} is a file in one layer "
                     f"and a directory in another. Composing packs must not collide on "
                     f"a path; fix the pack layout and re-run."
                 )
-            # No is_file() guard on the source: a vanished source (TOCTOU) is a hard
-            # failure that must surface (into staging — `dst` stays intact), not
-            # silently yield an install missing an activation file.
+            # No is_file() guard: a vanished source (TOCTOU) must surface, not yield an
+            # install missing an activation file.
             shutil.copy2(source, target)
         if anneal_path is not None:
             _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
 
-        # Operator content is backed up HERE — after the staged tree is built and
-        # substituted — and compared against the STAGED bytes, i.e. the exact bytes
-        # about to be written.
-        #
-        # ⛔ Comparing against the composed SOURCE was wrong, and only latently so
-        # while this loop covered two markdown files. Install substitutes
-        # `{{ANNEAL_MEMORY}}` into hooks (the line above), so an INSTALLED hook can
-        # never equal its package source: widening the scope to the whole tree would
-        # have reported the pristine `_levain_hook.py` as operator-edited on EVERY
-        # re-install — spurious noise on exactly the file class this backup exists
-        # for, plus a hard InitError for anyone whose backup dir won't stage.
-        # Found by codex + complement at L3, confirmed on disk.
-        #
-        # Comparing against the staged RESULT needs no knowledge of the substitution
-        # rule, so it cannot drift when that rule changes. Duplicating the layering
-        # rule instead of reusing it is a defect this file has already shipped twice.
-        if dst.exists():
-            # Stage backups outside `dst` (under `.levain/`) so the swap doesn't touch
-            # them. Inside this try, so a later failure cleans them up: a backup left
-            # behind next to an untouched dst looks like work that happened.
-            staging_failed = False  # mkdir tried once and failed; don't retry per file
-
-            # ⛔ NOT `dst.rglob("*")`: pathlib SILENTLY SWALLOWS scan errors —
-            # MEASURED on this interpreter, an unreadable subdirectory simply does
-            # not appear in the results. A file we cannot enumerate would then be
-            # destroyed by the swap with no backup and no warning, which is the
-            # exact contract this backup exists to hold. `os.walk` with a raising
-            # `onerror` turns an unscannable directory into a refusal BEFORE the
-            # cutover. Found by codex at L3 round 2.
-            def _scan_failed(err: OSError) -> None:
-                raise InitError(
-                    f"could not scan {err.filename} for operator edits before "
-                    f"replacing the activation tree ({err}). Refusing to destroy "
-                    f"files that cannot be enumerated; resolve the error and re-run."
-                ) from err
-
-            current_files: list[Path] = []
-            for walk_root, walk_dirs, walk_files in os.walk(dst, onerror=_scan_failed):
-                walk_dirs.sort()
-                current_files.extend(Path(walk_root) / f for f in sorted(walk_files))
-
-            for current in current_files:
-                if not current.is_file():
-                    continue
-                rel = current.relative_to(dst)
-                # `__pycache__`/`*.pyc` are build residue no layer provides; without
-                # this they would look operator-added and be backed up every run.
-                if _activation_excluded(rel):
-                    continue
-                name = rel.as_posix()
-                staged = new_tree / rel
-                # Is this worth TELLING the operator about? Separate from whether it
-                # gets copied — see the substitution branch below.
-                notify = True
-                # Survives byte-identically? A missing staged file means nothing
-                # provides it → the swap DELETES it → always preserve, and it is
-                # never read at all (`copy2` streams). When there IS a counterpart,
-                # `_same_contents` compares in bounded chunks after a size check.
-                # ⚠ This comment previously claimed reads were bounded while the
-                # code beside it called `read_bytes()` on BOTH sides — caught by glm
-                # and codex at L3 round 2. A comment asserting a property the
-                # adjacent code lacks is the class this apparatus exists to catch,
-                # and it was written in the act of fixing that class.
-                if staged.is_file():
-                    try:
-                        if _same_contents(current, staged):
-                            continue
-                        # The bytes differ. For a hook, that is not yet an answer:
-                        # install rewrites the `_INSTALL_ANNEAL_BIN` line itself from a
-                        # PATH lookup that is not stable between runs, so ask the sharper
-                        # question — do these differ in anything INSTALL DID NOT WRITE?
-                        if _is_hook_script(rel) and _hook_bodies_match(current, staged):
-                            # Differs ONLY in what install itself substitutes. Still
-                            # COPIED — an operator edit confined to that very line
-                            # (pointing `_INSTALL_ANNEAL_BIN` at a wrapper, say) is
-                            # indistinguishable from install's own output without a
-                            # record of what install last wrote, and there is none.
-                            # ⛔ So the safe half is preserved and only the CLAIM is
-                            # dropped: silent, best-effort, never a refusal. The
-                            # spore-859 defect was never "we copy too much", it was
-                            # "we tell the operator they edited something they did
-                            # not" — and a false notice is the only part worth
-                            # removing. codex L3 HIGH.
-                            notify = False
-                    except OSError as e:
-                        # About to replace it and can't compare it — don't destroy
-                        # blind. A failure on either side is equally a reason to keep
-                        # the operator's bytes, so this refuses rather than guessing.
-                        raise InitError(
-                            f"could not compare {current} against its replacement to "
-                            f"check for operator edits ({e}). Refusing to overwrite a "
-                            f"possibly-edited file; resolve the error and re-run."
-                        ) from e
-                # About to be overwritten or deleted, and these bytes are not
-                # reproducible from the install — so they are the operator's.
-                if backup_staging is None and not staging_failed:
-                    candidate = (
-                        dst.parent / ".levain" / "backups" / "activation" / str(time.time_ns())
-                    )
-                    try:
-                        candidate.mkdir(parents=True, exist_ok=True)
-                        backup_staging = candidate
-                    except OSError:
-                        staging_failed = True  # see the fail-loud guard below
-                if backup_staging is None:
-                    if not notify:
-                        # Best-effort: never block a pristine reinstall — but SAY SO.
-                        # A silent skip here would lose an edit confined to the
-                        # substituted line with no trace at all, which is the failure
-                        # mode of "act safely, stay quiet". The copy is allowed to
-                        # fail; the SILENCE is not.
-                        unstaged_notes.append(
-                            f"  note: could not stage a copy of {name} (backup dir under "
-                            f"{dst.parent / '.levain' / 'backups'} could not be created). "
-                            f"Proceeding — but if you had edited that file, the edit is "
-                            f"not recoverable."
-                        )
-                        continue
-                    raise InitError(
-                        f"operator-edited {name} would be replaced by this re-install, "
-                        f"but the backup dir under {dst.parent / '.levain' / 'backups'} "
-                        f"could not be created. Refusing to overwrite your edit; fix the "
-                        f"backup-dir permissions (or back {current} up yourself) and re-run."
-                    )
-                bak = backup_staging / name
-                try:
-                    bak.parent.mkdir(parents=True, exist_ok=True)  # `hooks/x.py` is nested
-                    shutil.copy2(current, bak)
-                except OSError as e:
-                    if not notify:
-                        emit(
-                            f"  note: could not stage a copy of {name} ({e}). Proceeding "
-                            f"— but if you had edited that file, the edit is not "
-                            f"recoverable."
-                        )
-                        continue
-                    raise InitError(
-                        f"operator-edited {name} could not be backed up to {bak} ({e}). "
-                        f"Refusing to overwrite your edit; back {current} up yourself and "
-                        f"re-run."
-                    ) from e
-                if notify:
-                    backups.append((name, bak))
+        # This run's receipt, from the staged bytes and the winning source of each.
+        receipt: dict[str, dict[str, str]] = {
+            rel_str: {
+                "installed": _sha256_stream(new_tree / rel_str),
+                "source": _sha256_stream(source),
+            }
+            for rel_str, source in composed.items()
+        }
+        prior_installed, prior_status = read_activation_receipt(dst.parent)
     except BaseException:
-        # Any build failure (vanished source, collision, interrupt) leaves dst
-        # untouched. Clean the staged tree AND this run's backups — the originals
-        # still live in the untouched dst, so the backups would be misleading.
         shutil.rmtree(new_tree, ignore_errors=True)
-        if backup_staging is not None:
-            shutil.rmtree(backup_staging, ignore_errors=True)
         raise
 
-    # Atomic swap with rollback: move the old tree ASIDE (atomic rename), move the
-    # new one into place (atomic rename), delete the old on success. A swap failure
-    # restores the original — `dst` is never left missing or partial. Both renames
-    # are same-filesystem (all under `dst.parent`). codex L3 re-verify MED.
-    old_aside: Path | None = None
+    live_receipt = activation_receipt_path(dst.parent)
+    # Held in memory so a swap that does not go through can restore the live receipt
+    # exactly as it was; see the rollback below.
+    prior_receipt_text: str | None = None
+    if prior_status == "ok":
+        try:
+            prior_receipt_text = _read_receipt_text(live_receipt)
+        except (OSError, ValueError):
+            pass
+    backups_root = dst.parent / ".levain" / "backups" / "activation"
+    had_previous = dst.exists() or dst.is_symlink()
+    stamp = time.time_ns()
+    tree_backup = backups_root / f"{_TREE_BACKUP_PREFIX}{stamp}"
+    carried_receipt: Path | None = None
+
+    def _drop_carried() -> None:
+        if carried_receipt is not None:
+            try:
+                carried_receipt.unlink()
+            except OSError:
+                pass
+
+    # The previous tree's receipt travels with it, copied BEFORE the invalidation below
+    # removes the live one. A failed copy leaves that tree unproven, so it is kept. The
+    # path is recorded before copying, so a partial copy is removed rather than orphaned
+    # (L1 LOW, reproduced). A symlinked activation/ carries none; see the swap.
+    if had_previous and prior_status == "ok" and not dst.is_symlink():
+        carried_receipt = _tree_receipt_path(tree_backup)
+        try:
+            backups_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(live_receipt, carried_receipt)
+        except OSError:
+            _drop_carried()
+            carried_receipt = None
+
+    # ⛔ INVALIDATE THE LIVE RECEIPT BEFORE THE SWAP (L1 + L2 HIGH, reproduced
+    # 2026-09-13): removed only afterwards, it outlived any interrupt, kill or unwritable
+    # `.levain/` in between, describing a tree no longer installed. Absent reads as
+    # UNKNOWN. Skipped when it already records exactly the bytes about to be installed, so
+    # a no-change reinstall is never blocked by an unwritable `.levain/`.
+    if prior_installed is None or {
+        rel: entry["installed"] for rel, entry in prior_installed.items()
+    } != {rel: entry["installed"] for rel, entry in receipt.items()}:
+        try:
+            live_receipt.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            shutil.rmtree(new_tree, ignore_errors=True)
+            _drop_carried()
+            raise InitError(
+                f"could not remove the previous activation install receipt at "
+                f"{live_receipt} ({e}). It describes the tree this re-install replaces, and "
+                f"left in place it would report install's own files as your edits next "
+                f"time. Nothing was changed; fix the permissions on "
+                f"{dst.parent / '.levain'} and re-run."
+            ) from e
+
+    moved_to: Path | None = None
+    # Where the rename in flight would put the previous tree. Set BEFORE each `os.replace`, so
+    # the rollback decides from DISK whether that rename landed, never from which statement ran
+    # last. Assigning `moved_to` before the rename lost the receipt when the rename failed
+    # (complement + glm HIGH, round 2); assigning it after lost `activation/` when an interrupt
+    # landed between the two (codex HIGH, round 3). Both reproduced 2026-09-14.
+    candidate: Path | None = None
+    link_target: str | None = None
+    notes: list[str] = []
     try:
-        if dst.exists():
-            old_aside = dst.parent / f".levain-activation-old-{time.time_ns()}"
-            os.replace(dst, old_aside)
+        if had_previous and dst.is_symlink():
+            # A symlinked activation/ moves as the LINK. Renamed into backups, a relative
+            # link dangles and the notice points at nothing (L1 MED, L2 LOW, reproduced).
+            # Kept beside activation/ it still resolves; the content stays at its target.
+            link_target = os.readlink(dst)
+            candidate = dst.parent / f".levain-activation-prev-{stamp}"
+            os.replace(dst, candidate)
+            moved_to = candidate
+        elif had_previous:
+            try:
+                backups_root.mkdir(parents=True, exist_ok=True)
+                candidate = tree_backup
+                os.replace(dst, tree_backup)
+                moved_to = tree_backup
+            except OSError as e:
+                if not (dst.exists() or dst.is_symlink()):
+                    raise  # the rollback's reconcile finds the tree where the rename left it
+                candidate = dst.parent / f".levain-activation-prev-{stamp}"
+                try:
+                    os.replace(dst, candidate)
+                    moved_to = candidate
+                except OSError as e2:
+                    raise InitError(
+                        f"could not keep the previous activation/ under {backups_root} "
+                        f"({e}) or beside it ({e2}). Nothing was moved or deleted; fix the "
+                        f"permissions and re-run."
+                    ) from e2
+                _drop_carried()
+                notes.append(
+                    f"  note: could not keep the previous activation/ under {backups_root} "
+                    f"({e}). It is kept at {moved_to} instead, which levain never removes."
+                )
         os.replace(new_tree, dst)
-    except BaseException:
+    except BaseException as exc:
         shutil.rmtree(new_tree, ignore_errors=True)
-        if old_aside is not None and not dst.exists():
-            os.replace(old_aside, dst)  # restore the original tree
-        if backup_staging is not None:
-            shutil.rmtree(backup_staging, ignore_errors=True)
+        # Decided from DISK: a rename that landed before the interrupt did leaves the tree at
+        # `candidate` and nothing at `dst`, whatever `moved_to` says (codex HIGH, round 3).
+        if (moved_to is None and candidate is not None
+                and (candidate.exists() or candidate.is_symlink())
+                and not (dst.exists() or dst.is_symlink())):
+            moved_to = candidate
+        original_at_dst = moved_to is None and had_previous
+        if (moved_to is not None and not (dst.exists() or dst.is_symlink())
+                and (moved_to.exists() or moved_to.is_symlink())):
+            try:
+                os.replace(moved_to, dst)  # put the original tree back
+                original_at_dst = True
+            except OSError as e3:
+                # Raised in place of `exc` so the operator learns where the tree is (codex
+                # MED). `_drop_carried` is skipped: a carried receipt that still exists sits
+                # beside the tree under `backups_root`, which can still prove itself.
+                raise InitError(
+                    f"the new activation/ could not be installed ({exc}), and putting the "
+                    f"previous one back failed too ({e3}). The previous activation/ is intact "
+                    f"at {moved_to}; move it back to {dst} by hand. Nothing was deleted."
+                ) from exc
+        # ⛔ THE ORIGINAL TREE IS BACK, SO ITS RECEIPT GOES BACK (complement HIGH + glm MED ×2,
+        # reproduced 2026-09-14). The carried copy is used when it still exists (codex MED,
+        # round 2). The text read before the invalidation is the fallback, because the copy is
+        # absent whenever `backups_root` refused it, is already unlinked once the sibling fallback
+        # ran, and never exists for a symlinked activation/. Relying on the copy alone left an
+        # intact tree with no receipt on each of those paths, and on the refusal path beside an
+        # error saying nothing was deleted.
+        if (original_at_dst and not live_receipt.exists()
+                and (dst.exists() or dst.is_symlink())):
+            try:
+                if carried_receipt is not None and carried_receipt.exists():
+                    os.replace(carried_receipt, live_receipt)
+                    carried_receipt = None
+                elif prior_receipt_text is not None:
+                    _atomic_write_text(live_receipt, prior_receipt_text)
+            except OSError:
+                pass
+        _drop_carried()
         raise
-    if old_aside is not None:
-        shutil.rmtree(old_aside, ignore_errors=True)
 
-    for note in unstaged_notes:
+    # Everything below runs only after the new tree is in place: best-effort, never
+    # raising into a completed install.
+    try:
+        _write_activation_receipt(dst.parent, receipt)
+    except OSError as e:
+        notes.append(
+            f"  note: could not record the activation install receipt ({e}). The install "
+            f"is complete; the next `levain init --force` cannot tell your edits from "
+            f"install's own files, and that backup will be kept rather than rotated."
+        )
+
+    try:
+        _report_and_rotate(moved_to, link_target, prior_status, prior_installed,
+                           backups_root, emit, notes)
+    except OSError as e:
+        # The install is complete; nothing after the swap may turn it into a traceback that
+        # repeats on every later run (L1 HIGH, reproduced).
+        notes.append(f"  note: the install is complete, but reporting on or rotating old "
+                     f"backups failed ({e}); no backup was rotated by that step.")
+    for note in notes:
         emit(note)
-    for name, bak in backups:
-        emit(f"  ! Operator-edited {name} preserved at {bak}")
+
+
+def _report_and_rotate(
+    moved_to: Path | None,
+    link_target: str | None,
+    prior_status: str,
+    prior_installed: Mapping[str, Mapping[str, str]] | None,
+    backups_root: Path,
+    emit: Callable[[str], None],
+    notes: list[str],
+) -> None:
+    """Post-swap notices for the retained tree, then receipt-gated rotation."""
+    if moved_to is not None and link_target is not None:
+        emit(f"  activation/ was a symlink to {link_target}; that content is untouched at "
+             f"its target, and the link itself is kept at {moved_to}")
+        return
+    if moved_to is not None:
+        if prior_status == "ok" and prior_installed is not None:
+            edited, unexamined = _edits_against_receipt(moved_to, prior_installed)
+            for name in edited:
+                emit(f"  ! Operator-edited {name} preserved at {moved_to / name}")
+            for name in unexamined:
+                emit(f"  note: could not compare {name} with its install receipt; it is "
+                     f"preserved in {moved_to}")
+            emit(f"  Previous activation/ kept whole at {moved_to}")
+        else:
+            emit(
+                f"  Previous activation/ kept whole at {moved_to} (no install receipt "
+                f"covers it, so levain cannot tell whether you edited anything in it)"
+            )
+        if moved_to.parent == backups_root:
+            notes.extend(_prune_activation_backups(backups_root, _ACTIVATION_TREES_KEPT))
 
 
 def _substitute_hook_placeholders(hooks_dir: Path, mapping: dict[str, str]) -> None:
@@ -2148,6 +2353,51 @@ def _codex_block_dict(block: str) -> dict | None:
         return tomllib.loads(block)
     except (tomllib.TOMLDecodeError, ValueError):
         return None
+
+
+_LEVAIN_OWNED_CODEX_KEYS = ("command", "args")
+
+
+def _without_levain_keys(parsed: dict | None) -> dict | None:
+    """`parsed` with the keys `init` itself writes removed from the anneal_memory server
+    table, so only what an operator added is compared. None stays None."""
+    if parsed is None:
+        return None
+    servers = dict(parsed.get("mcp_servers") or {})
+    server = servers.get("anneal_memory")
+    if isinstance(server, dict):
+        servers["anneal_memory"] = {
+            k: v for k, v in server.items() if k not in _LEVAIN_OWNED_CODEX_KEYS
+        }
+    return {**parsed, "mcp_servers": servers}
+
+
+def _is_levain_launcher(parsed: dict | None, store: str | None) -> bool:
+    """Whether the anneal_memory server table launches `store` exactly as a levain `init`
+    wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, or the current
+    `<python> -P -m anneal_memory --db <store> serve`. Any other launcher was chosen by
+    someone, and replacing it is replacing their customisation."""
+    if parsed is None or store is None:
+        return False
+    server = (parsed.get("mcp_servers") or {}).get("anneal_memory") or {}
+    command, args = server.get("command"), server.get("args")
+    if not isinstance(command, str) or not isinstance(args, list):
+        return False
+    if args == ["--db", store, "serve"]:
+        return Path(command).name in ("anneal-memory", "anneal-memory.exe")
+    # The current shape's command is the interpreter `init` ran under, so it differs between
+    # venvs and cannot be compared for equality without re-raising Diogenes' false alarm on a
+    # re-init from another venv. It must at least BE a Python interpreter (complement + glm +
+    # codex HIGH, round 3, reproduced 2026-09-14: a wrapper keeping levain's exact args read
+    # as levain's own). ⚠ This picks the NOTICE only; `_merge_codex_config` backs the block
+    # up whatever this returns, so a misjudged launcher costs a wrong sentence, not the block.
+    return (
+        args == ["-P", "-m", "anneal_memory", "--db", store, "serve"]
+        and _PYTHON_NAME.fullmatch(Path(command).name) is not None
+    )
+
+
+_PYTHON_NAME = re.compile(r"python(?:3(?:\.\d+)?)?(?:\.exe)?")
 
 
 def _codex_block_store(block: str) -> str | None:
@@ -2228,6 +2478,10 @@ def _merge_codex_config(
     repoint: tuple[str, str, Path] | None = None
     unknown_prior: Path | None = None
     customized: Path | None = None
+    relaunched = False
+    relaunched_bak: Path | None = None
+    reformatted_bak: Path | None = None
+    new_dict: dict | None = None
     old_block_match = _CODEX_MCP_BLOCK_RE.search(existing)
     if old_block_match:
         old_dict = _codex_block_dict(old_block_match.group(0))
@@ -2272,8 +2526,34 @@ def _merge_codex_config(
             and new_store is not None
             and old_store != new_store
         )
-        content_changed = not replacing_unknown and not store_changed and old_dict != new_dict
-        if replacing_unknown or store_changed or content_changed:
+        # ⛔ LEVAIN'S OWN KEYS ARE NOT A CUSTOMISATION (Diogenes MEDIUM, 2026-09-14, his
+        # signature reproduced: 7 lines and a backup). `command` and `args` are what `init`
+        # writes, so they change on every pre-spore-751 upgrade and on a re-init from another
+        # interpreter; compared whole, the dicts always differed and the operator was told a
+        # customisation was gone when nothing of theirs was touched.
+        # ⛔ AND ONLY WHILE THE OLD LAUNCHER IS ONE LEVAIN ITSELF WROTE (codex HIGH, round 2,
+        # reproduced 2026-09-14): a customisation can live INSIDE `command`/`args` — a wrapper
+        # command plus `--trace` on the same store was replaced with no backup and no warning.
+        relaunched = (
+            not replacing_unknown and not store_changed and old_dict != new_dict
+            and _without_levain_keys(old_dict) == _without_levain_keys(new_dict)
+            and _is_levain_launcher(old_dict, old_store)
+        )
+        content_changed = (
+            not replacing_unknown and not store_changed and old_dict != new_dict
+            and not relaunched
+        )
+        # Settings identical, TEXT not: comments or formatting an operator put inside the block,
+        # which the replacement below deletes (codex MED, round 4, reproduced 2026-09-14: a
+        # `# corporate runbook` line vanished with no backup and no notice).
+        raw_changed = old_block_match.group(0).rstrip() + "\n" != new_block
+        # ⛔ PRESERVE ALWAYS; THE HEURISTIC CHOOSES ONLY THE WORDING (spore-865, applied 2026-09-14
+        # after three review rounds each found a launcher the classifier misjudged, and a fourth
+        # found a comment-only change no named case covered). The gate is the two FACTS, not the
+        # named cases: back up whenever the parsed block or its raw text differs, so a gap in the
+        # classification below can only produce an extra backup or a wrong notice, never a lost
+        # block. A byte-identical re-run stays silent.
+        if raw_changed or old_dict != new_dict:
             bak = _timestamped_backup_path(path)
             try:
                 shutil.copy2(path, bak)
@@ -2284,6 +2564,10 @@ def _merge_codex_config(
                     else f"from {old_store} to {new_store}"
                     if store_changed
                     else "whose settings would be overwritten"
+                    if content_changed
+                    else "whose launcher would be updated"
+                    if relaunched
+                    else "whose comments or formatting would be replaced"
                 )
                 raise InitError(
                     f"could not back up {path} ({e}) before replacing Codex's global "
@@ -2296,8 +2580,12 @@ def _merge_codex_config(
             elif store_changed:
                 assert old_store is not None and new_store is not None  # store_changed implies it
                 repoint = (old_store, new_store, bak)
-            else:
+            elif content_changed:
                 customized = bak
+            elif relaunched:
+                relaunched_bak = bak
+            else:
+                reformatted_bak = bak
         # `new_block` is data, not a template: a literal replacement, so a store path
         # containing a backslash cannot be read as a group reference and corrupt the file.
         existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
@@ -2394,8 +2682,9 @@ def _merge_codex_config(
             + (f"; your previous config is also copied at {repoint[2]}." if repoint
                else f"; your previous config is also copied at {unknown_prior}."
                if unknown_prior is not None
-               else f"; your previous config is also copied at {customized}."
-               if customized is not None else ".")
+               else f"; your previous config is also copied at "
+               f"{customized or relaunched_bak or reformatted_bak}."
+               if (customized or relaunched_bak or reformatted_bak) is not None else ".")
         ) from e
 
     if unknown_prior is not None:
@@ -2423,6 +2712,18 @@ def _merge_codex_config(
         emit("    (Every codex session on this machine reads that store, not")
         emit("     just this install. Re-run init from the install you want it")
         emit("     reading if this was not what you meant.)")
+
+    if relaunched:
+        server = ((new_dict or {}).get("mcp_servers") or {}).get("anneal_memory") or {}
+        emit(f"  Codex's GLOBAL anneal_memory registration in {path} keeps its store and now")
+        emit(f"    starts the memory server as: {server.get('command')} "
+             f"{' '.join(str(a) for a in server.get('args') or [])}")
+        emit(f"    Your previous config is copied at {relaunched_bak}")
+
+    if reformatted_bak is not None:
+        emit(f"  Codex's GLOBAL anneal_memory block in {path} keeps its settings, but comments or")
+        emit("    formatting inside that block were not kept.")
+        emit(f"    Your previous config is copied at {reformatted_bak}")
 
 
 def _run_anneal_cmd(
@@ -2474,6 +2775,8 @@ def _init_store(
 
     `emit` (default `print`) sinks the progress + failure-remediation lines so a
     web init can surface them in the browser; the CLI is byte-unchanged."""
+    from levain.manifest import anneal_invocation, pip_invocation
+
     emit("")
     if store.is_file() and store.stat().st_size > 0:
         # An existing store carries the entity's memory + identity; --force
@@ -2501,8 +2804,8 @@ def _init_store(
             emit(f"    - {e}")
         emit("    The memory is preserved, but the schema may still be the ops")
         emit("    default — a partnership entity needs the 6-section schema.")
-        emit("    Fix: pip install -U anneal-memory")
-        emit(f"    Then: anneal-memory --db {store} set-schema partnership")
+        emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
+        emit(f"    Then: {anneal_invocation('--db', str(store), 'set-schema', 'partnership')}")
         return False
 
     emit(f"Initializing anneal-memory store at {store}...")
@@ -2523,8 +2826,8 @@ def _init_store(
     emit("    Most likely cause: anneal-memory is not installed in this Python,")
     emit("    or is older than the release that supports `init --schema` /")
     emit("    `set-schema` (the 6-section partnership schema).")
-    emit("    Fix: pip install -U anneal-memory")
-    emit(f"    Then: anneal-memory --db {store} init --schema partnership")
+    emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
+    emit(f"    Then: {anneal_invocation('--db', str(store), 'init', '--schema', 'partnership')}")
     return False
 
 

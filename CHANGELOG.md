@@ -15,7 +15,32 @@ Stamped `0.4.7.dev0`. **The tree past a release tag no longer claims the release
 - The MCP registration (`.mcp.json` for Claude Code, `[mcp_servers.anneal_memory]` in `~/.codex/config.toml` for Codex) now runs `<Levain's Python> -P -m anneal_memory`. `-P` keeps the directory the client was started in off Python's import path, so an `anneal_memory/` source checkout there cannot stand in for the installed package.
 - The hooks, `doctor`, `update` and `init --web` use the `anneal-memory` script that belongs to the anneal package Levain's own Python imports. They find it through that package's install record, not through `PATH`. If that script cannot be run, they fall back to `<Levain's Python> -P -m anneal_memory`. The hooks no longer try a bare `anneal-memory` from `PATH` at all.
 
-**Existing installs keep their old registration until you re-run `levain init --force`.** Nothing breaks if you don't; you keep whichever anneal the old lookup picked.
+**Existing installs keep their old registration until you re-run `levain init --force`.** Nothing breaks if you don't; you keep whichever anneal the old lookup picked. `levain doctor` now reports such a registration as a pending post-upgrade step (below).
+
+### Changed — `levain doctor` exits 6 when the only failures are post-upgrade steps not yet applied
+
+`doctor` used to exit 1 both when something was broken and when a routine post-upgrade step was still pending, so the expected upgrade path looked like a broken install. It now exits:
+
+- `0` — every check passed;
+- `1` — at least one failure that is not a pending upgrade step (and whenever `--invoke`'s live-fire check fails);
+- `6` — every failure is a post-upgrade step not yet applied: hooks or the adapter carrier that predate the installed levain, the version set last composed by an older levain (`levain update` pending), or a memory-server registration that does not run Levain's own interpreter (`levain init --force` pending).
+
+The failures are still printed as `FAIL`, because they are real: until you apply the named remedy, the install keeps running the activation layer from the release it was last set up with.
+
+⚠ **If a script branches on specific codes** (`case $? in 1) ...`), exit 6 no longer matches the `1` branch. Scripts that only test for nonzero (`levain doctor || alert`) behave as before.
+
+### Changed — `levain init --force` keeps your whole previous `activation/` tree, and deletes an old one only when it can prove you never edited it
+
+`init --force` used to look at each file under `activation/` before replacing the tree, and copy the ones it judged to be yours into `.levain/backups/activation/<timestamp>/`. Anything that judgement could not handle was lost: an edit saved in the moment between the check and the replacement, a symlink, a directory it could not read.
+
+- **The previous tree is moved whole** to `.levain/backups/activation/tree-<timestamp>/`. Every file, symlink and directory you had is in it, exactly as it was.
+- **`init` now records what it installed** in `.levain/activation-manifest.json`: for each file under `activation/`, the sha256 of the bytes as installed and of the package file they came from. A copy travels beside each kept tree as `tree-<timestamp>.receipt.json`.
+- **An old tree is deleted only if every file in it matches that record**, with nothing added and no symlinks: then it holds nothing of yours. The newest three such trees are kept. Any tree that differs, has extra files or symlinks, or has no readable record (every tree kept from an install made before this release) is **never deleted**, and `init` names it.
+- The "Operator-edited … preserved at" lines are worked out from that record, so they now also catch an edit made only to the `_INSTALL_ANNEAL_BIN` line of a hook. Where there is no record, `init` says it cannot tell.
+- If `.levain/backups/activation/` cannot take the move, the previous tree is kept beside `activation/` as `.levain-activation-prev-<timestamp>`, `init` tells you so, and levain never removes it. A reinstall is never blocked by this.
+- Backup directories written by earlier releases (named with a bare timestamp) are never removed.
+- This supersedes 0.4.5's stated exception for symlinks under `activation/`: they are now kept as symlinks.
+- If `activation/` itself is a symlink, the link is kept beside it as `.levain-activation-prev-<timestamp>` (where it still resolves) and its target is left untouched; `init` says so.
 
 ## [0.4.6] — 2026-09-13
 

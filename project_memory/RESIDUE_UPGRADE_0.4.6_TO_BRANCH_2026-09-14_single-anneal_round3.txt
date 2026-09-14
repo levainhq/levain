@@ -1,0 +1,260 @@
+=== RESIDUE TRANSCRIPT (single-anneal operator, round-3 tree) — scratch HOME=/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home PATH=/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin:/usr/bin:/bin:/usr/sbin:/sbin, 2026-09-14 08:38 EDT ===
+which anneal-memory: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory
+=== STEP 1: published levain from PyPI ===
+levain 0.4.6 | anneal-memory 0.9.9
+$ levain init --path inst --adapter codex --answers answers.json
+
+Levain init — installing to /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  adapter:    codex
+  python:     /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python
+  anneal:     /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory
+
+============================================================
+Interview — fills the world.md, origin.md templates.
+============================================================
+  Non-interactive — 17 answer(s) from answers.json.
+  Codex adapter installed.
+
+Initializing anneal-memory store at /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db...
+  Store initialized (partnership schema).
+  Recorded the known-good set (anneal 0.9.9 / schema partnership).
+  Methodology baseline set (migrations through 0.9.7 — your seed is current as of this release).
+
+Files created (you can hand-edit any of these):
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/README.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/continuity.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/memory.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/origin.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/partnership.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/spore_instructions.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/world.md
+  adapter         /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/AGENTS.md
+  codex (global)  /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/hooks.json
+  codex (global)  /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/config.toml
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/_levain_hook.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/session_start.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/user_prompt_submit.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/posture.md
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/recency_directives.md
+  store           /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db
+
+  (activation/posture.md is what DIRECTS your entity — see below. It and
+   recency_directives.md are yours to tune as you learn the shapes your
+   substrate's training leaks.)
+
+============================================================
+Install complete.
+============================================================
+  Install:   /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  Adapter:   codex
+
+What the interview did NOT set:
+  Your answers describe WHO you are — they were written into your
+  seed files under seed/, which your entity reads as CONTEXT.
+
+  They did NOT write HOW it behaves. That is a separate file:
+        /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/posture.md
+  — the block injected at the TOP of every session. It ships as a
+  generic starter and the interview leaves it untouched.
+
+  So if you told the interview how you want to be worked with and
+  want that ENFORCED rather than merely known, edit posture.md now.
+  (activation/recency_directives.md is the same idea applied within
+   a session.)
+
+Next steps:
+  - IMPORTANT — Codex hook trust is per-content-hash. The very
+    first invocation MUST be interactive `codex` (not `codex exec`)
+    so Codex can prompt to trust the hook scripts. Editing the
+    hook scripts invalidates trust until re-approved interactively.
+        cd /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst && codex
+  - Verify the install (loud):  levain doctor --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  - Smoke-test the hooks:       levain verify-hooks --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  - (`doctor` static-checks wiring; `verify-hooks` actually invokes the
+     hook scripts. The harness still has to invoke them — verify in an
+     interactive session.)
+
+[init exit=0]
+=== codex config.toml as 0.4.6 wrote it (comments stripped) ===
+
+[mcp_servers.anneal_memory]
+command = "/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory"
+args = ["--db", "/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db", "serve"]
+=== STEP 2: upgrade the package to seat/0914-l3triage @ 5a583a3 ===
+levain 0.4.7.dev0 | anneal-memory 0.9.9
+=== STEP 3: levain doctor BEFORE re-init (the C6 case) ===
+$ levain doctor --path inst
+Levain doctor — checking /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+
+  [OK] install root: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  [OK] seed/: 7 files present (origin.md, partnership.md, world.md, memory.md, spore_instructions.md, continuity.md, README.md)
+  [OK] activation/: 2 activation files present
+  [OK] hook scripts: 3 scripts present and parse OK
+  [FAIL] hook freshness: installed hook script(s) differ from the package: _levain_hook.py — the hooks that run are these installed copies, not the package's (no install receipt covers them, so doctor cannot tell an outdated hook from an edited one)
+      → Your hooks predate the installed levain version (or were edited), and hook fixes do NOT arrive via `pip install -U` or `levain update`. Re-render with `levain init --force --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst` — it RE-RUNS THE INTERVIEW and replaces the whole activation/ tree. Your store is kept, and the previous activation/ tree is moved whole into .levain/backups/activation/ first, hooks and all (an old copy is removed only when it provably holds no edits).
+  [OK] activation scope: install-scoped (the default) — hooks fire only for sessions whose working directory is inside /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst — your Codex hooks are wired globally, so they run in every Codex session and stay silent outside it. Set {"scope": "global"} in .levain/config.json if you want the entity present everywhere
+  [OK] seed content (world.md): no unfilled placeholders
+  [OK] seed content (origin.md): no unfilled placeholders
+  [OK] seed content (answers present): 17 recorded field(s), none empty
+  [OK] seed content (seed matches record): rendered seed carries every recorded answer
+  [OK] seed content (answer shapes): consistent with each field
+  [OK] python interpreter: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python (3.12.13)
+  [OK] anneal-memory CLI: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory (anneal-memory 0.9.9)
+  [OK] .levain/memory.db: reachable (5 table(s): associations, episodes, metadata…)
+  [FAIL] compat: levain: levain upgraded 0.4.6 -> 0.4.7.dev0 since the set was last composed
+      → Run `levain update` to reconcile anneal + schema + migrations to the new known-good set.
+  [OK] compat: anneal: anneal-memory 0.9.9 is AHEAD of this levain release's known-good 0.9.8 — untested together — advisory (run `levain update`); not a set failure
+  [OK] compat: schema: store schema is partnership
+  [OK] compat: migrate: no unreviewed anneal migration proposals
+  [OK] compat: pip-pin: known-good anneal 0.9.8 matches the pip floor >=0.9.8
+
+  Adapter: codex
+  [OK] AGENTS.md: present
+  [OK] AGENTS.md freshness: matches current seed classification
+  [OK] context surface: 36,165 B loaded every session across 4 seed file(s) + carrier — identity 3,685B · mechanism 21,893B · method 8,883B (61% mechanism) — mostly machinery, which is a Levain composition issue, not yours
+  [OK] ~/.codex/hooks.json SessionStart → session_start.py: wired to this install (/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python)
+  [OK] ~/.codex/hooks.json UserPromptSubmit → user_prompt_submit.py: wired to this install (/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python)
+  [OK] config.toml [mcp_servers.anneal_memory]: registered, store=/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db
+  [FAIL] config.toml [mcp_servers.anneal_memory] command: launches `/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory`, not `/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python -P -m anneal_memory` — the anneal serving your memory may not be the one levain checks and upgrades
+      → Registrations written before levain pinned the memory server to its own interpreter look like this. `levain init --force --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst` rewrites it (it RE-RUNS THE INTERVIEW; your store is kept).
+
+3 check(s) FAILED.
+  Every failure above is a post-upgrade step not yet applied (exit 6, not 1).
+  None of them is classed as broken, but until you apply them this install
+  is still running what an earlier levain set up (its activation layer,
+  adapter carrier or memory-server registration), not what the installed
+  levain ships.
+  Note: doctor is static — it does NOT invoke the activation hooks.
+        For the actual firing test, run `levain verify-hooks`
+        or `levain doctor --invoke`.
+        Also: hooks no-op when LEVAIN_HOOK_SUPPRESS=1 is in the env.
+[doctor exit=6]
+=== STEP 4: levain init --force ===
+$ levain init --path inst --adapter codex --force --answers answers.json
+
+Levain init — installing to /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  adapter:    codex
+  python:     /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python
+  anneal:     /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory
+
+============================================================
+Interview — fills the world.md, origin.md templates.
+============================================================
+  Non-interactive — 17 answer(s) from answers.json.
+  Previous activation/ kept whole at /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/backups/activation/tree-1789389516407945000 (no install receipt covers it, so levain cannot tell whether you edited anything in it)
+  Kept, because they may hold edits (levain deletes a backup only when it proves unedited): /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/backups/activation/tree-1789389516407945000
+  ! Existing /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/hooks.json backed up to /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/hooks.json.bak.1789389516408772000
+    (Codex is one-install-per-machine at v1 — this install now owns it.)
+  Codex's GLOBAL anneal_memory registration in /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/config.toml keeps its store and now
+    starts the memory server as: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python -P -m anneal_memory --db /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db serve
+    Your previous config is copied at /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/config.toml.bak.1789389516409197000
+  Codex adapter installed.
+
+anneal-memory store already present at /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db — memory preserved.
+  Section schema already partnership — nothing to migrate.
+  Recorded the known-good set (anneal 0.9.9 / schema partnership).
+
+Files created (you can hand-edit any of these):
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/README.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/continuity.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/memory.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/origin.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/partnership.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/spore_instructions.md
+  seed            /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/seed/world.md
+  adapter         /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/AGENTS.md
+  codex (global)  /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/hooks.json
+  codex (global)  /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/home/.codex/config.toml
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/_levain_hook.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/session_start.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/hooks/user_prompt_submit.py
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/posture.md
+  activation      /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/recency_directives.md
+  store           /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db
+
+  (activation/posture.md is what DIRECTS your entity — see below. It and
+   recency_directives.md are yours to tune as you learn the shapes your
+   substrate's training leaks.)
+
+============================================================
+Install complete.
+============================================================
+  Install:   /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  Adapter:   codex
+
+What the interview did NOT set:
+  Your answers describe WHO you are — they were written into your
+  seed files under seed/, which your entity reads as CONTEXT.
+
+  They did NOT write HOW it behaves. That is a separate file:
+        /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/activation/posture.md
+  — the block injected at the TOP of every session. It ships as a
+  generic starter and the interview leaves it untouched.
+
+  So if you told the interview how you want to be worked with and
+  want that ENFORCED rather than merely known, edit posture.md now.
+  (activation/recency_directives.md is the same idea applied within
+   a session.)
+
+Next steps:
+  - IMPORTANT — Codex hook trust is per-content-hash. The very
+    first invocation MUST be interactive `codex` (not `codex exec`)
+    so Codex can prompt to trust the hook scripts. Editing the
+    hook scripts invalidates trust until re-approved interactively.
+        cd /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst && codex
+  - Verify the install (loud):  levain doctor --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  - Smoke-test the hooks:       levain verify-hooks --path /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  - (`doctor` static-checks wiring; `verify-hooks` actually invokes the
+     hook scripts. The harness still has to invoke them — verify in an
+     interactive session.)
+
+[init exit=0]
+=== codex config.toml after re-init (comments stripped) ===
+
+[mcp_servers.anneal_memory]
+command = "/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python"
+args = ["-P", "-m", "anneal_memory", "--db", "/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db", "serve"]
+=== files in CODEX_HOME ===
+config.toml
+config.toml.bak.1789389516409197000
+hooks.json
+hooks.json.bak.1789389516408772000
+=== STEP 5: levain doctor AFTER re-init ===
+$ levain doctor --path inst
+Levain doctor — checking /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+
+  [OK] install root: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst
+  [OK] seed/: 7 files present (origin.md, partnership.md, world.md, memory.md, spore_instructions.md, continuity.md, README.md)
+  [OK] activation/: 2 activation files present
+  [OK] hook scripts: 3 scripts present and parse OK
+  [OK] hook freshness: hook scripts match the package
+  [OK] activation scope: install-scoped (the default) — hooks fire only for sessions whose working directory is inside /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst — your Codex hooks are wired globally, so they run in every Codex session and stay silent outside it. Set {"scope": "global"} in .levain/config.json if you want the entity present everywhere
+  [OK] seed content (world.md): no unfilled placeholders
+  [OK] seed content (origin.md): no unfilled placeholders
+  [OK] seed content (answers present): 17 recorded field(s), none empty
+  [OK] seed content (seed matches record): rendered seed carries every recorded answer
+  [OK] seed content (answer shapes): consistent with each field
+  [OK] python interpreter: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python (3.12.13)
+  [OK] anneal-memory CLI: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/anneal-memory (anneal-memory 0.9.9)
+  [OK] .levain/memory.db: reachable (5 table(s): associations, episodes, metadata…)
+  [OK] compat: levain: levain 0.4.7.dev0 (matches last composed)
+  [OK] compat: anneal: anneal-memory 0.9.9 is AHEAD of this levain release's known-good 0.9.8 — untested together — advisory (run `levain update`); not a set failure
+  [OK] compat: schema: store schema is partnership
+  [OK] compat: migrate: no unreviewed anneal migration proposals
+  [OK] compat: pip-pin: known-good anneal 0.9.8 matches the pip floor >=0.9.8
+
+  Adapter: codex
+  [OK] AGENTS.md: present
+  [OK] AGENTS.md freshness: matches current seed classification
+  [OK] context surface: 36,165 B loaded every session across 4 seed file(s) + carrier — identity 3,685B · mechanism 21,893B · method 8,883B (61% mechanism) — mostly machinery, which is a Levain composition issue, not yours
+  [OK] ~/.codex/hooks.json SessionStart → session_start.py: wired to this install (/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python)
+  [OK] ~/.codex/hooks.json UserPromptSubmit → user_prompt_submit.py: wired to this install (/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python)
+  [OK] config.toml [mcp_servers.anneal_memory]: registered, store=/Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/inst/.levain/memory.db
+  [OK] config.toml [mcp_servers.anneal_memory] command: /Users/phillipclapham/.claude/jobs/0ed1cbb8/tmp/residue5/venv/bin/python -P -m anneal_memory (this levain's environment)
+
+All checks passed.
+  Note: doctor is static — it does NOT invoke the activation hooks.
+        For the actual firing test, run `levain verify-hooks`
+        or `levain doctor --invoke`.
+        Also: hooks no-op when LEVAIN_HOOK_SUPPRESS=1 is in the env.
+[doctor exit=0]

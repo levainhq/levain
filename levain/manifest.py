@@ -266,6 +266,35 @@ def declared_set() -> CompatSet:
 # Discovery — read the INSTALLED set from anneal's own JSON CLI
 # ---------------------------------------------------------------------------
 
+# The first levain release whose lock records the anneal its own interpreter imports
+# (spore-751). Locks from earlier releases recorded whichever `anneal-memory` PATH found.
+# ⚠ `_cmp` ignores `.devN`, so a lock written by a 0.4.7.dev0 build from before 751 merged
+# is treated as post-751; that affects dev installs only.
+_FIRST_SINGLE_ANNEAL_LEVAIN = "0.4.7"
+
+
+def anneal_invocation(*args: str) -> str:
+    """The command an operator should TYPE to reach the anneal levain's interpreter imports.
+
+    For advice strings only. A bare `anneal-memory` resolves through PATH, which can name a
+    different anneal from the one serving the store: the split `spore-751` ended in the
+    code and left standing in the remediation text (Diogenes LOW, 2026-09-14).
+
+    Pass the real arguments: all of them are shell-quoted together, so an install path
+    holding a space pastes as one `--db` value (codex MED, 2026-09-14). A caller showing a
+    placeholder such as `<store>` passes none and appends it as display text."""
+    import shlex
+
+    return shlex.join([sys.executable, "-P", "-m", "anneal_memory", *args])
+
+
+def pip_invocation() -> str:
+    """`<levain python> -m pip`, for advice strings: a bare `pip` can belong to another Python."""
+    import shlex
+
+    return f"{shlex.quote(sys.executable)} -m pip"
+
+
 def resolve_anneal_bin() -> str:
     """The ``anneal-memory`` console script of the anneal THIS interpreter imports.
 
@@ -460,8 +489,8 @@ def compute_drift(
         verdicts.append(AxisVerdict(
             "anneal", "unknown",
             "could not determine the installed anneal-memory version",
-            "Check `anneal-memory --version`; install/repair with "
-            "`pip install -U anneal-memory`.",
+            f"Check `{anneal_invocation()} --version`; install/repair with "
+            f"`{pip_invocation()} install -U anneal-memory`.",
         ))
     else:
         cmp = _cmp(installed.anneal, declared.anneal)
@@ -475,7 +504,7 @@ def compute_drift(
                 "anneal", "behind",
                 f"anneal-memory {installed.anneal} is BEHIND known-good "
                 f"{declared.anneal}",
-                f"Run `levain update` (or `pip install 'anneal-memory=="
+                f"Run `levain update` (or `{pip_invocation()} install 'anneal-memory=="
                 f"{declared.anneal}'`).",
             ))
         else:
@@ -484,7 +513,8 @@ def compute_drift(
                 f"anneal-memory {installed.anneal} is AHEAD of this levain "
                 f"release's known-good {declared.anneal} — untested together",
                 "Run `levain doctor` after upgrading levain "
-                "(`pip install -U levain`); review `anneal-memory migrate check` "
+                f"(`{pip_invocation()} install -U levain`); review "
+                f"`{anneal_invocation()} --db <store> migrate check` "
                 "for instruction edits the newer anneal implies.",
             ))
 
@@ -495,21 +525,36 @@ def compute_drift(
         and installed.anneal is not None
         and _cmp(installed.anneal, lock.anneal) != 0
     ):
-        verdicts.append(AxisVerdict(
-            "anneal-lock", "drift",
-            f"anneal-memory changed {lock.anneal} -> {installed.anneal} since this "
-            f"install was last composed (an out-of-band upgrade)",
-            "Run `levain update` so the methodology layer reconciles with the new "
-            "anneal (this is the exact drift that lands a new feature as a conflict "
-            "with stale instructions).",
-        ))
+        if lock.levain and _cmp(lock.levain, _FIRST_SINGLE_ANNEAL_LEVAIN) < 0:
+            # ⚖ Phill 2026-09-14, option 3: the exit code stays, the TEXT names the likely
+            # cause. A pre-spore-751 levain recorded whichever `anneal-memory` came first on
+            # PATH, so a mismatch here is most likely a second anneal on PATH at lock-write
+            # time, not an upgrade (measured on a scratch-HOME upgrade from published 0.4.6).
+            verdicts.append(AxisVerdict(
+                "anneal-lock", "drift",
+                f"anneal-memory {lock.anneal} -> {installed.anneal}: this install's lock was "
+                f"written by levain {lock.levain}, which recorded whichever anneal-memory came "
+                f"first on PATH. That was most likely a different anneal from the one levain "
+                f"runs, not an out-of-band upgrade",
+                "Run `levain init --force` (it RE-RUNS THE INTERVIEW; your store is kept) or "
+                "`levain update`; either records the anneal levain's own interpreter imports.",
+            ))
+        else:
+            verdicts.append(AxisVerdict(
+                "anneal-lock", "drift",
+                f"anneal-memory changed {lock.anneal} -> {installed.anneal} since this "
+                f"install was last composed (an out-of-band upgrade)",
+                "Run `levain update` so the methodology layer reconciles with the new "
+                "anneal (this is the exact drift that lands a new feature as a conflict "
+                "with stale instructions).",
+            ))
 
     # -- schema (the store's section schema) --
     if installed.schema is None:
         verdicts.append(AxisVerdict(
             "schema", "unknown",
             "could not determine the store's section schema",
-            "Check `anneal-memory --db <store> status --json`.",
+            f"Check `{anneal_invocation()} --db <store> status --json`.",
         ))
     elif installed.schema == declared.schema:
         verdicts.append(AxisVerdict(
@@ -539,9 +584,9 @@ def compute_drift(
             "migrate", "pending",
             f"{n} unreviewed anneal migration proposal(s) — your instruction "
             f"files may have drifted from the substrate",
-            "Run `anneal-memory migrate check` to review, apply the edits that "
-            "fit (under operator review — anneal never clobbers), then "
-            "`anneal-memory migrate ack`. `levain update` walks this.",
+            f"Run `{anneal_invocation()} --db <store> migrate check` to review, apply "
+            f"the edits that fit (under operator review — anneal never clobbers), then "
+            f"`{anneal_invocation()} --db <store> migrate ack`. `levain update` walks this.",
         ))
 
     return SetDrift(verdicts=verdicts)
