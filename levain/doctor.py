@@ -1654,12 +1654,37 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
     # since init wrote it" (an edit, never routine). With no receipt entry — every install
     # made before the receipt existed — the hook stays pending and the text says doctor
     # cannot tell which it is.
+    #
+    # ⚖ C6 AMENDED (Phill, 2026-09-15): a CORRUPT or EMPTY receipt is not a pre-receipt
+    # install and must not read as one. `_write_activation_receipt` (install.py) is the
+    # sole writer and runs after the tree is in place; a failed write reads as absent, and
+    # rollback restores the prior text — so a legitimate install cannot produce a corrupt
+    # or empty receipt. Reading one as "no receipt yet" would downgrade an edited/tampered
+    # hook (e.g. an appended `os.system(...)`) from broken (exit 1) to pending (exit 6),
+    # exactly like the pack-provenance corrupt refusal ~90 lines up already fails closed.
     edited: list[str] = []
     unproven: list[str] = []
     if stale:
-        from levain.install import _sha256_stream, read_activation_receipt
+        from levain.install import _sha256_stream, activation_receipt_path, read_activation_receipt
 
-        receipt_files, _status = read_activation_receipt(install)
+        receipt_files, status = read_activation_receipt(install)
+        if status in ("corrupt", "empty"):
+            return [
+                CheckResult(
+                    "hook freshness",
+                    False,
+                    "installed hook script(s) differ from the package: "
+                    + ", ".join(sorted(set(stale)))
+                    + f" — the install receipt at {activation_receipt_path(install)} is "
+                    f"unreadable ({status}), so doctor cannot tell an outdated hook from an "
+                    f"edited one; a damaged receipt is not a pre-receipt install",
+                    f"Re-render with `levain init --force --path {install}` — it RE-RUNS THE "
+                    f"INTERVIEW and replaces the whole activation/ tree. Your store is kept, "
+                    f"and the previous activation/ tree is moved whole into "
+                    f".levain/backups/activation/ first, hooks and all (an old copy is removed "
+                    f"only when it provably holds no edits).",
+                )
+            ]
         for rel in sorted(set(stale)):
             entry = (receipt_files or {}).get(f"hooks/{rel}")
             if entry is None:
