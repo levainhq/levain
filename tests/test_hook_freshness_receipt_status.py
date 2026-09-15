@@ -91,10 +91,13 @@ def test_hook_freshness_by_receipt_status(
     assert text_fragment in r.detail, r.detail
 
 
-def test_corrupt_and_empty_name_the_receipt_path_and_remedy(tmp_path: Path):
+@pytest.mark.parametrize("receipt_mode", ["corrupt", "empty"])
+def test_corrupt_and_empty_name_the_receipt_path_and_remedy(tmp_path: Path, receipt_mode: str):
     """The C6 amendment requires the check's own text to name the unreadable receipt
-    and the `init --force` remedy -- not just say "differ from the package"."""
-    install = _edited_hook_install(tmp_path, "corrupt")
+    and the `init --force` remedy -- not just say "differ from the package" -- for BOTH
+    damaged-receipt states, not only "corrupt" (glm L3 LOW: the name/docstring promised
+    both, the body only ever called "corrupt")."""
+    install = _edited_hook_install(tmp_path, receipt_mode)
     r = doctor._check_hook_freshness(install)[0]
     assert str(inst.activation_receipt_path(install)) in r.detail
     assert r.hint is not None and "levain init --force" in r.hint
