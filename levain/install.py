@@ -1755,14 +1755,10 @@ def read_activation_receipt_file(
     record exists to remove.
     """
     try:
-        # Bounded (codex MED): a damaged or hostile receipt of any size must read as corrupt,
-        # never exhaust memory. A real one is a few KB per hundred files.
-        if path.stat().st_size > _RECEIPT_MAX_BYTES:
-            return None, "corrupt"
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_receipt_text(path)
     except FileNotFoundError:
         return None, "absent"
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError):
         return None, "corrupt"
     try:
         data = json.loads(raw)

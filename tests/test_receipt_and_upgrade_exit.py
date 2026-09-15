@@ -737,6 +737,45 @@ def test_an_OVERSIZED_receipt_reads_as_corrupt_without_being_parsed(tmp_path: Pa
     assert read_activation_receipt_file(path) == (None, "corrupt")
 
 
+def test_a_receipt_that_GROWS_between_stat_and_read_is_still_bounded(tmp_path: Path, monkeypatch):
+    """diogenes-20260915-021123-837af5a66f91 (LOW), sharpened after codex L3: an
+    already-oversized file that is NOT valid receipt shape is caught by the old
+    stat-then-read_text code too (json.loads succeeds on `{}`-with-padding, then the schema
+    check rejects it) -- that alone does not kill the TOCTOU mutation. So the padded file
+    here IS a syntactically valid, schema-correct receipt with one real file entry, which
+    the old code would accept as "ok" if it ever read the whole thing. `stat()` is made to
+    LIE (report a size under the cap) while the file on disk is genuinely oversized,
+    simulating growth between the two calls the old code made separately.
+    `read_activation_receipt_file` no longer touches path.stat at all --
+    `_read_receipt_text`'s single bounded `fh.read` truncates before `_RECEIPT_MAX_BYTES + 1`
+    bytes and raises regardless of what stat claims, so it is always "corrupt". MUTATION:
+    revert to `path.stat().st_size` + a separate `path.read_text()` call, which would trust
+    the lying stat and read + parse the whole oversized-but-valid receipt as "ok"."""
+    path = tmp_path / "activation-manifest.json"
+    sha_a = "a" * 64
+    sha_b = "b" * 64
+    padding = "x" * (inst._RECEIPT_MAX_BYTES + 10)
+    body = json.dumps({
+        "schema": inst.ACTIVATION_RECEIPT_SCHEMA,
+        "files": {"real/file.py": {"installed": sha_a, "source": sha_b}},
+        "padding": padding,
+    })
+    path.write_text(body, encoding="utf-8")
+    assert len(body.encode("utf-8")) > inst._RECEIPT_MAX_BYTES
+    real_stat = Path.stat
+
+    class _LyingStat:
+        st_size = 1
+
+    def _stat(self, *a, **k):
+        if self == path:
+            return _LyingStat()
+        return real_stat(self, *a, **k)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    assert read_activation_receipt_file(path) == (None, "corrupt")
+
+
 def test_EDITED_and_UNPROVEN_stale_hooks_are_both_named(tmp_path: Path):
     """L3 complement LOW. MUTATION: drop the unproven clause from the edited detail."""
     from levain.install import _write_activation_receipt
