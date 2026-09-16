@@ -10,6 +10,10 @@ Levain gives your AI partner a memory that persists across sessions, and keeps t
 
 Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
 
+![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from a running install.](docs/img/cockpit-health-trace.png)
+
+*`levain serve` — memory health and a live consolidation trace, from a real install. You don't have to trust the pitch above; this is what "you can see what's in it" actually looks like.*
+
 ---
 
 ## What this is
@@ -116,6 +120,8 @@ levain init --pack ./my-domain-pack --pack ./my-role-pack
 
 A pack is just a directory: a `pack.toml` declaring a name and an order, plus a `seed/` folder of Markdown files. A new file in a pack *adds* to what the base install carries; a file with the same name as a base file *overrides* it, with the higher-`order` pack winning on a collision. Files that need the interview to fill them in are declared in `render`; everything else is copied byte-for-byte. `--pack` is repeatable, so a domain layer and a role layer can stack — the domain pack carries the doctrine and process, the role layer carries who's driving it and how they talk. Every file a pack adds gets wired into your partner's activation the same way the base seed does; nothing you compose in sits on disk unread. Pack chapters you ship alongside the seed also show up in `levain docs` (below), composed with the base operator manual instead of living in a separate doc nobody opens.
 
+A domain pack's doctrine can also state where your partner should act on its own and where it has to stop and hand a decision to you — write that judgment as plain prose in the pack's seed, the same way you'd write anything else it should know. Today that's exactly what it is: prose your partner reads and is expected to follow, not something the harness enforces. The efferent gate Levain does enforce (below) — on a scheduled seat, on `run --task`, and on any REPL run you pin to `gated` — classifies by *tool kind*, bash vs. a file-editor read vs. write, not by your domain's judgment about what's safe to automate.
+
 There's no packs marketplace here and no bundled example pack — packs are something you author for your own domain, the same way you'd author the interview answers that make an install yours. The mechanism is the product; what you put in it is yours to write.
 
 ## Run a sovereign entity
@@ -174,6 +180,14 @@ levain docs               # the operator manual, composed with any pack's own ch
 
 **`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
 
+![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](docs/img/cockpit-operate.jpg)
+
+*Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a freshly-seeded demo install ("Ridge"), not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
+
+![The State, Active Threads, Patterns, Decisions, and Context panels from the same demo install.](docs/img/cockpit-state.png)
+
+*The felt-memory side: what a wrap actually writes to your continuity file, rendered from outside the session. Same demo install as above.*
+
 **`levain tui`** is the terminal-native peer of `serve`: read and steer without a browser or a port. `--read-only` drops to a pure inspection view.
 
 **`levain focus`** sets the one line your sessions read to orient: *what you're working on right now*. It travels across sessions like the rest of your memory.
@@ -211,7 +225,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
 - **Always-on daemon and governed seats:** macOS today; Linux and Windows are planned.
 - **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) is macOS only. On any other platform the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
-- **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled seat. Nothing in `daemon install-seat` or `doctor` currently warns you if a seat is running that way.
+- **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled seat. `daemon install-seat` warns loudly at install time if you're about to install one that way; `doctor` doesn't re-check it on a seat that's already running.
 - **One seat at a time:** a governed seat runs one entity on one schedule. Coordinating several seats as a fleet is not built yet — see *Where this is going* below.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
 - **No security absolutes.** The confinement floor is real and load-bearing, but it's a floor, not a guarantee — it denies a fixed set of crown-jewel paths and known escape routes, not "everything dangerous." Read the module docstrings in `levain/firing/confinement.py` if you're deciding whether to trust it with something that matters.
@@ -231,20 +245,21 @@ bash scripts/install_hooks.sh
 ```
 
 It points `core.hooksPath` at the tracked `scripts/hooks/` and installs a `pre-push` gate that runs
-the release-stamp test before anything becomes public. ⚠ **`core.hooksPath` is local config git
-cannot ship, so a fresh clone is UNGATED until someone runs that line** — which is exactly why it is
+the release-stamp test before anything becomes public. `core.hooksPath` is local config git can't
+ship on its own, so a fresh clone has no gate until someone runs that line — which is why it's
 documented here rather than only in the script. The gate fails closed; the deliberate escape is
 `git push --no-verify`.
 
 ## Where this is going (not shipped yet)
 
-Everything above is installable today. This section is future tense on purpose — nothing here has an install command, because none of it exists yet.
+Everything above is installable today. This section is future tense on purpose — nothing here has an install command, because none of it is released.
 
+- **The pack will carry your domain's judgment, and something will route on it.** Right now a pack's doctrine on when to act and when to ask is prose your partner reads — real, but not enforced (see *Composing a domain* above), and the efferent gate classifies by tool kind alone. The design calls for every install to carry a pack, and for that pack to declare its domain's automation threshold: which kinds of steps are *eligible* to run on their own and which always need a person. Eligibility isn't the same as being allowed to run unwatched, though — the design is explicit that a below-threshold step doesn't skip the gate on day one just because a pack says it's eligible. It has to earn that by running gated for a while and building a clean track record under a floor it can't buy its way past; only then does it graduate to executing on its own with a quiet receipt instead of a halt. A step above the threshold still gates the way every efferent action does today, and a step that starts below the threshold but turns into something above it mid-run pops back to the gate before it acts. It's still undecided which layer would own that routing — the gate Levain ships today, a separate always-on autonomic layer, or something in the pack itself — so read "the gate" above as "whatever ends up enforcing this," not a claim about today's `firing/gate.py`.
 - **Linux for the always-on cockpit and governed seats.** The confinement floor already has a Linux design in progress (sandboxing via `bwrap`, lifecycle via `systemd --user`, mirroring what `daemon install`/`install-seat` do on macOS today), but it isn't merged or released. Windows autostart is a further-out planned target, not started.
 - **Talking to a running entity from the cockpit.** Right now the alive Conversation an entity holds during `levain run` lives only in that process. The plan is a server-held session your cockpit (`levain serve`/`levain tui`) can open a `/turn` onto, so you could watch and steer a sovereign entity's conversation the way you already watch its memory.
 - **A fleet of seats.** `daemon install-seat` runs one governed entity on one schedule. Coordinating several seats — an inter-entity bus, cross-seat aggregation — is a real target but a later one, and it inherits the same gate discipline: nothing about running more entities relaxes what any single one is allowed to do unattended.
 
-None of this changes what ships today, and none of it loosens the gate. More surface, same floor.
+None of this changes what ships today. Nothing gets looser just because a pack declares a step eligible — that eligibility still has to be earned, gated, under a floor — and until any of this ships, an efferent action's only way past the gate is the same all-or-nothing `ungated` override that exists now.
 
 ## License
 
