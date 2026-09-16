@@ -10,9 +10,9 @@ Levain gives your AI partner a memory that persists across sessions, and keeps t
 
 Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
 
-![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from a running install.](docs/img/cockpit-health-trace.png)
+![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from the author's own long-running memory store.](docs/img/cockpit-health-trace.png)
 
-*`levain serve` — memory health and a live consolidation trace, from a real install. You don't have to trust the pitch above; this is what "you can see what's in it" actually looks like.*
+*`levain serve` — memory health and a live consolidation trace, from the author's own long-running memory store. You don't have to trust the pitch above; this is what "you can see what's in it" actually looks like.*
 
 ---
 
@@ -180,7 +180,7 @@ levain docs               # the operator manual, composed with any pack's own ch
 
 **`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
 
-![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](docs/img/cockpit-operate.jpg)
+![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](docs/img/cockpit-operate.png)
 
 *Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a freshly-seeded demo install ("Ridge"), not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
 
