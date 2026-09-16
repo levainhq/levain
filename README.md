@@ -18,7 +18,7 @@ If you've worked with an AI partner long enough to feel the session-amnesia prob
 
 It packages four things that work together:
 
-1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, an association graph that surfaces related memories on its own, and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and close themselves when they're done.
+1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, an association graph that surfaces related memories on its own, and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
 
 2. **A methodology-core seed.** A small, dense set of files defining who your partner is, how the partnership works, how memory accrues, and who you are to it. Written so your partner lives *inside* the method instead of pointing at it.
 
@@ -26,7 +26,17 @@ It packages four things that work together:
 
 4. **A scripted onboarding.** `levain init` walks you through filling the seed so your partner is uniquely yours from session one. Terminal, a browser form with `--web`, or a JSON answer file with `--answers` when nobody is at the keyboard.
 
-The kit runs under Claude Code or Codex CLI — both first-class, both wired via hooks. A third adapter, `openhands`, is also accepted by `levain init --adapter`: it is hookless, and instead of wiring a hosted harness it scaffolds a sovereign, runnable entity with its own store and seed.
+## Three ways to run it
+
+Levain isn't a tool you adopt in one place. It's a governed substrate you can apply wherever you already work, in any combination.
+
+**Inside the harness you're already using.** Claude Code and Codex CLI both wire in via hooks — your partner stops starting cold, and its proven patterns and open loops fire on their own, per turn, without you asking.
+
+**As its own sovereign partner.** `levain init --adapter openhands` scaffolds an entity that isn't wired into anything — its own identity, its own memory store, its own hands on your real repos, running on an open model you choose rather than a frontier vendor's hosted assistant (point it at a local Ollama model to also keep the compute itself on your machine). It talks to you as a REPL (`levain run`) or takes one task and exits (`levain run --task`), and it consolidates its own memory with its own mind (`levain wrap`).
+
+**On a schedule, unattended.** `levain daemon install-seat` runs that same sovereign entity on a cadence — every hour, every day, whatever you set — while you're away. It's not autonomous in the sense that should worry you: every action the entity takes that reaches outside itself halts and reports back to you before it lands, because with nobody watching there's nobody to ask. See *Hand it a schedule* below for exactly what that means.
+
+All three modes share one store discipline and one governance model. You're not choosing between three products.
 
 ## Why a seed, not a finished methodology
 
@@ -63,7 +73,7 @@ This creates `./my-partner`, runs the interview, lays down the seed, registers t
 ```
 levain init                          # install into the current directory (must be empty)
 levain init --force                  # install into an existing workspace (backs up anything it touches)
-levain init --adapter claude-code    # or --adapter codex; prompts if omitted
+levain init --adapter claude-code    # or --adapter codex, or --adapter openhands; prompts if omitted
 levain init --web                    # fill the same interview in a browser form, localhost only
 ```
 
@@ -96,10 +106,47 @@ your name and your partner's, which an entity is not allowed to be missing.
 missing, unknown, or has plainly landed in the wrong slot, it says so and installs
 nothing — rather than writing a half-captured partner and reporting success.
 
+## Composing a domain — AgentPacks
+
+The base seed gives your partner a general methodology. A **pack** layers a domain on top of that at install time: your own doctrine, your own process library, your own vocabulary — composed over the same governed substrate rather than swapped in for it.
+
+```
+levain init --pack ./my-domain-pack --pack ./my-role-pack
+```
+
+A pack is just a directory: a `pack.toml` declaring a name and an order, plus a `seed/` folder of Markdown files. A new file in a pack *adds* to what the base install carries; a file with the same name as a base file *overrides* it, with the higher-`order` pack winning on a collision. Files that need the interview to fill them in are declared in `render`; everything else is copied byte-for-byte. `--pack` is repeatable, so a domain layer and a role layer can stack — the domain pack carries the doctrine and process, the role layer carries who's driving it and how they talk. Every file a pack adds gets wired into your partner's activation the same way the base seed does; nothing you compose in sits on disk unread. Pack chapters you ship alongside the seed also show up in `levain docs` (below), composed with the base operator manual instead of living in a separate doc nobody opens.
+
+There's no packs marketplace here and no bundled example pack — packs are something you author for your own domain, the same way you'd author the interview answers that make an install yours. The mechanism is the product; what you put in it is yours to write.
+
+## Run a sovereign entity
+
+`levain init --adapter openhands` scaffolds something different from the hook-wired adapters above: an entity that is its *own* partner, not a layer inside a harness you're already running. Its own identity, its own memory store, never a hook into your Claude Code or Codex session, never a reach into `~/.anneal-memory` or any other store on your machine — that isolation is checked and enforced, not assumed.
+
+```
+pip install 'levain[openhands]'
+levain init --adapter openhands --path ./ada
+levain run ./ada                    # talk to it as a REPL, on an open model by default
+levain run ./ada --task "..."       # or hand it one task, non-interactively, and read the exit code
+levain wrap ./ada                   # consolidate what it learned into its own lasting memory
+```
+
+It runs against Ollama by default, through `--model`/`--base-url` — or any OpenAI-compatible or Anthropic-style endpoint you point it at instead. The out-of-the-box default, `glm-5.2:cloud`, is served through Ollama Cloud, so by default the episode content does leave your machine; point `--model` at a plain Ollama model name (no `:cloud`) to keep the whole conversation local. Either way it's an open model you chose, never a frontier vendor's hosted assistant. Give it hands and, on macOS, it works your real repos through a file editor and a sandboxed shell, both fenced to the same crown-jewels floor described below — `~/.anneal-memory`, sibling stores, and your SSH key material stay off-limits no matter what it's asked to do. On any other platform there's no confinement provider yet, so it gets the file editor only, never an unconfined shell — see *Boundaries*. `--no-tools` runs it as a pure conversational partner with no hands at all. `levain wrap` is what makes the entity's identity compound instead of just accumulating transcripts: it metabolizes its own raw episodes into its own six-section memory, composed on its own model by default, so the entity that answers you tomorrow has actually learned from today.
+
+## Hand it a schedule — the governed seat
+
+`levain daemon install-seat` takes the sovereign entity above and runs it unattended, on a cadence, while you're away.
+
+```
+levain daemon install-seat --path ./ada --task "check the queue and report" --interval 3600
+```
+
+This is the part that separates a governed seat from the always-on personal-agent runtimes that make headlines for the wrong reasons. **We never ask the model whether what it's about to do is safe.** The gate that halts an action reads the *tool*, not the model's opinion of itself — because a gate the entity can talk its way through is not a gate. By default, every action the seat takes that reaches outside itself — a shell command, a file write, anything efferent — halts before it executes: exit code 4 in the seat's log, the activity that led up to it right there for you to read. It's not a permission prompt, because an unattended seat has nobody to ask, and there's no queue holding the action for you to approve later — the halt ends that run, and the next scheduled turn starts fresh (and will halt again at the same point if the task still needs that action). Because bash is classified as efferent by *kind*, not by what the command actually does, a seat task that needs the shell at all will halt on it every run, even for something as harmless as `ls` — plan seat tasks around the file-editor hand where you can, or expect to be reading a lot of exit-4 logs. This default can be turned off per entity (`efferent_gate: "ungated"` in `.levain/confinement.json`), which is a real escape hatch and not a decision to make lightly for something that runs unattended.
+
+The seat is wall-clock bounded (`--max-seconds`), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." And it consolidates its own memory on the same cadence by default (`--consolidate-every`) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized, always-loaded tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
+
 ## Keep it in sync — `doctor` and `update`
 
 What changed between releases — and anything that changes an existing deployment's behaviour — is in [`CHANGELOG.md`](https://github.com/levainhq/levain/blob/main/CHANGELOG.md). Read it before upgrading across a minor version.
-
 
 Levain composes a stack across two version lines that `pip` alone can't keep aligned: the `anneal-memory` library (versioned separately on PyPI) and your methodology seed (versioned inside Levain). `pip` keeps the *library* compatible, but it's blind to *methodology* drift. A new memory feature can land as a contradiction with your older, hand-tuned instructions instead of a clean addition. That drift is what breaks a long-running install.
 
@@ -122,6 +169,7 @@ Your partner's memory normally only exists *inside* a session. These look at it 
 levain dashboard          # a one-shot terminal glance (add --json for the raw view)
 levain serve              # a live local view in your browser
 levain tui                # a full-screen interactive terminal view
+levain docs               # the operator manual, composed with any pack's own chapters
 ```
 
 **`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
@@ -140,16 +188,18 @@ Two of those write targets are your own inbox into the partnership. Dump anythin
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
-## Keep it running on login (macOS)
+## Keep it running (macOS)
 
 ```
 levain daemon install       # start the local write window on login, survive a crash
+levain daemon install-seat  # install a governed, scheduled entity — see "Hand it a schedule" above
 levain daemon status        # is it actually installed and running?
 levain daemon would-install  # dry-run: show what install would do, change nothing
+levain daemon restart       # restart a running serve or seat, e.g. after new code
 levain daemon uninstall
 ```
 
-`levain daemon` keeps the local writable view of your memory available without an ad-hoc background process. It starts on login and restarts on crash, per-user with no admin or root (a launchd user agent on macOS today; Linux `systemd --user` and Windows Task Scheduler are planned). It's always pointed at loopback, never off-box. `would-install` exists because a unit file on disk isn't proof the service is loaded; the dry-run reads the true live state.
+`levain daemon install` keeps the local writable cockpit (`levain serve --write`) available without an ad-hoc background process — it starts on login and restarts on crash. `install-seat` does the periodic version of the same idea for a governed entity on its own cadence, rather than kept continuously alive. Both are per-user, no admin or root (a launchd user agent on macOS today; Linux `systemd --user` and Windows Task Scheduler are planned), and both stay pointed at loopback, never off-box. `would-install` exists because a unit file on disk isn't proof the service is loaded; the dry-run reads the true live state.
 
 ## Audience
 
@@ -159,8 +209,12 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 - **Harnesses:** Claude Code and Codex CLI (hook-wired), plus `openhands` (hookless, scaffolds a sovereign entity). One adapter per install — separate installs if you need more than one.
 - **Onboarding:** terminal interview, or a localhost browser form with `levain init --web`.
-- **Always-on daemon:** macOS today; Linux and Windows are planned.
+- **Always-on daemon and governed seats:** macOS today; Linux and Windows are planned.
+- **Confined shell hands:** the sandboxed bash tool for a sovereign entity (`levain run`) is macOS only. On any other platform the entity gets the file-editor hand and no shell — it fails closed rather than granting an unconfined one.
+- **The efferent gate is a default, not a lock.** `efferent_gate: "ungated"` in an entity's `.levain/confinement.json` turns the halt off entirely, including for a scheduled seat. Nothing in `daemon install-seat` or `doctor` currently warns you if a seat is running that way.
+- **One seat at a time:** a governed seat runs one entity on one schedule. Coordinating several seats as a fleet is not built yet — see *Where this is going* below.
 - **Codex hook reliability:** recent Codex versions have a platform-level hook-trust gap no consumer can work around. `levain verify-hooks` (and `levain doctor --invoke`) invoke each hook with the JSON a harness would send and prove the scripts fire correctly; whether Codex itself invokes them at runtime is up to Codex.
+- **No security absolutes.** The confinement floor is real and load-bearing, but it's a floor, not a guarantee — it denies a fixed set of crown-jewel paths and known escape routes, not "everything dangerous." Read the module docstrings in `levain/firing/confinement.py` if you're deciding whether to trust it with something that matters.
 
 ## What it's built on
 
@@ -181,6 +235,16 @@ the release-stamp test before anything becomes public. ⚠ **`core.hooksPath` is
 cannot ship, so a fresh clone is UNGATED until someone runs that line** — which is exactly why it is
 documented here rather than only in the script. The gate fails closed; the deliberate escape is
 `git push --no-verify`.
+
+## Where this is going (not shipped yet)
+
+Everything above is installable today. This section is future tense on purpose — nothing here has an install command, because none of it exists yet.
+
+- **Linux for the always-on cockpit and governed seats.** The confinement floor already has a Linux design in progress (sandboxing via `bwrap`, lifecycle via `systemd --user`, mirroring what `daemon install`/`install-seat` do on macOS today), but it isn't merged or released. Windows autostart is a further-out planned target, not started.
+- **Talking to a running entity from the cockpit.** Right now the alive Conversation an entity holds during `levain run` lives only in that process. The plan is a server-held session your cockpit (`levain serve`/`levain tui`) can open a `/turn` onto, so you could watch and steer a sovereign entity's conversation the way you already watch its memory.
+- **A fleet of seats.** `daemon install-seat` runs one governed entity on one schedule. Coordinating several seats — an inter-entity bus, cross-seat aggregation — is a real target but a later one, and it inherits the same gate discipline: nothing about running more entities relaxes what any single one is allowed to do unattended.
+
+None of this changes what ships today, and none of it loosens the gate. More surface, same floor.
 
 ## License
 
