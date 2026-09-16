@@ -2284,10 +2284,21 @@ def _report_and_rotate(
                 emit(f"  note: could not compare {name} with its install receipt; it is "
                      f"preserved in {moved_to}")
             emit(f"  Previous activation/ kept whole at {moved_to}")
-        else:
+        elif prior_status == "absent":
             emit(
                 f"  Previous activation/ kept whole at {moved_to} (no install receipt "
                 f"covers it, so levain cannot tell whether you edited anything in it)"
+            )
+        else:
+            # ⚖ C6 AMENDED (Phill, 2026-09-15): a corrupt/empty receipt read the same as
+            # "no receipt yet" here, contradicting doctor's own C6 text ("a damaged receipt
+            # is not a pre-receipt install") a few lines away in doctor.py. Reproduced via
+            # the real CLI 2026-09-16: absent, corrupt and empty all printed the byte-
+            # identical "no install receipt covers it" line.
+            emit(
+                f"  Previous activation/ kept whole at {moved_to} (its install receipt "
+                f"was unreadable ({prior_status}), so levain cannot tell whether you "
+                f"edited anything in it — a damaged receipt is not a pre-receipt install)"
             )
         if moved_to.parent == backups_root:
             notes.extend(_prune_activation_backups(backups_root, _ACTIVATION_TREES_KEPT))
