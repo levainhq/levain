@@ -314,6 +314,49 @@ def test_hook_freshness_stale_is_pending_and_says_the_old_hooks_run(tmp_path: Pa
 # ---------- L1/L2 round: fixes, each with its mutant ----------
 
 
+@pytest.mark.parametrize("state,damage", [
+    ("absent", None),
+    ("corrupt", "not json at all"),
+    ("empty", '{"schema": 1, "files": {}}'),
+])
+def test_a_damaged_receipt_is_named_DISTINCTLY_from_a_pre_receipt_install(
+    tmp_path: Path, state: str, damage: str | None
+):
+    """MEDIUM (Diogenes, install.py:2289 pre-fix): `_report_and_rotate` compared only
+    `prior_status == "ok"`, so absent/corrupt/empty all fell into the same else-branch and
+    printed the byte-identical "no install receipt covers it" line — contradicting C6's
+    own text in doctor.py ("a damaged receipt is not a pre-receipt install"), reproduced
+    via the real CLI 2026-09-16 (all three states gave the identical sentence).
+
+    MUTATION: restore the two-way `if prior_status == "ok" ... else ...` split -> absent
+    and corrupt/empty collapse back to one message."""
+    base = _layer(tmp_path / "base")
+    install = tmp_path / "install"
+    dst = install / "activation"
+    _copy_activation_tree([base], dst, base_activation=base, anneal_path="/opt/a/anneal-memory")
+    receipt = activation_receipt_path(install)
+    if damage is None:
+        receipt.unlink()
+    else:
+        receipt.write_text(damage, encoding="utf-8")
+
+    files, read_status = read_activation_receipt_file(receipt)
+    assert read_status == state
+
+    said: list[str] = []
+    _copy_activation_tree([base], dst, base_activation=base,
+                          anneal_path="/usr/local/bin/anneal-memory", emit=said.append)
+    kept = [m for m in said if "Previous activation/ kept whole" in m]
+    assert kept, said
+    if state == "absent":
+        assert "no install receipt covers it" in kept[0]
+        assert "unreadable" not in kept[0]
+    else:
+        assert f"unreadable ({state})" in kept[0]
+        assert "a damaged receipt is not a pre-receipt install" in kept[0]
+        assert "no install receipt covers it" not in kept[0]
+
+
 def test_an_interrupt_AFTER_the_swap_never_leaves_the_OLD_receipt(tmp_path: Path, monkeypatch):
     """L1 + L2 HIGH, reproduced. MUTATION: skip the pre-swap invalidation -> the old
     receipt survives, and the next re-install calls install's own hook an operator edit."""

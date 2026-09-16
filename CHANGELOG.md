@@ -8,6 +8,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.8.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
+
+`doctor`'s hook-freshness check used to read a receipt it could not parse the same way it reads an install that predates the receipt entirely: both landed on exit 6, "an upgrade step is pending." **A receipt that exists but is unreadable is not a pre-receipt install** — `_write_activation_receipt` is the sole writer and runs only after the tree is in place, a failed write reads as absent (not corrupt), and a failed swap rolls the prior receipt back — so a legitimate install cannot produce a corrupt or empty one. Reading it as "no receipt yet" could downgrade a tampered hook (an appended `os.system(...)`, say) from broken (exit 1) to routine-pending (exit 6). A corrupt or empty receipt now exits 1, naming the receipt's path and why doctor could not read it, with the same `init --force` remedy. An absent receipt (a genuinely pre-receipt install) is unchanged: still exit 6.
+
+`levain init --force`'s own post-swap notice had the identical gap: absent, corrupt and empty receipts all printed the byte-identical "no install receipt covers it" line for the retained backup tree. Corrupt and empty now say so explicitly — "its install receipt was unreadable (corrupt/empty) … a damaged receipt is not a pre-receipt install" — while absent keeps its original text.
+
 ## [0.4.7] — 2026-09-14
 
 ### Changed — Levain now requires anneal-memory 0.9.10 or later
