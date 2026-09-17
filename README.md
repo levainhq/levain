@@ -10,7 +10,7 @@ Levain gives your AI partner a memory that persists across sessions, and keeps t
 
 Apache 2.0 · Python 3.12+ · Claude Code, Codex CLI, and OpenHands.
 
-![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from the author's own long-running memory store.](docs/img/cockpit-health-trace.png)
+![The cockpit's Health and Cognition Trace panels — Hebbian links, graduation counts, episode counts, and a live per-wrap oscilloscope, all real numbers from the author's own long-running memory store.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-health-trace.png)
 
 *`levain serve` — memory health and a live consolidation trace, from the author's own long-running memory store. You don't have to trust the pitch above; this is what "you can see what's in it" actually looks like.*
 
@@ -148,7 +148,7 @@ levain daemon install-seat --path ./ada --task "check the queue and report" --in
 
 This is the part that separates a governed seat from the always-on personal-agent runtimes that make headlines for the wrong reasons. **We never ask the model whether what it's about to do is safe.** The gate that halts an action reads the *tool*, not the model's opinion of itself — because a gate the entity can talk its way through is not a gate. By default, every action the seat takes that reaches outside itself — a shell command, a file write, anything efferent — halts before it executes: exit code 4 in the seat's log, the activity that led up to it right there for you to read. It's not a permission prompt, because an unattended seat has nobody to ask, and there's no queue holding the action for you to approve later — the halt ends that run, and the next scheduled turn starts fresh (and will halt again at the same point if the task still needs that action). Because bash is classified as efferent by *kind*, not by what the command actually does, a seat task that needs the shell at all will halt on it every run, even for something as harmless as `ls` — plan seat tasks around the file-editor hand where you can, or expect to be reading a lot of exit-4 logs. This default can be turned off per entity (`efferent_gate: "ungated"` in `.levain/confinement.json`), which is a real escape hatch and not a decision to make lightly for something that runs unattended.
 
-The seat is wall-clock bounded (`--max-seconds`), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." And it consolidates its own memory on the same cadence by default (`--consolidate-every`) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized, always-loaded tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
+The seat is wall-clock bounded (`--max-seconds`), so a stalled model endpoint can't silently strand it running forever behind a schedule that looks healthy; a bound this hits exits 5, distinctly from a genuine failure, so a supervisor watching the exit code knows the difference between "the environment stalled" and "something is actually broken." And it consolidates its own memory — after each scheduled turn it checks the backlog and consolidates once enough new episodes have accumulated (`--consolidate-every N` is an episode count, not a cadence; default: the wrap-nudge threshold) — but a consolidate run unattended may only *metabolize*, never *crystallize*: it can compose its working memory, but promoting anything into the crystallized, always-loaded tier is refused structurally unless a human runs the wrap themselves. An agent nobody is watching does not get to rewrite its own bedrock.
 
 ## Keep it in sync — `doctor` and `update`
 
@@ -180,11 +180,11 @@ levain docs               # the operator manual, composed with any pack's own ch
 
 **`levain serve`** runs a tiny localhost web app (default `http://127.0.0.1:7420`) and opens your browser to a live view of your substrate: memory health, the association graph, crystallized patterns, open loops, and your State / Active-Threads narrative. It binds loopback only, refuses non-loopback hosts, and serves its own UI from the package (no CDN, renders offline). Read-only by default. Pass **`--write`** to edit your memory from the browser: your State, the lifecycle of your open loops, your inbox and reference notes. Every change goes through a governed path that records it, so the writable view doubles as an audit log of what you did. It stays loopback-only by construction: your seed and config are private, so there's no off-box write surface.
 
-![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](docs/img/cockpit-operate.png)
+![The Operate zone — Open Loops, Tray, and Keep panels, each editable from the browser.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-operate.png)
 
 *Open Loops surface on their own when a prompt touches them; Tray is your inbox into the partnership; Keep is durable reference. Shown on a freshly-seeded demo install ("Ridge"), not a real one — an operator's actual Open Loops and Tray are exactly the kind of thing this README won't put on the internet.*
 
-![The State, Active Threads, Patterns, Decisions, and Context panels from the same demo install.](docs/img/cockpit-state.png)
+![The State, Active Threads, Patterns, Decisions, and Context panels from the same demo install.](https://raw.githubusercontent.com/levainhq/levain/main/docs/img/cockpit-state.png)
 
 *The felt-memory side: what a wrap actually writes to your continuity file, rendered from outside the session. Same demo install as above.*
 
