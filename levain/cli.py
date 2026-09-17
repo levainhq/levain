@@ -134,10 +134,10 @@ def main(argv: list[str] | None = None) -> int:
             "object keyed by SLOT NAME (never an ordered list — answers are "
             "matched by name, so field order is not something you have to know). "
             "Requires --adapter, since the adapter menu would otherwise prompt. "
-            "Every slot must be present; \"\" is allowed only for an optional "
-            "section (equivalent to answering the terminal's `Skip this section?` "
-            "with y) or an optional-line field. Get a blank one with "
-            "--answers-template."
+            "Every slot must be present; \"\" is accepted on every slot except "
+            "OPERATOR_NAME and ENTITY_NAME, which require an answer (matching "
+            "the validator — the terminal interview and the web form also accept "
+            "blanks elsewhere). Get a blank one with --answers-template."
         ),
     )
     init_p.add_argument(
