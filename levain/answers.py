@@ -168,7 +168,8 @@ def validate_answers(fields: Iterable[_Field], answers: dict[str, str]) -> list[
     if missing:
         errors.append(
             f"missing slot(s): {', '.join(missing)} "
-            f"(every slot must be present; use \"\" to skip an optional one)"
+            f"(every slot must be present; \"\" is accepted for any slot except "
+            f"{' and '.join(IDENTITY_SLOTS)})"
         )
 
     empty_identity = [
@@ -283,20 +284,38 @@ def field_guide(fields: Iterable[_Field]) -> str:
         "Answers are matched BY SLOT NAME; the order below is the order the "
         "terminal interview asks, not a requirement."
     )
-    lines.append(
-        f"Every slot may be \"\" except {' and '.join(IDENTITY_SLOTS)} "
-        "(marked [required])."
-    )
+    present_identity = [s for s in IDENTITY_SLOTS if s in {f.slot for f in plan}]
+    if present_identity:
+        lines.append(
+            f"Every slot may be \"\" except {' and '.join(present_identity)} "
+            "(marked [required])."
+        )
     lines.append("")
 
+    # An identity slot inside an optional section must not be told to "skip":
+    # the validator refuses it blank, so the section hint would contradict it.
+    identity_sections: set[int] = set()
+    section_no = -1
+    for f in plan:
+        if f.first_in_section:
+            section_no += 1
+        if f.slot in IDENTITY_SLOTS:
+            identity_sections.add(section_no)
+
     current_spec: str | None = None
+    section_no = -1
     for f in plan:
         if f.spec_name != current_spec:
             current_spec = f.spec_name
             lines.append(f"=== {current_spec} ===")
         if f.first_in_section:
+            section_no += 1
             title = f.section_title or "[preamble]"
-            opt = "  (optional section — leave its slots \"\" to skip)" if f.optional else ""
+            opt = (
+                "  (optional section — leave its slots \"\" to skip)"
+                if f.optional and section_no not in identity_sections
+                else ""
+            )
             lines.append("")
             lines.append(f"  ## {title}{opt}")
             if f.section_guidance:
