@@ -97,15 +97,14 @@ class _Field(Protocol):
 
 
 def is_required(field: _Field) -> bool:
-    """A field whose answer may NOT be empty.
+    """A field the seed EXPECTS filled — not a field init refuses blank.
 
     Two independent ways to be optional, and both are honored: the SECTION carries
     `<!-- optional -->` (answering every slot in it empty drops the whole section at
     render), or the FIELD resolves to the `optional-line` style (the template's own
-    "blank to skip" affordance). Everything else is required — including a field the
-    terminal interview would have let an operator skip with a bare Enter, because a
-    hollow seed is the defect this whole surface exists to prevent, not a shortcut
-    to preserve for parity.
+    "blank to skip" affordance). Everything else is expected filled, and `doctor`
+    reports a blank one as a thin seed. Init still ACCEPTS a blank there; only the
+    identity slots (`IDENTITY_SLOTS`) are refused blank (see `validate_answers`).
     """
     return not field.optional and field.style != "optional-line"
 
@@ -284,6 +283,10 @@ def field_guide(fields: Iterable[_Field]) -> str:
         "Answers are matched BY SLOT NAME; the order below is the order the "
         "terminal interview asks, not a requirement."
     )
+    lines.append(
+        f"Every slot may be \"\" except {' and '.join(IDENTITY_SLOTS)} "
+        "(marked [required])."
+    )
     lines.append("")
 
     current_spec: str | None = None
@@ -298,7 +301,7 @@ def field_guide(fields: Iterable[_Field]) -> str:
             lines.append(f"  ## {title}{opt}")
             if f.section_guidance:
                 lines.append(f"     {f.section_guidance}")
-        req = "" if is_required(f) else "  [may be \"\"]"
+        req = "  [required]" if f.slot in IDENTITY_SLOTS else ""
         lines.append(f"    {f.slot}  ({f.style}){req}")
         if f.guidance:
             lines.append(f"        {f.guidance}")
