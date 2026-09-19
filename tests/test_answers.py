@@ -190,11 +190,18 @@ def test_the_emitted_template_validates_against_its_own_plan_once_filled():
     assert validate_answers(PLAN, data) == []
 
 
-def test_guide_names_every_slot_and_marks_the_optional_ones():
+def test_guide_names_every_slot_and_marks_only_the_identity_ones_required():
     g = field_guide(PLAN)
     for slot in ("OPERATOR_NAME", "AGE", "BIO", "ENTITY_NAME"):
         assert slot in g
-    assert 'may be ""' in g
+    # Diogenes 2026-09-18: the guide must agree with the validator and the help —
+    # blank is accepted everywhere except the identity slots.
+    assert sum(l.endswith("[required]") for l in g.splitlines()) == 2
+    for line in g.splitlines():
+        if line.strip().startswith(("OPERATOR_NAME", "ENTITY_NAME")):
+            assert line.endswith("[required]")
+        elif line.startswith("    ") and "(" in line and ")" in line:
+            assert not line.endswith("[required]")
     assert "BY SLOT NAME" in g
 
 
