@@ -205,6 +205,27 @@ def test_guide_names_every_slot_and_marks_only_the_identity_ones_required():
     assert "BY SLOT NAME" in g
 
 
+def test_guide_header_names_only_identity_slots_the_plan_has():
+    g = field_guide([F("AGE", style="optional-line"), F("ENTITY_NAME")])
+    assert "except ENTITY_NAME (marked" in g
+    assert "OPERATOR_NAME" not in g
+    assert "except" not in field_guide([F("AGE", style="optional-line")])
+
+
+def test_guide_does_not_say_skip_for_an_optional_section_holding_an_identity_slot():
+    # The validator refuses a blank identity slot even inside an optional section.
+    g = field_guide(
+        [F("OPERATOR_NAME", first_in_section=True, section_title="Who", optional=True)]
+    )
+    assert "optional section" not in g
+    assert "OPERATOR_NAME  (line)  [required]" in g
+
+
+def test_missing_slot_error_does_not_imply_only_optional_slots_can_be_blank():
+    errs = validate_answers(PLAN, {"OPERATOR_NAME": "C", "ENTITY_NAME": "A"})
+    assert any("missing slot" in e and "except OPERATOR_NAME" in e for e in errs)
+
+
 def test_impossible_shape_is_a_validation_ERROR_not_just_a_note():
     """The gate must be the gate (L3/glm, medium).
 
