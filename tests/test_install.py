@@ -190,7 +190,7 @@ def test_checkpoint_path_is_inside_dot_levain(tmp_path: Path):
 
 
 def test_save_and_load_checkpoint_round_trip(tmp_path: Path):
-    answers = {"NAME": "Alex", "CITY": "Columbus"}
+    answers = {"NAME": "Alex", "CITY": "Riverton"}
     _save_checkpoint(tmp_path, answers)
     loaded = _load_checkpoint(tmp_path)
     assert loaded == answers
@@ -220,11 +220,11 @@ def test_load_checkpoint_filters_non_string_entries(tmp_path: Path):
     target = _checkpoint_path(tmp_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
-        '{"NAME": "Alex", "NUMBER": 42, "NULL_VAL": null, "CITY": "Columbus"}',
+        '{"NAME": "Alex", "NUMBER": 42, "NULL_VAL": null, "CITY": "Riverton"}',
         encoding="utf-8",
     )
     loaded = _load_checkpoint(tmp_path)
-    assert loaded == {"NAME": "Alex", "CITY": "Columbus"}
+    assert loaded == {"NAME": "Alex", "CITY": "Riverton"}
 
 
 def test_save_checkpoint_creates_parent_dir(tmp_path: Path):
@@ -275,15 +275,15 @@ def test_conduct_interview_calls_checkpoint_fn_after_each_section(tmp_path: Path
     checkpoints: list[dict[str, str]] = []
     answers = conduct_interview(
         [spec],
-        input_fn=lambda prompt: "Alex" if "NAME" in prompt else "Columbus",
+        input_fn=lambda prompt: "Alex" if "NAME" in prompt else "Riverton",
         output_fn=lambda s: None,
         checkpoint_fn=lambda a: checkpoints.append(dict(a)),
     )
     # Two sections → two checkpoint snapshots, cumulative.
     assert len(checkpoints) == 2
     assert checkpoints[0] == {"NAME": "Alex"}
-    assert checkpoints[1] == {"NAME": "Alex", "CITY": "Columbus"}
-    assert answers == {"NAME": "Alex", "CITY": "Columbus"}
+    assert checkpoints[1] == {"NAME": "Alex", "CITY": "Riverton"}
+    assert answers == {"NAME": "Alex", "CITY": "Riverton"}
 
 
 def test_conduct_interview_with_initial_answers_skips_answered_slots(tmp_path: Path):
@@ -303,7 +303,7 @@ def test_conduct_interview_with_initial_answers_skips_answered_slots(tmp_path: P
 
     def driver(prompt: str) -> str:
         prompts.append(prompt)
-        return "Columbus"
+        return "Riverton"
 
     answers = conduct_interview(
         [spec],
@@ -312,7 +312,7 @@ def test_conduct_interview_with_initial_answers_skips_answered_slots(tmp_path: P
         output_fn=lambda s: None,
     )
     # Should have prompted only for CITY (NAME was pre-loaded).
-    assert answers == {"NAME": "Alex", "CITY": "Columbus"}
+    assert answers == {"NAME": "Alex", "CITY": "Riverton"}
     # NAME prompt should not appear in the captured prompts.
     assert not any("NAME" in p for p in prompts)
     assert any("CITY" in p for p in prompts)

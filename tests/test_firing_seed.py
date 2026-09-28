@@ -29,7 +29,7 @@ def _seed_entity(
     tmp_path: Path,
     *,
     name: str = "Coyote",
-    operator: str = "Phill Clapham",
+    operator: str = "Avery Lane",
     files: tuple[str, ...] = ("origin.md", "world.md", "partnership.md"),
 ) -> Path:
     """A minimal filled entity dir: ``.levain/`` + the requested ``seed/`` files."""
@@ -45,7 +45,7 @@ def _seed_entity(
             "<!-- interview: a comment that must be stripped -->\n\n"
             f"Your job: partner with {operator}.\n"
         ),
-        "world.md": f"# Who Your Operator Is\n\n## Identity\n\n{operator}. 46. Columbus, OH.\n",
+        "world.md": f"# Who Your Operator Is\n\n## Identity\n\n{operator}. 39. Riverton.\n",
         "partnership.md": "# How We Work\n\nYou are a partner, not an assistant.\n",
         "memory.md": "# Your Memory\n\nanneal mechanics — must NOT be in the constitution.\n",
     }
@@ -73,14 +73,14 @@ def test_seed_leaf_imports_without_openhands_or_anneal():
 
 
 def test_constitution_composes_identity_operator_partnership(tmp_path):
-    ent = _seed_entity(tmp_path, name="Coyote", operator="Phill Clapham")
+    ent = _seed_entity(tmp_path, name="Coyote", operator="Avery Lane")
     c = EntitySeed(ent).constitution()
     assert c is not None
     assert "Coyote" in c                        # origin (who it is)
-    assert "Phill Clapham" in c                 # world (its operator)
+    assert "Avery Lane. 39. Riverton." in c   # world (its operator) — world.md-only text
     assert "partner, not an assistant" in c     # partnership (the floor)
     # order: identity → operator → how-we-work
-    assert c.index("Coyote") < c.index("Phill Clapham") < c.index("partner, not an assistant")
+    assert c.index("Coyote") < c.index("Avery Lane. 39. Riverton.") < c.index("partner, not an assistant")
 
 
 def test_constitution_strips_guidance_and_comments(tmp_path):
@@ -120,7 +120,7 @@ def test_reanchor_is_the_origin_charter(tmp_path):
     assert r is not None and "Coyote" in r
     # the re-anchor is the compressed identity (origin.md ONLY), not the full constitution frame:
     # world.md-unique content (the operator's location, its ## Identity heading) is absent.
-    assert "Columbus, OH" not in r
+    assert "Riverton" not in r
 
 
 def test_reanchor_none_when_origin_absent(tmp_path):
@@ -356,14 +356,14 @@ def test_real_rendered_templates_clean_correctly(tmp_path):
     (`> Part of the seed…`, `> **Seed material…`) stripped, identity/operator content kept."""
     interview = pytest.importorskip("levain.interview")
     ans = {
-        "ENTITY_NAME": "Sage", "SUBSTRATE": "minimax-m3", "OPERATOR_NAME": "Phill Clapham",
-        "JOB": "research partner", "AGE": "46", "LOCATION": "Columbus", "ROLES": "- architect",
-        "PERSONAL_HISTORY": "bassist", "COGNITION": "plays", "HEALTH": "x", "FAMILY": "y",
-        "INTERESTS": "poker", "WORK": "levain", "COMMUNICATION": "direct", "BOUNDARIES": "none",
+        "ENTITY_NAME": "Sage", "SUBSTRATE": "minimax-m3", "OPERATOR_NAME": "Avery Lane",
+        "JOB": "research partner", "AGE": "39", "LOCATION": "Riverton", "ROLES": "- architect",
+        "PERSONAL_HISTORY": "cartographer", "COGNITION": "plays", "HEALTH": "x", "FAMILY": "y",
+        "INTERESTS": "chess", "WORK": "levain", "COMMUNICATION": "direct", "BOUNDARIES": "none",
         "STRATEGIC_DIRECTION": "z", "CONTEXT": "llc",
     }
     tmpl = Path(interview.__file__).parent / "templates" / "seed"
-    for name, marker in (("origin.md", "Sage"), ("world.md", "Phill Clapham")):
+    for name, marker in (("origin.md", "Sage"), ("world.md", "Avery Lane")):
         rendered = interview.render_template(interview.parse_template(tmpl / name), ans)
         cleaned = _clean(rendered)
         assert "Part of the seed" not in cleaned and "Seed material" not in cleaned
@@ -422,12 +422,12 @@ def test_multiline_contiguous_guidance_is_fully_stripped(tmp_path):
         "> **Seed material — operator template.** blah blah.\n"
         ">\n"
         "> **No fast-moving state.** more guidance text.\n\n"
-        "## Identity\n\nPhill Clapham. Columbus.\n",
+        "## Identity\n\nAvery Lane. Riverton.\n",
         encoding="utf-8",
     )
     c = EntitySeed(ent).constitution() or ""
     assert "Seed material" not in c and "No fast-moving" not in c  # whole block gone
-    assert "Phill Clapham" in c  # real content survives
+    assert "Avery Lane. Riverton." in c  # real content survives (world.md-only text)
 
 
 def test_glued_epigraph_consumed_but_blank_separated_survives(tmp_path):

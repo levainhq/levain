@@ -871,13 +871,13 @@ def test_prompt_for_slot_line_prompt_string_unchanged_by_clear():
 
 def test_conduct_interview_back_then_clear_empties_prior_answer(tmp_path: Path):
     # NAME="Alpha"; at CITY :back; at the NAME revisit type :clear → NAME="";
-    # then CITY="Columbus". The integration peer of the back-then-blank-keeps test.
+    # then CITY="Riverton". The integration peer of the back-then-blank-keeps test.
     spec = _two_section_spec(tmp_path)
-    feed = iter(["Alpha", ":back", ":clear", "Columbus"])
+    feed = iter(["Alpha", ":back", ":clear", "Riverton"])
     answers = conduct_interview(
         [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
     )
-    assert answers == {"NAME": "", "CITY": "Columbus"}
+    assert answers == {"NAME": "", "CITY": "Riverton"}
 
 
 # ---------- conduct_interview: back-navigation (item 2) ----------
@@ -895,32 +895,32 @@ def _two_section_spec(tmp_path: Path):
 
 def test_conduct_interview_back_revises_prior_answer(tmp_path: Path):
     spec = _two_section_spec(tmp_path)
-    # NAME="Alpha"; at CITY type :back; re-answer NAME="Beta"; CITY="Columbus".
-    feed = iter(["Alpha", ":back", "Beta", "Columbus"])
+    # NAME="Alpha"; at CITY type :back; re-answer NAME="Beta"; CITY="Riverton".
+    feed = iter(["Alpha", ":back", "Beta", "Riverton"])
     answers = conduct_interview(
         [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
     )
-    assert answers == {"NAME": "Beta", "CITY": "Columbus"}
+    assert answers == {"NAME": "Beta", "CITY": "Riverton"}
 
 
 def test_conduct_interview_back_at_first_question_is_noop(tmp_path: Path):
     spec = _two_section_spec(tmp_path)
     # :back at the very first prompt does nothing; then answer through.
-    feed = iter([":back", "Alpha", "Columbus"])
+    feed = iter([":back", "Alpha", "Riverton"])
     answers = conduct_interview(
         [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
     )
-    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+    assert answers == {"NAME": "Alpha", "CITY": "Riverton"}
 
 
 def test_conduct_interview_back_then_blank_keeps_prior_answer(tmp_path: Path):
     spec = _two_section_spec(tmp_path)
     # NAME="Alpha"; at CITY :back; at NAME revisit a blank keeps Alpha; CITY.
-    feed = iter(["Alpha", ":back", "", "Columbus"])
+    feed = iter(["Alpha", ":back", "", "Riverton"])
     answers = conduct_interview(
         [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
     )
-    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+    assert answers == {"NAME": "Alpha", "CITY": "Riverton"}
 
 
 def _multislot_spec(tmp_path: Path):
@@ -938,9 +938,9 @@ def test_conduct_interview_forward_multislot_prints_no_revising_header(tmp_path:
     # genuine back-navigation re-entry only.
     spec = _multislot_spec(tmp_path)
     out: list[str] = []
-    feed = iter(["Alpha", "Columbus"])
+    feed = iter(["Alpha", "Riverton"])
     answers = conduct_interview([spec], input_fn=lambda p: next(feed), output_fn=out.append)
-    assert answers == {"NAME": "Alpha", "CITY": "Columbus"}
+    assert answers == {"NAME": "Alpha", "CITY": "Riverton"}
     assert not any("revising" in line for line in out)
     # The section header prints exactly once, on the first slot.
     assert sum(1 for line in out if line.strip() == "## Identity") == 1
@@ -950,9 +950,9 @@ def test_conduct_interview_back_into_multislot_prints_revising_header(tmp_path: 
     # The flip side: a real back-nav revisit DOES re-orient with "(revising)".
     spec = _multislot_spec(tmp_path)
     out: list[str] = []
-    feed = iter(["Alpha", ":back", "Beta", "Columbus"])
+    feed = iter(["Alpha", ":back", "Beta", "Riverton"])
     answers = conduct_interview([spec], input_fn=lambda p: next(feed), output_fn=out.append)
-    assert answers == {"NAME": "Beta", "CITY": "Columbus"}
+    assert answers == {"NAME": "Beta", "CITY": "Riverton"}
     assert any("revising" in line for line in out)
 
 
@@ -993,12 +993,12 @@ def test_conduct_interview_back_at_optional_skip_prompt(tmp_path: Path):
     )
     spec = parse_template(template)
     # A="Alpha"; at the Maybe skip-prompt type :back; revise A="Beta";
-    # now skip Maybe ("y"); answer C="Columbus".
-    feed = iter(["Alpha", ":back", "Beta", "y", "Columbus"])
+    # now skip Maybe ("y"); answer C="Riverton".
+    feed = iter(["Alpha", ":back", "Beta", "y", "Riverton"])
     answers = conduct_interview(
         [spec], input_fn=lambda p: next(feed), output_fn=lambda s: None
     )
-    assert answers == {"A": "Beta", "B": "", "C": "Columbus"}
+    assert answers == {"A": "Beta", "B": "", "C": "Riverton"}
 
 
 def test_conduct_interview_return_to_bailed_field_restores_section_context(tmp_path: Path):
@@ -1049,10 +1049,10 @@ def test_build_field_plan_prefills_current_without_excluding(tmp_path: Path):
     # rendered, and `values` pre-fills `current`. An already-valued slot stays in
     # the plan, carrying its value — it does NOT vanish.
     plan = {f.slot: f for f in build_field_plan(
-        [_three_line_spec(tmp_path)], values={"CITY": "Columbus"}
+        [_three_line_spec(tmp_path)], values={"CITY": "Riverton"}
     )}
     assert set(plan) == {"NAME", "CITY", "ROLE"}  # nothing excluded
-    assert plan["CITY"].current == "Columbus"
+    assert plan["CITY"].current == "Riverton"
     assert plan["NAME"].current == ""
 
 

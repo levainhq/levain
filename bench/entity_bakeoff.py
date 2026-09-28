@@ -144,7 +144,7 @@ def _scaffold_entity(root: Path, task: str = "easy") -> Path:
         "Your job: complete coding tasks for your operator.\n"
     )
     (seed / "world.md").write_text(
-        "# Who Your Operator Is\n\nPhill Clapham. 46. Columbus, OH.\n"
+        "# Who Your Operator Is\n\nAvery Lane. 39. Riverton.\n"
     )
     (seed / "partnership.md").write_text(
         "# How We Work\n\nYou are a partner, not an assistant.\n"

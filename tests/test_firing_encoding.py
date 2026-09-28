@@ -150,7 +150,7 @@ LEGITIMATE = [
     # lone lead-byte-lookalike characters inside real words
     "âme, âge, bâton",
     # code and paths, where a stray byte would be catastrophic to rewrite
-    "path = 'C:\\Users\\phill\\Ω' # ohm",
+    "path = 'C:\\Users\\avery\\Ω' # ohm",
 ]
 
 # Text that legitimately contains a lead-byte character standing alone — the one shape the

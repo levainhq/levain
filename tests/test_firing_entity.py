@@ -35,7 +35,7 @@ def _entity(tmp_path: Path, name: str = "coyote") -> Path:
     return d
 
 
-def _seed(entity_dir: Path, *, name: str = "Coyote", operator: str = "Phill Clapham") -> Path:
+def _seed(entity_dir: Path, *, name: str = "Coyote", operator: str = "Avery Lane") -> Path:
     """Lay down a minimal filled ``seed/`` so ``build_entity_agent`` has a real identity to render
     (step 4). Enough for the constitution to prove "boots as itself": an origin (who it is), a world
     (its operator), a partnership (the floor)."""
@@ -50,7 +50,7 @@ def _seed(entity_dir: Path, *, name: str = "Coyote", operator: str = "Phill Clap
         encoding="utf-8",
     )
     (seed / "world.md").write_text(
-        f"# Who Your Operator Is\n\n## Identity\n\n{operator}. 46. Columbus, OH.\n", encoding="utf-8"
+        f"# Who Your Operator Is\n\n## Identity\n\n{operator}. 39. Riverton.\n", encoding="utf-8"
     )
     (seed / "partnership.md").write_text(
         "# How We Work\n\nYou are a partner, not an assistant.\n", encoding="utf-8"
@@ -206,12 +206,12 @@ def test_build_entity_agent_boots_as_itself_from_seed(tmp_path):
     + partnership floor ride the set-once constitution suffix (so "who are you?" is the seed, not the
     model's stock "I am OpenHands"), and the re-anchor kind is the seed source. Guidance blockquotes +
     interview comments are stripped; the generic default is REPLACED (not appended)."""
-    ent = _seed(_entity(tmp_path), name="Coyote", operator="Phill Clapham")
+    ent = _seed(_entity(tmp_path), name="Coyote", operator="Avery Lane")
     binding = build_entity_agent(ent, _stub_llm())
 
     suffix = binding.agent.agent_context.system_message_suffix or ""
     assert "Coyote" in suffix                       # identity (origin.md)
-    assert "Phill Clapham" in suffix                # operator (world.md)
+    assert "Avery Lane. 39. Riverton." in suffix  # operator (world.md-only text)
     assert "partner, not an assistant" in suffix    # floor (partnership.md)
     assert "governed cognitive substrate" not in suffix  # the generic default was REPLACED
     assert "guidance blockquote" not in suffix      # > blockquote stripped
@@ -249,7 +249,7 @@ def test_build_entity_agent_warns_on_present_but_unreadable_seed(tmp_path, caplo
 _NEOCORTEX = (
     "## State\nMidway through the PARITY_BUG_FIX; even-length median is wrong.\n\n"
     "## Active Threads\n- mediancalc bugfix\n\n## Patterns\n- parallelize_reads | 1x\n\n"
-    "## Decisions\n- start with small repos\n\n## Context\nFirst real session with Phill.\n\n"
+    "## Decisions\n- start with small repos\n\n## Context\nFirst real session with Avery.\n\n"
     "## Understanding\nEarly — the seed is planted.\n"
 )
 
@@ -259,7 +259,7 @@ def test_build_entity_agent_folds_neocortex_into_the_constitution(tmp_path):
     With a seed AND a written neocortex, the set-once session_start suffix carries BOTH the static seed
     identity AND the dynamic neocortex (State/Context…), under the memory preamble that marks it as
     lived memory — the seed (birth) precedes the memory (life)."""
-    ent = _seed(_entity(tmp_path), name="Coyote", operator="Phill Clapham")
+    ent = _seed(_entity(tmp_path), name="Coyote", operator="Avery Lane")
     (ent / ".levain" / "memory.continuity.md").write_text(_NEOCORTEX, encoding="utf-8")
 
     binding = build_entity_agent(ent, _stub_llm())
@@ -269,7 +269,7 @@ def test_build_entity_agent_folds_neocortex_into_the_constitution(tmp_path):
     assert "partner, not an assistant" in suffix               # …and the floor
     assert "Your Memory — carried from your prior sessions" in suffix  # the memory preamble marker
     assert "PARITY_BUG_FIX" in suffix                          # State surfaced
-    assert "First real session with Phill" in suffix           # Context surfaced
+    assert "First real session with Avery" in suffix           # Context surfaced
     assert suffix.index("Coyote") < suffix.index("Your Memory — carried")  # seed before memory
 
 

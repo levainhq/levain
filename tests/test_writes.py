@@ -41,7 +41,7 @@ WORLD = """# Who Your Operator Is
 
 ## Identity
 
-Phill. 46. Columbus, OH.
+Avery. 39. Riverton.
 
 ## How They Think
 
@@ -87,7 +87,7 @@ This session built the governed State write.
 
 ## Understanding
 
-Phill is a paradox-holding ensemble mind.
+Avery thinks in systems.
 """
 
 _CONTINUITY_REL = Path(".levain") / "memory.continuity.md"
@@ -224,13 +224,13 @@ class TestSectionEdit:
         # siblings + H1 + preamble preserved
         assert "# Who Your Operator Is" in out
         assert "> Seed material" in out
-        assert "Phill. 46. Columbus, OH." in out
+        assert "Avery. 39. Riverton." in out
         assert "Direct, profanity welcome." in out
         # section order preserved
         assert out.index("## Identity") < out.index("## How They Think") < out.index("## Communication")
 
     def test_edit_first_section(self, install: Path) -> None:
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New identity."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New identity."))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "New identity." in out
         assert "# Who Your Operator Is" in out
@@ -240,20 +240,20 @@ class TestSectionEdit:
         apply_edit(_scope(install), _world_section("Communication", "Direct, profanity welcome.", "Terse."))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "Terse." in out
-        assert "Phill. 46." in out
+        assert "Avery. 39." in out
 
     def test_reparse_round_trips(self, install: Path) -> None:
         # After an edit the read layer re-parses the new body correctly.
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "X.\nY."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "X.\nY."))
         docs = {d.key: d for d in _read_config_docs(install) if d.source == "seed/world.md"}
         ident = next(d for d in docs.values() if d.heading == "Identity")
         assert ident.body == "X.\nY."
 
     def test_empty_body_clears_section(self, install: Path) -> None:
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", ""))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", ""))
         out = (install / "seed" / "world.md").read_text(encoding="utf-8")
         assert "## Identity" in out
-        assert "Phill. 46." not in out
+        assert "Avery. 39." not in out
         # next section still intact
         assert "## How They Think" in out
 
@@ -272,7 +272,7 @@ class TestSectionEdit:
         dup = WORLD + "\n## Identity\n\nduplicate.\n"
         (root / "seed" / "world.md").write_text(dup, encoding="utf-8")
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(root), _world_section("Identity", "Phill. 46. Columbus, OH.", "x"))
+            apply_edit(_scope(root), _world_section("Identity", "Avery. 39. Riverton.", "x"))
         assert ei.value.code == "section_ambiguous"
 
 
@@ -307,7 +307,7 @@ class TestStaleCheck:
 class TestReversibility:
     def test_backup_and_audit_written(self, install: Path) -> None:
         res = apply_edit(_scope(install), _world_section(
-            "Identity", "Phill. 46. Columbus, OH.", "New."), now="2026-06-13T19:00:00+00:00")
+            "Identity", "Avery. 39. Riverton.", "New."), now="2026-06-13T19:00:00+00:00")
         edits = recent_edits(install / ".levain")
         assert len(edits) == 1
         rec = edits[0]
@@ -322,7 +322,7 @@ class TestReversibility:
         assert backup.read_text(encoding="utf-8") == WORLD
 
     def test_newest_first(self, install: Path) -> None:
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "A."))
         ident_body = "A."  # the new current body of Identity
         apply_edit(_scope(install), _world_section("Identity", ident_body, "B."))
         edits = recent_edits(install / ".levain")
@@ -331,7 +331,7 @@ class TestReversibility:
         assert edits[0]["new_sha256"] != edits[1]["new_sha256"]
 
     def test_undo_restores_prior(self, install: Path) -> None:
-        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "Changed."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "Changed."))
         assert "Changed." in (install / "seed" / "world.md").read_text(encoding="utf-8")
         apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         restored = (install / "seed" / "world.md").read_text(encoding="utf-8")
@@ -342,7 +342,7 @@ class TestReversibility:
         # tree (e.g. the audit log itself) must be REFUSED, never used as a restore source.
         # The CAS gate runs first, so forge a REAL edit's record (new_sha256 stays valid)
         # and tamper only its `backup` field — this exercises the prefix validation.
-        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New."))
         log = install / ".levain" / "edits.jsonl"
         lines = log.read_text(encoding="utf-8").splitlines()
         rec = json.loads(lines[-1])
@@ -358,7 +358,7 @@ class TestReversibility:
         # escape the subdir (`backups/../edits.jsonl`) must be refused — the prefix string
         # is not enough; the RESOLVED path must stay under backups/. (CAS runs first, so
         # forge a real edit's record and tamper only `backup`.)
-        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New."))
         log = install / ".levain" / "edits.jsonl"
         lines = log.read_text(encoding="utf-8").splitlines()
         rec = json.loads(lines[-1])
@@ -383,12 +383,12 @@ class TestReversibility:
         assert ei.value.http_status == 404
 
     def test_no_tmp_files_left(self, install: Path) -> None:
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "X."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "X."))
         leftovers = list((install / "seed").glob(".*tmp*"))
         assert leftovers == []
 
     def test_view_surfaces_recent_edits(self, install: Path) -> None:
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New."))
         view = SubstrateSource.local(install).build()
         assert len(view.recent_edits) == 1
         assert view.recent_edits[0]["heading"] == "Identity"
@@ -458,7 +458,7 @@ class TestInputValidation:
     def test_oversize_body_413(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), _world_section(
-                "Identity", "Phill. 46. Columbus, OH.", "z" * (256 * 1024 + 1)))
+                "Identity", "Avery. 39. Riverton.", "z" * (256 * 1024 + 1)))
         assert ei.value.http_status == 413
 
 
@@ -476,7 +476,7 @@ class TestApparatusFixes:
         assert res["ok"]  # NOT a spurious 409
         out = (root / "seed" / "world.md").read_bytes()
         assert b"\r" not in out  # consistent LF, no stray \r (no mixed endings)
-        assert b"Topological." in out and b"Phill. 46. Columbus, OH." in out
+        assert b"Topological." in out and b"Avery. 39. Riverton." in out
 
     def test_crlf_in_new_body_normalized(self, install: Path) -> None:
         # An untrusted client (curl) sending \r\n in new_body must not write mixed endings.
@@ -487,14 +487,14 @@ class TestApparatusFixes:
 
     def test_section_break_rejected(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "text\n## Sneaky\nmore"))
+            apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "text\n## Sneaky\nmore"))
         assert ei.value.code == "section_break"
         assert ei.value.http_status == 422
 
     def test_concurrent_same_section_serialized_no_lost_update(self, install: Path) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
-        expected = "Phill. 46. Columbus, OH."
+        expected = "Avery. 39. Riverton."
 
         def attempt(i: int) -> str:
             try:
@@ -523,7 +523,7 @@ class TestApparatusFixes:
     def test_undo_refuses_stale_id_no_discard_of_newer(self, install: Path) -> None:
         # Two edits to the SAME file; undoing the OLDER one is refused (it would
         # silently discard the newer edit). Only the latest edit to a file undoes.
-        r1 = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "A."))
+        r1 = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "A."))
         r2 = apply_edit(_scope(install), _world_section("Communication", "Direct, profanity welcome.", "B."))
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": r1["id"]})
@@ -535,7 +535,7 @@ class TestApparatusFixes:
         assert "A." in out and "Direct, profanity welcome." in out
 
     def test_cannot_double_undo(self, install: Path) -> None:
-        r = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "Once."))
+        r = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "Once."))
         apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
         # the file no longer matches r's result → a second undo of r is refused
         with pytest.raises(EditError) as ei:
@@ -617,8 +617,8 @@ class TestStateEdit:
         cont = _add_continuity(install)
         r = apply_edit(_scope(install), _state_req(_section_body(CONTINUITY, "State"), "edited state."))
         wrapped = (cont.read_text(encoding="utf-8")
-                   .replace("Phill is a paradox-holding ensemble mind.",
-                            "Phill is a paradox-holding ensemble mind, re-consolidated."))
+                   .replace("Avery thinks in systems.",
+                            "Avery thinks in systems, re-consolidated."))
         cont.write_text(wrapped, encoding="utf-8")  # the consolidate touched the felt layer
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": r["id"]})
@@ -700,8 +700,8 @@ class TestStateEdit:
 
         cont = _add_continuity(install)
         wrapped = CONTINUITY.replace(
-            "Phill is a paradox-holding ensemble mind.",
-            "Phill is a paradox-holding ensemble mind, re-consolidated.",
+            "Avery thinks in systems.",
+            "Avery thinks in systems, re-consolidated.",
         )
         real = W._edit_one_section
 
@@ -765,7 +765,7 @@ class TestContinuityLockWiring:
 
     def test_config_edit_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
         calls = self._spy(monkeypatch)
-        apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New."))
         assert calls == []
 
     def test_entity_name_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
@@ -781,7 +781,7 @@ class TestContinuityLockWiring:
         assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
 
     def test_undo_of_config_does_not_take_the_lock(self, install: Path, monkeypatch) -> None:
-        res = apply_edit(_scope(install), _world_section("Identity", "Phill. 46. Columbus, OH.", "New."))
+        res = apply_edit(_scope(install), _world_section("Identity", "Avery. 39. Riverton.", "New."))
         calls = self._spy(monkeypatch)  # spy only the undo
         apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert calls == []

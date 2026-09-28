@@ -38,7 +38,7 @@ def _filled(capsys) -> dict[str, str]:
         a[slot] = prose.get(slot, "")
     a.update({
         "OPERATOR_NAME": "Chris",
-        "LOCATION": "Ohio",
+        "LOCATION": "Riverton",
         "ROLES": "- Builder",
         "INTERESTS": "Baking",
         "ENTITY_NAME": "Ada",
@@ -82,7 +82,7 @@ def test_non_interactive_install_creates_a_real_entity(tmp_path: Path, capsys, m
     origin = (install / "seed" / "origin.md").read_text(encoding="utf-8")
     world = (install / "seed" / "world.md").read_text(encoding="utf-8")
     assert "Ada" in origin and "Shipping v2" in origin
-    assert "Chris" in world and "Ohio" in world
+    assert "Chris" in world and "Riverton" in world
     assert "{{" not in origin.replace("`{{", "")  # nothing left unfilled
 
     # The answers are RECORDED — which is what makes doctor's content check possible.

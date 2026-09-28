@@ -1028,7 +1028,7 @@ class TestServeWriteFlag:
 
 _W_WORLD = (
     "# Who Your Operator Is\n\n> Seed material — operator template.\n\n"
-    "## Identity\n\nPhill. 46. Columbus, OH.\n\n"
+    "## Identity\n\nAvery. 39. Riverton.\n\n"
     "## Communication\n\nDirect, profanity welcome.\n"
 )
 _W_ORIGIN = "# Who You Are — Aria\n\nA new entity.\n"
@@ -1072,7 +1072,7 @@ class TestWriteBoundary:
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/world.md", "heading": "Identity",
-                "expected_body": "Phill. 46. Columbus, OH.", "new_body": "Topological mind.",
+                "expected_body": "Avery. 39. Riverton.", "new_body": "Topological mind.",
             })
         assert status == 200 and body["ok"] is True
         out = (src.install_root / "seed" / "world.md").read_text(encoding="utf-8")
@@ -1115,11 +1115,11 @@ class TestWriteBoundary:
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/world.md", "heading": "Identity",
-                "expected_body": "Phill. 46. Columbus, OH.", "new_body": "x",
+                "expected_body": "Avery. 39. Riverton.", "new_body": "x",
             }, headers={"Sec-Fetch-Site": "cross-site"})
         assert status == 403 and body["error"] == "forbidden"
         # the file is untouched
-        assert "Phill. 46." in (src.install_root / "seed" / "world.md").read_text("utf-8")
+        assert "Avery. 39." in (src.install_root / "seed" / "world.md").read_text("utf-8")
 
     def test_same_site_refused(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
@@ -1197,7 +1197,7 @@ class TestWriteBoundary:
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/world.md", "heading": "Identity",
-                "expected_body": "Phill. 46. Columbus, OH.", "new_body": big,
+                "expected_body": "Avery. 39. Riverton.", "new_body": big,
             })
         assert status == 413
 

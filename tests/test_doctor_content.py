@@ -34,7 +34,7 @@ def _seed(install: Path, files: dict[str, str]) -> None:
 
 
 def test_passes_when_render_targets_are_filled(tmp_path: Path):
-    _seed(tmp_path, {"world.md": "# Me\nChris. 40. Ohio.\n", "origin.md": "You are Ada.\n"})
+    _seed(tmp_path, {"world.md": "# Me\nChris. 40. Riverton.\n", "origin.md": "You are Ada.\n"})
     results = _check_seed_content(tmp_path)
     assert [r.name for r in results] == ["seed content (world.md)", "seed content (origin.md)"]
     assert all(r.ok for r in results)

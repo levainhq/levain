@@ -97,7 +97,7 @@ The answer file is a JSON object **keyed by slot name**, never an ordered list, 
 you never have to know or match the order the interview happens to ask in:
 
 ```json
-{ "OPERATOR_NAME": "Chris", "ENTITY_NAME": "Ada", "LOCATION": "Ohio" }
+{ "OPERATOR_NAME": "Chris", "ENTITY_NAME": "Ada", "LOCATION": "Riverton" }
 ```
 
 `--answers-template` writes the blank file to stdout and a guide to *what each
