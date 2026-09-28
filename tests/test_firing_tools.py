@@ -75,7 +75,7 @@ class _FakeWorkspace:
 
 
 class _FakeConvState:
-    # uid=501(phillipclapham) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),79(_appserverusr),80(admin),81(_appserveradm),701(com.apple.sharepoint.group.1),33(_appstore),98(_lpadmin),100(_lpoperator),204(_developer),250(_analyticsusers),395(com.apple.access_ftp),398(com.apple.access_screensharing),399(com.apple.access_ssh),400(com.apple.access_remote_ae) mirrors the real ConversationState (a required UUID) — the floor registry keys on the
+    # uid=501(exampleuser) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),80(admin) mirrors the real ConversationState (a required UUID) — the floor registry keys on the
     # CONVERSATION, so a fake without one would silently fall back to object identity and hide
     # whether create() actually shares.
     _n = 0
