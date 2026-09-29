@@ -75,7 +75,7 @@ class _FakeWorkspace:
 
 
 class _FakeConvState:
-    # uid=501(exampleuser) gid=20(staff) groups=20(staff),12(everyone),61(localaccounts),80(admin) mirrors the real ConversationState (a required UUID) — the floor registry keys on the
+    # `id` mirrors the real ConversationState (a required UUID) — the floor registry keys on the
     # CONVERSATION, so a fake without one would silently fall back to object identity and hide
     # whether create() actually shares.
     _n = 0
