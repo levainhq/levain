@@ -441,6 +441,10 @@ def _unique_slots(
     return list(seen.keys())
 
 
+#: Blank answers to one identity slot before the terminal walk gives up and refuses.
+_IDENTITY_MAX_BLANKS = 3
+
+
 def conduct_interview(
     specs: list[TemplateSpec],
     answers: dict[str, str] | None = None,
@@ -462,7 +466,16 @@ def conduct_interview(
     progress so a Ctrl+C mid-interview can be resumed on the next
     `levain init` against the same path.
     """
-    answers = dict(answers or {})
+    # The terminal walk enforces the same identity rule as the `--answers` gate
+    # (`validate_answers`): a blank OPERATOR_NAME / ENTITY_NAME is not an answer. A
+    # blank one restored from an old checkpoint is dropped so it is asked again.
+    from levain.answers import IDENTITY_SLOTS, AnswersError
+
+    answers = {
+        k: v
+        for k, v in (answers or {}).items()
+        if not (k in IDENTITY_SLOTS and not v.strip())
+    }
 
     # Build the flat, ordered field plan via the shared derivation (so the
     # terminal walk and the web init form can never drift). Optional-section
@@ -479,6 +492,7 @@ def conduct_interview(
     entered_sections: set[int] = set()   # id(section) — section header shown
     skipped_sections: set[int] = set()   # id(section) — optional skip chosen
     visited_fields: set[int] = set()     # plan index — field already prompted
+    identity_blanks: dict[str, int] = {}  # slot -> blank answers refused so far
     #   nav-state (visited) is deliberately separate from value-state (answers):
     #   a field bailed out of with `:back` before answering is still "visited".
 
@@ -570,6 +584,21 @@ def conduct_interview(
                 output_fn("  (Already at the first question — nothing to go back to.)")
                 continue
             i = j
+            continue
+
+        if field.slot in IDENTITY_SLOTS and not result.strip():
+            # Bounded, never a loop: an EOF on a multi-line prompt reads as a blank,
+            # so an unbounded re-ask would spin on a closed pipe forever.
+            identity_blanks[field.slot] = identity_blanks.get(field.slot, 0) + 1
+            if identity_blanks[field.slot] >= _IDENTITY_MAX_BLANKS:
+                raise AnswersError(
+                    f"{field.slot} was left blank {_IDENTITY_MAX_BLANKS} times; "
+                    f"an entity must know its own name and its operator's."
+                )
+            output_fn(
+                f"  {field.slot} cannot be blank (an entity must know its own name "
+                f"and its operator's) — please answer."
+            )
             continue
 
         answers[field.slot] = result

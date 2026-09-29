@@ -166,10 +166,13 @@ def validate_answers(fields: Iterable[_Field], answers: dict[str, str]) -> list[
 
     missing = [f.slot for f in plan if f.slot not in answers]
     if missing:
+        planned_identity = [s for s in IDENTITY_SLOTS if s in known]
+        exception = (
+            f" except {' and '.join(planned_identity)}" if planned_identity else ""
+        )
         errors.append(
             f"missing slot(s): {', '.join(missing)} "
-            f"(every slot must be present; \"\" is accepted for any slot except "
-            f"{' and '.join(IDENTITY_SLOTS)})"
+            f"(every slot must be present; \"\" is accepted for any slot{exception})"
         )
 
     empty_identity = [

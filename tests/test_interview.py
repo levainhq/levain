@@ -523,6 +523,31 @@ def test_conduct_interview_with_injected_input_fn(tmp_path: Path):
     assert answers.get("NAME") == "Alex"
 
 
+def test_terminal_walk_refuses_blank_identity_slot_instead_of_writing_it(tmp_path: Path):
+    """Reproduced failure: `init --adapter openhands` with bare Enter throughout exited 0
+    and wrote an empty identity ("You are ****."), which `doctor` then failed. A blank
+    identity slot is re-asked, and a slot that stays blank is refused, never looped on."""
+    from levain.answers import AnswersError
+
+    template = tmp_path / "origin.md"
+    template.write_text(
+        "# Origin\n\n## S\n\n<!-- interview: their name -->\n\n{{OPERATOR_NAME}}\n",
+        encoding="utf-8",
+    )
+    spec = parse_template(template)
+
+    told: list[str] = []
+    replies = iter(["", "Alex"])
+    answers = conduct_interview(
+        [spec], input_fn=lambda prompt: next(replies), output_fn=told.append
+    )
+    assert answers["OPERATOR_NAME"] == "Alex"
+    assert any("cannot be blank" in line for line in told)
+
+    with pytest.raises(AnswersError, match="OPERATOR_NAME"):
+        conduct_interview([spec], input_fn=lambda prompt: "", output_fn=lambda s: None)
+
+
 def test_conduct_interview_shares_answers_across_specs(tmp_path: Path):
     """Cross-spec slot sharing: if both world.md and origin.md have
     `{{OPERATOR_NAME}}`, the second spec must not re-prompt."""
