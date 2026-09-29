@@ -547,6 +547,25 @@ def test_terminal_walk_refuses_blank_identity_slot_instead_of_writing_it(tmp_pat
     with pytest.raises(AnswersError, match="OPERATOR_NAME"):
         conduct_interview([spec], input_fn=lambda prompt: "", output_fn=lambda s: None)
 
+    # An identity slot in an OPTIONAL section must not be skippable into a blank.
+    opt = tmp_path / "optional.md"
+    opt.write_text(
+        "# Opt\n\n## Who\n\n<!-- optional: test -->\n<!-- interview: their name -->\n\n"
+        "{{OPERATOR_NAME}}\n",
+        encoding="utf-8",
+    )
+    prompts: list[str] = []
+
+    def optional_driver(prompt: str) -> str:
+        prompts.append(prompt)
+        return "y" if "Skip this section" in prompt else "Alex"
+
+    optional_answers = conduct_interview(
+        [parse_template(opt)], input_fn=optional_driver, output_fn=lambda s: None
+    )
+    assert optional_answers["OPERATOR_NAME"] == "Alex"
+    assert not any("Skip this section" in p for p in prompts)
+
 
 def test_conduct_interview_shares_answers_across_specs(tmp_path: Path):
     """Cross-spec slot sharing: if both world.md and origin.md have

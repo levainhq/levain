@@ -521,7 +521,12 @@ def conduct_interview(
             output_fn("")
             output_fn(f"## {section.title}" if section.title else "[preamble]")
 
-            if section.optional:
+            # A section still owing an identity answer cannot be skipped: the skip
+            # would write "" over it, past the blank-identity refusal below.
+            owes_identity = any(
+                f.section is section and f.slot in IDENTITY_SLOTS for f in plan
+            )
+            if section.optional and not owes_identity:
                 if section.optional_reason:
                     output_fn(f"  (optional — {section.optional_reason})")
                 else:
@@ -601,6 +606,7 @@ def conduct_interview(
             )
             continue
 
+        identity_blanks.pop(field.slot, None)
         answers[field.slot] = result
 
         # Persist progress after each completed section (matches the old

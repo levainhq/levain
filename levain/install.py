@@ -495,7 +495,8 @@ def run_init(
             _report_partial_state(install)
             return 1
         except AnswersError as e:
-            # `_refuse_input` fired — a slot escaped validation. Loud, named, no hang.
+            # `_refuse_input` fired (a slot escaped validation), or the terminal walk
+            # refused a blank identity slot. Loud, named, no hang.
             print(f"FAIL: {e}")
             _report_partial_state(install)
             return 1
