@@ -587,7 +587,8 @@ class TestSeedOwnership:
         (pack / "seed" / "world.md").unlink()
         (pack / "pack.toml").write_text('name = "p"\norder = 10\n')  # drops it from `render` too
         out, _prov, _drifted, review = _reconcile(inst)
-        assert review and "RENDERED" in out
+        mine = [ln for ln in out.splitlines() if "RENDERED" in ln]
+        assert review and mine and "by hand" not in mine[0]
         assert (inst / "seed" / "world.md").read_text() == "# PACK world rendered\n"
 
     def test_a_genuinely_dropped_seed_is_still_removed(self, tmp_path):
@@ -609,3 +610,48 @@ class TestSeedOwnership:
         _out, _prov, _drifted, review = _reconcile(inst)
         assert review
         assert (inst / "seed" / "world.md").read_text() == "# PACK world rendered\n"
+
+    def test_a_finder_dotfile_in_a_pack_seed_dir_does_not_blind_the_reconcile(self, tmp_path):
+        # L1+L2 round 1, both reproduced: one `.DS_Store` made the whole stack unknowable,
+        # so every seed change in every pack surfaced forever and none applied. The drift
+        # hasher ignores the file, so ownership must too.
+        pack = _write_pack(tmp_path / "p", name="p", seed={"a.md": "v1\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (pack / "seed" / ".DS_Store").write_bytes(b"\0\0")
+        (pack / "seed" / "a.md").write_text("v2\n")
+        out, _prov, drifted, review = _reconcile(inst)
+        assert drifted and not review, out
+        assert (inst / "seed" / "a.md").read_text() == "v2\n"
+
+    def test_an_invalid_layer_is_opaque_alone_and_named(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"a.md": "v1\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"b.md": "b\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (b / "seed" / "asset.png").write_bytes(b"png")  # b is now an invalid layer
+        (a / "seed" / "a.md").write_text("v2\n")
+        out, _prov, _drifted, _review = _reconcile(inst)
+        assert (inst / "seed" / "a.md").read_text() == "v2\n"  # a is still reconciled
+        assert "pack-layer problem" in out and "asset.png" in out
+
+    def test_a_drop_after_an_order_change_does_not_leave_orphaned_content(self, tmp_path):
+        # L2 round 1, reproduced: b wins x.md at init, then drops below a by `order`, then
+        # drops x.md. The install still held b's bytes, which no layer ships, and the
+        # update reported the set as known-good.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (b / "pack.toml").write_text('name = "b"\norder = 5\n')
+        (b / "seed" / "x.md").unlink()
+        _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "A\n"
+
+    def test_restores_and_removals_are_announced(self, tmp_path):
+        pack = _write_pack(tmp_path / "p", name="p",
+                           seed={"partnership.md": "# PACK\n", "only.md": "x\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (inst / "seed" / "partnership.md").write_text("# PACK + mine\n")
+        (pack / "seed" / "partnership.md").unlink()
+        (pack / "seed" / "only.md").unlink()
+        out, *_ = _reconcile(inst)
+        assert "seed/partnership.md restored" in out and "kept at partnership.md." in out
+        assert "seed/only.md removed" in out
