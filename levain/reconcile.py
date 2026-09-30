@@ -121,11 +121,17 @@ class _SeedStack:
     providers: dict[str, frozenset[int]]  # seed filename -> ranks of every layer shipping it
     opaque: frozenset[str]
     problems: list[str]
+    # Every seed filename the install's recorded stack composed: the base's plus each
+    # pack's RECORDED seed files. A name outside it entering the roster is a set change.
+    recorded_roster: frozenset[str]
+    # The BASE layer could not be read: every filename might be one it ships, so no
+    # ownership answer is safe (a drop would otherwise read "no layer ships it").
+    blind: bool = False
 
     def owner(self, fname: str, self_rank: int | None) -> str:
         """Which layer wins ``fname`` relative to the pack at ``self_rank``:
         ``self`` | ``higher`` | ``lower`` | ``none`` (no layer ships it) | ``unknown``."""
-        if self_rank is None or fname in self.opaque:
+        if self.blind or self_rank is None or fname in self.opaque:
             return "unknown"
         ranks = self.providers.get(fname)
         if not ranks:
@@ -135,12 +141,14 @@ class _SeedStack:
             return "self"
         return "higher" if top > self_rank else "lower"
 
-    def only_provider(self, fname: str, self_rank: int | None) -> bool:
-        """True when no OTHER layer ships ``fname`` — so the pack adding or dropping it
-        changes the composed seed SET (the adapter @import list), not just its content."""
-        if self_rank is None or fname in self.opaque:
+    def is_new_to_roster(self, fname: str) -> bool:
+        """True when ``fname`` was not in the recorded composed roster — so a pack adding
+        it changes the composed seed SET (the adapter @import list), not just its
+        content. Judged against the whole recorded stack, so a file moving between two
+        packs in one update is not a set change."""
+        if self.blind:
             return True  # cannot tell -> keep the conservative seed-set warning
-        return not (self.providers.get(fname, frozenset()) - {self_rank})
+        return fname not in self.recorded_roster
 
 
 def _layer_seed_names(layer: Path, manifest: PackManifest) -> set[str]:
@@ -165,6 +173,11 @@ def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _See
     layers: list[tuple[Path, PackManifest, set[str]]] = []
     opaque: set[str] = set()
     problems: list[str] = []
+    blind = False
+    recorded_roster: set[str] = set()
+    for drift in drifts:
+        recorded_roster.update(
+            r[len("seed/"):] for r in drift.recorded.files if r.startswith("seed/"))
     candidates: list[tuple[Path, PackDrift | None]] = [(templates_root, None)]
     candidates += [(Path(d.source), d) for d in drifts]
     for src, d in candidates:
@@ -175,12 +188,16 @@ def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _See
             names = _layer_seed_names(src, mf)
         except (PackError, OSError) as e:
             problems.append(str(e))
-            if d is not None:
+            if d is None:
+                blind = True
+            else:
                 opaque.update(r[len("seed/"):] for r in d.recorded.files if r.startswith("seed/"))
                 if d.current_files:
                     opaque.update(r[len("seed/"):] for r in d.current_files if r.startswith("seed/"))
             continue
         layers.append((src, mf, names))
+        if d is None:
+            recorded_roster.update(names)
     # Stable sort on `order`: ties keep lock order, the order init received the packs in.
     layers.sort(key=lambda layer: layer[1].order)
     winners: dict[str, SeedEntry] = {}
@@ -196,6 +213,8 @@ def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _See
         providers={n: frozenset(r) for n, r in providers.items()},
         opaque=frozenset(opaque),
         problems=problems,
+        recorded_roster=frozenset(recorded_roster),
+        blind=blind,
     )
 
 
@@ -545,8 +564,11 @@ def reconcile_pack(
         dst = install / "seed" / fname
         owner = _owner(fname)
         if owner == "higher":
+            # This pack's last-shipped bytes: its source hash for a verbatim seed, its
+            # rendered-output hash for a render seed (the template hash never matches).
+            shipped = {recorded.get(rel), drift.recorded.rendered.get(rel)} - {None}
             try:
-                stale = dst.is_file() and _sha256_file(dst) == recorded.get(rel)
+                stale = dst.is_file() and _sha256_file(dst) in shipped
             except OSError:
                 stale = False
             if not stale:
@@ -586,7 +608,7 @@ def reconcile_pack(
     for rel in drift.added:
         fname = rel[len("seed/"):] if rel.startswith("seed/") else ""
         if (fname in ON_DEMAND_SEED and _owner(fname) == "self"
-                and not stack.only_provider(fname, self_rank)):
+                and not stack.is_new_to_roster(fname)):
             _flag(rel, "now overrides a lower layer's on-demand seed, but the carrier's "
                        "retained summary for it still describes the file it replaced")
 
@@ -596,7 +618,7 @@ def reconcile_pack(
     # filename stays in the composed roster, so the @import list is still right.
     seed_added = [
         rel for rel in drift.added
-        if rel.startswith("seed/") and stack.only_provider(rel[len("seed/"):], self_rank)
+        if rel.startswith("seed/") and stack.is_new_to_roster(rel[len("seed/"):])
     ]
     if seed_added or seed_removed:
         emit(f"  pack {drift.name!r}: the seed set changed (added {len(seed_added)}, "

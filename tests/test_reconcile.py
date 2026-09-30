@@ -655,3 +655,51 @@ class TestSeedOwnership:
         out, *_ = _reconcile(inst)
         assert "seed/partnership.md restored" in out and "kept at partnership.md." in out
         assert "seed/only.md removed" in out
+
+    def test_an_unreadable_base_layer_never_turns_a_drop_into_a_delete(self, tmp_path):
+        # L3 round 1, codex HIGH + complement MED: base failing to read dropped its names
+        # from the stack, so a dropped override read "no layer ships it" and was deleted.
+        from contextlib import contextmanager
+        pack = _write_pack(tmp_path / "p", name="p", seed={"partnership.md": "# PACK\n"})
+        inst = _install_stack(tmp_path, [pack])
+        broken = _write_pack(tmp_path / "base", name="levain-base", order=0,
+                             seed={"partnership.md": "# BASE\n"})
+        (broken / "seed" / "asset.png").write_bytes(b"png")
+
+        @contextmanager
+        def _broken_root():
+            yield broken
+        (pack / "seed" / "partnership.md").unlink()
+        with mock.patch.object(reconcile, "_templates_root", _broken_root):
+            out, _prov, _drifted, review = _reconcile(inst)
+        assert review and "pack-layer problem" in out
+        assert (inst / "seed" / "partnership.md").read_text() == "# PACK\n"
+
+    def test_a_rendered_orphan_after_an_order_change_is_not_silently_kept(self, tmp_path):
+        # L3 round 1, codex HIGH: the stale check compared a RENDERED install file with
+        # the template hash, which never matches, so the orphan was skipped as "fine".
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, render=["x.md"],
+                        seed={"x.md": "B {{X}}\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (inst / "seed" / "x.md").write_text("B filled\n")
+        rendered = manifest.rendered_hashes(inst, ["seed/x.md"])
+        provs = [manifest.pack_provenance("a", a, None),
+                 manifest.pack_provenance("b", b, None, rendered=rendered, render=("x.md",))]
+        _record(inst, provs)
+        (b / "pack.toml").write_text('name = "b"\norder = 5\n')
+        (b / "seed" / "x.md").unlink()
+        _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "A\n"
+
+    def test_a_file_moving_between_packs_in_one_update_is_not_a_seed_set_change(self, tmp_path):
+        # L3 round 1, codex MED: judged per pack, the adding pack looked like the only
+        # provider, so the move re-surfaced on every update until a re-onboard.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"y.md": "y\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (a / "seed" / "x.md").unlink()
+        (b / "seed" / "x.md").write_text("B\n")
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert "seed set changed" not in out and not review, out
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
