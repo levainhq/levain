@@ -34,6 +34,7 @@ from pathlib import Path
 from levain.install import (
     InitError,
     _copy_pack_docs,
+    _templates_root,
     _timestamped_backup_path,
     _write_brand_config,
     read_answers,
@@ -42,11 +43,19 @@ from levain.install import (
 from levain.manifest import (
     PackDrift,
     PackProvenance,
+    _pack_hash_excluded,
     _sha256_file,
     compute_pack_drift,
     read_pack_locks_status,
 )
-from levain.packs import PackError, PackManifest, compose_brand, load_pack_manifest
+from levain.packs import (
+    ON_DEMAND_SEED,
+    PackError,
+    PackManifest,
+    SeedEntry,
+    compose_brand,
+    load_pack_manifest,
+)
 
 # A prompter asks the operator for the pack's NEWLY-ADDED render slots. It returns
 # ``{slot: answer}`` for the given InterviewFields, or ``None`` when it cannot prompt
@@ -80,6 +89,8 @@ class PackReconcile:
     backed_up: list[str] = field(default_factory=list)  # operator-edited -> .bak + applied
     added: list[str] = field(default_factory=list)      # new seeds copied in
     removed: list[str] = field(default_factory=list)    # dropped seeds removed
+    # dropped OVERRIDES: the next-winning lower layer's file was put back (spore-450)
+    restored: list[str] = field(default_factory=list)
     review: list[str] = field(default_factory=list)     # surfaced for the operator
     # New rendered-output hashes for render seeds this run wrote (folded into the
     # recorded `rendered` map so a fast-forwarded render file stops re-drifting).
@@ -87,12 +98,135 @@ class PackReconcile:
     new_provenance: PackProvenance | None = None
 
 
+@dataclass
+class _SeedStack:
+    """WHO OWNS each ``install/seed/<name>`` now: the CURRENT stack of the base templates
+    + every recorded pack, in the order the lock recorded them, resolved last-wins by
+    filename after a stable sort on ``order`` (the rule ``compose_roster`` applies at
+    init).
+
+    A pack reconciles only the seed files it WINS. ``install/seed/`` is flat and the
+    roster is last-wins by filename, so a file one pack adds, changes or drops may be
+    another layer's to show (spore-450: dropping an override deleted the base file it
+    had been hiding, leaving the carrier's ``@seed/`` import dangling).
+
+    Each layer is read ON ITS OWN, so one bad layer never blinds the reconcile for the
+    others: a layer that cannot be read (source gone, pack.toml or seed/ invalid) has
+    an unknown rank, so every filename it ships or recorded goes in ``opaque`` and the
+    reason in ``problems``. For an opaque name the reconcile SURFACES rather than
+    writes or deletes."""
+
+    winners: dict[str, SeedEntry]
+    rank: dict[Path, int]  # resolved layer dir -> position in the stack
+    providers: dict[str, frozenset[int]]  # seed filename -> ranks of every layer shipping it
+    opaque: frozenset[str]
+    problems: list[str]
+    # The install's carrier text (CLAUDE.md / AGENTS.md): the import list a seed-set
+    # change is ABOUT. ``None`` when the install has no carrier file.
+    carrier: str | None
+    # The BASE layer could not be read: every filename might be one it ships, so no
+    # ownership answer is safe (a drop would otherwise read "no layer ships it").
+    blind: bool = False
+
+    def owner(self, fname: str, self_rank: int | None) -> str:
+        """Which layer wins ``fname`` relative to the pack at ``self_rank``:
+        ``self`` | ``higher`` | ``lower`` | ``none`` (no layer ships it) | ``unknown``."""
+        if self.blind or self_rank is None or fname in self.opaque:
+            return "unknown"
+        ranks = self.providers.get(fname)
+        if not ranks:
+            return "none"
+        top = max(ranks)
+        if top == self_rank:
+            return "self"
+        return "higher" if top > self_rank else "lower"
+
+    def is_new_to_roster(self, fname: str) -> bool:
+        """True when the adapter's import list does not reference ``seed/<fname>`` — so
+        a pack adding it changes the composed seed SET, not just its content. Read from
+        the carrier itself: stable across runs (reconcile never rewrites it, only a
+        re-onboard does), and a file moving between two packs stays referenced."""
+        if self.blind or self.carrier is None:
+            return True  # cannot tell -> keep the conservative seed-set warning
+        return f"seed/{fname}" not in self.carrier
+
+
+def _layer_seed_names(layer: Path, manifest: PackManifest) -> set[str]:
+    """The seed filenames one layer ships, validated the way ``compose_roster`` validates
+    a layer EXCEPT that files the pack-drift hasher ignores (a Finder ``.DS_Store``) are
+    ignored here too: drift never reports them, so they must not decide ownership."""
+    seed_dir = layer / "seed"
+    if not seed_dir.is_dir():
+        raise PackError(f"pack {manifest.name!r}: seed directory not found at {seed_dir}")
+    names = {f.name for f in seed_dir.iterdir()
+             if f.is_file() and not _pack_hash_excluded(f"seed/{f.name}")}
+    stray = sorted(n for n in names if not n.endswith(".md"))
+    if stray:
+        raise PackError(f"pack {manifest.name!r}: seed/ holds non-.md file(s) {stray}")
+    missing = sorted(set(manifest.render) - names)
+    if missing:
+        raise PackError(f"pack {manifest.name!r}: render lists {missing} but seed/ lacks them")
+    return names
+
+
+def _build_seed_stack(
+    templates_root: Path, drifts: Sequence[PackDrift], install: Path
+) -> _SeedStack:
+    layers: list[tuple[Path, PackManifest, set[str]]] = []
+    opaque: set[str] = set()
+    problems: list[str] = []
+    blind = False
+    carrier: str | None = None
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        try:
+            text = (install / name).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        carrier = (carrier or "") + text
+    candidates: list[tuple[Path, PackDrift | None]] = [(templates_root, None)]
+    candidates += [(Path(d.source), d) for d in drifts]
+    for src, d in candidates:
+        try:
+            if d is not None and d.status == "source_missing":
+                raise PackError(f"pack {d.name!r}: source {d.source} is gone")
+            mf = load_pack_manifest(src)
+            names = _layer_seed_names(src, mf)
+        except (PackError, OSError, ValueError) as e:  # ValueError: undecodable pack.toml
+            problems.append(str(e))
+            if d is None:
+                blind = True
+            else:
+                opaque.update(r[len("seed/"):] for r in d.recorded.files if r.startswith("seed/"))
+                if d.current_files:
+                    opaque.update(r[len("seed/"):] for r in d.current_files if r.startswith("seed/"))
+            continue
+        layers.append((src, mf, names))
+    # Stable sort on `order`: ties keep lock order, the order init received the packs in.
+    layers.sort(key=lambda layer: layer[1].order)
+    winners: dict[str, SeedEntry] = {}
+    providers: dict[str, set[int]] = {}
+    for i, (src, mf, names) in enumerate(layers):
+        for n in names:
+            providers.setdefault(n, set()).add(i)
+            winners[n] = SeedEntry(name=n, path=src / "seed" / n,
+                                   mode="render" if n in mf.render else "verbatim")
+    return _SeedStack(
+        winners=winners,
+        rank={src.resolve(): i for i, (src, _mf, _n) in enumerate(layers)},
+        providers={n: frozenset(r) for n, r in providers.items()},
+        opaque=frozenset(opaque),
+        problems=problems,
+        carrier=carrier,
+        blind=blind,
+    )
+
+
 def _load_manifest(source: Path):
     """The current source pack's parsed manifest, or None if pack.toml can't be
     parsed (the pack is then unreconcilable -> needs_review)."""
     try:
         return load_pack_manifest(source)
-    except PackError:
+    except (PackError, ValueError):  # ValueError: an undecodable pack.toml
         return None
 
 
@@ -236,6 +370,58 @@ def _emit_changelog_context(source: Path, name: str, emit: Callable[[str], None]
             emit(f"    {ln}")
 
 
+def _show_winner(
+    install: Path,
+    drift: PackDrift,
+    rel: str,
+    stack: _SeedStack,
+    *,
+    apply: bool,
+    r: PackReconcile,
+    emit: Callable[[str], None],
+    flag: Callable[[str, str], None],
+) -> None:
+    """A pack stopped shipping ``rel`` while another layer still ships it: put that
+    layer's file in the install (spore-450). A render-mode winner is flagged, not
+    restored: ``levain update`` does not re-render a seed from a layer it did not just
+    reconcile, so the dropped copy stays loaded until a re-onboard."""
+    fname = rel[len("seed/"):]
+    winner = stack.winners.get(fname)
+    if winner is None:  # the caller's owner was "lower"/"higher", so a winner exists
+        flag(rel, "was dropped, but the layer that still ships it could not be found")
+        return
+    if winner.is_render:
+        flag(rel, "was an override of a RENDERED seed another layer ships; `levain "
+                  "update` does not re-render that layer's copy, so the dropped override "
+                  "is still the loaded one")
+        return
+    dst = install / "seed" / fname
+    try:
+        if not (dst.is_file() and _sha256_file(dst) == _sha256_file(winner.path)):
+            backup = None
+            if dst.exists() and _sha256_file(dst) != drift.recorded.files.get(rel):
+                backup = _timestamped_backup_path(dst)  # an operator edit is kept
+            if apply:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if backup is not None:
+                    shutil.copy2(dst, backup)
+                shutil.copy2(winner.path, dst)
+            r.restored.append(rel)
+            if backup is not None:
+                r.backed_up.append(rel)
+            verb = "restored" if apply else "would restore"
+            kept = f"; your edited copy {'is' if apply else 'would be'} kept at " \
+                   f"{backup.name}" if backup is not None else ""
+            emit(f"  pack {drift.name!r}: {rel} {verb} from the layer that still ships it "
+                 f"({winner.path.parent.parent}){kept}.")
+    except OSError as e:
+        flag(rel, f"was dropped, but the copy another layer ships could not be restored ({e})")
+        return
+    if fname in ON_DEMAND_SEED:
+        flag(rel, "now comes from another layer, but the carrier's retained summary for "
+                  "it still describes the dropped override")
+
+
 def reconcile_pack(
     install: Path,
     drift: PackDrift,
@@ -244,10 +430,12 @@ def reconcile_pack(
     prompter: Prompter | None,
     apply: bool,
     emit: Callable[[str], None],
+    stack: _SeedStack,
 ) -> PackReconcile:
     """Reconcile a single pack's drift. ``apply=False`` reports only (dry-run).
     ``answers`` is the shared, MUTABLE persisted-answer set (a render re-prompt adds
-    to it in place); the caller persists it once after all packs."""
+    to it in place); the caller persists it once after all packs. ``stack`` says which
+    layer owns each seed filename."""
     r = PackReconcile(name=drift.name, status="unchanged", new_provenance=drift.recorded)
 
     if drift.status == "source_missing":
@@ -271,11 +459,22 @@ def reconcile_pack(
     current = drift.current_files or {}
     recorded = drift.recorded.files
     acted = False
+    self_rank = stack.rank.get(source.resolve())
+
+    def _owner(fname: str) -> str:
+        return stack.owner(fname, self_rank)
 
     def _surface(rel: str, why: str) -> None:
         r.review.append(rel)
         emit(f"  pack {drift.name!r}: {rel} {why} — review (run `levain init` "
              f"to re-onboard, or reconcile by hand).")
+
+    def _flag(rel: str, why: str) -> None:
+        # Ownership flags hold this file's provenance, and editing by hand does not
+        # clear that; only a re-onboard re-records it. So never offer "by hand" here.
+        if rel not in r.review:
+            r.review.append(rel)
+        emit(f"  pack {drift.name!r}: {rel} {why} — re-onboard (`levain init`) to clear this.")
 
     # A render-MEMBERSHIP flip (a file goes verbatim<->render via pack.toml `render`,
     # possibly with UNCHANGED seed bytes) is invisible to a source-hash diff — the file
@@ -302,6 +501,13 @@ def reconcile_pack(
             _surface(rel, "changed")
             continue
         fname = rel[len("seed/"):]
+        owner = _owner(fname)
+        if owner == "higher":
+            continue  # a later layer wins this filename, so this pack's copy is not the one shown
+        if owner != "self":
+            _flag(rel, "changed, but which pack layer owns it could not be resolved (see "
+                       "the pack-layer problem above)")
+            continue
         if fname in render_names:
             before = len(r.review)
             _reconcile_render_file(
@@ -344,32 +550,95 @@ def reconcile_pack(
             emit(f"  pack {drift.name!r}: could not reconcile {rel} ({e}) — review.")
             r.review.append(rel)
 
-    # dropped seed files: the pack authoritatively removed the doctrine. Back up any
-    # operator-diverged copy before unlinking (a RENDERED file always diverges from
-    # the recorded SOURCE hash, so its answers are never lost). activation/manifest
-    # drops are surfaced, not auto-removed.
+    # dropped seed files. What the drop MEANS depends on who else ships the filename:
+    # no other layer -> the doctrine is authoritatively gone, remove it; a LOWER layer
+    # -> the pack dropped an OVERRIDE, so the file it was hiding comes back (spore-450);
+    # a HIGHER layer -> leave it, UNLESS the install still holds exactly this pack's
+    # last-shipped bytes (a pack `order` change moved the win), which no layer ships now.
+    # Back up any operator-diverged copy before replacing or unlinking it (a RENDERED
+    # file always diverges from the recorded SOURCE hash, so its answers are never
+    # lost). activation/manifest drops are surfaced, not auto-removed.
+    seed_removed: list[str] = []
     for rel in sorted(drift.removed):
         if not rel.startswith("seed/"):
             _surface(rel, "removed at source")
             continue
-        dst = install / "seed" / rel[len("seed/"):]
+        fname = rel[len("seed/"):]
+        dst = install / "seed" / fname
+        owner = _owner(fname)
+        if owner == "higher":
+            # This pack's last-shipped bytes: its source hash for a verbatim seed, its
+            # rendered-output hash for a render seed (the template hash never matches).
+            shipped = {recorded.get(rel), drift.recorded.rendered.get(rel)} - {None}
+            winner = stack.winners.get(fname)
+            try:
+                here = _sha256_file(dst) if dst.is_file() else None
+                stale = here in shipped
+                # An edited copy of this pack's file after it lost the win: neither ours
+                # nor the winner's, so which it is cannot be told. Never pass it silently.
+                unknown = (here is not None and not stale and winner is not None
+                           and not winner.is_render and here != _sha256_file(winner.path))
+            except OSError:
+                stale, unknown = False, False
+            if unknown and winner is not None:
+                # A NOTICE, not a held flag: an operator's edit of the winning layer's
+                # copy looks exactly like this, and holding provenance would trap it
+                # until a re-onboard (complement L1). Said once, never silent.
+                emit(f"  pack {drift.name!r}: {rel} was dropped while another layer "
+                     f"({winner.path.parent.parent}) wins it, and the install copy matches "
+                     f"neither that layer's file nor this pack's: left as is. If it is your "
+                     f"edit of that layer's file, nothing is wrong; if not, re-onboard "
+                     f"(`levain init`) to show that layer's file.")
+                continue
+            if not stale:
+                continue
+        if owner in ("lower", "higher"):
+            _show_winner(install, drift, rel, stack, apply=apply, r=r, emit=emit, flag=_flag)
+            acted = acted or rel in r.restored
+            continue
+        if owner != "none":
+            _flag(rel, "was dropped, but whether another pack layer still ships it could "
+                       "not be resolved (see the pack-layer problem above), so it was NOT removed")
+            continue
+        seed_removed.append(rel)
         if not dst.exists():
             continue
         try:
-            if _sha256_file(dst) != recorded.get(rel) and apply:
-                shutil.copy2(dst, _timestamped_backup_path(dst))
+            backup = (_timestamped_backup_path(dst)
+                      if _sha256_file(dst) != recorded.get(rel) else None)
             if apply:
+                if backup is not None:
+                    shutil.copy2(dst, backup)
                 dst.unlink()
             r.removed.append(rel)
             acted = True
+            kept = f"; your edited copy {'is' if apply else 'would be'} kept at " \
+                   f"{backup.name}" if backup is not None else ""
+            emit(f"  pack {drift.name!r}: {rel} {'removed' if apply else 'would be removed'} "
+                 f"(no pack layer ships it any more){kept}.")
         except OSError as e:
             emit(f"  pack {drift.name!r}: could not remove dropped {rel} ({e}) — review.")
             r.review.append(rel)
 
+    # An on-demand seed's carrier line embeds a summary chosen BY WINNING LAYER (base
+    # retention text vs. the override's own H1 — install._on_demand_block), so a
+    # pack newly overriding one changes what that line should say. Restores flag the
+    # same thing from _show_winner.
+    for rel in drift.added:
+        fname = rel[len("seed/"):] if rel.startswith("seed/") else ""
+        if (fname in ON_DEMAND_SEED and _owner(fname) == "self"
+                and not stack.is_new_to_roster(fname)):
+            _flag(rel, "now overrides a lower layer's on-demand seed, but the carrier's "
+                       "retained summary for it still describes the file it replaced")
+
     # An importable-seed SET change means the adapter @import block needs regenerating
-    # — surface it (v1 does not surgically edit the rendered adapter file).
-    seed_added = [rel for rel in drift.added if rel.startswith("seed/")]
-    seed_removed = [rel for rel in drift.removed if rel.startswith("seed/")]
+    # — surface it (v1 does not surgically edit the rendered adapter file). A file that
+    # another layer also ships is an override (or its removal), NOT a set change: the
+    # filename stays in the composed roster, so the @import list is still right.
+    seed_added = [
+        rel for rel in drift.added
+        if rel.startswith("seed/") and stack.is_new_to_roster(rel[len("seed/"):])
+    ]
     if seed_added or seed_removed:
         emit(f"  pack {drift.name!r}: the seed set changed (added {len(seed_added)}, "
              f"removed {len(seed_removed)}) — the adapter @import list is NOT regenerated "
@@ -423,11 +692,20 @@ def reconcile_packs(
     apply: bool,
     emit: Callable[[str], None],
 ) -> list[PackReconcile]:
-    """Reconcile every drifted pack; return per-pack outcomes."""
-    return [
-        reconcile_pack(install, d, answers=answers, prompter=prompter, apply=apply, emit=emit)
-        for d in drifts
-    ]
+    """Reconcile every drifted pack; return per-pack outcomes. Seed ownership is
+    resolved ONCE, over every pack's CURRENT source, so packs drifting in the same run
+    agree on who wins each filename. The templates context stays open across the loop
+    because a restore copies from the base layer's files."""
+    with _templates_root() as templates_root:
+        stack = _build_seed_stack(templates_root, drifts, install)
+        for problem in stack.problems:
+            emit(f"  pack-layer problem: {problem} — files that layer ships are left "
+                 f"untouched until it is fixed.")
+        return [
+            reconcile_pack(install, d, answers=answers, prompter=prompter, apply=apply,
+                           emit=emit, stack=stack)
+            for d in drifts
+        ]
 
 
 def run_pack_reconcile(
@@ -509,7 +787,7 @@ def run_pack_reconcile(
             src = Path(d.source)
             try:
                 mf = load_pack_manifest(src)
-            except PackError:
+            except (PackError, ValueError):
                 continue
             pairs.append((mf, src))
             manifests.append(mf)
