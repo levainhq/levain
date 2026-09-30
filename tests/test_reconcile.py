@@ -477,3 +477,135 @@ class TestBrandRebakeOnUpdate:
         cfg = self._read_config(install)
         assert "surface_name" not in cfg  # stale company chrome cleared (IP-boundary)
         assert cfg["entity_name"] == "Athena"  # operator rename preserved
+
+
+# --------------------------------------------------------------------------
+# seed OWNERSHIP across layers — spore-450: a pack reconciles only the files it wins
+# --------------------------------------------------------------------------
+
+def _base_seed(name: str) -> bytes:
+    from levain.install import _templates_root
+    with _templates_root() as root:
+        return (root / "seed" / name).read_bytes()
+
+
+def _install_stack(tmp_path, packs):
+    """The post-init seed dir for base + ``packs``: each filename holds the WINNING
+    layer's bytes (last-wins by order, as compose_roster composes it)."""
+    from levain.install import _templates_root
+    from levain.packs import compose_roster
+    install = tmp_path / "install"
+    (install / "seed").mkdir(parents=True)
+    with _templates_root() as root:
+        for e in compose_roster([root, *packs]):
+            if not e.is_render:
+                (install / "seed" / e.name).write_bytes(e.path.read_bytes())
+    provs = []
+    for pack in packs:
+        mf = load_pack_manifest(pack)
+        provs.append(manifest.pack_provenance(mf.name, pack, mf.version, render=mf.render))
+    _record(install, provs)
+    write_answers(install, {}, lambda s: None)
+    return install
+
+
+class TestSeedOwnership:
+    def test_dropped_override_restores_the_base_seed(self, tmp_path):
+        # The reproduced failure: the base file was DELETED, leaving `@seed/partnership.md`
+        # dangling in the carrier and doctor FAILing "missing required files".
+        pack = _write_pack(tmp_path / "p", name="p", seed={"partnership.md": "# PACK\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (pack / "seed" / "partnership.md").unlink()
+        out, _prov, drifted, review = _reconcile(inst)
+        assert drifted and not review
+        assert (inst / "seed" / "partnership.md").read_bytes() == _base_seed("partnership.md")
+        assert "seed set changed" not in out  # the filename never left the roster
+
+    def test_dropped_override_of_an_on_demand_seed_restores_and_flags_the_pointer(self, tmp_path):
+        pack = _write_pack(tmp_path / "p", name="p", seed={"spore_instructions.md": "# PACK\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (pack / "seed" / "spore_instructions.md").unlink()
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert (inst / "seed" / "spore_instructions.md").read_bytes() == _base_seed(
+            "spore_instructions.md")
+        assert review and "retained summary" in out
+
+    def test_operator_edited_override_is_backed_up_before_the_restore(self, tmp_path):
+        pack = _write_pack(tmp_path / "p", name="p", seed={"partnership.md": "# PACK\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (inst / "seed" / "partnership.md").write_text("# PACK + my notes\n")
+        (pack / "seed" / "partnership.md").unlink()
+        _reconcile(inst)
+        assert (inst / "seed" / "partnership.md").read_bytes() == _base_seed("partnership.md")
+        backups = [p for p in (inst / "seed").iterdir() if p.name.startswith("partnership.md.")]
+        assert [b.read_text() for b in backups] == ["# PACK + my notes\n"]
+
+    def test_dropping_a_file_a_higher_pack_overrides_leaves_that_pack_s_copy(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (a / "seed" / "x.md").unlink()
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
+        assert not review and "seed set changed" not in out
+
+    def test_a_lower_pack_change_never_overwrites_a_higher_override(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A v1\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (a / "seed" / "x.md").write_text("A v2\n")
+        _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
+
+    def test_a_higher_pack_dropping_its_override_restores_the_lower_pack(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (b / "seed" / "x.md").unlink()
+        _out, _prov, _drifted, review = _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "A\n"
+        assert not review
+
+    def test_unresolvable_owner_surfaces_and_never_deletes(self, tmp_path):
+        # Pack b's source is gone and it recorded x.md: whether b still wins x.md is
+        # unknowable, so a's drop must not delete the file.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        import shutil
+        shutil.rmtree(b)
+        (a / "seed" / "x.md").unlink()
+        _out, _prov, _drifted, review = _reconcile(inst)
+        assert review
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
+
+    def test_dropped_override_of_a_render_seed_surfaces_and_keeps_the_file(self, tmp_path):
+        pack = _write_pack(tmp_path / "p", name="p", render=["world.md"],
+                           seed={"world.md": "# PACK world {{X}}\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (inst / "seed" / "world.md").write_text("# PACK world rendered\n")
+        (pack / "seed" / "world.md").unlink()
+        (pack / "pack.toml").write_text('name = "p"\norder = 10\n')  # drops it from `render` too
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert review and "RENDERED" in out
+        assert (inst / "seed" / "world.md").read_text() == "# PACK world rendered\n"
+
+    def test_a_genuinely_dropped_seed_is_still_removed(self, tmp_path):
+        pack = _write_pack(tmp_path / "p", name="p", seed={"only.md": "x\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (pack / "seed" / "only.md").unlink()
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert not (inst / "seed" / "only.md").exists()
+        assert review and "seed set changed" in out
+
+    def test_a_pack_left_invalid_by_the_drop_surfaces_and_never_deletes(self, tmp_path):
+        # `render` still names the file the pack dropped: compose_roster refuses the
+        # stack, so ownership is unknowable and nothing may be deleted.
+        pack = _write_pack(tmp_path / "p", name="p", render=["world.md"],
+                           seed={"world.md": "# PACK world {{X}}\n"})
+        inst = _install_stack(tmp_path, [pack])
+        (inst / "seed" / "world.md").write_text("# PACK world rendered\n")
+        (pack / "seed" / "world.md").unlink()
+        _out, _prov, _drifted, review = _reconcile(inst)
+        assert review
+        assert (inst / "seed" / "world.md").read_text() == "# PACK world rendered\n"

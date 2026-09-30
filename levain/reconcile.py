@@ -34,6 +34,7 @@ from pathlib import Path
 from levain.install import (
     InitError,
     _copy_pack_docs,
+    _templates_root,
     _timestamped_backup_path,
     _write_brand_config,
     read_answers,
@@ -46,7 +47,15 @@ from levain.manifest import (
     compute_pack_drift,
     read_pack_locks_status,
 )
-from levain.packs import PackError, PackManifest, compose_brand, load_pack_manifest
+from levain.packs import (
+    ON_DEMAND_SEED,
+    PackError,
+    PackManifest,
+    SeedEntry,
+    compose_brand,
+    compose_roster,
+    load_pack_manifest,
+)
 
 # A prompter asks the operator for the pack's NEWLY-ADDED render slots. It returns
 # ``{slot: answer}`` for the given InterviewFields, or ``None`` when it cannot prompt
@@ -80,11 +89,89 @@ class PackReconcile:
     backed_up: list[str] = field(default_factory=list)  # operator-edited -> .bak + applied
     added: list[str] = field(default_factory=list)      # new seeds copied in
     removed: list[str] = field(default_factory=list)    # dropped seeds removed
+    # dropped OVERRIDES: the next-winning lower layer's file was put back (spore-450)
+    restored: list[str] = field(default_factory=list)
     review: list[str] = field(default_factory=list)     # surfaced for the operator
     # New rendered-output hashes for render seeds this run wrote (folded into the
     # recorded `rendered` map so a fast-forwarded render file stops re-drifting).
     render_written: dict[str, str] = field(default_factory=dict)
     new_provenance: PackProvenance | None = None
+
+
+@dataclass
+class _SeedStack:
+    """WHO OWNS each ``install/seed/<name>`` now: the CURRENT composed roster over the
+    base templates + every recorded pack whose source still loads, re-resolved with
+    :func:`compose_roster` itself (the function init composes with), over the packs in
+    the order the lock recorded them.
+
+    A pack reconciles only the seed files it WINS. ``install/seed/`` is flat and
+    ``compose_roster`` is last-wins by filename, so a file one pack adds, changes or
+    drops may be another layer's to show (spore-450: dropping an override deleted the
+    base file it had been hiding, leaving the carrier's ``@seed/`` import dangling).
+
+    ``None`` from :func:`_build_seed_stack` means the stack could not be composed at
+    all; ``opaque`` names the seed files of recorded packs that could not be loaded
+    (source gone / pack.toml broken), whose rank is unknown. For either, ownership is
+    unknowable and the reconcile must SURFACE rather than write or delete."""
+
+    winners: dict[str, SeedEntry]
+    rank: dict[Path, int]  # resolved layer dir -> position in the composed stack
+    providers: dict[str, frozenset[int]]  # seed filename -> ranks of every layer shipping it
+    opaque: frozenset[str]
+
+    def owner(self, fname: str, self_rank: int | None) -> str:
+        """Which layer wins ``fname`` relative to the pack at ``self_rank``:
+        ``self`` | ``higher`` | ``lower`` | ``none`` (no layer ships it) | ``unknown``."""
+        if self_rank is None or fname in self.opaque:
+            return "unknown"
+        ranks = self.providers.get(fname)
+        if not ranks:
+            return "none"
+        top = max(ranks)
+        if top == self_rank:
+            return "self"
+        return "higher" if top > self_rank else "lower"
+
+    def only_provider(self, fname: str, self_rank: int | None) -> bool:
+        """True when no OTHER layer ships ``fname`` — so the pack adding or dropping it
+        changes the composed seed SET (the adapter @import list), not just its content."""
+        if self_rank is None or fname in self.opaque:
+            return True  # cannot tell -> keep the conservative seed-set warning
+        return not (self.providers.get(fname, frozenset()) - {self_rank})
+
+
+def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _SeedStack | None:
+    dirs: list[Path] = [templates_root]
+    opaque: set[str] = set()
+    for d in drifts:
+        src = Path(d.source)
+        try:
+            if d.status == "source_missing":
+                raise PackError("source missing")
+            load_pack_manifest(src)
+        except PackError:
+            opaque.update(r[len("seed/"):] for r in d.recorded.files if r.startswith("seed/"))
+            continue
+        dirs.append(src)
+    try:
+        roster = compose_roster(dirs)
+        # compose_roster's own stable sort by `order` (ties keep input order),
+        # reproduced so each layer gets the rank compose_roster gave it.
+        ordered = sorted(dirs, key=lambda p: load_pack_manifest(p).order)
+        providers: dict[str, set[int]] = {}
+        for i, p in enumerate(ordered):
+            for f in (p / "seed").glob("*.md"):
+                if f.is_file():
+                    providers.setdefault(f.name, set()).add(i)
+    except (PackError, OSError):
+        return None
+    return _SeedStack(
+        winners={e.name: e for e in roster},
+        rank={p.resolve(): i for i, p in enumerate(ordered)},
+        providers={n: frozenset(r) for n, r in providers.items()},
+        opaque=frozenset(opaque),
+    )
 
 
 def _load_manifest(source: Path):
@@ -236,6 +323,45 @@ def _emit_changelog_context(source: Path, name: str, emit: Callable[[str], None]
             emit(f"    {ln}")
 
 
+def _restore_lower_layer(
+    install: Path,
+    drift: PackDrift,
+    rel: str,
+    stack: _SeedStack | None,
+    *,
+    apply: bool,
+    r: PackReconcile,
+    surface: Callable[[str, str], None],
+) -> None:
+    """A pack dropped its OVERRIDE of ``rel``: put back the file the next-winning lower
+    layer ships (spore-450). A render-mode winner is surfaced, not restored — it needs
+    the interview's answers composed the way init composes it, which is a re-onboard."""
+    fname = rel[len("seed/"):]
+    winner = stack.winners.get(fname) if stack is not None else None
+    if winner is None:  # _owner said "lower", so this cannot happen; never delete on it
+        surface(rel, "was dropped, but the layer it was overriding could not be found")
+        return
+    if winner.is_render:
+        surface(rel, "was an override of a RENDERED seed another layer provides; that "
+                     "layer's version needs your interview answers, so it was NOT restored")
+        return
+    dst = install / "seed" / fname
+    try:
+        if not (dst.is_file() and _sha256_file(dst) == _sha256_file(winner.path)):
+            if apply:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists() and _sha256_file(dst) != drift.recorded.files.get(rel):
+                    shutil.copy2(dst, _timestamped_backup_path(dst))  # operator edit kept
+                shutil.copy2(winner.path, dst)
+            r.restored.append(rel)
+    except OSError as e:
+        surface(rel, f"was dropped, but the lower layer's copy could not be restored ({e})")
+        return
+    if fname in ON_DEMAND_SEED:
+        surface(rel, "was restored from a lower layer, but the carrier's retained summary "
+                     "for it still describes the dropped override")
+
+
 def reconcile_pack(
     install: Path,
     drift: PackDrift,
@@ -244,10 +370,13 @@ def reconcile_pack(
     prompter: Prompter | None,
     apply: bool,
     emit: Callable[[str], None],
+    stack: _SeedStack | None,
 ) -> PackReconcile:
     """Reconcile a single pack's drift. ``apply=False`` reports only (dry-run).
     ``answers`` is the shared, MUTABLE persisted-answer set (a render re-prompt adds
-    to it in place); the caller persists it once after all packs."""
+    to it in place); the caller persists it once after all packs. ``stack`` says which
+    layer owns each seed filename (``None`` = unknowable: every seed write or delete is
+    surfaced instead)."""
     r = PackReconcile(name=drift.name, status="unchanged", new_provenance=drift.recorded)
 
     if drift.status == "source_missing":
@@ -271,6 +400,10 @@ def reconcile_pack(
     current = drift.current_files or {}
     recorded = drift.recorded.files
     acted = False
+    self_rank = stack.rank.get(source.resolve()) if stack is not None else None
+
+    def _owner(fname: str) -> str:
+        return stack.owner(fname, self_rank) if stack is not None else "unknown"
 
     def _surface(rel: str, why: str) -> None:
         r.review.append(rel)
@@ -302,6 +435,12 @@ def reconcile_pack(
             _surface(rel, "changed")
             continue
         fname = rel[len("seed/"):]
+        owner = _owner(fname)
+        if owner == "higher":
+            continue  # a later layer overrides this file; install/seed/ holds ITS copy
+        if owner != "self":
+            _surface(rel, "changed, but which pack layer owns it could not be resolved")
+            continue
         if fname in render_names:
             before = len(r.review)
             _reconcile_render_file(
@@ -344,15 +483,32 @@ def reconcile_pack(
             emit(f"  pack {drift.name!r}: could not reconcile {rel} ({e}) — review.")
             r.review.append(rel)
 
-    # dropped seed files: the pack authoritatively removed the doctrine. Back up any
-    # operator-diverged copy before unlinking (a RENDERED file always diverges from
-    # the recorded SOURCE hash, so its answers are never lost). activation/manifest
-    # drops are surfaced, not auto-removed.
+    # dropped seed files. What the drop MEANS depends on who else ships the filename:
+    # no other layer -> the doctrine is authoritatively gone, remove it; a LOWER layer
+    # -> the pack dropped an OVERRIDE, so the file it was hiding comes back (spore-450);
+    # a HIGHER layer -> install/seed/ already holds that layer's copy, leave it alone.
+    # Back up any operator-diverged copy before replacing or unlinking it (a RENDERED
+    # file always diverges from the recorded SOURCE hash, so its answers are never
+    # lost). activation/manifest drops are surfaced, not auto-removed.
+    seed_removed: list[str] = []
     for rel in sorted(drift.removed):
         if not rel.startswith("seed/"):
             _surface(rel, "removed at source")
             continue
-        dst = install / "seed" / rel[len("seed/"):]
+        fname = rel[len("seed/"):]
+        dst = install / "seed" / fname
+        owner = _owner(fname)
+        if owner == "higher":
+            continue
+        if owner == "lower":
+            _restore_lower_layer(install, drift, rel, stack, apply=apply, r=r, surface=_surface)
+            acted = acted or rel in r.restored
+            continue
+        if owner != "none":
+            _surface(rel, "was dropped, but whether another pack layer still provides it "
+                          "could not be resolved, so it was NOT removed")
+            continue
+        seed_removed.append(rel)
         if not dst.exists():
             continue
         try:
@@ -366,10 +522,27 @@ def reconcile_pack(
             emit(f"  pack {drift.name!r}: could not remove dropped {rel} ({e}) — review.")
             r.review.append(rel)
 
+    # An on-demand seed's carrier line embeds a summary chosen BY WINNING LAYER (base
+    # retention text vs. the override's own H1 — install._on_demand_block), so a
+    # pack newly overriding one changes what that line should say. Restores surface
+    # the same thing from _restore_lower_layer.
+    for rel in drift.added:
+        fname = rel[len("seed/"):] if rel.startswith("seed/") else ""
+        if (fname in ON_DEMAND_SEED and _owner(fname) == "self"
+                and stack is not None and not stack.only_provider(fname, self_rank)
+                and rel not in r.review):
+            _surface(rel, "now overrides a lower layer's on-demand seed, but the carrier's "
+                          "retained summary for it still describes the file it replaced")
+
     # An importable-seed SET change means the adapter @import block needs regenerating
-    # — surface it (v1 does not surgically edit the rendered adapter file).
-    seed_added = [rel for rel in drift.added if rel.startswith("seed/")]
-    seed_removed = [rel for rel in drift.removed if rel.startswith("seed/")]
+    # — surface it (v1 does not surgically edit the rendered adapter file). A file that
+    # another layer also ships is an override (or its removal), NOT a set change: the
+    # filename stays in the composed roster, so the @import list is still right.
+    seed_added = [
+        rel for rel in drift.added
+        if rel.startswith("seed/") and (
+            stack is None or stack.only_provider(rel[len("seed/"):], self_rank))
+    ]
     if seed_added or seed_removed:
         emit(f"  pack {drift.name!r}: the seed set changed (added {len(seed_added)}, "
              f"removed {len(seed_removed)}) — the adapter @import list is NOT regenerated "
@@ -423,11 +596,17 @@ def reconcile_packs(
     apply: bool,
     emit: Callable[[str], None],
 ) -> list[PackReconcile]:
-    """Reconcile every drifted pack; return per-pack outcomes."""
-    return [
-        reconcile_pack(install, d, answers=answers, prompter=prompter, apply=apply, emit=emit)
-        for d in drifts
-    ]
+    """Reconcile every drifted pack; return per-pack outcomes. Seed ownership is
+    resolved ONCE, over every pack's CURRENT source, so packs drifting in the same run
+    agree on who wins each filename. The templates context stays open across the loop
+    because a restore copies from the base layer's files."""
+    with _templates_root() as templates_root:
+        stack = _build_seed_stack(templates_root, drifts)
+        return [
+            reconcile_pack(install, d, answers=answers, prompter=prompter, apply=apply,
+                           emit=emit, stack=stack)
+            for d in drifts
+        ]
 
 
 def run_pack_reconcile(
