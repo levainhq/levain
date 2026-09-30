@@ -501,6 +501,9 @@ def _install_stack(tmp_path, packs):
         for e in compose_roster([root, *packs]):
             if not e.is_render:
                 (install / "seed" / e.name).write_bytes(e.path.read_bytes())
+    # The carrier init writes: an import per installed seed (what a seed-set change is about).
+    (install / "CLAUDE.md").write_text(
+        "".join(f"@seed/{p.name}\n" for p in sorted((install / "seed").glob("*.md"))))
     provs = []
     for pack in packs:
         mf = load_pack_manifest(pack)
@@ -705,7 +708,7 @@ class TestSeedOwnership:
         assert "seed set changed" not in out and not review, out
         assert (inst / "seed" / "x.md").read_text() == "B\n"
 
-    def test_an_edited_orphan_after_an_order_change_is_flagged_not_passed(self, tmp_path):
+    def test_an_edited_orphan_after_an_order_change_is_noticed_not_passed(self, tmp_path):
         # L3 round 2, codex HIGH + complement MED: edited, the orphan matched neither
         # hash, so it was skipped and its provenance advanced with no future signal.
         a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
@@ -715,7 +718,7 @@ class TestSeedOwnership:
         (b / "pack.toml").write_text('name = "b"\norder = 5\n')
         (b / "seed" / "x.md").unlink()
         out, _prov, _drifted, review = _reconcile(inst)
-        assert review and "matches neither" in out
+        assert "matches neither" in out and not review  # a notice, never a held trap
         assert (inst / "seed" / "x.md").read_text() == "B + my edit\n"
 
     def test_a_base_file_init_never_installed_is_new_to_the_roster(self, tmp_path):
@@ -736,8 +739,12 @@ class TestSeedOwnership:
             yield upgraded
         (pack / "seed" / "novel.md").write_text("# pack novel\n")
         with mock.patch.object(reconcile, "_templates_root", _upgraded_root):
-            out, _prov, _drifted, review = _reconcile(inst)
-        assert review and "seed set changed" in out
+            out, prov, _drifted, review = _reconcile(inst)
+            assert review and "seed set changed" in out
+            _record(inst, prov)  # what `levain update` persists between runs
+            out2, _prov, _drifted, review2 = _reconcile(inst)
+        # complement L1: a disk-derived roster cleared this on run 2 with the seed inert
+        assert review2 and "seed set changed" in out2
 
     def test_an_undecodable_pack_toml_is_a_named_problem_not_a_crash(self, tmp_path):
         a = _write_pack(tmp_path / "a", name="a", order=10, seed={"a.md": "v1\n"})

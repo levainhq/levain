@@ -121,10 +121,9 @@ class _SeedStack:
     providers: dict[str, frozenset[int]]  # seed filename -> ranks of every layer shipping it
     opaque: frozenset[str]
     problems: list[str]
-    # Every seed filename the install's recorded stack composed: each pack's RECORDED
-    # seed files, plus the base's that were on disk before this update. A name outside
-    # it entering the roster is a set change.
-    recorded_roster: frozenset[str]
+    # The install's carrier text (CLAUDE.md / AGENTS.md): the import list a seed-set
+    # change is ABOUT. ``None`` when the install has no carrier file.
+    carrier: str | None
     # The BASE layer could not be read: every filename might be one it ships, so no
     # ownership answer is safe (a drop would otherwise read "no layer ships it").
     blind: bool = False
@@ -143,13 +142,13 @@ class _SeedStack:
         return "higher" if top > self_rank else "lower"
 
     def is_new_to_roster(self, fname: str) -> bool:
-        """True when ``fname`` was not in the recorded composed roster — so a pack adding
-        it changes the composed seed SET (the adapter @import list), not just its
-        content. Judged against the whole recorded stack, so a file moving between two
-        packs in one update is not a set change."""
-        if self.blind:
+        """True when the adapter's import list does not reference ``seed/<fname>`` — so
+        a pack adding it changes the composed seed SET, not just its content. Read from
+        the carrier itself: stable across runs (reconcile never rewrites it, only a
+        re-onboard does), and a file moving between two packs stays referenced."""
+        if self.blind or self.carrier is None:
             return True  # cannot tell -> keep the conservative seed-set warning
-        return fname not in self.recorded_roster
+        return f"seed/{fname}" not in self.carrier
 
 
 def _layer_seed_names(layer: Path, manifest: PackManifest) -> set[str]:
@@ -177,10 +176,13 @@ def _build_seed_stack(
     opaque: set[str] = set()
     problems: list[str] = []
     blind = False
-    recorded_roster: set[str] = set()
-    for drift in drifts:
-        recorded_roster.update(
-            r[len("seed/"):] for r in drift.recorded.files if r.startswith("seed/"))
+    carrier: str | None = None
+    for name in ("CLAUDE.md", "AGENTS.md"):
+        try:
+            text = (install / name).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        carrier = (carrier or "") + text
     candidates: list[tuple[Path, PackDrift | None]] = [(templates_root, None)]
     candidates += [(Path(d.source), d) for d in drifts]
     for src, d in candidates:
@@ -199,10 +201,6 @@ def _build_seed_stack(
                     opaque.update(r[len("seed/"):] for r in d.current_files if r.startswith("seed/"))
             continue
         layers.append((src, mf, names))
-        if d is None:
-            # The lock does not record the base roster, and a levain upgrade can change
-            # it, so a base name counts as composed only if init actually installed it.
-            recorded_roster.update(n for n in names if (install / "seed" / n).is_file())
     # Stable sort on `order`: ties keep lock order, the order init received the packs in.
     layers.sort(key=lambda layer: layer[1].order)
     winners: dict[str, SeedEntry] = {}
@@ -218,7 +216,7 @@ def _build_seed_stack(
         providers={n: frozenset(r) for n, r in providers.items()},
         opaque=frozenset(opaque),
         problems=problems,
-        recorded_roster=frozenset(recorded_roster),
+        carrier=carrier,
         blind=blind,
     )
 
@@ -582,10 +580,15 @@ def reconcile_pack(
                            and not winner.is_render and here != _sha256_file(winner.path))
             except OSError:
                 stale, unknown = False, False
-            if unknown:
-                _flag(rel, "was dropped while another layer wins it, but the install copy "
-                           "matches neither that layer's file nor this pack's, so it was "
-                           "left as is")
+            if unknown and winner is not None:
+                # A NOTICE, not a held flag: an operator's edit of the winning layer's
+                # copy looks exactly like this, and holding provenance would trap it
+                # until a re-onboard (complement L1). Said once, never silent.
+                emit(f"  pack {drift.name!r}: {rel} was dropped while another layer "
+                     f"({winner.path.parent.parent}) wins it, and the install copy matches "
+                     f"neither that layer's file nor this pack's: left as is. If it is your "
+                     f"edit of that layer's file, nothing is wrong; if not, re-onboard "
+                     f"(`levain init`) to show that layer's file.")
                 continue
             if not stale:
                 continue
