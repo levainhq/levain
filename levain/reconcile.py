@@ -121,8 +121,9 @@ class _SeedStack:
     providers: dict[str, frozenset[int]]  # seed filename -> ranks of every layer shipping it
     opaque: frozenset[str]
     problems: list[str]
-    # Every seed filename the install's recorded stack composed: the base's plus each
-    # pack's RECORDED seed files. A name outside it entering the roster is a set change.
+    # Every seed filename the install's recorded stack composed: each pack's RECORDED
+    # seed files, plus the base's that were on disk before this update. A name outside
+    # it entering the roster is a set change.
     recorded_roster: frozenset[str]
     # The BASE layer could not be read: every filename might be one it ships, so no
     # ownership answer is safe (a drop would otherwise read "no layer ships it").
@@ -169,7 +170,9 @@ def _layer_seed_names(layer: Path, manifest: PackManifest) -> set[str]:
     return names
 
 
-def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _SeedStack:
+def _build_seed_stack(
+    templates_root: Path, drifts: Sequence[PackDrift], install: Path
+) -> _SeedStack:
     layers: list[tuple[Path, PackManifest, set[str]]] = []
     opaque: set[str] = set()
     problems: list[str] = []
@@ -186,7 +189,7 @@ def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _See
                 raise PackError(f"pack {d.name!r}: source {d.source} is gone")
             mf = load_pack_manifest(src)
             names = _layer_seed_names(src, mf)
-        except (PackError, OSError) as e:
+        except (PackError, OSError, ValueError) as e:  # ValueError: undecodable pack.toml
             problems.append(str(e))
             if d is None:
                 blind = True
@@ -197,7 +200,9 @@ def _build_seed_stack(templates_root: Path, drifts: Sequence[PackDrift]) -> _See
             continue
         layers.append((src, mf, names))
         if d is None:
-            recorded_roster.update(names)
+            # The lock does not record the base roster, and a levain upgrade can change
+            # it, so a base name counts as composed only if init actually installed it.
+            recorded_roster.update(n for n in names if (install / "seed" / n).is_file())
     # Stable sort on `order`: ties keep lock order, the order init received the packs in.
     layers.sort(key=lambda layer: layer[1].order)
     winners: dict[str, SeedEntry] = {}
@@ -223,7 +228,7 @@ def _load_manifest(source: Path):
     parsed (the pack is then unreconcilable -> needs_review)."""
     try:
         return load_pack_manifest(source)
-    except PackError:
+    except (PackError, ValueError):  # ValueError: an undecodable pack.toml
         return None
 
 
@@ -567,10 +572,21 @@ def reconcile_pack(
             # This pack's last-shipped bytes: its source hash for a verbatim seed, its
             # rendered-output hash for a render seed (the template hash never matches).
             shipped = {recorded.get(rel), drift.recorded.rendered.get(rel)} - {None}
+            winner = stack.winners.get(fname)
             try:
-                stale = dst.is_file() and _sha256_file(dst) in shipped
+                here = _sha256_file(dst) if dst.is_file() else None
+                stale = here in shipped
+                # An edited copy of this pack's file after it lost the win: neither ours
+                # nor the winner's, so which it is cannot be told. Never pass it silently.
+                unknown = (here is not None and not stale and winner is not None
+                           and not winner.is_render and here != _sha256_file(winner.path))
             except OSError:
-                stale = False
+                stale, unknown = False, False
+            if unknown:
+                _flag(rel, "was dropped while another layer wins it, but the install copy "
+                           "matches neither that layer's file nor this pack's, so it was "
+                           "left as is")
+                continue
             if not stale:
                 continue
         if owner in ("lower", "higher"):
@@ -678,7 +694,7 @@ def reconcile_packs(
     agree on who wins each filename. The templates context stays open across the loop
     because a restore copies from the base layer's files."""
     with _templates_root() as templates_root:
-        stack = _build_seed_stack(templates_root, drifts)
+        stack = _build_seed_stack(templates_root, drifts, install)
         for problem in stack.problems:
             emit(f"  pack-layer problem: {problem} — files that layer ships are left "
                  f"untouched until it is fixed.")
@@ -768,7 +784,7 @@ def run_pack_reconcile(
             src = Path(d.source)
             try:
                 mf = load_pack_manifest(src)
-            except PackError:
+            except (PackError, ValueError):
                 continue
             pairs.append((mf, src))
             manifests.append(mf)

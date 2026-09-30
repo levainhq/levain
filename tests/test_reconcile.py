@@ -10,6 +10,7 @@ anneal binary.
 from __future__ import annotations
 
 import io
+import shutil
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -703,3 +704,47 @@ class TestSeedOwnership:
         out, _prov, _drifted, review = _reconcile(inst)
         assert "seed set changed" not in out and not review, out
         assert (inst / "seed" / "x.md").read_text() == "B\n"
+
+    def test_an_edited_orphan_after_an_order_change_is_flagged_not_passed(self, tmp_path):
+        # L3 round 2, codex HIGH + complement MED: edited, the orphan matched neither
+        # hash, so it was skipped and its provenance advanced with no future signal.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (inst / "seed" / "x.md").write_text("B + my edit\n")
+        (b / "pack.toml").write_text('name = "b"\norder = 5\n')
+        (b / "seed" / "x.md").unlink()
+        out, _prov, _drifted, review = _reconcile(inst)
+        assert review and "matches neither" in out
+        assert (inst / "seed" / "x.md").read_text() == "B + my edit\n"
+
+    def test_a_base_file_init_never_installed_is_new_to_the_roster(self, tmp_path):
+        # L3 round 2, codex MED: a levain upgrade adds a base seed; a pack adding the same
+        # name must still warn that the @import list lacks it.
+        from contextlib import contextmanager
+
+        from levain.install import _templates_root as real_root
+        pack = _write_pack(tmp_path / "p", name="p", seed={"a.md": "a\n"})
+        inst = _install_stack(tmp_path, [pack])
+        with real_root() as root:
+            upgraded = tmp_path / "base"
+            shutil.copytree(root, upgraded)
+        (upgraded / "seed" / "novel.md").write_text("# base novel\n")
+
+        @contextmanager
+        def _upgraded_root():
+            yield upgraded
+        (pack / "seed" / "novel.md").write_text("# pack novel\n")
+        with mock.patch.object(reconcile, "_templates_root", _upgraded_root):
+            out, _prov, _drifted, review = _reconcile(inst)
+        assert review and "seed set changed" in out
+
+    def test_an_undecodable_pack_toml_is_a_named_problem_not_a_crash(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"a.md": "v1\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"b.md": "b\n"})
+        inst = _install_stack(tmp_path, [a, b])
+        (b / "pack.toml").write_bytes(b"name = \"b\"\n\xff\xfe\n")
+        (a / "seed" / "a.md").write_text("v2\n")
+        out, *_ = _reconcile(inst)
+        assert "pack-layer problem" in out
+        assert (inst / "seed" / "a.md").read_text() == "v2\n"
