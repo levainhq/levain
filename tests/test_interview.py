@@ -567,6 +567,29 @@ def test_terminal_walk_refuses_blank_identity_slot_instead_of_writing_it(tmp_pat
     assert not any("Skip this section" in p for p in prompts)
 
 
+def test_identity_blank_counter_resets_and_refusal_has_no_revising_header(tmp_path: Path):
+    """Two blanks, an answer, then a `:back` revisit and two `:clear`s (blank on a revisit
+    means keep, so `:clear` is how a revisit goes blank) must NOT raise:
+    an accepted answer resets the slot's blank count (max is 3). And re-asking a refused
+    blank is not a back-navigation revisit, so it carries no "(revising)" header."""
+    t = tmp_path / "origin.md"
+    t.write_text(
+        "# Origin\n\n## S\n\n<!-- interview: their name -->\n\n{{OPERATOR_NAME}}\n\n"
+        "<!-- interview: a note -->\n\n{{NOTE}}\n",
+        encoding="utf-8",
+    )
+    told: list[str] = []
+    replies = iter(["", "", "Alex", ":back", ":clear", ":clear", "Alex2", "n"])
+    answers = conduct_interview(
+        [parse_template(t)], input_fn=lambda prompt: next(replies), output_fn=told.append
+    )
+    assert answers["OPERATOR_NAME"] == "Alex2"
+    assert sum("cannot be blank" in line for line in told) == 4
+    # two "(revising)" headers — the genuine :back revisit of NAME and the forward
+    # revisit of NOTE — and none from the four refusals
+    assert sum("(revising)" in line for line in told) == 2
+
+
 def test_conduct_interview_shares_answers_across_specs(tmp_path: Path):
     """Cross-spec slot sharing: if both world.md and origin.md have
     `{{OPERATOR_NAME}}`, the second spec must not re-prompt."""

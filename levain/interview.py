@@ -493,6 +493,7 @@ def conduct_interview(
     skipped_sections: set[int] = set()   # id(section) — optional skip chosen
     visited_fields: set[int] = set()     # plan index — field already prompted
     identity_blanks: dict[str, int] = {}  # slot -> blank answers refused so far
+    refused_reask = False  # this pass re-asks a refused blank: not a back-navigation revisit
     #   nav-state (visited) is deliberately separate from value-state (answers):
     #   a field bailed out of with `:back` before answering is still "visited".
 
@@ -560,7 +561,7 @@ def conduct_interview(
                 output_fn("")
                 output_fn(f"  Guidance: {section.guidance}")
                 output_fn("")
-        elif i in visited_fields:
+        elif i in visited_fields and not refused_reask:
             # Re-arrived at a field we already prompted (back-navigation):
             # re-orient with a "(revising)" header. Using visited-state (not
             # `answers`) means a field bailed out of with `:back` before being
@@ -570,6 +571,7 @@ def conduct_interview(
             output_fn("")
             output_fn(f"## {section.title or '[preamble]'}  (revising)")
 
+        refused_reask = False
         visited_fields.add(i)
 
         style = _resolve_style(section, field.slot)
@@ -604,6 +606,7 @@ def conduct_interview(
                 f"  {field.slot} cannot be blank (an entity must know its own name "
                 f"and its operator's) — please answer."
             )
+            refused_reask = True
             continue
 
         identity_blanks.pop(field.slot, None)
