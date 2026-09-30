@@ -4,9 +4,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [0.4.8] — 2026-09-30
+
+### Fixed — `levain init` in the terminal no longer writes an empty identity
+
+`levain init` answered with bare Enter throughout used to exit 0 and write an empty operator and entity name into `seed/origin.md`, which `levain doctor` then failed. The terminal interview was the one onboarding path that skipped the identity rule; the `--answers` file and the web form already refused it. The interview now re-asks a blank operator or entity name, drops a blank one restored from an old checkpoint so it is asked again, and after three blanks in a row stops with an error rather than looping (a closed pipe reads as endless blanks). An identity question inside an optional section can no longer be skipped into a blank. The re-ask of a refused blank no longer prints a "(revising)" header, which belongs to going back with `:back`.
+
+### Fixed — `levain update` no longer deletes a seed file that another pack still ships, or one you edited
+
+When a pack's override of a base seed file was dropped, `update` could delete the file outright, or leave it reading as up to date, so the base version never came back. Reconcile now works out which layer owns each seed file: a dropped override restores the layer it hid, an unreadable base layer means nothing is deleted (it is reported instead), a stray Finder `.DS_Store` in a pack's `seed/` no longer makes the whole stack unreadable, a file moved from one pack to another in one update is judged once, and an undecodable `pack.toml` is treated as an unreadable layer rather than crashing `update`. A copy you edited is kept, backed up and reported, never overwritten silently. Each restore or removal prints one line saying what it did.
+
+**Known limit, unchanged from 0.4.7:** a change to a pack's `order` alone, with no override dropped, is not reconciled. The `pack.toml` comment documents it as a v1 limitation.
+
 ## [Unreleased]
 
-Stamped `0.4.8.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
 ### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
 
