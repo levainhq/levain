@@ -1824,8 +1824,9 @@ def refresh_adapter(
     - an unreadable activation receipt: the activation tree is not touched (review).
 
     The seed files and the interview are not touched: the pack reconcile owns seeds.
-    Codex's global hooks.json / config.toml are only reported, never rewritten here, because
-    replacing them repoints every codex session on the machine."""
+    Codex's machine-global hooks.json / config.toml are rewritten only when they already
+    belong to this install (:func:`_refresh_codex_global`); otherwise they are named and
+    left alone, because replacing them repoints every codex session on the machine."""
     from levain import manifest
 
     out = AdapterRefresh()
