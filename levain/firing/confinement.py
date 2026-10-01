@@ -2684,6 +2684,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # The EQUAL case stays: it needs its remount for EROFS on a write.
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             continue
+        if sub.exists() and not sub.is_dir():
+            # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
+            # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
+            # Deny it the way step (4) denies a file, which refuses both read and write.
+            argv += ["--ro-bind", "/dev/null", str(sub)]
+            continue
         tmpfs_roots.append(sub)
         argv += ["--tmpfs", str(sub)]
         remount_ro.append(str(sub))

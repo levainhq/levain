@@ -3263,3 +3263,19 @@ def test_linux_live_a_deny_root_strictly_inside_ssh_does_not_brick_the_shell(tmp
     with BwrapProvider().spawn_shell(policy) as sh:
         assert sh.run(f"cat {ssh}/known_hosts").exit_code == 0
         assert sh.run(f"cat {ssh}/keys/id").exit_code != 0
+
+
+@linux_live
+def test_linux_live_a_deny_subtree_that_is_a_file_does_not_brick_the_shell(tmp_path, monkeypatch) -> None:
+    """Found 2026-10-01 on argushub, a real host: its ~/.anneal-memory is a regular FILE (a SQLite
+    db), not the usual directory. Step (2) put `--tmpfs` over it, bwrap answered "Can't mkdir
+    ~/.anneal-memory: Not a directory", and the bash hand could not start at all. A subtree root
+    that exists as a file is denied the way a deny file is."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    (tmp_path / ".anneal-memory").write_text("A STORE THAT IS A FILE\n")
+    with BwrapProvider().spawn_shell(build_policy(ent, ssh_mode="agent")) as sh:
+        assert sh.run("echo alive").exit_code == 0
+        assert sh.run(f"cat {tmp_path}/.anneal-memory").exit_code != 0
+        assert sh.run(f"echo POISON > {tmp_path}/.anneal-memory").exit_code != 0
+    assert (tmp_path / ".anneal-memory").read_text() == "A STORE THAT IS A FILE\n"
