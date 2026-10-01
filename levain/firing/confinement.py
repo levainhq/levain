@@ -2674,18 +2674,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
     file_roots: list[Path] = []   # subtree roots that are files: denied both ways, like step (4)
+    nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
             continue
-        # A root STRICTLY inside the ssh dir is hidden by step (3)'s tmpfs anyway, and its deferred
-        # remount would then target a path that tmpfs hid, aborting bwrap before bash starts
-        # (Diogenes MEDIUM 2026-10-01, reproduced on a Linux kernel and on argushub). Nothing is
-        # rebound under it: step (3) rebinds only known_hosts and config, guarded by _caller_denies.
-        # The cost (L1 on 3e5a113): the ssh tmpfs has no remount, so a WRITE under such a root
-        # succeeds into the tmpfs and evaporates instead of failing EROFS. Reads stay denied, as for
-        # the rest of ~/.ssh in agent mode. The EQUAL case stays: it needs its remount for EROFS.
+        # A root STRICTLY inside the ssh dir cannot be mounted here: step (3)'s ssh tmpfs, emitted
+        # later, would hide it and its deferred remount would then abort bwrap (Diogenes MEDIUM
+        # 2026-10-01, reproduced on argushub). It is mounted AFTER that tmpfs instead, keeping its
+        # remount, so a write under it fails EROFS rather than evaporating in the bare ssh tmpfs
+        # (L3 2026-10-01, all three lineages).
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
+            nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
         if sub.exists() and not sub.is_dir():
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
@@ -2717,6 +2717,14 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if config.exists() and not _caller_denies(config, policy):
             argv += ["--ro-bind", str(config), str(config)]
             rebound.append(config)
+        for sub in nested_in_ssh:
+            if sub.exists() and not sub.is_dir():
+                argv += ["--ro-bind", "/dev/null", str(sub)]
+                file_roots.append(sub)
+            else:
+                argv += ["--tmpfs", str(sub)]
+                remount_ro.append(str(sub))
+                tmpfs_roots.append(sub)
 
     # (4) READ+WRITE-DENIED FILES — credential files and the confinement config that defines the
     # floor. `--ro-bind /dev/null` denies BOTH directions (EACCES on read and on write), which is the

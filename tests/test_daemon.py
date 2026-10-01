@@ -1135,10 +1135,18 @@ def test_systemd_reinstall_during_a_turn_says_that_turn_runs_the_old_definition(
     running = {"*": {"LoadState": "loaded", "ActiveState": "activating", "SubState": "start",
                      "MainPID": "4242", "ExecMainStatus": "0"}}
     monkeypatch.setattr(daemon, "_run", _FakeSystemctl(show=running))
-    first = systemd.install(_seat(tmp_path))
-    assert "PREVIOUS definition" not in first          # nothing installed before it
+    proc = tmp_path / "proc"
+    monkeypatch.setattr(SystemdUserProvider, "PROC", proc)
+    (proc / "4242").mkdir(parents=True)
+    (proc / "4242" / "cmdline").write_bytes(b"\0".join(a.encode() for a in _seat(tmp_path).argv) + b"\0")
     same = systemd.install(_seat(tmp_path))
-    assert "PREVIOUS definition" not in same           # unchanged definition: nothing to say
+    assert "PREVIOUS definition" not in same           # the turn runs exactly this argv
     changed = replace(_seat(tmp_path), argv=["/usr/bin/levain", "run", "--task", "y"])
     out = systemd.install(changed)
     assert "PREVIOUS definition" in out and "4242" in out
+    # L3 (complement): a SECOND install of the same new definition, the old turn still running
+    again = systemd.install(changed)
+    assert "PREVIOUS definition" in again
+    # L3 (codex): a turn that started after the reload already runs the new argv
+    (proc / "4242" / "cmdline").write_bytes(b"\0".join(a.encode() for a in changed.argv) + b"\0")
+    assert "PREVIOUS definition" not in systemd.install(changed)

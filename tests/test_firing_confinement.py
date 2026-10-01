@@ -3263,6 +3263,12 @@ def test_linux_live_a_deny_root_strictly_inside_ssh_does_not_brick_the_shell(tmp
     with BwrapProvider().spawn_shell(policy) as sh:
         assert sh.run(f"cat {ssh}/known_hosts").exit_code == 0
         assert sh.run(f"cat {ssh}/keys/id").exit_code != 0
+        # ...and a write under it is REFUSED, not swallowed by the bare ssh tmpfs (L3, 3 lineages)
+        # mkdir first: without it the write fails on ENOENT and proves nothing (measured: it
+        # passed on the code this test was written against)
+        assert sh.run(f"mkdir -p {ssh}/keys; echo POISON > {ssh}/keys/new").exit_code != 0
+        assert sh.run(f"echo NEWHOST >> {ssh}/known_hosts").exit_code == 0   # the re-allow holds
+    assert not (ssh / "keys" / "new").exists()
 
 
 @linux_live

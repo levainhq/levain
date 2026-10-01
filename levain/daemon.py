@@ -909,6 +909,24 @@ class SystemdUserProvider(DaemonProvider):
                 out[k.strip()] = v.strip()
         return out
 
+    PROC = Path("/proc")   # a class attribute so tests can point it at a fake process table
+
+    def _turn_runs_another_argv(self, main_pid: str, spec: DaemonSpec,
+                                prior_service: bytes | None) -> bool:
+        """Is the running turn executing something other than ``spec.argv``? Read from the turn's
+        own ``/proc/<pid>/cmdline``, not inferred from whether this install changed the unit file:
+        a second reinstall of the same new definition, or a turn the timer started after the
+        reload, both fooled the byte comparison (L3 2026-10-01, complement + codex). Falls back to
+        that comparison only when the process cannot be read."""
+        try:
+            pid = int(main_pid)
+            if pid <= 0:
+                return False
+            running = (self.PROC / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+            return [a.decode("utf-8", "surrogateescape") for a in running] != list(spec.argv)
+        except (ValueError, OSError):
+            return prior_service is not None and prior_service != self.render_unit(spec).encode()
+
     def _enable_linger(self) -> str:
         """Ask for lingering and REPORT the answer. Never assumes it was granted — a polkit-denied
         linger on a locked-down box would otherwise leave an operator with a unit that looks
@@ -1031,8 +1049,9 @@ class SystemdUserProvider(DaemonProvider):
             # reinstall during a turn left it running the OLD task to completion, while this summary
             # printed that turn's pid as if it were the idle timer. Say so; do not kill the turn.
             svc = self._show(f"{spec.label}.service", "ActiveState,MainPID")
-            if (prior_service is not None and prior_service != self.render_unit(spec).encode("utf-8")
-                    and svc.get("ActiveState") in ("activating", "active", "deactivating")):
+            if (svc.get("ActiveState") in ("activating", "active", "deactivating")
+                    and self._turn_runs_another_argv(svc.get("MainPID", ""), spec,
+                                                     prior_service)):
                 run_line += (
                     f"\n  ⚠ a turn that started BEFORE this install is still running (pid "
                     f"{svc.get('MainPID', '?')}) on the PREVIOUS definition; it finishes on that, and "
