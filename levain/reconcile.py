@@ -789,7 +789,8 @@ def _reconcile_moved_wins(
     # current winner as its owner would silence it for good (codex L3 HIGH). It is listed,
     # pack.toml is held, and `wins` stays unrecorded so the next run asks again.
     unresolved: list[str] = []
-    if pre_wins and not stack.blind:
+    moved = any("pack.toml" in d.modified for d in drifts)  # order lives in pack.toml
+    if pre_wins and moved and not stack.blind:
         for n, ranks in sorted(stack.providers.items()):
             if len(ranks) < 2 or n in owners or n in stack.opaque or n not in stack.winners:
                 continue

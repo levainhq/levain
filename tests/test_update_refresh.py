@@ -457,8 +457,9 @@ def test_a_pre_receipt_settings_from_another_interpreter_is_refreshed(make_insta
     assert ".claude/settings.json" in r.refreshed
 
 
-def test_an_obsolete_unedited_activation_file_is_removed(make_install):
-    # codex L3 MED: a file levain stopped shipping lingered (an obsolete hook stays executable).
+def test_an_obsolete_activation_file_is_named_and_never_deleted(make_install):
+    # A file levain stopped shipping is dropped from the record and named, never deleted
+    # (codex L3 r2: deleting by receipt key reached outside the install).
     install = make_install()
     old = install / "activation" / "hooks" / "obsolete.py"
     old.write_text("# shipped once\n")
@@ -467,8 +468,9 @@ def test_an_obsolete_unedited_activation_file_is_removed(make_install):
     data["files"]["hooks/obsolete.py"] = {"installed": _sha(b"# shipped once\n"),
                                           "source": _sha(b"# shipped once\n")}
     path.write_text(json.dumps(data))
-    r, _out = _refresh(install)
-    assert not old.exists() and "hooks/obsolete.py" not in json.loads(path.read_text())["files"]
+    r, out = _refresh(install)
+    assert old.exists() and "no longer shipped" in out
+    assert "hooks/obsolete.py" not in json.loads(path.read_text())["files"]
 
 
 def test_an_obsolete_edited_activation_file_is_left(make_install):
@@ -481,6 +483,20 @@ def test_an_obsolete_edited_activation_file_is_left(make_install):
     path.write_text(json.dumps(data))
     r, out = _refresh(install)
     assert old.read_text() == "mine now\n" and "left in place" in out
+
+
+def test_a_receipt_key_outside_activation_never_deletes_anything(make_install, tmp_path):
+    # codex L3 r2 HIGH, reproduced: "../../important.txt" with a matching hash was deleted.
+    install = make_install()
+    victim = tmp_path / "important.txt"
+    victim.write_text("precious\n")
+    path = activation_receipt_path(install)
+    data = json.loads(path.read_text())
+    data["files"]["../../important.txt"] = {"installed": _sha(b"precious\n"),
+                                            "source": _sha(b"precious\n")}
+    path.write_text(json.dumps(data))
+    _refresh(install)
+    assert victim.read_text() == "precious\n"
 
 
 def test_a_current_tree_without_a_receipt_gets_one(make_install):

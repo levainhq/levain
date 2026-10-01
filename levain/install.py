@@ -1263,7 +1263,9 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
             f"cannot open the install lock {path} ({e.strerror or e}). Nothing was "
             f"written; fix the permissions on {path.parent} and re-run."
         ) from None
-    unsupported = {errno.ENOLCK, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}
+    # ENOLCK is NOT here: it also means a full lock table or lockd down, both transient,
+    # and running unguarded then is the corruption the lock exists to stop (L3 r2).
+    unsupported = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}
     try:
         try:
             while True:
@@ -2050,13 +2052,16 @@ def _refresh_activation(
                      f"to manage, so it was not refreshed.")
         return
 
+    unreadable: list[str] = []
+
     def disk(rel: str) -> bytes | None:
         try:
             return (dst / rel).read_bytes()
         except FileNotFoundError:
             return None
         except OSError:
-            return b""
+            unreadable.append(rel)
+            return None  # never b"": an unreadable file must not read as an empty one
 
     receipt, status = read_activation_receipt(install)
     if status == "ok" and all(disk(rel) == want for rel, (want, _src) in expected.items()) \
@@ -2072,29 +2077,21 @@ def _refresh_activation(
     legacy = status == "absent"
     new_receipt = dict(record)
     stamp = time.time_ns()
-    # Files levain installed that this release no longer ships: an unedited one is removed
-    # (it is levain's, and an obsolete hook must not linger as an executable); an edited
-    # one is the operator's now and is left, said once, and dropped from the record.
+    # Files levain installed that this release no longer ships are NAMED and dropped from
+    # the record, never deleted. Deleting was tried and removed (codex L3 r2, reproduced): a
+    # receipt key like "../../x" made update delete a file outside the install, and the
+    # check-then-unlink raced an editor's save. Removing a file is the operator's call.
     for rel in sorted(set(record) - set(expected)):
-        here = disk(rel)
         del new_receipt[rel]
-        if here is None:
-            continue
-        key = f"activation/{rel}"
-        if hashlib.sha256(here).hexdigest() == record[rel]["installed"]:
-            out.refreshed.append(f"{key} (no longer shipped: removed)")
-            if apply:
-                try:
-                    (dst / rel).unlink()
-                except OSError as e:
-                    out.refreshed.pop()
-                    new_receipt[rel] = record[rel]
-                    lines.append(f"  {key}: no longer shipped, but could not be removed ({e}).")
-        else:
-            lines.append(f"  note: {key} is no longer shipped by levain and you edited it, "
-                         f"so it is left in place as yours.")
+        lines.append(f"  note: activation/{rel} is no longer shipped by this levain; it is "
+                     f"left in place (delete it yourself if you do not want it).")
     for rel, (want, src) in sorted(expected.items()):
         here = disk(rel)
+        if rel in unreadable:
+            out.review.append(f"activation/{rel}")
+            lines.append(f"  activation/{rel}: could not be read, so whether it is current "
+                         f"cannot be told.")
+            continue
         last = record[rel]["installed"] if rel in record else None
         action = _refresh_decision(here, want, last, levain_code=rel.startswith("hooks/")
                                    and rel.endswith(".py"), legacy=legacy)
@@ -2263,7 +2260,10 @@ def _refresh_codex_config(
 
 
 def _record_adapter_key(install: Path, key: str, digest: str) -> None:
-    files = _read_adapter_receipt(install) or {}
+    files = _read_adapter_receipt(install)
+    if files is None and install.joinpath(*ADAPTER_RECEIPT_REL).exists():
+        return  # unreadable: rewriting it with one key would drop every other record
+    files = files or {}
     files[key] = digest
     _write_adapter_receipt(install, files)
 
@@ -2295,10 +2295,11 @@ def _levain_render_variant(
         return False
     if mcp:
         try:
-            args = x["mcpServers"]["anneal_memory"]["args"]
             store = str(install / ".levain" / "memory.db")
-            if not (isinstance(args, list) and "--db" in args
-                    and args[args.index("--db") + 1:args.index("--db") + 2] == [store]):
+            # Only a launcher levain itself writes (the same test the codex config uses):
+            # a wrapper command or an extra flag is the operator's (codex L3 r2).
+            if not _is_levain_launcher({"mcp_servers": {
+                    "anneal_memory": x["mcpServers"]["anneal_memory"]}}, store):
                 return False
             for tree in (x, y, v):
                 tree["mcpServers"]["anneal_memory"].pop("command", None)

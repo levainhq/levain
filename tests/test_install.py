@@ -3178,12 +3178,12 @@ def test_a_concurrent_init_force_is_refused_and_writes_nothing(tmp_path, capsys)
 
 
 def test_install_lock_proceeds_where_the_filesystem_cannot_lock(tmp_path, monkeypatch, capsys):
-    # L2 MED: ENOLCK/ENOTSUP (NFS without lockd, some SMB/FUSE homes) is not "busy";
-    # refusing would block every init and update there forever.
+    # L2 MED: ENOTSUP (a filesystem with no flock at all) is not "busy"; refusing would
+    # block every init and update there forever.
     import errno
 
     def no_locks(_fd, _op):
-        raise OSError(errno.ENOLCK, "No locks available")
+        raise OSError(errno.ENOTSUP, "Operation not supported")
 
     monkeypatch.setattr(fcntl, "flock", no_locks)
     with install_lock(tmp_path):
@@ -3221,10 +3221,11 @@ def test_install_lock_fails_closed_on_an_unexpected_flock_error(tmp_path, monkey
 
     from levain.install import InstallLockError
 
-    def eio(_fd, _op):
-        raise OSError(errno.EIO, "I/O error")
+    for code in (errno.EIO, errno.ENOLCK):  # ENOLCK: lock table full / lockd down (L3 r2)
+        def fail(_fd, _op, code=code):
+            raise OSError(code, "nope")
 
-    monkeypatch.setattr(fcntl, "flock", eio)
-    with pytest.raises(InstallLockError, match="could not lock"):
-        with install_lock(tmp_path):
-            pass
+        monkeypatch.setattr(fcntl, "flock", fail)
+        with pytest.raises(InstallLockError, match="could not lock"):
+            with install_lock(tmp_path):
+                pass
