@@ -2585,6 +2585,35 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
             argv += ["--ro-bind", str(config), str(config)]
             rebound.append(config)
 
+    # (3b) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
+    # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
+    # its own store, which is the only mount-namespace way to stop a PLANT of a file that does not
+    # exist yet (a first memory.continuity.md, a SQLite sidecar, a confinement.json) without
+    # leaving a stub on the host. The stub was the defect, measured 2026-09-30: K4c gave each absent
+    # file a ``--ro-bind /dev/null`` mountpoint, and bwrap left it on the host as a 0-byte 0444 file
+    # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
+    # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
+    # as empty JSON that the next session's ``load_confinement_config`` refuses.
+    # ⚖ STRICTER THAN macOS IN ONE WAY, STATED: on macOS the confined shell may create new files in
+    # .levain other than the denied literals; here it may not. Existing entries behave the same.
+    protected = set(policy.own_memory_files)
+    if policy.config_file is not None:
+        protected.add(policy.config_file)
+    ro_store_dirs: list[Path] = []
+    for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
+        if not d.is_dir() or d.is_symlink():
+            continue
+        argv += ["--ro-bind", str(d), str(d)]
+        ro_store_dirs.append(d)
+        for child in sorted(d.iterdir(), key=lambda p: p.name):
+            if child in protected or child.is_symlink():
+                continue
+            argv += ["--bind", str(child), str(child)]
+
+    def _absent_in_ro_store(f: Path) -> bool:
+        # Nothing to hide and nothing the shell can create: no mount, so no host stub.
+        return not f.exists() and f.parent in ro_store_dirs
+
     # (4) READ+WRITE-DENIED FILES — credential files and the confinement config that defines the
     # floor. `--ro-bind /dev/null` denies BOTH directions (EACCES on read and on write), which is the
     # closest analogue of macOS's `(deny file-read* file-write* (literal ...))`. Measured to hold with
@@ -2617,6 +2646,8 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
         # "SELECTS THE FORM rather than skipping the path" and points at the write-only block "for
         # why it is applied rather than skipping outright". It described step (5) while step (4),
         # its other call site, did the opposite. The helper was right; one caller was not.
+        if _absent_in_ro_store(f):
+            continue
         argv += ["--ro-bind", "/dev/null", str(f)]
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
@@ -2633,13 +2664,13 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     # worth an empty file: sshd reads an empty authorized_keys as NO KEYS, an empty config/rc as no
     # directives. The alternative — skip it — is `--ro-bind-try` by another name and lets the plant
     # through, which a control run confirmed it does.
-    # ⚠ OPEN, FLAGGED RATHER THAN BURIED: `own_memory_files` goes through this same branch, so a
-    # FRESH entity whose memory.continuity.md does not exist yet gets a 0-byte one created by the
-    # confinement layer. That is very likely benign (a fresh entity has no memory to read) but it has
-    # NOT been verified end-to-end against a real `levain run` on Linux, and a confinement floor
-    # writing into the memory store is exactly the kind of thing that must be checked, not assumed.
+    # The entity's own store files never reach the missing-file branch: an absent one is covered by
+    # the read-only store dir in step (3b), because the stub this branch would leave broke the
+    # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
+        if _absent_in_ro_store(f):
+            continue
         if f in sockets:
             # Step (6) owns every socket path. A self-bind here would not stop a connect, and the
             # missing-file branch below would try to CREATE a socket path under a root-owned /run.

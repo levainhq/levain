@@ -2483,7 +2483,44 @@ def test_bwrap_cred_files_and_config_deny_both_directions(tmp_path, monkeypatch)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
     assert str(secret.resolve()) in devnull_targets
     if policy.config_file is not None:
-        assert str(policy.config_file) in devnull_targets
+        # An ABSENT config gets no mount (a /dev/null mountpoint would leave an empty JSON stub the
+        # next session refuses); the read-only store dir is what stops the shell creating it.
+        assert (str(policy.config_file) in devnull_targets) == policy.config_file.exists()
+
+
+def _store_policy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    lv = ent / ".levain"
+    lv.mkdir(parents=True, exist_ok=True)
+    (lv / "memory.db").write_text("")
+    (lv / "context.json").write_text("{}")
+    (lv / "docs").mkdir()
+    return build_policy(ent), lv
+
+
+def test_bwrap_mounts_the_entity_store_read_only_and_binds_ordinary_entries_back(tmp_path, monkeypatch) -> None:
+    """The plant of a NOT-YET-EXISTING store file (a first continuity, a SQLite sidecar) can only be
+    refused by making the dir read-only; ordinary existing entries stay writable as on macOS."""
+    policy, lv = _store_policy(tmp_path, monkeypatch)
+    argv = _bwrap_argv(policy)
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--ro-bind", str(lv), str(lv)] in triples
+    assert ["--bind", str(lv / "context.json"), str(lv / "context.json")] in triples
+    assert ["--bind", str(lv / "docs"), str(lv / "docs")] in triples
+    assert ["--bind", str(lv / "memory.db"), str(lv / "memory.db")] not in triples
+
+
+def test_bwrap_leaves_no_stub_for_an_absent_store_file(tmp_path, monkeypatch) -> None:
+    """THE STUB DEFECT (measured 2026-09-30): a /dev/null mountpoint for an absent file is left on the
+    host as a 0-byte 0444 file, and anneal cannot open a 0444 memory.db. No absent store file, and
+    no absent confinement.json, may be named as a mount target at all."""
+    policy, lv = _store_policy(tmp_path, monkeypatch)
+    argv = _bwrap_argv(policy)
+    for name in ("memory.continuity.md", "memory.db-wal", "memory.db-shm", "memory.db-journal",
+                 "confinement.json"):
+        assert not (lv / name).exists()
+        assert str(lv / name) not in argv, name
 
 
 def test_bwrap_write_only_files_are_ro_self_binds_when_they_exist(tmp_path, monkeypatch) -> None:
@@ -2867,6 +2904,31 @@ def test_linux_live_a_daemon_socket_is_unreachable_and_stays_so_across_a_restart
     finally:
         sh.close()
         srv.close()
+
+
+@linux_live
+def test_linux_live_the_store_refuses_a_plant_and_leaves_the_host_store_usable(tmp_path, monkeypatch) -> None:
+    """CONTROL: an ordinary existing store entry stays writable. ATTACK: planting a first continuity
+    or a SQLite sidecar is refused. AND THE HOST: after the shell, no 0-byte stub is left behind, so
+    the next session's config load and the anneal store still work (both failed with the stub)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    lv = ent / ".levain"
+    lv.mkdir(parents=True, exist_ok=True)
+    (lv / "context.json").write_text("{}")
+    sh = BwrapProvider().spawn_shell(build_policy(ent))
+    try:
+        ok = sh.run(f"echo '{{\"k\": 1}}' > {lv}/context.json && echo WROTE")
+        assert "WROTE" in ok.output, "control: an existing ordinary store entry must stay writable"
+        for name in ("memory.continuity.md", "memory.db-wal", "confinement.json"):
+            r = sh.run(f"echo planted > {lv}/{name} && echo CREATED || echo REFUSED")
+            assert "REFUSED" in r.output, name
+    finally:
+        sh.close()
+    for name in ("memory.continuity.md", "memory.db-wal", "memory.db-shm", "memory.db-journal",
+                 "confinement.json"):
+        assert not (lv / name).exists(), f"{name} was left on the host"
+    assert load_confinement_config(ent) is not None
 
 
 @linux_live
