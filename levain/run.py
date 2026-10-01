@@ -735,6 +735,7 @@ def _print_banner(
     gate_mode: str = "gated", max_seconds: float | None = None,
     allow_container_sockets: bool = False,
     bash_note: str | None = None,
+    bash_offline: bool = False,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -761,6 +762,10 @@ def _print_banner(
     else:
         hands = "file_editor + terminal (bash)" if bash_ok else "file_editor"
         print(f"  tools:     {hands} — confined to the crown-jewels floor")
+        if bash_ok and bash_offline:
+            print("             ⚠ bash has NO network: on Linux, blocking connections back to this host")
+            print("               means removing the network (pip, git fetch, curl fail inside bash).")
+            print("               \"allow_localhost_outbound\": true restores it, with the spore-755 exposure.")
         if not bash_ok:
             # ⚠ THIS LINE USED TO READ "no OS sandbox on this platform", WHICH K4c MADE FALSE and
             # which was the most operator-visible sentence in the whole Linux story. Levain supports
@@ -872,6 +877,7 @@ def _banner_for(
         ssh_mode=session.ssh_mode, deny_standard_creds=session.deny_standard_creds, task=task,
         gate_mode=session.gate_mode, max_seconds=max_seconds, bash_note=bash_note,
         allow_container_sockets=session.allow_container_sockets,
+        bash_offline=getattr(session, "bash_offline", False),
     )
 
 

@@ -71,9 +71,9 @@ Found by running it on a Linux kernel while bringing K4c onto this release line,
 - **A daemon label is now a plain name on both platforms.** Letters, digits, `.`, `_` and `-` only. A label such as `../x` used to name a file outside the unit directory for `install` and `uninstall`.
 - **The sandbox creates missing mount targets on the host** (an empty directory or file where a protected path did not exist). That has always been true of the Linux floor; it is now stated, and kept out of the entity's own store.
 
-### Changed — on Linux, bash is off while the entity's floor blocks connections back to this host
+### Changed — on Linux, bash runs without network while the entity's floor blocks connections back to this host
 
-Since 0.4.6 the floor stops the entity from connecting to this machine's own services (the `sshd` route in 0.4.6's security note). On macOS the sandbox enforces that. On Linux, `bwrap` cannot block one destination while allowing the rest of the network, so an entity whose floor asks for that block gets no bash on Linux. The file editor still works. To accept that exposure and keep bash, set `"allow_localhost_outbound": true` in the entity's `.levain/confinement.json`. **This is a holding position, not a final design.**
+Since 0.4.6 the floor stops the entity from connecting to this machine's own services (the `sshd` route in 0.4.6's security note). On macOS the sandbox blocks just that destination. On Linux, `bwrap` cannot block a single destination, so the block runs bash in its own empty network namespace: connections back to this host fail, over TCP and over abstract unix sockets (both measured), and so does all other network inside bash (`pip`, `git fetch`, `curl`). The entity's model calls are made by `levain` outside the sandbox and are unaffected. `levain run` and `levain doctor` both say so. To give bash the network back and accept that exposure, set `"allow_localhost_outbound": true` in the entity's `.levain/confinement.json`.
 
 ## [0.4.8] — 2026-09-30
 

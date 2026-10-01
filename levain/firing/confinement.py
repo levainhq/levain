@@ -2020,6 +2020,9 @@ class ConfinementProvider(ABC):
     #: spore-755). A provider that cannot must refuse to spawn while that deny is requested, never
     #: run without it; the operator's opt-out is ``allow_localhost_outbound`` in confinement.json.
     enforces_localhost_deny: bool = False
+    #: Whether this provider enforces that deny by removing ALL network from bash (bwrap's
+    #: ``--unshare-net``), which the banner must say, since pip/git/curl then fail inside bash.
+    localhost_deny_removes_network: bool = False
 
 
     @abstractmethod
@@ -2648,6 +2651,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # SandboxedShell.close()'s process-group teardown.
         "--die-with-parent",
     ]
+    if policy.deny_localhost_outbound:
+        # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
+        # namespace. Closes connects back to this host over TCP AND abstract unix sockets (both
+        # measured), at the cost of all network inside bash.
+        argv.append("--unshare-net")
 
     # Steps (2)-(6) build the BODY first, because step (1) has to know which directories the body
     # will make bwrap CREATE on the host. Read-only remounts are collected and applied LAST: a
@@ -3017,15 +3025,20 @@ def bwrap_available() -> bool:
     return proc.returncode == 0
 
 
-# ⚖ HOLDING POSITION, PENDING PHILL'S RULING (2026-09-30): bwrap has no per-destination connect
-# deny. Measured on a Linux kernel: with no network flag the sandbox reaches a 127.0.0.1 listener;
-# ``--unshare-net`` refuses it but removes ALL network (pip, git, curl). Until a ruling picks the
-# Linux posture, a policy that asks for the deny gets NO bash on Linux rather than bash without it.
+# ⚖ THE LINUX POSTURE, DECIDED 2026-10-01 (option B, under Phill's go): bwrap has no
+# per-destination connect deny, so the deny renders as ``--unshare-net`` and bash runs with NO
+# network. Measured on argushub the same day: under ``--unshare-net`` a 127.0.0.1 listener is refused
+# (curl rc 7), an abstract-socket D-Bus is refused (busctl rc 1), the internet is gone (rc 6) and bash
+# itself works; with no flag all three are reachable. The entity's own model calls are made by the
+# levain process, outside bwrap. ``allow_localhost_outbound: true`` gives bash the network back, with
+# the spore-755 exposure. Until 2026-10-01 the deny refused bash outright on Linux (option C).
+#: The refusal a provider that CANNOT enforce the deny gives (none shipped does since option B; the
+#: seam in session.py/doctor.py stays for a future provider).
 LINUX_LOCALHOST_REFUSAL = (
-    "on Linux the sandbox cannot block connections back to this host, and this "
-    "entity's floor requires that (a local sshd reached through the forwarded ssh agent reads "
-    "crown-jewel files as an unsandboxed user — spore-755). The file editor still works. To accept "
-    "that exposure and get bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
+    "this platform's sandbox cannot block connections back to this host, and this entity's floor "
+    "requires that (a local sshd reached through the forwarded ssh agent reads crown-jewel files as "
+    "an unsandboxed user — spore-755). The file editor still works. To accept that exposure and get "
+    "bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
 )
 
 
@@ -3057,6 +3070,10 @@ class BwrapProvider(ConfinementProvider):
     artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
     before it is either claimed or shipped."""
 
+    #: Enforced by ``--unshare-net`` (no network at all in bash), not by a per-destination rule.
+    enforces_localhost_deny = True
+    localhost_deny_removes_network = True
+
     def available(self) -> bool:
         return bwrap_available()
 
@@ -3068,10 +3085,6 @@ class BwrapProvider(ConfinementProvider):
         :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
         terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
         later by someone who does not trust this docstring."""
-        if policy.deny_localhost_outbound:
-            # The same refusal as spawn: a rendered command that silently dropped the deny would be
-            # a reproduction of a floor this provider does not run (codex, L3 r1).
-            raise ConfinementError(f"bash refused: {LINUX_LOCALHOST_REFUSAL}")
         argv, create_first = _bwrap_plan(policy)
         mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
         return mkdir + shlex.join(argv) + "\n"
@@ -3083,8 +3096,6 @@ class BwrapProvider(ConfinementProvider):
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
-        if policy.deny_localhost_outbound:
-            raise ConfinementError(f"bash refused: {LINUX_LOCALHOST_REFUSAL}")
         if not bwrap_available():
             raise ConfinementError(
                 f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "

@@ -857,13 +857,21 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
         # config `levain run` reads, so this line and the banner agree.
         try:
-            enforces = select_provider().enforces_localhost_deny
+            provider = select_provider()
+            enforces = provider.enforces_localhost_deny
+            offline = bool(getattr(provider, "localhost_deny_removes_network", False))
         except Exception:  # noqa: BLE001 — no provider: diagnose_confinement already said supported
-            enforces = True
+            enforces, offline = True, False
         if not enforces and not cfg.allow_localhost_outbound:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} available, but `levain run` gets file_editor only: "
                                 f"{LINUX_LOCALHOST_REFUSAL}")]
+        if offline and not cfg.allow_localhost_outbound:
+            return [CheckResult("confinement floor", True,
+                                f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
+                                f"NO network (connections back to this host are blocked by removing "
+                                f"the network; \"allow_localhost_outbound\": true restores it, with "
+                                f"the spore-755 exposure)")]
         return [CheckResult("confinement floor", True,
                             f"{d.provider} — `levain run` gets file_editor + bash")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"

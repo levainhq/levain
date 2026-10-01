@@ -1871,9 +1871,8 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
         return out
 
     # 2026-09-30, K4c landing: BwrapProvider consumes `deny_sockets` in `_bwrap_argv` step (6)
-    # (pinned by the bwrap socket tests below and measured live), and for `deny_localhost_outbound`
-    # it REFUSES to spawn (`enforces_localhost_deny = False`), pending Phill's ruling on the Linux
-    # posture. Both decisions are asserted by name in the tests that follow this one.
+    # (pinned by the bwrap socket tests below and measured live), and enforces `deny_localhost_outbound`
+    # with `--unshare-net` (option B, 2026-10-01). Both are asserted by name in the tests below.
     providers = _concrete(_conf.ConfinementProvider)
     assert providers == {"SeatbeltProvider", "BwrapProvider"}, (
         f"the ConfinementProvider roster changed to {sorted(providers)}. Every provider MUST "
@@ -1899,19 +1898,20 @@ def test_no_shipped_provider_overrides_spawn_shell() -> None:
         assert "_spawn_shell_impl" in vars(cls)
 
 
-def test_bwrap_refuses_to_spawn_while_the_localhost_deny_is_requested(tmp_path, monkeypatch) -> None:
-    """bwrap has no per-destination connect deny (measured: no flag reaches a 127.0.0.1 listener;
-    ``--unshare-net`` takes all network with it). So a policy carrying the deny gets no shell, and
-    the refusal names the operator's opt-out."""
+def test_bwrap_enforces_the_localhost_deny_by_removing_the_network(tmp_path, monkeypatch) -> None:
+    """Option B (2026-10-01, under Phill's go; until then the deny refused bash on Linux): bwrap has
+    no per-destination connect deny, so the deny renders as `--unshare-net`. Measured on argushub:
+    under it a 127.0.0.1 listener and an abstract-socket bus are refused, bash still works."""
     from levain.firing import confinement as _conf
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert _conf.BwrapProvider.enforces_localhost_deny is False
+    assert _conf.BwrapProvider.enforces_localhost_deny is True
+    assert _conf.BwrapProvider.localhost_deny_removes_network is True
     assert _conf.SeatbeltProvider.enforces_localhost_deny is True
-    pol = build_policy(_entity(tmp_path), deny_localhost_outbound=True)
-    monkeypatch.setattr(_conf, "bwrap_available", lambda: True)  # the refusal must not hinge on the host
-    with pytest.raises(ConfinementError, match="allow_localhost_outbound"):
-        _conf.BwrapProvider().spawn_shell(pol)
+    assert _conf.SeatbeltProvider.localhost_deny_removes_network is False
+    on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
+    off = _bwrap_argv(build_policy(_entity(tmp_path, "off"), deny_localhost_outbound=False))
+    assert "--unshare-net" in on and "--unshare-net" not in off
 
 
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
@@ -2641,11 +2641,11 @@ def test_bwrap_refuses_a_dangling_symlinked_protected_file(tmp_path, monkeypatch
         _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
 
 
-def test_bwrap_render_refuses_like_spawn_when_the_localhost_deny_is_on(tmp_path, monkeypatch) -> None:
+def test_bwrap_render_carries_the_network_unshare_like_spawn(tmp_path, monkeypatch) -> None:
+    """The rendered command is the floor that runs (codex, L3 r1): it carries --unshare-net too."""
     monkeypatch.setenv("HOME", str(tmp_path))
     pol = build_policy(_entity(tmp_path), deny_localhost_outbound=True)
-    with pytest.raises(ConfinementError, match="allow_localhost_outbound"):
-        BwrapProvider().render_profile(pol)
+    assert "--unshare-net" in BwrapProvider().render_profile(pol)
 
 
 def test_bwrap_leaves_no_stub_for_an_absent_store_file(tmp_path, monkeypatch) -> None:

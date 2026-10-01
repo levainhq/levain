@@ -1709,8 +1709,9 @@ def _supported(conf):
 
 
 def test_doctor_agrees_with_run_when_the_sandbox_cannot_deny_localhost(tmp_path, monkeypatch):
-    """The Linux holding position: bwrap works, but `levain run` drops bash for an entity whose
-    floor asks to block connections back to this host. Doctor must not promise the bash it drops."""
+    """The generic seam: a provider that cannot block connections back to this host makes `levain
+    run` drop bash for an entity whose floor asks for it. Doctor must not promise the bash it drops.
+    (bwrap took this path until 2026-10-01; it now enforces the deny with --unshare-net.)"""
     from levain.doctor import _check_confinement
     import levain.firing.confinement as conf
 
@@ -1721,6 +1722,26 @@ def test_doctor_agrees_with_run_when_the_sandbox_cannot_deny_localhost(tmp_path,
     assert r.ok is True and "file_editor only" in r.detail and "allow_localhost_outbound" in r.detail
     (tmp_path / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
     assert "file_editor + bash" in _check_confinement(tmp_path)[0].detail
+
+
+class _OfflineLocalhostDeny:
+    enforces_localhost_deny = True
+    localhost_deny_removes_network = True
+
+
+def test_doctor_says_bash_has_no_network_where_the_deny_removes_it(tmp_path, monkeypatch):
+    """Option B (2026-10-01): on Linux the localhost deny is --unshare-net, so bash runs offline.
+    Doctor must say so, exactly as the run banner does, and stop saying it once the entity opts out."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "diagnose_confinement", _supported(conf))
+    monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _OfflineLocalhostDeny())
+    (tmp_path / ".levain").mkdir()
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is True and "file_editor + bash" in r.detail and "NO network" in r.detail
+    (tmp_path / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    assert "NO network" not in _check_confinement(tmp_path)[0].detail
 
 
 def test_doctor_names_a_broken_config_instead_of_promising_bash(tmp_path, monkeypatch):

@@ -569,8 +569,9 @@ class _LocalhostProvider:
 def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
     tmp_path: Path, monkeypatch, capsys, _clean_entity_env
 ):
-    """The Linux holding position (spore-755): a sandbox that cannot refuse a connect back to this
-    host gets NO bash while the entity's floor asks for that deny, rather than bash without it."""
+    """The generic seam (spore-755): a provider that cannot refuse a connect back to this host gets
+    NO bash while the entity's floor asks for that deny, rather than bash without it. No shipped
+    provider takes this path since 2026-10-01 (bwrap enforces the deny with --unshare-net)."""
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
     entity = _openhands_entity(tmp_path)
     monkeypatch.setattr("levain.session.confinement_supported", lambda: True)

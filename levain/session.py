@@ -444,6 +444,7 @@ class EntitySession:
     bash_ok: bool
     ssh_mode: str = "agent"
     deny_standard_creds: bool = False
+    bash_offline: bool = False   # bash runs with NO network (Linux: the localhost deny is --unshare-net)
     allow_container_sockets: bool = False
     """spore-725. Carried here for ONE reason: the banner must render the floor that is
     actually in force, never a static sentence. It is read from the same
@@ -593,9 +594,13 @@ class EntitySession:
             # A provider that cannot deny connects back to this host drops bash here, before the
             # tools are built, so the banner never offers a shell that refuses every command.
             bash_refusal = None
+            bash_offline = False
             if bash_ok and cfg is not None and not cfg.allow_localhost_outbound:
-                if not select_provider().enforces_localhost_deny:
+                provider = select_provider()
+                if not provider.enforces_localhost_deny:
                     bash_ok, bash_refusal = False, LINUX_LOCALHOST_REFUSAL
+                else:
+                    bash_offline = bool(getattr(provider, "localhost_deny_removes_network", False))
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR
@@ -669,6 +674,7 @@ class EntitySession:
             allow_container_sockets=allow_container_sockets,
             gate_mode=gate_mode,
             bash_refusal=bash_refusal if with_tools else None,
+            bash_offline=with_tools and bash_ok and bash_offline,
         )
 
     # -- the one operation ---------------------------------------------------
