@@ -958,9 +958,16 @@ def test_systemd_rendered_units_pass_systemd_analyze_verify(tmp_path, monkeypatc
             ["systemd-analyze", "verify", "--user", str(d / name)],
             capture_output=True, text=True,
         )
-        # A container has no system bus; that is environmental, not a unit defect.
+        # A container has no system bus; that is environmental, not a unit defect. And `--user`
+        # verify loads every user unit on the host, so a real host prints warnings about OTHER
+        # units, each prefixed with that unit's own path (argushub, 2026-10-01: "argus-*.service:3:
+        # Invalid URL"). Only lines about the units written here count.
+        def _about_another_unit(ln: str) -> bool:
+            head = ln.split(":", 1)[0]
+            return head.startswith("/") and not head.startswith(str(d))
         errs = [ln for ln in (proc.stderr or "").splitlines()
-                if ln.strip() and "Failed to connect to system bus" not in ln]
+                if ln.strip() and "Failed to connect to system bus" not in ln
+                and not _about_another_unit(ln)]
         assert not errs, f"{name} rejected by systemd: {errs}"
 
 
