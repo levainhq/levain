@@ -863,9 +863,9 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         if offline:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
-                                f"no network: connections back to this host are blocked by removing "
-                                f"it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": true "
-                                f"restores the network, with the spore-755 exposure")]
+                                f"no IP network: connections back to this host are blocked by "
+                                f"removing it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": "
+                                f"true restores the network, with the spore-755 exposure")]
         return [CheckResult("confinement floor", True,
                             f"{d.provider} — `levain run` gets file_editor + bash")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"

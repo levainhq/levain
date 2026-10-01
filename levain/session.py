@@ -443,7 +443,7 @@ class EntitySession:
     bash_ok: bool
     ssh_mode: str = "agent"
     deny_standard_creds: bool = False
-    bash_offline: bool = False   # bash runs with NO network (Linux: the localhost deny is --unshare-net)
+    bash_offline: bool = False   # bash runs with no IP network (Linux: the localhost deny is --unshare-net)
     allow_container_sockets: bool = False
     """spore-725. Carried here for ONE reason: the banner must render the floor that is
     actually in force, never a static sentence. It is read from the same

@@ -765,8 +765,8 @@ def _print_banner(
         print(f"  tools:     {hands} — confined to the crown-jewels floor")
         if bash_ok and bash_offline:
             # The residual is the shared OFFLINE_RESIDUAL that doctor prints too (codex, L3 on B).
-            print("             ⚠ bash has no network: on Linux, blocking connections back to this host")
-            print("               means removing it (pip, git fetch, curl fail inside bash).")
+            print("             ⚠ bash has no IP network: on Linux, blocking connections back to this")
+            print("               host means removing it (pip, git fetch, curl fail inside bash).")
             print(textwrap.fill(OFFLINE_RESIDUAL[0].upper() + OFFLINE_RESIDUAL[1:] + ".", width=88,
                                 initial_indent="               ", subsequent_indent="               "))
             print("               \"allow_localhost_outbound\": true restores it, with the spore-755 exposure.")

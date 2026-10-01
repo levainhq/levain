@@ -3069,22 +3069,23 @@ LINUX_LOCALHOST_REFUSAL = (
     "bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
 )
 
-#: The refusal when the provider enforces the deny by ``--unshare-net`` but this host cannot make a
-#: network namespace (see :func:`bwrap_netns_available`).
+#: The refusal when the provider enforces the deny by ``--unshare-net`` but the probe for it failed
+#: (see :func:`bwrap_netns_available`; a timeout or a transient bwrap failure lands here too).
 NETNS_REFUSAL = (
-    "this host lets bwrap create a sandbox but not a network namespace, and this entity's floor "
-    "blocks connections back to this host by removing bash's network. The file editor still works. "
+    "the `bwrap --unshare-net` probe failed on this host, and this entity's floor blocks "
+    "connections back to this host by removing bash's network. The file editor still works. "
     "To accept that exposure and get bash, set \"allow_localhost_outbound\": true in "
     ".levain/confinement.json."
 )
 
 #: What bash can still reach when the deny runs as ``--unshare-net``. One string, printed by the
-#: banner and doctor and quoted in the README/CHANGELOG, so the residual is named everywhere the
-#: posture is (codex, L3 on option B; the ControlMaster class is spore-1005).
+#: banner and doctor, so the residual is named everywhere the posture is (codex, L3 on option B
+#: twice; the ControlMaster class is spore-1005).
 OFFLINE_RESIDUAL = (
-    "bash keeps only its own isolated loopback; a PATHNAME unix socket the floor does not deny (an "
-    "ssh ControlMaster socket in /tmp, for one) is a file, not a network address, and stays "
-    "reachable (spore-1005)"
+    "bash keeps only its own isolated loopback. NOT blocked: a unix socket at a file path the floor "
+    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, D-Bus, X11), which can reach "
+    "this host's services and so bypass the block (spore-1005); and inside a VM, AF_VSOCK to the "
+    "hypervisor"
 )
 
 
@@ -3104,7 +3105,9 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
             return False, NETNS_REFUSAL, False
         return True, None, bool(provider.localhost_deny_removes_network)
     except Exception as exc:  # noqa: BLE001 — undetermined == no bash (the honesty floor)
-        return False, f"the localhost deny could not be checked on this host ({exc})", False
+        return False, (f"the localhost deny could not be checked on this host ({exc}). To accept "
+                       "that exposure and get bash, set \"allow_localhost_outbound\": true in "
+                       ".levain/confinement.json."), False
 
 
 class BwrapProvider(ConfinementProvider):

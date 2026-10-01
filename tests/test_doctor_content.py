@@ -1742,11 +1742,11 @@ def test_doctor_says_bash_has_no_network_where_the_deny_removes_it(tmp_path, mon
     monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _OfflineLocalhostDeny())
     (tmp_path / ".levain").mkdir()
     r = _check_confinement(tmp_path)[0]
-    assert r.ok is True and "file_editor + bash" in r.detail and "no network" in r.detail
+    assert r.ok is True and "file_editor + bash" in r.detail and "no IP network" in r.detail
     # The residual is named, not overclaimed away (codex, L3 on B): loopback + pathname sockets.
-    assert "isolated loopback" in r.detail and "ControlMaster" in r.detail
+    assert "isolated loopback" in r.detail and "ControlMaster" in r.detail and "AF_VSOCK" in r.detail
     (tmp_path / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
-    assert "no network" not in _check_confinement(tmp_path)[0].detail
+    assert "no IP network" not in _check_confinement(tmp_path)[0].detail
 
 
 class _NoNetnsLocalhostDeny(_OfflineLocalhostDeny):
@@ -1764,7 +1764,7 @@ def test_doctor_drops_bash_where_the_deny_cannot_make_a_network_namespace(tmp_pa
     monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _NoNetnsLocalhostDeny())
     (tmp_path / ".levain").mkdir()
     r = _check_confinement(tmp_path)[0]
-    assert r.ok is True and "file_editor only" in r.detail and "network namespace" in r.detail
+    assert r.ok is True and "file_editor only" in r.detail and "--unshare-net" in r.detail
 
 
 def test_doctor_fails_closed_when_the_provider_cannot_be_selected(tmp_path, monkeypatch):
@@ -1781,6 +1781,7 @@ def test_doctor_fails_closed_when_the_provider_cannot_be_selected(tmp_path, monk
     (tmp_path / ".levain").mkdir()
     r = _check_confinement(tmp_path)[0]
     assert r.ok is True and "file_editor only" in r.detail and "could not be checked" in r.detail
+    assert "allow_localhost_outbound" in r.detail
 
 
 def test_doctor_names_a_broken_config_instead_of_promising_bash(tmp_path, monkeypatch):
