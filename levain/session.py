@@ -56,10 +56,9 @@ from levain.firing.agent_reply import (
 )
 from levain.firing.confinement import (
     ConfinementError,
-    LINUX_LOCALHOST_REFUSAL,
     confinement_supported,
     load_confinement_config,
-    select_provider,
+    resolve_localhost_deny,
 )
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
@@ -595,12 +594,9 @@ class EntitySession:
             # tools are built, so the banner never offers a shell that refuses every command.
             bash_refusal = None
             bash_offline = False
-            if bash_ok and cfg is not None and not cfg.allow_localhost_outbound:
-                provider = select_provider()
-                if not provider.enforces_localhost_deny:
-                    bash_ok, bash_refusal = False, LINUX_LOCALHOST_REFUSAL
-                else:
-                    bash_offline = bool(getattr(provider, "localhost_deny_removes_network", False))
+            if bash_ok and cfg is not None:
+                bash_ok, bash_refusal, bash_offline = resolve_localhost_deny(
+                    cfg.allow_localhost_outbound)
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR

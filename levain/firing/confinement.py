@@ -259,6 +259,8 @@ __all__ = [
     "select_provider",
     "sandbox_exec_available",
     "bwrap_available",
+    "bwrap_netns_available",
+    "resolve_localhost_deny",
     "confinement_supported",
     "ConfinementDiagnosis",
     "diagnose_confinement",
@@ -2024,6 +2026,11 @@ class ConfinementProvider(ABC):
     #: ``--unshare-net``), which the banner must say, since pip/git/curl then fail inside bash.
     localhost_deny_removes_network: bool = False
 
+    def localhost_deny_ready(self) -> bool:
+        """Whether the deny can actually be applied on THIS host right now (a provider whose
+        mechanism needs a host capability beyond :meth:`available` overrides this)."""
+        return self.enforces_localhost_deny
+
 
     @abstractmethod
     def available(self) -> bool:
@@ -3025,6 +3032,28 @@ def bwrap_available() -> bool:
     return proc.returncode == 0
 
 
+def bwrap_netns_available() -> bool:
+    """True iff bwrap can ALSO make a new network namespace here — the localhost deny's argv.
+
+    :func:`bwrap_available` runs without ``--unshare-net``, so it says nothing about a host where a
+    user namespace works and a network namespace does not (a kernel without ``CONFIG_NET_NS``,
+    gVisor, a loopback setup bwrap cannot complete). There, every bash spawn under the deny dies at
+    startup, and doctor and the banner must not have promised bash (complement + codex, L3 on
+    option B). Same shape and the same fail-closed rule as :func:`bwrap_available`: run it."""
+    if not (os.path.isfile(BWRAP) and os.access(BWRAP, os.X_OK)):
+        return False
+    try:
+        proc = subprocess.run(
+            [BWRAP, "--unshare-net", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+             "/bin/true"],
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 # ⚖ THE LINUX POSTURE, DECIDED 2026-10-01 (option B, under Phill's go): bwrap has no
 # per-destination connect deny, so the deny renders as ``--unshare-net`` and bash runs with NO
 # network. Measured on argushub the same day: under ``--unshare-net`` a 127.0.0.1 listener is refused
@@ -3032,14 +3061,50 @@ def bwrap_available() -> bool:
 # itself works; with no flag all three are reachable. The entity's own model calls are made by the
 # levain process, outside bwrap. ``allow_localhost_outbound: true`` gives bash the network back, with
 # the spore-755 exposure. Until 2026-10-01 the deny refused bash outright on Linux (option C).
-#: The refusal a provider that CANNOT enforce the deny gives (none shipped does since option B; the
-#: seam in session.py/doctor.py stays for a future provider).
+#: The refusal for a provider that CANNOT enforce the deny (see :func:`resolve_localhost_deny`).
 LINUX_LOCALHOST_REFUSAL = (
     "this platform's sandbox cannot block connections back to this host, and this entity's floor "
     "requires that (a local sshd reached through the forwarded ssh agent reads crown-jewel files as "
     "an unsandboxed user — spore-755). The file editor still works. To accept that exposure and get "
     "bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
 )
+
+#: The refusal when the provider enforces the deny by ``--unshare-net`` but this host cannot make a
+#: network namespace (see :func:`bwrap_netns_available`).
+NETNS_REFUSAL = (
+    "this host lets bwrap create a sandbox but not a network namespace, and this entity's floor "
+    "blocks connections back to this host by removing bash's network. The file editor still works. "
+    "To accept that exposure and get bash, set \"allow_localhost_outbound\": true in "
+    ".levain/confinement.json."
+)
+
+#: What bash can still reach when the deny runs as ``--unshare-net``. One string, printed by the
+#: banner and doctor and quoted in the README/CHANGELOG, so the residual is named everywhere the
+#: posture is (codex, L3 on option B; the ControlMaster class is spore-1005).
+OFFLINE_RESIDUAL = (
+    "bash keeps only its own isolated loopback; a PATHNAME unix socket the floor does not deny (an "
+    "ssh ControlMaster socket in /tmp, for one) is a file, not a network address, and stays "
+    "reachable (spore-1005)"
+)
+
+
+def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | None, bool]:
+    """``(bash_ok, refusal, offline)`` for a host that can otherwise sandbox bash.
+
+    ONE computation for ``levain run`` (session) and ``levain doctor``, which used to compute this
+    separately and disagree when :func:`select_provider` raised (glm, L3 on option B). Fails closed:
+    anything undeterminable drops bash, never promises it."""
+    if allow_localhost_outbound:
+        return True, None, False
+    try:
+        provider = select_provider()
+        if not provider.enforces_localhost_deny:
+            return False, LINUX_LOCALHOST_REFUSAL, False
+        if not provider.localhost_deny_ready():
+            return False, NETNS_REFUSAL, False
+        return True, None, bool(provider.localhost_deny_removes_network)
+    except Exception as exc:  # noqa: BLE001 — undetermined == no bash (the honesty floor)
+        return False, f"the localhost deny could not be checked on this host ({exc})", False
 
 
 class BwrapProvider(ConfinementProvider):
@@ -3076,6 +3141,9 @@ class BwrapProvider(ConfinementProvider):
 
     def available(self) -> bool:
         return bwrap_available()
+
+    def localhost_deny_ready(self) -> bool:
+        return bwrap_netns_available()
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """The bwrap invocation as shell-quoted text.

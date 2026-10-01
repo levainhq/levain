@@ -37,11 +37,12 @@ from __future__ import annotations
 
 import platform
 import sys
+import textwrap
 from pathlib import Path
 
 from levain.firing.deadline import TurnDeadline, TurnTimeout, format_timeout_report
 from levain.firing.gate import PendingEfferent
-from levain.firing.confinement import diagnose_confinement
+from levain.firing.confinement import OFFLINE_RESIDUAL, diagnose_confinement
 from levain.session import (
     EXIT_INTERRUPTED,
     EXIT_OK,
@@ -763,8 +764,11 @@ def _print_banner(
         hands = "file_editor + terminal (bash)" if bash_ok else "file_editor"
         print(f"  tools:     {hands} — confined to the crown-jewels floor")
         if bash_ok and bash_offline:
-            print("             ⚠ bash has NO network: on Linux, blocking connections back to this host")
-            print("               means removing the network (pip, git fetch, curl fail inside bash).")
+            # The residual is the shared OFFLINE_RESIDUAL that doctor prints too (codex, L3 on B).
+            print("             ⚠ bash has no network: on Linux, blocking connections back to this host")
+            print("               means removing it (pip, git fetch, curl fail inside bash).")
+            print(textwrap.fill(OFFLINE_RESIDUAL[0].upper() + OFFLINE_RESIDUAL[1:] + ".", width=88,
+                                initial_indent="               ", subsequent_indent="               "))
             print("               \"allow_localhost_outbound\": true restores it, with the spore-755 exposure.")
         if not bash_ok:
             # ⚠ THIS LINE USED TO READ "no OS sandbox on this platform", WHICH K4c MADE FALSE and
@@ -808,8 +812,14 @@ def _print_banner(
         else:
             print("             container daemon sockets: docker \u00b7 podman \u00b7 containerd \u00b7 CRI-O")
             print("               (a root daemon outside this sandbox would read any path for it)")
-            print("             \u26a0 NOT covered: a custom $DOCKER_HOST, a TCP daemon endpoint, or a")
-            print("               runtime whose socket is not in that list — the deny is BY NAME,")
+            # Under the Linux offline posture a TCP endpoint is unreachable anyway (no network in
+            # bash), so naming it as NOT covered would contradict the line above (codex, L3 on B).
+            if bash_offline:
+                print("             \u26a0 NOT covered: a custom $DOCKER_HOST unix socket or a runtime")
+                print("               whose socket is not in that list — the deny is BY NAME,")
+            else:
+                print("             \u26a0 NOT covered: a custom $DOCKER_HOST, a TCP daemon endpoint, or a")
+                print("               runtime whose socket is not in that list — the deny is BY NAME,")
             print("               and pinning one in deny_files does NOT close it (that denies the")
             print("               FILE, not the connect). No operator socket list exists yet.")
             print("             \u26a0 coverage is a SPAWN-TIME SNAPSHOT: the list is re-resolved each")

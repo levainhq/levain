@@ -844,34 +844,28 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     # the one outcome here that FAILS — not a missing optional hand, an entity that cannot start.
     try:
         from levain.firing.confinement import (
-            LINUX_LOCALHOST_REFUSAL,
+            OFFLINE_RESIDUAL,
             load_confinement_config,
-            select_provider,
+            resolve_localhost_deny,
         )
         cfg = load_confinement_config(install)
     except Exception as exc:  # noqa: BLE001
         return [CheckResult("confinement floor", False,
                             f"`levain run` will refuse to start this entity: {exc}")]
     if d.supported:
-        # The host can sandbox bash, but on a provider that cannot block connections back to this
-        # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
-        # config `levain run` reads, so this line and the banner agree.
-        try:
-            provider = select_provider()
-            enforces = provider.enforces_localhost_deny
-            offline = bool(getattr(provider, "localhost_deny_removes_network", False))
-        except Exception:  # noqa: BLE001 — no provider: diagnose_confinement already said supported
-            enforces, offline = True, False
-        if not enforces and not cfg.allow_localhost_outbound:
+        # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
+        # network. `levain run` asks the SAME resolver with the same config, so the two agree.
+        bash_ok, refusal, offline = resolve_localhost_deny(cfg.allow_localhost_outbound)
+        if not bash_ok:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} available, but `levain run` gets file_editor only: "
-                                f"{LINUX_LOCALHOST_REFUSAL}")]
-        if offline and not cfg.allow_localhost_outbound:
+                                f"{refusal}")]
+        if offline:
             return [CheckResult("confinement floor", True,
                                 f"{d.provider} — `levain run` gets file_editor + bash, and bash has "
-                                f"NO network (connections back to this host are blocked by removing "
-                                f"the network; \"allow_localhost_outbound\": true restores it, with "
-                                f"the spore-755 exposure)")]
+                                f"no network: connections back to this host are blocked by removing "
+                                f"it; {OFFLINE_RESIDUAL}. \"allow_localhost_outbound\": true "
+                                f"restores the network, with the spore-755 exposure")]
         return [CheckResult("confinement floor", True,
                             f"{d.provider} — `levain run` gets file_editor + bash")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"

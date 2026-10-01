@@ -552,7 +552,7 @@ def test_run_entity_passes_confined_tools_by_default(
     # Force the OS-floor-present branch so this is platform-independent — the entity gets BOTH confined
     # hands (file editor + sandboxed bash).
     monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
-    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(True))
+    monkeypatch.setattr("levain.firing.confinement.select_provider", lambda: _LocalhostProvider(True))
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)
@@ -562,8 +562,14 @@ def test_run_entity_passes_confined_tools_by_default(
 
 
 class _LocalhostProvider:
-    def __init__(self, enforces: bool) -> None:
+    localhost_deny_removes_network = False
+
+    def __init__(self, enforces: bool, ready: bool = True) -> None:
         self.enforces_localhost_deny = enforces
+        self._ready = ready
+
+    def localhost_deny_ready(self) -> bool:
+        return self._ready
 
 
 def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
@@ -575,7 +581,24 @@ def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
     entity = _openhands_entity(tmp_path)
     monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
-    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(False))
+    monkeypatch.setattr("levain.firing.confinement.select_provider", lambda: _LocalhostProvider(False))
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    assert run_entity(entity, with_tools=True) == 2
+    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+
+
+def test_run_entity_drops_bash_where_the_deny_cannot_make_a_network_namespace(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    """L3 on option B (complement + codex): bwrap can run but not unshare the network (no
+    CONFIG_NET_NS, gVisor). Every bash spawn under the deny would die at startup, so `levain run`
+    must not offer bash at all."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.firing.confinement.select_provider",
+                        lambda: _LocalhostProvider(True, ready=False))
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, with_tools=True) == 2
@@ -591,7 +614,7 @@ def test_run_entity_keeps_bash_when_the_operator_opts_out_of_the_localhost_deny(
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text('{"allow_localhost_outbound": true}\n')
     monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
-    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(False))
+    monkeypatch.setattr("levain.firing.confinement.select_provider", lambda: _LocalhostProvider(False))
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, with_tools=True) == 2

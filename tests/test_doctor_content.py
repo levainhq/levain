@@ -1728,6 +1728,9 @@ class _OfflineLocalhostDeny:
     enforces_localhost_deny = True
     localhost_deny_removes_network = True
 
+    def localhost_deny_ready(self) -> bool:
+        return True
+
 
 def test_doctor_says_bash_has_no_network_where_the_deny_removes_it(tmp_path, monkeypatch):
     """Option B (2026-10-01): on Linux the localhost deny is --unshare-net, so bash runs offline.
@@ -1739,9 +1742,45 @@ def test_doctor_says_bash_has_no_network_where_the_deny_removes_it(tmp_path, mon
     monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _OfflineLocalhostDeny())
     (tmp_path / ".levain").mkdir()
     r = _check_confinement(tmp_path)[0]
-    assert r.ok is True and "file_editor + bash" in r.detail and "NO network" in r.detail
+    assert r.ok is True and "file_editor + bash" in r.detail and "no network" in r.detail
+    # The residual is named, not overclaimed away (codex, L3 on B): loopback + pathname sockets.
+    assert "isolated loopback" in r.detail and "ControlMaster" in r.detail
     (tmp_path / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
-    assert "NO network" not in _check_confinement(tmp_path)[0].detail
+    assert "no network" not in _check_confinement(tmp_path)[0].detail
+
+
+class _NoNetnsLocalhostDeny(_OfflineLocalhostDeny):
+    def localhost_deny_ready(self) -> bool:
+        return False
+
+
+def test_doctor_drops_bash_where_the_deny_cannot_make_a_network_namespace(tmp_path, monkeypatch):
+    """L3 on option B (complement + codex): bwrap runs but cannot unshare the network, so every
+    bash spawn under the deny dies. Doctor must not promise bash there."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "diagnose_confinement", _supported(conf))
+    monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _NoNetnsLocalhostDeny())
+    (tmp_path / ".levain").mkdir()
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is True and "file_editor only" in r.detail and "network namespace" in r.detail
+
+
+def test_doctor_fails_closed_when_the_provider_cannot_be_selected(tmp_path, monkeypatch):
+    """L3 on option B (glm): doctor's own `except` assumed the deny enforced and promised bash
+    while `levain run` raised. Both now ask one resolver, which drops bash when undeterminable."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    def _boom(*a, **k):
+        raise conf.ConfinementError("no provider")
+
+    monkeypatch.setattr(conf, "diagnose_confinement", _supported(conf))
+    monkeypatch.setattr(conf, "select_provider", _boom)
+    (tmp_path / ".levain").mkdir()
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is True and "file_editor only" in r.detail and "could not be checked" in r.detail
 
 
 def test_doctor_names_a_broken_config_instead_of_promising_bash(tmp_path, monkeypatch):
