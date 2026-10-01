@@ -16,6 +16,12 @@ in one ordered, fail-safe operation:
    the operator to apply under review. We never auto-apply (anneal's never-clobber
    contract) and never auto-ack; ``--ack`` advances the marker AFTER the operator
    has applied the edits, as a separate deliberate intent.
+3.5 **pack drift** -> reconcile a pulled pack source into the install
+   (``levain.reconcile``).
+3.6 **activation tree + adapter files** -> re-composed from THIS levain, per file, so an
+   upgrade (``pip install -U levain``) reaches the hooks and the carrier without
+   ``init --force`` (``install.refresh_adapter``; an operator's edit is kept). This also
+   runs when nothing else drifted, since the lock can be current while the hooks are not.
 4. **record the lock** -> write ``.levain/manifest.json`` with the
    actually-composed versions (reality after reconcile, not the intended target).
 
@@ -33,12 +39,39 @@ from pathlib import Path
 from typing import Callable
 
 from levain import manifest, reconcile
+from levain.install import InstallBusy, install_lock, refresh_adapter
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
 Emit = Callable[[str], None]
 
 
 def run_update(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    yes: bool = False,
+    no_pip: bool = False,
+    ack: bool = False,
+    emit: Emit = print,
+    confirm: Callable[[str], bool] | None = None,
+) -> int:
+    """:func:`_run_update` under the per-install lock (``install.install_lock``), so it
+    never interleaves with an ``init --force`` on the same install. ``--dry-run`` writes
+    nothing and takes no lock."""
+    kwargs = dict(dry_run=dry_run, yes=yes, no_pip=no_pip, ack=ack, emit=emit,
+                  confirm=confirm)
+    if dry_run:
+        return _run_update(path, **kwargs)  # type: ignore[arg-type]
+    install = Path(str(path)).expanduser().resolve()
+    try:
+        with install_lock(install):
+            return _run_update(path, **kwargs)  # type: ignore[arg-type]
+    except InstallBusy as e:
+        emit(f"FAIL: {e.message}")
+        return 1
+
+
+def _run_update(
     path: Path,
     *,
     dry_run: bool = False,
@@ -94,7 +127,8 @@ def run_update(
         engine_clean = not drift.has_actionable_drift and not drift.has_unknown
         if packs_drifted:
             reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
-        if engine_clean and not packs_drifted:
+        plan = refresh_adapter(install, apply=False, emit=emit)
+        if engine_clean and not packs_drifted and not plan.refreshed and not plan.review:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
         emit("--dry-run: the plan above is what `levain update` WOULD do. "
@@ -104,6 +138,14 @@ def run_update(
         return 1
 
     if not drift.has_actionable_drift and not drift.has_unknown and not packs_drifted:
+        # An upgrade with the lock already current still leaves the activation tree and
+        # adapter files at the previous release (gap #19), so this runs here too.
+        adapter = refresh_adapter(install, apply=True, emit=emit)
+        if adapter.review:
+            emit("\nAdapter files need your review (listed above) — merge by hand or "
+                 "re-onboard (`levain init --force`), then re-run `levain update`.")
+            _record_lock(install, installed, emit)
+            return 1
         if drift.in_sync:
             emit("Already at the known-good set — nothing to reconcile.")
         else:
@@ -206,6 +248,11 @@ def run_update(
         install, dry_run=False, emit=emit
     )
 
+    # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
+    #    `pip install -U levain` changes neither; only `init --force` used to). After the
+    #    pack reconcile, which may have changed the roster the carrier lists. --
+    adapter_needs_review = bool(refresh_adapter(install, apply=True, emit=emit).review)
+
     # -- 4. record the lock (reality after reconcile) — carry the updated pack
     #    provenance so a reconciled pack stops re-drifting; write_lock always writes
     #    the `packs` key, so this must be handed the set to keep. --
@@ -234,6 +281,10 @@ def run_update(
         # (a write fault) — don't claim full success on a missing lock (codex L3).
         emit("Runtime reconciled, but the compatibility lock could NOT be "
              "recorded — re-run `levain update` so the baseline is written.")
+        return 1
+    if adapter_needs_review:
+        emit("Adapter files need your review (listed above) — merge by hand or "
+             "re-onboard (`levain init --force`), then re-run `levain update`.")
         return 1
     if pack_needs_review:
         # Engine is at known-good, but a pulled pack carried changes that can't

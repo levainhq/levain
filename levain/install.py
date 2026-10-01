@@ -45,7 +45,7 @@ import tomllib
 import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -697,6 +697,8 @@ def _apply_init(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit,
     )
+    record_adapter_receipt(install, chosen, templates_root, python_path, import_seed,
+                           on_demand_seed, emit=emit)
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
@@ -1611,19 +1613,34 @@ def _install_claude_code(
         emit=emit,
     )
 
+    for target, text in _claude_code_files(
+        install, adapter_root, python_path, import_seed, on_demand_seed
+    ).items():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    emit("  Claude Code adapter installed.")
+
+
+def _claude_code_files(
+    install: Path,
+    adapter_root: Path,
+    python_path: str,
+    import_seed: Sequence[SeedEntry],
+    on_demand_seed: Sequence[SeedEntry],
+) -> dict[Path, str]:
+    """The install-local files the claude-code adapter renders from its templates:
+    the carrier, the hook settings and the MCP registration. One builder for both
+    `init` and `levain update`'s refresh, so the two cannot render different bytes."""
     # The @seed import list is roster-driven, not hard-coded — so a pack's added
     # seed file actually LOADS (install-to-disk without import = the bug this seam
     # fixes). Fill {{SEED_IMPORTS}} rather than copy the template byte-for-byte.
     claude_md = (adapter_root / "CLAUDE.md.template").read_text(encoding="utf-8")
     claude_md = _fill_seed_imports(claude_md, _claude_import_block(import_seed))
     claude_md = _fill_seed_on_demand(claude_md, _on_demand_block(on_demand_seed))
-    (install / "CLAUDE.md").write_text(claude_md, encoding="utf-8")
 
-    settings_dir = install / ".claude"
-    settings_dir.mkdir(parents=True, exist_ok=True)
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
     settings_text = settings_text.replace("{{PYTHON}}", python_path)
-    (settings_dir / "settings.json").write_text(settings_text, encoding="utf-8")
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
     mcp_text = mcp_text.replace("{{INSTALL_DIR}}", str(install))
@@ -1631,9 +1648,11 @@ def _install_claude_code(
     # that serves memory is structurally the one levain imports. Escaped as a JSON string
     # body because an interpreter path can carry `\` or `"`.
     mcp_text = mcp_text.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
-    (install / ".mcp.json").write_text(mcp_text, encoding="utf-8")
-
-    emit("  Claude Code adapter installed.")
+    return {
+        install / "CLAUDE.md": claude_md,
+        install / ".claude" / "settings.json": settings_text,
+        install / ".mcp.json": mcp_text,
+    }
 
 
 def _install_codex(
@@ -1658,20 +1677,443 @@ def _install_codex(
         anneal_path=anneal_path,
         emit=emit,
     )
+    (install / "AGENTS.md").write_text(
+        _codex_agents_md(adapter_root, import_seed, on_demand_seed), encoding="utf-8")
+
+    codex_home = _codex_home()
+    codex_home.mkdir(parents=True, exist_ok=True)
+
+    _write_codex_hooks(codex_home / "hooks.json",
+                       _codex_hooks_json(adapter_root, python_path, install), emit)
+
+    mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
+    # spore-751: see _install_claude_code. With ensure_ascii=False the only escapes left are
+    # `\"`, `\\`, `\b \f \n \r \t` and `\u00XX` for control characters, all of which TOML
+    # basic strings accept. The ASCII form would emit surrogate pairs that TOML rejects.
+    mcp_fragment = mcp_fragment.replace(
+        "{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1]
+    )
+    mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
+    _merge_codex_config(codex_home / "config.toml", mcp_fragment, emit=emit)
+
+    emit("  Codex adapter installed.")
+
+
+ADAPTER_RECEIPT_REL = (".levain", "adapter-receipt.json")
+
+
+def _read_adapter_receipt(install: Path) -> dict[str, str] | None:
+    """``{relpath: sha256 of the bytes levain last wrote}`` for the install-local adapter
+    files (the carrier, ``.claude/settings.json``, ``.mcp.json``), or None when there is
+    no usable record (an install from before it existed, or a damaged file). Separate
+    from the activation receipt on purpose: that one describes the activation tree only,
+    and doctor validates every entry in it against that tree."""
+    try:
+        data = json.loads(install.joinpath(*ADAPTER_RECEIPT_REL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) and _SHA256_HEX.fullmatch(v)
+        for k, v in files.items()
+    ):
+        return None
+    return dict(files)
+
+
+def _write_adapter_receipt(install: Path, files: Mapping[str, str]) -> None:
+    """Record the adapter files' written hashes (atomic). Raises OSError."""
+    _atomic_write_text(
+        install.joinpath(*ADAPTER_RECEIPT_REL),
+        json.dumps({"schema": 1, "files": dict(sorted(files.items()))}, indent=2) + "\n",
+    )
+
+
+def _sha256_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _adapter_local_files(
+    adapter: str,
+    install: Path,
+    adapter_root: Path,
+    python_path: str,
+    import_seed: Sequence[SeedEntry],
+    on_demand_seed: Sequence[SeedEntry],
+) -> dict[Path, str]:
+    """The adapter's files INSIDE the install. Codex's hooks.json and config.toml live in
+    the machine-global ``CODEX_HOME`` and are deliberately not in this set."""
+    if adapter == "claude-code":
+        return _claude_code_files(install, adapter_root, python_path, import_seed,
+                                  on_demand_seed)
+    if adapter == "codex":
+        return {install / "AGENTS.md": _codex_agents_md(adapter_root, import_seed,
+                                                        on_demand_seed)}
+    return {}
+
+
+def record_adapter_receipt(
+    install: Path, adapter: str, templates_root: Path, python_path: str,
+    import_seed: Sequence[SeedEntry], on_demand_seed: Sequence[SeedEntry],
+    emit: Callable[[str], None] = print,
+) -> None:
+    """After an adapter install: record what was written, so a later ``levain update``
+    can tell an operator's edit from a file the package has since moved. Best-effort."""
+    files = _adapter_local_files(adapter, install, templates_root / "adapters" / adapter,
+                                 python_path, import_seed, on_demand_seed)
+    if not files:
+        return
+    try:
+        _write_adapter_receipt(install, {
+            target.relative_to(install).as_posix(): _sha256_text(text)
+            for target, text in files.items()
+        })
+    except OSError as e:
+        emit(f"  note: could not record the adapter receipt ({e}); the next `levain "
+             f"update` will back up the adapter files before refreshing them.")
+
+
+@dataclass
+class AdapterRefresh:
+    """What :func:`refresh_adapter` did (or, without ``apply``, would do)."""
+
+    refreshed: list[str] = field(default_factory=list)
+    review: list[str] = field(default_factory=list)
+
+
+def _expected_activation(
+    layer_roots: Sequence[Path], anneal_path: str | None
+) -> dict[str, tuple[bytes, Path]]:
+    """``{rel: (bytes init would install, winning source)}`` for the composed activation
+    tree: the source bytes, with ``{{ANNEAL_MEMORY}}`` substituted in every hook .py the way
+    :func:`_substitute_hook_placeholders` does it."""
+    out: dict[str, tuple[bytes, Path]] = {}
+    for rel, src in _compose_activation_layers(layer_roots).items():
+        data = src.read_bytes()
+        if anneal_path is not None and rel.startswith("hooks/") and rel.endswith(".py"):
+            try:
+                data = data.decode("utf-8").replace("{{ANNEAL_MEMORY}}", anneal_path).encode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        out[rel] = (data, src)
+    return out
+
+
+def refresh_adapter(
+    install: Path, *, apply: bool, emit: Callable[[str], None] = print
+) -> AdapterRefresh:
+    """Bring the install's activation tree and adapter files up to what THIS levain
+    renders, after ``pip install -U levain`` (gap #19: until now only ``levain init
+    --force`` did, re-running the whole interview).
+
+    Decided PER FILE from three hashes: the file on disk, what the package renders now,
+    and what levain last wrote (the activation receipt; ``.levain/adapter-receipt.json``
+    for the adapter files):
+
+    - on disk == package: current.
+    - on disk == last written: unedited, so the package's version is written.
+    - edited, and the package's version has not moved: the operator's edit is kept, quietly
+      (``activation/posture.md`` is meant to be edited).
+    - edited, AND the package moved: kept, and listed for review (exit 1): only the
+      operator can merge the two.
+    - no record (an install from before the receipts): the activation tree is replaced
+      whole exactly as ``init --force`` does it, the previous tree kept in
+      ``.levain/backups/activation/``; an adapter file is backed up beside itself first.
+    - an unreadable activation receipt: the activation tree is not touched (review).
+
+    The seed files and the interview are not touched: the pack reconcile owns seeds.
+    Codex's global hooks.json / config.toml are only reported, never rewritten here, because
+    replacing them repoints every codex session on the machine."""
+    from levain import manifest
+
+    out = AdapterRefresh()
+    adapter = effective_adapter(install)
+    if adapter not in ("claude-code", "codex"):
+        return out
+    recorded, status = manifest.read_pack_locks_status(install)
+    pack_dirs = [Path(p.source) for p in recorded]
+    if status == "corrupt" or any(not (d / "pack.toml").is_file() for d in pack_dirs):
+        out.review.append("adapter")
+        emit("\n• adapter files NOT refreshed: a recorded pack's source is unreadable or "
+             "gone, so the install cannot be re-composed faithfully. Restore it, or "
+             "re-onboard (`levain init --force`).")
+        return out
+    python_path = sys.executable
+    anneal_path = manifest.resolve_anneal_bin()
+    verb = "refreshed" if apply else "would refresh"
+    with _templates_root() as templates_root:
+        try:
+            roster = compose_roster([templates_root, *pack_dirs])
+            adapter_root = templates_root / "adapters" / adapter
+            base_activation = _base_activation_root(adapter, templates_root)
+            activation_roots = order_activation_roots(templates_root, base_activation,
+                                                      pack_dirs)
+            expected = _expected_activation(activation_roots, anneal_path)
+            files = _adapter_local_files(adapter, install, adapter_root, python_path,
+                                         import_entries(roster), on_demand_entries(roster))
+        except (PackError, InitError, OSError, ValueError) as e:
+            out.review.append("adapter")
+            emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
+            return out
+        lines: list[str] = []
+        _refresh_activation(install, expected, activation_roots, base_activation,
+                            anneal_path, apply=apply, out=out, lines=lines, emit=emit)
+        _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
+        if adapter == "codex":
+            _refresh_codex_global(install, adapter_root, python_path, apply=apply, out=out,
+                                  lines=lines)
+    if out.refreshed or lines:
+        emit(f"\n• adapter files ({adapter}):")
+        for rel in out.refreshed:
+            emit(f"  {rel}: {verb} to this levain's version")
+        for ln in lines:
+            emit(ln)
+    return out
+
+
+def _refresh_codex_global(
+    install: Path,
+    adapter_root: Path,
+    python_path: str,
+    *,
+    apply: bool,
+    out: AdapterRefresh,
+    lines: list[str],
+) -> None:
+    """Codex's hooks.json and config.toml are MACHINE-GLOBAL: replacing them repoints every
+    codex session on the machine. So each is refreshed only when it already belongs to THIS
+    install (hooks.json names it; the config block's ``--db`` is its store), which makes the
+    write a refresh of this install's own registration, never a repoint. One that belongs to
+    another install is named and left alone. Both writes keep init's backups."""
+    home = _codex_home()
+    hooks = home / "hooks.json"
+    want = _codex_hooks_json(adapter_root, python_path, install)
+    try:
+        here: str | None = hooks.read_text(encoding="utf-8")
+    except OSError:
+        here = None
+    if here is not None and here != want:
+        if str(install) in here:
+            out.refreshed.append(str(hooks))
+            if apply:
+                try:
+                    _write_codex_hooks(hooks, want, lines.append)
+                except OSError as e:
+                    out.refreshed.pop()
+                    out.review.append(str(hooks))
+                    lines.append(f"  {hooks}: could not be written ({e}).")
+        else:
+            lines.append(f"  note: {hooks} belongs to another install, so `levain update` "
+                         f"left it alone (rewriting it repoints every codex session).")
+    config = home / "config.toml"
+    fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
+    fragment = fragment.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
+    fragment = fragment.replace("{{INSTALL_DIR}}", str(install))
+    try:
+        existing = config.read_text(encoding="utf-8")
+    except OSError:
+        return
+    old_block = _CODEX_MCP_BLOCK_RE.search(existing)
+    new_block = _CODEX_MCP_BLOCK_RE.search(fragment)
+    if old_block is None or new_block is None:
+        return
+    if old_block.group(0).rstrip() == new_block.group(0).rstrip():
+        return
+    if _codex_block_store(old_block.group(0)) != _codex_block_store(new_block.group(0)):
+        lines.append(f"  note: {config} registers another store for codex, so `levain "
+                     f"update` left it alone (rewriting it repoints every codex session).")
+        return
+    out.refreshed.append(f"{config} [mcp_servers.anneal_memory]")
+    if apply:
+        try:
+            _merge_codex_config(config, fragment, emit=lines.append)
+        except OSError as e:
+            out.refreshed.pop()
+            out.review.append(str(config))
+            lines.append(f"  {config}: could not be written ({e}).")
+
+
+def _refresh_activation(
+    install: Path,
+    expected: Mapping[str, tuple[bytes, Path]],
+    activation_roots: Sequence[Path],
+    base_activation: Path,
+    anneal_path: str | None,
+    *,
+    apply: bool,
+    out: AdapterRefresh,
+    lines: list[str],
+    emit: Callable[[str], None],
+) -> None:
+    import hashlib
+
+    dst = install / "activation"
+    if dst.is_symlink():
+        lines.append(f"  note: activation/ is a symlink to {os.readlink(dst)}; it is yours "
+                     f"to manage, so it was not refreshed.")
+        return
+
+    def _disk(rel: str) -> bytes | None:
+        try:
+            return (dst / rel).read_bytes()
+        except FileNotFoundError:
+            return None
+
+    stale = {rel for rel, (want, _src) in expected.items() if _disk(rel) != want}
+    if not stale:
+        return
+    receipt, status = read_activation_receipt(install)
+    if status in ("corrupt", "empty"):
+        out.review.append("activation/")
+        lines.append(f"  activation/: NOT refreshed — its install receipt is unreadable "
+                     f"({status}), so your edits cannot be told from the package's files. "
+                     f"Re-onboard (`levain init --force`) to replace it whole.")
+        return
+    if status == "absent" or receipt is None:
+        # From before the receipt: init --force's own semantics, the whole previous tree
+        # kept under .levain/backups/activation/ (spore-861 ruling B).
+        out.refreshed.append("activation/ (whole tree: no install receipt covers it; the "
+                             "previous tree is kept under .levain/backups/activation/)")
+        if apply:
+            try:
+                _copy_activation_tree(activation_roots, dst, base_activation=base_activation,
+                                      anneal_path=anneal_path, emit=lines.append)
+            except (InitError, OSError) as e:
+                out.refreshed.pop()
+                out.review.append("activation/")
+                lines.append(f"  activation/: could not be replaced ({e}).")
+        return
+
+    def _sha(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    new_receipt = dict(receipt)
+    for rel in sorted(stale):
+        want, src = expected[rel]
+        here = _disk(rel)
+        rec = receipt.get(rel)
+        last = rec["installed"] if rec else None
+        if here is not None and last is not None and _sha(here) != last:
+            if _sha(want) == last:
+                continue  # an operator edit of a file the package has not changed
+            out.review.append(f"activation/{rel}")
+            lines.append(f"  activation/{rel}: you edited it AND this levain ships a new "
+                         f"version; your copy is kept. Merge by hand, or take the package's "
+                         f"with `levain init --force` (your copy goes to the backups).")
+            continue
+        if here is None and last is not None and _sha(want) == last:
+            continue  # the operator deleted it and the package has not changed it
+        out.refreshed.append(f"activation/{rel}")
+        if apply:
+            target = dst / rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(target, want, like=src)
+                new_receipt[rel] = {"installed": _sha(want), "source": _sha256_stream(src)}
+            except OSError as e:
+                out.refreshed.pop()
+                out.review.append(f"activation/{rel}")
+                lines.append(f"  activation/{rel}: could not be written ({e}).")
+    if apply and new_receipt != receipt:
+        try:
+            _write_activation_receipt(install, new_receipt)
+        except OSError as e:
+            lines.append(f"  note: could not update the activation receipt ({e}); the next "
+                         f"`levain update` re-checks these files.")
+
+
+def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) -> None:
+    """Unique temp + fsync + ``os.replace``, keeping ``like``'s permission bits (a hook
+    script must stay executable)."""
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if like is not None:
+            os.chmod(tmp, stat.S_IMODE(like.stat().st_mode))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _refresh_adapter_files(
+    install: Path,
+    files: Mapping[Path, str],
+    *,
+    apply: bool,
+    out: AdapterRefresh,
+    lines: list[str],
+) -> None:
+    receipt = _read_adapter_receipt(install)
+    new_receipt = dict(receipt or {})
+    for target, text in files.items():
+        rel = target.relative_to(install).as_posix()
+        want = _sha256_text(text)
+        try:
+            here = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            here = None
+        except (OSError, ValueError):
+            here = ""  # unreadable: never equal to anything levain wrote
+        last = (receipt or {}).get(rel)
+        if here == text:
+            new_receipt[rel] = want
+            continue
+        if here is not None and last is not None and _sha256_text(here) != last:
+            if want == last:
+                continue  # an operator edit; the package has not moved this file
+            out.review.append(rel)
+            lines.append(f"  {rel}: you edited it AND this levain renders it differently; "
+                         f"your copy is kept. Merge by hand, or take levain's with "
+                         f"`levain init --force`.")
+            continue
+        out.refreshed.append(rel)
+        if not apply:
+            continue
+        try:
+            if here is not None and last is None:
+                backup = _timestamped_backup_path(target)  # no record: it may be an edit
+                shutil.copy2(target, backup)
+                lines.append(f"  {rel}: no record of what levain wrote here, so the "
+                             f"previous copy is kept at {backup.name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(target, text)
+            new_receipt[rel] = want
+        except OSError as e:
+            out.refreshed.pop()
+            out.review.append(rel)
+            lines.append(f"  {rel}: could not be written ({e}).")
+    if apply and new_receipt != (receipt or {}):
+        try:
+            _write_adapter_receipt(install, new_receipt)
+        except OSError as e:
+            lines.append(f"  note: could not record the adapter receipt ({e}).")
+
+
+def _codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def _codex_agents_md(
+    adapter_root: Path, import_seed: Sequence[SeedEntry], on_demand_seed: Sequence[SeedEntry]
+) -> str:
     # Roster-driven read-list (same load-side seam as claude-code): a pack's added
     # seed file appears in the numbered "read these, in order" list it must load.
     agents_md = (adapter_root / "AGENTS.md.template").read_text(encoding="utf-8")
     agents_md = _fill_seed_imports(agents_md, _codex_import_block(import_seed))
-    agents_md = _fill_seed_on_demand(agents_md, _on_demand_block(on_demand_seed))
-    (install / "AGENTS.md").write_text(agents_md, encoding="utf-8")
+    return _fill_seed_on_demand(agents_md, _on_demand_block(on_demand_seed))
 
-    codex_home = Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
-    codex_home.mkdir(parents=True, exist_ok=True)
 
-    hooks_text = (adapter_root / "hooks.json.template").read_text(encoding="utf-8")
-    hooks_text = hooks_text.replace("{{PYTHON}}", python_path)
-    hooks_text = hooks_text.replace("{{INSTALL_DIR}}", str(install))
-    hooks_target = codex_home / "hooks.json"
+def _write_codex_hooks(hooks_target: Path, hooks_text: str,
+                       emit: Callable[[str], None]) -> None:
     if hooks_target.exists() or hooks_target.is_symlink():
         # Timestamped backup so repeated re-runs accrete instead of clobber.
         bak = _timestamped_backup_path(hooks_target)
@@ -1685,17 +2127,11 @@ def _install_codex(
         emit("    (Codex is one-install-per-machine at v1 — this install now owns it.)")
     hooks_target.write_text(hooks_text, encoding="utf-8")
 
-    mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    # spore-751: see _install_claude_code. With ensure_ascii=False the only escapes left are
-    # `\"`, `\\`, `\b \f \n \r \t` and `\u00XX` for control characters, all of which TOML
-    # basic strings accept. The ASCII form would emit surrogate pairs that TOML rejects.
-    mcp_fragment = mcp_fragment.replace(
-        "{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1]
-    )
-    mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
-    _merge_codex_config(codex_home / "config.toml", mcp_fragment, emit=emit)
 
-    emit("  Codex adapter installed.")
+def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
+    hooks_text = (adapter_root / "hooks.json.template").read_text(encoding="utf-8")
+    hooks_text = hooks_text.replace("{{PYTHON}}", python_path)
+    return hooks_text.replace("{{INSTALL_DIR}}", str(install))
 
 
 def _install_openhands(install: Path, *, emit: Callable[[str], None] = print) -> None:
