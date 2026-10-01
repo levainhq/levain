@@ -548,9 +548,17 @@ def test_update_does_not_install_a_pack_hook_the_reconcile_is_holding(tmp_path, 
     hook = install / "activation" / "hooks" / "zz_pack_hook.py"
     assert hook.read_text() == "print('v1')\n"
 
+    # ...and, in the same run, a base hook an older levain wrote (L1 on the first cut of this
+    # fix: holding the whole tree kept base hook fixes out for as long as the pack review stood).
+    base = install / "activation" / HOOK
+    current = base.read_bytes()
+    base.write_bytes(b"# old hook\n")
+    _set_receipt(install, HOOK, b"# old hook\n")
+
     (pack / "activation" / "hooks" / "zz_pack_hook.py").write_text("print('v2')\n")
     lines: list[str] = []
     rc = run_update(install, no_pip=True, yes=True, emit=lines.append, confirm=lambda s: False)
     out = "\n".join(lines)
     assert rc == 1 and "activation changed" in out
     assert hook.read_text() == "print('v1')\n", "an unreviewed pack hook was installed"
+    assert base.read_bytes() == current, "a base hook fix was held along with the pack hook"

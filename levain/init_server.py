@@ -37,6 +37,7 @@ from typing import Any
 
 from levain.install import (
     InitError,
+    InstallLockError,
     _base_activation_root,
     _copy_pack_docs,
     _is_safe_install_target,
@@ -515,6 +516,14 @@ class _InitHandler(BaseHTTPRequestHandler):
                         emit=messages.append,
                         require_empty=not self.server.force,
                     )
+                except InstallLockError as exc:
+                    # Refused before any write (busy, or the target filled up meanwhile): not
+                    # a partial install, so not the 500 "partial" shape below.
+                    self._send_json(
+                        {"error": "install_refused", "message": exc.message,
+                         "partial": False, "messages": messages}, 409
+                    )
+                    return
                 except InitError as exc:
                     self._send_json(
                         {"error": "install_failed", "message": exc.message,

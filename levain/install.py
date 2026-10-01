@@ -572,9 +572,9 @@ def apply_init(
     with install_lock(install):
         if require_empty and not _is_safe_install_target_locked(install):
             raise InstallTargetTaken(
-                f"{install} is no longer empty: another `levain init` finished there while "
-                f"this one was running. Nothing was written. Re-run with --force to replace "
-                f"it, or choose another path."
+                f"{install} is no longer empty: something was written there while this "
+                f"`levain init` was running (another init, say). Nothing was written by this "
+                f"one. Re-run with --force to replace it, or choose another path."
             )
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
@@ -1187,7 +1187,8 @@ def _is_safe_install_target_locked(path: Path) -> bool:
     for entry in path.iterdir():
         if entry.name != INSTALL_LOCK_REL[0] or not entry.is_dir():
             return False
-        own = {INSTALL_LOCK_REL[1], ".gitignore", _checkpoint_path(path).name}
+        ckpt = _checkpoint_path(path).name
+        own = {INSTALL_LOCK_REL[1], ".gitignore", ckpt, ckpt + ".tmp"}
         if any(e.name not in own for e in entry.iterdir()):
             return False
     return True
@@ -1917,9 +1918,9 @@ def refresh_adapter(
     The seed files and the interview are not touched: the pack reconcile owns seeds. So
     the carrier (CLAUDE.md / AGENTS.md, whose import list IS the seed set) is refreshed
     only when the caller says the pack layer is settled (``carrier``) and every seed it
-    would import is on disk; otherwise it would load a seed the reconcile held back. The
-    activation tree is held under the same flag: it is composed from the live pack
-    sources, so refreshing it would install a pack hook the reconcile is holding.
+    would import is on disk; otherwise it would load a seed the reconcile held back. An
+    activation file a drifted pack changed is never refreshed here: the pack reconcile owns
+    it and lists it for review.
     Codex's machine-global hooks.json is handled only when it already names this
     install, and config.toml only when it already registers this install's store;
     otherwise they are named and left alone, because replacing them repoints every
@@ -1963,16 +1964,14 @@ def refresh_adapter(
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
             return out
-        if carrier:
-            _refresh_activation(install, expected, apply=apply, out=out, lines=lines)
-        else:
-            # The roster above is composed from the LIVE pack sources, so refreshing now
-            # would install a pack's changed hook (executable code) in the same run the
-            # reconcile lists it for review (codex L3 on 19811f7, reproduced: pack hook v1
-            # -> v2, update exit 1, installed bytes v2). Hold the whole tree until settled.
-            # Not added to out.review: the pack reconcile already exits 1 for this.
-            lines.append("  activation/: not refreshed, because the pack reconcile above is "
-                         "holding changes for review; settle that first.")
+        # `expected` is composed from the LIVE pack sources, so a path a pack changed since
+        # it was recorded would be installed in the same run the pack reconcile lists it for
+        # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,
+        # installed bytes v2). Hold exactly those paths; everything else still refreshes.
+        # Computed AFTER `expected` captured its bytes, on purpose: a pack edited in between
+        # either shows up here as drift (held) or did not reach `expected` (codex L3 r2).
+        held = _pack_held_activation(recorded)
+        _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
                          if not (install / "seed" / e.name).is_file())
@@ -2081,6 +2080,17 @@ def _put_pending(install: Path, key: str, data: bytes) -> Path:
     return target
 
 
+def _pack_held_activation(recorded: Sequence) -> set[str]:
+    """Activation paths (relative to ``activation/``) that a recorded pack has added,
+    changed or removed since it was recorded. The pack reconcile surfaces these for review
+    and keeps their old provenance, so the adapter refresh must leave them alone."""
+    from levain import manifest
+
+    prefix = "activation/"
+    return {rel[len(prefix):] for d in manifest.compute_pack_drift(recorded) if d.drifted
+            for rel in (*d.added, *d.modified, *d.removed) if rel.startswith(prefix)}
+
+
 def _refresh_activation(
     install: Path,
     expected: Mapping[str, tuple[bytes, Path]],
@@ -2088,6 +2098,7 @@ def _refresh_activation(
     apply: bool,
     out: AdapterRefresh,
     lines: list[str],
+    held: set[str] = frozenset(),
 ) -> None:
     import hashlib
 
@@ -2126,7 +2137,11 @@ def _refresh_activation(
     # the record, never deleted. Deleting was tried and removed (codex L3 r2, reproduced): a
     # receipt key like "../../x" made update delete a file outside the install, and the
     # check-then-unlink raced an editor's save. Removing a file is the operator's call.
-    for rel in sorted(set(record) - set(expected)):
+    for rel in sorted(held):
+        lines.append(f"  activation/{rel}: not refreshed, because a pack changed it and the "
+                     f"pack reconcile above is holding it for review.")
+    expected = {rel: v for rel, v in expected.items() if rel not in held}
+    for rel in sorted(set(record) - set(expected) - held):
         del new_receipt[rel]
         lines.append(f"  note: activation/{rel} is no longer shipped by this levain; it is "
                      f"left in place (delete it yourself if you do not want it).")
