@@ -329,3 +329,152 @@ def field_guide(fields: Iterable[_Field]) -> str:
             lines.append(f"        {f.guidance}")
     lines.append("")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# adopt-answers (spore-423): a hand-edited seed becomes the record.
+# ---------------------------------------------------------------------------
+
+class AdoptRefused(AnswersError):
+    """The seed cannot be turned into a complete, exact record. Nothing is written."""
+
+
+def _sentinel(slot: str) -> str:
+    # Private-use code points: no template or answer carries them, and render's
+    # whitespace normalisation leaves them alone.
+    return f"{slot}"
+
+
+def _normalise(text: str) -> str:
+    """The tail of ``render_template``'s own normalisation, so a seed that differs from
+    a render only by trailing whitespace on a line, or a missing final newline, still
+    counts as that render."""
+    import re
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text.strip() + "\n"
+
+
+def _split(target: str, skeleton: str, *, from_right: bool) -> dict[str, str] | None:
+    """Read each slot's value out of ``target`` by anchoring on the literal text between
+    the sentinels in ``skeleton``: each literal is found with ``find`` (left to right,
+    first occurrence) or ``rfind`` (right to left, last occurrence). Whitespace touching a
+    slot is not anchored on, since render's clean-up moves it when a value is blank or
+    multi-line. A slot seen twice must read the same both times. Linear in the text, per
+    skeleton; ``None`` when the literals are not there in order."""
+    parts = skeleton.split("\ue000")
+    lits = [parts[0]]
+    names: list[str] = []
+    for piece in parts[1:]:
+        name, _, lit = piece.partition("\ue001")
+        names.append(name)
+        lits.append(lit)
+    if not names:
+        return {} if target == skeleton else None
+    first, last = lits[0].rstrip(), lits[-1].lstrip()
+    if not (target.startswith(first) and target.endswith(last)
+            and len(first) + len(last) <= len(target)):
+        return None
+    lo, hi = len(first), len(target) - len(last)
+    inner = [lit.strip() for lit in lits[1:-1]]
+    for i, core in enumerate(inner):
+        if not core:
+            # Nothing but whitespace between two fields: "x y z" splits as x|y z or
+            # x y|z, and both re-render the same. No anchor, so no honest answer.
+            raise AdoptRefused(f"the fields {names[i]} and {names[i + 1]} have nothing but "
+                               f"whitespace between them in this template, so where one "
+                               f"ends and the next begins cannot be read back.")
+    values: list[str] = []
+    if not from_right:
+        pos = lo
+        for core in inner:
+            idx = target.find(core, pos, hi)
+            if idx < 0:
+                return None
+            values.append(target[pos:idx])
+            pos = idx + len(core)
+        values.append(target[pos:hi])
+    else:
+        end = hi
+        for core in reversed(inner):
+            idx = target.rfind(core, lo, end)
+            if idx < 0:
+                return None
+            values.append(target[idx + len(core):end])
+            end = idx
+        values.append(target[lo:end])
+        values.reverse()
+    out: dict[str, str] = {}
+    for name, value in zip(names, values):
+        value = value.strip()
+        if out.setdefault(name, value) != value:
+            return None
+    return out
+
+
+def extract_answers(
+    text: str,
+    *,
+    slots: Iterable[str],
+    optional_sections: Iterable[Iterable[str]],
+    render: Any,
+    max_combinations: int = 4096,
+) -> dict[str, str]:
+    """The ONE answer set that ``render`` turns into ``text``, or raise
+    :class:`AdoptRefused`. ALL-OR-REFUSE (spore-423): a partial record is worse than
+    none, because doctor then goes green over it and the next re-render blank-fills
+    the gaps.
+
+    ``render(answers) -> str`` is the template's own renderer, which is lossy: it
+    drops an optional section whose slots are all blank and collapses a blank inline
+    ``{{AGE}}``. So every combination of {dropped optional sections} x {AGE blank} is
+    rendered with a sentinel per slot, giving the exact skeleton of that case, and the
+    seed is matched against each. A candidate counts only if ``render`` reproduces the
+    seed from it (up to render's own whitespace normalisation): the round trip is the
+    proof, not the parse. Of the proven answer sets, the one leaving the most text to
+    the template is adopted; none, or a tie, is a refusal."""
+    import itertools
+
+    slot_list = list(dict.fromkeys(slots))
+    groups = [list(g) for g in optional_sections]
+    age_options = (False, True) if "AGE" in slot_list else (False,)
+    combos = 2 ** len(groups) * len(age_options)
+    if combos > max_combinations:
+        raise AdoptRefused(f"this template has {len(groups)} optional sections; trying every "
+                           f"combination of them is not bounded enough to be safe.")
+    target = _normalise(text)
+    proven: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
+    for dropped in itertools.product((False, True), repeat=len(groups)):
+        blank = {s for g, d in zip(groups, dropped) if d for s in g}
+        for age_blank in age_options:
+            fill = {s: ("" if s in blank or (age_blank and s == "AGE") else _sentinel(s))
+                    for s in slot_list}
+            skeleton = _normalise(render(fill))
+            for from_right in (False, True):
+                found = _split(target, skeleton, from_right=from_right)
+                if found is None:
+                    continue
+                got = {s: "" for s in slot_list}
+                got.update(found)
+                if _normalise(render(got)) == target:
+                    proven[tuple(sorted(got.items()))] = got
+    if not proven:
+        raise AdoptRefused("the seed differs from the template outside the interview's "
+                           "fields (or a field's text was split across a heading), so no "
+                           "answer set reproduces it.")
+    # Several answer sets can render the same text: a blank AGE lets "Chris. 46." read
+    # as a name of "Chris. 46", and a dropped optional section lets the previous field
+    # swallow its heading. Each such reading moves template text INTO a value, so the
+    # reading that leaves the most text to the template (the least in the values) is the
+    # template's own. A tie at that minimum is a real ambiguity, and refuses.
+    def weight(a: dict[str, str]) -> int:
+        return sum(len(v) for v in a.values())
+
+    best = min(weight(a) for a in proven.values())
+    winners = [a for a in proven.values() if weight(a) == best]
+    if len(winners) > 1:
+        diff = sorted({s for a in winners for b in winners for s in slot_list if a[s] != b[s]})
+        raise AdoptRefused(f"the seed reads as more than one answer set; the field(s) "
+                           f"{', '.join(diff)} cannot be told apart from the text alone.")
+    return winners[0]

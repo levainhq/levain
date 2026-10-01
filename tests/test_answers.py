@@ -241,3 +241,105 @@ def test_unusual_shape_stays_a_warning_and_never_rejects_a_file():
     # The asymmetry survives: a long-but-legal answer is somebody's real answer,
     # and a heuristic does not get to overrule them about it.
     assert validate_answers(PLAN, {**FULL, "OPERATOR_NAME": "x" * 500}) == []
+
+
+# ---------------------------------------------------------------------------
+# extract_answers (spore-423): read the interview answers back out of a render.
+# ---------------------------------------------------------------------------
+import random as _random  # noqa: E402
+
+from levain.answers import AdoptRefused, extract_answers  # noqa: E402
+from levain.interview import parse_template, render_template  # noqa: E402
+
+_SEED = Path(__file__).resolve().parent.parent / "levain" / "templates" / "seed"
+
+
+def _case(name: str):
+    spec = parse_template(_SEED / name)
+    slots = list(dict.fromkeys(s for sec in spec.sections for s in sec.slots))
+    optional = [sec.slots for sec in spec.sections if sec.title and sec.optional]
+    return spec, slots, optional, (lambda a: render_template(spec, a))
+
+
+@pytest.mark.parametrize("name", ["world.md", "origin.md"])
+def test_any_answer_set_reads_back_exactly(name):
+    spec, slots, optional, render = _case(name)
+    rnd = _random.Random(7)
+    words = ["Chris", "Riverton", "Plays first.", "- Builder\n- Maker", "Baking, poker",
+             "Line one.\nLine two.", "a tea shop"]
+    for _ in range(60):
+        a = {s: (rnd.choice(words) if rnd.random() < 0.6 else "") for s in slots}
+        for s in ("OPERATOR_NAME", "ENTITY_NAME"):
+            if s in a:
+                a[s] = rnd.choice(["Chris", "Ada"])
+        if a.get("AGE"):
+            a["AGE"] = str(rnd.randint(20, 80))
+        assert extract_answers(render(a), slots=slots, optional_sections=optional,
+                               render=render) == a
+
+
+def test_a_filled_age_is_not_read_as_part_of_the_name():
+    # "Chris. 46. Riverton." also renders from a name of "Chris. 46" and a blank AGE.
+    spec, slots, optional, render = _case("world.md")
+    a = {s: "" for s in slots}
+    a.update(OPERATOR_NAME="Chris", AGE="46", LOCATION="Riverton")
+    got = extract_answers(render(a), slots=slots, optional_sections=optional, render=render)
+    assert (got["OPERATOR_NAME"], got["AGE"]) == ("Chris", "46")
+
+
+def test_a_value_holding_a_later_heading_is_read_whole():
+    spec, slots, optional, render = _case("world.md")
+    a = {s: "" for s in slots}
+    a.update(OPERATOR_NAME="Chris", INTERESTS="Baking", WORK="Levain",
+             COGNITION="Plays first.\n\n## Work & Projects\nnot a heading")
+    got = extract_answers(render(a), slots=slots, optional_sections=optional, render=render)
+    assert got == a
+
+
+def test_an_edit_outside_the_fields_is_refused():
+    spec, slots, optional, render = _case("world.md")
+    a = {s: "" for s in slots}
+    a.update(OPERATOR_NAME="Chris")
+    text = render(a).replace("## ", "## Renamed ", 1)
+    with pytest.raises(AdoptRefused, match="outside the interview's fields"):
+        extract_answers(text, slots=slots, optional_sections=optional, render=render)
+
+
+def test_a_genuine_tie_is_refused(tmp_path):
+    tpl = tmp_path / "t.md"
+    tpl.write_text("# T\n\n{{A}} {{B}}\n", encoding="utf-8")
+    spec = parse_template(tpl)
+    render = (lambda a: render_template(spec, a))  # noqa: E731
+    # "x y z" is A="x", B="y z" or A="x y", B="z": the same text, nothing to anchor on.
+    with pytest.raises(AdoptRefused, match="nothing but whitespace"):
+        extract_answers(render({"A": "x y", "B": "z"}), slots=["A", "B"],
+                        optional_sections=[], render=render)
+
+
+def test_too_many_optional_sections_are_refused_not_searched():
+    with pytest.raises(AdoptRefused, match="not bounded"):
+        extract_answers("x\n", slots=["A"], optional_sections=[["A"]] * 13,
+                        render=lambda a: "x\n")
+
+
+def test_two_readings_of_equal_weight_are_refused(tmp_path):
+    tpl = tmp_path / "t.md"
+    tpl.write_text("# T\n\n{{A}}-{{B}}\n", encoding="utf-8")
+    spec = parse_template(tpl)
+    render = (lambda a: render_template(spec, a))  # noqa: E731
+    # "x-y-z": A="x", B="y-z" (first "-") or A="x-y", B="z" (last "-"), same weight.
+    with pytest.raises(AdoptRefused, match="more than one answer set"):
+        extract_answers(render({"A": "x-y", "B": "z"}), slots=["A", "B"],
+                        optional_sections=[], render=render)
+
+
+def test_an_optional_section_emptied_but_left_in_place_is_refused():
+    # The "kept" skeleton matches with a blank value, but a blank value makes render DROP
+    # the section, so that record would not reproduce the seed: only the round trip sees it.
+    spec, slots, optional, render = _case("world.md")
+    a = {s: "" for s in slots}
+    a.update(OPERATOR_NAME="Chris", PERSONAL_HISTORY="Grew up by the sea.")
+    text = render(a).replace("Grew up by the sea.", "")
+    assert "## Personal History" in text
+    with pytest.raises(AdoptRefused):
+        extract_answers(text, slots=slots, optional_sections=optional, render=render)

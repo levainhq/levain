@@ -2098,6 +2098,122 @@ def _refresh_adapter_files(
             lines.append(f"  note: could not record the adapter receipt ({e}).")
 
 
+def _first_foreign_line(spec: TemplateSpec, text: str, record: Mapping[str, str]) -> str:
+    """Where a refused seed first departs from a render of the current record: a pointer
+    for the operator (the record may itself be stale, so it is a hint, not a diagnosis)."""
+    import difflib
+
+    from levain.interview import render_template
+
+    ours = render_template(spec, dict(record)).splitlines()
+    theirs = text.splitlines()
+    for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(a=ours, b=theirs).get_opcodes():
+        if tag in ("replace", "insert") and j1 < j2:
+            return f" The first line that departs from your recorded answers is line {j1 + 1}: {theirs[j1][:80]!r}."
+    return ""
+
+
+def run_adopt_answers(
+    path: Path, *, dry_run: bool = False, emit: Callable[[str], None] = print
+) -> int:
+    """``levain adopt-answers``: make the install's RENDERED seed files the interview record
+    (``.levain/answers.json``), so a hand edit stops being something the next re-render
+    (``init --force`` from the record, a pack render reconcile) silently reverts
+    (spore-423; reproduced: an edited LOCATION in world.md was reverted by a re-onboard
+    from the record, with no backup of the seed).
+
+    ALL-OR-REFUSE: every render seed must read back to exactly one answer set that
+    re-renders to it (``answers.extract_answers``), and the result must pass the same
+    validation as ``init --answers``. Anything less writes nothing and exits 1."""
+    from levain import manifest
+    from levain.answers import AdoptRefused, extract_answers, validate_answers
+    from levain.interview import build_field_plan, parse_template, render_template
+
+    install = Path(str(path)).expanduser().resolve()
+
+    def refuse(why: str) -> int:
+        emit(f"FAIL: {why}")
+        emit("  Nothing was written; the record is unchanged.")
+        return 1
+
+    if not (install / "seed").is_dir():
+        return refuse(f"{install} has no seed/ directory, so it is not a levain install.")
+    recorded, status = manifest.read_pack_locks_status(install)
+    if status == "corrupt":
+        return refuse("the lock's pack provenance is unreadable, so which templates this "
+                      "install was rendered from cannot be known.")
+    pack_dirs = [Path(p.source) for p in recorded]
+    gone = [str(d) for d in pack_dirs if not (d / "pack.toml").is_file()]
+    if gone:
+        return refuse(f"a recorded pack's source is gone ({', '.join(gone)}), so its "
+                      f"templates cannot be read.")
+    with _templates_root() as templates_root:
+        try:
+            roster = compose_roster([templates_root, *pack_dirs])
+            specs = [parse_template(e.path) for e in render_entries(roster)]
+        except (PackError, OSError, ValueError) as e:
+            return refuse(f"the install's templates could not be composed ({e}).")
+        merged: dict[str, str] = {}
+        whitespace_only: list[str] = []
+        for spec in specs:
+            name = spec.path.name
+            try:
+                text = (install / "seed" / name).read_text(encoding="utf-8")
+            except (OSError, ValueError) as e:
+                return refuse(f"seed/{name} could not be read ({e}).")
+            slots = [sl for sec in spec.sections for sl in sec.slots]
+            optional = [sec.slots for sec in spec.sections if sec.title and sec.optional]
+            try:
+                got = extract_answers(text, slots=slots, optional_sections=optional,
+                                      render=lambda a, spec=spec: render_template(spec, a))
+            except AdoptRefused as e:
+                return refuse(f"seed/{name}: {e}"
+                              f"{_first_foreign_line(spec, text, read_answers(install))}")
+            if render_template(spec, got) != text:
+                whitespace_only.append(name)
+            for slot, value in got.items():
+                if merged.setdefault(slot, value) != value:
+                    return refuse(f"{slot} reads differently in two seed files; make them "
+                                  f"agree, then re-run.")
+    errors = validate_answers(build_field_plan(specs), merged)
+    if errors:
+        return refuse("what the seed files say is not a valid record:\n    "
+                      + "\n    ".join(errors))
+    old = read_answers(install)
+    changed = sorted(sl for sl in merged if old.get(sl) != merged[sl])
+    dropped = sorted(set(old) - set(merged))
+    if not changed and not dropped:
+        emit("The seed files already match the record; nothing to adopt.")
+        return 0
+
+    def show(value: str | None) -> str:
+        if value is None:
+            return "(absent)"
+        one = value.replace("\n", " / ")
+        return repr(one if len(one) <= 60 else one[:57] + "...")
+
+    emit(f"{'Would adopt' if dry_run else 'Adopting'} {len(changed)} field(s) from the "
+         f"seed files into {install / '.levain' / 'answers.json'}:")
+    for sl in changed:
+        emit(f"  {sl}: {show(old.get(sl))} -> {show(merged[sl])}")
+    for sl in dropped:
+        emit(f"  {sl}: {show(old[sl])} -> dropped (no template asks it any more)")
+    for name in whitespace_only:
+        emit(f"  note: seed/{name} differs from a render only in whitespace; a re-render "
+             f"would tidy it.")
+    if dry_run:
+        emit("--dry-run: nothing was written.")
+        return 0
+    try:
+        with install_lock(install):
+            if not write_answers(install, merged, emit):
+                return refuse("the record could not be written.")
+    except InstallBusy as e:
+        return refuse(e.message)
+    emit("Recorded. A re-render from the record now reproduces your seed files.")
+    return 0
+
+
 def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
 

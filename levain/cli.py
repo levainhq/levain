@@ -844,6 +844,34 @@ def main(argv: list[str] | None = None) -> int:
     )
     upd_p.set_defaults(func=_cmd_update)
 
+    adopt_p = subparsers.add_parser(
+        "adopt-answers",
+        help="Make your hand-edited seed files the interview record (.levain/answers.json).",
+        description=(
+            "Read the interview answers back OUT of the rendered seed files (world.md, "
+            "origin.md, and any pack's rendered seeds) and record them as the install's "
+            "answers, so a re-render from the record (`levain init --force`, a pack "
+            "update) reproduces your edits instead of reverting them. All or nothing: "
+            "every seed file must read back to exactly one answer set that renders it "
+            "again, or nothing is written and it exits 1. An edit outside the "
+            "interview's fields (a changed heading, an added paragraph between "
+            "sections) cannot become a record and is refused."
+        ),
+    )
+    adopt_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    adopt_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show what would be recorded and write nothing.",
+    )
+    adopt_p.set_defaults(func=_cmd_adopt_answers)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
@@ -1631,6 +1659,12 @@ def _cmd_update(args: argparse.Namespace) -> int:
         no_pip=args.no_pip,
         ack=args.ack,
     )
+
+
+def _cmd_adopt_answers(args: argparse.Namespace) -> int:
+    from levain.install import run_adopt_answers
+
+    return run_adopt_answers(args.path, dry_run=args.dry_run)
 
 
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:
