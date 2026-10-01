@@ -912,10 +912,8 @@ _systemd_live = pytest.mark.skipif(
     # and reported "I HAVE NO LINUX HOST", which was TRUE and became a false constraint: an image
     # that runs them had been on the build machine for a day. Nobody goes looking for a container
     # they do not know exists. `tests/linux/Dockerfile` is committed for exactly this moment.
-    reason=("needs a Linux host with systemd-analyze — you can get one: "
-            "docker build -t levain-linux-systemd -f tests/linux/Dockerfile tests/linux && "
-            "docker run --rm -v \"$PWD\":/src:ro levain-linux-systemd "
-            "sh -c 'cp -r /src /tmp/w && cd /tmp/w && python3 -m pytest tests/test_daemon.py -k systemd -q'"),
+    reason=("needs a Linux host with systemd-analyze — you can get one: the build and run commands "
+            "are in the header of tests/linux/Dockerfile"),
 )
 
 

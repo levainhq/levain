@@ -851,7 +851,9 @@ def _banner_for(
     # Computed HERE, not inside `_print_banner`: the banner stays a pure render over plain facts so
     # every floor permutation stays cheap to test without standing up a real entity.
     bash_note = None
-    if session.with_tools and not session.bash_ok:
+    if session.with_tools and not session.bash_ok and session.bash_refusal:
+        bash_note = session.bash_refusal
+    elif session.with_tools and not session.bash_ok:
         try:
             bash_note = diagnose_confinement().operator_note()
         except Exception:  # noqa: BLE001 — a diagnosis that fails must never break the banner

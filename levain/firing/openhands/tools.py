@@ -639,14 +639,9 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # exist at that layer -- for a provider that implements the `_spawn_shell_impl`
                 # seam. The base `spawn_shell` refreshes again on its own behalf, so a consumer
                 # calling it directly is covered too.
-                # ⛔⛔ THIS COMMENT USED TO SAY `BwrapProvider` ON k4c-linux "inherits the invariant
-                # by construction". THAT WAS FALSE, and the same false sentence was in
-                # confinement.py as the stated reason a control could be deleted. MEASURED
-                # 2026-09-05: k4c-linux has NO `refresh_socket_denies` anywhere, and BOTH its
-                # providers override `spawn_shell` DIRECTLY (it has no `_spawn_shell_impl`) --
-                # which is exactly the one way to NOT inherit it. The k4c-linux merge must port
-                # both providers onto the `_spawn_shell_impl` seam or it reintroduces spore-768
-                # on Linux. See the ConfinementProvider.spawn_shell docstring.
+                # (A comment here once claimed the K4c branch's BwrapProvider inherited this by
+                # construction; it overrode `spawn_shell` directly and did not. The port fixed it,
+                # and `test_no_shipped_provider_overrides_spawn_shell` holds it.)
                 refreshed = refresh_socket_denies(self._floor.policy)
                 candidate = provider.spawn_shell(
                     refreshed, default_timeout=self._default_timeout

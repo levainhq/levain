@@ -4,6 +4,51 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+
+### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
+
+`doctor`'s hook-freshness check used to read a receipt it could not parse the same way it reads an install that predates the receipt entirely: both landed on exit 6, "an upgrade step is pending." **A receipt that exists but is unreadable is not a pre-receipt install** — `_write_activation_receipt` is the sole writer and runs only after the tree is in place, a failed write reads as absent (not corrupt), and a failed swap rolls the prior receipt back — so a legitimate install cannot produce a corrupt or empty one. Reading it as "no receipt yet" could downgrade a tampered hook (an appended `os.system(...)`, say) from broken (exit 1) to routine-pending (exit 6). A corrupt or empty receipt now exits 1, naming the receipt's path and why doctor could not read it, with the same `init --force` remedy. An absent receipt (a genuinely pre-receipt install) is unchanged: still exit 6.
+
+`levain init --force`'s own post-swap notice had the identical gap: absent, corrupt and empty receipts all printed the byte-identical "no install receipt covers it" line for the retained backup tree. Corrupt and empty now say so explicitly — "its install receipt was unreadable (corrupt/empty) … a damaged receipt is not a pre-receipt install" — while absent keeps its original text.
+
+### Added — Linux support: a confinement floor and a scheduled seat (K4c)
+
+Levain's sovereign entity now runs on Linux, not only macOS. Two pieces, and the second is the one that makes an unattended seat possible at all:
+
+- **Confinement** — a `bwrap` (bubblewrap) mount-namespace floor enforcing the same crown-jewels policy as the macOS seatbelt floor. It is a re-derivation, not a port: seatbelt is a path predicate, `bwrap` is a mount namespace with the opposite default, and every mapping was measured on a Linux kernel rather than read off a man page. Where the two differ, Linux is stronger — a write-denied file cannot be renamed out (`EBUSY`, it is a mountpoint) or hardlinked out (`EXDEV`, separate mount device), which rests on ordinary mount semantics instead of the undocumented Apple behaviour the macOS floor depends on.
+- **Lifecycle** — a `systemd --user` provider (service, plus a separate `.timer` for a scheduled seat). `install` also requests `loginctl enable-linger`, without which a user unit stops when your last session ends and a headless box's seat would quietly die at logout.
+
+**⚠ On Ubuntu 23.10 through 24.10, including 24.04 LTS, expect Levain to report no bash hands until you act.** Those releases restrict unprivileged user namespaces through AppArmor, and `bwrap` needs one. Ubuntu 25.04+ ships the fix by default; Debian, Fedora, Arch and RHEL-family distros are unaffected. Levain fails closed and says so — the entity still gets its file-editor hand, which is fully cross-platform, but no shell.
+
+**The fix is Ubuntu's own profile, not one you write.** `levain doctor` prints the three commands, and they are in the README under *Linux*. It keeps the host-wide restriction on and is reversible. ⚠ One consequence worth knowing before you apply it: the profile stacks the sandboxed process under a child profile with no capabilities, so the entity's bash can no longer run a nested `bwrap`, rootless docker/podman, flatpak, or a browser sandbox.
+
+**Do not infer capability from the usual two checks.** `bwrap` being installed and `kernel.unprivileged_userns_clone=1` can BOTH be true on a host where every invocation still fails — that pair reads green on a machine we measured as entirely unable to run it. Levain therefore probes by *executing* `bwrap`, and you should too.
+
+### Fixed — the run banner told Linux operators their platform was unsupported
+
+`levain run` printed *"bash dropped: no OS sandbox on this platform"* whenever the bash hand was unavailable. That was true while macOS was the only supported OS. It is false now in the most common Linux case — a **supported** platform whose kernel refuses to start the sandbox, which is one command away from working — and it is the sentence an operator reads before concluding Levain has no Linux support.
+
+The banner now names the real reason and the fix, and `levain doctor` gained a **confinement floor** check reporting which floor is active or why there is none. It REPORTS, it never FAILS: an entity with only its file-editor hand is a working, supported configuration, and turning a healthy install red for a missing optional hand is how an operator learns to ignore `doctor`. Both surfaces read one shared diagnosis, so they cannot drift.
+
+### Fixed — `confinement_supported()` could not have reported a second platform correctly
+
+It selected a provider polymorphically and then checked the macOS driver unconditionally. With one provider that was invisible; with two it fails in both directions — a working Linux floor would never be offered, and asked about Linux from a Mac it would answer yes from a host that cannot know. The driver check now travels with the provider.
+
+### Fixed, before release — the Linux floor as first written let containers through, and could not start on most hosts
+
+Measured on a Linux kernel while bringing K4c onto this release line:
+
+- **A container daemon socket was reachable from inside the Linux sandbox.** The socket was mounted read-only, and a read-only mount does not stop a `connect()`. The daemon answered. The socket's directory is now hidden instead, and that holds even when the daemon restarts and recreates its socket. A plain file mask over the socket did not hold: the restart removed it. A socket in a directory every program shares (`/run/docker.sock`, a rootless `$XDG_RUNTIME_DIR/docker.sock`) can only be masked as a file, so it is covered until the daemon recreates it. The module docstring states this limit.
+- **The rootless sockets were not on the list.** Rootless podman (`$XDG_RUNTIME_DIR/podman/podman.sock`), rootless Docker (`$XDG_RUNTIME_DIR/docker.sock`) and Docker Desktop for Linux (`~/.docker/desktop/docker.sock`) are denied now. The first two are user services the entity could otherwise start itself with `systemctl --user`.
+- **Bash failed to start on any Linux host without containerd, CRI-O and colima.** Every daemon directory on the socket list was pinned as a jewel's parent, and the sandbox refuses to pin a directory that does not exist, or one reached through a symlink such as `/var/run`. Absent directories are skipped (there is nothing in them to move), and symlinked ones are pinned at their real path.
+
+### Changed — on Linux, bash is off while the entity's floor blocks connections back to this host
+
+Since 0.4.6 the floor stops the entity from connecting to this machine's own services (the `sshd` route in 0.4.6's security note). On macOS the sandbox enforces that. On Linux, `bwrap` cannot block one destination while allowing the rest of the network, so an entity whose floor asks for that block gets no bash on Linux. The file editor still works. To accept that exposure and keep bash, set `"allow_localhost_outbound": true` in the entity's `.levain/confinement.json`. **This is a holding position, not a final design.**
+
 ## [0.4.8] — 2026-09-30
 
 ### Fixed — `levain init` in the terminal no longer writes an empty identity
@@ -15,16 +60,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 When a pack's override of a base seed file was dropped, `update` could delete the file outright, or leave it reading as up to date, so the base version never came back. Reconcile now works out which layer owns each seed file: a dropped override restores the layer it hid, an unreadable base layer means nothing is deleted (it is reported instead), a stray Finder `.DS_Store` in a pack's `seed/` no longer makes the whole stack unreadable, a file moved from one pack to another in one update is judged once, and an undecodable `pack.toml` is treated as an unreadable layer rather than crashing `update`. A copy you edited is kept, backed up and reported, never overwritten silently. Each restore or removal prints one line saying what it did.
 
 **Known limit, unchanged from 0.4.7:** a change to a pack's `order` alone, with no override dropped, is not reconciled. The `pack.toml` comment documents it as a v1 limitation.
-
-## [Unreleased]
-
-Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
-
-### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
-
-`doctor`'s hook-freshness check used to read a receipt it could not parse the same way it reads an install that predates the receipt entirely: both landed on exit 6, "an upgrade step is pending." **A receipt that exists but is unreadable is not a pre-receipt install** — `_write_activation_receipt` is the sole writer and runs only after the tree is in place, a failed write reads as absent (not corrupt), and a failed swap rolls the prior receipt back — so a legitimate install cannot produce a corrupt or empty one. Reading it as "no receipt yet" could downgrade a tampered hook (an appended `os.system(...)`, say) from broken (exit 1) to routine-pending (exit 6). A corrupt or empty receipt now exits 1, naming the receipt's path and why doctor could not read it, with the same `init --force` remedy. An absent receipt (a genuinely pre-receipt install) is unchanged: still exit 6.
-
-`levain init --force`'s own post-swap notice had the identical gap: absent, corrupt and empty receipts all printed the byte-identical "no install receipt covers it" line for the retained backup tree. Corrupt and empty now say so explicitly — "its install receipt was unreadable (corrupt/empty) … a damaged receipt is not a pre-receipt install" — while absent keeps its original text.
 
 ## [0.4.7] — 2026-09-14
 
@@ -413,29 +448,6 @@ here for it to apply to yet; the same three arms land with Linux support.
 replaced by placeholder-aware normalisation, along with a comment explaining why it was imported
 rather than reimplemented. A dead import keeps its justifying comment looking live. Both are gone,
 and `ruff` passes again.
-
-### Added — Linux support: a confinement floor and a scheduled seat (K4c)
-
-Levain's sovereign entity now runs on Linux, not only macOS. Two pieces, and the second is the one that makes an unattended seat possible at all:
-
-- **Confinement** — a `bwrap` (bubblewrap) mount-namespace floor enforcing the same crown-jewels policy as the macOS seatbelt floor. It is a re-derivation, not a port: seatbelt is a path predicate, `bwrap` is a mount namespace with the opposite default, and every mapping was measured on a Linux kernel rather than read off a man page. Where the two differ, Linux is stronger — a write-denied file cannot be renamed out (`EBUSY`, it is a mountpoint) or hardlinked out (`EXDEV`, separate mount device), which rests on ordinary mount semantics instead of the undocumented Apple behaviour the macOS floor depends on.
-- **Lifecycle** — a `systemd --user` provider (service, plus a separate `.timer` for a scheduled seat). `install` also requests `loginctl enable-linger`, without which a user unit stops when your last session ends and a headless box's seat would quietly die at logout.
-
-**⚠ On Ubuntu 23.10 through 24.10, including 24.04 LTS, expect Levain to report no bash hands until you act.** Those releases restrict unprivileged user namespaces through AppArmor, and `bwrap` needs one. Ubuntu 25.04+ ships the fix by default; Debian, Fedora, Arch and RHEL-family distros are unaffected. Levain fails closed and says so — the entity still gets its file-editor hand, which is fully cross-platform, but no shell.
-
-**The fix is Ubuntu's own profile, not one you write.** `levain doctor` prints the three commands, and they are in the README under *Linux*. It keeps the host-wide restriction on and is reversible. ⚠ One consequence worth knowing before you apply it: the profile stacks the sandboxed process under a child profile with no capabilities, so the entity's bash can no longer run a nested `bwrap`, rootless docker/podman, flatpak, or a browser sandbox.
-
-**Do not infer capability from the usual two checks.** `bwrap` being installed and `kernel.unprivileged_userns_clone=1` can BOTH be true on a host where every invocation still fails — that pair reads green on a machine we measured as entirely unable to run it. Levain therefore probes by *executing* `bwrap`, and you should too.
-
-### Fixed — the run banner told Linux operators their platform was unsupported
-
-`levain run` printed *"bash dropped: no OS sandbox on this platform"* whenever the bash hand was unavailable. That was true while macOS was the only supported OS. It is false now in the most common Linux case — a **supported** platform whose kernel refuses to start the sandbox, which is one command away from working — and it is the sentence an operator reads before concluding Levain has no Linux support.
-
-The banner now names the real reason and the fix, and `levain doctor` gained a **confinement floor** check reporting which floor is active or why there is none. It REPORTS, it never FAILS: an entity with only its file-editor hand is a working, supported configuration, and turning a healthy install red for a missing optional hand is how an operator learns to ignore `doctor`. Both surfaces read one shared diagnosis, so they cannot drift.
-
-### Fixed — `confinement_supported()` could not have reported a second platform correctly
-
-It selected a provider polymorphically and then checked the macOS driver unconditionally. With one provider that was invisible; with two it fails in both directions — a working Linux floor would never be offered, and asked about Linux from a Mac it would answer yes from a host that cannot know. The driver check now travels with the provider.
 
 ### Fixed — `doctor` reported green on two of the three ways to write user-level wiring
 

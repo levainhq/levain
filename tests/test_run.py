@@ -552,11 +552,48 @@ def test_run_entity_passes_confined_tools_by_default(
     # Force the OS-floor-present branch so this is platform-independent — the entity gets BOTH confined
     # hands (file editor + sandboxed bash).
     monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(True))
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)
     assert rc == 2
     assert captured["tools"] is not None
+    assert [t.name for t in captured["tools"]] == ["levain_file_editor", "levain_bash"]
+
+
+class _LocalhostProvider:
+    def __init__(self, enforces: bool) -> None:
+        self.enforces_localhost_deny = enforces
+
+
+def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    """The Linux holding position (spore-755): a sandbox that cannot refuse a connect back to this
+    host gets NO bash while the entity's floor asks for that deny, rather than bash without it."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(False))
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    assert run_entity(entity, with_tools=True) == 2
+    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+
+
+def test_run_entity_keeps_bash_when_the_operator_opts_out_of_the_localhost_deny(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    entity = _openhands_entity(tmp_path)
+    cfg = entity / ".levain" / "confinement.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('{"allow_localhost_outbound": true}\n')
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.session.select_provider", lambda: _LocalhostProvider(False))
+    captured: dict = {}
+    _spy_build_entity_agent(monkeypatch, captured)
+    assert run_entity(entity, with_tools=True) == 2
     assert [t.name for t in captured["tools"]] == ["levain_file_editor", "levain_bash"]
 
 

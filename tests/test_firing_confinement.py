@@ -1211,7 +1211,7 @@ class _StubProvider(ConfinementProvider):
     def render_profile(self, policy) -> str:  # pragma: no cover - not exercised here
         return ""
 
-    def spawn_shell(self, policy, *, env=None, default_timeout: float = 120.0):  # pragma: no cover
+    def _spawn_shell_impl(self, policy, *, env=None, default_timeout: float = 120.0):  # pragma: no cover
         raise NotImplementedError
 
 
@@ -1836,12 +1836,11 @@ def test_confinement_config_field_order_is_append_only() -> None:
 
 
 def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypatch) -> None:
-    """⛔ A TRIPWIRE FOR THE K4c MERGE, NOT A TEST OF TODAY'S CODE.
-
-    `deny_sockets` is enforced by exactly one thing: `SeatbeltProvider.render_profile`'s
-    `network-outbound` rule. `build_policy` populates the field unconditionally and this module's
-    prose calls it the UNIVERSAL floor — which is true while macOS is the only provider, and
-    becomes FALSE the moment a Linux (`bwrap`) or container provider lands without consuming it.
+    """⛔ A TRIPWIRE ON THE PROVIDER ROSTER. Written for the K4c merge, when `deny_sockets` was
+    enforced only by `SeatbeltProvider.render_profile`'s `network-outbound` rule; it fired as
+    designed when the port made `BwrapProvider` concrete (2026-09-30). `build_policy` populates the
+    field unconditionally and this module's prose calls it the UNIVERSAL floor, which stays true only
+    while every provider consumes it.
     A policy field that one provider honours and another silently ignores is a floor that reports
     itself armed on a platform where the flagship bypass still works.
 
@@ -1865,15 +1864,20 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
     def _concrete(cls) -> set:
         out = set()
         for sub in cls.__subclasses__():
-            if not getattr(sub, "__abstractmethods__", None):
+            # The roster is the module's SHIPPED providers; a stub a test defines is not one.
+            if not getattr(sub, "__abstractmethods__", None) and sub.__module__ == _conf.__name__:
                 out.add(sub.__name__)
             out |= _concrete(sub)
         return out
 
+    # 2026-09-30, K4c landing: BwrapProvider consumes `deny_sockets` in `_bwrap_argv` step (6)
+    # (pinned by the bwrap socket tests below and measured live), and for `deny_localhost_outbound`
+    # it REFUSES to spawn (`enforces_localhost_deny = False`), pending Phill's ruling on the Linux
+    # posture. Both decisions are asserted by name in the tests that follow this one.
     providers = _concrete(_conf.ConfinementProvider)
-    assert providers == {"SeatbeltProvider"}, (
+    assert providers == {"SeatbeltProvider", "BwrapProvider"}, (
         f"the ConfinementProvider roster changed to {sorted(providers)}. Every provider MUST "
-        f"enforce the network-outbound denies that only SeatbeltProvider renders today — "
+        f"enforce (or, for the localhost deny, refuse to spawn without) the connect-denies — "
         f"CrownJewelsPolicy.deny_sockets (spore-725, a reachable container daemon is a total "
         f"crown-jewels bypass) AND CrownJewelsPolicy.deny_localhost_outbound (spore-755, a local "
         f"sshd reached via the forwarded agent socket is the same class). Both are connect-denies "
@@ -1881,6 +1885,111 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
         f"new provider for BOTH and update this assertion, or the floor is macOS-only while the "
         f"code and the run banner both call it universal."
     )
+
+
+def test_no_shipped_provider_overrides_spawn_shell() -> None:
+    """The refresh lives in the base `spawn_shell`; a provider that overrides it skips the refresh
+    (spore-768). The K4c branch did exactly that before the port."""
+    from levain.firing import confinement as _conf
+
+    for cls in (_conf.SeatbeltProvider, _conf.BwrapProvider):
+        assert "spawn_shell" not in vars(cls), f"{cls.__name__} overrides spawn_shell"
+        assert "_spawn_shell_impl" in vars(cls)
+
+
+def test_bwrap_refuses_to_spawn_while_the_localhost_deny_is_requested(tmp_path, monkeypatch) -> None:
+    """bwrap has no per-destination connect deny (measured: no flag reaches a 127.0.0.1 listener;
+    ``--unshare-net`` takes all network with it). So a policy carrying the deny gets no shell, and
+    the refusal names the operator's opt-out."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _conf.BwrapProvider.enforces_localhost_deny is False
+    assert _conf.SeatbeltProvider.enforces_localhost_deny is True
+    pol = build_policy(_entity(tmp_path), deny_localhost_outbound=True)
+    monkeypatch.setattr(_conf, "bwrap_available", lambda: True)  # the refusal must not hinge on the host
+    with pytest.raises(ConfinementError, match="allow_localhost_outbound"):
+        _conf.BwrapProvider().spawn_shell(pol)
+
+
+def _bwrap_socket_policy(tmp_path, monkeypatch, *socks):
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", tuple(str(s) for s in socks))
+    return build_policy(_entity(tmp_path))
+
+
+def test_bwrap_hides_a_socket_in_a_daemon_dir_with_a_readonly_tmpfs(tmp_path, monkeypatch) -> None:
+    """A ``--ro-bind S S`` does NOT stop connect() (measured: the daemon answered), and a
+    ``/dev/null`` over-mount detaches when the daemon recreates its socket (measured). The
+    directory tmpfs held across the restart, so a daemon-owned dir gets that form."""
+    from levain.firing.confinement import _bwrap_argv
+
+    d = tmp_path / ".colima" / "default"
+    d.mkdir(parents=True)
+    sock = d / "docker.sock"
+    sock.touch()
+    argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
+    dd = str(d.resolve())
+    assert ["--tmpfs", dd, "--remount-ro", dd] in [argv[k:k + 4] for k in range(len(argv))]
+    assert ["--ro-bind", str(sock.resolve()), str(sock.resolve())] not in [
+        argv[k:k + 3] for k in range(len(argv))
+    ], "a read-only self-bind of a socket stops nothing and must not be rendered as a deny"
+
+
+def test_bwrap_uses_a_dev_null_mount_for_a_socket_in_a_shared_dir(tmp_path, monkeypatch) -> None:
+    from levain.firing.confinement import _bwrap_argv
+
+    sock = tmp_path / "docker.sock"   # its parent is $HOME, which must never be hidden
+    sock.touch()
+    argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
+    assert ["--ro-bind", "/dev/null", str(sock.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
+    assert "--tmpfs" not in argv or str(tmp_path.resolve()) not in [
+        argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"
+    ]
+
+
+def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monkeypatch) -> None:
+    """THE BRICK, measured 2026-09-30: every absent daemon dir in the socket roster was self-bound as
+    an ancestor and bwrap aborted ("Can't find source path /run/containerd"), so no Linux host
+    without containerd, CRI-O and colima could spawn a shell. An absent dir under a parent this
+    user cannot create in gets nothing at all."""
+    from levain.firing.confinement import _bwrap_argv
+
+    ro = tmp_path / "rootowned"
+    ro.mkdir()
+    ro.chmod(0o555)
+    try:
+        sock = ro / "containerd" / "containerd.sock"
+        argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
+    finally:
+        ro.chmod(0o755)
+    assert str(ro / "containerd") not in argv
+    assert str(sock) not in argv
+
+
+def test_bwrap_hides_an_absent_daemon_dir_the_entity_could_start_a_daemon_in(tmp_path, monkeypatch) -> None:
+    """`systemctl --user start podman.socket` works from inside the sandbox, so a rootless daemon dir
+    that is absent at spawn is still mounted (bwrap creates it empty) — otherwise the socket the
+    entity starts afterwards would be visible."""
+    from levain.firing.confinement import _bwrap_argv
+
+    run = tmp_path / "xdg"
+    run.mkdir()
+    sock = run / "podman" / "podman.sock"
+    argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
+    d = str((run / "podman").resolve())
+    assert ["--tmpfs", d, "--remount-ro", d] in [argv[k:k + 4] for k in range(len(argv))]
+
+
+def test_xdg_runtime_socket_entries_drop_when_the_variable_is_unset(monkeypatch) -> None:
+    from levain.firing.confinement import _expand_socket_source
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") is None
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == Path("/run/user/1000/docker.sock")
 
 
 def test_crown_jewel_reason_fails_CLOSED_on_a_tilde_user_path_not_by_raising(tmp_path) -> None:
@@ -2036,6 +2145,9 @@ def test_spawn_shell_refreshes_so_every_consumer_gets_it_not_just_one_call_site(
     from levain.firing.confinement import ConfinementProvider
 
     class _Direct(ConfinementProvider):
+        def available(self):
+            return True
+
         def render_profile(self, policy):
             return ""
 
@@ -2351,7 +2463,10 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
     bound = [d for _, d in self_binds]
     for anc in policy.deny_write_dirs:
-        assert str(anc) in bound
+        # An absent ancestor holds nothing to relocate, and self-binding it aborts bwrap (the brick
+        # measured 2026-09-30); every ancestor that EXISTS is still pinned.
+        # Bound by its RESOLVED path: a mount cannot land on a symlink (/var/run, macOS's /var).
+        assert (str(anc.resolve()) in bound) == anc.is_dir(), anc
     for i, a in enumerate(bound):
         for b in bound[i + 1:]:
             assert not Path(b) in Path(a).parents, f"{b} is a parent of {a} but is mounted after it"
@@ -2399,7 +2514,8 @@ def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkey
     ssh = tmp_path / ".ssh"
     ssh.mkdir()
     policy = build_policy(_entity(tmp_path), ssh_mode="raw")
-    missing = [p for p in policy.deny_write_files if not p.exists()]
+    sockets = set(policy.socket_spellings) | set(policy.deny_sockets)  # step (6) owns those
+    missing = [p for p in policy.deny_write_files if not p.exists() and p not in sockets]
     assert missing, "fixture must produce at least one not-yet-existing ssh vector"
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
@@ -2566,6 +2682,21 @@ linux_live = pytest.mark.skipif(
 )
 
 
+def test_linux_live_cannot_skip_where_it_is_required() -> None:
+    """The `linux_live` tests SKIP wherever bwrap cannot run, which is right on a laptop and wrong in
+    the image built to run them: there a skip is a green suite that never touched the floor.
+    `tests/linux/Dockerfile` sets ``LEVAIN_REQUIRE_LINUX_LIVE=1``, so in that image a refused
+    namespace FAILS here instead of skipping eight tests quietly."""
+    if os.environ.get("LEVAIN_REQUIRE_LINUX_LIVE") != "1":
+        pytest.skip("only enforced where LEVAIN_REQUIRE_LINUX_LIVE=1 (the Linux test image)")
+    assert platform.system() == "Linux" and bwrap_available(), (
+        "LEVAIN_REQUIRE_LINUX_LIVE=1 but bwrap cannot establish a namespace here, so every "
+        "linux_live test would skip. In Docker, run with --security-opt seccomp=unconfined "
+        "--security-opt apparmor=unconfined --security-opt systempaths=unconfined "
+        "(see tests/linux/Dockerfile)."
+    )
+
+
 @pytest.fixture()
 def linux_floor(tmp_path: Path, monkeypatch):
     """A real confined shell over a realistic crown-jewels layout."""
@@ -2661,6 +2792,99 @@ def test_linux_live_planting_authorized_keys_is_refused_not_silently_discarded(l
     sh, _home, _ent, _j, ssh, _c = linux_floor
     assert sh.run(f"echo PLANTED > {ssh}/authorized_keys").exit_code != 0
     assert not (ssh / "authorized_keys").exists()
+
+
+def _unix_daemon(path: Path):
+    """A real listening unix socket that answers every connect — the stand-in for dockerd."""
+    import threading
+
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(path))
+    srv.listen(8)
+
+    def _serve() -> None:
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.sendall(b"DAEMON-ANSWERED\n")
+            conn.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    return srv
+
+
+_CONNECT = (
+    "python3 -c \"import socket,sys;s=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);"
+    "print(s.recv(64).decode().strip())\" "
+)
+
+
+@linux_live
+def test_linux_live_the_default_floor_spawns_on_a_host_without_container_daemons(
+    tmp_path, monkeypatch
+) -> None:
+    """THE BRICK (measured 2026-09-30): the real socket roster, on a host where /run/containerd and
+    friends do not exist, aborted bwrap before bash started. A floor that cannot spawn is not a
+    floor; it is "no bash on Linux"."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sh = BwrapProvider().spawn_shell(build_policy(_entity(tmp_path)))
+    try:
+        r = sh.run("echo SPAWNED")
+        assert r.exit_code == 0 and "SPAWNED" in r.output
+    finally:
+        sh.close()
+
+
+@linux_live
+def test_linux_live_a_daemon_socket_is_unreachable_and_stays_so_across_a_restart(
+    tmp_path, monkeypatch
+) -> None:
+    """CONTROL (host reaches the daemon) / ATTACK (the entity connects, before AND after the daemon
+    recreates its socket). The restart is the case that defeated a /dev/null over-mount when
+    measured: the host-side unlink detached it."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    d = tmp_path / ".colima" / "default"
+    d.mkdir(parents=True)
+    sock = d / "docker.sock"
+    srv = _unix_daemon(sock)
+    monkeypatch.setattr(_conf, "_CONTAINER_DAEMON_SOCKETS", (str(sock),))
+    control = subprocess.run(["bash", "-c", _CONNECT + str(sock)], capture_output=True, text=True)
+    assert "DAEMON-ANSWERED" in control.stdout, "control: the host must reach the daemon"
+    sh = BwrapProvider().spawn_shell(build_policy(_entity(tmp_path)))
+    try:
+        assert "DAEMON-ANSWERED" not in sh.run(_CONNECT + str(sock)).output
+        srv.close()
+        sock.unlink()
+        srv = _unix_daemon(sock)   # the daemon restarts, on the HOST
+        assert "DAEMON-ANSWERED" in subprocess.run(
+            ["bash", "-c", _CONNECT + str(sock)], capture_output=True, text=True
+        ).stdout, "control: the restarted daemon must be live"
+        assert "DAEMON-ANSWERED" not in sh.run(_CONNECT + str(sock)).output
+    finally:
+        sh.close()
+        srv.close()
+
+
+@linux_live
+def test_linux_live_a_readonly_self_bind_does_not_stop_a_connect(tmp_path) -> None:
+    """Why step (6) exists, kept as a live fact: the socket arm K4c shipped (``--ro-bind S S``)
+    lets the connect through. If this ever starts FAILING, the kernel changed and the arm choice
+    should be re-measured, not assumed."""
+    sock = tmp_path / "d.sock"
+    srv = _unix_daemon(sock)
+    try:
+        r = subprocess.run(
+            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+             "--ro-bind", str(sock), str(sock), "bash", "-c", _CONNECT + str(sock)],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert "DAEMON-ANSWERED" in r.stdout
+    finally:
+        srv.close()
 
 
 @linux_live

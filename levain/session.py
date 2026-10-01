@@ -56,8 +56,10 @@ from levain.firing.agent_reply import (
 )
 from levain.firing.confinement import (
     ConfinementError,
+    LINUX_LOCALHOST_REFUSAL,
     confinement_supported,
     load_confinement_config,
+    select_provider,
 )
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
@@ -454,6 +456,9 @@ class EntitySession:
     driving gets the governed posture, which costs an unnecessary halt; the opposite default
     would silently hand an unattended seat ungoverned hands, and only one of those two mistakes
     is recoverable after the fact."""
+    bash_refusal: str | None = None
+    """Why bash was dropped when the cause is THIS entity's floor rather than the host's sandbox
+    (the host-side reasons come from ``diagnose_confinement``). The banner prints it verbatim."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
 
     # -- construction --------------------------------------------------------
@@ -585,6 +590,12 @@ class EntitySession:
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
             allow_container_sockets = cfg.allow_container_sockets if cfg is not None else False
+            # A provider that cannot deny connects back to this host drops bash here, before the
+            # tools are built, so the banner never offers a shell that refuses every command.
+            bash_refusal = None
+            if bash_ok and cfg is not None and not cfg.allow_localhost_outbound:
+                if not select_provider().enforces_localhost_deny:
+                    bash_ok, bash_refusal = False, LINUX_LOCALHOST_REFUSAL
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR
@@ -657,6 +668,7 @@ class EntitySession:
             deny_standard_creds=deny_standard_creds,
             allow_container_sockets=allow_container_sockets,
             gate_mode=gate_mode,
+            bash_refusal=bash_refusal if with_tools else None,
         )
 
     # -- the one operation ---------------------------------------------------

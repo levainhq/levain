@@ -401,7 +401,23 @@ _CONTAINER_DAEMON_SOCKETS = (
     "~/.local/share/containers/podman/machine/podman.sock",   # podman machine (rootless)
     "/var/run/containerd/containerd.sock",  # containerd directly — below docker, same authority
     "/var/run/crio/crio.sock",              # CRI-O
+    # ROOTLESS LINUX (K4c). These are the sockets an ENTITY CAN START ITSELF — both are systemd
+    # --user socket units, so `systemctl --user start podman.socket` is one command from inside the
+    # sandbox — which makes them the sharpest Linux instances, not the rare ones. An unset
+    # $XDG_RUNTIME_DIR (every macOS host) drops the entry instead of denying a literal "$XDG..." path.
+    "$XDG_RUNTIME_DIR/podman/podman.sock",  # podman, rootless
+    "$XDG_RUNTIME_DIR/docker.sock",         # Docker, rootless
+    "~/.docker/desktop/docker.sock",        # Docker Desktop for Linux
 )
+
+
+def _expand_socket_source(spec: str) -> Path | None:
+    """One roster entry as a path, or None when it names an environment variable this process does
+    not have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
+    expanded = os.path.expandvars(spec)
+    if "$" in expanded:
+        return None
+    return Path(expanded).expanduser()
 
 
 class ConfinementError(RuntimeError):
@@ -881,7 +897,9 @@ def build_policy(
     # host-side connect succeeding against the same socket while the entity's was refused.
     socket_sources_l: list[Path] = []
     if not allow_container_sockets:
-        socket_sources_l = [Path(s).expanduser() for s in _CONTAINER_DAEMON_SOCKETS]
+        socket_sources_l = [
+            p for p in (_expand_socket_source(s) for s in _CONTAINER_DAEMON_SOCKETS) if p is not None
+        ]
     socket_sources_t = _dedup(socket_sources_l)
     # ⛔ ONE RESOLUTION FEEDS ALL THREE ARMS (codex L3 #5 + glm, 2026-09-04). This block used to
     # resolve the sources THREE times — once for the connect deny, once inline for the write deny,
@@ -1938,10 +1956,16 @@ class ConfinementProvider(ABC):
     """One thin provider per OS. ``render_profile`` is PURE (no I/O) so the generated sandbox text is
     fully testable without touching the system; ``spawn_shell`` shells out to the platform sandbox
     driver. macOS (:class:`SeatbeltProvider`) shipped first and Linux (:class:`BwrapProvider`, K4c)
-    shipped against this contract unchanged apart from the ``available()`` addition — which is the
-    seam doing its job. A container backend remains a pure addition. The macOS crown-jewels denylist
+    shipped against this contract with two additions, ``available()`` and
+    ``enforces_localhost_deny`` — which is the seam doing its job. A container backend remains a pure addition. The macOS crown-jewels denylist
     is the requirements spec for every provider; the Linux one was re-derived against it row by row
     and measured, never ported."""
+
+    #: Whether this provider can deny an outbound connect to THIS host (``deny_localhost_outbound``,
+    #: spore-755). A provider that cannot must refuse to spawn while that deny is requested, never
+    #: run without it; the operator's opt-out is ``allow_localhost_outbound`` in confinement.json.
+    enforces_localhost_deny: bool = False
+
 
     @abstractmethod
     def available(self) -> bool:
@@ -2006,14 +2030,11 @@ class ConfinementProvider(ABC):
         risk and not only an adversarial one, because ``spawn_shell`` is the public non-underscore
         name that looks like the thing to override.
 
-        ⛔⛔ ``BwrapProvider`` ON ``k4c-linux`` DOES **NOT** INHERIT THIS BY CONSTRUCTION, AND AN
-        EARLIER VERSION OF THIS DOCSTRING CLAIMED IT DID — in this file and in ``tools.py``, as the
-        stated justification for removing a control. MEASURED 2026-09-05 against the branch:
-        ``git show k4c-linux:levain/firing/confinement.py | grep refresh_socket_denies`` returns
-        NOTHING, and BOTH providers there (``SeatbeltProvider``, ``BwrapProvider``) override
-        ``spawn_shell`` DIRECTLY — that branch has no ``_spawn_shell_impl`` at all. **The k4c-linux
-        merge is therefore where spore-768 returns on Linux, and porting both providers onto the
-        ``_spawn_shell_impl`` seam is part of that merge, not a follow-up.**
+        ⛔ The K4c branch, written before this seam existed, had ``BwrapProvider`` (and its own
+        ``SeatbeltProvider``) override ``spawn_shell`` DIRECTLY, and a docstring then claimed it
+        inherited the refresh anyway. It did not; that was spore-768 waiting to return on Linux. The
+        2026-09-30 port moved ``BwrapProvider`` onto ``_spawn_shell_impl``, and
+        ``test_no_shipped_provider_overrides_spawn_shell`` now asserts it for every provider.
         ⚖ This is not a reversal of "make the refresh structural" — it is a stronger form of it. The
         metaclass tried to make it impossible to SKIP a step; moving it upstream makes the step not
         exist at this layer at all. Same move as the conversation-floor key: **stop balancing,
@@ -2123,6 +2144,9 @@ class SeatbeltProvider(ConfinementProvider):
     based, not ``id_*``) while re-allowing ``known_hosts`` (r+w) and ``config`` (r) so agent-auth
     still works. ⚠ ``config`` is read-re-allowed and its WRITE stays denied in BOTH modes, which
     the previous wording omitted."""
+
+    enforces_localhost_deny = True  # ``(deny network-outbound (remote ip "localhost:*"))``
+
 
     def available(self) -> bool:
         """The seatbelt driver is ``/usr/bin/sandbox-exec``. Delegates to the long-standing module
@@ -2446,6 +2470,10 @@ class _SeatbeltShell(SandboxedShell):
 #   ssh_dir (agent mode)         --tmpfs, then bind back    key material ENOENT; known_hosts r+w
 #                                known_hosts (rw) + config  reaches the REAL host file; config
 #                                (ro) INTO the tmpfs        read OK / write EROFS
+#   deny_sockets, daemon dir     --tmpfs P --remount-ro P   connect ENOENT, holds across a daemon
+#                                                           restart (measured 2026-09-30)
+#   deny_sockets, shared dir     --ro-bind /dev/null S      connect ECONNREFUSED until the daemon
+#                                                           recreates S (measured 2026-09-30)
 #
 # WHY THE ANCESTOR SELF-BIND IS NOT DROPPABLE HERE, WHICH IS THE FINDING THAT NEARLY WENT THE OTHER
 # WAY. Inside ONE sandbox, renaming a jewel's ancestor does not expose the jewel — the over-mount is
@@ -2512,8 +2540,25 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     # `_write_deny_ancestors` already returns lexicographically sorted paths, and for a path string a
     # parent is a prefix of its child, so that sort IS parent-first. Re-sorted here anyway so this
     # block does not silently depend on a guarantee made in another function.
+    # ⛔ AN ABSENT ANCESTOR IS SKIPPED, AND THAT IS NOT A FAIL-OPEN: a directory that does not exist
+    # holds no jewel to relocate, and a self-bind of it is not a deny — bwrap ABORTS on the missing
+    # source and the entity loses bash on every host. That was MEASURED after the spore-725 socket
+    # roster merged in (`bwrap: Can't find source path /run/containerd`): its entries made every
+    # absent daemon dir an "ancestor", so a host without containerd, CRI-O and colima could not
+    # spawn a shell at all. An ancestor that exists at spawn is still pinned, which is the whole of
+    # what the relocation finding below requires.
+    # ⛔ AND IT BINDS THE RESOLVED DIRECTORY: a mount cannot land on a symlink, so an ancestor like
+    # /var/run (a symlink to /run on every modern distro) aborted bwrap the same way, measured the
+    # same night. Resolving pins the directory the jewel actually lives in, which is what a rename
+    # would have to move. A symlink COMPONENT itself cannot be pinned by a mount.
+    pinned: list[str] = []
     for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
-        argv += ["--bind", str(d), str(d)]
+        if d.is_dir():
+            r = str(d.resolve())
+            if r not in pinned:
+                pinned.append(r)
+    for r in sorted(pinned):
+        argv += ["--bind", r, r]
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     tmpfs_roots: list[Path] = list(policy.deny_read_write)
@@ -2593,7 +2638,12 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     # confinement layer. That is very likely benign (a fresh entity has no memory to read) but it has
     # NOT been verified end-to-end against a real `levain run` on Linux, and a confinement floor
     # writing into the memory store is exactly the kind of thing that must be checked, not assumed.
+    sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
+        if f in sockets:
+            # Step (6) owns every socket path. A self-bind here would not stop a connect, and the
+            # missing-file branch below would try to CREATE a socket path under a root-owned /run.
+            continue
         if any(_ci_within(f, r) for r in rebound):
             # known_hosts / config were deliberately bound BACK for ssh to work. known_hosts is
             # read-write by design; config is a ``--ro-bind``, which already refuses writes honestly
@@ -2614,6 +2664,47 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
             argv += ["--ro-bind", str(f), str(f)]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
+
+    # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
+    # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
+    #   ``--ro-bind S S``           connect SUCCEEDS. A read-only mount does not stop connect(),
+    #                               which is the same fact as ``-v docker.sock:...:ro`` still
+    #                               granting the daemon. It was K4c's only socket arm as ported.
+    #   ``--ro-bind /dev/null S``   connect REFUSED (ECONNREFUSED) — until the daemon RECREATES
+    #                               its socket: the host-side unlink detaches the mount and the
+    #                               sandbox then reaches the new socket. Measured.
+    #   ``--tmpfs P --remount-ro P``  over the socket's own DIRECTORY: ENOENT, and it HOLDS across
+    #                               a daemon restart, because the new socket lands in the host dir
+    #                               the sandbox cannot see. Measured.
+    # So the directory form is used wherever the socket lives in a directory the daemon owns, and
+    # the file form only where the parent is shared by everything (/run, $XDG_RUNTIME_DIR) and
+    # hiding it would break the host. Paths are the RESOLVED targets, which is what connect() uses.
+    # A daemon dir that is absent but creatable by this user (its parent exists and is writable)
+    # is still mounted — bwrap creates it empty — because the user-level daemons
+    # (``systemctl --user start podman.socket``) can be STARTED FROM INSIDE THE SANDBOX, and a
+    # dir that is not hidden at spawn would then show the socket. An absent dir under a parent the
+    # user cannot write belongs to a root daemon this user cannot start, and is skipped.
+    # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock, rootless
+    # $XDG_RUNTIME_DIR/docker.sock) is covered only while its inode lives. A restart re-exposes it
+    # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
+    # Both run through the user's service manager, which is outside this namespace — the Linux form
+    # of the launchd-helper limit in the module docstring.
+    shared = {Path("/"), Path("/run"), Path("/var/run"), Path("/tmp"), Path("/var/tmp"), Path.home()}
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        shared.add(Path(xdg))
+    hidden_dirs: list[Path] = []
+    for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
+        parent = s.parent
+        if parent in shared:
+            if s.exists():
+                argv += ["--ro-bind", "/dev/null", str(s)]
+            continue
+        if parent in hidden_dirs:
+            continue
+        if parent.is_dir() or (parent.parent.is_dir() and os.access(parent.parent, os.W_OK)):
+            argv += ["--tmpfs", str(parent), "--remount-ro", str(parent)]
+            hidden_dirs.append(parent)
 
     return argv
 
@@ -2645,6 +2736,18 @@ def bwrap_available() -> bool:
         # "probably fine".
         return False
     return proc.returncode == 0
+
+
+# ⚖ HOLDING POSITION, PENDING PHILL'S RULING (2026-09-30): bwrap has no per-destination connect
+# deny. Measured on a Linux kernel: with no network flag the sandbox reaches a 127.0.0.1 listener;
+# ``--unshare-net`` refuses it but removes ALL network (pip, git, curl). Until a ruling picks the
+# Linux posture, a policy that asks for the deny gets NO bash on Linux rather than bash without it.
+LINUX_LOCALHOST_REFUSAL = (
+    "bash dropped: on Linux the sandbox cannot block connections back to this host, and this "
+    "entity's floor requires that (a local sshd reached through the forwarded ssh agent reads "
+    "crown-jewel files as an unsandboxed user — spore-755). The file editor still works. To accept "
+    "that exposure and get bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
+)
 
 
 class BwrapProvider(ConfinementProvider):
@@ -2688,13 +2791,15 @@ class BwrapProvider(ConfinementProvider):
         later by someone who does not trust this docstring."""
         return shlex.join(_bwrap_argv(policy)) + "\n"
 
-    def spawn_shell(
+    def _spawn_shell_impl(
         self,
         policy: CrownJewelsPolicy,
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
+        if policy.deny_localhost_outbound:
+            raise ConfinementError(LINUX_LOCALHOST_REFUSAL)
         if not bwrap_available():
             raise ConfinementError(
                 f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "

@@ -1,0 +1,9 @@
+# Context is the repo root (see Dockerfile). Keep the host venv and build output out of it.
+.venv
+build
+dist
+*.egg-info
+.git
+**/__pycache__
+**/.DS_Store
+.pytest_cache

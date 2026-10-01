@@ -223,6 +223,8 @@ The sovereign entity (`levain run`) gets two hands: a file editor and a bash she
 
 Levain **fails closed**: with no sandbox it drops bash and runs with the file editor alone, rather than handing an entity an unconfined shell. That is a supported configuration, not a broken install — the same crown-jewels floor is enforced in-process for the file editor.
 
+**For now, bash on Linux also needs one setting.** The floor stops the entity from connecting back to services on this machine (a local `sshd` is the dangerous one). The macOS sandbox can block that one destination, and `bwrap` cannot without cutting off all network access. So on Linux bash stays off until you set `"allow_localhost_outbound": true` in the entity's `.levain/confinement.json`, which accepts that exposure. `levain run` prints this when it drops bash.
+
 **On Ubuntu 23.10 through 24.10 you will land there on first run**, including 24.04 LTS. Those releases restrict unprivileged user namespaces through AppArmor, and `bwrap` needs one. Ubuntu 25.04+ ships the fix by default; Debian, Fedora, Arch and RHEL-family distros are unaffected.
 
 Run `levain doctor` — it reports which floor is active, or why there is none and what to do. The fix is Ubuntu's own profile:
