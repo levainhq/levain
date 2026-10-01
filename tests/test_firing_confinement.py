@@ -3053,11 +3053,11 @@ def test_linux_live_the_store_refuses_a_plant_and_leaves_the_host_store_usable(t
     ent = _entity(tmp_path)
     lv = ent / ".levain"
     lv.mkdir(parents=True, exist_ok=True)
-    (lv / "context.json").write_text("{}")
+    (lv / "docs").mkdir()
     sh = BwrapProvider().spawn_shell(build_policy(ent))
     try:
-        ok = sh.run(f"echo '{{\"k\": 1}}' > {lv}/context.json && echo WROTE")
-        assert "WROTE" in ok.output, "control: an existing ordinary store entry must stay writable"
+        ok = sh.run(f"echo note > {lv}/docs/n.txt && echo WROTE")
+        assert "WROTE" in ok.output, "control: an existing store SUBDIRECTORY must stay writable"
         for name in ("memory.continuity.md", "memory.db-wal", "confinement.json"):
             r = sh.run(f"echo planted > {lv}/{name} && echo CREATED || echo REFUSED")
             assert "REFUSED" in r.output, name
