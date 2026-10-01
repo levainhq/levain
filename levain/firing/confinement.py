@@ -329,6 +329,16 @@ _OWN_MEMORY_FILENAMES = (
 # impact under default-allow (a gh token = repo push/admin; aws creds = infra/$), so the operator who
 # does NOT need those tools flips ONE config line to fold them in. ``~/.config/gh`` is a DIR (the token
 # lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
+# The Keychain's mach services (spore-1245). SecurityServer + securityd.xpc were MEASURED to carry the
+# reads (denying them refused `security -w` and the osxkeychain helper); systemkeychain is Apple's
+# separate System-keychain endpoint (codex L3), denied by name, not exercised.
+_KEYCHAIN_MACH_SERVICES = (
+    "com.apple.SecurityServer",
+    "com.apple.securityd.xpc",
+    "com.apple.securityd.systemkeychain",
+)
+
+
 def cred_floor_label(system: str | None = None) -> str:
     """What the standard cred floor covers on this OS, for banners: the macOS Keychain is folded in
     by the Seatbelt profile (``CrownJewelsPolicy.deny_keychain``); Linux has no counterpart."""
@@ -2261,9 +2271,11 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append(";; default). Without it, `security find-generic-password -w` and every")
             lines.append(";; credential helper (`git credential-osxkeychain`, gh's stored token) read")
             lines.append(";; the operator's secrets from inside this sandbox (measured 2026-10-01).")
-            lines.append(";; HTTPS trust and git over the forwarded ssh agent are unaffected (measured).")
-            lines.append('(deny mach-lookup (global-name "com.apple.SecurityServer")')
-            lines.append('                 (global-name "com.apple.securityd.xpc"))')
+            lines.append(";; Server-authenticated HTTPS and git over the forwarded ssh agent are")
+            lines.append(";; unaffected (measured). The systemkeychain endpoint is denied by name;")
+            lines.append(";; it was not exercised (no test item can be put in System.keychain unprivileged).")
+            for svc in _KEYCHAIN_MACH_SERVICES:
+                lines.append(f'(deny mach-lookup (global-name "{svc}"))')
             lines.append("")
 
         if policy.config_file is not None:

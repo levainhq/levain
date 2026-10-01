@@ -3322,8 +3322,26 @@ def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, 
     policy = build_policy(_entity(tmp_path), deny_standard_creds=deny)
     assert policy.deny_keychain is expected
     profile = SeatbeltProvider().render_profile(policy)
-    assert ('(global-name "com.apple.SecurityServer")' in profile) is expected
-    assert ('(global-name "com.apple.securityd.xpc")' in profile) is expected
+    for svc in ("com.apple.SecurityServer", "com.apple.securityd.xpc",
+                "com.apple.securityd.systemkeychain"):
+        assert (f'(deny mach-lookup (global-name "{svc}"))' in profile) is expected
+
+
+@pytest.mark.parametrize("mode,expected", [("interactive", False), ("unattended", True)])
+def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypatch, mode, expected):
+    """complement L3: policy_for_conv_state (the file editor's / bash executor's policy, built at
+    tool-creation time from the process channel) is where the two enforcers once disagreed."""
+    from types import SimpleNamespace
+
+    from levain.firing.openhands.tools import policy_for_conv_state
+
+    ent = _entity(tmp_path)
+    ws = ent / "workspace"
+    ws.mkdir()
+    monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(ent))
+    monkeypatch.setenv("LEVAIN_DRIVE_MODE", mode)
+    state = SimpleNamespace(workspace=SimpleNamespace(working_dir=str(ws)))
+    assert policy_for_conv_state(state).deny_keychain is expected
 
 
 def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
