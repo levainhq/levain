@@ -91,8 +91,11 @@ def store_path() -> Path:
 # `levain doctor` reported healthy. He was carrying a local patch to this file,
 # which `levain init --force` replaced on each upgrade — that command rewrites the
 # whole activation/ tree and is step two of the documented upgrade procedure, so
-# following our own instructions is what ate it. (`levain update` does NOT write
-# activation/; its only file writes are pack reconciles under seed/.)
+# following our own instructions is what ate it. (`levain update` refreshes
+# activation/ file by file and keeps a file you edited, putting the new version under
+# .levain/pending/ instead. The exception is an install made before the activation
+# receipt existed: there an edited hook cannot be told from an old one, so update
+# replaces it and keeps the previous copy under .levain/backups/activation/.)
 #
 # The cwd gate is CORRECT as a default and is not being weakened: it is what stops
 # an unrelated session in a different codebase inheriting this partnership's

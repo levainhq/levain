@@ -419,6 +419,7 @@ def extract_answers(
     slots: Iterable[str],
     optional_sections: Iterable[Iterable[str]],
     render: Any,
+    prior: dict[str, str] | None = None,
     max_combinations: int = 4096,
 ) -> dict[str, str]:
     """The ONE answer set that ``render`` turns into ``text``, or raise
@@ -432,8 +433,9 @@ def extract_answers(
     rendered with a sentinel per slot, giving the exact skeleton of that case, and the
     seed is matched against each. A candidate counts only if ``render`` reproduces the
     seed from it (up to render's own whitespace normalisation): the round trip is the
-    proof, not the parse. Of the proven answer sets, the one leaving the most text to
-    the template is adopted; none, or a tie, is a refusal."""
+    proof, not the parse. Of the proven answer sets, the one closest to ``prior`` (the
+    current record: an edit changes few answers) wins, then the one leaving the most text
+    to the template; none, or a tie on both, is a refusal."""
     import itertools
 
     slot_list = list(dict.fromkeys(slots))
@@ -468,11 +470,14 @@ def extract_answers(
     # swallow its heading. Each such reading moves template text INTO a value, so the
     # reading that leaves the most text to the template (the least in the values) is the
     # template's own. A tie at that minimum is a real ambiguity, and refuses.
-    def weight(a: dict[str, str]) -> int:
-        return sum(len(v) for v in a.values())
+    # The current record ranks first: "Op. St. Louis." also reads as AGE="St",
+    # LOCATION="Louis" (L2, reproduced), and only the record says AGE was blank.
+    def rank(a: dict[str, str]) -> tuple[int, int]:
+        moved = sum(a[s] != prior.get(s, "") for s in slot_list) if prior else 0
+        return moved, sum(len(v) for v in a.values())
 
-    best = min(weight(a) for a in proven.values())
-    winners = [a for a in proven.values() if weight(a) == best]
+    best = min(rank(a) for a in proven.values())
+    winners = [a for a in proven.values() if rank(a) == best]
     if len(winners) > 1:
         diff = sorted({s for a in winners for b in winners for s in slot_list if a[s] != b[s]})
         raise AdoptRefused(f"the seed reads as more than one answer set; the field(s) "

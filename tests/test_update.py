@@ -28,6 +28,13 @@ def _inst(**kw) -> InstalledSet:
     return InstalledSet(**base)
 
 
+@pytest.fixture(autouse=True)
+def _an_install(tmp_path):
+    """Every install has a .levain/ (its store lives there); `levain update` refuses a
+    path without one rather than creating it (the install lock's create=False)."""
+    (tmp_path / ".levain").mkdir(exist_ok=True)
+
+
 @pytest.fixture
 def declared(monkeypatch):
     d = CompatSet(levain="0.3.4", anneal="0.9.5", schema="partnership")

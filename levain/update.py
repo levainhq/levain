@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Callable
 
 from levain import manifest, reconcile
-from levain.install import InstallBusy, install_lock, refresh_adapter
+from levain.install import InstallLockError, install_lock, refresh_adapter
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
 Emit = Callable[[str], None]
@@ -64,9 +64,9 @@ def run_update(
         return _run_update(path, **kwargs)  # type: ignore[arg-type]
     install = Path(str(path)).expanduser().resolve()
     try:
-        with install_lock(install):
+        with install_lock(install, create=False):
             return _run_update(path, **kwargs)  # type: ignore[arg-type]
-    except InstallBusy as e:
+    except InstallLockError as e:
         emit(f"FAIL: {e.message}")
         return 1
 
@@ -127,7 +127,7 @@ def _run_update(
         engine_clean = not drift.has_actionable_drift and not drift.has_unknown
         if packs_drifted:
             reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
-        plan = refresh_adapter(install, apply=False, emit=emit)
+        plan = refresh_adapter(install, apply=False, emit=emit, carrier=not packs_drifted)
         if engine_clean and not packs_drifted and not plan.refreshed and not plan.review:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
@@ -251,7 +251,8 @@ def _run_update(
     # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
     #    `pip install -U levain` changes neither; only `init --force` used to). After the
     #    pack reconcile, which may have changed the roster the carrier lists. --
-    adapter_needs_review = bool(refresh_adapter(install, apply=True, emit=emit).review)
+    adapter_needs_review = bool(refresh_adapter(
+        install, apply=True, emit=emit, carrier=not pack_needs_review).review)
 
     # -- 4. record the lock (reality after reconcile) — carry the updated pack
     #    provenance so a reconciled pack stops re-drifting; write_lock always writes

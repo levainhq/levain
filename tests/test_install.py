@@ -3175,3 +3175,41 @@ def test_a_concurrent_init_force_is_refused_and_writes_nothing(tmp_path, capsys)
     assert (install / "seed" / "world.md").read_text(encoding="utf-8") == world
     assert run_init(install, "openhands", force=True, answers_file=af) == 0
     assert "Someone Else" in (install / "seed" / "world.md").read_text(encoding="utf-8")
+
+
+def test_install_lock_proceeds_where_the_filesystem_cannot_lock(tmp_path, monkeypatch, capsys):
+    # L2 MED: ENOLCK/ENOTSUP (NFS without lockd, some SMB/FUSE homes) is not "busy";
+    # refusing would block every init and update there forever.
+    import errno
+
+    def no_locks(_fd, _op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    with install_lock(tmp_path):
+        pass
+    assert "cannot lock" in capsys.readouterr().err
+
+
+def test_install_lock_names_an_unwritable_levain_dir(tmp_path):
+    # L2 LOW, reproduced: a read-only .levain gave a PermissionError traceback.
+    from levain.install import InstallLockError
+
+    levain = tmp_path / ".levain"
+    levain.mkdir()
+    os.chmod(levain, 0o500)
+    try:
+        with pytest.raises(InstallLockError, match="cannot open the install lock"):
+            with install_lock(tmp_path):
+                pass
+    finally:
+        os.chmod(levain, 0o700)
+
+
+def test_install_lock_never_creates_a_levain_dir_when_told_not_to(tmp_path):
+    from levain.install import InstallLockError
+
+    with pytest.raises(InstallLockError, match="not a levain install"):
+        with install_lock(tmp_path, create=False):
+            pass
+    assert not (tmp_path / ".levain").exists()

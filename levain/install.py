@@ -523,7 +523,7 @@ def run_init(
                 # `levain init --force` doesn't offer to resume stale answers.
                 _clear_checkpoint(install)
                 copied_docs = _refresh_pack_docs(install, pack_manifests, pack_dirs)
-        except InstallBusy as e:
+        except InstallLockError as e:
             print(f"FAIL: {e.message}")  # refused before any write: no partial-state report
             return 1
         except InitError as e:
@@ -1201,7 +1201,11 @@ class InitError(Exception):
         self.message = message
 
 
-class InstallBusy(InitError):
+class InstallLockError(InitError):
+    """The install lock could not be taken; nothing was written."""
+
+
+class InstallBusy(InstallLockError):
     """Another levain process is writing this install right now; nothing was written."""
 
 
@@ -1211,7 +1215,7 @@ _held_install_locks_guard = threading.Lock()
 
 
 @contextmanager
-def install_lock(install: Path) -> Iterator[None]:
+def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     """Hold the per-install SINGLE-WRITER lock (``.levain/install.lock``, an exclusive
     non-blocking ``flock``) for the duration, or raise :class:`InstallBusy` at once.
 
@@ -1243,13 +1247,42 @@ def install_lock(install: Path) -> Iterator[None]:
             with _held_install_locks_guard:
                 _held_install_locks[key] -= 1
         return
+    import errno
+
     path = install.joinpath(*INSTALL_LOCK_REL)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    if not create and not path.parent.is_dir():
+        # `update` / `adopt-answers` on a path that is not an install must not leave a
+        # .levain/ behind, which would make a later `init` there refuse a non-empty dir.
+        raise InstallLockError(f"{install} is not a levain install (no .levain/ directory).")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        _ensure_gitignored(path.parent, path.name)
+    except OSError as e:
+        raise InstallLockError(
+            f"cannot open the install lock {path} ({e.strerror or e}). Nothing was "
+            f"written; fix the permissions on {path.parent} and re-run."
+        ) from None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                # A filesystem without lock support (NFS without lockd, some SMB/FUSE
+                # homes) is not "another process": proceed unguarded, and say so.
+                print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
+                      f"continuing without the guard against a concurrent init/update.",
+                      file=sys.stderr)
+                os.close(fd)
+                fd = -1
+                with _held_install_locks_guard:
+                    _held_install_locks[key] = 1
+                try:
+                    yield
+                finally:
+                    with _held_install_locks_guard:
+                        del _held_install_locks[key]
+                return
             raise InstallBusy(
                 f"another levain process (an `init` or `update`) is writing {install} "
                 f"right now. This run installed nothing; re-run once that one has finished."
@@ -1263,7 +1296,8 @@ def install_lock(install: Path) -> Iterator[None]:
                 del _held_install_locks[key]
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
-        os.close(fd)
+        if fd >= 0:
+            os.close(fd)
 
 
 @contextmanager
@@ -1723,6 +1757,7 @@ def _read_adapter_receipt(install: Path) -> dict[str, str] | None:
 
 def _write_adapter_receipt(install: Path, files: Mapping[str, str]) -> None:
     """Record the adapter files' written hashes (atomic). Raises OSError."""
+    _ensure_gitignored(install / ".levain", ADAPTER_RECEIPT_REL[-1])
     _atomic_write_text(
         install.joinpath(*ADAPTER_RECEIPT_REL),
         json.dumps({"schema": 1, "files": dict(sorted(files.items()))}, indent=2) + "\n",
@@ -1765,9 +1800,12 @@ def record_adapter_receipt(
                                  python_path, import_seed, on_demand_seed)
     if not files:
         return
+    if adapter == "codex":  # init writes codex's hooks.json too (machine-global)
+        files = {**files, _codex_home() / "hooks.json": _codex_hooks_json(
+            templates_root / "adapters" / adapter, python_path, install)}
     try:
         _write_adapter_receipt(install, {
-            target.relative_to(install).as_posix(): _sha256_text(text)
+            _adapter_key(install, target): _sha256_text(text)
             for target, text in files.items()
         })
     except OSError as e:
@@ -1801,32 +1839,36 @@ def _expected_activation(
     return out
 
 
+PENDING_REL = (".levain", "pending")
+
+
 def refresh_adapter(
-    install: Path, *, apply: bool, emit: Callable[[str], None] = print
+    install: Path, *, apply: bool, emit: Callable[[str], None] = print,
+    carrier: bool = True,
 ) -> AdapterRefresh:
     """Bring the install's activation tree and adapter files up to what THIS levain
     renders, after ``pip install -U levain`` (gap #19: until now only ``levain init
     --force`` did, re-running the whole interview).
 
-    Decided PER FILE from three hashes: the file on disk, what the package renders now,
-    and what levain last wrote (the activation receipt; ``.levain/adapter-receipt.json``
-    for the adapter files):
+    Decided PER FILE (:func:`_refresh_decision`) from three hashes: the file on disk, what
+    the package renders now, and what levain last wrote (the activation receipt;
+    ``.levain/adapter-receipt.json`` for the carrier, settings, MCP and codex hooks). An
+    operator's edit is never overwritten: where the package ALSO moved, the package's
+    version is put beside the install under ``.levain/pending/`` and the file is listed
+    for review ONCE (exit 1), after which the record holds the package's hash so later
+    runs are quiet. With no record at all (an install from before the receipts), only
+    activation hooks are replaced, because they are levain's own code and ``doctor``
+    already calls a stale one a pending upgrade; the old copy is backed up first.
+    Nothing is ever replaced whole, so a file the operator added is never moved.
 
-    - on disk == package: current.
-    - on disk == last written: unedited, so the package's version is written.
-    - edited, and the package's version has not moved: the operator's edit is kept, quietly
-      (``activation/posture.md`` is meant to be edited).
-    - edited, AND the package moved: kept, and listed for review (exit 1): only the
-      operator can merge the two.
-    - no record (an install from before the receipts): the activation tree is replaced
-      whole exactly as ``init --force`` does it, the previous tree kept in
-      ``.levain/backups/activation/``; an adapter file is backed up beside itself first.
-    - an unreadable activation receipt: the activation tree is not touched (review).
-
-    The seed files and the interview are not touched: the pack reconcile owns seeds.
-    Codex's machine-global hooks.json / config.toml are rewritten only when they already
-    belong to this install (:func:`_refresh_codex_global`); otherwise they are named and
-    left alone, because replacing them repoints every codex session on the machine."""
+    The seed files and the interview are not touched: the pack reconcile owns seeds. So
+    the carrier (CLAUDE.md / AGENTS.md, whose import list IS the seed set) is refreshed
+    only when the caller says the pack layer is settled (``carrier``) and every seed it
+    would import is on disk; otherwise it would load a seed the reconcile held back.
+    Codex's machine-global hooks.json is handled only when it already names this
+    install, and config.toml only when it already registers this install's store;
+    otherwise they are named and left alone, because replacing them repoints every
+    codex session on the machine."""
     from levain import manifest
 
     out = AdapterRefresh()
@@ -1843,7 +1885,7 @@ def refresh_adapter(
         return out
     python_path = sys.executable
     anneal_path = manifest.resolve_anneal_bin()
-    verb = "refreshed" if apply else "would refresh"
+    lines: list[str] = []
     with _templates_root() as templates_root:
         try:
             roster = compose_roster([templates_root, *pack_dirs])
@@ -1858,15 +1900,36 @@ def refresh_adapter(
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
             return out
-        lines: list[str] = []
-        _refresh_activation(install, expected, activation_roots, base_activation,
-                            anneal_path, apply=apply, out=out, lines=lines, emit=emit)
+        _refresh_activation(install, expected, apply=apply, out=out, lines=lines)
+        carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
+        missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
+                         if not (install / "seed" / e.name).is_file())
+        held = None
+        if not carrier:
+            held = "the pack reconcile above is holding seed changes for review"
+        elif missing:
+            held = f"it would load seed file(s) not installed yet: {', '.join(missing)}"
+        if held is not None:
+            files = {t: x for t, x in files.items() if t.name != carrier_name}
+            lines.append(f"  {carrier_name}: not refreshed, because {held}; re-onboard "
+                         f"(`levain init --force`) or settle that first.")
+        if adapter == "codex":
+            hooks = _codex_home() / "hooks.json"
+            here = _read_or_none(hooks)
+            want = _codex_hooks_json(adapter_root, python_path, install)
+            if here is not None and here != want and not _names_install(here, install):
+                lines.append(f"  note: {hooks} belongs to another install, so `levain "
+                             f"update` left it alone (rewriting it repoints every codex "
+                             f"session).")
+            elif here is not None:
+                files = {**files, hooks: want}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
         if adapter == "codex":
-            _refresh_codex_global(install, adapter_root, python_path, apply=apply, out=out,
+            _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
     if out.refreshed or lines:
         emit(f"\n• adapter files ({adapter}):")
+        verb = "refreshed" if apply else "would refresh"
         for rel in out.refreshed:
             emit(f"  {rel}: {verb} to this levain's version")
         for ln in lines:
@@ -1874,7 +1937,175 @@ def refresh_adapter(
     return out
 
 
-def _refresh_codex_global(
+def _read_or_none(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return ""  # unreadable: equal to nothing levain wrote
+
+
+def _names_install(text: str, install: Path) -> bool:
+    """Whether codex's hooks.json points INTO this install: its path followed by a
+    separator, so ``/x/inst`` never claims ``/x/inst2`` (L2 HIGH, reproduced)."""
+    return (str(install) + os.sep) in text
+
+
+def _refresh_decision(
+    here: bytes | None, want: bytes, last: str | None, *, levain_code: bool
+) -> str:
+    """What to do with one file. ``here`` is its bytes on disk (None: absent), ``want``
+    what the package renders now, ``last`` the hash levain last recorded for it (None: no
+    record). Returns ``current`` | ``write`` | ``write_backup`` | ``keep`` | ``pending``.
+
+    ``pending`` = keep the operator's file, put the package's version under
+    .levain/pending/, list it for review, and record the package's hash so the review
+    fires once per package change rather than on every run."""
+    import hashlib
+
+    def sha(b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+
+    if here == want:
+        return "current"
+    if here is None:
+        if last is None:
+            return "write"  # new in this release
+        return "keep" if sha(want) == last else "pending"  # the operator deleted it
+    if last is None:
+        return "write_backup" if levain_code else "pending"
+    if sha(here) == last:
+        return "write"  # unedited since levain wrote it
+    return "keep" if sha(want) == last else "pending"
+
+
+def _put_pending(install: Path, key: str, data: bytes) -> Path:
+    target = install.joinpath(*PENDING_REL, *key.split("/"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_gitignored(install / ".levain", PENDING_REL[-1] + "/")
+    _atomic_write_bytes(target, data)
+    return target
+
+
+def _refresh_activation(
+    install: Path,
+    expected: Mapping[str, tuple[bytes, Path]],
+    *,
+    apply: bool,
+    out: AdapterRefresh,
+    lines: list[str],
+) -> None:
+    import hashlib
+
+    dst = install / "activation"
+    if dst.is_symlink():
+        lines.append(f"  note: activation/ is a symlink to {os.readlink(dst)}; it is yours "
+                     f"to manage, so it was not refreshed.")
+        return
+
+    def disk(rel: str) -> bytes | None:
+        try:
+            return (dst / rel).read_bytes()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return b""
+
+    if all(disk(rel) == want for rel, (want, _src) in expected.items()):
+        return
+    receipt, status = read_activation_receipt(install)
+    if status in ("corrupt", "empty"):
+        out.review.append("activation/")
+        lines.append(f"  activation/: NOT refreshed — its install receipt is unreadable "
+                     f"({status}), so your edits cannot be told from the package's files. "
+                     f"Re-onboard (`levain init --force`) to replace it whole.")
+        return
+    record = receipt or {}
+    new_receipt = dict(record)
+    stamp = time.time_ns()
+    for rel, (want, src) in sorted(expected.items()):
+        here = disk(rel)
+        last = record[rel]["installed"] if rel in record else None
+        action = _refresh_decision(here, want, last, levain_code=rel.startswith("hooks/")
+                                   and rel.endswith(".py"))
+        entry = {"installed": hashlib.sha256(want).hexdigest(),
+                 "source": _sha256_stream(src)}
+        if action == "keep":
+            continue
+        if action == "current":
+            if rel not in record:
+                new_receipt[rel] = entry  # a pre-receipt install gains its record
+            continue
+        key = f"activation/{rel}"
+        if action == "pending":
+            out.review.append(key)
+            if apply:
+                try:
+                    where = _put_pending(install, key, want)
+                    new_receipt[rel] = entry
+                except OSError as e:
+                    lines.append(f"  {key}: could not stage the package's version ({e}).")
+                    continue
+            else:
+                where = install.joinpath(*PENDING_REL, *key.split("/"))
+            lines.append(f"  {key}: yours is kept (edited, or levain has no record of "
+                         f"writing it), and this levain ships a different version, now at "
+                         f"{where}. Merge it in, or copy it over yours if you never edited "
+                         f"it. Listed once: the next update is quiet about it.")
+            continue
+        out.refreshed.append(key)
+        if not apply:
+            continue
+        target = dst / rel
+        try:
+            if action == "write_backup" and here is not None:
+                backup = install / ".levain" / "backups" / "activation" / f"files-{stamp}" / rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                lines.append(f"  {key}: levain has no record of writing it, so the "
+                             f"previous copy is kept at {backup}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(target, want, like=src)
+            new_receipt[rel] = entry
+        except OSError as e:
+            out.refreshed.pop()
+            out.review.append(key)
+            lines.append(f"  {key}: could not be written ({e}).")
+    if apply and new_receipt != record:
+        try:
+            _write_activation_receipt(install, new_receipt)
+        except OSError as e:
+            lines.append(f"  note: could not update the activation receipt ({e}); the next "
+                         f"`levain update` re-checks these files.")
+
+
+def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) -> None:
+    """Unique temp + fsync + ``os.replace``, keeping ``like``'s permission bits (a hook
+    script must stay executable). A symlinked target is resolved first, so the LINK
+    survives and its target gets the bytes (the class ``_atomic_write_text`` was fixed for:
+    a dotfiles-managed file would otherwise turn into a plain file)."""
+    target = target.resolve()
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if like is not None:
+            os.chmod(tmp, stat.S_IMODE(like.stat().st_mode))
+        elif target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _refresh_codex_config(
     install: Path,
     adapter_root: Path,
     python_path: str,
@@ -1883,38 +2114,15 @@ def _refresh_codex_global(
     out: AdapterRefresh,
     lines: list[str],
 ) -> None:
-    """Codex's hooks.json and config.toml are MACHINE-GLOBAL: replacing them repoints every
-    codex session on the machine. So each is refreshed only when it already belongs to THIS
-    install (hooks.json names it; the config block's ``--db`` is its store), which makes the
-    write a refresh of this install's own registration, never a repoint. One that belongs to
-    another install is named and left alone. Both writes keep init's backups."""
-    home = _codex_home()
-    hooks = home / "hooks.json"
-    want = _codex_hooks_json(adapter_root, python_path, install)
-    try:
-        here: str | None = hooks.read_text(encoding="utf-8")
-    except OSError:
-        here = None
-    if here is not None and here != want:
-        if str(install) in here:
-            out.refreshed.append(str(hooks))
-            if apply:
-                try:
-                    _write_codex_hooks(hooks, want, lines.append)
-                except OSError as e:
-                    out.refreshed.pop()
-                    out.review.append(str(hooks))
-                    lines.append(f"  {hooks}: could not be written ({e}).")
-        else:
-            lines.append(f"  note: {hooks} belongs to another install, so `levain update` "
-                         f"left it alone (rewriting it repoints every codex session).")
-    config = home / "config.toml"
+    """config.toml's ``[mcp_servers.anneal_memory]`` block, only when it already registers
+    THIS install's store (so the write is never a repoint). ``_merge_codex_config`` keeps
+    its own backups and says what it replaced."""
+    config = _codex_home() / "config.toml"
     fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
     fragment = fragment.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
     fragment = fragment.replace("{{INSTALL_DIR}}", str(install))
-    try:
-        existing = config.read_text(encoding="utf-8")
-    except OSError:
+    existing = _read_or_none(config)
+    if not existing:
         return
     old_block = _CODEX_MCP_BLOCK_RE.search(existing)
     new_block = _CODEX_MCP_BLOCK_RE.search(fragment)
@@ -1936,113 +2144,47 @@ def _refresh_codex_global(
             lines.append(f"  {config}: could not be written ({e}).")
 
 
-def _refresh_activation(
-    install: Path,
-    expected: Mapping[str, tuple[bytes, Path]],
-    activation_roots: Sequence[Path],
-    base_activation: Path,
-    anneal_path: str | None,
-    *,
-    apply: bool,
-    out: AdapterRefresh,
-    lines: list[str],
-    emit: Callable[[str], None],
-) -> None:
-    import hashlib
-
-    dst = install / "activation"
-    if dst.is_symlink():
-        lines.append(f"  note: activation/ is a symlink to {os.readlink(dst)}; it is yours "
-                     f"to manage, so it was not refreshed.")
-        return
-
-    def _disk(rel: str) -> bytes | None:
-        try:
-            return (dst / rel).read_bytes()
-        except FileNotFoundError:
-            return None
-
-    stale = {rel for rel, (want, _src) in expected.items() if _disk(rel) != want}
-    if not stale:
-        return
-    receipt, status = read_activation_receipt(install)
-    if status in ("corrupt", "empty"):
-        out.review.append("activation/")
-        lines.append(f"  activation/: NOT refreshed — its install receipt is unreadable "
-                     f"({status}), so your edits cannot be told from the package's files. "
-                     f"Re-onboard (`levain init --force`) to replace it whole.")
-        return
-    if status == "absent" or receipt is None:
-        # From before the receipt: init --force's own semantics, the whole previous tree
-        # kept under .levain/backups/activation/ (spore-861 ruling B).
-        out.refreshed.append("activation/ (whole tree: no install receipt covers it; the "
-                             "previous tree is kept under .levain/backups/activation/)")
-        if apply:
-            try:
-                _copy_activation_tree(activation_roots, dst, base_activation=base_activation,
-                                      anneal_path=anneal_path, emit=lines.append)
-            except (InitError, OSError) as e:
-                out.refreshed.pop()
-                out.review.append("activation/")
-                lines.append(f"  activation/: could not be replaced ({e}).")
-        return
-
-    def _sha(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
-    new_receipt = dict(receipt)
-    for rel in sorted(stale):
-        want, src = expected[rel]
-        here = _disk(rel)
-        rec = receipt.get(rel)
-        last = rec["installed"] if rec else None
-        if here is not None and last is not None and _sha(here) != last:
-            if _sha(want) == last:
-                continue  # an operator edit of a file the package has not changed
-            out.review.append(f"activation/{rel}")
-            lines.append(f"  activation/{rel}: you edited it AND this levain ships a new "
-                         f"version; your copy is kept. Merge by hand, or take the package's "
-                         f"with `levain init --force` (your copy goes to the backups).")
-            continue
-        if here is None and last is not None and _sha(want) == last:
-            continue  # the operator deleted it and the package has not changed it
-        out.refreshed.append(f"activation/{rel}")
-        if apply:
-            target = dst / rel
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write_bytes(target, want, like=src)
-                new_receipt[rel] = {"installed": _sha(want), "source": _sha256_stream(src)}
-            except OSError as e:
-                out.refreshed.pop()
-                out.review.append(f"activation/{rel}")
-                lines.append(f"  activation/{rel}: could not be written ({e}).")
-    if apply and new_receipt != receipt:
-        try:
-            _write_activation_receipt(install, new_receipt)
-        except OSError as e:
-            lines.append(f"  note: could not update the activation receipt ({e}); the next "
-                         f"`levain update` re-checks these files.")
-
-
-def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) -> None:
-    """Unique temp + fsync + ``os.replace``, keeping ``like``'s permission bits (a hook
-    script must stay executable)."""
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+def _adapter_key(install: Path, target: Path) -> str:
+    """The adapter receipt's key: a path inside the install, or ``codex-home/<name>`` for a
+    file in the machine-global CODEX_HOME."""
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        if like is not None:
-            os.chmod(tmp, stat.S_IMODE(like.stat().st_mode))
-        os.replace(tmp, target)
-    except BaseException:
+        return target.relative_to(install).as_posix()
+    except ValueError:
+        return f"codex-home/{target.name}"
+
+
+def _same_json_shape(a: str, b: str, *, install: Path | None = None, mcp: bool = False) -> bool:
+    """Both parse as JSON with the same key tree and list lengths: they may differ only in
+    leaf values. With ``mcp``, the ``anneal_memory`` server's ``command`` and ``args`` are
+    levain's own launcher (spore-751 changed its shape) and are set aside, but only while
+    the old args still serve THIS install's store, so a repointed server never counts."""
+    try:
+        x, y = json.loads(a), json.loads(b)
+    except ValueError:
+        return False
+    if mcp:
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+            old_srv = x["mcpServers"]["anneal_memory"]
+            new_srv = y["mcpServers"]["anneal_memory"]
+            args = old_srv["args"]
+            store = str((install or Path()) / ".levain" / "memory.db")
+            if not (isinstance(args, list) and "--db" in args
+                    and args[args.index("--db") + 1:args.index("--db") + 2] == [store]):
+                return False
+            for srv in (old_srv, new_srv):
+                srv.pop("command", None)
+                srv.pop("args", None)
+        except (KeyError, TypeError, AttributeError, ValueError):
+            return False
+
+    def same(u: object, v: object) -> bool:
+        if isinstance(u, dict) and isinstance(v, dict):
+            return u.keys() == v.keys() and all(same(u[k], v[k]) for k in u)
+        if isinstance(u, list) and isinstance(v, list):
+            return len(u) == len(v) and all(same(i, j) for i, j in zip(u, v))
+        return not isinstance(u, (dict, list)) and not isinstance(v, (dict, list))
+
+    return same(x, y)
 
 
 def _refresh_adapter_files(
@@ -2054,45 +2196,73 @@ def _refresh_adapter_files(
     lines: list[str],
 ) -> None:
     receipt = _read_adapter_receipt(install)
-    new_receipt = dict(receipt or {})
+    record = receipt or {}
+    new_receipt = dict(record)
     for target, text in files.items():
-        rel = target.relative_to(install).as_posix()
-        want = _sha256_text(text)
+        key = _adapter_key(install, target)
+        want_text = text
+        want = text.encode("utf-8")
         try:
-            here = target.read_text(encoding="utf-8")
+            here_text: str | None = target.read_text(encoding="utf-8")
         except FileNotFoundError:
-            here = None
-        except (OSError, ValueError):
-            here = ""  # unreadable: never equal to anything levain wrote
-        last = (receipt or {}).get(rel)
-        if here == text:
-            new_receipt[rel] = want
+            here_text = None
+        except (OSError, ValueError) as e:
+            out.review.append(key)
+            lines.append(f"  {key}: could not be read ({e}), so whether it is current "
+                         f"cannot be told.")
             continue
-        if here is not None and last is not None and _sha256_text(here) != last:
-            if want == last:
-                continue  # an operator edit; the package has not moved this file
-            out.review.append(rel)
-            lines.append(f"  {rel}: you edited it AND this levain renders it differently; "
-                         f"your copy is kept. Merge by hand, or take levain's with "
-                         f"`levain init --force`.")
+        here = None if here_text is None else here_text.encode("utf-8")
+        action = _refresh_decision(here, want, record.get(key), levain_code=False)
+        if (action == "pending" and key not in record and here_text is not None
+                and target.suffix == ".json"
+                and _same_json_shape(here_text, want_text, install=install,
+                                     mcp=target.name == ".mcp.json")):
+            # No record, but the file is levain's own render from an earlier release: the
+            # same keys and list lengths, only leaf strings (interpreter / anneal paths)
+            # differ. An operator's addition (a server, a hook, a permission) changes the
+            # shape and is staged instead. Its old copy is still kept.
+            action = "write_backup"
+        if action == "keep":
             continue
-        out.refreshed.append(rel)
+        if action == "current":
+            new_receipt[key] = _sha256_text(want_text)
+            continue
+        if action == "pending":
+            out.review.append(key)
+            if apply:
+                try:
+                    where = _put_pending(install, key, want)
+                    new_receipt[key] = _sha256_text(want_text)
+                except OSError as e:
+                    lines.append(f"  {key}: could not stage levain's version ({e}).")
+                    continue
+            else:
+                where = install.joinpath(*PENDING_REL, *key.split("/"))
+            lines.append(f"  {key}: yours is kept (edited, or levain has no record of "
+                         f"writing it), and this levain renders it differently, now at "
+                         f"{where}. Merge it in, or copy it over yours if you never edited "
+                         f"it. Listed once: the next update is quiet about it.")
+            continue
+        out.refreshed.append(str(target) if key.startswith("codex-home/") else key)
         if not apply:
             continue
         try:
-            if here is not None and last is None:
-                backup = _timestamped_backup_path(target)  # no record: it may be an edit
-                shutil.copy2(target, backup)
-                lines.append(f"  {rel}: no record of what levain wrote here, so the "
-                             f"previous copy is kept at {backup.name}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_text(target, text)
-            new_receipt[rel] = want
+            if key.startswith("codex-home/"):
+                _write_codex_hooks(target, want_text, lines.append)  # backs up itself
+            else:
+                if action == "write_backup" and here_text is not None:
+                    backup = _timestamped_backup_path(target)
+                    shutil.copy2(target, backup)
+                    lines.append(f"  {key}: levain has no record of writing it, so the "
+                                 f"previous copy is kept at {backup.name}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_text(target, want_text)
+            new_receipt[key] = _sha256_text(want_text)
         except OSError as e:
             out.refreshed.pop()
-            out.review.append(rel)
-            lines.append(f"  {rel}: could not be written ({e}).")
-    if apply and new_receipt != (receipt or {}):
+            out.review.append(key)
+            lines.append(f"  {key}: could not be written ({e}).")
+    if apply and new_receipt != record:
         try:
             _write_adapter_receipt(install, new_receipt)
         except OSError as e:
@@ -2126,11 +2296,24 @@ def run_adopt_answers(
     ALL-OR-REFUSE: every render seed must read back to exactly one answer set that
     re-renders to it (``answers.extract_answers``), and the result must pass the same
     validation as ``init --answers``. Anything less writes nothing and exits 1."""
+    install = Path(str(path)).expanduser().resolve()
+    if dry_run:
+        return _adopt_answers(install, dry_run=True, emit=emit)
+    try:
+        # Held across the READS too: a concurrent init/update between reading the seeds
+        # and writing the record would otherwise be overwritten by a stale reading.
+        with install_lock(install, create=False):
+            return _adopt_answers(install, dry_run=False, emit=emit)
+    except InstallLockError as e:
+        emit(f"FAIL: {e.message}")
+        emit("  Nothing was written; the record is unchanged.")
+        return 1
+
+
+def _adopt_answers(install: Path, *, dry_run: bool, emit: Callable[[str], None]) -> int:
     from levain import manifest
     from levain.answers import AdoptRefused, extract_answers, validate_answers
     from levain.interview import build_field_plan, parse_template, render_template
-
-    install = Path(str(path)).expanduser().resolve()
 
     def refuse(why: str) -> int:
         emit(f"FAIL: {why}")
@@ -2140,6 +2323,12 @@ def run_adopt_answers(
     if not (install / "seed").is_dir():
         return refuse(f"{install} has no seed/ directory, so it is not a levain install.")
     recorded, status = manifest.read_pack_locks_status(install)
+    drifted = [d.name for d in manifest.compute_pack_drift(recorded) if d.drifted]
+    if drifted:
+        return refuse(f"pack(s) {', '.join(drifted)} changed since the seeds were rendered, "
+                      f"so the templates read here are not the ones your seeds came from. "
+                      f"Run `levain update` first.")
+    old = read_answers(install)
     if status == "corrupt":
         return refuse("the lock's pack provenance is unreadable, so which templates this "
                       "install was rendered from cannot be known.")
@@ -2166,7 +2355,8 @@ def run_adopt_answers(
             optional = [sec.slots for sec in spec.sections if sec.title and sec.optional]
             try:
                 got = extract_answers(text, slots=slots, optional_sections=optional,
-                                      render=lambda a, spec=spec: render_template(spec, a))
+                                      render=lambda a, spec=spec: render_template(spec, a),
+                                      prior=old)
             except AdoptRefused as e:
                 return refuse(f"seed/{name}: {e}"
                               f"{_first_foreign_line(spec, text, read_answers(install))}")
@@ -2180,7 +2370,15 @@ def run_adopt_answers(
     if errors:
         return refuse("what the seed files say is not a valid record:\n    "
                       + "\n    ".join(errors))
-    old = read_answers(install)
+    if old:
+        # A slot the record never held was never asked. Recording it as "" would make
+        # `update` treat it as answered and re-render it blank (L1, reproduced: a field
+        # an upstream template added after the seed was rendered).
+        unasked = sorted(sl for sl in merged if sl not in old and not merged[sl])
+        if unasked:
+            return refuse(f"the template asks {', '.join(unasked)}, which your record never "
+                          f"answered and your seed files do not fill. Answer it in the seed "
+                          f"(or re-onboard), then re-run.")
     changed = sorted(sl for sl in merged if old.get(sl) != merged[sl])
     dropped = sorted(set(old) - set(merged))
     if not changed and not dropped:
@@ -2205,12 +2403,8 @@ def run_adopt_answers(
     if dry_run:
         emit("--dry-run: nothing was written.")
         return 0
-    try:
-        with install_lock(install):
-            if not write_answers(install, merged, emit):
-                return refuse("the record could not be written.")
-    except InstallBusy as e:
-        return refuse(e.message)
+    if not write_answers(install, merged, emit):
+        return refuse("the record could not be written.")
     emit("Recorded. A re-render from the record now reproduces your seed files.")
     return 0
 

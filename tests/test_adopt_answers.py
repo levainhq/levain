@@ -119,3 +119,51 @@ def test_the_cli_wires_it(install, capsys):
     assert "Would adopt" in capsys.readouterr().out
     assert main(["adopt-answers", "--path", str(install)]) == 0
     assert read_answers(install)["LOCATION"] == "Lakewood"
+
+
+def test_the_current_record_breaks_a_misreadable_edit(install):
+    # L2, reproduced: "Op. St. Louis." also reads as AGE="St", LOCATION="Louis" and both
+    # re-render identically; the record says AGE was blank, so that reading loses.
+    world = install / "seed" / "world.md"
+    text = world.read_text(encoding="utf-8")
+    assert "Chris. Riverton." in text
+    world.write_text(text.replace("Chris. Riverton.", "Chris. St. Louis."), encoding="utf-8")
+    code, out = _adopt(install)
+    assert code == 0
+    record = read_answers(install)
+    assert (record["AGE"], record["LOCATION"]) == ("", "St. Louis")
+
+
+def test_a_slot_the_record_never_held_is_not_recorded_blank(install):
+    # L1, reproduced: a field a template added after the seed was rendered was adopted as
+    # "", so `update` would never ask it and re-render it blank.
+    path = install / ".levain" / "answers.json"
+    record = json.loads(path.read_text())
+    del record["HEALTH"]
+    path.write_text(json.dumps(record))
+    code, out = _adopt(install)
+    assert code == 1 and "HEALTH" in out and "never answered" in out
+    assert "HEALTH" not in json.loads(path.read_text())
+
+
+def test_a_drifted_pack_is_refused(tmp_path, capsys):
+    from tests.test_init_answers import _filled
+
+    pack = tmp_path / "pack"
+    (pack / "seed").mkdir(parents=True)
+    (pack / "pack.toml").write_text('name = "p"\norder = 10\n')
+    (pack / "seed" / "extra.md").write_text("# extra\n")
+    af = tmp_path / "a.json"
+    af.write_text(json.dumps(_filled(capsys)))
+    inst = tmp_path / "e"
+    assert run_init(inst, "openhands", force=False, packs=[pack], answers_file=af) == 0
+    (pack / "seed" / "extra.md").write_text("# extra v2\n")
+    code, out = _adopt(inst)
+    assert code == 1 and "changed since the seeds were rendered" in out
+
+
+def test_adopt_on_a_path_that_is_not_an_install_creates_nothing(tmp_path):
+    target = tmp_path / "typo"
+    target.mkdir()
+    code, _out = _adopt(target)
+    assert code == 1 and not (target / ".levain").exists()
