@@ -8,11 +8,26 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
-### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
+### Changed — `levain doctor` sends a stale hook or carrier to `levain update`, not `init --force`
 
-`doctor`'s hook-freshness check used to read a receipt it could not parse the same way it reads an install that predates the receipt entirely: both landed on exit 6, "an upgrade step is pending." **A receipt that exists but is unreadable is not a pre-receipt install** — `_write_activation_receipt` is the sole writer and runs only after the tree is in place, a failed write reads as absent (not corrupt), and a failed swap rolls the prior receipt back — so a legitimate install cannot produce a corrupt or empty one. Reading it as "no receipt yet" could downgrade a tampered hook (an appended `os.system(...)`, say) from broken (exit 1) to routine-pending (exit 6). A corrupt or empty receipt now exits 1, naming the receipt's path and why doctor could not read it, with the same `init --force` remedy. An absent receipt (a genuinely pre-receipt install) is unchanged: still exit 6.
+Since `update` refreshes the activation tree and adapter files (below), doctor's remedy for a hook or `CLAUDE.md` / `AGENTS.md` that predates the installed levain is `levain update --path <install>`, which keeps your edits. It used to say these fixes "do not arrive via `levain update`" and sent you to `init --force`, which re-runs the interview. `init --force` stays the remedy for an edited hook you want back to the package's version, and for an unreadable install receipt.
 
-`levain init --force`'s own post-swap notice had the identical gap: absent, corrupt and empty receipts all printed the byte-identical "no install receipt covers it" line for the retained backup tree. Corrupt and empty now say so explicitly — "its install receipt was unreadable (corrupt/empty) … a damaged receipt is not a pre-receipt install" — while absent keeps its original text.
+### Fixed — install truth
+
+- **A pack `order` change alone now moves the installed seed file.** Previously the old winner's copy stayed installed and every later `levain update` reported clean. The lock now records which layer won each seed filename (`wins` on each pack's provenance; a lock without it is read as before), and `update` installs the new winner, backing up an edited copy first. A rendered seed whose win moved is flagged for re-onboard.
+- **Two `levain init --force` runs on one install can no longer interleave.** One of them used to crash mid-swap or leave the activation receipt describing a tree that was not installed. `init` and `update` now take a per-install lock (`.levain/install.lock`), and a second run is refused at once with nothing written. A filesystem that does not support `flock` at all proceeds unguarded, with a note; any other lock error (including `ENOLCK`, e.g. NFS with lockd down) refuses with the real error.
+
+### Added — install truth
+
+- **`levain update` now refreshes the activation tree and the adapter files after an upgrade**: the hooks, `posture.md`, `recency_directives.md`, `CLAUDE.md` / `AGENTS.md`, `.claude/settings.json`, `.mcp.json`, and for codex the `hooks.json` / `config.toml` block that belong to this install. `pip install -U levain` no longer needs `levain init --force` after it.
+  - Each file is decided on its own. A file you edited is kept.
+  - If the new release changed that file too, its new version goes to `.levain/pending/` and the file is listed once for you to merge (`update` exits 1 that run).
+  - On an install made before Levain recorded what it wrote, only hook scripts, and JSON files that differ solely where Levain substitutes your interpreter path, are replaced, each with a backup. Everything else is staged.
+  - Codex's machine-global files are never repointed from another install.
+- **`levain adopt-answers [--dry-run]`.** Reads your interview answers back out of hand-edited `world.md` / `origin.md` (and any pack's rendered seeds) and records them as `.levain/answers.json`, so a re-render from the record keeps your edits instead of reverting them.
+  - All or nothing: a seed that does not read back to an answer set that renders it again is refused, with the first line that departs, and nothing is written.
+  - Also refused: a drifted pack, or a field your record never answered.
+
 
 ### Added — Linux support: a confinement floor and a scheduled seat (K4c)
 
@@ -31,7 +46,7 @@ Levain's sovereign entity now runs on Linux, not only macOS. Two pieces, and the
 
 `levain run` printed *"bash dropped: no OS sandbox on this platform"* whenever the bash hand was unavailable. That was true while macOS was the only supported OS. It is false now in the most common Linux case — a **supported** platform whose kernel refuses to start the sandbox, which is one command away from working — and it is the sentence an operator reads before concluding Levain has no Linux support.
 
-The banner now names the real reason and the fix, and `levain doctor` gained a **confinement floor** check reporting which floor is active or why there is none. It REPORTS, it never FAILS: an entity with only its file-editor hand is a working, supported configuration, and turning a healthy install red for a missing optional hand is how an operator learns to ignore `doctor`. Both surfaces read one shared diagnosis.
+The banner now names the real reason and the fix, and `levain doctor` gained a **confinement floor** check reporting which floor is active or why there is none. A missing hand is reported, never failed: an entity with only its file-editor hand is a working, supported configuration, and turning a healthy install red for a missing optional hand is how an operator learns to ignore `doctor`. Both surfaces read one shared diagnosis.
 
 ### Fixed — `confinement_supported()` could not have reported a second platform correctly
 
@@ -67,6 +82,14 @@ Since 0.4.6 the floor stops the entity from connecting to this machine's own ser
 When a pack's override of a base seed file was dropped, `update` could delete the file outright, or leave it reading as up to date, so the base version never came back. Reconcile now works out which layer owns each seed file: a dropped override restores the layer it hid, an unreadable base layer means nothing is deleted (it is reported instead), a stray Finder `.DS_Store` in a pack's `seed/` no longer makes the whole stack unreadable, a file moved from one pack to another in one update is judged once, and an undecodable `pack.toml` is treated as an unreadable layer rather than crashing `update`. A copy you edited is kept, backed up and reported, never overwritten silently. Each restore or removal prints one line saying what it did.
 
 **Known limit, unchanged from 0.4.7:** a change to a pack's `order` alone, with no override dropped, is not reconciled. The `pack.toml` comment documents it as a v1 limitation.
+
+### Changed — `levain doctor` exits 1, not 6, on a corrupt or empty activation receipt
+
+`doctor`'s hook-freshness check used to read a receipt it could not parse the same way it reads an install that predates the receipt entirely: both landed on exit 6, "an upgrade step is pending." **A receipt that exists but is unreadable is not a pre-receipt install** — `_write_activation_receipt` is the sole writer and runs only after the tree is in place, a failed write reads as absent (not corrupt), and a failed swap rolls the prior receipt back — so a legitimate install cannot produce a corrupt or empty one. Reading it as "no receipt yet" could downgrade a tampered hook (an appended `os.system(...)`, say) from broken (exit 1) to routine-pending (exit 6). A corrupt or empty receipt now exits 1, naming the receipt's path and why doctor could not read it, with the same `init --force` remedy. An absent receipt (a genuinely pre-receipt install) is unchanged: still exit 6.
+
+`levain init --force`'s own post-swap notice had the identical gap: absent, corrupt and empty receipts all printed the byte-identical "no install receipt covers it" line for the retained backup tree. Corrupt and empty now say so explicitly — "its install receipt was unreadable (corrupt/empty) … a damaged receipt is not a pre-receipt install" — while absent keeps its original text.
+
+*(This entry was filed under `[Unreleased]` when 0.4.8 was cut. The change is in the 0.4.8 code, so it belongs here.)*
 
 ## [0.4.7] — 2026-09-14
 

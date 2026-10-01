@@ -290,9 +290,10 @@ def test_doctor_flags_a_stale_carrier_that_still_eagerly_imports_an_on_demand_se
     results = _check_carrier_freshness(install, install / "CLAUDE.md")
     assert results and not results[0].ok
     assert "spore_instructions.md" in results[0].detail
-    # the remedy must be actionable AND must correct the wrong instinct
-    assert "init --force" in results[0].hint
-    assert "update" in results[0].hint
+    # the remedy is `levain update`, which refreshes the carrier since install truth
+    # (test_update_refresh proves following it clears this check)
+    assert "levain update" in results[0].hint
+    assert "init --force" not in results[0].hint
 
 
 def test_doctor_carrier_freshness_passes_on_a_current_carrier(tmp_path: Path):
@@ -850,9 +851,10 @@ def test_hook_freshness_catches_a_stale_installed_hook(tmp_path: Path):
     r = _check_hook_freshness(install)[0]
     assert not r.ok
     assert "_levain_hook.py" in r.detail
-    # the remedy must correct the wrong instinct, not just name a command
-    assert "init --force" in r.hint
-    assert "pip install -U" in r.hint
+    # since install truth `levain update` refreshes hooks; test_update_refresh proves
+    # following this remedy clears the check
+    assert "levain update" in r.hint
+    assert "init --force" not in r.hint
 
 
 def test_hook_freshness_ignores_operator_edits_to_activation_markdown(tmp_path: Path):

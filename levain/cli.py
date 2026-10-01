@@ -794,13 +794,19 @@ def main(argv: list[str] | None = None) -> int:
 
     upd_p = subparsers.add_parser(
         "update",
-        help="Update the known-good version set together (anneal + schema + migrations).",
+        help="Update the known-good version set together (anneal + schema + migrations) "
+             "and refresh the activation tree and adapter files after an upgrade.",
         description=(
             "Reconcile this install's composed stack to the declared known-good "
             "SET in one ordered, fail-safe operation: bring anneal-memory to the "
             "tested version, re-run the partnership schema if the store drifted, "
             "surface anneal's `migrate check` instruction proposals for you to "
-            "apply under review, and record the composed set. The fix for "
+            "apply under review, and record the composed set. After a levain "
+            "upgrade it also refreshes the activation tree and adapter files "
+            "(hooks, posture.md, recency_directives.md, CLAUDE.md / AGENTS.md, "
+            ".claude/settings.json, .mcp.json, codex hooks): a file you edited is "
+            "kept, and where the new release changed it too, its new version is "
+            "staged under .levain/pending/ and listed once. The fix for "
             "version-drift — a new anneal feature landing as a CONFLICT with stale "
             "methodology instructions instead of an addition. The env-mutating pip "
             "step is gated (it prompts; --yes auto-confirms, --no-pip skips it)."

@@ -562,3 +562,33 @@ def test_update_does_not_install_a_pack_hook_the_reconcile_is_holding(tmp_path, 
     assert rc == 1 and "activation changed" in out
     assert hook.read_text() == "print('v1')\n", "an unreviewed pack hook was installed"
     assert base.read_bytes() == current, "a base hook fix was held along with the pack hook"
+
+
+def test_doctor_names_update_for_a_stale_hook_and_carrier_and_update_clears_both(make_install):
+    """Reproduced at 19811f7 (the merge of install truth): doctor's stale-hook remedy said
+    hook fixes "do NOT arrive via ... `levain update`" and sent the operator to
+    `init --force`, which re-runs the whole interview, while `levain update` (this
+    refresh) already cleared the same hook. The carrier remedy said the same. Follow the
+    remedy doctor prints, then doctor must go green."""
+    from levain.doctor import _check_carrier_freshness, _check_hook_freshness
+
+    install = make_install()
+    hook = install / "activation" / HOOK
+    hook.write_bytes(b"# old hook\n")
+    _set_receipt(install, HOOK, b"# old hook\n")
+    carrier = install / "CLAUDE.md"
+    stale_text = carrier.read_text() + "\n@seed/spore_instructions.md\n"
+    carrier.write_text(stale_text)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"]["CLAUDE.md"] = _sha(stale_text.encode())
+    receipt.write_text(json.dumps(data))
+
+    for check, remedy in ((_check_hook_freshness(install), "hook"),
+                          (_check_carrier_freshness(install, carrier), "carrier")):
+        assert not check[0].ok, remedy
+        assert "levain update" in check[0].hint and "init --force" not in check[0].hint, remedy
+
+    _refresh(install)
+    assert _check_hook_freshness(install)[0].ok
+    assert _check_carrier_freshness(install, carrier)[0].ok

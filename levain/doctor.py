@@ -1395,12 +1395,12 @@ def _check_openhands(install: Path) -> list[CheckResult]:
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
-    ⚠ THE UPGRADE PATH DOES NOT RE-RENDER THIS FILE. Adapter carriers are written at
-    `init` only: `update.py` never calls `apply_init`/`_install_adapter`, and
-    `reconcile.py` says so outright ("the adapter @import list is NOT regenerated").
-    So when a seed file changes class — as `spore_instructions.md` did on 2026-08-01,
-    eager -> on-demand — every EXISTING install keeps eagerly importing it forever,
-    gaining none of the benefit, while every other check stays green.
+    History: when this check was written (2026-08-01), adapter carriers were written at
+    `init` only, so when a seed file changed class — as `spore_instructions.md` did,
+    eager -> on-demand — every EXISTING install kept eagerly importing it, gaining none
+    of the benefit, while every other check stayed green. Since the install-truth
+    work, `levain update` refreshes the carrier (`install.refresh_adapter`), and the
+    remedy below says so; an edited or unrecorded carrier is staged, not overwritten.
 
     That is the same shape as the defect being fixed: the operator cannot see it, and
     nothing tells them. Presence-only carrier checks cannot catch it (the file IS
@@ -1434,13 +1434,10 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
                 False,
                 "eagerly loads seed file(s) now classified on-demand: "
                 + ", ".join(stale),
-                f"This install predates the change. Re-render the carrier with "
-                f"`levain init --force --path {install}` — it RE-RUNS THE INTERVIEW "
-                f"and replaces the whole activation/ tree. Your store is kept, and "
-                f"the previous activation/ tree is moved whole into "
-                f".levain/backups/activation/ first, hooks and all (an old copy is "
-                f"removed only when it provably holds no edits). `levain update` does "
-                f"NOT rewrite the carrier.",
+                f"This install predates the change. Run `levain update --path "
+                f"{install}`: it rewrites {carrier.name} if it is still the copy levain "
+                f"wrote. If you edited it, or levain has no record of writing it, the "
+                f"new version is staged under .levain/pending/ for you to merge.",
                 upgrade_pending=True,
             )
         ]
@@ -1792,13 +1789,12 @@ def _check_hook_freshness(install: Path) -> list[CheckResult]:
                     " (no install receipt covers them, so doctor cannot tell an outdated "
                     "hook from an edited one)" if unproven else ""
                 ),
-                f"Your hooks predate the installed levain version (or were edited), and hook fixes "
-                f"do NOT arrive via `pip install -U` or `levain update`. Re-render "
-                f"with `levain init --force --path {install}` — it RE-RUNS THE "
-                f"INTERVIEW and replaces the whole activation/ tree. Your store is "
-                f"kept, and the previous activation/ tree is moved whole into "
-                f".levain/backups/activation/ first, hooks and all (an old copy is "
-                f"removed only when it provably holds no edits).",
+                f"Your hooks predate the installed levain version. Run `levain update "
+                f"--path {install}`: it replaces each hook levain wrote and you did not "
+                f"edit, and a hook with no install record is replaced too, its previous "
+                f"copy kept under .levain/backups/activation/. A hook you edited is "
+                f"kept, and the package's version is staged under .levain/pending/ for "
+                f"you to merge.",
                 upgrade_pending=True,
             )
         ]
