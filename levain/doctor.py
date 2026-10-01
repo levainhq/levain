@@ -825,7 +825,8 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     without a surface saying so the operator's only signal is a banner line and a missing tool.
 
     The diagnosis itself is NOT computed here: :func:`~levain.firing.confinement.diagnose_confinement`
-    is the single source, shared with the ``levain run`` banner, so the two cannot drift."""
+    is the single source for the host's answer, shared with the ``levain run`` banner; the entity's
+    localhost opt-out is read from the same config ``levain run`` reads."""
     # Lazy import — this module keeps levain imports out of its top level (see `run_doctor`).
     try:
         from levain.firing.confinement import diagnose_confinement
@@ -838,6 +839,22 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
 
     if d.supported:
+        # The host can sandbox bash, but on a provider that cannot block connections back to this
+        # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
+        # config `levain run` reads, so this line and the banner agree.
+        try:
+            from levain.firing.confinement import (
+                LINUX_LOCALHOST_REFUSAL,
+                load_confinement_config,
+                select_provider,
+            )
+            if (not select_provider().enforces_localhost_deny
+                    and not load_confinement_config(install).allow_localhost_outbound):
+                return [CheckResult("confinement floor", True,
+                                    f"{d.provider} available, but `levain run` gets file_editor only: "
+                                    f"{LINUX_LOCALHOST_REFUSAL}")]
+        except Exception:  # noqa: BLE001 — a config problem is reported by `levain run` itself
+            pass
         return [CheckResult("confinement floor", True,
                             f"{d.provider} — `levain run` gets file_editor + bash")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"

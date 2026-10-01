@@ -411,9 +411,27 @@ _CONTAINER_DAEMON_SOCKETS = (
 )
 
 
+def _runtime_dir() -> str | None:
+    """``$XDG_RUNTIME_DIR``, or on Linux the systemd default ``/run/user/<uid>`` when the variable is
+    unset, empty or relative. A rootless daemon's socket is still there under cron, ``su`` or an ssh
+    session without pam_systemd, and the entity can set the variable itself, so a missing variable
+    must not drop the entries (L1 + L2 review, 2026-09-30). None off Linux: macOS has no such dir."""
+    value = os.environ.get("XDG_RUNTIME_DIR", "")
+    if value and os.path.isabs(value):
+        return value
+    if platform.system() == "Linux":
+        return f"/run/user/{os.getuid()}"
+    return None
+
+
 def _expand_socket_source(spec: str) -> Path | None:
-    """One roster entry as a path, or None when it names an environment variable this process does
-    not have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
+    """One roster entry as a path, or None when it names a runtime dir this host does not have — a
+    path still containing ``$`` would deny a file nobody can create, and read as cover."""
+    if spec.startswith("$XDG_RUNTIME_DIR"):
+        runtime = _runtime_dir()
+        if runtime is None:
+            return None
+        spec = runtime + spec[len("$XDG_RUNTIME_DIR"):]
     expanded = os.path.expandvars(spec)
     if "$" in expanded:
         return None
@@ -2449,10 +2467,11 @@ class _SeatbeltShell(SandboxedShell):
 # 2026-09-03, driving the real provider. They were NOT taken on argushub — argushub is Ubuntu 24.04.4
 # / bubblewrap 0.9.0 too, but on x86_64, and it CANNOT RUN bwrap at all (see `bwrap_available`), which
 # is what sent the proof to a container in the first place. Same distro, same bwrap, different arch.
-# ⛔ STILL OWED: one confirming run on a real (non-container) Linux host, because a container relaxes
-# seccomp to permit user namespaces at all and that is a difference in the environment under test.
-# The `linux_live` tests in tests/test_firing_confinement.py ARE that run — they self-skip anywhere
-# bwrap cannot establish a namespace, so pointing them at a capable host is the whole procedure.
+# Later the same day (0e42e18's commit) the live floor ran on argushub hardware after its AppArmor
+# profile was loaded. The 2026-09-30 port changed this argv (steps 1, 3b and 6, deferred remounts)
+# and was re-run only in a container (tests/linux/Dockerfile, kernel 6.12). A container relaxes
+# seccomp to permit user namespaces at all, so the real-host run is OWED AGAIN for this argv. The
+# `linux_live` tests ARE that run: point them at a capable host.
 # seatbelt is a PATH PREDICATE evaluated per syscall; bwrap is a MOUNT NAMESPACE established once
 # at spawn. The polarity is also inverted — crown-jewels is deliberately default-ALLOW-with-denies
 # (the Slice-1 flip) while bwrap's idiom is default-deny-with-binds — so the base is ``--bind / /``
@@ -2512,8 +2531,30 @@ def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(_ci_within(path, r) for r in roots)
 
 
+def _bwrap_file_target(f: Path) -> Path:
+    """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
+    aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
+    REFUSED, because masking its target leaves the link free to be swapped for a planted file; one
+    they cannot replace is masked at its real path."""
+    if not f.is_symlink():
+        return f
+    if os.access(f.parent, os.W_OK):
+        raise ConfinementError(
+            f"{f} is a symlink in a directory this user can write. The Linux floor protects files "
+            "with mounts, and a mount cannot cover a symlink, so the link could be replaced by a "
+            "planted file. Refusing to grant bash hands (fail-closed). Replace the symlink with the "
+            "real file to use bash."
+        )
+    return f.resolve()
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
-    """THE single source of the bwrap invocation. :meth:`BwrapProvider.render_profile` renders this
+    """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
+    return _bwrap_plan(policy)[0]
+
+
+def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
+    """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
     with two views, never two builders that can drift (the ``two_things_that_should_be_one`` class
     fired on this repo the day before this was written).
@@ -2535,35 +2576,18 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
         "--die-with-parent",
     ]
 
-    # (1) ANCESTOR DIRS FIRST. Parent-before-child is a HARD ordering requirement (bwrap applies ops
-    # in sequence and a child over-mount must land inside an already-established parent bind).
-    # `_write_deny_ancestors` already returns lexicographically sorted paths, and for a path string a
-    # parent is a prefix of its child, so that sort IS parent-first. Re-sorted here anyway so this
-    # block does not silently depend on a guarantee made in another function.
-    # ⛔ AN ABSENT ANCESTOR IS SKIPPED, AND THAT IS NOT A FAIL-OPEN: a directory that does not exist
-    # holds no jewel to relocate, and a self-bind of it is not a deny — bwrap ABORTS on the missing
-    # source and the entity loses bash on every host. That was MEASURED after the spore-725 socket
-    # roster merged in (`bwrap: Can't find source path /run/containerd`): its entries made every
-    # absent daemon dir an "ancestor", so a host without containerd, CRI-O and colima could not
-    # spawn a shell at all. An ancestor that exists at spawn is still pinned, which is the whole of
-    # what the relocation finding below requires.
-    # ⛔ AND IT BINDS THE RESOLVED DIRECTORY: a mount cannot land on a symlink, so an ancestor like
-    # /var/run (a symlink to /run on every modern distro) aborted bwrap the same way, measured the
-    # same night. Resolving pins the directory the jewel actually lives in, which is what a rename
-    # would have to move. A symlink COMPONENT itself cannot be pinned by a mount.
-    pinned: list[str] = []
-    for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
-        if d.is_dir():
-            r = str(d.resolve())
-            if r not in pinned:
-                pinned.append(r)
-    for r in sorted(pinned):
-        argv += ["--bind", r, r]
+    # Steps (2)-(6) build the BODY first, because step (1) has to know which directories the body
+    # will make bwrap CREATE on the host. Read-only remounts are collected and applied LAST: a
+    # later mount whose mountpoint lies inside a jewel tmpfs has to be created while that tmpfs is
+    # still writable, or bwrap aborts.
+    head, argv = argv, []
+    remount_ro: list[str] = []
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     tmpfs_roots: list[Path] = list(policy.deny_read_write)
     for sub in policy.deny_read_write:
-        argv += ["--tmpfs", str(sub), "--remount-ro", str(sub)]
+        argv += ["--tmpfs", str(sub)]
+        remount_ro.append(str(sub))
 
     # (3) ssh KEY MATERIAL (agent mode). tmpfs the directory, then bind the two files ssh actually
     # needs back INTO it — the mount-namespace analogue of SBPL's last-match-wins re-allow. The
@@ -2648,14 +2672,16 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
         # its other call site, did the opposite. The helper was right; one caller was not.
         if _absent_in_ro_store(f):
             continue
-        argv += ["--ro-bind", "/dev/null", str(f)]
+        argv += ["--ro-bind", "/dev/null", str(_bwrap_file_target(f))]
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
     # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
     # write returns EROFS. `rm` of one returns EBUSY, and so does `rm -rf` of its parent directory —
     # both measured, which is what makes the vector floor hold without the ancestor pin doing it.
     #
-    # ⚠ THE MISSING-FILE CASE IS THE ONE PLACE THIS FLOOR MUTATES THE HOST, AND IT IS DELIBERATE.
+    # ⚠ THE MISSING-FILE CASE MUTATES THE HOST, AND IT IS DELIBERATE. It is not the only place: any
+    # mount whose target is missing makes bwrap create it (steps 1, 2, 4, 6 too), and step (3b)
+    # exists because doing it inside the entity's own store broke that store.
     # A mount needs a mountpoint. macOS denies a path STRING, so it covers a file that does not exist
     # YET — which is the entire point of the ssh vector floor (`spore-322`): the attack is PLANTING an
     # authorized_keys that was never there. bwrap can only over-mount something that exists, so a
@@ -2670,6 +2696,11 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
+            continue
+        if f in deny_both:
+            # Step (4) already denies it BOTH ways. A self-bind here would take its source from the
+            # real host file and stack it on top, making a read-denied file readable again (L2
+            # review, 2026-09-30); macOS denies such a file both ways unconditionally.
             continue
         if f in sockets:
             # Step (6) owns every socket path. A self-bind here would not stop a connect, and the
@@ -2692,7 +2723,8 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
             # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
             argv += ["--ro-bind", "/dev/null", str(f)]
         elif f.exists():
-            argv += ["--ro-bind", str(f), str(f)]
+            t = str(_bwrap_file_target(f))
+            argv += ["--ro-bind", t, t]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 
@@ -2720,24 +2752,81 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
     # Both run through the user's service manager, which is outside this namespace — the Linux form
     # of the launchd-helper limit in the module docstring.
-    shared = {Path("/"), Path("/run"), Path("/var/run"), Path("/tmp"), Path("/var/tmp"), Path.home()}
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg:
-        shared.add(Path(xdg))
+    # Compared RESOLVED, because the socket targets are: a symlinked runtime dir or HOME compared
+    # lexically would get the directory form, a read-only tmpfs over the whole runtime dir (L1 + L2).
+    shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
+    shared.add(Path.home().resolve())
+    runtime = _runtime_dir()
+    if runtime is not None:
+        shared.add(Path(runtime).resolve())
     hidden_dirs: list[Path] = []
     for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
         parent = s.parent
-        if parent in shared:
+        if parent.resolve() in shared:
             if s.exists():
                 argv += ["--ro-bind", "/dev/null", str(s)]
             continue
         if parent in hidden_dirs:
             continue
         if parent.is_dir() or (parent.parent.is_dir() and os.access(parent.parent, os.W_OK)):
-            argv += ["--tmpfs", str(parent), "--remount-ro", str(parent)]
+            argv += ["--tmpfs", str(parent)]
+            remount_ro.append(str(parent))
             hidden_dirs.append(parent)
 
-    return argv
+    # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
+    # applies ops in sequence and a child mount must land inside an already-pinned parent); sorting
+    # path strings is parent-first, because a parent is a prefix of its child.
+    # ``--bind P P`` makes each ancestor a MOUNTPOINT, so renaming it is EBUSY — the relocation
+    # finding below. Three cases, all measured or reviewed on 2026-09-30:
+    #   · PRESENT: pinned at its RESOLVED path. A mount cannot land on a symlink, so /var/run (a
+    #     symlink to /run) aborted bwrap until it was resolved.
+    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable): REFUSED. Pinning the target leaves
+    #     the link itself free to be swapped for a real directory holding a planted file, and macOS
+    #     covers that link by name while a mount cannot. Fail closed, as bwrap itself used to.
+    #   · ABSENT: pinned only if the body will CREATE something under it — then it is created here
+    #     first (by the provider on the host, 0700, just before bwrap runs: bwrap resolves a bind's
+    #     SOURCE before it applies ``--dir``, so it cannot pin a directory it creates itself —
+    #     measured) and pinned, because an unpinned directory that bwrap creates on the
+    #     host can be renamed away and replaced with a planted one (L1 + L2 review: raw mode with no
+    #     ~/.ssh, plant ``authorized_keys``). An absent ancestor nothing will be created under holds
+    #     nothing and is skipped — a self-bind of a missing source aborts bwrap, which is how the
+    #     socket roster's absent daemon dirs (/run/containerd) once cost every Linux host its bash.
+    created: list[str] = []
+    for k, op in enumerate(argv):
+        if op in ("--bind", "--ro-bind"):
+            created.append(argv[k + 2])
+        elif op in ("--tmpfs", "--dir"):
+            created.append(argv[k + 1])
+    pins: list[tuple[str, bool]] = []   # (path, needs creating)
+    for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
+        if d.is_symlink():
+            if os.access(d.parent, os.W_OK):
+                raise ConfinementError(
+                    f"{d} is a symlink in a directory this user can write. The Linux floor pins a "
+                    "jewel's parent directories with mounts, and a mount cannot pin a symlink, so "
+                    "the link could be swapped for a planted directory. Refusing to grant bash "
+                    "hands (fail-closed). Replace the symlink with the real directory to use bash."
+                )
+            entry = (str(d.resolve()), False)
+        elif d.is_dir():
+            entry = (str(d.resolve()), False)
+        elif any(c == str(d) or c.startswith(str(d) + "/") for c in created):
+            entry = (str(d), True)
+        else:
+            continue
+        if entry[0] not in [p for p, _ in pins]:
+            pins.append(entry)
+    ancestors: list[str] = []
+    create_first: list[str] = []
+    for path, create in sorted(pins):
+        if create:
+            create_first.append(path)
+        ancestors += ["--bind", path, path]
+
+    out = head + ancestors + argv
+    for r in remount_ro:
+        out += ["--remount-ro", r]
+    return out, create_first
 
 
 def bwrap_available() -> bool:
@@ -2774,7 +2863,7 @@ def bwrap_available() -> bool:
 # ``--unshare-net`` refuses it but removes ALL network (pip, git, curl). Until a ruling picks the
 # Linux posture, a policy that asks for the deny gets NO bash on Linux rather than bash without it.
 LINUX_LOCALHOST_REFUSAL = (
-    "bash dropped: on Linux the sandbox cannot block connections back to this host, and this "
+    "on Linux the sandbox cannot block connections back to this host, and this "
     "entity's floor requires that (a local sshd reached through the forwarded ssh agent reads "
     "crown-jewel files as an unsandboxed user — spore-755). The file editor still works. To accept "
     "that exposure and get bash, set \"allow_localhost_outbound\": true in .levain/confinement.json."
@@ -2820,7 +2909,9 @@ class BwrapProvider(ConfinementProvider):
         :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
         terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
         later by someone who does not trust this docstring."""
-        return shlex.join(_bwrap_argv(policy)) + "\n"
+        argv, create_first = _bwrap_plan(policy)
+        mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
+        return mkdir + shlex.join(argv) + "\n"
 
     def _spawn_shell_impl(
         self,
@@ -2830,7 +2921,7 @@ class BwrapProvider(ConfinementProvider):
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
         if policy.deny_localhost_outbound:
-            raise ConfinementError(LINUX_LOCALHOST_REFUSAL)
+            raise ConfinementError(f"bash refused: {LINUX_LOCALHOST_REFUSAL}")
         if not bwrap_available():
             raise ConfinementError(
                 f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "
@@ -2841,7 +2932,18 @@ class BwrapProvider(ConfinementProvider):
                 "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
-        argv = _bwrap_argv(policy) + ["/bin/bash", "--noprofile", "--norc"]
+        argv, create_first = _bwrap_plan(policy)
+        argv = argv + ["/bin/bash", "--noprofile", "--norc"]
+        # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
+        # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
+        for d in create_first:
+            try:
+                Path(d).mkdir(mode=0o700, exist_ok=True)
+            except OSError as exc:
+                raise ConfinementError(
+                    f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
+                    "bash hands (fail-closed)."
+                ) from exc
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
@@ -2917,8 +3019,9 @@ def select_provider(system: str | None = None) -> ConfinementProvider:
 class ConfinementDiagnosis:
     """Why this host does or does not have an OS confinement floor, in operator-facing terms.
 
-    ⚡ ONE SOURCE FOR AN EXPLANATION TWO SURFACES NEED. The ``levain run`` banner and ``levain
-    doctor`` both have to answer "will this entity get bash, and if not what do I do about it".
+    ⚡ ONE SOURCE FOR THE HOST'S ANSWER, WHICH TWO SURFACES NEED. The ``levain run`` banner and
+    ``levain doctor`` both have to answer "will this entity get bash, and if not what do I do about
+    it". The one ENTITY-side reason (``LINUX_LOCALHOST_REFUSAL``) is a shared constant both print.
     Computing that twice is the ``two_things_that_should_be_one_computed_by_two_pieces_of_code``
     class, and the drift would land in the two places an operator looks when something is wrong."""
 

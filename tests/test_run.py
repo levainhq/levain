@@ -724,6 +724,19 @@ def test_banner_says_bash_dropped_without_a_sandbox(tmp_path: Path, capsys):
     assert "crown-jewels floor" in out   # the file editor still rides the floor
 
 
+def test_banner_prints_the_localhost_refusal_once_and_names_the_opt_out(tmp_path: Path, capsys):
+    from levain.firing.confinement import LINUX_LOCALHOST_REFUSAL
+    from levain.run import _print_banner
+
+    _print_banner(
+        tmp_path, _FakeBinding(tmp_path), model="ollama/minimax-m3:cloud",
+        with_tools=True, bash_ok=False, ssh_mode="agent", bash_note=LINUX_LOCALHOST_REFUSAL,
+    )
+    out = capsys.readouterr().out
+    assert out.count("bash dropped") == 1
+    assert "allow_localhost_outbound" in out
+
+
 def test_run_entity_rejects_a_malformed_confinement_config(
     tmp_path: Path, monkeypatch, capsys, _clean_entity_env
 ):

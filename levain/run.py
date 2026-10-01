@@ -35,6 +35,7 @@ without the extra; a missing extra becomes a friendly one-line install hint.
 """
 from __future__ import annotations
 
+import platform
 import sys
 from pathlib import Path
 
@@ -766,7 +767,8 @@ def _print_banner(
             # Linux; the common Ubuntu case is a SUPPORTED platform whose kernel will not let the
             # sandbox start — one command away, and the old wording sent that operator looking for a
             # port that had already shipped. `bash_note` carries the real reason + the fix, computed
-            # ONCE in `diagnose_confinement` so this and `levain doctor` cannot drift.
+            # ONCE in `diagnose_confinement` (or, for the entity-side Linux localhost reason, the
+            # shared `LINUX_LOCALHOST_REFUSAL` that doctor prints too).
             note = bash_note or "no OS confinement floor available here"
             print(f"             (bash dropped — file editor only: {note})")
             if bash_note:
@@ -806,6 +808,10 @@ def _print_banner(
             print("             \u26a0 coverage is a SPAWN-TIME SNAPSHOT: the list is re-resolved each")
             print("               time a shell starts, so a listed socket created BEFORE that is")
             print("               covered. One created AFTER, pointing somewhere unlisted, is not.")
+            if platform.system() == "Linux":
+                print("             \u26a0 on Linux a socket in a SHARED dir (/run/docker.sock, the user")
+                print("               runtime dir) is masked as a file: if its daemon starts or")
+                print("               restarts after the shell does, it is reachable until the next one")
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —

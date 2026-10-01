@@ -1697,6 +1697,30 @@ def test_doctor_confinement_check_reports_and_never_fails(tmp_path, monkeypatch)
     assert "→" in r.detail
 
 
+class _NoLocalhostDeny:
+    enforces_localhost_deny = False
+
+
+def _supported(conf):
+    return lambda *a, **k: conf.ConfinementDiagnosis(
+        supported=True, provider="bwrap (Linux mount namespace)", reason="", remedy=None)
+
+
+def test_doctor_agrees_with_run_when_the_sandbox_cannot_deny_localhost(tmp_path, monkeypatch):
+    """The Linux holding position: bwrap works, but `levain run` drops bash for an entity whose
+    floor asks to block connections back to this host. Doctor must not promise the bash it drops."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "diagnose_confinement", _supported(conf))
+    monkeypatch.setattr(conf, "select_provider", lambda *a, **k: _NoLocalhostDeny())
+    (tmp_path / ".levain").mkdir()
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is True and "file_editor only" in r.detail and "allow_localhost_outbound" in r.detail
+    (tmp_path / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    assert "file_editor + bash" in _check_confinement(tmp_path)[0].detail
+
+
 def test_doctor_confinement_check_survives_a_broken_diagnosis(tmp_path, monkeypatch):
     """The diagnosis probes the filesystem and executes a binary. Neither may take the whole doctor
     run down — an unrelated crash here would hide every other check."""

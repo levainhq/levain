@@ -1892,7 +1892,9 @@ def test_no_shipped_provider_overrides_spawn_shell() -> None:
     (spore-768). The K4c branch did exactly that before the port."""
     from levain.firing import confinement as _conf
 
-    for cls in (_conf.SeatbeltProvider, _conf.BwrapProvider):
+    shipped = [c for c in _conf.ConfinementProvider.__subclasses__() if c.__module__ == _conf.__name__]
+    assert {c.__name__ for c in shipped} >= {"SeatbeltProvider", "BwrapProvider"}
+    for cls in shipped:
         assert "spawn_shell" not in vars(cls), f"{cls.__name__} overrides spawn_shell"
         assert "_spawn_shell_impl" in vars(cls)
 
@@ -1910,6 +1912,15 @@ def test_bwrap_refuses_to_spawn_while_the_localhost_deny_is_requested(tmp_path, 
     monkeypatch.setattr(_conf, "bwrap_available", lambda: True)  # the refusal must not hinge on the host
     with pytest.raises(ConfinementError, match="allow_localhost_outbound"):
         _conf.BwrapProvider().spawn_shell(pol)
+
+
+def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
+    """A read-only tmpfs over ``d``: mounted, then remounted read-only LATER (remounts are deferred to
+    the end of the argv so mountpoints inside the tmpfs can still be created)."""
+    pairs = [argv[k:k + 2] for k in range(len(argv))]
+    if ["--tmpfs", d] not in pairs or ["--remount-ro", d] not in pairs:
+        return False
+    return pairs.index(["--remount-ro", d]) > pairs.index(["--tmpfs", d])
 
 
 def _bwrap_socket_policy(tmp_path, monkeypatch, *socks):
@@ -1931,8 +1942,7 @@ def test_bwrap_hides_a_socket_in_a_daemon_dir_with_a_readonly_tmpfs(tmp_path, mo
     sock = d / "docker.sock"
     sock.touch()
     argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
-    dd = str(d.resolve())
-    assert ["--tmpfs", dd, "--remount-ro", dd] in [argv[k:k + 4] for k in range(len(argv))]
+    assert _tmpfs_then_ro(argv, str(d.resolve()))
     assert ["--ro-bind", str(sock.resolve()), str(sock.resolve())] not in [
         argv[k:k + 3] for k in range(len(argv))
     ], "a read-only self-bind of a socket stops nothing and must not be rendered as a deny"
@@ -1957,6 +1967,8 @@ def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monke
     user cannot create in gets nothing at all."""
     from levain.firing.confinement import _bwrap_argv
 
+    if os.geteuid() == 0:
+        pytest.skip("root can create inside a 0555 dir, so the 'cannot create here' case cannot be built")
     ro = tmp_path / "rootowned"
     ro.mkdir()
     ro.chmod(0o555)
@@ -1965,8 +1977,9 @@ def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monke
         argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
     finally:
         ro.chmod(0o755)
-    assert str(ro / "containerd") not in argv
-    assert str(sock) not in argv
+    for spelling in {str(ro / "containerd"), str((ro / "containerd").resolve()), str(sock),
+                     str(sock.resolve())}:
+        assert spelling not in argv, spelling
 
 
 def test_bwrap_hides_an_absent_daemon_dir_the_entity_could_start_a_daemon_in(tmp_path, monkeypatch) -> None:
@@ -1979,17 +1992,28 @@ def test_bwrap_hides_an_absent_daemon_dir_the_entity_could_start_a_daemon_in(tmp
     run.mkdir()
     sock = run / "podman" / "podman.sock"
     argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
-    d = str((run / "podman").resolve())
-    assert ["--tmpfs", d, "--remount-ro", d] in [argv[k:k + 4] for k in range(len(argv))]
+    assert _tmpfs_then_ro(argv, str((run / "podman").resolve()))
 
 
-def test_xdg_runtime_socket_entries_drop_when_the_variable_is_unset(monkeypatch) -> None:
+def test_xdg_runtime_socket_entries_follow_the_variable_and_fall_back_on_linux(monkeypatch) -> None:
     from levain.firing.confinement import _expand_socket_source
 
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") is None
+    from levain.firing import confinement as _conf
+
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == Path("/run/user/1000/docker.sock")
+    for unset in (None, "", "relative/dir"):
+        if unset is None:
+            monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        else:
+            monkeypatch.setenv("XDG_RUNTIME_DIR", unset)
+        monkeypatch.setattr(_conf.platform, "system", lambda: "Darwin")
+        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") is None
+        # On Linux the socket is still at the systemd default when the variable is missing (cron, su).
+        monkeypatch.setattr(_conf.platform, "system", lambda: "Linux")
+        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == Path(
+            f"/run/user/{os.getuid()}/docker.sock"
+        )
 
 
 def test_crown_jewel_reason_fails_CLOSED_on_a_tilde_user_path_not_by_raising(tmp_path) -> None:
@@ -2463,10 +2487,13 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
     bound = [d for _, d in self_binds]
     for anc in policy.deny_write_dirs:
-        # An absent ancestor holds nothing to relocate, and self-binding it aborts bwrap (the brick
-        # measured 2026-09-30); every ancestor that EXISTS is still pinned.
-        # Bound by its RESOLVED path: a mount cannot land on a symlink (/var/run, macOS's /var).
-        assert (str(anc.resolve()) in bound) == anc.is_dir(), anc
+        # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
+        # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
+        # lands under is skipped (self-binding a missing source aborted bwrap, 2026-09-30).
+        made = [d for k, a in enumerate(argv) if a in ("--tmpfs", "--dir") for d in [argv[k + 1]]]
+        made += [d for _, d in _triples(argv, "--ro-bind")] + [d for _, d in _triples(argv, "--bind")]
+        expected = anc.is_dir() or any(m == str(anc) or m.startswith(str(anc) + "/") for m in made)
+        assert (str(anc.resolve() if anc.is_dir() else anc) in bound) == expected, anc
     for i, a in enumerate(bound):
         for b in bound[i + 1:]:
             assert not Path(b) in Path(a).parents, f"{b} is a parent of {a} but is mounted after it"
@@ -2497,6 +2524,59 @@ def _store_policy(tmp_path, monkeypatch):
     (lv / "context.json").write_text("{}")
     (lv / "docs").mkdir()
     return build_policy(ent), lv
+
+
+def test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it(tmp_path, monkeypatch) -> None:
+    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv makes bwrap CREATE ~/.ssh to hold
+    the vector mounts; unpinned, the entity could rename it away, make a fresh one and plant
+    ``authorized_keys`` on the host. It must be created and pinned BEFORE any mount inside it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert not (tmp_path / ".ssh").exists()
+    from levain.firing.confinement import _bwrap_plan
+
+    argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    ssh = str(tmp_path / ".ssh")
+    assert ssh in create_first, "bwrap cannot pin a dir it creates; the provider must create it first"
+    i_pin = [argv[k:k + 3] for k in range(len(argv))].index(["--bind", ssh, ssh])
+    inside = [k for k, a in enumerate(argv) if a.startswith(ssh + "/")]
+    assert inside and min(inside) > i_pin, "a mount inside ~/.ssh landed before ~/.ssh was pinned"
+
+
+def test_bwrap_refuses_a_replaceable_symlinked_jewel_ancestor(tmp_path, monkeypatch) -> None:
+    """A mount cannot pin a symlink; pinning its target leaves the link swappable. Fail closed."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / "dotfiles-ssh"
+    real.mkdir()
+    (tmp_path / ".ssh").symlink_to(real)
+    with pytest.raises(ConfinementError, match="symlink"):
+        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+
+
+def test_bwrap_refuses_a_replaceable_symlinked_protected_file(tmp_path, monkeypatch) -> None:
+    """Measured 2026-09-30: a stow-style symlinked ~/.ssh/config made bwrap abort with an opaque
+    startup error. It is refused now with the reason, before bwrap runs."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    real = tmp_path / "dotfiles-config"
+    real.write_text("Host *\n")
+    (ssh / "config").symlink_to(real)
+    with pytest.raises(ConfinementError, match="symlink"):
+        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+
+
+def test_bwrap_a_file_denied_both_ways_is_not_re_exposed_by_the_write_only_pass(tmp_path, monkeypatch) -> None:
+    """L2 (2026-09-30): an operator pins ~/.ssh/config in `deny_files` in raw mode. Step (4) masks it
+    with /dev/null; step (5) used to add ``--ro-bind config config`` on top, re-exposing the read."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    cfg = ssh / "config"
+    cfg.write_text("Host *\n")
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw", deny_files=(cfg,)))
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--ro-bind", "/dev/null", str(cfg)] in triples
+    assert ["--ro-bind", str(cfg), str(cfg)] not in triples
 
 
 def test_bwrap_mounts_the_entity_store_read_only_and_binds_ordinary_entries_back(tmp_path, monkeypatch) -> None:
@@ -2666,7 +2746,8 @@ def test_bwrap_render_profile_is_the_same_argv_it_spawns(tmp_path, monkeypatch) 
     not trust the docstring."""
     policy = _lin_policy(tmp_path, monkeypatch)
     rendered = BwrapProvider().render_profile(policy)
-    assert shlex.split(rendered) == _bwrap_argv(policy)
+    # A directory the floor must create before pinning is rendered as a leading `mkdir ... &&`.
+    assert shlex.split(rendered.split(" && ")[-1]) == _bwrap_argv(policy)
 
 
 def test_bwrap_spawn_shell_fails_closed_and_names_the_apparmor_cause(tmp_path, monkeypatch) -> None:
@@ -2929,6 +3010,44 @@ def test_linux_live_the_store_refuses_a_plant_and_leaves_the_host_store_usable(t
                  "confinement.json"):
         assert not (lv / name).exists(), f"{name} was left on the host"
     assert load_confinement_config(ent) is not None
+
+
+@linux_live
+def test_linux_live_an_ssh_dir_the_sandbox_creates_cannot_be_swapped_for_a_planted_one(
+    tmp_path, monkeypatch
+) -> None:
+    """L1 H1 / L2 (2026-09-30), the attack as written: raw mode, no ~/.ssh at spawn. Rename the dir
+    the sandbox created, make a fresh one, plant authorized_keys. The rename must be refused and
+    nothing planted may reach the host."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    assert not ssh.exists()
+    sh = BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    try:
+        r = sh.run(f"mv {ssh} {tmp_path}/moved && echo MOVED || echo REFUSED")
+        assert "REFUSED" in r.output
+        sh.run(f"echo PLANTED-KEY > {ssh}/authorized_keys")
+    finally:
+        sh.close()
+    assert not (tmp_path / "moved").exists()
+    ak = ssh / "authorized_keys"
+    assert not ak.exists() or "PLANTED-KEY" not in ak.read_text()
+
+
+@linux_live
+def test_linux_live_a_mount_inside_a_jewel_tmpfs_does_not_cost_bash(tmp_path, monkeypatch) -> None:
+    """L2 (2026-09-30): a deny file under a jewel subtree needs its mountpoint created INSIDE that
+    tmpfs, which aborted bwrap while the tmpfs was already read-only. Remounts now come last."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    gh = tmp_path / ".config" / "gh"
+    sh = BwrapProvider().spawn_shell(
+        build_policy(_entity(tmp_path), deny_standard_creds=True, deny_files=(gh / "hosts.yml",))
+    )
+    try:
+        assert "UP" in sh.run("echo UP").output
+        assert "REFUSED" in sh.run(f"echo x > {gh}/new && echo WROTE || echo REFUSED").output
+    finally:
+        sh.close()
 
 
 @linux_live
