@@ -1026,6 +1026,19 @@ class SystemdUserProvider(DaemonProvider):
                 f"(now: {st.detail}). Force a turn with `levain daemon restart`; activity lands in "
                 f"{spec.stdout_log} and DECISIONS (gated halts) in {spec.stderr_log}"
             )
+            # Restarting the TIMER does not touch a turn already running, and systemd applies a
+            # changed unit only at the next start. Measured 2026-10-01 on argushub (systemd 255): a
+            # reinstall during a turn left it running the OLD task to completion, while this summary
+            # printed that turn's pid as if it were the idle timer. Say so; do not kill the turn.
+            svc = self._show(f"{spec.label}.service", "ActiveState,MainPID")
+            if (prior_service is not None and prior_service != self.render_unit(spec).encode("utf-8")
+                    and svc.get("ActiveState") in ("activating", "active", "deactivating")):
+                run_line += (
+                    f"\n  ⚠ a turn that started BEFORE this install is still running (pid "
+                    f"{svc.get('MainPID', '?')}) on the PREVIOUS definition; it finishes on that, and "
+                    f"the next turn uses the new one. `levain daemon restart` starts a new-definition "
+                    f"turn now, stopping that one."
+                )
         else:
             run_line = (f"running ({st.detail})" if st.running
                         else f"NOT yet running ({st.detail}) — check the log at {spec.stdout_log}")

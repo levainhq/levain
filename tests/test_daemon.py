@@ -1118,3 +1118,20 @@ def test_restart_refuses_an_invalid_label_before_the_service_manager_sees_it(pro
         with pytest.raises(daemon.DaemonError):
             provider().restart(bad)
     assert calls == []
+
+
+def test_systemd_reinstall_during_a_turn_says_that_turn_runs_the_old_definition(
+        systemd, tmp_path, monkeypatch) -> None:
+    """Reproduced 2026-10-01 on argushub (systemd 255, a real seat): a reinstall with a new task
+    while a turn ran left that turn finishing the OLD task, and the summary printed its pid as the
+    idle timer's. Restarting the timer never touches a running oneshot service."""
+    running = {"*": {"LoadState": "loaded", "ActiveState": "activating", "SubState": "start",
+                     "MainPID": "4242", "ExecMainStatus": "0"}}
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(show=running))
+    first = systemd.install(_seat(tmp_path))
+    assert "PREVIOUS definition" not in first          # nothing installed before it
+    same = systemd.install(_seat(tmp_path))
+    assert "PREVIOUS definition" not in same           # unchanged definition: nothing to say
+    changed = replace(_seat(tmp_path), argv=["/usr/bin/levain", "run", "--task", "y"])
+    out = systemd.install(changed)
+    assert "PREVIOUS definition" in out and "4242" in out
