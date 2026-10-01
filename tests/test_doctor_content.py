@@ -1731,7 +1731,14 @@ def test_doctor_names_a_broken_config_instead_of_promising_bash(tmp_path, monkey
     (tmp_path / ".levain").mkdir()
     (tmp_path / ".levain" / "confinement.json").write_text("{not json")
     r = _check_confinement(tmp_path)[0]
-    assert r.ok is True and "refuse to start" in r.detail and "bash" not in r.detail.split(":")[0]
+    assert r.ok is False and "refuse to start" in r.detail and "bash" not in r.detail
+    # ...and on a host with NO sandbox too: run refuses the config either way (codex, L3 r2).
+    monkeypatch.setattr(
+        conf, "diagnose_confinement",
+        lambda *a, **k: conf.ConfinementDiagnosis(supported=False, provider=None, reason="none",
+                                                 remedy=None),
+    )
+    assert _check_confinement(tmp_path)[0].ok is False
 
 
 def test_doctor_confinement_check_survives_a_broken_diagnosis(tmp_path, monkeypatch):

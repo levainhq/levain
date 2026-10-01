@@ -2586,7 +2586,7 @@ def test_bwrap_mounts_the_entity_store_read_only_and_binds_ordinary_entries_back
     argv = _bwrap_argv(policy)
     triples = [argv[k:k + 3] for k in range(len(argv))]
     assert ["--ro-bind", str(lv), str(lv)] in triples
-    assert ["--bind", str(lv / "docs"), str(lv / "docs")] in triples
+    assert ["--bind-try", str(lv / "docs"), str(lv / "docs")] in triples
     # A top-level FILE is not bound back: a per-file bind pins its inode, and the host writes these
     # by rename, so the shell would read and write an orphan (complement, L3 r1).
     assert ["--bind", str(lv / "context.json"), str(lv / "context.json")] not in triples
@@ -2619,6 +2619,26 @@ def test_bwrap_nested_deny_roots_given_child_first_emit_only_the_parent(tmp_path
     tmpfs = [argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"]
     assert str(parent.resolve()) in tmpfs or str(parent) in tmpfs
     assert str(child) not in tmpfs and str(child.resolve()) not in tmpfs
+
+
+def test_bwrap_distinct_roots_differing_only_in_case_both_keep_their_tmpfs(tmp_path, monkeypatch) -> None:
+    """complement + codex, L3 r2: the de-dup used a case-folding matcher, so on ext4 /x/Secret
+    swallowed the distinct /x/secret/inner and left it readable. Containment must be exact."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    a, b = tmp_path / "Secret", tmp_path / "secret" / "inner"
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), extra_deny_read_write=(a, b)))
+    tmpfs = [argv[k + 1] for k, x in enumerate(argv) if x == "--tmpfs"]
+    assert str(a) in tmpfs and str(b) in tmpfs
+
+
+def test_bwrap_refuses_a_dangling_symlinked_protected_file(tmp_path, monkeypatch) -> None:
+    """complement, L3 r2: masking a dangling link's target makes bwrap create a stub there."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").symlink_to(tmp_path / "nowhere" / "x")
+    with pytest.raises(ConfinementError, match="dangling"):
+        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
 
 
 def test_bwrap_render_refuses_like_spawn_when_the_localhost_deny_is_on(tmp_path, monkeypatch) -> None:

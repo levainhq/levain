@@ -2558,7 +2558,7 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     caller handles — not a raw ``OSError`` that crashes the tool call (codex, L3 r1)."""
     try:
         return _bwrap_plan_impl(policy)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:   # RuntimeError: a symlink loop in Path.resolve()
         raise ConfinementError(
             f"could not inspect the host to build the Linux floor ({exc}) — refusing to grant bash "
             "hands (fail-closed)."
@@ -2631,7 +2631,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         for child in sorted(d.iterdir(), key=lambda p: p.name):
             if child in protected or child.is_symlink() or not child.is_dir():
                 continue
-            argv += ["--bind", str(child), str(child)]
+            # `-try` is banned for JEWELS (a missing source must not start an unprotected sandbox).
+            # This is the opposite case: an ordinary subdirectory the host removed between planning
+            # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
+            # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
+            argv += ["--bind-try", str(child), str(child)]
 
     def _absent_in_ro_store(f: Path) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub.
@@ -2641,9 +2645,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
     # child hides the child's mountpoint, and the deferred remount of the child then aborts bwrap
     # (codex, L3 r1, with deny_subtrees given child-first).
+    # ⛔ EXACT containment, never `_ci_within`: that matcher over-matches on purpose and is safe only
+    # where a match REFUSES; here a match DROPS a deny, so /srv/Secret would have swallowed a
+    # distinct /srv/secret on a case-sensitive filesystem (complement + codex, L3 r2). Its only
+    # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
-        if any(_ci_within(sub, r) for r in tmpfs_roots):
+        if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
             continue
         tmpfs_roots.append(sub)
         argv += ["--tmpfs", str(sub)]
@@ -2703,7 +2711,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # its other call site, did the opposite. The helper was right; one caller was not.
         if _absent_in_ro_store(f):
             continue
-        argv += ["--ro-bind", "/dev/null", str(_bwrap_file_target(f))]
+        # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
+        # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
+        argv += ["--ro-bind", "/dev/null", str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))]
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
     # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
@@ -2737,7 +2747,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # Step (6) owns every socket path. A self-bind here would not stop a connect, and the
             # missing-file branch below would try to CREATE a socket path under a root-owned /run.
             continue
-        if any(_ci_within(f, r) for r in rebound):
+        if f in rebound:   # exact: a case-folded match here would SKIP a protection (codex, L3 b)
             # known_hosts / config were deliberately bound BACK for ssh to work. known_hosts is
             # read-write by design; config is a ``--ro-bind``, which already refuses writes honestly
             # (EROFS). Over-mounting either here would undo the re-allow.
@@ -2753,10 +2763,16 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # ⚡ AND THE MOUNTPOINT LANDS INSIDE THE TMPFS, so unlike the missing-file case below this
             # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
             argv += ["--ro-bind", "/dev/null", str(f)]
-        elif f.exists() or f.is_symlink():
-            # A dangling link is a link too: it goes through the same refusal (complement, L3 r1).
+        elif f.is_symlink() and not f.exists():
+            # A dangling link: masking its target would make bwrap create a stub wherever the link
+            # points (complement, L3 r2). Refuse it, with the reason.
+            raise ConfinementError(
+                f"{f} is a dangling symlink — the Linux floor cannot protect it without creating "
+                "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
+            )
+        elif f.exists():
             t = str(_bwrap_file_target(f))
-            argv += ["--ro-bind", t, t] if f.exists() else ["--ro-bind", "/dev/null", t]
+            argv += ["--ro-bind", t, t]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 

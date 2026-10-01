@@ -811,7 +811,8 @@ def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
 def _check_confinement(install: Path) -> list[CheckResult]:
     """Report whether ``levain run`` will get its bash hand on THIS host, and if not, how to fix it.
 
-    ⚖ THIS REPORTS, IT NEVER FAILS — a deliberate call, not an oversight. An entity with only its
+    ⚖ A MISSING HAND IS REPORTED, NEVER FAILED — a deliberate call, not an oversight. (The one FAIL
+    is a ``confinement.json`` that ``levain run`` refuses: that entity cannot start at all.) An entity with only its
     file-editor hand is a WORKING, SUPPORTED configuration: the in-process crown-jewels floor is
     fully cross-platform and enforces the same denylist. Turning a healthy install red because it
     lacks an optional hand is how an operator learns to ignore doctor, and it would contradict what
@@ -838,21 +839,23 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     except Exception as exc:  # noqa: BLE001
         return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
 
-    if d.supported:
-        # The host can sandbox bash, but on a provider that cannot block connections back to this
-        # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
-        # config `levain run` reads, so this line and the banner agree.
+    # The entity's own config first, on EVERY host: `levain run` refuses a broken one whether or not
+    # bash is possible, so doctor must not report a working configuration (codex, L3 r2). This is
+    # the one outcome here that FAILS — not a missing optional hand, an entity that cannot start.
+    try:
         from levain.firing.confinement import (
             LINUX_LOCALHOST_REFUSAL,
             load_confinement_config,
             select_provider,
         )
-        try:
-            cfg = load_confinement_config(install)
-        except Exception as exc:  # noqa: BLE001 — `levain run` refuses this config; say so, not "bash"
-            return [CheckResult("confinement floor", True,
-                                f"{d.provider} available, but `levain run` will refuse to start: "
-                                f"{exc}")]
+        cfg = load_confinement_config(install)
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("confinement floor", False,
+                            f"`levain run` will refuse to start this entity: {exc}")]
+    if d.supported:
+        # The host can sandbox bash, but on a provider that cannot block connections back to this
+        # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
+        # config `levain run` reads, so this line and the banner agree.
         try:
             enforces = select_provider().enforces_localhost_deny
         except Exception:  # noqa: BLE001 — no provider: diagnose_confinement already said supported
