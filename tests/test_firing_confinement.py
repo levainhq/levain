@@ -3279,3 +3279,22 @@ def test_linux_live_a_deny_subtree_that_is_a_file_does_not_brick_the_shell(tmp_p
         assert sh.run(f"cat {tmp_path}/.anneal-memory").exit_code != 0
         assert sh.run(f"echo POISON > {tmp_path}/.anneal-memory").exit_code != 0
     assert (tmp_path / ".anneal-memory").read_text() == "A STORE THAT IS A FILE\n"
+
+
+def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tmp_path, monkeypatch) -> None:
+    """L1 on 252f4b9, reproduced from the plan argv: a subtree root that is a FILE got
+    `--ro-bind /dev/null F`, and when F was also a write-deny vector (raw mode,
+    ~/.ssh/authorized_keys) step (5) then stacked `--ro-bind F F` on top, so the real file read
+    again. Before 252f4b9 the same input aborted bwrap (fail closed)."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    ak = ssh / "authorized_keys"
+    ak.write_text("ssh-ed25519 AAAA\n")
+    argv, _ = _bwrap_plan(build_policy(_entity(tmp_path), ssh_mode="raw",
+                                       extra_deny_read_write=(ak,)))
+    binds = [argv[i + 1] for i, a in enumerate(argv[:-2])
+             if a == "--ro-bind" and argv[i + 2] == str(ak)]
+    assert binds == ["/dev/null"], binds

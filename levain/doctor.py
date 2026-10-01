@@ -1457,13 +1457,13 @@ from levain.install import hook_body as _hook_body  # noqa: E402
 def _check_hook_freshness(install: Path) -> list[CheckResult]:
     """Do the installed HOOK SCRIPTS still match the ones this package ships?
 
-    ⚠ A THIRD SURFACE IN THE SAME CLASS, and the class is the finding. Levain
-    copies artifacts into the operator's install at `init` and has NO upgrade path
-    that refreshes them: `update.py` never re-installs, and `reconcile.py` only
-    handles pack drift — it SURFACES activation changes rather than applying them
-    (reconcile.py:296). So `pip install -U levain` upgrades the package and leaves
-    the operator running the old copies. It already bit the adapter carrier; it
-    bites hooks harder, because a hook fix is exactly what a bug report produces.
+    ⚠ A THIRD SURFACE IN THE SAME CLASS, and the class is the finding. When this check
+    was written (2026-08-01), Levain copied artifacts into the operator's install at
+    `init` and had NO upgrade path that refreshed them, so `pip install -U levain`
+    upgraded the package and left the operator running the old copies; a hook fix is
+    exactly what a bug report produces. Since the install-truth work, `levain update`
+    refreshes hooks (`install.refresh_adapter`), and the pending-upgrade remedy below
+    names it; this check is what tells the operator an update is owed.
 
     Concretely, 2026-08-01: Alex De Groodt reported that `install_root()` accepted
     any ANCESTOR as the install, which silently killed the whole activation layer

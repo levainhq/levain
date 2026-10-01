@@ -2673,6 +2673,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # distinct /srv/secret on a case-sensitive filesystem (complement + codex, L3 r2). Its only
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
+    file_roots: list[Path] = []   # subtree roots that are files: denied both ways, like step (4)
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
@@ -2681,7 +2682,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # remount would then target a path that tmpfs hid, aborting bwrap before bash starts
         # (Diogenes MEDIUM 2026-10-01, reproduced on a Linux kernel and on argushub). Nothing is
         # rebound under it: step (3) rebinds only known_hosts and config, guarded by _caller_denies.
-        # The EQUAL case stays: it needs its remount for EROFS on a write.
+        # The cost (L1 on 3e5a113): the ssh tmpfs has no remount, so a WRITE under such a root
+        # succeeds into the tmpfs and evaporates instead of failing EROFS. Reads stay denied, as for
+        # the rest of ~/.ssh in agent mode. The EQUAL case stays: it needs its remount for EROFS.
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             continue
         if sub.exists() and not sub.is_dir():
@@ -2689,6 +2692,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
             # Deny it the way step (4) denies a file, which refuses both read and write.
             argv += ["--ro-bind", "/dev/null", str(sub)]
+            file_roots.append(sub)
             continue
         tmpfs_roots.append(sub)
         argv += ["--tmpfs", str(sub)]
@@ -2775,8 +2779,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
-        if f in deny_both:
-            # Step (4) already denies it BOTH ways. A self-bind here would take its source from the
+        if f in deny_both or f in file_roots:
+            # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
             # real host file and stack it on top, making a read-denied file readable again (L2
             # review, 2026-09-30); macOS denies such a file both ways unconditionally.
             continue
