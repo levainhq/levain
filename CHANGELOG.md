@@ -4,9 +4,19 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased]
+## [0.5.0] — 2026-10-01
 
-Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
+**Minor, not patch: Linux becomes a supported platform** (a bubblewrap confinement floor and `systemd --user` seats). Install-truth work lands alongside it: `levain update` now refreshes the activation tree and adapter files after an upgrade.
+
+### Known open issues in this release
+
+Found in review, not fixed in 0.5.0, each tracked for a later release:
+
+- **A pack `order` change alone can switch which pack's activation hook is installed, without review.** When two packs ship the same `activation/hooks/<file>`, changing only one pack's `order` in its `pack.toml` makes `levain update` install the other pack's hook. A changed hook *file* is held for review; a changed *winner* is not.
+- **A pack source edited and then reverted while `levain update` runs can slip its edited hook in.** It needs a concurrent writer to the pack directory during the update.
+- **Codex's machine-global files are guarded by a per-install lock.** `~/.codex/hooks.json` and `config.toml` are shared by every install on the machine, so two installs updating at once can interleave on them.
+- **On Linux, the localhost block does not cover unix sockets at a file path, or AF_VSOCK.** Bash runs with no IP network, but a socket at a path the floor does not deny (an ssh ControlMaster or proxy socket in `/tmp`, D-Bus, X11) can still reach this host's services and bypass the block, and inside a VM so can AF_VSOCK. `levain run` and `levain doctor` print this. The ssh ControlMaster case is the same on macOS (named since 0.4.6).
+- **`levain run` reads `.levain/confinement.json` twice at startup.** The banner is rendered from one read and the floor is built from the second, so editing that file at the very moment an entity starts can make the banner describe a different floor from the one in force. The entity cannot write the file; only an operator edit at startup can cause this.
 
 ### Changed — on macOS, an unattended seat can no longer read the Keychain
 
