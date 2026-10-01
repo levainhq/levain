@@ -1721,6 +1721,19 @@ def test_doctor_agrees_with_run_when_the_sandbox_cannot_deny_localhost(tmp_path,
     assert "file_editor + bash" in _check_confinement(tmp_path)[0].detail
 
 
+def test_doctor_names_a_broken_config_instead_of_promising_bash(tmp_path, monkeypatch):
+    """L3 r1 (complement + codex + glm): a malformed confinement.json makes `levain run` refuse to
+    start, and doctor used to swallow it and print "file_editor + bash"."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "diagnose_confinement", _supported(conf))
+    (tmp_path / ".levain").mkdir()
+    (tmp_path / ".levain" / "confinement.json").write_text("{not json")
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is True and "refuse to start" in r.detail and "bash" not in r.detail.split(":")[0]
+
+
 def test_doctor_confinement_check_survives_a_broken_diagnosis(tmp_path, monkeypatch):
     """The diagnosis probes the filesystem and executes a binary. Neither may take the whole doctor
     run down — an unrelated crash here would hide every other check."""

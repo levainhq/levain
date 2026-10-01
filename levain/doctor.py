@@ -842,19 +842,25 @@ def _check_confinement(install: Path) -> list[CheckResult]:
         # The host can sandbox bash, but on a provider that cannot block connections back to this
         # host, `levain run` still drops bash unless the entity opted out of that deny. Read the same
         # config `levain run` reads, so this line and the banner agree.
+        from levain.firing.confinement import (
+            LINUX_LOCALHOST_REFUSAL,
+            load_confinement_config,
+            select_provider,
+        )
         try:
-            from levain.firing.confinement import (
-                LINUX_LOCALHOST_REFUSAL,
-                load_confinement_config,
-                select_provider,
-            )
-            if (not select_provider().enforces_localhost_deny
-                    and not load_confinement_config(install).allow_localhost_outbound):
-                return [CheckResult("confinement floor", True,
-                                    f"{d.provider} available, but `levain run` gets file_editor only: "
-                                    f"{LINUX_LOCALHOST_REFUSAL}")]
-        except Exception:  # noqa: BLE001 — a config problem is reported by `levain run` itself
-            pass
+            cfg = load_confinement_config(install)
+        except Exception as exc:  # noqa: BLE001 — `levain run` refuses this config; say so, not "bash"
+            return [CheckResult("confinement floor", True,
+                                f"{d.provider} available, but `levain run` will refuse to start: "
+                                f"{exc}")]
+        try:
+            enforces = select_provider().enforces_localhost_deny
+        except Exception:  # noqa: BLE001 — no provider: diagnose_confinement already said supported
+            enforces = True
+        if not enforces and not cfg.allow_localhost_outbound:
+            return [CheckResult("confinement floor", True,
+                                f"{d.provider} available, but `levain run` gets file_editor only: "
+                                f"{LINUX_LOCALHOST_REFUSAL}")]
         return [CheckResult("confinement floor", True,
                             f"{d.provider} — `levain run` gets file_editor + bash")]
     detail = f"{d.reason} — `levain run` gets file_editor only (this is a supported configuration)"

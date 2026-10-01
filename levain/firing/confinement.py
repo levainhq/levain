@@ -411,31 +411,32 @@ _CONTAINER_DAEMON_SOCKETS = (
 )
 
 
-def _runtime_dir() -> str | None:
-    """``$XDG_RUNTIME_DIR``, or on Linux the systemd default ``/run/user/<uid>`` when the variable is
-    unset, empty or relative. A rootless daemon's socket is still there under cron, ``su`` or an ssh
-    session without pam_systemd, and the entity can set the variable itself, so a missing variable
-    must not drop the entries (L1 + L2 review, 2026-09-30). None off Linux: macOS has no such dir."""
+def _runtime_dirs() -> list[str]:
+    """Every user runtime dir a rootless socket may live in. ``$XDG_RUNTIME_DIR`` when it is set and
+    absolute, and on Linux ALSO the systemd default ``/run/user/<uid>``: a ``systemctl --user``
+    socket lives there whatever the launching shell's variable says (a nix or container shell can
+    point it elsewhere), and under cron or ``su`` the variable is missing entirely while the socket
+    is not (L1, L2 and complement L3 r1, 2026-09-30). None of it off Linux unless the variable is set."""
+    out: list[str] = []
     value = os.environ.get("XDG_RUNTIME_DIR", "")
     if value and os.path.isabs(value):
-        return value
+        out.append(value)
     if platform.system() == "Linux":
-        return f"/run/user/{os.getuid()}"
-    return None
+        default = f"/run/user/{os.getuid()}"
+        if default not in out:
+            out.append(default)
+    return out
 
 
-def _expand_socket_source(spec: str) -> Path | None:
-    """One roster entry as a path, or None when it names a runtime dir this host does not have — a
-    path still containing ``$`` would deny a file nobody can create, and read as cover."""
+def _expand_socket_source(spec: str) -> list[Path]:
+    """One roster entry as the paths it names; empty when it names a runtime dir this host does not
+    have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
     if spec.startswith("$XDG_RUNTIME_DIR"):
-        runtime = _runtime_dir()
-        if runtime is None:
-            return None
-        spec = runtime + spec[len("$XDG_RUNTIME_DIR"):]
+        return [Path(r + spec[len("$XDG_RUNTIME_DIR"):]) for r in _runtime_dirs()]
     expanded = os.path.expandvars(spec)
     if "$" in expanded:
-        return None
-    return Path(expanded).expanduser()
+        return []
+    return [Path(expanded).expanduser()]
 
 
 class ConfinementError(RuntimeError):
@@ -915,9 +916,7 @@ def build_policy(
     # host-side connect succeeding against the same socket while the entity's was refused.
     socket_sources_l: list[Path] = []
     if not allow_container_sockets:
-        socket_sources_l = [
-            p for p in (_expand_socket_source(s) for s in _CONTAINER_DAEMON_SOCKETS) if p is not None
-        ]
+        socket_sources_l = [p for s in _CONTAINER_DAEMON_SOCKETS for p in _expand_socket_source(s)]
     socket_sources_t = _dedup(socket_sources_l)
     # ⛔ ONE RESOLUTION FEEDS ALL THREE ARMS (codex L3 #5 + glm, 2026-09-04). This block used to
     # resolve the sources THREE times — once for the connect deny, once inline for the write deny,
@@ -2554,6 +2553,19 @@ def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
 
 
 def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
+    """:func:`_bwrap_plan_impl`, with a filesystem error while inspecting the host (an unlistable
+    store, an entry vanishing mid-walk) turned into the fail-closed :class:`ConfinementError` every
+    caller handles — not a raw ``OSError`` that crashes the tool call (codex, L3 r1)."""
+    try:
+        return _bwrap_plan_impl(policy)
+    except OSError as exc:
+        raise ConfinementError(
+            f"could not inspect the host to build the Linux floor ({exc}) — refusing to grant bash "
+            "hands (fail-closed)."
+        ) from exc
+
+
+def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
     with two views, never two builders that can drift (the ``two_things_that_should_be_one`` class
@@ -2583,9 +2595,57 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     head, argv = argv, []
     remount_ro: list[str] = []
 
+    # (2a) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
+    # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
+    # its own store, which is the only mount-namespace way to stop a PLANT of a file that does not
+    # exist yet (a first memory.continuity.md, a SQLite sidecar, a confinement.json) without
+    # leaving a stub on the host. The stub was the defect, measured 2026-09-30: K4c gave each absent
+    # file a ``--ro-bind /dev/null`` mountpoint, and bwrap left it on the host as a 0-byte 0444 file
+    # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
+    # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
+    # as empty JSON that the next session's ``load_confinement_config`` refuses.
+    # ⛔ IT COMES FIRST IN THE BODY, before the jewel tmpfs of step (2): a bind takes its source from
+    # the real host tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel
+    # (complement + codex, L3 r1). Emitted first, any deny inside .levain lands on top of it.
+    # ⚖ STRICTER THAN macOS, STATED: on macOS the confined shell may create new files in .levain
+    # other than the denied literals and edit the ones it may write; here it may do neither for a
+    # top-level file. Its subdirectories stay writable.
+    protected = set(policy.own_memory_files)
+    if policy.config_file is not None:
+        protected.add(policy.config_file)
+    ro_store_dirs: list[Path] = []
+    for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
+        if d.is_symlink() or not d.is_dir():
+            # `levain run` refuses an entity with no .levain/ before it gets here; anything else
+            # reaching this has no store to protect, and must not be handed a shell that would
+            # create one (with stubs) on the host.
+            raise ConfinementError(
+                f"the entity store {d} is missing or a symlink — refusing to grant bash hands "
+                "(fail-closed)."
+            )
+        argv += ["--ro-bind", str(d), str(d)]
+        ro_store_dirs.append(d)
+        # Only DIRECTORIES come back read-write. A per-FILE bind pins the file's inode, so a host
+        # write by rename (anneal and levain write that way) would leave the shell reading and
+        # writing an orphan (complement, L3 r1); a top-level file therefore stays read-only here.
+        for child in sorted(d.iterdir(), key=lambda p: p.name):
+            if child in protected or child.is_symlink() or not child.is_dir():
+                continue
+            argv += ["--bind", str(child), str(child)]
+
+    def _absent_in_ro_store(f: Path) -> bool:
+        # Nothing to hide and nothing the shell can create: no mount, so no host stub.
+        return not f.exists() and f.parent in ro_store_dirs
+
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
-    tmpfs_roots: list[Path] = list(policy.deny_read_write)
-    for sub in policy.deny_read_write:
+    # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
+    # child hides the child's mountpoint, and the deferred remount of the child then aborts bwrap
+    # (codex, L3 r1, with deny_subtrees given child-first).
+    tmpfs_roots: list[Path] = []
+    for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
+        if any(_ci_within(sub, r) for r in tmpfs_roots):
+            continue
+        tmpfs_roots.append(sub)
         argv += ["--tmpfs", str(sub)]
         remount_ro.append(str(sub))
 
@@ -2608,35 +2668,6 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if config.exists() and not _caller_denies(config, policy):
             argv += ["--ro-bind", str(config), str(config)]
             rebound.append(config)
-
-    # (3b) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
-    # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
-    # its own store, which is the only mount-namespace way to stop a PLANT of a file that does not
-    # exist yet (a first memory.continuity.md, a SQLite sidecar, a confinement.json) without
-    # leaving a stub on the host. The stub was the defect, measured 2026-09-30: K4c gave each absent
-    # file a ``--ro-bind /dev/null`` mountpoint, and bwrap left it on the host as a 0-byte 0444 file
-    # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
-    # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
-    # as empty JSON that the next session's ``load_confinement_config`` refuses.
-    # ⚖ STRICTER THAN macOS IN ONE WAY, STATED: on macOS the confined shell may create new files in
-    # .levain other than the denied literals; here it may not. Existing entries behave the same.
-    protected = set(policy.own_memory_files)
-    if policy.config_file is not None:
-        protected.add(policy.config_file)
-    ro_store_dirs: list[Path] = []
-    for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
-        if not d.is_dir() or d.is_symlink():
-            continue
-        argv += ["--ro-bind", str(d), str(d)]
-        ro_store_dirs.append(d)
-        for child in sorted(d.iterdir(), key=lambda p: p.name):
-            if child in protected or child.is_symlink():
-                continue
-            argv += ["--bind", str(child), str(child)]
-
-    def _absent_in_ro_store(f: Path) -> bool:
-        # Nothing to hide and nothing the shell can create: no mount, so no host stub.
-        return not f.exists() and f.parent in ro_store_dirs
 
     # (4) READ+WRITE-DENIED FILES — credential files and the confinement config that defines the
     # floor. `--ro-bind /dev/null` denies BOTH directions (EACCES on read and on write), which is the
@@ -2680,7 +2711,7 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # both measured, which is what makes the vector floor hold without the ancestor pin doing it.
     #
     # ⚠ THE MISSING-FILE CASE MUTATES THE HOST, AND IT IS DELIBERATE. It is not the only place: any
-    # mount whose target is missing makes bwrap create it (steps 1, 2, 4, 6 too), and step (3b)
+    # mount whose target is missing makes bwrap create it (steps 1, 2, 4, 6 too), and step (2a)
     # exists because doing it inside the entity's own store broke that store.
     # A mount needs a mountpoint. macOS denies a path STRING, so it covers a file that does not exist
     # YET — which is the entire point of the ssh vector floor (`spore-322`): the attack is PLANTING an
@@ -2691,7 +2722,7 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # directives. The alternative — skip it — is `--ro-bind-try` by another name and lets the plant
     # through, which a control run confirmed it does.
     # The entity's own store files never reach the missing-file branch: an absent one is covered by
-    # the read-only store dir in step (3b), because the stub this branch would leave broke the
+    # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
@@ -2722,9 +2753,10 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # ⚡ AND THE MOUNTPOINT LANDS INSIDE THE TMPFS, so unlike the missing-file case below this
             # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
             argv += ["--ro-bind", "/dev/null", str(f)]
-        elif f.exists():
+        elif f.exists() or f.is_symlink():
+            # A dangling link is a link too: it goes through the same refusal (complement, L3 r1).
             t = str(_bwrap_file_target(f))
-            argv += ["--ro-bind", t, t]
+            argv += ["--ro-bind", t, t] if f.exists() else ["--ro-bind", "/dev/null", t]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 
@@ -2750,14 +2782,18 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock, rootless
     # $XDG_RUNTIME_DIR/docker.sock) is covered only while its inode lives. A restart re-exposes it
     # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
-    # Both run through the user's service manager, which is outside this namespace — the Linux form
-    # of the launchd-helper limit in the module docstring.
+    # Both run through the user's service manager, which is outside this namespace.
+    # ⛔ AND THAT MANAGER IS THE SHARPER LIMIT, NOT CLOSED HERE: nothing in this floor hides
+    # $XDG_RUNTIME_DIR/bus or $XDG_RUNTIME_DIR/systemd, so ``systemd-run --user`` from inside the
+    # sandbox can plausibly start a command OUTSIDE it that reads any jewel [reasoned, not run: no
+    # user-session host was available; codex + L1, 2026-09-30]. The Linux form of the launchd-helper
+    # limit in the module docstring. Masking them costs the shell `systemctl --user` and desktop
+    # D-Bus, a floor-scope decision for the operator (spore-1244).
     # Compared RESOLVED, because the socket targets are: a symlinked runtime dir or HOME compared
     # lexically would get the directory form, a read-only tmpfs over the whole runtime dir (L1 + L2).
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     shared.add(Path.home().resolve())
-    runtime = _runtime_dir()
-    if runtime is not None:
+    for runtime in _runtime_dirs():
         shared.add(Path(runtime).resolve())
     hidden_dirs: list[Path] = []
     for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
@@ -2909,6 +2945,10 @@ class BwrapProvider(ConfinementProvider):
         :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
         terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
         later by someone who does not trust this docstring."""
+        if policy.deny_localhost_outbound:
+            # The same refusal as spawn: a rendered command that silently dropped the deny would be
+            # a reproduction of a floor this provider does not run (codex, L3 r1).
+            raise ConfinementError(f"bash refused: {LINUX_LOCALHOST_REFUSAL}")
         argv, create_first = _bwrap_plan(policy)
         mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
         return mkdir + shlex.join(argv) + "\n"

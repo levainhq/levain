@@ -1995,25 +1995,25 @@ def test_bwrap_hides_an_absent_daemon_dir_the_entity_could_start_a_daemon_in(tmp
     assert _tmpfs_then_ro(argv, str((run / "podman").resolve()))
 
 
-def test_xdg_runtime_socket_entries_follow_the_variable_and_fall_back_on_linux(monkeypatch) -> None:
+def test_xdg_runtime_socket_entries_follow_the_variable_and_the_linux_default(monkeypatch) -> None:
+    """The env dir when it is set and absolute, and on Linux ALSO /run/user/<uid>, where a
+    `systemctl --user` socket lives whatever the launching shell says (complement, L3 r1)."""
+    from levain.firing import confinement as _conf
     from levain.firing.confinement import _expand_socket_source
 
-    from levain.firing import confinement as _conf
-
-    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-    assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == Path("/run/user/1000/docker.sock")
+    default = Path(f"/run/user/{os.getuid()}/docker.sock")
+    monkeypatch.setattr(_conf.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/nix/run")
+    assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == [Path("/nix/run/docker.sock"), default]
     for unset in (None, "", "relative/dir"):
         if unset is None:
             monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         else:
             monkeypatch.setenv("XDG_RUNTIME_DIR", unset)
-        monkeypatch.setattr(_conf.platform, "system", lambda: "Darwin")
-        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") is None
-        # On Linux the socket is still at the systemd default when the variable is missing (cron, su).
         monkeypatch.setattr(_conf.platform, "system", lambda: "Linux")
-        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == Path(
-            f"/run/user/{os.getuid()}/docker.sock"
-        )
+        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == [default]
+        monkeypatch.setattr(_conf.platform, "system", lambda: "Darwin")
+        assert _expand_socket_source("$XDG_RUNTIME_DIR/docker.sock") == []
 
 
 def test_crown_jewel_reason_fails_CLOSED_on_a_tilde_user_path_not_by_raising(tmp_path) -> None:
@@ -2586,9 +2586,46 @@ def test_bwrap_mounts_the_entity_store_read_only_and_binds_ordinary_entries_back
     argv = _bwrap_argv(policy)
     triples = [argv[k:k + 3] for k in range(len(argv))]
     assert ["--ro-bind", str(lv), str(lv)] in triples
-    assert ["--bind", str(lv / "context.json"), str(lv / "context.json")] in triples
     assert ["--bind", str(lv / "docs"), str(lv / "docs")] in triples
+    # A top-level FILE is not bound back: a per-file bind pins its inode, and the host writes these
+    # by rename, so the shell would read and write an orphan (complement, L3 r1).
+    assert ["--bind", str(lv / "context.json"), str(lv / "context.json")] not in triples
     assert ["--bind", str(lv / "memory.db"), str(lv / "memory.db")] not in triples
+
+
+def test_bwrap_a_jewel_inside_the_store_stays_hidden_under_the_store_mount(tmp_path, monkeypatch) -> None:
+    """complement + codex, L3 r1: the store bind takes its source from the real tree, so emitted
+    AFTER a jewel tmpfs under .levain it re-exposed that jewel. The tmpfs must come later."""
+    policy, lv = _store_policy(tmp_path, monkeypatch)
+    secret = lv / "docs"
+    policy = build_policy(lv.parent, extra_deny_read_write=(secret,))
+    argv = _bwrap_argv(policy)
+    pairs = [argv[k:k + 2] for k in range(len(argv))]
+    i_store = [argv[k:k + 3] for k in range(len(argv))].index(["--ro-bind", str(lv), str(lv)])
+    i_tmpfs = pairs.index(["--tmpfs", str(secret)])
+    assert i_store < i_tmpfs
+    rebinds = [k for k in range(len(argv) - 2) if argv[k:k + 3] == ["--bind", str(secret), str(secret)]]
+    assert all(k < i_tmpfs for k in rebinds), "the real dir was bound back over the jewel tmpfs"
+
+
+def test_bwrap_nested_deny_roots_given_child_first_emit_only_the_parent(tmp_path, monkeypatch) -> None:
+    """codex, L3 r1: a parent tmpfs after its child hid the child's mountpoint, and the deferred
+    remount of the child aborted bwrap."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parent = tmp_path / "secret"
+    child = parent / "private"
+    child.mkdir(parents=True)
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), extra_deny_read_write=(child, parent)))
+    tmpfs = [argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"]
+    assert str(parent.resolve()) in tmpfs or str(parent) in tmpfs
+    assert str(child) not in tmpfs and str(child.resolve()) not in tmpfs
+
+
+def test_bwrap_render_refuses_like_spawn_when_the_localhost_deny_is_on(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pol = build_policy(_entity(tmp_path), deny_localhost_outbound=True)
+    with pytest.raises(ConfinementError, match="allow_localhost_outbound"):
+        BwrapProvider().render_profile(pol)
 
 
 def test_bwrap_leaves_no_stub_for_an_absent_store_file(tmp_path, monkeypatch) -> None:
