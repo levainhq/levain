@@ -119,7 +119,12 @@ is tabulated above :func:`_bwrap_argv`.
     open, so the entity can drive an EXISTING unsandboxed daemon (``pbcopy``/``pasteboardd``) or hit a
     LOCAL service that re-exposes crown-jewel content (the argushub store on ``:8420``, the continuity
     digest pushed to Supabase) — the file-deny doesn't cover the socket. Spawning a NON-descendant
-    unsandboxed helper via ``launchd`` is plausible (L2 could not confirm it under a non-GUI shell).
+    unsandboxed helper via ``launchd`` was MEASURED REFUSED for ``launchctl submit`` and
+    ``launchctl bootstrap gui/<uid>`` from a real SeatbeltProvider shell (Diogenes 2026-10-01;
+    submit re-run by the levain seat the same day: rc=1 and no job ran inside, rc=0 and the job ran
+    in the outside control); ``launchctl print`` still answers, so launchd is reachable but will not
+    create jobs for a sandboxed caller. Other routes to an unsandboxed process (Apple Events to an
+    app, say) were not tried.
     Same class as network-exfil: gated-drive halt + human-in-the-loop where present, ``spore-417``
     for the per-domain policy. ⚠ An unattended seat has no human in this class either.
     ⛔ sshd ON THIS HOST IS THE SHARPEST INSTANCE OF THIS CLASS, AND ``ssh_mode="agent"`` MAKES IT
