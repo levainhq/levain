@@ -671,7 +671,7 @@ class LaunchdProvider(DaemonProvider):
     def restart(self, label: str) -> str:
         _refuse_root()
         domain = self._domain()
-        _run(["launchctl", "kickstart", "-k", f"{domain}/{label}"], check=True)
+        _run(["launchctl", "kickstart", "-k", f"{domain}/{_valid_label(label)}"], check=True)
         return f"restarted {label}"
 
 
@@ -1132,7 +1132,9 @@ class SystemdUserProvider(DaemonProvider):
         _refuse_root()
         # Restart the SERVICE even for a seat: "force a turn now" is what an operator means, and
         # restarting the timer would merely reset the countdown.
-        _run(["systemctl", "--user", "restart", f"{label}.service"], check=True)
+        # restart builds no unit path, so nothing else validates the label here; systemctl reads
+        # `*.service` as a glob over every loaded user unit.
+        _run(["systemctl", "--user", "restart", f"{_valid_label(label)}.service"], check=True)
         return f"restarted {label}"
 
 

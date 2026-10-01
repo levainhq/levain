@@ -1103,3 +1103,18 @@ def test_an_old_systemd_is_refused_before_anything_is_written(systemd, tmp_path,
     with pytest.raises(DaemonError, match="240"):
         systemd.install(_seat(tmp_path))
     assert not (systemd.UNIT_DIR / "levain-seat.service").exists()
+
+
+@pytest.mark.parametrize("provider", [daemon.SystemdUserProvider, daemon.LaunchdProvider])
+def test_restart_refuses_an_invalid_label_before_the_service_manager_sees_it(provider, monkeypatch):
+    """Reproduced 2026-10-01 with the manager stubbed: `restart('*')` sent
+    `systemctl --user restart '*.service'` (a glob over every loaded user unit) and
+    `launchctl kickstart -k gui/<uid>/*`. restart builds no unit path, so the label check
+    the other verbs get through their path helpers never ran."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(daemon, "_run", lambda cmd, check: calls.append(cmd))
+    monkeypatch.setattr(daemon, "_refuse_root", lambda: None)
+    for bad in ("*", "../x", "a@b"):
+        with pytest.raises(daemon.DaemonError):
+            provider().restart(bad)
+    assert calls == []
