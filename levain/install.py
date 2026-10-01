@@ -1960,17 +1960,17 @@ def refresh_adapter(
                 on_demand_entries(roster)).items()}
             if adapter == "codex":
                 variants["hooks.json"] = _codex_hooks_json(adapter_root, _VARIABLE, install)
+            # `expected` is composed from the LIVE pack sources, so a path a pack changed since
+            # it was recorded would be installed in the same run the pack reconcile lists it for
+            # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,
+            # installed bytes v2). Hold exactly those paths; everything else still refreshes.
+            # Inside the try so an unreadable pack file fails closed (complement L3 r3). A pack
+            # source edited AND reverted while this runs is not caught (codex L3 r3, routed).
+            held = _pack_held_activation(recorded)
         except (PackError, InitError, OSError, ValueError) as e:
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
             return out
-        # `expected` is composed from the LIVE pack sources, so a path a pack changed since
-        # it was recorded would be installed in the same run the pack reconcile lists it for
-        # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,
-        # installed bytes v2). Hold exactly those paths; everything else still refreshes.
-        # Computed AFTER `expected` captured its bytes, on purpose: a pack edited in between
-        # either shows up here as drift (held) or did not reach `expected` (codex L3 r2).
-        held = _pack_held_activation(recorded)
         _refresh_activation(install, expected, apply=apply, out=out, lines=lines, held=held)
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
@@ -2138,6 +2138,7 @@ def _refresh_activation(
     # receipt key like "../../x" made update delete a file outside the install, and the
     # check-then-unlink raced an editor's save. Removing a file is the operator's call.
     for rel in sorted(held):
+        out.review.append(f"activation/{rel}")  # unsettled executable drift: never exit 0
         lines.append(f"  activation/{rel}: not refreshed, because a pack changed it and the "
                      f"pack reconcile above is holding it for review.")
     expected = {rel: v for rel, v in expected.items() if rel not in held}
