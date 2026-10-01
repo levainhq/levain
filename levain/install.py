@@ -518,6 +518,7 @@ def run_init(
                     verbatim,
                     activation_roots=activation_roots,
                     packs=list(zip(pack_manifests, pack_dirs)),
+                    require_empty=not force,
                 )
                 # Interview completed successfully — clear the checkpoint so the next
                 # `levain init --force` doesn't offer to resume stale answers.
@@ -558,10 +559,23 @@ def apply_init(
     activation_roots: Sequence[Path] | None = None,
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
+    require_empty: bool = False,
 ) -> InitResult:
     """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
-    :class:`InstallBusy` before writing anything when another process holds it."""
+    :class:`InstallBusy` before writing anything when another process holds it.
+
+    ``require_empty`` (a fresh init, no ``--force``) re-checks the target UNDER the lock.
+    The caller's own emptiness check runs before the interview, minutes earlier, so two
+    fresh inits could both pass it and the second would overwrite the first's seeds with
+    no authorization and no backup (codex L3 on 19811f7, reproduced). Raises
+    :class:`InstallTargetTaken` before writing anything."""
     with install_lock(install):
+        if require_empty and not _is_safe_install_target_locked(install):
+            raise InstallTargetTaken(
+                f"{install} is no longer empty: another `levain init` finished there while "
+                f"this one was running. Nothing was written. Re-run with --force to replace "
+                f"it, or choose another path."
+            )
         return _apply_init(
             install, chosen, answers, templates_root, python_path, anneal_path, specs,
             verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
@@ -1164,6 +1178,21 @@ def _is_safe_install_target(path: Path) -> bool:
     return not any(path.iterdir())
 
 
+def _is_safe_install_target_locked(path: Path) -> bool:
+    """:func:`_is_safe_install_target` for a caller holding :func:`install_lock`: this
+    run's own bookkeeping (the lock file, the ``.gitignore`` entry the lock writes, and
+    the interview checkpoint) does not count as content."""
+    if not path.is_dir():
+        return False
+    for entry in path.iterdir():
+        if entry.name != INSTALL_LOCK_REL[0] or not entry.is_dir():
+            return False
+        own = {INSTALL_LOCK_REL[1], ".gitignore", _checkpoint_path(path).name}
+        if any(e.name not in own for e in entry.iterdir()):
+            return False
+    return True
+
+
 @contextmanager
 def _templates_root() -> Iterator[Path]:
     """Yields the package's `templates/` directory as a filesystem Path.
@@ -1207,6 +1236,11 @@ class InstallLockError(InitError):
 
 class InstallBusy(InstallLockError):
     """Another levain process is writing this install right now; nothing was written."""
+
+
+class InstallTargetTaken(InstallLockError):
+    """A fresh (non --force) init found the target no longer empty once it held the lock:
+    another init finished there first. Nothing was written."""
 
 
 INSTALL_LOCK_REL = (".levain", "install.lock")
@@ -1883,7 +1917,9 @@ def refresh_adapter(
     The seed files and the interview are not touched: the pack reconcile owns seeds. So
     the carrier (CLAUDE.md / AGENTS.md, whose import list IS the seed set) is refreshed
     only when the caller says the pack layer is settled (``carrier``) and every seed it
-    would import is on disk; otherwise it would load a seed the reconcile held back.
+    would import is on disk; otherwise it would load a seed the reconcile held back. The
+    activation tree is held under the same flag: it is composed from the live pack
+    sources, so refreshing it would install a pack hook the reconcile is holding.
     Codex's machine-global hooks.json is handled only when it already names this
     install, and config.toml only when it already registers this install's store;
     otherwise they are named and left alone, because replacing them repoints every
@@ -1927,7 +1963,16 @@ def refresh_adapter(
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
             return out
-        _refresh_activation(install, expected, apply=apply, out=out, lines=lines)
+        if carrier:
+            _refresh_activation(install, expected, apply=apply, out=out, lines=lines)
+        else:
+            # The roster above is composed from the LIVE pack sources, so refreshing now
+            # would install a pack's changed hook (executable code) in the same run the
+            # reconcile lists it for review (codex L3 on 19811f7, reproduced: pack hook v1
+            # -> v2, update exit 1, installed bytes v2). Hold the whole tree until settled.
+            # Not added to out.review: the pack reconcile already exits 1 for this.
+            lines.append("  activation/: not refreshed, because the pack reconcile above is "
+                         "holding changes for review; settle that first.")
         carrier_name = "CLAUDE.md" if adapter == "claude-code" else "AGENTS.md"
         missing = sorted(e.name for e in [*import_entries(roster), *on_demand_entries(roster)]
                          if not (install / "seed" / e.name).is_file())

@@ -3229,3 +3229,40 @@ def test_install_lock_fails_closed_on_an_unexpected_flock_error(tmp_path, monkey
         with pytest.raises(InstallLockError, match="could not lock"):
             with install_lock(tmp_path):
                 pass
+
+
+def test_a_second_fresh_init_that_lost_the_race_writes_nothing(tmp_path, capsys, monkeypatch):
+    """codex L3 on 19811f7, reproduced: two `levain init` runs without --force both passed
+    the empty-target check (it runs before the interview), and the second, taking the lock
+    after the first finished, overwrote the first's seeds and answers.json with no backup;
+    both exited 0. The emptiness check now repeats under the lock."""
+    import json as _json
+
+    from levain import install as inst_mod
+    from tests.test_init_answers import _filled
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    target = tmp_path / "ent"
+    a_file, b_file = tmp_path / "a.json", tmp_path / "b.json"
+    a = _filled(capsys)
+    b = dict(a, ENTITY_NAME="EntityB", OPERATOR_NAME="BOB_B")
+    a_file.write_text(_json.dumps(a)); b_file.write_text(_json.dumps(b))
+
+    real_lock = inst_mod.install_lock
+    state = {"raced": False}
+
+    def lock_after_a_finishes(path, **kw):
+        # B has passed its empty-target check; A now runs to completion first.
+        if not state["raced"]:
+            state["raced"] = True
+            monkeypatch.setattr(inst_mod, "install_lock", real_lock)
+            assert inst_mod.run_init(target, "claude-code", force=False, answers_file=a_file) == 0
+        return real_lock(path, **kw)
+
+    monkeypatch.setattr(inst_mod, "install_lock", lock_after_a_finishes)
+
+    rc_b = inst_mod.run_init(target, "claude-code", force=False, answers_file=b_file)
+    origin = (target / "seed" / "origin.md").read_text()
+    assert rc_b == 1
+    assert "EntityB" not in origin and a["ENTITY_NAME"] in origin
+    assert "no longer empty" in capsys.readouterr().out

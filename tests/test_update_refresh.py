@@ -528,3 +528,29 @@ def test_an_unreadable_codex_hooks_file_is_review(make_install, tmp_path):
     finally:
         os.chmod(hooks, 0o644)
     assert str(hooks) in r.review and "could not be read" in out
+
+
+def test_update_does_not_install_a_pack_hook_the_reconcile_is_holding(tmp_path, capsys, monkeypatch):
+    """codex L3 on 19811f7, reproduced: a pulled pack changed its activation hook; update's
+    pack reconcile listed it "activation changed — review" and exited 1, while the adapter
+    refresh in the same run installed the new hook bytes (executable code) anyway."""
+    from levain.update import run_update
+    from tests.test_init_answers import _filled
+    from tests.test_reconcile import _write_pack
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    pack = _write_pack(tmp_path / "pack", name="zzpack", seed={"zz_note.md": "note\n"},
+                       activation={"hooks/zz_pack_hook.py": "print('v1')\n"})
+    af = tmp_path / "a.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    install = tmp_path / "ent"
+    assert run_init(install, "claude-code", force=False, packs=[pack], answers_file=af) == 0
+    hook = install / "activation" / "hooks" / "zz_pack_hook.py"
+    assert hook.read_text() == "print('v1')\n"
+
+    (pack / "activation" / "hooks" / "zz_pack_hook.py").write_text("print('v2')\n")
+    lines: list[str] = []
+    rc = run_update(install, no_pip=True, yes=True, emit=lines.append, confirm=lambda s: False)
+    out = "\n".join(lines)
+    assert rc == 1 and "activation changed" in out
+    assert hook.read_text() == "print('v1')\n", "an unreviewed pack hook was installed"

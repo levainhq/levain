@@ -513,6 +513,7 @@ class _InitHandler(BaseHTTPRequestHandler):
                         activation_roots=activation_roots,
                         packs=pack_pairs,
                         emit=messages.append,
+                        require_empty=not self.server.force,
                     )
                 except InitError as exc:
                     self._send_json(
