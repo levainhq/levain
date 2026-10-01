@@ -794,7 +794,10 @@ def test_systemd_install_writes_both_units_and_enables_the_timer(systemd, tmp_pa
     assert (systemd.UNIT_DIR / "levain-seat.timer").exists()
     assert "daemon-reload" in fake.verbs
     # the TIMER is what gets enabled — enabling the service would run it once and never again
-    assert ["systemctl", "--user", "enable", "--now", "levain-seat.timer"] in fake.calls
+    assert ["systemctl", "--user", "enable", "levain-seat.timer"] in fake.calls
+    # ...and RESTARTED, not `enable --now`: --now leaves an already-active unit on its old
+    # definition, so a reinstall with a new cadence or task never took effect (L3 2026-09-30).
+    assert ["systemctl", "--user", "restart", "levain-seat.timer"] in fake.calls
     assert "idle between turns is NORMAL" in out
 
 
@@ -1008,7 +1011,12 @@ def test_the_timer_label_is_guarded_too_because_Unit_names_the_service(tmp_path)
     """`render_timer` puts the label in TWO directives, and `Unit=` is the one naming the service the
     timer fires. A guard on the service alone would leave the timer injectable."""
     spec = _injection_seat(tmp_path)
-    bad = replace(spec, label="seat\nExecStart=/bin/sh")
+    # Refused at construction now (the label is a file name too)...
+    with pytest.raises(DaemonError):
+        replace(spec, label="seat\nExecStart=/bin/sh")
+    # ...and the renderers' own guard still holds for a spec that got past it some other way.
+    bad = replace(spec)
+    object.__setattr__(bad, "label", "seat\nExecStart=/bin/sh")
     with pytest.raises(DaemonError):
         SystemdUserProvider().render_timer(bad)
     with pytest.raises(DaemonError):
@@ -1026,3 +1034,72 @@ def test_an_ordinary_single_line_task_still_renders(tmp_path) -> None:
     exec_line = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")][0]
     for flag in ("--unattended", "--max-seconds", "--consolidate"):
         assert flag in exec_line, f"{flag} left the ExecStart directive"
+
+
+# ---------- L3 2026-09-30 (the K4c port): labels, escaping, reinstall, seat status ----------
+
+
+@pytest.mark.parametrize("label", ["../escape", "a/b", "seat@1", "100%", ".hidden", "x..y", "", "a" * 129])
+def test_a_label_that_is_not_a_plain_name_is_refused_on_both_platforms(tmp_path, label) -> None:
+    """The label is a FILE NAME on both platforms; ``../x`` would write, or for uninstall delete,
+    outside the unit directory. Refused at the spec AND at every provider's path helper."""
+    with pytest.raises(DaemonError):
+        replace(_seat(tmp_path), label=label)
+    with pytest.raises(DaemonError):
+        SystemdUserProvider()._service_path(label)
+    with pytest.raises(DaemonError):
+        daemon.LaunchdProvider()._plist_path(label)
+
+
+def test_the_shipped_labels_are_still_accepted(tmp_path) -> None:
+    for label in (daemon.DEFAULT_LABEL, daemon.DEFAULT_SEAT_LABEL, "levain-seat", "a_b-c.d"):
+        assert replace(_seat(tmp_path), label=label).label == label
+
+
+def test_execstart_escapes_what_systemd_would_otherwise_rewrite(tmp_path) -> None:
+    """MEASURED on systemd 255: with shlex.quote alone, ``%n`` became the unit name, ``${PATH}`` was
+    expanded and ``\\n`` became a newline. Doubled, every argument arrived byte-exact."""
+    spec = replace(_seat(tmp_path), argv=["/usr/bin/levain", "run", "--task", "90% of ${PATH} a\\nb %n"])
+    unit = SystemdUserProvider().render_unit(spec)
+    line = next(ln for ln in unit.splitlines() if ln.startswith("ExecStart="))
+    assert "90%% of $${PATH} a\\\\nb %%n" in line
+
+
+def test_a_seat_service_has_no_install_section(tmp_path) -> None:
+    """Only the timer starts a seat; an [Install] section let a stale enablement start it at login."""
+    assert "[Install]" not in SystemdUserProvider().render_unit(_seat(tmp_path))
+    assert "[Install]" in SystemdUserProvider().render_unit(_resident(tmp_path))
+
+
+def test_resident_to_periodic_stops_the_resident_service(systemd, tmp_path, monkeypatch) -> None:
+    fake = _FakeSystemctl(show={"*": {"LoadState": "loaded", "ActiveState": "active",
+                                      "SubState": "waiting", "MainPID": "0", "ExecMainStatus": "0"}})
+    monkeypatch.setattr(daemon, "_run", fake)
+    seat = _seat(tmp_path)
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / f"{seat.label}.service").write_text("old resident unit\n")
+    systemd.install(seat)
+    assert ["systemctl", "--user", "disable", "--now", f"{seat.label}.service"] in fake.calls
+
+
+def test_seat_status_reads_the_turn_from_the_service_not_the_timer(systemd, tmp_path, monkeypatch) -> None:
+    """A timer has no MainPID or exit status; a seat whose every turn failed read as healthy."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-seat.timer").write_text("t\n")
+    (systemd.UNIT_DIR / "levain-seat.service").write_text("s\n")
+    fake = _FakeSystemctl(show={
+        "levain-seat.timer": {"LoadState": "loaded", "ActiveState": "active", "SubState": "waiting"},
+        "levain-seat.service": {"MainPID": "0", "ExecMainStatus": "3", "Result": "exit-code"},
+    })
+    monkeypatch.setattr(daemon, "_run", fake)
+    st = systemd.status("levain-seat")
+    assert "last exit = 3" in st.detail and st.running is False
+
+
+def test_an_old_systemd_is_refused_before_anything_is_written(systemd, tmp_path, monkeypatch) -> None:
+    def old(cmd, *, check=False):  # noqa: ANN001
+        return subprocess.CompletedProcess(cmd, 0, stdout="systemd 239 (239-58.el8)\n+PAM", stderr="")
+    monkeypatch.setattr(daemon, "_run", old)
+    with pytest.raises(DaemonError, match="240"):
+        systemd.install(_seat(tmp_path))
+    assert not (systemd.UNIT_DIR / "levain-seat.service").exists()

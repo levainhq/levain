@@ -2530,6 +2530,17 @@ def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(_ci_within(path, r) for r in roots)
 
 
+def _reachable(p: Path) -> bool:
+    """False when this user cannot even stat ``p`` (EACCES: another user's runtime dir). Such a path
+    is out of the entity's reach too, so there is nothing to mask — and probing it must not raise
+    and cost the shell (measured 2026-09-30: XDG_RUNTIME_DIR naming another uid's dir)."""
+    try:
+        p.exists()
+        return True
+    except PermissionError:
+        return False
+
+
 def _bwrap_file_target(f: Path) -> Path:
     """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
     aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
@@ -2799,12 +2810,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # $XDG_RUNTIME_DIR/docker.sock) is covered only while its inode lives. A restart re-exposes it
     # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
     # Both run through the user's service manager, which is outside this namespace.
-    # ⛔ AND THAT MANAGER IS THE SHARPER LIMIT, NOT CLOSED HERE: nothing in this floor hides
-    # $XDG_RUNTIME_DIR/bus or $XDG_RUNTIME_DIR/systemd, so ``systemd-run --user`` from inside the
-    # sandbox can plausibly start a command OUTSIDE it that reads any jewel [reasoned, not run: no
-    # user-session host was available; codex + L1, 2026-09-30]. The Linux form of the launchd-helper
-    # limit in the module docstring. Masking them costs the shell `systemctl --user` and desktop
-    # D-Bus, a floor-scope decision for the operator (spore-1244).
+    # That manager is itself the sharper bypass, and step (7) hides it: the entity cannot ask it to
+    # start or restart anything.
     # Compared RESOLVED, because the socket targets are: a symlinked runtime dir or HOME compared
     # lexically would get the directory form, a read-only tmpfs over the whole runtime dir (L1 + L2).
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
@@ -2814,6 +2821,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     hidden_dirs: list[Path] = []
     for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
         parent = s.parent
+        if not _reachable(parent):
+            continue   # another user's runtime dir: this user (and so the entity) cannot reach it
         if parent.resolve() in shared:
             if s.exists():
                 argv += ["--ro-bind", "/dev/null", str(s)]
@@ -2824,6 +2833,28 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             argv += ["--tmpfs", str(parent)]
             remount_ro.append(str(parent))
             hidden_dirs.append(parent)
+
+    # (7) THE USER'S SERVICE MANAGER AND SESSION BUS (spore-1244), MEASURED 2026-09-30 in a
+    # systemd-as-PID-1 container with a real `systemd --user` (systemd 255, linger on), driving the
+    # real provider: with neither hidden, `systemd-run --user --pipe --wait cat <jewel>` from INSIDE
+    # the confined shell printed the jewel — the manager runs the command outside this namespace, a
+    # whole-floor bypass. With `$XDG_RUNTIME_DIR/systemd` hidden and `$XDG_RUNTIME_DIR/bus` masked,
+    # both `systemd-run --user` and `systemctl --user` get "Failed to connect to bus". The same
+    # class as the container sockets above (an unsandboxed daemon's socket), so it is denied by
+    # default the same way. The cost: the shell has no `systemctl --user` and no session D-Bus.
+    # ⚠ A bus started AFTER the shell, or a D-Bus on an abstract socket (older distros), is not
+    # covered — the manager that could start one is unreachable from inside, so the entity cannot.
+    for r in _runtime_dirs():
+        rd = Path(r)
+        if not _reachable(rd):
+            continue
+        sysd = rd / "systemd"
+        if _reachable(sysd) and (sysd.is_dir() or (rd.is_dir() and os.access(rd, os.W_OK))):
+            argv += ["--tmpfs", str(sysd)]
+            remount_ro.append(str(sysd))
+        bus = rd / "bus"
+        if _reachable(bus) and bus.exists():
+            argv += ["--ro-bind", "/dev/null", str(bus)]
 
     # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
     # applies ops in sequence and a child mount must land inside an already-pinned parent); sorting
