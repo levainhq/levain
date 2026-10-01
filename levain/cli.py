@@ -852,8 +852,9 @@ def main(argv: list[str] | None = None) -> int:
             "origin.md, and any pack's rendered seeds) and record them as the install's "
             "answers, so a re-render from the record (`levain init --force`, a pack "
             "update) reproduces your edits instead of reverting them. All or nothing: "
-            "every seed file must read back to exactly one answer set that renders it "
-            "again, or nothing is written and it exits 1. An edit outside the "
+            "every seed file must read back to an answer set that renders it again "
+            "(where two would, the one closest to your current record is taken, and a "
+            "tie refuses), or nothing is written and it exits 1. An edit outside the "
             "interview's fields (a changed heading, an added paragraph between "
             "sections) cannot become a record and is refused."
         ),
