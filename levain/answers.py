@@ -446,6 +446,7 @@ def extract_answers(
         raise AdoptRefused(f"this template has {len(groups)} optional sections; trying every "
                            f"combination of them is not bounded enough to be safe.")
     target = _normalise(text)
+    unsplittable: AdoptRefused | None = None
     proven: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
     for dropped in itertools.product((False, True), repeat=len(groups)):
         blank = {s for g, d in zip(groups, dropped) if d for s in g}
@@ -454,13 +455,21 @@ def extract_answers(
                     for s in slot_list}
             skeleton = _normalise(render(fill))
             for from_right in (False, True):
-                found = _split(target, skeleton, from_right=from_right)
+                try:
+                    found = _split(target, skeleton, from_right=from_right)
+                except AdoptRefused as e:
+                    # This combination puts two fields side by side; another (one of them
+                    # blank, its section dropped) may still prove the seed.
+                    unsplittable = e
+                    continue
                 if found is None:
                     continue
                 got = {s: "" for s in slot_list}
                 got.update(found)
                 if _normalise(render(got)) == target:
                     proven[tuple(sorted(got.items()))] = got
+    if not proven and unsplittable is not None:
+        raise unsplittable
     if not proven:
         raise AdoptRefused("the seed differs from the template outside the interview's "
                            "fields (or a field's text was split across a heading), so no "

@@ -783,6 +783,25 @@ def _reconcile_moved_wins(
     not re-render) keeps its RECORDED owner, so it re-surfaces until a re-onboard."""
     by_layer = {Path(d.source).resolve(): (d, o) for d, o in zip(drifts, outcomes)}
     owners = _recorded_owners(install, drifts, stack, base)
+    pre_wins = any(d.recorded.wins is None for d in drifts)
+    # A lock from before `wins`, a contested file whose installed copy matches no layer
+    # (an edit), and the stack moved: which layer it was cannot be told, so recording the
+    # current winner as its owner would silence it for good (codex L3 HIGH). It is listed,
+    # pack.toml is held, and `wins` stays unrecorded so the next run asks again.
+    unresolved: list[str] = []
+    if pre_wins and not stack.blind:
+        for n, ranks in sorted(stack.providers.items()):
+            if len(ranks) < 2 or n in owners or n in stack.opaque or n not in stack.winners:
+                continue
+            dst = install / "seed" / n
+            winner = stack.winners[n]
+            try:
+                if not dst.is_file() or (not winner.is_render
+                                         and _sha256_file(dst) == _sha256_file(winner.path)):
+                    continue
+            except OSError:
+                pass
+            unresolved.append(n)
     handled = {rel for o in outcomes
                for rel in (*o.updated, *o.added, *o.removed, *o.restored, *o.review,
                            *o.backed_up)}
@@ -846,14 +865,23 @@ def _reconcile_moved_wins(
             emit(f"  pack {d.name!r}: {rel} now comes from another layer, but the "
                  f"carrier's retained summary for it still describes the old one — "
                  f"re-onboard (`levain init`) to clear this.")
+    for n in unresolved:
+        rel = f"seed/{n}"
+        d, r = by_layer.get(_layer_of(stack.winners[n])) or next(iter(by_layer.values()))
+        if rel not in r.review:
+            r.review.append(rel)
+        emit(f"  pack {d.name!r}: {rel} is shipped by more than one layer and your copy "
+             f"matches none of them, so which layer it came from cannot be told after the "
+             f"stack changed — re-onboard (`levain init`) to settle it.")
     for o in outcomes:
         if o.review and o.status in ("unchanged", "reconciled"):
             o.status = "needs_review"
     # An unshown move keeps its recorded owner above, but nothing re-runs this pass
     # unless a pack drifts again: hold every changed pack.toml at its recorded hash so
     # the next `levain update` sees the same drift and re-surfaces it.
-    unshown = any(final.get(n) == owners[n] != _layer_of(stack.winners[n])
-                  for n in set(owners) & set(stack.winners) if n not in stack.opaque)
+    unshown = bool(unresolved) or any(
+        final.get(n) == owners[n] != _layer_of(stack.winners[n])
+        for n in set(owners) & set(stack.winners))
     for layer, (d, o) in by_layer.items():
         if o.new_provenance is None:
             continue
@@ -862,6 +890,8 @@ def _reconcile_moved_wins(
                 **o.new_provenance.files, "pack.toml": d.recorded.files["pack.toml"]})
         if stack.blind or d.status == "source_missing" or layer not in stack.rank:
             wins = o.new_provenance.wins  # cannot be resolved this run: keep the record
+        elif unresolved:
+            wins = None  # see `unresolved` above: nothing is claimed until it is settled
         else:
             wins = tuple(sorted(n for n, owner in final.items() if owner == layer))
         o.new_provenance = replace(o.new_provenance, wins=wins)

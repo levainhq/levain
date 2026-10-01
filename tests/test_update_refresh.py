@@ -363,3 +363,152 @@ def test_an_mcp_entry_serving_another_store_is_staged_not_replaced(make_install,
     before = mcp.read_text()
     r, _out = _refresh(install)
     assert r.review == [".mcp.json"] and mcp.read_text() == before
+
+
+def test_a_missing_imported_seed_is_review_not_clean(make_install):
+    # codex L3 HIGH: the carrier was held but update exited 0 over a dangling import.
+    install = make_install()
+    (install / "seed" / "partnership.md").unlink()
+    r, _out = _refresh(install)
+    assert "CLAUDE.md" in r.review
+
+
+def test_a_failing_codex_config_merge_is_review_not_a_traceback(make_install, tmp_path,
+                                                                monkeypatch):
+    # codex L3 HIGH: _merge_codex_config raises InitError, which escaped as a traceback.
+    from levain import install as inst_mod
+
+    install = make_install("codex")
+    config = tmp_path / "codex-home" / "config.toml"
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    text = config.read_text()
+    older = text.replace('"serve"]', '"serve-old"]')
+    assert older != text
+    config.write_text(older)
+    data["files"][inst_mod.CODEX_CONFIG_KEY] = inst_mod._codex_block_hash(older)
+    receipt.write_text(json.dumps(data))
+
+    def boom(*_a, **_k):
+        raise inst_mod.InitError("backup failed")
+
+    monkeypatch.setattr(inst_mod, "_merge_codex_config", boom)
+    r, out = _refresh(install)
+    assert inst_mod.CODEX_CONFIG_KEY in r.review and "backup failed" in out
+
+
+def test_a_customised_codex_block_on_the_same_store_is_staged(make_install, tmp_path):
+    # codex L3 MED: store equality alone let update replace an operator's `env`.
+    install = make_install("codex")
+    config = tmp_path / "codex-home" / "config.toml"
+    text = config.read_text()
+    mine = text.replace("[mcp_servers.anneal_memory]\n",
+                        "[mcp_servers.anneal_memory]\nstartup_timeout_ms = 90000\n", 1)
+    assert mine != text
+    config.write_text(mine)
+    # Unchanged package: the edit is simply kept, with nothing to say.
+    assert not _refresh(install)[0].review and config.read_text() == mine
+    # The package moves (the record holds an older block): now it is staged, once.
+    from levain import install as inst_mod
+
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"][inst_mod.CODEX_CONFIG_KEY] = _sha(b"an older block\n")
+    receipt.write_text(json.dumps(data))
+    r, out = _refresh(install)
+    assert config.read_text() == mine
+    assert any("config.toml" in x for x in r.review) and "Listed once" in out
+    assert not _refresh(install)[0].review
+
+
+def test_a_pre_receipt_settings_leaf_edit_is_staged(make_install):
+    # codex L3 MED: same-shaped JSON was taken as levain's even with an operator's leaf.
+    install = make_install()
+    settings = install / ".claude" / "settings.json"
+    data = json.loads(settings.read_text())
+
+    def first_string_leaf(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if isinstance(v, str) and "python" not in v.lower() and "/" not in v:
+                    node[k] = v + "-mine"
+                    return True
+                if first_string_leaf(v):
+                    return True
+        if isinstance(node, list):
+            return any(first_string_leaf(v) for v in node)
+        return False
+
+    assert first_string_leaf(data)
+    settings.write_text(json.dumps(data))
+    install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
+    r, _out = _refresh(install)
+    assert r.review == [".claude/settings.json"]
+
+
+def test_a_pre_receipt_settings_from_another_interpreter_is_refreshed(make_install):
+    install = make_install()
+    settings = install / ".claude" / "settings.json"
+    import sys
+
+    settings.write_text(settings.read_text().replace(sys.executable, "/old/venv/bin/python"))
+    install.joinpath(*ADAPTER_RECEIPT_REL).unlink()
+    r, _out = _refresh(install)
+    assert ".claude/settings.json" in r.refreshed
+
+
+def test_an_obsolete_unedited_activation_file_is_removed(make_install):
+    # codex L3 MED: a file levain stopped shipping lingered (an obsolete hook stays executable).
+    install = make_install()
+    old = install / "activation" / "hooks" / "obsolete.py"
+    old.write_text("# shipped once\n")
+    path = activation_receipt_path(install)
+    data = json.loads(path.read_text())
+    data["files"]["hooks/obsolete.py"] = {"installed": _sha(b"# shipped once\n"),
+                                          "source": _sha(b"# shipped once\n")}
+    path.write_text(json.dumps(data))
+    r, _out = _refresh(install)
+    assert not old.exists() and "hooks/obsolete.py" not in json.loads(path.read_text())["files"]
+
+
+def test_an_obsolete_edited_activation_file_is_left(make_install):
+    install = make_install()
+    old = install / "activation" / "notes.md"
+    old.write_text("mine now\n")
+    path = activation_receipt_path(install)
+    data = json.loads(path.read_text())
+    data["files"]["notes.md"] = {"installed": _sha(b"shipped\n"), "source": _sha(b"shipped\n")}
+    path.write_text(json.dumps(data))
+    r, out = _refresh(install)
+    assert old.read_text() == "mine now\n" and "left in place" in out
+
+
+def test_a_current_tree_without_a_receipt_gets_one(make_install):
+    install = make_install()
+    activation_receipt_path(install).unlink()
+    _refresh(install)
+    assert activation_receipt_path(install).is_file()
+
+
+def test_a_pre_receipt_deleted_file_is_not_recreated(make_install):
+    # complement L3: with no record, an absent posture.md may be one the operator deleted.
+    install = make_install()
+    (install / "activation" / "posture.md").unlink()
+    activation_receipt_path(install).unlink()
+    r, _out = _refresh(install)
+    assert not (install / "activation" / "posture.md").exists()
+    assert "activation/posture.md" in r.review
+
+
+def test_an_unreadable_codex_hooks_file_is_review(make_install, tmp_path):
+    # codex L3 MED: unreadable read as "another install's" and passed.
+    import os
+
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    os.chmod(hooks, 0)
+    try:
+        r, out = _refresh(install)
+    finally:
+        os.chmod(hooks, 0o644)
+    assert str(hooks) in r.review and "could not be read" in out

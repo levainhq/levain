@@ -879,3 +879,32 @@ class TestWinsInTheLock:
     def test_wins_do_not_enter_the_fingerprint(self):
         a = manifest.PackProvenance(name="p", source="/x", version=None, files={"f": "h"})
         assert a.fingerprint == replace(a, wins=("x.md",)).fingerprint
+
+
+class TestL3Round1Reconcile:
+    def test_an_edited_contested_copy_on_an_old_lock_is_listed_and_re_surfaces(self, tmp_path):
+        # codex L3 HIGH: with no `wins` and a copy matching no layer, the current winner
+        # was recorded as owner and pack.toml advanced, so it went silent for good.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b], wins=False)
+        (inst / "seed" / "x.md").write_text("B + my notes\n")
+        _set_order(a, "a", 30)
+        out, prov, _drifted, review = _reconcile(inst)
+        assert review and "matches none of them" in out
+        assert (inst / "seed" / "x.md").read_text() == "B + my notes\n"
+        assert all(p.wins is None for p in prov)
+        _record(inst, prov)
+        assert _reconcile(inst)[2]  # still drifted: it re-surfaces
+
+    def test_a_win_moving_to_an_unreadable_layer_re_surfaces(self, tmp_path):
+        # glm L3 HIGH: the opaque name was filtered out, so pack.toml advanced silently.
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        c = _write_pack(tmp_path / "c", name="c", order=5, seed={"x.md": "C\n"})
+        inst = _install_stack(tmp_path, [c, a, b], wins=True)
+        shutil.rmtree(b)
+        _set_order(a, "a", 30)
+        _out, prov, _drifted, _review = _reconcile(inst)
+        _record(inst, prov)
+        assert _reconcile(inst)[2]

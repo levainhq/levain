@@ -3213,3 +3213,18 @@ def test_install_lock_never_creates_a_levain_dir_when_told_not_to(tmp_path):
         with install_lock(tmp_path, create=False):
             pass
     assert not (tmp_path / ".levain").exists()
+
+
+def test_install_lock_fails_closed_on_an_unexpected_flock_error(tmp_path, monkeypatch):
+    # codex L3 HIGH: EIO and friends ran unguarded, the corruption the lock prevents.
+    import errno
+
+    from levain.install import InstallLockError
+
+    def eio(_fd, _op):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(fcntl, "flock", eio)
+    with pytest.raises(InstallLockError, match="could not lock"):
+        with install_lock(tmp_path):
+            pass

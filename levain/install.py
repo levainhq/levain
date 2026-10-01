@@ -1263,11 +1263,22 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
             f"cannot open the install lock {path} ({e.strerror or e}). Nothing was "
             f"written; fix the permissions on {path.parent} and re-run."
         ) from None
+    unsupported = {errno.ENOLCK, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except InterruptedError:
+                    continue
         except OSError as e:
-            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+            if e.errno not in {errno.EWOULDBLOCK, errno.EAGAIN} | unsupported:
+                raise InstallLockError(
+                    f"could not lock {path} ({e.strerror or e}). Nothing was written; "
+                    f"re-run, and check the filesystem if it repeats."
+                ) from None
+            if e.errno in unsupported:
                 # A filesystem without lock support (NFS without lockd, some SMB/FUSE
                 # homes) is not "another process": proceed unguarded, and say so.
                 print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
@@ -1800,13 +1811,19 @@ def record_adapter_receipt(
                                  python_path, import_seed, on_demand_seed)
     if not files:
         return
-    if adapter == "codex":  # init writes codex's hooks.json too (machine-global)
+    extra: dict[str, str] = {}
+    if adapter == "codex":  # init writes codex's hooks.json + config block too (global)
+        codex_root = templates_root / "adapters" / adapter
         files = {**files, _codex_home() / "hooks.json": _codex_hooks_json(
-            templates_root / "adapters" / adapter, python_path, install)}
+            codex_root, python_path, install)}
+        block = _codex_block_hash(_codex_fragment(codex_root, python_path, install))
+        if block is not None:
+            extra[CODEX_CONFIG_KEY] = block
     try:
         _write_adapter_receipt(install, {
-            _adapter_key(install, target): _sha256_text(text)
-            for target, text in files.items()
+            **{_adapter_key(install, target): _sha256_text(text)
+               for target, text in files.items()},
+            **extra,
         })
     except OSError as e:
         emit(f"  note: could not record the adapter receipt ({e}); the next `levain "
@@ -1871,6 +1888,7 @@ def refresh_adapter(
     codex session on the machine."""
     from levain import manifest
 
+    install = install.resolve()  # every path compare below is against resolved paths
     out = AdapterRefresh()
     adapter = effective_adapter(install)
     if adapter not in ("claude-code", "codex"):
@@ -1896,6 +1914,13 @@ def refresh_adapter(
             expected = _expected_activation(activation_roots, anneal_path)
             files = _adapter_local_files(adapter, install, adapter_root, python_path,
                                          import_entries(roster), on_demand_entries(roster))
+            # The same files rendered with a sentinel interpreter: the leaves that differ
+            # are the ones levain substitutes per machine (see _levain_render_variant).
+            variants = {t.name: x for t, x in _adapter_local_files(
+                adapter, install, adapter_root, _VARIABLE, import_entries(roster),
+                on_demand_entries(roster)).items()}
+            if adapter == "codex":
+                variants["hooks.json"] = _codex_hooks_json(adapter_root, _VARIABLE, install)
         except (PackError, InitError, OSError, ValueError) as e:
             out.review.append("adapter")
             emit(f"\n• adapter files NOT refreshed: the package could not be composed ({e}).")
@@ -1909,21 +1934,29 @@ def refresh_adapter(
             held = "the pack reconcile above is holding seed changes for review"
         elif missing:
             held = f"it would load seed file(s) not installed yet: {', '.join(missing)}"
+            out.review.append(carrier_name)  # not a clean install: exit 1 until settled
         if held is not None:
             files = {t: x for t, x in files.items() if t.name != carrier_name}
             lines.append(f"  {carrier_name}: not refreshed, because {held}; re-onboard "
                          f"(`levain init --force`) or settle that first.")
         if adapter == "codex":
             hooks = _codex_home() / "hooks.json"
-            here = _read_or_none(hooks)
             want = _codex_hooks_json(adapter_root, python_path, install)
+            try:
+                here = _read_or_none(hooks)
+            except _Unreadable as e:
+                here = None
+                out.review.append(str(hooks))
+                lines.append(f"  {hooks}: could not be read ({e}), so whether it is "
+                             f"current, or this install's, cannot be told.")
             if here is not None and here != want and not _names_install(here, install):
                 lines.append(f"  note: {hooks} belongs to another install, so `levain "
                              f"update` left it alone (rewriting it repoints every codex "
                              f"session).")
             elif here is not None:
                 files = {**files, hooks: want}
-        _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
+        _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
+                               variants=variants)
         if adapter == "codex":
             _refresh_codex_config(install, adapter_root, python_path, apply=apply, out=out,
                                   lines=lines)
@@ -1937,23 +1970,34 @@ def refresh_adapter(
     return out
 
 
+class _Unreadable(Exception):
+    pass
+
+
 def _read_or_none(path: Path) -> str | None:
+    """The file's text, None when absent; raises :class:`_Unreadable` otherwise, so an
+    unreadable file is never mistaken for an empty or foreign one."""
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except (OSError, ValueError):
-        return ""  # unreadable: equal to nothing levain wrote
+    except (OSError, ValueError) as e:
+        raise _Unreadable(str(e)) from None
 
 
 def _names_install(text: str, install: Path) -> bool:
     """Whether codex's hooks.json points INTO this install: its path followed by a
-    separator, so ``/x/inst`` never claims ``/x/inst2`` (L2 HIGH, reproduced)."""
-    return (str(install) + os.sep) in text
+    separator, so ``/x/inst`` never claims ``/x/inst2`` (L2 HIGH, reproduced). Checked
+    raw and JSON-escaped, since hooks.json escapes a backslash or quote in the path."""
+    prefix = str(install) + os.sep
+    # Bounded on the LEFT too: "/var/x/e/" is a substring of "/private/var/x/e/".
+    return any(re.search(r"(?<![\w/.~-])" + re.escape(p), text)
+               for p in (prefix, json.dumps(prefix, ensure_ascii=False)[1:-1]))
 
 
 def _refresh_decision(
-    here: bytes | None, want: bytes, last: str | None, *, levain_code: bool
+    here: bytes | None, want: bytes, last: str | None, *, levain_code: bool,
+    legacy: bool = False,
 ) -> str:
     """What to do with one file. ``here`` is its bytes on disk (None: absent), ``want``
     what the package renders now, ``last`` the hash levain last recorded for it (None: no
@@ -1971,7 +2015,9 @@ def _refresh_decision(
         return "current"
     if here is None:
         if last is None:
-            return "write"  # new in this release
+            # New in this release, unless there is no record at all (an install from
+            # before the receipt), where an absent file may be one the operator deleted.
+            return "pending" if legacy and not levain_code else "write"
         return "keep" if sha(want) == last else "pending"  # the operator deleted it
     if last is None:
         return "write_backup" if levain_code else "pending"
@@ -2012,9 +2058,10 @@ def _refresh_activation(
         except OSError:
             return b""
 
-    if all(disk(rel) == want for rel, (want, _src) in expected.items()):
-        return
     receipt, status = read_activation_receipt(install)
+    if status == "ok" and all(disk(rel) == want for rel, (want, _src) in expected.items()) \
+            and set(receipt or {}) <= set(expected):
+        return
     if status in ("corrupt", "empty"):
         out.review.append("activation/")
         lines.append(f"  activation/: NOT refreshed — its install receipt is unreadable "
@@ -2022,13 +2069,35 @@ def _refresh_activation(
                      f"Re-onboard (`levain init --force`) to replace it whole.")
         return
     record = receipt or {}
+    legacy = status == "absent"
     new_receipt = dict(record)
     stamp = time.time_ns()
+    # Files levain installed that this release no longer ships: an unedited one is removed
+    # (it is levain's, and an obsolete hook must not linger as an executable); an edited
+    # one is the operator's now and is left, said once, and dropped from the record.
+    for rel in sorted(set(record) - set(expected)):
+        here = disk(rel)
+        del new_receipt[rel]
+        if here is None:
+            continue
+        key = f"activation/{rel}"
+        if hashlib.sha256(here).hexdigest() == record[rel]["installed"]:
+            out.refreshed.append(f"{key} (no longer shipped: removed)")
+            if apply:
+                try:
+                    (dst / rel).unlink()
+                except OSError as e:
+                    out.refreshed.pop()
+                    new_receipt[rel] = record[rel]
+                    lines.append(f"  {key}: no longer shipped, but could not be removed ({e}).")
+        else:
+            lines.append(f"  note: {key} is no longer shipped by levain and you edited it, "
+                         f"so it is left in place as yours.")
     for rel, (want, src) in sorted(expected.items()):
         here = disk(rel)
         last = record[rel]["installed"] if rel in record else None
         action = _refresh_decision(here, want, last, levain_code=rel.startswith("hooks/")
-                                   and rel.endswith(".py"))
+                                   and rel.endswith(".py"), legacy=legacy)
         entry = {"installed": hashlib.sha256(want).hexdigest(),
                  "source": _sha256_stream(src)}
         if action == "keep":
@@ -2105,6 +2174,20 @@ def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) 
         raise
 
 
+CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
+
+
+def _codex_fragment(adapter_root: Path, python_path: str, install: Path) -> str:
+    fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
+    fragment = fragment.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
+    return fragment.replace("{{INSTALL_DIR}}", str(install))
+
+
+def _codex_block_hash(fragment_or_config: str) -> str | None:
+    m = _CODEX_MCP_BLOCK_RE.search(fragment_or_config)
+    return None if m is None else _sha256_text(m.group(0).rstrip() + "\n")
+
+
 def _refresh_codex_config(
     install: Path,
     adapter_root: Path,
@@ -2115,33 +2198,74 @@ def _refresh_codex_config(
     lines: list[str],
 ) -> None:
     """config.toml's ``[mcp_servers.anneal_memory]`` block, only when it already registers
-    THIS install's store (so the write is never a repoint). ``_merge_codex_config`` keeps
-    its own backups and says what it replaced."""
+    THIS install's store (so the write is never a repoint), and then three-way like every
+    other file: replaced when it is the block levain recorded writing, or (no record) a
+    launcher levain itself writes with nothing of the operator's around it; otherwise the
+    new block is staged under .levain/pending/ and listed once. ``_merge_codex_config``
+    keeps its own backup and says what it replaced."""
     config = _codex_home() / "config.toml"
-    fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    fragment = fragment.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
-    fragment = fragment.replace("{{INSTALL_DIR}}", str(install))
-    existing = _read_or_none(config)
+    fragment = _codex_fragment(adapter_root, python_path, install)
+    try:
+        existing = _read_or_none(config)
+    except _Unreadable as e:
+        out.review.append(str(config))
+        lines.append(f"  {config}: could not be read ({e}), so whether codex's memory "
+                     f"registration is current cannot be told.")
+        return
     if not existing:
         return
     old_block = _CODEX_MCP_BLOCK_RE.search(existing)
     new_block = _CODEX_MCP_BLOCK_RE.search(fragment)
     if old_block is None or new_block is None:
         return
-    if old_block.group(0).rstrip() == new_block.group(0).rstrip():
+    old_text, new_text = old_block.group(0).rstrip() + "\n", new_block.group(0).rstrip() + "\n"
+    if old_text == new_text:
         return
-    if _codex_block_store(old_block.group(0)) != _codex_block_store(new_block.group(0)):
+    old_store = _codex_block_store(old_text)
+    if old_store != _codex_block_store(new_text):
         lines.append(f"  note: {config} registers another store for codex, so `levain "
                      f"update` left it alone (rewriting it repoints every codex session).")
+        return
+    record = (_read_adapter_receipt(install) or {}).get(CODEX_CONFIG_KEY)
+    old_dict, new_dict = _codex_block_dict(old_text), _codex_block_dict(new_text)
+    if record is not None:
+        levains = _sha256_text(old_text) == record
+    else:
+        levains = (_is_levain_launcher(old_dict, old_store)
+                   and _without_levain_keys(old_dict) == _without_levain_keys(new_dict))
+    if not levains:
+        if record == _sha256_text(new_text):
+            return  # already listed once against this version
+        out.review.append(CODEX_CONFIG_KEY)
+        where = install.joinpath(*PENDING_REL, "codex-home", "config.toml.anneal_memory")
+        if apply:
+            try:
+                _put_pending(install, "codex-home/config.toml.anneal_memory",
+                             new_text.encode("utf-8"))
+                _record_adapter_key(install, CODEX_CONFIG_KEY, _sha256_text(new_text))
+            except OSError as e:
+                lines.append(f"  {config}: could not stage levain's block ({e}).")
+                return
+        lines.append(f"  {config} [mcp_servers.anneal_memory]: yours is kept (it carries "
+                     f"settings levain did not write), and this levain renders it "
+                     f"differently, now at {where}. Merge it in. Listed once.")
         return
     out.refreshed.append(f"{config} [mcp_servers.anneal_memory]")
     if apply:
         try:
             _merge_codex_config(config, fragment, emit=lines.append)
-        except OSError as e:
+            _record_adapter_key(install, CODEX_CONFIG_KEY, _sha256_text(new_text))
+        except (OSError, InitError) as e:
             out.refreshed.pop()
-            out.review.append(str(config))
-            lines.append(f"  {config}: could not be written ({e}).")
+            out.review.append(CODEX_CONFIG_KEY)
+            lines.append(f"  {config}: could not be written "
+                         f"({getattr(e, 'message', None) or e}).")
+
+
+def _record_adapter_key(install: Path, key: str, digest: str) -> None:
+    files = _read_adapter_receipt(install) or {}
+    files[key] = digest
+    _write_adapter_receipt(install, files)
 
 
 def _adapter_key(install: Path, target: Path) -> str:
@@ -2153,38 +2277,46 @@ def _adapter_key(install: Path, target: Path) -> str:
         return f"codex-home/{target.name}"
 
 
-def _same_json_shape(a: str, b: str, *, install: Path | None = None, mcp: bool = False) -> bool:
-    """Both parse as JSON with the same key tree and list lengths: they may differ only in
-    leaf values. With ``mcp``, the ``anneal_memory`` server's ``command`` and ``args`` are
-    levain's own launcher (spore-751 changed its shape) and are set aside, but only while
-    the old args still serve THIS install's store, so a repointed server never counts."""
+_VARIABLE = "\ue000levain-variable\ue001"
+
+
+def _levain_render_variant(
+    here: str, want: str, variant: str, *, install: Path, mcp: bool = False
+) -> bool:
+    """Whether ``here`` (a JSON file with no record) is levain's own render from another
+    machine or release: the same keys and list lengths as ``want``, differing only at
+    leaves that are a per-machine variable (the leaf in ``variant``, rendered with a
+    sentinel interpreter, holds the sentinel). With ``mcp``, the anneal_memory server's
+    ``command``/``args`` are levain's launcher (spore-751 changed its shape) and are set
+    aside, but only while the old args still serve THIS install's store."""
     try:
-        x, y = json.loads(a), json.loads(b)
+        x, y, v = json.loads(here), json.loads(want), json.loads(variant)
     except ValueError:
         return False
     if mcp:
         try:
-            old_srv = x["mcpServers"]["anneal_memory"]
-            new_srv = y["mcpServers"]["anneal_memory"]
-            args = old_srv["args"]
-            store = str((install or Path()) / ".levain" / "memory.db")
+            args = x["mcpServers"]["anneal_memory"]["args"]
+            store = str(install / ".levain" / "memory.db")
             if not (isinstance(args, list) and "--db" in args
                     and args[args.index("--db") + 1:args.index("--db") + 2] == [store]):
                 return False
-            for srv in (old_srv, new_srv):
-                srv.pop("command", None)
-                srv.pop("args", None)
+            for tree in (x, y, v):
+                tree["mcpServers"]["anneal_memory"].pop("command", None)
+                tree["mcpServers"]["anneal_memory"].pop("args", None)
         except (KeyError, TypeError, AttributeError, ValueError):
             return False
 
-    def same(u: object, v: object) -> bool:
-        if isinstance(u, dict) and isinstance(v, dict):
-            return u.keys() == v.keys() and all(same(u[k], v[k]) for k in u)
-        if isinstance(u, list) and isinstance(v, list):
-            return len(u) == len(v) and all(same(i, j) for i, j in zip(u, v))
-        return not isinstance(u, (dict, list)) and not isinstance(v, (dict, list))
+    def same(a: object, b: object, c: object) -> bool:
+        if isinstance(a, dict) and isinstance(b, dict) and isinstance(c, dict):
+            return (a.keys() == b.keys() == c.keys()
+                    and all(same(a[k], b[k], c[k]) for k in a))
+        if isinstance(a, list) and isinstance(b, list) and isinstance(c, list):
+            return len(a) == len(b) == len(c) and all(map(same, a, b, c))
+        if any(isinstance(t, (dict, list)) for t in (a, b, c)):
+            return False
+        return a == b or (isinstance(c, str) and _VARIABLE in c)
 
-    return same(x, y)
+    return same(x, y, v)
 
 
 def _refresh_adapter_files(
@@ -2194,6 +2326,7 @@ def _refresh_adapter_files(
     apply: bool,
     out: AdapterRefresh,
     lines: list[str],
+    variants: Mapping[str, str] | None = None,
 ) -> None:
     receipt = _read_adapter_receipt(install)
     record = receipt or {}
@@ -2213,14 +2346,16 @@ def _refresh_adapter_files(
             continue
         here = None if here_text is None else here_text.encode("utf-8")
         action = _refresh_decision(here, want, record.get(key), levain_code=False)
+        variant = (variants or {}).get(target.name)
         if (action == "pending" and key not in record and here_text is not None
-                and target.suffix == ".json"
-                and _same_json_shape(here_text, want_text, install=install,
-                                     mcp=target.name == ".mcp.json")):
-            # No record, but the file is levain's own render from an earlier release: the
-            # same keys and list lengths, only leaf strings (interpreter / anneal paths)
-            # differ. An operator's addition (a server, a hook, a permission) changes the
-            # shape and is staged instead. Its old copy is still kept.
+                and variant is not None and target.suffix == ".json"
+                and _levain_render_variant(here_text, want_text, variant, install=install,
+                                           mcp=target.name == ".mcp.json")):
+            # No record, but the file differs from this release's render ONLY where levain
+            # substitutes a per-machine value (the interpreter path), or, in .mcp.json,
+            # only in its own anneal_memory launcher for this install's store: an earlier
+            # release's render, not an operator's file. Anything else is staged. The old
+            # copy is still kept.
             action = "write_backup"
         if action == "keep":
             continue

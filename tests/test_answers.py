@@ -343,3 +343,17 @@ def test_an_optional_section_emptied_but_left_in_place_is_refused():
     assert "## Personal History" in text
     with pytest.raises(AdoptRefused):
         extract_answers(text, slots=slots, optional_sections=optional, render=render)
+
+
+def test_a_side_by_side_pair_in_a_dropped_section_does_not_abort(tmp_path):
+    # complement L3: the whitespace refusal from the all-filled skeleton escaped before
+    # the skeleton with that section dropped could prove the seed.
+    tpl = tmp_path / "t.md"
+    tpl.write_text("# T {{A}}\n\n## Extra\n<!-- optional: extra -->\n{{B}} {{C}}\n",
+                   encoding="utf-8")
+    spec = parse_template(tpl)
+    render = (lambda a: render_template(spec, a))  # noqa: E731
+    optional = [sec.slots for sec in spec.sections if sec.title and sec.optional]
+    got = extract_answers(render({"A": "x", "B": "", "C": ""}), slots=["A", "B", "C"],
+                          optional_sections=optional, render=render)
+    assert got == {"A": "x", "B": "", "C": ""}
