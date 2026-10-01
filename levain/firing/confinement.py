@@ -329,6 +329,15 @@ _OWN_MEMORY_FILENAMES = (
 # impact under default-allow (a gh token = repo push/admin; aws creds = infra/$), so the operator who
 # does NOT need those tools flips ONE config line to fold them in. ``~/.config/gh`` is a DIR (the token
 # lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
+def cred_floor_label(system: str | None = None) -> str:
+    """What the standard cred floor covers on this OS, for banners: the macOS Keychain is folded in
+    by the Seatbelt profile (``CrownJewelsPolicy.deny_keychain``); Linux has no counterpart."""
+    import platform as _platform
+
+    base = "~/.config/gh · ~/.aws/credentials · ~/.netrc"
+    return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
+
+
 _STANDARD_CRED_SUBTREES = ("~/.config/gh",)   # gh OAuth token (hosts.yml) → repo push/admin
 _STANDARD_CRED_FILES = (
     "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
@@ -582,6 +591,12 @@ class CrownJewelsPolicy:
     # targeted network deny is `deny_localhost_outbound` below — WIRED (it renders and enforces),
     # not an `allow_network`-style promise, and off by default so the connect-to-self side-channel
     # is closed only where a drive-layer caller opts in.
+    deny_keychain: bool = False   # macOS: deny the Keychain services (spore-1245), set from the SAME
+    # resolved switch as the standard cred stores (``deny_standard_creds``: denied by default for an
+    # UNATTENDED drive only, per-entity overridable), so it is never on while a human drives at the REPL
+    # unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
+    # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
+    # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
     deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
     # class, for a FRESH connection. If this host runs sshd (Remote Login) and it authorises a key
     # the entity can use, ``ssh localhost cat <jewel>`` has sshd — root, OUTSIDE the sandbox — read a
@@ -1045,6 +1060,7 @@ def build_policy(
         socket_spellings=socket_spellings_t,
         socket_sources=socket_sources_t,
         deny_localhost_outbound=deny_localhost_outbound,
+        deny_keychain=deny_standard_creds,
     )
 
 
@@ -2238,6 +2254,16 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append(";; seatbelt rejects a per-port loopback literal, so all-or-nothing is the")
             lines.append(";; only granularity it offers.")
             lines.append('(deny network-outbound (remote ip "localhost:*"))')
+            lines.append("")
+
+        if policy.deny_keychain:
+            lines.append(";; THE KEYCHAIN (spore-1245) — on with the standard cred floor (unattended by")
+            lines.append(";; default). Without it, `security find-generic-password -w` and every")
+            lines.append(";; credential helper (`git credential-osxkeychain`, gh's stored token) read")
+            lines.append(";; the operator's secrets from inside this sandbox (measured 2026-10-01).")
+            lines.append(";; HTTPS trust and git over the forwarded ssh agent are unaffected (measured).")
+            lines.append('(deny mach-lookup (global-name "com.apple.SecurityServer")')
+            lines.append('                 (global-name "com.apple.securityd.xpc"))')
             lines.append("")
 
         if policy.config_file is not None:

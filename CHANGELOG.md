@@ -8,6 +8,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 Stamped `0.4.9.dev0`. **The tree past a release tag no longer claims the released version** — see *Versioning* at the foot of this file.
 
+### Changed — on macOS, an unattended seat can no longer read the Keychain
+
+From inside the confined shell, `security find-generic-password -w` and any credential helper (`git credential-osxkeychain`, the token `gh` stores) used to read your secrets, in every drive mode. The macOS floor now denies the Keychain services whenever the standard credential floor is on: by default for an **unattended** seat, not while you drive `levain run` yourself. It is the same switch as `~/.config/gh` · `~/.aws/credentials` · `~/.netrc`, so `"deny_standard_creds": false` in `.levain/confinement.json` gives a specific seat its Keychain back, and `true` denies it while you drive too. HTTPS and git over the forwarded ssh agent are unaffected; a seat that pushes over HTTPS with a stored credential, or uses `gh`, needs that opt-out or the ssh agent. Linux has no counterpart in this release.
+
 ### Changed — `levain doctor` sends a stale hook or carrier to `levain update`, not `init --force`
 
 Since `update` refreshes the activation tree and adapter files (below), doctor's remedy for a hook or `CLAUDE.md` / `AGENTS.md` that predates the installed levain is `levain update --path <install>`, which keeps your edits. It used to say these fixes "do not arrive via `levain update`" and sent you to `init --force`, which re-runs the interview. `init --force` stays the remedy for an edited hook you want back to the package's version, and for an unreadable install receipt.

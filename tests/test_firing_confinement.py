@@ -3304,3 +3304,30 @@ def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tm
     binds = [argv[i + 1] for i, a in enumerate(argv[:-2])
              if a == "--ro-bind" and argv[i + 2] == str(ak)]
     assert binds == ["/dev/null"], binds
+
+
+@pytest.mark.parametrize("mode,setting,expected", [
+    ("interactive", None, False), ("headless", None, False), ("unattended", None, True),
+    ("unattended", False, False),   # the per-entity opt-out keeps the Keychain for that seat
+    ("interactive", True, True),    # and an operator can pin it on while driving
+])
+def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, expected) -> None:
+    """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives).
+    Measured before the rule: from inside the confined shell `security find-generic-password -w`
+    and `git credential-osxkeychain get` read secrets. Measured after, on the real provider:
+    interactive/headless read, unattended refused (rc 44, helper empty), https unaffected."""
+    from levain.firing.drive import resolve_cred_floor
+
+    deny = resolve_cred_floor(setting, mode=mode)
+    policy = build_policy(_entity(tmp_path), deny_standard_creds=deny)
+    assert policy.deny_keychain is expected
+    profile = SeatbeltProvider().render_profile(policy)
+    assert ('(global-name "com.apple.SecurityServer")' in profile) is expected
+    assert ('(global-name "com.apple.securityd.xpc")' in profile) is expected
+
+
+def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
+    from levain.firing.confinement import cred_floor_label
+
+    assert cred_floor_label("Darwin").endswith("· the Keychain")
+    assert "Keychain" not in cred_floor_label("Linux")

@@ -785,10 +785,12 @@ def _print_banner(
         # when those are READABLE the banner has to say so out loud, or it claims a floor it does
         # not enforce. install-seat already warns on this; the run banner must not be quieter than
         # the installer about the same fact (codex L3 MEDIUM).
+        from levain.firing.confinement import cred_floor_label
+
         if deny_standard_creds:
-            print("             standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
+            print(f"             standard cred stores {cred_floor_label()}")
         else:
-            print("             ⚠ standard cred stores ~/.config/gh · ~/.aws/credentials · ~/.netrc")
+            print(f"             ⚠ standard cred stores {cred_floor_label()}")
             print("               are READABLE by this entity (deny_standard_creds is off)")
         # CONTAINER SOCKETS (spore-725). Stated in BOTH directions, like the cred-store line
         # above, and NEVER as "containers are fenced" — the deny is a NAMED ENUMERATION and an

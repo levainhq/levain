@@ -1573,14 +1573,16 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     # last thing the operator reads before they stop watching. Resolved through the RUNTIME's own
     # resolve_gate_mode with human_present=False (how a seat is actually driven), so this claim
     # cannot drift from the behaviour it describes. (glm L3.)
+    from levain.firing.confinement import cred_floor_label
+
     print()
     if cred_floor is True:
         why = ("pinned by deny_standard_creds: true" if cred_declared is True
                else "the default for an unattended seat")
-        print(f"  cred floor: ~/.config/gh · ~/.aws/credentials · ~/.netrc are DENIED ({why}).")
+        print(f"  cred floor: {cred_floor_label()} are DENIED ({why}).")
     elif cred_floor is False:
         print(
-            "  ⚠ cred floor: ~/.config/gh · ~/.aws/credentials · ~/.netrc are READABLE by this\n"
+            f"  ⚠ cred floor: {cred_floor_label()} are READABLE by this\n"
             "    seat — deny_standard_creds is explicitly false, so the unattended default is\n"
             "    OVERRIDDEN. It can read those credentials with nobody watching; the gate stops\n"
             "    it SENDING them anywhere, but not reading them into memory that persists."
