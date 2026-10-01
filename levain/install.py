@@ -60,6 +60,7 @@ from levain.packs import (
     compose_brand,
     compose_roster,
     import_entries,
+    layer_wins,
     load_pack_manifest,
     on_demand_entries,
     order_activation_roots,
@@ -708,7 +709,10 @@ def apply_init(
     _write_brand_config(install, compose_brand([mf for mf, _ in packs]), emit)
     store_ok = _init_store(store, anneal_path, emit=emit)
     if store_ok:
-        _record_compat_lock(install, store, anneal_path, packs=packs, emit=emit)
+        winning = [(spec.path.name, spec.path) for spec in specs]
+        winning += [(entry.name, entry.path) for entry in verbatim]
+        _record_compat_lock(install, store, anneal_path, packs=packs, emit=emit,
+                            winning=winning)
     return InitResult(install=install, adapter=chosen, store_ok=store_ok)
 
 
@@ -922,6 +926,7 @@ def _record_compat_lock(
     anneal_path: str,
     packs: Sequence[tuple[PackManifest, Path]] = (),
     emit: Callable[[str], None] = print,
+    winning: Sequence[tuple[str, Path]] | None = None,
 ) -> None:
     """Record the composed known-good set to ``.levain/manifest.json`` (the drift
     baseline) AND ack a fresh install's migrate marker up to the version the seed
@@ -973,6 +978,10 @@ def _record_compat_lock(
             mf.name, pack_dir, mf.version,
             rendered=manifest.rendered_hashes(install, [f"seed/{n}" for n in mf.render]),
             render=mf.render,
+            # The filenames this pack WON (``winning`` = every installed seed file's
+            # source, from the one compose_roster the writes used); None when the
+            # caller passed no roster, which the reconcile reads as "not recorded".
+            wins=None if winning is None else layer_wins(winning, pack_dir),
         )
         for mf, pack_dir in packs
     ]

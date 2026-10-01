@@ -36,7 +36,7 @@ ordered stack of pack dirs in a later slice.
 from __future__ import annotations
 
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -295,6 +295,15 @@ def compose_roster(pack_dirs: Sequence[Path]) -> list[SeedEntry]:
         [SeedEntry(name=n, path=winning_path[n], mode="render") for n in render_names]
         + [SeedEntry(name=n, path=winning_path[n], mode="verbatim") for n in verbatim]
     )
+
+
+def layer_wins(winning: Iterable[tuple[str, Path]], layer: Path) -> tuple[str, ...]:
+    """The seed filenames ``layer`` won: those whose winning source file (each
+    ``(name, path)`` pair, ``path`` = ``<layer>/seed/<name>`` as :func:`compose_roster`
+    resolves it) lives in that layer's ``seed/`` directory. Recorded in the lock so a
+    later reconcile can see a win move when only a pack's ``order`` changed."""
+    root = layer.resolve()
+    return tuple(sorted(n for n, p in winning if p.parent.parent.resolve() == root))
 
 
 def discover_roster(pack_dir: Path) -> list[SeedEntry]:

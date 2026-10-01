@@ -490,7 +490,7 @@ def reconcile_pack(
             # it must NOT trap the install: a version-only bump is documented as
             # harmless sugar (L1 #2 — surfacing it forced permanent exit-1). A render
             # change drives the reconcile through its own seed files; an order change
-            # (cross-pack override) is a rare v1 limitation, not a permanent trap.
+            # moves wins, which _reconcile_moved_wins handles across the whole stack.
             continue
         if rel.startswith("activation/"):
             _surface(rel, "activation changed")
@@ -701,11 +701,170 @@ def reconcile_packs(
         for problem in stack.problems:
             emit(f"  pack-layer problem: {problem} — files that layer ships are left "
                  f"untouched until it is fixed.")
-        return [
+        outcomes = [
             reconcile_pack(install, d, answers=answers, prompter=prompter, apply=apply,
                            emit=emit, stack=stack)
             for d in drifts
         ]
+        _reconcile_moved_wins(install, drifts, outcomes, stack, templates_root.resolve(),
+                              apply=apply, emit=emit)
+        return outcomes
+
+
+def _layer_of(entry: SeedEntry) -> Path:
+    return entry.path.parent.parent.resolve()
+
+
+def _shipped(drift: PackDrift, rel: str) -> set[str]:
+    """The bytes this pack last put in the install for ``rel``: the source hash of a
+    verbatim seed, the rendered-output hash of a render seed."""
+    return {drift.recorded.files.get(rel), drift.recorded.rendered.get(rel)} - {None}
+
+
+def _recorded_owners(
+    install: Path, drifts: Sequence[PackDrift], stack: _SeedStack, base: Path
+) -> dict[str, Path]:
+    """Which layer's file the install held for each seed filename when the lock was
+    written. From the recorded ``wins`` when every pack has them (a name no pack won
+    is the base layer's, if the base ships it). A lock written before ``wins``
+    existed is read from the install's bytes instead, and only where they match
+    exactly one layer's last-shipped bytes; anything else is left out (unknown)."""
+    owners: dict[str, Path] = {}
+    if all(d.recorded.wins is not None for d in drifts):
+        for d in drifts:
+            for n in d.recorded.wins or ():
+                owners[n] = Path(d.source).resolve()
+        for n, ranks in stack.providers.items():
+            if n not in owners and stack.rank.get(base) in ranks:
+                owners[n] = base
+        return owners
+    by_layer = {Path(d.source).resolve(): d for d in drifts}
+    for n, ranks in stack.providers.items():
+        dst = install / "seed" / n
+        if len(ranks) < 2 or not dst.is_file():
+            continue  # only a contested name can have had its win moved
+        try:
+            here = _sha256_file(dst)
+            matches = set()
+            for layer, rank in stack.rank.items():
+                if rank not in ranks:
+                    continue
+                d = by_layer.get(layer)
+                if d is not None:
+                    bytes_ = _shipped(d, f"seed/{n}")
+                else:  # the base layer: its file is its shipped bytes
+                    bytes_ = {_sha256_file(layer / "seed" / n)}
+                if here in bytes_:
+                    matches.add(layer)
+        except OSError:
+            continue
+        if len(matches) == 1:
+            owners[n] = matches.pop()
+    return owners
+
+
+def _reconcile_moved_wins(
+    install: Path,
+    drifts: Sequence[PackDrift],
+    outcomes: Sequence[PackReconcile],
+    stack: _SeedStack,
+    base: Path,
+    *,
+    apply: bool,
+    emit: Callable[[str], None],
+) -> None:
+    """Show the new winner of every seed filename whose win MOVED to another layer
+    with no seed file of its own changing: a pack ``order`` change alone. The
+    per-pack reconcile cannot see that (the only changed source file is
+    ``pack.toml``), so the install kept the old winner's copy and every later run
+    reported clean. Then record each pack's ``wins`` for the next run.
+
+    A move the reconcile could not show (a render-mode winner, which ``update`` does
+    not re-render) keeps its RECORDED owner, so it re-surfaces until a re-onboard."""
+    by_layer = {Path(d.source).resolve(): (d, o) for d, o in zip(drifts, outcomes)}
+    owners = _recorded_owners(install, drifts, stack, base)
+    handled = {rel for o in outcomes
+               for rel in (*o.updated, *o.added, *o.removed, *o.restored, *o.review,
+                           *o.backed_up)}
+    held = {rel for o in outcomes for rel in o.review}
+    final: dict[str, Path] = {n: _layer_of(e) for n, e in stack.winners.items()}
+    for n in stack.opaque:  # an unreadable layer may own it: keep only the record
+        final.pop(n, None)
+        if n in owners:
+            final[n] = owners[n]
+    for fname in sorted(set(owners) & set(stack.winners)):
+        rel = f"seed/{fname}"
+        was, now = owners[fname], final[fname]
+        if was == now or rel in handled - held:
+            continue  # unmoved, or the per-pack reconcile already installed the winner
+        if stack.blind or fname in stack.opaque or rel in held:
+            final[fname] = was  # not shown, so the install still holds `was`'s copy
+            continue
+        # Report under the pack that now wins it, else the pack that lost it.
+        d, r = by_layer.get(now) or by_layer[was]
+        winner = stack.winners[fname]
+        if winner.is_render:
+            final[fname] = was
+            r.review.append(rel)
+            emit(f"  pack {d.name!r}: {rel} is now won by another layer ({now}) after a "
+                 f"pack `order` change, but it is a RENDERED seed and `levain update` "
+                 f"does not re-render it — re-onboard (`levain init`) to show it.")
+            continue
+        dst = install / "seed" / fname
+        try:
+            here = _sha256_file(dst) if dst.is_file() else None
+            if here == _sha256_file(winner.path):
+                continue  # the install already holds the new winner's bytes
+            lost = by_layer.get(was)
+            old_bytes = (_shipped(lost[0], rel) if lost is not None
+                         else {_sha256_file(was / "seed" / fname)})
+            backup = (_timestamped_backup_path(dst)
+                      if here is not None and here not in old_bytes else None)
+            if apply:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if backup is not None:
+                    shutil.copy2(dst, backup)
+                shutil.copy2(winner.path, dst)
+        except OSError as e:
+            final[fname] = was
+            r.review.append(rel)
+            emit(f"  pack {d.name!r}: {rel} is now won by another layer ({now}), but its "
+                 f"copy could not be installed ({e}) — review.")
+            continue
+        r.restored.append(rel)
+        if backup is not None:
+            r.backed_up.append(rel)
+        if r.status == "unchanged":
+            r.status = "reconciled"
+        verb = "replaced" if apply else "would be replaced"
+        kept = (f"; your edited copy {'is' if apply else 'would be'} kept at "
+                f"{backup.name}" if backup is not None else "")
+        emit(f"  pack {d.name!r}: {rel} {verb} by the copy from {now}, which wins it "
+             f"after a pack `order` change{kept}.")
+        if fname in ON_DEMAND_SEED:
+            r.review.append(rel)
+            emit(f"  pack {d.name!r}: {rel} now comes from another layer, but the "
+                 f"carrier's retained summary for it still describes the old one — "
+                 f"re-onboard (`levain init`) to clear this.")
+    for o in outcomes:
+        if o.review and o.status in ("unchanged", "reconciled"):
+            o.status = "needs_review"
+    # An unshown move keeps its recorded owner above, but nothing re-runs this pass
+    # unless a pack drifts again: hold every changed pack.toml at its recorded hash so
+    # the next `levain update` sees the same drift and re-surfaces it.
+    unshown = any(final.get(n) == owners[n] != _layer_of(stack.winners[n])
+                  for n in set(owners) & set(stack.winners) if n not in stack.opaque)
+    for layer, (d, o) in by_layer.items():
+        if o.new_provenance is None:
+            continue
+        if unshown and "pack.toml" in d.modified and "pack.toml" in d.recorded.files:
+            o.new_provenance = replace(o.new_provenance, files={
+                **o.new_provenance.files, "pack.toml": d.recorded.files["pack.toml"]})
+        if stack.blind or d.status == "source_missing" or layer not in stack.rank:
+            wins = o.new_provenance.wins  # cannot be resolved this run: keep the record
+        else:
+            wins = tuple(sorted(n for n, owner in final.items() if owner == layer))
+        o.new_provenance = replace(o.new_provenance, wins=wins)
 
 
 def run_pack_reconcile(

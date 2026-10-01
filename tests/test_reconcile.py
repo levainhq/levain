@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import shutil
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -490,24 +491,30 @@ def _base_seed(name: str) -> bytes:
         return (root / "seed" / name).read_bytes()
 
 
-def _install_stack(tmp_path, packs):
+def _install_stack(tmp_path, packs, *, wins=False):
     """The post-init seed dir for base + ``packs``: each filename holds the WINNING
-    layer's bytes (last-wins by order, as compose_roster composes it)."""
+    layer's bytes (last-wins by order, as compose_roster composes it). ``wins=True``
+    records each pack's won filenames the way init now does; the default writes a
+    lock from before the ``wins`` field existed."""
     from levain.install import _templates_root
-    from levain.packs import compose_roster
+    from levain.packs import compose_roster, layer_wins
     install = tmp_path / "install"
     (install / "seed").mkdir(parents=True)
     with _templates_root() as root:
-        for e in compose_roster([root, *packs]):
+        roster = compose_roster([root, *packs])
+        for e in roster:
             if not e.is_render:
                 (install / "seed" / e.name).write_bytes(e.path.read_bytes())
+    winning = [(e.name, e.path) for e in roster]
     # The carrier init writes: an import per installed seed (what a seed-set change is about).
     (install / "CLAUDE.md").write_text(
         "".join(f"@seed/{p.name}\n" for p in sorted((install / "seed").glob("*.md"))))
     provs = []
     for pack in packs:
         mf = load_pack_manifest(pack)
-        provs.append(manifest.pack_provenance(mf.name, pack, mf.version, render=mf.render))
+        provs.append(manifest.pack_provenance(
+            mf.name, pack, mf.version, render=mf.render,
+            wins=layer_wins(winning, pack) if wins else None))
     _record(install, provs)
     write_answers(install, {}, lambda s: None)
     return install
@@ -755,3 +762,120 @@ class TestSeedOwnership:
         out, *_ = _reconcile(inst)
         assert "pack-layer problem" in out
         assert (inst / "seed" / "a.md").read_text() == "v2\n"
+
+
+def _set_order(pack: Path, name: str, order: int) -> None:
+    (pack / "pack.toml").write_text(f'name = "{name}"\norder = {order}\n', encoding="utf-8")
+
+
+class TestOrderChangeMovesAWin:
+    """A pack `order` change alone moves which layer wins a filename while no seed
+    file changes (codex L3 r2 HIGH on spore-450). Reproduced through the CLI first:
+    the install kept the old winner's copy and every later update reported clean."""
+
+    def _ab(self, tmp_path, *, wins=True):
+        a = _write_pack(tmp_path / "a", name="a", order=10, seed={"x.md": "A\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        return a, b, _install_stack(tmp_path, [a, b], wins=wins)
+
+    def test_the_new_winner_is_installed_and_the_next_run_is_clean(self, tmp_path):
+        a, _b, inst = self._ab(tmp_path)
+        _set_order(a, "a", 30)
+        out, prov, drifted, review = _reconcile(inst)
+        assert drifted and not review
+        assert (inst / "seed" / "x.md").read_text() == "A\n"
+        assert "order` change" in out
+        assert {p.name: p.wins for p in prov} == {"a": ("x.md",), "b": ()}
+        _record(inst, prov)
+        assert _reconcile(inst)[2] is False  # recorded: no drift left
+
+    def test_a_lock_without_wins_is_read_from_the_install_bytes(self, tmp_path):
+        a, _b, inst = self._ab(tmp_path, wins=False)
+        _set_order(a, "a", 30)
+        _out, prov, _drifted, review = _reconcile(inst)
+        assert not review and (inst / "seed" / "x.md").read_text() == "A\n"
+        assert {p.name: p.wins for p in prov} == {"a": ("x.md",), "b": ()}
+
+    def test_an_edited_copy_is_backed_up_before_it_is_replaced(self, tmp_path):
+        a, _b, inst = self._ab(tmp_path)
+        (inst / "seed" / "x.md").write_text("B + my notes\n")
+        _set_order(a, "a", 30)
+        _reconcile(inst)
+        assert (inst / "seed" / "x.md").read_text() == "A\n"
+        backups = [p for p in (inst / "seed").iterdir() if p.name.startswith("x.md.")]
+        assert [p.read_text() for p in backups] == ["B + my notes\n"]
+
+    def test_an_unedited_copy_is_replaced_without_a_backup(self, tmp_path):
+        a, _b, inst = self._ab(tmp_path)
+        _set_order(a, "a", 30)
+        _reconcile(inst)
+        assert not [p for p in (inst / "seed").iterdir() if p.name.startswith("x.md.")]
+
+    def test_a_dry_run_writes_nothing(self, tmp_path):
+        a, _b, inst = self._ab(tmp_path)
+        _set_order(a, "a", 30)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            reconcile.run_pack_reconcile(inst, dry_run=True, emit=print)
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
+        assert "would be replaced" in buf.getvalue()
+
+    def test_a_pack_overtaking_the_base_installs_its_copy(self, tmp_path):
+        p = _write_pack(tmp_path / "p", name="p", order=-5,
+                        seed={"partnership.md": "# PACK\n"})
+        inst = _install_stack(tmp_path, [p], wins=True)
+        assert (inst / "seed" / "partnership.md").read_bytes() == _base_seed("partnership.md")
+        _set_order(p, "p", 10)
+        _out, _prov, _drifted, review = _reconcile(inst)
+        assert not review
+        assert (inst / "seed" / "partnership.md").read_text() == "# PACK\n"
+
+    def test_a_render_mode_winner_is_flagged_and_re_surfaces(self, tmp_path):
+        a = _write_pack(tmp_path / "a", name="a", order=10, render=["x.md"],
+                        seed={"x.md": "A {{OPERATOR_NAME}}\n"})
+        b = _write_pack(tmp_path / "b", name="b", order=20, seed={"x.md": "B\n"})
+        inst = _install_stack(tmp_path, [a, b], wins=True)
+        (a / "pack.toml").write_text('name = "a"\norder = 30\nrender = ["x.md"]\n')
+        out, prov, _drifted, review = _reconcile(inst)
+        assert review and "RENDERED" in out
+        assert (inst / "seed" / "x.md").read_text() == "B\n"
+        _record(inst, prov)
+        out2, _prov2, drifted2, review2 = _reconcile(inst)
+        assert drifted2 and review2 and "RENDERED" in out2
+
+
+class TestWinsInTheLock:
+    """`wins` is optional in the lock: a lock written before it existed must still read
+    as "ok" (doctor and update both read the pack section), with wins=None."""
+
+    def _lock(self, install, entry):
+        lock = manifest.lock_path(install)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        lock.write_text(json.dumps({"levain": "0", "anneal": "0", "schema": "s",
+                                    "packs": [entry]}))
+
+    def test_round_trip(self, tmp_path):
+        prov = manifest.PackProvenance(name="p", source="/x", version=None,
+                                       files={"pack.toml": "h"}, wins=("b.md", "a.md"))
+        _record(tmp_path, [prov])
+        got, status = manifest.read_pack_locks_status(tmp_path)
+        assert status == "ok" and got[0].wins == ("b.md", "a.md")
+
+    def test_an_old_lock_without_wins_reads_ok_as_not_recorded(self, tmp_path):
+        self._lock(tmp_path, {"name": "p", "source": "/x", "files": {}})
+        got, status = manifest.read_pack_locks_status(tmp_path)
+        assert status == "ok" and got[0].wins is None
+
+    def test_a_malformed_wins_reads_as_not_recorded_never_corrupt(self, tmp_path):
+        self._lock(tmp_path, {"name": "p", "source": "/x", "files": {}, "wins": [1]})
+        got, status = manifest.read_pack_locks_status(tmp_path)
+        assert status == "ok" and got[0].wins is None
+
+    def test_an_empty_win_set_is_kept_distinct_from_not_recorded(self, tmp_path):
+        self._lock(tmp_path, {"name": "p", "source": "/x", "files": {}, "wins": []})
+        assert manifest.read_pack_locks_status(tmp_path)[0][0].wins == ()
+
+    def test_wins_do_not_enter_the_fingerprint(self):
+        a = manifest.PackProvenance(name="p", source="/x", version=None, files={"f": "h"})
+        assert a.fingerprint == replace(a, wins=("x.md",)).fingerprint

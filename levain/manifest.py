@@ -986,6 +986,12 @@ class PackProvenance:
     # render-MEMBERSHIP flip (a file goes verbatim<->render via pack.toml `render`,
     # with UNCHANGED seed bytes), which a source-hash diff alone misses (codex L3 #1).
     render: tuple[str, ...] = ()
+    # The seed filenames whose INSTALLED copy came from this layer when the lock was
+    # written: the names it won in the stack. A pack `order` change alone moves a win
+    # without changing any seed file, so the reconcile compares this against the
+    # current stack to find it. ``None`` = not recorded (a lock written before this
+    # field existed), never an empty win set.
+    wins: tuple[str, ...] | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -1018,9 +1024,11 @@ def pack_provenance(
     version: str | None,
     rendered: Mapping[str, str] | None = None,
     render: Sequence[str] = (),
+    wins: Sequence[str] | None = None,
 ) -> PackProvenance:
     """Snapshot a pack source dir's provenance (name + source + version + source
-    hashes + the render files' rendered-output hashes + the render membership)."""
+    hashes + the render files' rendered-output hashes + the render membership + the
+    seed filenames it won)."""
     return PackProvenance(
         name=name,
         source=str(source),
@@ -1028,6 +1036,7 @@ def pack_provenance(
         files=hash_pack_source(source),
         rendered=dict(rendered or {}),
         render=tuple(render),
+        wins=None if wins is None else tuple(sorted(wins)),
     )
 
 
@@ -1035,6 +1044,7 @@ def _pack_to_json(p: PackProvenance) -> dict[str, object]:
     return {
         "name": p.name, "source": p.source, "version": p.version,
         "files": p.files, "rendered": p.rendered, "render": list(p.render),
+        **({} if p.wins is None else {"wins": list(p.wins)}),
     }
 
 
@@ -1099,9 +1109,15 @@ def read_pack_locks_status(install: Path) -> tuple[list[PackProvenance], PackLoc
         render = entry.get("render")
         if not isinstance(render, list) or not all(isinstance(x, str) for x in render):
             render = []
+        # Optional like `render`, but absent/malformed reads as None ("not recorded"),
+        # never []: an empty win set is a claim the layer won nothing.
+        wins = entry.get("wins")
+        if not isinstance(wins, list) or not all(isinstance(x, str) for x in wins):
+            wins = None
         out.append(PackProvenance(
             name=name, source=source, version=version,
             files=dict(files), rendered=dict(rendered), render=tuple(render),
+            wins=None if wins is None else tuple(wins),
         ))
     return out, "ok"
 
