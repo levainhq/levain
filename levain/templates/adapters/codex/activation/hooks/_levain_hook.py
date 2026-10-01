@@ -884,9 +884,9 @@ def crystal_recall(prompt: str, timeout: float = 2.0) -> list[dict]:
     wrap-time crystallization routing), so a large body of earned wisdom stays
     effective without bloating always-loaded context.
 
-    Uses anneal's default (associative/Hebbian) backend: it surfaces patterns
-    grounded in a matched episode even with zero keyword overlap, auto-degrading
-    to keyword-only when no episodic db is resolvable. The query is passed after a
+    Uses anneal's default recall backend; how it matches is anneal's to state, not
+    this hook's (an associative-hop claim stood here; it was dropped 2026-10-01
+    until a measurement earns it back). The query is passed after a
     `--` options terminator (so a prompt that itself looks like a flag — `--json`,
     `-h` — is still parsed as the query, not silently swallowed as an option) and
     capped to the same bound as the tokenizer so a pasted huge prompt can't burn
