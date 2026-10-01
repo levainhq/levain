@@ -3089,3 +3089,89 @@ def test_fill_seed_on_demand_empty_leaves_an_inline_placeholder_line_intact():
     INLINE placeholder must lose only the token — eating its whole line would take
     the operator's own text with it."""
     assert _fill_seed_on_demand("a {{SEED_ON_DEMAND}} b\nc", "") == "a  b\nc"
+
+
+# ---------------------------------------------------------------------------
+# spore-1023: the per-install lock. Reproduced through the CLI first: two
+# concurrent `levain init --force` runs on one install left the activation
+# receipt describing a tree that was not installed (1/40 pairs), and crashed
+# one run with a FileNotFoundError mid-swap (27/40 pairs).
+# ---------------------------------------------------------------------------
+import fcntl  # noqa: E402
+import threading  # noqa: E402
+
+from levain.install import INSTALL_LOCK_REL, InstallBusy, install_lock  # noqa: E402
+
+
+def _hold(install: Path) -> int:
+    """Take the install lock on a fresh fd, the way another process would."""
+    path = install.joinpath(*INSTALL_LOCK_REL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_install_lock_refuses_while_another_holder_writes(tmp_path: Path):
+    fd = _hold(tmp_path)
+    try:
+        with pytest.raises(InstallBusy, match="another levain process"):
+            with install_lock(tmp_path):
+                pass
+    finally:
+        os.close(fd)
+    with install_lock(tmp_path):  # released -> free again
+        pass
+
+
+def test_install_lock_is_reentrant_in_one_thread(tmp_path: Path):
+    with install_lock(tmp_path):
+        with install_lock(tmp_path):
+            pass
+        with install_lock(tmp_path):  # still held by the outer block
+            pass
+
+
+def test_install_lock_refuses_a_second_thread(tmp_path: Path):
+    seen: list[BaseException] = []
+
+    def other() -> None:
+        try:
+            with install_lock(tmp_path):
+                pass
+        except BaseException as e:  # noqa: BLE001
+            seen.append(e)
+
+    with install_lock(tmp_path):
+        t = threading.Thread(target=other)
+        t.start()
+        t.join()
+    assert len(seen) == 1 and isinstance(seen[0], InstallBusy)
+
+
+def test_a_concurrent_init_force_is_refused_and_writes_nothing(tmp_path, capsys):
+    import json as _json
+
+    from levain.install import run_init
+    from tests.test_init_answers import _filled
+
+    answers = _filled(capsys)
+    af = tmp_path / "answers.json"
+    af.write_text(_json.dumps(answers), encoding="utf-8")
+    install = tmp_path / "entity"
+    assert run_init(install, "openhands", force=False, answers_file=af) == 0
+    world = (install / "seed" / "world.md").read_text(encoding="utf-8")
+
+    af.write_text(_json.dumps({**answers, "OPERATOR_NAME": "Someone Else"}), encoding="utf-8")
+    capsys.readouterr()
+    fd = _hold(install)
+    try:
+        assert run_init(install, "openhands", force=True, answers_file=af) == 1
+    finally:
+        os.close(fd)
+    out = capsys.readouterr().out
+    assert "another levain process" in out
+    assert "partial" not in out.lower()
+    assert (install / "seed" / "world.md").read_text(encoding="utf-8") == world
+    assert run_init(install, "openhands", force=True, answers_file=af) == 0
+    assert "Someone Else" in (install / "seed" / "world.md").read_text(encoding="utf-8")

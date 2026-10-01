@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import stat
@@ -502,19 +503,29 @@ def run_init(
             _report_partial_state(install)
             return 1
 
+        # One install lock across every write (spore-1023): the docs rebuild below
+        # wipes .levain/docs, so a concurrent init must not interleave with it either.
         try:
-            result = apply_init(
-                install,
-                chosen,
-                answers,
-                templates_root,
-                python_path,
-                anneal_path,
-                render_specs,
-                verbatim,
-                activation_roots=activation_roots,
-                packs=list(zip(pack_manifests, pack_dirs)),
-            )
+            with install_lock(install):
+                result = apply_init(
+                    install,
+                    chosen,
+                    answers,
+                    templates_root,
+                    python_path,
+                    anneal_path,
+                    render_specs,
+                    verbatim,
+                    activation_roots=activation_roots,
+                    packs=list(zip(pack_manifests, pack_dirs)),
+                )
+                # Interview completed successfully — clear the checkpoint so the next
+                # `levain init --force` doesn't offer to resume stale answers.
+                _clear_checkpoint(install)
+                copied_docs = _refresh_pack_docs(install, pack_manifests, pack_dirs)
+        except InstallBusy as e:
+            print(f"FAIL: {e.message}")  # refused before any write: no partial-state report
+            return 1
         except InitError as e:
             # The write-half fails loud (a corrupt-wheel activation tree, an
             # operator edit that can't be preserved) — render it as a clean FAIL +
@@ -522,25 +533,6 @@ def run_init(
             print(f"FAIL: {e.message}")
             _report_partial_state(install)
             return 1
-
-    # Interview completed successfully — clear the checkpoint so the next
-    # `levain init --force` doesn't offer to resume stale answers.
-    _clear_checkpoint(install)
-
-    # ALWAYS refresh the persisted pack docs so `levain docs` renders a
-    # SELF-CONTAINED composed view — even with NO --pack this session. Calling it
-    # unconditionally is load-bearing: a --force reinstall that DROPS a pack must
-    # CLEAR that pack's stale (possibly company-private) chapters, not serve them
-    # forever — the exact IP-boundary failure class (complement L3 CRITICAL).
-    # `_copy_pack_docs` handles an empty pack list correctly (wipes .levain/docs,
-    # copies nothing). Base docs ship in the wheel; only pack docs copy. A copy
-    # failure must NOT fail an otherwise-good install (the manual is a read surface,
-    # not install-critical), so it warns and continues.
-    try:
-        copied_docs = _copy_pack_docs(install, list(zip(pack_manifests, pack_dirs)))
-    except (OSError, InitError) as e:
-        print(f"  note: could not refresh pack docs ({e}); `levain docs` shows base only.")
-        copied_docs = []
     if copied_docs:
         print(
             f"  docs:      {len(copied_docs)} pack chapter(s) → .levain/docs/ "
@@ -554,6 +546,29 @@ def run_init(
 
 
 def apply_init(
+    install: Path,
+    chosen: str,
+    answers: dict[str, str],
+    templates_root: Path,
+    python_path: str,
+    anneal_path: str,
+    specs: list[TemplateSpec],
+    verbatim: Sequence[SeedEntry],
+    *,
+    activation_roots: Sequence[Path] | None = None,
+    packs: Sequence[tuple[PackManifest, Path]] = (),
+    emit: Callable[[str], None] = print,
+) -> InitResult:
+    """:func:`_apply_init` under the per-install lock (:func:`install_lock`); raises
+    :class:`InstallBusy` before writing anything when another process holds it."""
+    with install_lock(install):
+        return _apply_init(
+            install, chosen, answers, templates_root, python_path, anneal_path, specs,
+            verbatim, activation_roots=activation_roots, packs=packs, emit=emit,
+        )
+
+
+def _apply_init(
     install: Path,
     chosen: str,
     answers: dict[str, str],
@@ -714,6 +729,25 @@ def apply_init(
         _record_compat_lock(install, store, anneal_path, packs=packs, emit=emit,
                             winning=winning)
     return InitResult(install=install, adapter=chosen, store_ok=store_ok)
+
+
+def _refresh_pack_docs(
+    install: Path, pack_manifests: Sequence[PackManifest], pack_dirs: Sequence[Path]
+) -> list[str]:
+    """ALWAYS refresh the persisted pack docs so `levain docs` renders a
+    SELF-CONTAINED composed view — even with NO --pack this session. Calling it
+    unconditionally is load-bearing: a --force reinstall that DROPS a pack must
+    CLEAR that pack's stale (possibly company-private) chapters, not serve them
+    forever — the exact IP-boundary failure class (complement L3 CRITICAL).
+    `_copy_pack_docs` handles an empty pack list correctly (wipes .levain/docs,
+    copies nothing). Base docs ship in the wheel; only pack docs copy. A copy
+    failure must NOT fail an otherwise-good install (the manual is a read surface,
+    not install-critical), so it warns and continues."""
+    try:
+        return _copy_pack_docs(install, list(zip(pack_manifests, pack_dirs)))
+    except (OSError, InitError) as e:
+        print(f"  note: could not refresh pack docs ({e}); `levain docs` shows base only.")
+        return []
 
 
 def _atomic_write_text(target: Path, payload: str) -> None:
@@ -1163,6 +1197,71 @@ class InitError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class InstallBusy(InitError):
+    """Another levain process is writing this install right now; nothing was written."""
+
+
+INSTALL_LOCK_REL = (".levain", "install.lock")
+_held_install_locks: dict[tuple[Path, int], int] = {}
+_held_install_locks_guard = threading.Lock()
+
+
+@contextmanager
+def install_lock(install: Path) -> Iterator[None]:
+    """Hold the per-install SINGLE-WRITER lock (``.levain/install.lock``, an exclusive
+    non-blocking ``flock``) for the duration, or raise :class:`InstallBusy` at once.
+
+    Two ``levain init --force`` runs on one install used to interleave their activation
+    swaps: reproduced through the CLI as an uncaught FileNotFoundError mid-swap, and as
+    a receipt describing a tree that was not installed (spore-1023).
+
+    REENTRANT per (install, thread): a nested ``install_lock`` inside a held one is a
+    no-op, so ``run_init`` can hold it across ``apply_init`` (which takes it too, for
+    the web POST). A second ``flock`` on a fresh fd would refuse even its own process,
+    because a BSD ``flock`` belongs to the open file, not the process. Without
+    ``fcntl`` (Windows) there is no lock and this yields unguarded."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    key = (install.resolve(), threading.get_ident())
+    with _held_install_locks_guard:
+        if key in _held_install_locks:
+            _held_install_locks[key] += 1
+            nested = True
+        else:
+            nested = False
+    if nested:
+        try:
+            yield
+        finally:
+            with _held_install_locks_guard:
+                _held_install_locks[key] -= 1
+        return
+    path = install.joinpath(*INSTALL_LOCK_REL)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise InstallBusy(
+                f"another levain process (an `init` or `update`) is writing {install} "
+                f"right now. This run installed nothing; re-run once that one has finished."
+            ) from None
+        with _held_install_locks_guard:
+            _held_install_locks[key] = 1
+        try:
+            yield
+        finally:
+            with _held_install_locks_guard:
+                del _held_install_locks[key]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @contextmanager
