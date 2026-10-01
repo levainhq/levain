@@ -3245,3 +3245,21 @@ def test_a_pinned_deny_file_under_ssh_is_bound_not_skipped(tmp_path, monkeypatch
     assert ("/dev/null", str(custom.resolve())) in _triples(argv, "--ro-bind")
     # the step-(5) vector is unaffected either way; it is the CONTROL for this test
     assert str((home / ".ssh" / "authorized_keys").resolve()) in dests
+
+
+@linux_live
+def test_linux_live_a_deny_root_strictly_inside_ssh_does_not_brick_the_shell(tmp_path, monkeypatch) -> None:
+    """Diogenes MEDIUM diogenes-20261001-022136, reproduced on a Linux kernel and then on argushub:
+    a deny root strictly inside ~/.ssh in agent mode queued a --remount-ro on a path the ssh tmpfs
+    then hid, and bwrap exited 1 ("Can't remount readonly on .../.ssh/keys") before bash started.
+    The equal case (~/.ssh itself) keeps its remount; this is the strictly nested one."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    ssh = tmp_path / ".ssh"
+    (ssh / "keys").mkdir(parents=True)
+    (ssh / "keys" / "id").write_text("PRIVATE-KEY\n")
+    (ssh / "known_hosts").write_text("HOSTS\n")
+    policy = build_policy(ent, ssh_mode="agent", extra_deny_read_write=(ssh / "keys",))
+    with BwrapProvider().spawn_shell(policy) as sh:
+        assert sh.run(f"cat {ssh}/known_hosts").exit_code == 0
+        assert sh.run(f"cat {ssh}/keys/id").exit_code != 0

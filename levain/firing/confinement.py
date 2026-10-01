@@ -1742,17 +1742,24 @@ class SandboxedShell:
         except (BrokenPipeError, OSError, ValueError) as exc:
             raise ConfinementError(f"shell exited before the startup handshake ({exc})") from exc
         deadline = time.monotonic() + timeout
+        # stderr is merged into stdout, so whatever the driver printed before dying (bwrap's
+        # "Can't remount readonly on ...", say) arrives here; keep it for the error.
+        early: list[str] = []
         while time.monotonic() < deadline:
             try:
                 line = self._stdout_q.get(timeout=0.2)
             except queue.Empty:
                 continue
             if line is None:
+                driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
+                said = " | ".join(x.strip() for x in early[-5:] if x.strip())
                 raise ConfinementError(
-                    "shell exited during startup — sandbox-exec / bash did not start."
+                    f"shell exited during startup — {driver} / bash did not start"
+                    + (f": {said}" if said else ".")
                 )
             if token in line:
                 return
+            early = [*early[-19:], line]
         raise ConfinementError("timed out waiting for the shell startup handshake.")
 
     def _teardown_failed_start(self, fifo_dir: str) -> None:
@@ -2661,8 +2668,16 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # distinct /srv/secret on a case-sensitive filesystem (complement + codex, L3 r2). Its only
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
+    ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
+            continue
+        # A root STRICTLY inside the ssh dir is hidden by step (3)'s tmpfs anyway, and its deferred
+        # remount would then target a path that tmpfs hid, aborting bwrap before bash starts
+        # (Diogenes MEDIUM 2026-10-01, reproduced on a Linux kernel and on argushub). Nothing is
+        # rebound under it: step (3) rebinds only known_hosts and config, guarded by _caller_denies.
+        # The EQUAL case stays: it needs its remount for EROFS on a write.
+        if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             continue
         tmpfs_roots.append(sub)
         argv += ["--tmpfs", str(sub)]
