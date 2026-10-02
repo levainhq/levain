@@ -1674,7 +1674,7 @@ class TestThePackFixtureIsRealAndNotHandWritten:
         assert "/usr/local/bin/anneal-memory" in text, "the substituted value must be present"
 
 
-def test_doctor_confinement_check_reports_and_never_fails(tmp_path, monkeypatch):
+def test_doctor_confinement_check_reports_a_missing_hand_and_never_fails_it(tmp_path, monkeypatch):
     """⚖ A REPORT, NOT A GATE — deliberate. An entity with only its file-editor hand is a WORKING,
     supported configuration (the in-process crown-jewels floor is cross-platform and enforces the
     same denylist). Turning a healthy install red for a missing OPTIONAL hand is how an operator
