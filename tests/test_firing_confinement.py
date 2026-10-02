@@ -3287,6 +3287,38 @@ def test_linux_live_a_deny_subtree_that_is_a_file_does_not_brick_the_shell(tmp_p
     assert (tmp_path / ".anneal-memory").read_text() == "A STORE THAT IS A FILE\n"
 
 
+@pytest.mark.skipif(not (_LIVE or (platform.system() == "Linux" and bwrap_available())),
+                    reason="needs a live provider: macOS sandbox-exec or a Linux host where bwrap runs")
+def test_live_a_file_jewels_sqlite_sidecars_are_denied(tmp_path, monkeypatch) -> None:
+    """Reproduced 2026-10-02 by Diogenes on BOTH providers: a WAL-mode SQLite store at
+    ~/.anneal-memory (a FILE, as on argushub) had its main file denied while `<db>-wal` still held the
+    uncheckpointed rows, readable from the confined shell, and `<db>-shm` was writable."""
+    import sqlite3
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = _entity(tmp_path)
+    db = tmp_path / ".anneal-memory"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE t (v TEXT)")
+        conn.execute("INSERT INTO t VALUES ('JEWEL-1002-SECRET')")
+        conn.commit()
+        wal, shm = Path(f"{db}-wal"), Path(f"{db}-shm")
+        assert b"JEWEL-1002-SECRET" in wal.read_bytes()   # the precondition: the row is in the WAL
+        provider = SeatbeltProvider() if _LIVE else BwrapProvider()
+        with provider.spawn_shell(build_policy(ent, ssh_mode="agent")) as sh:
+            assert sh.run("echo alive").exit_code == 0
+            assert sh.run(f"cat {db}").exit_code != 0
+            assert "JEWEL-1002-SECRET" not in sh.run(f"cat {wal}").output
+            assert sh.run(f"grep -a -c JEWEL-1002-SECRET {wal}").exit_code != 0
+            assert sh.run(f"printf X >> {shm}").exit_code != 0
+        assert conn.execute("SELECT v FROM t").fetchall() == [("JEWEL-1002-SECRET",)]
+    finally:
+        conn.close()
+
+
 def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tmp_path, monkeypatch) -> None:
     """L1 on 252f4b9, reproduced from the plan argv: a subtree root that is a FILE got
     `--ro-bind /dev/null F`, and when F was also a write-deny vector (raw mode,

@@ -609,6 +609,14 @@ class CrownJewelsPolicy:
     # unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
     # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
     # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
+    sqlite_sidecars: tuple[Path, ...] = ()  # the ``-wal``/``-shm``/``-journal`` paths of every
+    # FILE-shaped jewel, a subset of ``deny_files``. A WAL-mode SQLite store keeps committed frames
+    # that have not been checkpointed in ``<db>-wal``, so denying only the main file left them
+    # readable and writable (Diogenes MEDIUM 2026-10-02, run on both providers). Seatbelt denies
+    # them by name whether or not they exist; bwrap mounts only the ones present at spawn, because a
+    # ``/dev/null`` mountpoint for an absent one would leave a 0444 stub on the host that breaks the
+    # host's own SQLite writer (the step (2a) defect, measured 2026-09-30). This field is how
+    # :func:`_bwrap_plan_impl` tells them apart from an operator's ``deny_files``.
     deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
     # class, for a FRESH connection. If this host runs sshd (Remote Login) and it authorises a key
     # the entity can use, ``ssh localhost cat <jewel>`` has sshd — root, OUTSIDE the sandbox — read a
@@ -961,6 +969,19 @@ def build_policy(
     deny_write_files_l.extend(_arms.write_spellings)
     socket_spellings_t = _arms.spellings
 
+    # A FILE-shaped jewel may be a SQLite store (argushub's ~/.anneal-memory is one, in WAL mode), and
+    # its sidecars hold data the main-file deny does not cover. Same class as
+    # ``_OWN_MEMORY_FILENAMES`` for the entity's own store (Diogenes MEDIUM 2026-10-02). Named for
+    # every existing regular file rather than sniffed by header: an absent sidecar costs one literal
+    # on macOS and nothing on Linux, and the host process never reads an operator's credential file.
+    # The paths are the RESOLVED ones, which is what SQLite names its sidecars after.
+    sidecars: list[Path] = []
+    for jewel in _dedup(subtrees + files):
+        if jewel.is_file():
+            sidecars.extend(jewel.with_name(jewel.name + s) for s in ("-wal", "-shm", "-journal"))
+    sqlite_sidecars_t = _dedup(sidecars)
+    files.extend(sqlite_sidecars_t)
+
     deny_read_write = _dedup(subtrees)
     deny_files_t = _dedup(files)
     deny_write_files_t = _dedup(deny_write_files_l)
@@ -1073,6 +1094,7 @@ def build_policy(
         socket_sources=socket_sources_t,
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
+        sqlite_sidecars=sqlite_sidecars_t,
     )
 
 
@@ -2022,8 +2044,9 @@ class ConfinementProvider(ABC):
     #: spore-755). A provider that cannot must refuse to spawn while that deny is requested, never
     #: run without it; the operator's opt-out is ``allow_localhost_outbound`` in confinement.json.
     enforces_localhost_deny: bool = False
-    #: Whether this provider enforces that deny by removing ALL network from bash (bwrap's
+    #: Whether this provider enforces that deny by removing IP networking from bash (bwrap's
     #: ``--unshare-net``), which the banner must say, since pip/git/curl then fail inside bash.
+    #: Pathname unix sockets still reach the host: see ``OFFLINE_RESIDUAL``.
     localhost_deny_removes_network: bool = False
 
     def localhost_deny_ready(self) -> bool:
@@ -2528,9 +2551,10 @@ class _SeatbeltShell(SandboxedShell):
 # is what sent the proof to a container in the first place. Same distro, same bwrap, different arch.
 # Later the same day (0e42e18's commit) the live floor ran on argushub hardware after its AppArmor
 # profile was loaded. The 2026-09-30 port changed this argv (steps 1, 3b and 6, deferred remounts)
-# and was re-run only in a container (tests/linux/Dockerfile, kernel 6.12). A container relaxes
-# seccomp to permit user namespaces at all, so the real-host run is OWED AGAIN for this argv. The
-# `linux_live` tests ARE that run: point them at a capable host.
+# and was first re-run only in a container (tests/linux/Dockerfile, kernel 6.12), which relaxes
+# seccomp to permit user namespaces at all. On 2026-10-01 the `linux_live` tests ran on argushub
+# again (the 0.5.0 commits f4283d3, 0e09df5 and a3bfeb7 report those runs). They are the real-host
+# check for this argv: point them at a capable host after any change to it.
 # seatbelt is a PATH PREDICATE evaluated per syscall; bwrap is a MOUNT NAMESPACE established once
 # at spawn. The polarity is also inverted — crown-jewels is deliberately default-ALLOW-with-denies
 # (the Slice-1 flip) while bwrap's idiom is default-deny-with-binds — so the base is ``--bind / /``
@@ -2661,7 +2685,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
         # namespace. Closes connects back to this host over TCP AND abstract unix sockets (both
-        # measured), at the cost of all network inside bash.
+        # measured), at the cost of IP networking inside bash. Not closed: pathname unix sockets,
+        # named in ``OFFLINE_RESIDUAL``.
         argv.append("--unshare-net")
 
     # Steps (2)-(6) build the BODY first, because step (1) has to know which directories the body
@@ -2714,8 +2739,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             argv += ["--bind-try", str(child), str(child)]
 
     def _absent_in_ro_store(f: Path) -> bool:
-        # Nothing to hide and nothing the shell can create: no mount, so no host stub.
-        return not f.exists() and f.parent in ro_store_dirs
+        # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
+        # the NEAREST EXISTING ancestor, not the parent: an absent `.levain/vault` (or a path
+        # deeper under an absent dir) cannot be created from inside a read-only store dir, and
+        # mounting it made bwrap mkdir inside that read-only mount, so bash never started
+        # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
+        # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
+        # (6): a path the HOST creates there after spawn is visible through the read-only bind.
+        if f.exists():
+            return False
+        anc = f.parent
+        while not anc.exists() and anc != anc.parent:
+            anc = anc.parent
+        return anc in ro_store_dirs
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -2739,6 +2775,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # (L3 2026-10-01, all three lineages).
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
+            continue
+        if _absent_in_ro_store(sub):
             continue
         if sub.exists() and not sub.is_dir():
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
@@ -2812,6 +2850,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # why it is applied rather than skipping outright". It described step (5) while step (4),
         # its other call site, did the opposite. The helper was right; one caller was not.
         if _absent_in_ro_store(f):
+            continue
+        if f in policy.sqlite_sidecars and not f.exists():
+            # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
+            # breaks the host's SQLite writer. ⚠ SPAWN-TIME SNAPSHOT, stated: a sidecar the host
+            # creates after this shell starts (or deletes and recreates, which detaches the mount)
+            # is visible to it, the same residual as a shared-dir socket in step (6).
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
@@ -3138,7 +3182,8 @@ class BwrapProvider(ConfinementProvider):
     artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
     before it is either claimed or shipped."""
 
-    #: Enforced by ``--unshare-net`` (no network at all in bash), not by a per-destination rule.
+    #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
+    #: does not close is ``OFFLINE_RESIDUAL``.
     enforces_localhost_deny = True
     localhost_deny_removes_network = True
 

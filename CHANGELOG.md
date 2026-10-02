@@ -6,7 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Security
+
+- **A SQLite crown jewel's `-wal` and `-shm` files were readable and writable from the confined shell, on macOS and Linux.** When a denied store is a file rather than a directory (an `~/.anneal-memory` that is a SQLite database, as on some hosts), only the main file was denied. In WAL mode, recent committed rows live in `<db>-wal` until a checkpoint, so the shell could read them, and could write `<db>-shm`. The floor now also denies `-wal`, `-shm` and `-journal` beside every file-shaped jewel, including `deny_files` entries. On macOS they are denied whether or not they exist. On Linux only the ones present when the shell starts are covered; see Known open issues.
+
+### Known open issues
+
+- **On Linux, a SQLite sidecar created after the shell starts is not covered.** A mount cannot cover a file that does not exist yet, and creating an empty placeholder would break the database's own writer. A `-wal` or `-shm` that the host creates (or deletes and recreates) while the shell runs is readable from it. macOS is not affected.
+
 ### Fixed
+
+- **On Linux, a deny path inside `.levain` that did not exist yet stopped bash from starting.** bwrap tried to create it inside the read-only store mount. Such a path cannot be created from inside the shell either, so it is no longer mounted.
 
 - **`levain doctor` passed a malformed `confinement.json` when the host diagnosis itself raised.** The diagnosis ran first, and a probe error was reported as "not determinable" before the entity's config was read, so doctor stayed green for an entity `levain run` refuses. The config is now read first, so it fails the check on every host.
 - **On Linux, reinstalling a seat during a turn warned "PREVIOUS definition" even when nothing changed.** The default seat runs the `levain` console script, and the kernel records a script's process as `<interpreter> <script> <args>`, so the exact comparison with the seat's command never matched. The check now compares the end of the command line, which still catches a changed task.
