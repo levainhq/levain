@@ -1326,6 +1326,9 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
+    for f in policy.sqlite_sidecars:
+        if _ci_within(p, f):
+            return f"{p} is a SQLite sidecar (-wal/-shm/-journal) of a crown-jewel file"
     for f in policy.deny_files:
         if _ci_within(p, f):
             return f"{p} is a crown-jewel credential file"
@@ -2614,6 +2617,45 @@ def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
     return any(_ci_within(path, r) for r in roots)
 
 
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _is_sqlite_file(p: Path) -> bool:
+    """True if ``p`` is a regular file that starts with SQLite's header. Reads 16 bytes in the host
+    process; an unreadable file is not one, because the host's own SQLite could not open it either."""
+    try:
+        with open(p, "rb") as fh:
+            return p.is_file() and fh.read(16) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
+    """Refuse bash when a crown jewel is a SQLite database in a directory this user can write.
+
+    REPRODUCED 2026-10-02 (L1 on the sidecar fix, then end to end in the Linux container): with the
+    store closed, SQLite has deleted its ``-wal``, and nothing a mount can do stops the confined
+    shell CREATING ``<db>-wal`` in a writable directory. The shell copied a valid WAL there, and the
+    host's next open replayed it into the store: ``host reads: [('good',), ('PLANTED',)]``. A
+    planted ``-journal`` is replayed the same way in rollback mode. macOS denies the sidecar names
+    themselves, so its shell cannot create them (the same plant: ``Operation not permitted``).
+    ⚖ Before 0e09df5 bwrap aborted on a file-shaped root, so such a host had no bash; that commit
+    made bash start and opened this path. Refusing restores fail-closed for exactly this case. A
+    store that is a DIRECTORY is hidden by a read-only tmpfs and is unaffected."""
+    sidecars = set(policy.sqlite_sidecars)
+    candidates = [p for p in policy.deny_read_write if p.is_file()]
+    candidates += [f for f in policy.deny_files if f not in sidecars]
+    for jewel in candidates:
+        if _is_sqlite_file(jewel) and os.access(jewel.parent, os.W_OK):
+            raise ConfinementError(
+                f"{jewel} is a SQLite database in a directory this user can write. On Linux the "
+                "floor cannot stop the shell creating its -wal or -journal file there, and SQLite "
+                "replays such a file into the database on its next open, so the entity could "
+                "rewrite it. Refusing to grant bash hands (fail-closed). Keep the store in a "
+                "directory (as ~/.anneal-memory/ normally is) to use bash."
+            )
+
+
 def _reachable(p: Path) -> bool:
     """False when this user cannot even stat ``p`` (EACCES: another user's runtime dir). Such a path
     is out of the entity's reach too, so there is nothing to mask — and probing it must not raise
@@ -2653,6 +2695,10 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     caller handles — not a raw ``OSError`` that crashes the tool call (codex, L3 r1)."""
     try:
         return _bwrap_plan_impl(policy)
+    except ConfinementError:
+        # A deliberate refusal already names its cause. ConfinementError is a RuntimeError, so
+        # without this it was re-wrapped as "could not inspect the host", a false reason.
+        raise
     except (OSError, RuntimeError) as exc:   # RuntimeError: a symlink loop in Path.resolve()
         raise ConfinementError(
             f"could not inspect the host to build the Linux floor ({exc}) — refusing to grant bash "
@@ -2667,7 +2713,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     fired on this repo the day before this was written).
 
     Pure: no I/O EXCEPT ``Path.exists`` probes, which decide between the self-bind and the
-    ``/dev/null`` form for a write-denied file. That is a read, never a mutation."""
+    ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
+    (:func:`_refuse_plantable_sqlite_jewels`). Reads, never a mutation."""
+    _refuse_plantable_sqlite_jewels(policy)
     argv: list[str] = [
         BWRAP,
         # The polarity flip, in one flag: the whole filesystem is present and writable, exactly as a
@@ -2853,9 +2901,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         if f in policy.sqlite_sidecars and not f.exists():
             # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
-            # breaks the host's SQLite writer. ⚠ SPAWN-TIME SNAPSHOT, stated: a sidecar the host
-            # creates after this shell starts (or deletes and recreates, which detaches the mount)
-            # is visible to it, the same residual as a shared-dir socket in step (6).
+            # breaks the host's SQLite writer. A SQLite jewel in a directory this user can write
+            # never gets here (refused above: the shell could plant the sidecar). What remains is a
+            # jewel in a directory this user cannot write, where neither the shell nor this user's
+            # host process can create a sidecar; one another user creates later is visible.
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
@@ -3099,8 +3148,8 @@ def bwrap_netns_available() -> bool:
 
 
 # ⚖ THE LINUX POSTURE, DECIDED 2026-10-01 (option B, under Phill's go): bwrap has no
-# per-destination connect deny, so the deny renders as ``--unshare-net`` and bash runs with NO
-# network. Measured on argushub the same day: under ``--unshare-net`` a 127.0.0.1 listener is refused
+# per-destination connect deny, so the deny renders as ``--unshare-net`` and bash runs with no IP
+# network (pathname unix sockets remain: ``OFFLINE_RESIDUAL``). Measured on argushub the same day: under ``--unshare-net`` a 127.0.0.1 listener is refused
 # (curl rc 7), an abstract-socket D-Bus is refused (busctl rc 1), the internet is gone (rc 6) and bash
 # itself works; with no flag all three are reachable. The entity's own model calls are made by the
 # levain process, outside bwrap. ``allow_localhost_outbound: true`` gives bash the network back, with

@@ -3292,7 +3292,9 @@ def test_linux_live_a_deny_subtree_that_is_a_file_does_not_brick_the_shell(tmp_p
 def test_live_a_file_jewels_sqlite_sidecars_are_denied(tmp_path, monkeypatch) -> None:
     """Reproduced 2026-10-02 by Diogenes on BOTH providers: a WAL-mode SQLite store at
     ~/.anneal-memory (a FILE, as on argushub) had its main file denied while `<db>-wal` still held the
-    uncheckpointed rows, readable from the confined shell, and `<db>-shm` was writable."""
+    uncheckpointed rows, readable from the confined shell, and `<db>-shm` was writable. On Linux the
+    shell could also CREATE `<db>-wal` while the store was closed, and the host replayed it (L1,
+    reproduced end to end), so there bash is refused for a SQLite jewel in a writable directory."""
     import sqlite3
 
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -3307,13 +3309,18 @@ def test_live_a_file_jewels_sqlite_sidecars_are_denied(tmp_path, monkeypatch) ->
         conn.commit()
         wal, shm = Path(f"{db}-wal"), Path(f"{db}-shm")
         assert b"JEWEL-1002-SECRET" in wal.read_bytes()   # the precondition: the row is in the WAL
-        provider = SeatbeltProvider() if _LIVE else BwrapProvider()
-        with provider.spawn_shell(build_policy(ent, ssh_mode="agent")) as sh:
+        policy = build_policy(ent, ssh_mode="agent")
+        if not _LIVE:
+            with pytest.raises(ConfinementError, match="SQLite database in a directory"):
+                BwrapProvider().spawn_shell(policy)
+            return
+        with SeatbeltProvider().spawn_shell(policy) as sh:
             assert sh.run("echo alive").exit_code == 0
             assert sh.run(f"cat {db}").exit_code != 0
             assert "JEWEL-1002-SECRET" not in sh.run(f"cat {wal}").output
             assert sh.run(f"grep -a -c JEWEL-1002-SECRET {wal}").exit_code != 0
             assert sh.run(f"printf X >> {shm}").exit_code != 0
+            assert sh.run(f"printf X > {db}-journal").exit_code != 0   # the plant
         assert conn.execute("SELECT v FROM t").fetchall() == [("JEWEL-1002-SECRET",)]
     finally:
         conn.close()

@@ -1029,11 +1029,11 @@ class SystemdUserProvider(DaemonProvider):
                                    else f"{spec.label}.service")
                 _run(["systemctl", "--user", "daemon-reload"], check=False)
                 if target != rollback_target:
-                    # periodic -> resident: the failed install already ran `enable` on the
-                    # resident service, which created its default.target.wants symlink. Restoring
-                    # the periodic file (no [Install]) does not remove that symlink, so the
-                    # service would start at login beside its restored timer (Diogenes LOW
-                    # 2026-10-02).
+                    # A shape change: disable what the failed install enabled. For periodic ->
+                    # resident that is the service, whose default.target.wants symlink survives
+                    # the restored periodic file (no [Install]), so it would start at login beside
+                    # its restored timer (Diogenes LOW 2026-10-02). For resident -> periodic it is
+                    # the timer, already disabled above, so this is a no-op there.
                     _run(["systemctl", "--user", "disable", target], check=False)
                 _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
                 raise DaemonError(
