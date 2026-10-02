@@ -3376,14 +3376,21 @@ def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypat
     tool-creation time from the conversation's binding) is where the two enforcers once disagreed."""
     from types import SimpleNamespace
 
-    from levain.firing.openhands.tools import CONVERSATION_BINDING_KEY, policy_for_conv_state
+    from levain.firing.openhands.tools import bind_conversation, policy_for_conv_state
+
+    class _State:  # weak-referenceable, like the real ConversationState
+        agent_state: dict = {}
+        workspace = None
 
     ent = _entity(tmp_path)
     ws = ent / "workspace"
     ws.mkdir()
-    state = SimpleNamespace(
-        workspace=SimpleNamespace(working_dir=str(ws)),
-        agent_state={CONVERSATION_BINDING_KEY: {"entity_dir": str(ent), "drive_mode": mode}},
+    state = _State()
+    state.workspace = SimpleNamespace(working_dir=str(ws))
+    state.agent_state = {}
+    bind_conversation(
+        SimpleNamespace(agent=SimpleNamespace(_initialized=False), state=state),
+        entity_dir=ent, mode=mode,
     )
     assert policy_for_conv_state(state).deny_keychain is expected
 

@@ -1,8 +1,7 @@
 """spore-438: two ``EntitySession``s in ONE process — the K1-part-2 prerequisite.
 
 Each test is the reproduction that ran against 62e16b2 (before the conversation binding), turned
-into an assertion. On that tree the first two FAILED as described in their docstrings; the third
-pins the guard the fix deliberately kept.
+into an assertion; on that tree all three FAILED as described in their docstrings.
 
 openhands-gated. Real sessions, real ``Conversation`` objects, and the real lazy tool build (the
 SDK's ``_ensure_agent_ready``, which the first turn calls) — no model is contacted.
@@ -19,9 +18,8 @@ pytest.importorskip("openhands.sdk", reason="openhands extra absent")
 pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
 
 from levain.firing.confinement import confinement_supported  # noqa: E402
-from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV  # noqa: E402
 from levain.firing.isolation import AMBIGUOUS_ENTITY, LEVAIN_ENTITY_DIR_ENV  # noqa: E402
-from levain.session import EntitySession, SessionStartError  # noqa: E402
+from levain.session import EntitySession  # noqa: E402
 
 TOKEN = "PROBE-TOKEN-438"
 
@@ -36,7 +34,7 @@ def home(tmp_path, monkeypatch):
     gh.write_text(f"github.com:\n  oauth_token: {TOKEN}\n")
     monkeypatch.setenv("HOME", str(h))
     monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
+    monkeypatch.delenv("LEVAIN_DRIVE_MODE", raising=False)   # retired channel; stale shells only
     return h
 
 
@@ -122,16 +120,19 @@ def test_two_entities_in_one_process_each_resolve_their_own_store(tmp_path, home
         b.close()
 
 
-def test_the_widen_refusal_still_fires_and_says_why(tmp_path, home):
-    """The guard spore-438 keeps: a process whose recorded mode is unattended refuses to open an
-    interactive session (it would widen the recorded floor). The message names the refusal, not
-    the generic "check --model / --base-url" advice it fell into before."""
+def test_an_interactive_session_opens_after_an_unattended_one_with_its_own_floor(tmp_path, home):
+    """62e16b2: once an unattended session had opened, the process REFUSED every interactive one
+    (bind_drive_mode's widen guard, with an operator message pointing at --model). The guard was
+    retired with the env channel (Phill, 2026-10-02: "b on levain") because no floor reads it.
+    Now the interactive session opens and each floor is its own — the reverse order of the first
+    test, the one the guard used to refuse."""
     ent = _entity(tmp_path, "ent")
-    a = _open(ent, "unattended")
+    u = _open(ent, "unattended")
+    i = _open(ent, "interactive")
     try:
-        with pytest.raises(SessionStartError) as exc:
-            _open(ent, "interactive")
-        msg = str(exc.value)
-        assert "STRICTER" in msg and "--model" not in msg
+        assert not any(_gh_reads(u, home).values())
+        assert all(_gh_reads(i, home).values())
+        assert "LEVAIN_DRIVE_MODE" not in os.environ   # nothing publishes the retired channel
     finally:
-        a.close()
+        u.close()
+        i.close()

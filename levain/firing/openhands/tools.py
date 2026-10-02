@@ -126,18 +126,36 @@ LEVAIN_FILE_EDITOR_TOOL = "levain_file_editor"
 LEVAIN_BASH_TOOL = "levain_bash"
 
 
-# --- the shared crown-jewels floor for a run -------------------------------------------------
-
-
 # --- the per-conversation binding (spore-438) -------------------------------------------------
 
 CONVERSATION_BINDING_KEY = "levain.binding"
-"""The ``ConversationState.agent_state`` key carrying WHICH entity a conversation serves and HOW it
-is driven. Both floor enforcers are built inside the SDK's ``Tool.create(conv_state)``, a classmethod
-reached through a process-global registry — so the conversation state they are handed is the only
-per-conversation channel they have. ``agent_state`` is the SDK's own per-conversation dict; its
-``fork()`` carries it over (``fork_conv._state.agent_state = copy.deepcopy(...)`` in the SDK's
-``local_conversation.py``), so a forked conversation keeps its parent's binding."""
+"""The ``ConversationState.agent_state`` key carrying WHICH entity a conversation serves. Both floor
+enforcers are built inside the SDK's ``Tool.create(conv_state)``, a classmethod reached through a
+process-global registry — so the conversation state they are handed is the only per-conversation
+channel they have. ``agent_state`` is the SDK's own per-conversation dict, and it is PERSISTED and
+carried into a fork (``fork_conv._state.agent_state = copy.deepcopy(...)`` in the SDK's
+``local_conversation.py``) — right for the entity, which is the conversation's identity."""
+
+# HOW a conversation is driven is NOT identity: the same persisted conversation can be resumed by a
+# human today and a scheduler tonight. So the mode is never persisted. It is recorded here, in this
+# process, against the LIVE state object (identity-checked through a weakref, as ``_FLOORS`` is), and
+# anything that did not get it from :func:`bind_conversation` in this process — a resume, a fork, a
+# state rebuilt from disk — reads ``unattended`` (codex L3 HIGH, 2026-10-02).
+_MODES: dict[int, tuple["weakref.ref[Any]", DriveMode]] = {}
+_MODES_LOCK = threading.Lock()
+
+
+def _drop_mode(key: int) -> None:
+    with _MODES_LOCK:
+        entry = _MODES.get(key)
+        if entry is not None and entry[0]() is None:
+            _MODES.pop(key, None)
+
+
+def _live_mode(conv_state: Any) -> DriveMode | None:
+    with _MODES_LOCK:
+        entry = _MODES.get(id(conv_state))
+    return entry[1] if entry is not None and entry[0]() is conv_state else None
 
 
 class ConversationBindingError(ConfinementError):
@@ -146,16 +164,17 @@ class ConversationBindingError(ConfinementError):
 
 
 def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveMode) -> None:
-    """Record ``entity_dir`` + ``mode`` on ``conversation``'s own state, then READ IT BACK.
+    """Bind ``conversation`` to ``entity_dir`` (persisted on its state) and ``mode`` (this process
+    only), then READ IT BACK.
 
-    Refuses (:class:`ConfinementError`) if the conversation's agent has already built its tools —
-    their floors were resolved without this binding, and writing it now would make the binding
-    describe a floor that is not the one in force. Also refuses a binding that does not read back as
-    written: a floor that failed to wire must not present itself as one that did."""
-    if conversation.agent._initialized:  # openhands-sdk pinned exactly; a rename fails loudly here
+    Refuses (:class:`ConversationBindingError`) unless the conversation's agent has provably NOT yet
+    built its tools — their floors would have been resolved without this binding. Also refuses a
+    binding that does not read back as written: a floor that failed to wire must not present itself
+    as one that did."""
+    if getattr(conversation.agent, "_initialized", None) is not False:
         raise ConversationBindingError(
-            "the conversation's tools were built before its binding — their floor did not come "
-            "from this conversation (fail-closed)."
+            "cannot confirm the conversation's tools are unbuilt — their floor would not come from "
+            "this conversation (fail-closed)."
         )
     if mode not in DRIVE_MODES:
         raise ConversationBindingError(
@@ -164,10 +183,16 @@ def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveM
     ed = Path(entity_dir).expanduser().resolve()
     _require_agent_agrees(conversation.agent, ed)
     state = conversation.state
-    state.agent_state = {
-        **(state.agent_state or {}),
-        CONVERSATION_BINDING_KEY: {"entity_dir": str(ed), "drive_mode": mode},
-    }
+    record = {**(state.agent_state or {}), CONVERSATION_BINDING_KEY: {"entity_dir": str(ed)}}
+    if hasattr(state, "__enter__"):
+        with state:  # the SDK's own state lock (autosave / a concurrent run mutate under it)
+            state.agent_state = record
+    else:
+        state.agent_state = record
+    key = id(state)
+    with _MODES_LOCK:
+        _MODES[key] = (weakref.ref(state), mode)
+    weakref.finalize(state, _drop_mode, key)
     if conversation_binding(state) != (ed, mode):
         raise ConversationBindingError(
             "the conversation binding did not read back as written — refusing to build a floor "
@@ -192,18 +217,20 @@ def _require_agent_agrees(agent: Any, entity_dir: Path) -> None:
 def conversation_binding(conv_state: Any) -> tuple[Path | None, DriveMode]:
     """``(entity_dir, drive_mode)`` this conversation is bound to.
 
-    An absent or malformed binding yields ``(None, "unattended")``: the drive mode FAILS CLOSED, for
-    the reason :func:`~levain.firing.drive.current_drive_mode` gives (a wiring failure must never
-    widen the floor), and the entity is left for the caller to derive."""
+    ALL OR NOTHING: unless the persisted record names an entity AND this process bound a mode to
+    this very state object, the answer is ``(None, "unattended")`` — no half of a record is trusted
+    on its own (codex L3 HIGH, 2026-10-02: a record carrying only a mode used to fail open). The mode
+    fails CLOSED: wrongly denying is a visible refusal the operator fixes, wrongly granting is a silent
+    credential exposure with nobody watching. The entity is left for the caller to derive."""
     raw = (getattr(conv_state, "agent_state", None) or {}).get(CONVERSATION_BINDING_KEY)
-    if not isinstance(raw, dict):
+    ed = raw.get("entity_dir") if isinstance(raw, dict) else None
+    mode = _live_mode(conv_state)
+    if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES:
         return None, "unattended"
-    mode = raw.get("drive_mode")
-    ed = raw.get("entity_dir")
-    return (
-        Path(ed) if isinstance(ed, str) and ed else None,
-        mode if mode in DRIVE_MODES else "unattended",
-    )
+    return Path(ed), mode
+
+
+# --- the shared crown-jewels floor for a run -------------------------------------------------
 
 
 def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
@@ -222,6 +249,13 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
     silently yield a floor with holes)."""
     workspace = Path(conv_state.workspace.working_dir).expanduser().resolve()
     bound_entity, mode = conversation_binding(conv_state)
+    if bound_entity is not None and not (bound_entity / ".levain").is_dir():
+        # A bound entity that is gone (moved, renamed, a stale resumed record) would load NO
+        # confinement.json — a floor silently missing the operator's declarations. Refuse.
+        raise ConversationBindingError(
+            f"this conversation is bound to {bound_entity}, which is not an initialized entity "
+            "(no .levain/) — refusing to build a floor without its confinement declarations."
+        )
     entity_dir = bound_entity if bound_entity is not None else workspace.parent
     _require_agent_agrees(getattr(conv_state, "agent", None), entity_dir.resolve())
     cfg = load_confinement_config(entity_dir)

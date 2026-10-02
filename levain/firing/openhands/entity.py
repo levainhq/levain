@@ -39,6 +39,7 @@ from openhands.sdk.context.condenser import CondenserBase
 
 from levain.firing.contract import build_firing
 from levain.firing.isolation import (
+    guard_entity,
     ENTITY_STORE_SUBDIR,
     IsolationError,
     assert_entity_isolated,
@@ -221,6 +222,7 @@ def build_entity_agent(
     max_size: int = 120,
     keep_first: int = 4,
     presence_kind: str = "entity_seed",
+    publish_entity: bool = True,
 ) -> EntityBinding:
     """Build an isolated OpenHands ``Agent`` for the entity at ``entity_dir``, running on ``llm``.
 
@@ -247,7 +249,9 @@ def build_entity_agent(
     The constitution rides a STRING baked into the AgentContext (fork-safe as data, so the per-turn
     firing kind need not carry it); the re-anchor rides the serializable ``presence_kind`` (rebuilt on
     fork). Both read only the ENTITY's own seed — never flow's fossil (isolation applies to the seed)."""
-    ed, crystal, episodic = bind_entity(entity_dir)
+    # ``publish_entity=False``: guard only; the caller publishes the process channel once it has
+    # started (EntitySession.open), so a start that fails leaves the channel untouched.
+    ed, crystal, episodic = (bind_entity if publish_entity else guard_entity)(entity_dir)
     resolved_inner = (
         inner
         if inner is not None

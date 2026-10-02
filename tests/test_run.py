@@ -800,6 +800,15 @@ class _ReplBinding:
         return None
 
 
+class _ReplState:
+    """The conversation state surface the driver touches. A class, not a SimpleNamespace, because the
+    real ConversationState is weak-referenceable and `bind_conversation` relies on that."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+        self.agent_state: dict = {}
+
+
 class _ReplConversation:
     """A stand-in for the SDK Conversation that records every message it is SENT."""
 
@@ -807,7 +816,7 @@ class _ReplConversation:
 
     def __init__(self, _agent, workspace=None, visualizer=None) -> None:
         self.id = "conv-test"
-        self.state = types.SimpleNamespace(events=[], agent_state={})
+        self.state = _ReplState()
         # The real Conversation exposes its agent; `bind_conversation` asks it whether the tools
         # were already built (spore-438). A fresh conversation's agent has not built them.
         self.agent = types.SimpleNamespace(_initialized=False)

@@ -12,14 +12,18 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - A second session's drive mode set the first session's file-editor and bash floor. The first session's banner said one thing while its tools enforced another.
   - A second session that failed to open still moved the first session's floor.
   - Once the process named a second entity, the first session's recall, re-anchor and capture all used the second entity's store.
-  The entity and the drive mode now ride on the conversation itself (its `agent_state`, and the condenser's serialized fields, so a fork keeps them). Two entities can be open in one process, and each reads and writes only its own store.
-- **A second, different entity in one process no longer refuses to start.** Instead, `$LEVAIN_ENTITY_DIR` is marked ambiguous for the rest of the process, and any read that would rely on it (a firing rebuilt with no entity, or a stray default-kind `vagus_run`) refuses rather than picking one of the entities or falling back to the laptop store. A widening drive-mode rebind is still refused, as before.
-- **A library caller that builds an entity's tools without `EntitySession` gets the `unattended` floor** unless it binds the conversation (`levain.firing.openhands.tools.bind_conversation`), or resumes a persisted conversation that was bound (the binding lives in its state). It used to get whatever `$LEVAIN_DRIVE_MODE` held.
-- **A session that fails to start no longer records its drive mode for the process.** A refused unattended start used to block every later interactive start in the same process.
+  The entity now rides on the conversation (its `agent_state`, and the condenser's serialized fields, so a fork keeps it). The drive mode is recorded for the live conversation in this process only and is never persisted, because how a conversation is driven can change between runs: a conversation resumed from disk, or forked, gets the `unattended` floor until it is bound again. Two entities can be open in one process, and each reads and writes only its own store.
+- **A second, different entity in one process no longer refuses to start.** Instead, `$LEVAIN_ENTITY_DIR` is marked ambiguous for the rest of the process, and any read that would rely on it (a firing rebuilt with no entity, or a stray default-kind `vagus_run`) refuses rather than picking one of the entities or falling back to the laptop store. A session that fails to start leaves the variable as it was.
+- **A library caller that builds an entity's tools without `EntitySession` gets the `unattended` floor** unless it binds the conversation (`levain.firing.openhands.tools.bind_conversation`). It used to get whatever `$LEVAIN_DRIVE_MODE` held.
+- **A conversation whose agent serves a different entity than the conversation is bound to, or whose bound entity no longer exists, is refused** when its tools are built, rather than given a floor split across two entities or missing the entity's `confinement.json`.
+
+### Removed
+
+- **`$LEVAIN_DRIVE_MODE` and its "one process hosts one drive mode" refusal** (`bind_drive_mode`, `current_drive_mode`, `DriveModeConflict`). Nothing read the variable once the floor moved onto the conversation, and the refusal meant that once any unattended session had opened, the process could never open an interactive one. An interactive session now opens beside an unattended one, each with its own floor.
 
 ### Fixed
 
-- **A refused drive-mode rebind told the operator to check `--model` / `--base-url`.** It now says it is refusing to widen the credential floor.
+- **A session that failed to start after its conversation was built left that conversation open** until the process exited. It is now closed.
 
 ## [0.5.1] — 2026-10-02
 

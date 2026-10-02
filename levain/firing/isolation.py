@@ -48,6 +48,7 @@ __all__ = [
     "assert_workspace_isolated",
     "assert_path_within_workspace",
     "bind_entity",
+    "guard_entity",
     "AMBIGUOUS_ENTITY",
 ]
 
@@ -271,6 +272,21 @@ def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str
         )
 
 
+def guard_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
+    """:func:`bind_entity` without the publish: resolve + guard, touch no process state. A session
+    guards first and publishes only once it has started, so a start that fails leaves the process
+    channel as it found it (L3 2026-10-02)."""
+    ed = Path(entity_dir).expanduser().resolve()
+    if not (ed / ENTITY_STORE_SUBDIR).is_dir():
+        raise IsolationError(
+            f"{ed} is not an initialized Levain entity (no {ENTITY_STORE_SUBDIR}/). "
+            "Run `levain init --adapter openhands` in it first."
+        )
+    crystal, episodic = entity_store_paths(ed)
+    assert_entity_isolated(crystal, episodic, entity_dir=ed)
+    return ed, crystal, episodic
+
+
 def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
     """Resolve + GUARD an entity dir, then bind ``$LEVAIN_ENTITY_DIR`` (the process-level ambient
     channel). Returns ``(entity_dir, crystal_path, episodic_path)`` — all resolved.
@@ -297,14 +313,7 @@ def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
     ``_entity_env_path``), so a stray bare ``vagus_run`` / ``wrap_nudge`` in a one-entity process
     resolves to that entity at USE time, and in a multi-entity process is refused rather than sent to
     the laptop flow store."""
-    ed = Path(entity_dir).expanduser().resolve()
-    if not (ed / ENTITY_STORE_SUBDIR).is_dir():
-        raise IsolationError(
-            f"{ed} is not an initialized Levain entity (no {ENTITY_STORE_SUBDIR}/). "
-            "Run `levain init --adapter openhands` in it first."
-        )
-    crystal, episodic = entity_store_paths(ed)
-    assert_entity_isolated(crystal, episodic, entity_dir=ed)  # loud, BEFORE binding
+    ed, crystal, episodic = guard_entity(entity_dir)  # loud, BEFORE binding
     with _BIND_LOCK:
         existing = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
         if existing == AMBIGUOUS_ENTITY:

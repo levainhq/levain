@@ -56,30 +56,20 @@ either depending on the other.
 """
 from __future__ import annotations
 
-import os
-import threading
 from typing import Literal
 
 __all__ = [
     "DRIVE_MODES",
-    "DriveModeConflict",
-    "LEVAIN_DRIVE_MODE_ENV",
     "DriveMode",
-    "bind_drive_mode",
-    "current_drive_mode",
     "human_present",
     "resolve_cred_floor",
 ]
 
-LEVAIN_DRIVE_MODE_ENV = "LEVAIN_DRIVE_MODE"
-"""The PROCESS-level record of the drive mode — no longer what either floor enforcer reads.
-
-Both enforcers (the bash seatbelt and the file editor's tool-creation-time policy) resolve the mode
-from the CONVERSATION they serve (``levain.firing.openhands.tools.bind_conversation``, spore-438),
-because a process-global value can be changed by a second session between one session's resolve and
-its tool build — measured with two ``EntitySession``s in one process before that fix. The channel is
-still written by :func:`bind_drive_mode`, whose widen refusal now guards no floor (see its docstring).
-:func:`current_drive_mode` is public API; no enforcer calls it."""
+# There is no process-level drive-mode channel. ``$LEVAIN_DRIVE_MODE`` and its widen-refusal guard were
+# retired on 2026-10-02 (Phill: "b on levain") once spore-438 moved the mode onto each conversation
+# (``levain.firing.openhands.tools.bind_conversation``) and no reader of the env was left anywhere —
+# in levain, flow, anneal-memory, the hub, or any child process (the confined shell and the daemon
+# start from env dicts built from scratch). A process-global mode is the race spore-438 reproduced.
 
 DriveMode = Literal["interactive", "headless", "unattended"]
 
@@ -125,74 +115,7 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     """
     if setting is not None:
         return setting
-    # An UNRECOGNIZED mode denies, exactly as `current_drive_mode` maps garbage to "unattended".
-    # Both halves of the authority must fail the same way: if only the env reader failed closed,
-    # a direct library caller passing a typo'd mode would get "allowed" from this function and
-    # "denied" from the tool policy — one authority reporting two answers. (codex L3 LOW.)
+    # An UNRECOGNIZED mode denies, exactly as an unbound conversation resolves to "unattended"
+    # (`tools.conversation_binding`). Both must fail the same way, or a typo'd mode would get
+    # "allowed" here and "denied" from the tool policy — one authority, two answers. (codex L3 LOW.)
     return mode not in ("interactive", "headless")
-
-
-_BIND_LOCK = threading.Lock()
-
-
-class DriveModeConflict(RuntimeError):
-    """A second session tried to rebind the drive mode in a way that would WIDEN the floor."""
-
-
-def bind_drive_mode(mode: DriveMode) -> None:
-    """Publish ``mode`` on the fork-safe channel, **refusing any rebind that would WIDEN the floor**.
-
-    Called by :meth:`levain.session.EntitySession.open`.
-
-    **The race it was written for (codex L3 HIGH ×2, 2026-07-29).** Until spore-438 the two floor
-    enforcers READ this process-global channel, at a different moment from the session's own
-    resolve: each hand's ``create()`` called ``policy_for_conv_state`` after it. A second session
-    could flip the env in between, so one session's tools were built with another session's floor
-    while its banner still reported its own — and a second session that FAILED to start still
-    moved the env, because the bind precedes those failures. All three were reproduced with two
-    real sessions in one process before the conversation binding replaced the read.
-
-    Refusing the widening direction makes the race harmless rather than merely unlikely: a rebind
-    may TIGHTEN the floor (nothing is exposed by denying more) and may never LOOSEN it, so whatever
-    interleaving occurs, no session's credentials become readable because of another session's
-    mode. It is expressed as a comparison over the resolved FLOOR rather than over the mode names,
-    because the floor is the thing that must not weaken.
-
-    **What it protects now: nothing on the floor.** spore-438 built codex's diagnosis: the mode travels
-    in the CONVERSATION state each enforcer resolves, and no enforcer reads this channel. The refusal
-    was kept by the 2026-10-02 brief, so a process that recorded a stricter mode still refuses a
-    wider one — which in a multi-session server blocks a legitimate interactive session after any
-    unattended one. Retiring it is an open ruling, not a defect to work around.
-    """
-    with _BIND_LOCK:  # read-compare-write as one step, or thread order decides whether it refuses
-        current = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
-        if current in DRIVE_MODES and current != mode:
-            if resolve_cred_floor(None, mode=current) and not resolve_cred_floor(None, mode=mode):
-                raise DriveModeConflict(
-                    f"this process is already bound to drive mode {current!r}, whose credential "
-                    f"floor is STRICTER than {mode!r}; refusing to rebind and widen it. One process "
-                    f"hosts one drive mode — start a new process."
-                )
-        os.environ[LEVAIN_DRIVE_MODE_ENV] = str(mode)
-
-
-def current_drive_mode() -> DriveMode:
-    """Read the bound drive mode, **failing CLOSED to ``"unattended"``**.
-
-    The asymmetry is the whole argument, and it runs opposite to the usual "don't surprise the
-    operator" instinct:
-
-    - Wrongly resolving to ``unattended`` DENIES credentials to a session that should have had
-      them. The operator sees a refusal immediately, in the banner and at the point of use, and
-      fixes it in one line of ``confinement.json``.
-    - Wrongly resolving to anything else GRANTS credentials to a session that should not have had
-      them — silently, unattended, with the read compounding into always-loaded memory and nobody
-      watching. There is no error to see.
-
-    The only way this is unset in a real run is a WIRING failure, and a wiring failure must never
-    widen the floor. This mirrors :func:`human_present`, which also resolves an unrecognized mode
-    to the governed side, and ``arm_efferent_gate``'s read-back-and-refuse discipline: never let a
-    policy that failed to wire present itself as a policy that did.
-    """
-    raw = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
-    return raw if raw in DRIVE_MODES else "unattended"  # type: ignore[return-value]

@@ -14,6 +14,7 @@ confinement floor). The pure ``tool_action_summary`` render helper is tested in 
 """
 from __future__ import annotations
 
+import types
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ from levain.firing.openhands.tools import (  # noqa: E402
     LevainBashTool,
     LevainFileEditorTool,
     SandboxedBashExecutor,
-    CONVERSATION_BINDING_KEY,
+    bind_conversation,
     build_entity_tools,
     policy_for_conv_state,
 )
@@ -91,10 +92,12 @@ class _FakeConvState:
         # test sets one, exactly like a conversation nobody bound.
         self.agent_state: dict = {}
         if mode is not None or entity is not None:
-            self.agent_state[CONVERSATION_BINDING_KEY] = {
-                "entity_dir": str(entity if entity is not None else Path(wd).parent),
-                "drive_mode": mode,
-            }
+            # Through the REAL binder: the mode is recorded in-process against this object.
+            bind_conversation(
+                types.SimpleNamespace(agent=types.SimpleNamespace(_initialized=False), state=self),
+                entity_dir=entity if entity is not None else Path(wd).parent,
+                mode=mode or "unattended",
+            )
         if conv_id is None:
             type(self)._n += 1
             conv_id = f"fake-conv-{type(self)._n}"
@@ -232,12 +235,10 @@ def test_policy_for_conv_state_fails_CLOSED_when_the_drive_mode_is_unbound(tmp_p
     WIRING failure, and a wiring failure must never WIDEN the floor: wrongly denying surfaces as a
     visible refusal the operator fixes in one line, while wrongly granting is a silent credential
     exposure on an unattended seat with nobody watching."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
-    # The process channel saying "interactive" must not reach an UNBOUND conversation (spore-438):
-    # unbound is a wiring failure, and it fails closed whatever the process last recorded.
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
+    # Even with the retired env var set to "interactive" (an operator's stale shell), an UNBOUND
+    # conversation fails closed: nothing reads $LEVAIN_DRIVE_MODE any more (spore-438, 2026-10-02).
+    monkeypatch.setenv("LEVAIN_DRIVE_MODE", "interactive")
     ent, ws = _entity(tmp_path)
     assert crown_jewel_reason(
         policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"

@@ -63,8 +63,6 @@ from levain.firing.confinement import (
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
     DriveMode,
-    DriveModeConflict,
-    bind_drive_mode,
     human_present,
     resolve_cred_floor,
 )
@@ -77,6 +75,7 @@ from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
     assert_workspace_isolated,
+    bind_entity,
 )
 from levain.install import effective_adapter
 
@@ -279,23 +278,17 @@ class TurnResult:
 
 
 def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
-    """Publish the drive mode on the process channel AND resolve the cred floor from it.
-
-    Since spore-438 neither floor enforcer reads the process channel: both resolve from the
-    conversation's own binding (:func:`~levain.firing.openhands.tools.bind_conversation`, called
-    with the same ``mode``). The publish stays only for :func:`~levain.firing.drive.bind_drive_mode`'s
-    widen-refusal guard, which no longer protects any floor (kept by the 2026-10-02 brief; whether to
-    retire it is an open ruling). The resolve is the banner's value.
+    """The banner's cred floor for ``mode`` — the same value the conversation's tools resolve.
 
     Resolving through :func:`~levain.firing.drive.resolve_cred_floor` rather than reading
     ``cfg.deny_standard_creds`` directly is load-bearing: the field is a TRI-STATE whose ``None``
     means "derive from the drive", so a raw read silently treats an UNDECLARED entity as opted-OUT
-    and reinstates the exact hole this closes.
+    and reinstates the exact hole this closes. (Until 2026-10-02 this also published the mode on
+    ``$LEVAIN_DRIVE_MODE``; that channel is retired — see :mod:`levain.firing.drive`.)
 
-    ``cfg`` is ``None`` for a ``--no-tools`` session; the mode is still published (nothing else
-    would) and the floor still resolves, harmlessly, for hands that do not exist.
+    ``cfg`` is ``None`` for a ``--no-tools`` session; the floor still resolves, harmlessly, for hands
+    that do not exist.
     """
-    bind_drive_mode(mode)
     return resolve_cred_floor(
         cfg.deny_standard_creds if cfg is not None else None, mode=mode
     )
@@ -571,6 +564,10 @@ class EntitySession:
         #   - it fires AGAIN after mkdir (codex L3 TOCTOU — mkdir(exist_ok=True) follows a
         #     symlink swapped in after the first assert, so the invariant fires at USE);
         #   - a bad --model/--base-url is a usage error → clean exit 2, not a raw traceback.
+        # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`, which
+        # under-declares the concrete `send_message` / `state` surface.
+        conversation: Any = None
+        started = False
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -598,7 +595,9 @@ class EntitySession:
                 bash_ok, bash_refusal, bash_offline = resolve_localhost_deny(
                     cfg.allow_localhost_outbound)
             entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
-            binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
+            binding = build_entity_agent(
+                entity_dir, llm, tools=entity_tools, publish_entity=False
+            )
             workspace = entity_dir / WORKSPACE_SUBDIR
             assert_workspace_isolated(workspace, entity_dir=entity_dir)
             workspace.mkdir(parents=True, exist_ok=True)
@@ -614,9 +613,7 @@ class EntitySession:
                 conv_kwargs["callbacks"] = [_activity_callback(on_event, workspace)]
             if max_iterations is not None:
                 conv_kwargs["max_iteration_per_run"] = max_iterations
-            # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`,
-            # which under-declares the concrete `send_message` / `state` surface.
-            conversation: Any = Conversation(binding.agent, **conv_kwargs)
+            conversation = Conversation(binding.agent, **conv_kwargs)
             # spore-438: THIS conversation's entity + drive mode, on its own state. Both floor
             # enforcers resolve from here, so another session in this process cannot move this
             # one's floor; bind_conversation refuses if the tools were already built.
@@ -636,11 +633,12 @@ class EntitySession:
                 arm_efferent_gate(conversation)
             else:
                 disarm_efferent_gate(conversation)
-            # Publish the drive mode (the widen-refusal guard) and resolve the banner's cred floor
-            # LAST, so a session that fails to start leaves the process channel untouched (L1
-            # 2026-10-02, reproduced: a refused unattended open used to block every later
-            # interactive one). The tools' floor comes from the conversation binding above.
+            # Publish the process entity channel LAST, so a session that fails to start leaves it
+            # untouched (L3 2026-10-02: a refused second entity used to leave it ambiguous). The
+            # tools' floor comes from the conversation binding above, never from it.
+            bind_entity(entity_dir)
             deny_standard_creds = _apply_drive_policy(cfg, mode)
+            started = True
         except GateArmingError as exc:
             # Its OWN handler, ABOVE the generic one: a gate that will not arm must never be
             # reported as "check --model / --base-url", which would send the operator hunting a
@@ -651,11 +649,6 @@ class EntitySession:
                 f"  This entity is configured to gate efferent actions "
                 f"(.levain/confinement.json → efferent_gate), and the runtime did not accept it."
             ) from exc
-        except DriveModeConflict as exc:
-            # Its own handler for the same reason as the gate's: the generic one below would send the
-            # operator to check --model / --base-url while the news is the process-level drive-mode
-            # guard (bind_drive_mode) refusing this session.
-            raise SessionStartError(f"refusing to start the entity:\n  {exc}") from exc
         except ConversationBindingError as exc:
             # ABOVE the ConfinementError handler it subclasses: this is not a malformed
             # confinement.json, it is a conversation whose floor could not be bound to it.
@@ -677,6 +670,17 @@ class EntitySession:
                 f"could not start the entity ({exc}).\n"
                 f"  Check --model / --base-url (default: an open model via local Ollama)."
             ) from exc
+        finally:
+            # A start that failed AFTER the conversation was built must not abandon it: the SDK
+            # registers each conversation's close() with atexit, so a refused open would otherwise
+            # live until process exit (L3 2026-10-02, three seats). Best-effort; the start error wins.
+            if not started and conversation is not None:
+                try:
+                    conversation.close()
+                except Exception:  # noqa: BLE001
+                    logging.getLogger("levain.session").warning(
+                        "closing a conversation from a failed start raised", exc_info=True
+                    )
 
         return cls(
             entity_dir=entity_dir,
