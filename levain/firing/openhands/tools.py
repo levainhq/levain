@@ -61,7 +61,6 @@ Requires the ``openhands`` extra.
 """
 from __future__ import annotations
 
-import os
 import dataclasses
 import logging
 import threading
@@ -96,8 +95,7 @@ from levain.firing.confinement import (
     refresh_socket_denies,
     select_provider,
 )
-from levain.firing.drive import current_drive_mode, resolve_cred_floor
-from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
+from levain.firing.drive import DRIVE_MODES, DriveMode, resolve_cred_floor
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
 
@@ -113,6 +111,9 @@ __all__ = [
     "LevainBashTool",
     "policy_for_conv_state",
     "build_entity_tools",
+    "CONVERSATION_BINDING_KEY",
+    "bind_conversation",
+    "conversation_binding",
 ]
 
 # The REGISTRY keys (the ``Tool(name=...)`` spec names). Deliberately DISTINCT from the stock
@@ -127,21 +128,78 @@ LEVAIN_BASH_TOOL = "levain_bash"
 # --- the shared crown-jewels floor for a run -------------------------------------------------
 
 
+# --- the per-conversation binding (spore-438) -------------------------------------------------
+
+CONVERSATION_BINDING_KEY = "levain.binding"
+"""The ``ConversationState.agent_state`` key carrying WHICH entity a conversation serves and HOW it
+is driven. Both floor enforcers are built inside the SDK's ``Tool.create(conv_state)``, a classmethod
+reached through a process-global registry — so the conversation state they are handed is the only
+per-conversation channel they have. ``agent_state`` is the SDK's own per-conversation dict; its
+``fork()`` carries it over (``fork_conv._state.agent_state = copy.deepcopy(...)`` in the SDK's
+``local_conversation.py``), so a forked conversation keeps its parent's binding."""
+
+
+def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveMode) -> None:
+    """Record ``entity_dir`` + ``mode`` on ``conversation``'s own state, then READ IT BACK.
+
+    Refuses (:class:`ConfinementError`) if the conversation's agent has already built its tools —
+    their floors were resolved without this binding, and writing it now would make the binding
+    describe a floor that is not the one in force. Also refuses a binding that does not read back as
+    written: a floor that failed to wire must not present itself as one that did."""
+    if conversation.agent._initialized:  # openhands-sdk pinned exactly; a rename fails loudly here
+        raise ConfinementError(
+            "the conversation's tools were built before its binding — their floor did not come "
+            "from this conversation (fail-closed)."
+        )
+    if mode not in DRIVE_MODES:
+        raise ConfinementError(f"unknown drive mode {mode!r}; expected one of {DRIVE_MODES}")
+    ed = Path(entity_dir).expanduser().resolve()
+    state = conversation.state
+    state.agent_state = {
+        **(state.agent_state or {}),
+        CONVERSATION_BINDING_KEY: {"entity_dir": str(ed), "drive_mode": mode},
+    }
+    if conversation_binding(state) != (ed, mode):
+        raise ConfinementError(
+            "the conversation binding did not read back as written — refusing to build a floor "
+            "from it (fail-closed)."
+        )
+
+
+def conversation_binding(conv_state: Any) -> tuple[Path | None, DriveMode]:
+    """``(entity_dir, drive_mode)`` this conversation is bound to.
+
+    An absent or malformed binding yields ``(None, "unattended")``: the drive mode FAILS CLOSED, for
+    the reason :func:`~levain.firing.drive.current_drive_mode` gives (a wiring failure must never
+    widen the floor), and the entity is left for the caller to derive."""
+    raw = (getattr(conv_state, "agent_state", None) or {}).get(CONVERSATION_BINDING_KEY)
+    if not isinstance(raw, dict):
+        return None, "unattended"
+    mode = raw.get("drive_mode")
+    ed = raw.get("entity_dir")
+    return (
+        Path(ed) if isinstance(ed, str) and ed else None,
+        mode if mode in DRIVE_MODES else "unattended",
+    )
+
+
 def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
     """Build the ONE :class:`~levain.firing.confinement.CrownJewelsPolicy` that fences BOTH hands for
     this run — the shared floor.
 
-    The entity dir is the authoritative ``$LEVAIN_ENTITY_DIR`` (bound by
-    :func:`~levain.firing.isolation.bind_entity` BEFORE the conversation — and its tools — are built,
-    fork-safe), falling back to ``<workspace>/..`` (``levain run`` always creates the workspace as
-    ``<entity>/workspace/``) when the env is unset (e.g. a direct unit test). The universal floor
+    The entity dir and the drive mode both come from THIS conversation's binding
+    (:func:`conversation_binding`, written by :func:`bind_conversation`) — never from process-global
+    state, which a second session in the same process can change between this conversation's resolve
+    and its tool build (spore-438). An unbound conversation derives the entity as ``<workspace>/..``
+    (``levain run`` always creates the workspace as ``<entity>/workspace/``) and fails the drive mode
+    closed to ``unattended``. The universal floor
     (flow store + sibling stores + ssh key material) is always applied by ``build_policy``; the
     operator's app-specific credential files/subtrees come from ``<entity>/.levain/confinement.json``
     (fail-closed if that file is present but malformed — a broken crown-jewels declaration must not
     silently yield a floor with holes)."""
     workspace = Path(conv_state.workspace.working_dir).expanduser().resolve()
-    env = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    entity_dir = Path(env).expanduser().resolve() if env else workspace.parent
+    bound_entity, mode = conversation_binding(conv_state)
+    entity_dir = bound_entity if bound_entity is not None else workspace.parent
     cfg = load_confinement_config(entity_dir)
     return build_policy(
         entity_dir,
@@ -152,13 +210,11 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
         # RESOLVED, never the raw config value. `deny_standard_creds` is a TRI-STATE whose
         # `None` means "derive from the drive mode", and this policy is built OUTSIDE the session
         # object (at tool-creation time, then cached on the executor) — so it reads the mode from
-        # the process channel rather than closing over session state. Passing the raw
+        # the conversation's own binding rather than closing over session state. Passing the raw
         # value here would let the FILE EDITOR allow the standard cred stores on an unattended
         # seat while the bash seatbelt denied them: one policy, two enforcers, disagreeing — and
         # the file editor is the `view` path the unattended cred floor exists to close.
-        deny_standard_creds=resolve_cred_floor(
-            cfg.deny_standard_creds, mode=current_drive_mode()
-        ),
+        deny_standard_creds=resolve_cred_floor(cfg.deny_standard_creds, mode=mode),
         # spore-725. Passed straight through — NOT drive-resolved like the line above, because a
         # reachable container daemon is a total bypass in every drive mode (an interactive operator
         # watching the stream is not a mitigation for `docker run -v /:/host`). Both hands read the

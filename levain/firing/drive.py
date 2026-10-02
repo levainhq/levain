@@ -71,17 +71,14 @@ __all__ = [
 ]
 
 LEVAIN_DRIVE_MODE_ENV = "LEVAIN_DRIVE_MODE"
-"""The fork-safe channel carrying the drive mode to policy built OUTSIDE the session object.
+"""The PROCESS-level record of the drive mode — no longer what either floor enforcer reads.
 
-The crown-jewels floor has **one policy and two enforcers**, and each builds its own from
-``$LEVAIN_ENTITY_DIR`` + ``confinement.json`` at TOOL-CREATION time (not per call — the executors
-cache the policy they were constructed with; the earlier "rebuilt per call" wording here was simply
-wrong, codex+glm L3). Neither can close over session state, because ``create()`` is a classmethod
-reached through a process-global tool registry — there is no per-session channel to close over. Without a fork-safe channel for the mode, those two enforcers
-resolve the SAME field differently: bash would deny the standard cred stores on an unattended seat
-while the file editor allowed them — and the file editor is the ``view`` path, i.e. exactly the
-afferent read this floor exists to stop. Same idiom as ``$LEVAIN_ENTITY_DIR``: bound once at session
-start, re-read per op, never frozen into a closure."""
+Both enforcers (the bash seatbelt and the file editor's tool-creation-time policy) resolve the mode
+from the CONVERSATION they serve (``levain.firing.openhands.tools.bind_conversation``, spore-438),
+because a process-global value can be changed by a second session between one session's resolve and
+its tool build — measured with two ``EntitySession``s in one process before that fix. The channel is
+still written by :func:`bind_drive_mode`, whose widen-refusal guard it carries; :func:`current_drive_mode`
+reads it for a caller with no conversation to ask (in-tree callers: ``git grep -n "current_drive_mode(" levain/``)."""
 
 DriveMode = Literal["interactive", "headless", "unattended"]
 
@@ -141,17 +138,15 @@ class DriveModeConflict(RuntimeError):
 def bind_drive_mode(mode: DriveMode) -> None:
     """Publish ``mode`` on the fork-safe channel, **refusing any rebind that would WIDEN the floor**.
 
-    Called by :meth:`levain.session.EntitySession.open`, beside the ``$LEVAIN_ENTITY_DIR`` binding
-    it mirrors — and it mirrors that binding's REFUSAL too, for the same reason
-    (``bind_entity``: *"a silent rebind would swap the first agent's store on its next turn"*).
+    Called by :meth:`levain.session.EntitySession.open`.
 
-    **The race this closes (codex L3 HIGH ×2).** This channel is PROCESS-GLOBAL, and the two floor
-    enforcers read it at DIFFERENT moments: the bash seatbelt and the file editor each call
-    ``policy_for_conv_state`` from their own ``create()``, both AFTER the session resolved its own
-    value. In any multi-session process a second session could flip the env between those points,
-    so an unattended session's tools would be built with an interactive floor — while its banner,
-    resolved earlier, still claimed the credentials were denied. Worse, a second session that
-    later FAILS to start still poisons the env, because the bind happens before those failures.
+    **The race it was written for (codex L3 HIGH ×2, 2026-07-29).** Until spore-438 the two floor
+    enforcers READ this process-global channel, at a different moment from the session's own
+    resolve: each hand's ``create()`` called ``policy_for_conv_state`` after it. A second session
+    could flip the env in between, so one session's tools were built with another session's floor
+    while its banner still reported its own — and a second session that FAILED to start still
+    moved the env, because the bind precedes those failures. All three were reproduced with two
+    real sessions in one process before the conversation binding replaced the read.
 
     Refusing the widening direction makes the race harmless rather than merely unlikely: a rebind
     may TIGHTEN the floor (nothing is exposed by denying more) and may never LOOSEN it, so whatever
@@ -159,11 +154,10 @@ def bind_drive_mode(mode: DriveMode) -> None:
     mode. It is expressed as a comparison over the resolved FLOOR rather than over the mode names,
     because the floor is the thing that must not weaken.
 
-    **This is a guard, not the architecture.** The real fix is codex's own diagnosis — the mode
-    should travel in the CONVERSATION state being resolved, not in mutable ambient process state —
-    and that is a hard prerequisite for K1 part 2, whose server holds many sessions in one process.
-    Until then this refusal converts a silent widening into a loud failure, which is the same trade
-    ``bind_entity`` makes ("one process hosts one entity — start a new process").
+    **This is a guard, not the architecture.** The architecture is codex's diagnosis, built in
+    spore-438: the mode travels in the CONVERSATION state each enforcer resolves, so another session's
+    bind no longer reaches this one's floor. The guard is kept: a process asked to widen its recorded
+    mode still fails loudly ("one process hosts one drive mode — start a new process").
     """
     current = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
     if current in DRIVE_MODES and current != mode:

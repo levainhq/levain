@@ -10,6 +10,8 @@ Guarded on the ``openhands`` extra — skips cleanly where it's absent (levain's
 """
 from __future__ import annotations
 
+import os
+
 from pathlib import Path
 
 import pytest
@@ -119,15 +121,33 @@ def test_env_default_reguards_per_op_on_post_bind_escape(tmp_path):
         _env_episodic_path()  # re-derived + re-guarded → refuses the escaped store
 
 
-def test_bind_entity_refuses_rebind_to_different_entity(tmp_path):
-    """Single-entity-per-process: a second bind to a DIFFERENT initialized entity is refused
-    (the entity↔entity cross-wire, apparatus L1/complement). Idempotent same-entity re-bind is OK."""
+def test_a_second_entity_makes_every_AMBIENT_read_refuse(tmp_path, monkeypatch):
+    """spore-438. A second bind to a DIFFERENT entity no longer refuses (the session path carries its
+    own entity), but the ambient process channel can no longer say which entity it serves — so it is
+    marked ambiguous, stays that way, and every ambient reader REFUSES rather than pick one of the two
+    or fall through to the laptop flow store. Idempotent same-entity re-bind leaves it untouched."""
+    from levain.firing.anneal import AnnealEntityFiring, _env_episodic_path
+    from levain.firing.isolation import AMBIGUOUS_ENTITY, LEVAIN_ENTITY_DIR_ENV, resolve_entity_dir
+
+    monkeypatch.setenv("HOME", str(tmp_path))
     a = _entity(tmp_path, "entity_a")
     b = _entity(tmp_path, "entity_b")
     bind_entity(a)
-    bind_entity(a)  # idempotent — same entity, no raise
-    with pytest.raises(IsolationError, match="already bound to a different entity"):
-        bind_entity(b)
+    bind_entity(a)  # idempotent — same entity
+    assert os.environ[LEVAIN_ENTITY_DIR_ENV] == str(a.resolve())
+    bind_entity(b)
+    assert os.environ[LEVAIN_ENTITY_DIR_ENV] == AMBIGUOUS_ENTITY
+    bind_entity(a)  # sticky: never resolves back to either entity
+    assert os.environ[LEVAIN_ENTITY_DIR_ENV] == AMBIGUOUS_ENTITY
+    with pytest.raises(IsolationError, match="more than one entity"):
+        resolve_entity_dir()
+    with pytest.raises(IsolationError, match="more than one entity"):
+        AnnealEntityFiring()._resolve_episodic_path()
+    # the default-kind redirect must REFUSE, not return None (None = the laptop flow store)
+    with pytest.raises(IsolationError, match="more than one entity"):
+        _env_episodic_path()
+    # an EXPLICIT entity is unaffected — that is the session path
+    assert AnnealEntityFiring(entity_dir=b)._resolve_episodic_path().parent == (b / ".levain").resolve()
 
 
 def test_bind_entity_rejects_uninitialized_dir(tmp_path):
@@ -402,16 +422,23 @@ def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_
     assert "Your Memory — carried from your prior sessions" not in suffix
 
 
-def test_built_agents_firing_resolves_to_entity_store(tmp_path):
-    """The isolation carries THROUGH the built agent: with the binding env set, the agent's firing
-    kind rebuilds (as a fork would) to an AnnealEntityFiring resolving to the ENTITY crystal — never
-    the laptop default."""
+def test_built_agents_firing_resolves_to_entity_store(tmp_path, monkeypatch):
+    """The isolation carries THROUGH the built agent AND a fork: the condenser serializes its kind AND
+    its entity (spore-438), so the serialize→validate round-trip a fork performs rebuilds an
+    AnnealEntityFiring + SeedPresence on THIS entity — even when the process channel names another."""
     ent = _entity(tmp_path)
-    build_entity_agent(ent, _stub_llm())  # sets $LEVAIN_ENTITY_DIR
+    binding = build_entity_agent(ent, _stub_llm())
+    other = _entity(tmp_path, "other")
+    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(other))
 
-    firing = build_firing(ENTITY_FIRING_KIND)  # the zero-arg rebuild a fork performs
+    cond = binding.agent.condenser
+    forked = type(cond).model_validate(cond.model_dump())  # the round-trip fork/reload performs
+    firing = forked._firing
     assert type(firing).__name__ == "AnnealEntityFiring"
     assert firing._resolve_crystal_path() == (ent / ".levain" / "memory.crystal.json").resolve()
+    assert Path(forked._presence.entity_dir).resolve() == ent.resolve()
+    # the zero-arg rebuild (no entity carried) still follows the process channel — the ambient path
+    assert build_firing(ENTITY_FIRING_KIND)._resolve_crystal_path().parent == (other / ".levain").resolve()
 
 
 def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
@@ -425,18 +452,26 @@ def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
 
 
 def test_capture_turn_pins_entity_kind(tmp_path, monkeypatch):
-    """binding.capture_turn drives vagus_run with firing_kind='anneal_entity' (NOT vagus_run's
-    laptop-defaulting 'anneal' default) — the owned, correct-by-construction capture path (F1)."""
+    """binding.capture_turn drives vagus_run with an explicit ISOLATED firing on the binding's own
+    entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; and not the process channel,
+    spore-438 — which a second entity in the process would point elsewhere)."""
     import levain.firing.openhands.capture as capmod
+    from levain.firing.anneal import AnnealEntityFiring
+    from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
 
     ent = _entity(tmp_path)
     binding = build_entity_agent(ent, _stub_llm())
     seen: dict = {}
-    monkeypatch.setattr(capmod, "vagus_run", lambda conv, **kw: seen.update(conv=conv, **kw))
+    monkeypatch.setattr(
+        capmod, "vagus_run", lambda conv, firing=None, **kw: seen.update(conv=conv, firing=firing, **kw)
+    )
+    other = _entity(tmp_path, "other")
+    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(other))  # the process channel says elsewhere
     sentinel_conv = object()
     binding.capture_turn(sentinel_conv, session_id="s1")
     assert seen["conv"] is sentinel_conv
-    assert seen["firing_kind"] == ENTITY_FIRING_KIND == "anneal_entity"
+    assert isinstance(seen["firing"], AnnealEntityFiring)
+    assert seen["firing"]._resolve_episodic_path().parent == (ent / ".levain").resolve()
     assert seen["session_id"] == "s1"
 
 

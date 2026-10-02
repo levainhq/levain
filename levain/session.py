@@ -63,6 +63,7 @@ from levain.firing.confinement import (
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
     DriveMode,
+    DriveModeConflict,
     bind_drive_mode,
     human_present,
     resolve_cred_floor,
@@ -278,15 +279,13 @@ class TurnResult:
 
 
 def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
-    """Publish the drive mode on the fork-safe channel AND resolve the cred floor from it.
+    """Publish the drive mode on the process channel AND resolve the cred floor from it.
 
-    **One function on purpose, because the two must not drift.** The crown-jewels floor has one
-    policy and two enforcers: the bash seatbelt is rendered from the value this RETURNS, while the
-    file-editor policy is rebuilt PER CALL outside the session (fork-safety) and reads the mode
-    back off ``$LEVAIN_DRIVE_MODE``. Bind without resolving and bash gets the wrong floor; resolve
-    without binding and the FILE EDITOR does — and the file editor is the ``view`` path, i.e. the
-    afferent read the unattended cred floor exists to close. Two adjacent statements held together
-    by a comment is exactly how that drifts, so they are one call with one test.
+    Since spore-438 neither floor enforcer reads the process channel: both resolve from the
+    conversation's own binding (:func:`~levain.firing.openhands.tools.bind_conversation`, called
+    with the same ``mode`` once the conversation exists). The publish stays for
+    :func:`~levain.firing.drive.bind_drive_mode`'s widen-refusal guard, which still fires here; the
+    resolve is the banner's value.
 
     Resolving through :func:`~levain.firing.drive.resolve_cred_floor` rather than reading
     ``cfg.deny_standard_creds`` directly is load-bearing: the field is a TRI-STATE whose ``None``
@@ -548,7 +547,7 @@ class EntitySession:
                 arm_efferent_gate,
                 disarm_efferent_gate,
             )
-            from levain.firing.openhands.tools import build_entity_tools
+            from levain.firing.openhands.tools import bind_conversation, build_entity_tools
         except ImportError as exc:
             raise SessionStartError(
                 "the OpenHands runtime is not installed.\n"
@@ -584,8 +583,8 @@ class EntitySession:
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
-            # Publish the drive mode AND resolve the cred floor — ONE call, because the two must
-            # not drift (see `_apply_drive_policy`). Must run BEFORE any tool policy is built.
+            # Publish the drive mode (the widen-refusal guard) AND resolve the banner's cred floor.
+            # The tools' floor resolves from the conversation binding set below.
             deny_standard_creds = _apply_drive_policy(cfg, mode)
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
@@ -617,6 +616,10 @@ class EntitySession:
             # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`,
             # which under-declares the concrete `send_message` / `state` surface.
             conversation: Any = Conversation(binding.agent, **conv_kwargs)
+            # spore-438: THIS conversation's entity + drive mode, on its own state. Both floor
+            # enforcers resolve from here, so another session in this process cannot move this
+            # one's floor; bind_conversation refuses if the tools were already built.
+            bind_conversation(conversation, entity_dir=entity_dir, mode=mode)
 
             # The EFFERENT GATE (K3), armed on the live conversation — and this is the LAST step
             # of construction on purpose: it needs the conversation, and a session that reached
@@ -642,6 +645,11 @@ class EntitySession:
                 f"  This entity is configured to gate efferent actions "
                 f"(.levain/confinement.json → efferent_gate), and the runtime did not accept it."
             ) from exc
+        except DriveModeConflict as exc:
+            # Its own handler for the same reason as the gate's: the generic one below would send the
+            # operator to check --model / --base-url while the news is that this process refuses to
+            # widen another session's credential floor.
+            raise SessionStartError(f"refusing to start the entity:\n  {exc}") from exc
         except IsolationError as exc:
             raise SessionStartError(
                 f"sovereignty guard REFUSED to start the entity:\n  {exc}"

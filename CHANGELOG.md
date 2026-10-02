@@ -6,6 +6,20 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **Each session's crown-jewels floor and memory now come from the conversation it serves, not from process-wide environment variables.** Before this, `$LEVAIN_DRIVE_MODE` and `$LEVAIN_ENTITY_DIR` were the only channel the floor and the memory firings had. With two `EntitySession`s in one process (which no CLI path reaches yet; the server-held conversation will), we measured three crossovers:
+  - A second session's drive mode set the first session's file-editor and bash floor. The first session's banner said one thing while its tools enforced another.
+  - A second session that failed to open still moved the first session's floor.
+  - Once the process named a second entity, the first session's recall, re-anchor and capture all used the second entity's store.
+  The entity and the drive mode now ride on the conversation itself (its `agent_state`, and the condenser's serialized fields, so a fork keeps them). Two entities can be open in one process, and each reads and writes only its own store.
+- **A second, different entity in one process no longer refuses to start.** Instead, `$LEVAIN_ENTITY_DIR` is marked ambiguous for the rest of the process, and any read that would rely on it (a firing rebuilt with no entity, or a stray default-kind `vagus_run`) refuses rather than picking one of the entities or falling back to the laptop store. A widening drive-mode rebind is still refused, as before.
+- **A library caller that builds an entity's tools without `EntitySession` gets the `unattended` floor** unless it binds the conversation (`levain.firing.openhands.tools.bind_conversation`). It used to get whatever `$LEVAIN_DRIVE_MODE` held.
+
+### Fixed
+
+- **A refused drive-mode rebind told the operator to check `--model` / `--base-url`.** It now says it is refusing to widen the credential floor.
+
 ## [0.5.1] — 2026-10-02
 
 ### Security

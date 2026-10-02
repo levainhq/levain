@@ -10,8 +10,9 @@ constructor, not a discipline scattered across call sites):
      operator-laptop flow store or escape ``<entity>/.levain/``;
   2. verify the dir is an INITIALIZED entity (has ``.levain/``) — a friendly error, not a cryptic
      store-open failure three turns in;
-  3. bind ``$LEVAIN_ENTITY_DIR`` — the serialization-safe channel the firing re-reads on fork, so
-     isolation survives ``fork()`` / reload (a zero-arg registry rebuild finds the entity via env);
+  3. bind ``$LEVAIN_ENTITY_DIR`` — the process-level AMBIENT channel (marked ambiguous once a second
+     entity binds); the agent itself does not depend on it: its condenser serializes this entity
+     (spore-438), so ``fork()`` / reload rebuild the firing + presence on it;
   4. build ``Agent(agent_context=vagus_agent_context(firing_kind="anneal_entity"),
      condenser=LevainCondenser.build(firing_kind="anneal_entity", ...))`` — EVERY firing/condenser
      uses the isolated kind, whose resolver has NO ``~/.anneal-memory/`` fallback, so the whole
@@ -36,6 +37,7 @@ from typing import Any
 from openhands.sdk import LLM, Agent, LLMSummarizingCondenser
 from openhands.sdk.context.condenser import CondenserBase
 
+from levain.firing.contract import build_firing
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -68,17 +70,25 @@ class EntityBinding:
     agent: Agent
 
     def capture_turn(self, conversation: object, *, session_id: str | None = None) -> None:
-        """Run + capture a completed turn to the ENTITY store, pinning ``firing_kind="anneal_entity"``.
+        """Run + capture a completed turn to THIS binding's entity store (an explicit
+        ``AnnealEntityFiring`` on ``self.entity_dir``).
 
         Use this — NOT a bare ``vagus_run(conv)``, whose default ``firing_kind="anneal"`` resolves to
         the laptop flow store ``~/.anneal-memory/`` (the capture WRITE-leak, apparatus F1). The binding
-        OWNS capture so the run loop can't wire an unisolated one; the pinned ``anneal_entity`` kind
+        OWNS capture so the run loop can't wire an unisolated one; the isolated firing
         re-guards the store PER OP (``AnnealEntityFiring``), so it stays isolated even if ``.levain``
         is mutated after binding. (The entity-aware ``_env_*`` resolution also redirects a stray bare
-        ``vagus_run`` to the entity, re-guarded — belt-and-suspenders; this is the belt.)"""
+        ``vagus_run`` to the process's entity, re-guarded, and refuses when the process holds more
+        than one — belt-and-suspenders; this is the belt.)"""
+        from levain.firing.anneal import AnnealEntityFiring
         from levain.firing.openhands.capture import vagus_run
 
-        vagus_run(conversation, firing_kind=ENTITY_FIRING_KIND, session_id=session_id)
+        # spore-438: an EXPLICIT firing on this binding's own entity. Rebuilding from the kind alone
+        # resolves $LEVAIN_ENTITY_DIR, which in a process holding two entities names the wrong one
+        # for at least one of them. The firing still re-guards its store per op.
+        vagus_run(
+            conversation, AnnealEntityFiring(entity_dir=self.entity_dir), session_id=session_id
+        )
 
     def wrap_nudge(self, *, threshold: int | None = None) -> str | None:
         """The SessionEnd wrap-nudge against THIS entity's episodic store (never flow's, apparatus
@@ -230,8 +240,9 @@ def build_entity_agent(
         fresh "who are you?" answers with the seed identity, not the model's stock "I am OpenHands". A
         bare ``.levain``-only entity (no seed) falls back to the firing's generic default constitution.
       - the **re-anchor** (``presence_kind="entity_seed"``, the default) re-asserts that identity at
-        recency on the post-compaction recovery turn (``SeedPresence``, resolved per-op from the bound
-        ``$LEVAIN_ENTITY_DIR`` — fork-safe like the store). Pass ``presence_kind="stub"`` to opt out.
+        recency on the post-compaction recovery turn (``SeedPresence`` on this entity, carried by the
+        condenser's serialized ``entity_dir`` — fork-safe like the store). Pass
+        ``presence_kind="stub"`` to opt out.
 
     The constitution rides a STRING baked into the AgentContext (fork-safe as data, so the per-turn
     firing kind need not carry it); the re-anchor rides the serializable ``presence_kind`` (rebuilt on
@@ -274,7 +285,11 @@ def build_entity_agent(
     memory_block = _entity_continuity_block(ed) if seed_constitution is not None else None
     constitution = _compose_constitution(seed_constitution, memory_block)
     agent_ctx = vagus_agent_context(
-        firing_kind=ENTITY_FIRING_KIND, constitution=constitution
+        firing_kind=ENTITY_FIRING_KIND,
+        # spore-438: consulted only for a seedless entity's generic constitution — on THIS entity,
+        # not whatever the process-level channel names.
+        firing=build_firing(ENTITY_FIRING_KIND, entity_dir=str(ed)),
+        constitution=constitution,
     )
     # Pre-emptive act-first directive (bake-off 2026-07-17): bake the proven act-first prompt into the
     # system message so a task turn STARTS with a tool call instead of a plan-as-prose stall — the
@@ -304,6 +319,8 @@ def build_entity_agent(
             inner=resolved_inner,
             firing_kind=ENTITY_FIRING_KIND,
             presence_kind=presence_kind,
+            # spore-438: recall + re-anchor resolve THIS entity, not the process-global channel.
+            entity_dir=str(ed),
         ),
     )
     return EntityBinding(entity_dir=ed, crystal_path=crystal, episodic_path=episodic, agent=agent)

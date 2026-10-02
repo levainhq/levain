@@ -83,7 +83,7 @@ class PresenceSource(Protocol):
 # round-trip fork performs). Real presence kinds (the seed source) self-register on import; the
 # blessed-lazy-leaf allowlist below mirrors ``levain.firing.contract._LAZY_FIRING_MODULES``.
 
-_PRESENCE_REGISTRY: dict[str, Callable[[], PresenceSource]] = {}
+_PRESENCE_REGISTRY: dict[str, Callable[..., PresenceSource]] = {}
 
 # Explicit allowlist of lazily-importable presence leaves (kind → module), mirroring
 # ``levain.firing.contract._LAZY_FIRING_MODULES``. The first optional leaf (step 4) is the seed
@@ -97,13 +97,16 @@ _LAZY_PRESENCE_MODULES: dict[str, str] = {
 }
 
 
-def register_presence(kind: str, factory: Callable[[], PresenceSource]) -> None:
+def register_presence(kind: str, factory: Callable[..., PresenceSource]) -> None:
     """Register a ``PresenceSource`` factory under a serializable ``kind``."""
     _PRESENCE_REGISTRY[kind] = factory
 
 
-def build_presence(kind: str) -> PresenceSource:
+def build_presence(kind: str, *, entity_dir: str | None = None) -> PresenceSource:
     """Rebuild a ``PresenceSource`` from its registered kind (used on fork / reload).
+
+    ``entity_dir``: the per-conversation entity, exactly as :func:`levain.firing.contract.build_firing`
+    takes it (spore-438). ``None`` keeps the zero-argument rebuild.
 
     Serialization-safe: fork/reload reconstruct from the kind ALONE. A kind may live in an OPTIONAL
     leaf that self-registers on import (:data:`_LAZY_PRESENCE_MODULES`); if it isn't registered yet
@@ -125,7 +128,7 @@ def build_presence(kind: str) -> PresenceSource:
         raise ValueError(
             f"unknown presence kind {kind!r}; registered: {sorted(_PRESENCE_REGISTRY)}"
         )
-    return factory()
+    return factory() if entity_dir is None else factory(entity_dir=entity_dir)
 
 
 # --- Slice 1 STUB implementation ----------------------------------------------------

@@ -47,14 +47,26 @@ __all__ = [
     "assert_workspace_isolated",
     "assert_path_within_workspace",
     "bind_entity",
+    "AMBIGUOUS_ENTITY",
 ]
 
-# The serialization-safe binding channel: the entity's ROOT dir. Read per-inject/-capture by
-# ``AnnealEntityFiring`` (re-read, never frozen), so it survives a fork/reload — the ONE channel
-# that round-trips a zero-arg registry rebuild, exactly as the legacy ``VAGUS_CRYSTAL_PATH``
-# override does. ``levain run`` / :func:`~levain.firing.openhands.entity.build_entity_agent`
-# set it (the process owns exactly one entity).
+# The PROCESS-level entity channel: the entity's ROOT dir. Since spore-438 the session path carries
+# its own conversation's entity instead (condenser, capture, tool floor), so the channel serves only
+# AMBIENT reads — a kind rebuilt with no entity, and the default-kind redirect that keeps a stray bare
+# ``vagus_run`` out of the laptop flow store. The readers: ``git grep -n LEVAIN_ENTITY_DIR_ENV levain/``.
 LEVAIN_ENTITY_DIR_ENV = "LEVAIN_ENTITY_DIR"
+
+# What :func:`bind_entity` writes when a SECOND, different entity binds in the same process. An
+# ambient reader cannot know which of the two it is serving, so every reader of the channel refuses
+# this value rather than pick one (or fall through to the laptop store). Not a path anyone can hold.
+AMBIGUOUS_ENTITY = "levain:multiple-entities"
+
+
+def _refuse_ambiguous() -> IsolationError:
+    return IsolationError(
+        f"this process hosts more than one entity, so ${LEVAIN_ENTITY_DIR_ENV} cannot say which one "
+        "an ambient read serves — pass the entity explicitly (the session path always does)."
+    )
 
 # The per-entity substrate dir (matches ``doctor._check_store`` / ``dashboard`` / ``install``).
 ENTITY_STORE_SUBDIR = ".levain"
@@ -102,6 +114,8 @@ def resolve_entity_dir(explicit: Path | str | None = None) -> Path:
         if explicit is not None
         else os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
     )
+    if raw == AMBIGUOUS_ENTITY:
+        raise _refuse_ambiguous()
     if not raw:
         raise IsolationError(
             f"no entity bound: set ${LEVAIN_ENTITY_DIR_ENV} (or pass entity_dir) — an isolated "
@@ -252,8 +266,8 @@ def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str
 
 
 def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
-    """Resolve + GUARD an entity dir, then bind ``$LEVAIN_ENTITY_DIR`` (the process's single-entity
-    binding). Returns ``(entity_dir, crystal_path, episodic_path)`` — all resolved.
+    """Resolve + GUARD an entity dir, then bind ``$LEVAIN_ENTITY_DIR`` (the process-level ambient
+    channel). Returns ``(entity_dir, crystal_path, episodic_path)`` — all resolved.
 
     Raises :class:`IsolationError` if the dir is not an initialized entity or the derived stores would
     escape isolation. PURE — only ``os`` + this module's guard, NO anneal / NO openhands — so the
@@ -261,14 +275,22 @@ def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
     It lives HERE, not in the openhands adapter, precisely so that promise is true (apparatus codex
     round-2).
 
-    The env write is the single-entity-per-process contract: this process owns exactly one entity, and
-    a second bind to a DIFFERENT initialized entity is REFUSED (the entity↔entity cross-wire — the
-    firing re-reads ``$LEVAIN_ENTITY_DIR`` every op, so a silent rebind would swap the first agent's
-    store on its next turn). Idempotent re-bind to the same entity is fine; a leftover empty / non-dir
-    value is not a live binding. NO ``$VAGUS_*`` backstop is written — the ``"anneal"``-kind default
-    resolution is itself entity-aware + re-guarded PER OP when ``$LEVAIN_ENTITY_DIR`` is set
-    (``anneal._env_*`` → ``_entity_env_path``), so a stray bare ``vagus_run`` / ``wrap_nudge`` in the
-    entity process resolves to the entity at USE time — a runtime guard, not a cached bind-time path."""
+    The env write is the PROCESS-level channel, and it is no longer what keeps two entities apart
+    (spore-438): every session-path reader — the condenser's recall and re-anchor, the capture, the
+    tool floor — carries its own conversation's entity, so two entities can be served by one process
+    without either reading the other's store. What still reads the channel is the AMBIENT path (a
+    kind rebuilt with no entity, and the default-kind redirect below), and that path cannot know which
+    of two entities it serves. So a bind to a SECOND, different entity does not refuse: it marks the
+    channel :data:`AMBIGUOUS_ENTITY`, every ambient reader then refuses (``IsolationError``, which the
+    firing boundaries degrade to no-recall / a loud lost capture), and the marking is sticky for the
+    life of the process — it never resolves back to either entity. Re-binding the same entity is
+    idempotent; a leftover empty / non-dir value is not a live binding.
+
+    NO ``$VAGUS_*`` backstop is written — the ``"anneal"``-kind default resolution is itself
+    entity-aware + re-guarded PER OP when ``$LEVAIN_ENTITY_DIR`` is set (``anneal._env_*`` →
+    ``_entity_env_path``), so a stray bare ``vagus_run`` / ``wrap_nudge`` in a one-entity process
+    resolves to that entity at USE time, and in a multi-entity process is refused rather than sent to
+    the laptop flow store."""
     ed = Path(entity_dir).expanduser().resolve()
     if not (ed / ENTITY_STORE_SUBDIR).is_dir():
         raise IsolationError(
@@ -278,12 +300,12 @@ def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
     crystal, episodic = entity_store_paths(ed)
     assert_entity_isolated(crystal, episodic, entity_dir=ed)  # loud, BEFORE binding
     existing = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
+    if existing == AMBIGUOUS_ENTITY:
+        return ed, crystal, episodic  # sticky: a second entity already made ambient reads refuse
     if existing:
         existing_path = Path(existing).expanduser()
         if existing_path.is_dir() and existing_path.resolve() != ed:
-            raise IsolationError(
-                f"this process is already bound to a different entity ({existing_path.resolve()}); "
-                f"refusing to rebind to {ed}. One process hosts one entity — start a new process."
-            )
-    os.environ[LEVAIN_ENTITY_DIR_ENV] = str(ed)  # the serialization-safe binding (re-read per op)
+            os.environ[LEVAIN_ENTITY_DIR_ENV] = AMBIGUOUS_ENTITY
+            return ed, crystal, episodic
+    os.environ[LEVAIN_ENTITY_DIR_ENV] = str(ed)  # the ambient process channel (re-read per op)
     return ed, crystal, episodic

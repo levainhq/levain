@@ -40,6 +40,7 @@ from levain.firing.openhands.tools import (  # noqa: E402
     LevainBashTool,
     LevainFileEditorTool,
     SandboxedBashExecutor,
+    CONVERSATION_BINDING_KEY,
     build_entity_tools,
     policy_for_conv_state,
 )
@@ -80,9 +81,20 @@ class _FakeConvState:
     # whether create() actually shares.
     _n = 0
 
-    def __init__(self, wd: Path, conv_id: str | None = None) -> None:
+    def __init__(
+        self, wd: Path, conv_id: str | None = None, *, mode: str | None = None,
+        entity: Path | None = None,
+    ) -> None:
         self.workspace = _FakeWorkspace(wd)
         self.agent = _FakeAgent()
+        # The per-conversation binding `EntitySession.open` writes (spore-438). Absent unless a
+        # test sets one, exactly like a conversation nobody bound.
+        self.agent_state: dict = {}
+        if mode is not None or entity is not None:
+            self.agent_state[CONVERSATION_BINDING_KEY] = {
+                "entity_dir": str(entity if entity is not None else Path(wd).parent),
+                "drive_mode": mode,
+            }
         if conv_id is None:
             type(self)._n += 1
             conv_id = f"fake-conv-{type(self)._n}"
@@ -122,30 +134,35 @@ def test_registry_keys_distinct_but_llm_names_are_familiar():
     assert LEVAIN_BASH_TOOL != LevainBashTool.name
 
 
-def test_policy_for_conv_state_prefers_env_then_workspace_parent(tmp_path: Path, monkeypatch):
+def test_policy_for_conv_state_prefers_the_binding_then_workspace_parent(tmp_path: Path,
+                                                                         monkeypatch):
     ent, ws = _entity(tmp_path)
-    # env UNSET → entity dir derived as <workspace>/..
+    # unbound → entity dir derived as <workspace>/..
     pol = policy_for_conv_state(_FakeConvState(ws))
     assert pol.entity_dir == ent.resolve() and pol.workspace == ws.resolve()
-    # env SET (as levain run binds it) → that is authoritative
+    # the conversation's own binding is authoritative
     other = tmp_path / "other"
     (other / ".levain").mkdir(parents=True)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(other))
-    pol2 = policy_for_conv_state(_FakeConvState(ws))
+    pol2 = policy_for_conv_state(_FakeConvState(ws, mode="interactive", entity=other.resolve()))
     assert pol2.entity_dir == other.resolve()
+    # and the PROCESS channel is not consulted at all (spore-438): a third entity there moves neither
+    third = tmp_path / "third"
+    (third / ".levain").mkdir(parents=True)
+    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(third))
+    assert policy_for_conv_state(_FakeConvState(ws)).entity_dir == ent.resolve()
+    assert policy_for_conv_state(
+        _FakeConvState(ws, mode="interactive", entity=other.resolve())
+    ).entity_dir == other.resolve()
 
 
 def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
     """The confinement.json ``deny_standard_creds`` opt-in threads through policy_for_conv_state into
     the built policy (apparatus L1/complement: nothing pinned this end-to-end wiring — a dropped
     pass-through in tools.py would silently lose the opt-in while every other test still passed)."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
     ent, ws = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
-    pol = policy_for_conv_state(_FakeConvState(ws))
+    pol = policy_for_conv_state(_FakeConvState(ws, mode="interactive"))
     assert crown_jewel_reason(pol, tmp_path / ".config" / "gh" / "hosts.yml") is not None
     # a DIFFERENT entity with no confinement.json does NOT fold them in AT AN INTERACTIVE DRIVE
     # (gh hands intact for the operator who is sitting right there)
@@ -153,8 +170,7 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     (ent2 / ".levain").mkdir(parents=True)
     ws2 = ent2 / "workspace"
     ws2.mkdir()
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent2))
-    pol2 = policy_for_conv_state(_FakeConvState(ws2))
+    pol2 = policy_for_conv_state(_FakeConvState(ws2, mode="interactive"))
     assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
 
 
@@ -186,17 +202,14 @@ def test_policy_for_conv_state_denies_standard_creds_on_an_UNATTENDED_drive(tmp_
     while an interactive drive does not — same entity, same (absent) config, drive mode the only
     variable. This is the FILE-EDITOR enforcer, which is the one that matters: `view` is afferent,
     so the K3 gate never sees the read."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
     ent, ws = _entity(tmp_path)          # no confinement.json at all → the tri-state ABSENT
     gh = tmp_path / ".config" / "gh" / "hosts.yml"
 
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
-    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is None
-
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
-    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is not None
+    assert crown_jewel_reason(
+        policy_for_conv_state(_FakeConvState(ws, mode="interactive")), gh) is None
+    assert crown_jewel_reason(
+        policy_for_conv_state(_FakeConvState(ws, mode="unattended")), gh) is not None
 
 
 def test_policy_for_conv_state_honours_an_EXPLICIT_false_even_unattended(tmp_path: Path,
@@ -204,14 +217,12 @@ def test_policy_for_conv_state_honours_an_EXPLICIT_false_even_unattended(tmp_pat
     """An explicit ``false`` is an operator OPT-IN and must survive an unattended seat — a seat
     whose job is "open a PR nightly" genuinely needs gh. The unattended default is a DEFAULT, not a
     prohibition, and the tri-state exists precisely so this can be said."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
     ent, ws = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": false}')
     assert crown_jewel_reason(
-        policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"
+        policy_for_conv_state(_FakeConvState(ws, mode="unattended")),
+        tmp_path / ".config" / "gh" / "hosts.yml",
     ) is None
 
 
@@ -224,7 +235,9 @@ def test_policy_for_conv_state_fails_CLOSED_when_the_drive_mode_is_unbound(tmp_p
     from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
+    # The process channel saying "interactive" must not reach an UNBOUND conversation (spore-438):
+    # unbound is a wiring failure, and it fails closed whatever the process last recorded.
+    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
     ent, ws = _entity(tmp_path)
     assert crown_jewel_reason(
         policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"

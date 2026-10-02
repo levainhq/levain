@@ -808,6 +808,9 @@ class _ReplConversation:
     def __init__(self, _agent, workspace=None, visualizer=None) -> None:
         self.id = "conv-test"
         self.state = types.SimpleNamespace(events=[], agent_state={})
+        # The real Conversation exposes its agent; `bind_conversation` asks it whether the tools
+        # were already built (spore-438). A fresh conversation's agent has not built them.
+        self.agent = types.SimpleNamespace(_initialized=False)
 
     def send_message(self, message) -> None:
         type(self).sent.append(message)

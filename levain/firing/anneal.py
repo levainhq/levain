@@ -28,7 +28,9 @@ from pathlib import Path
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
 from levain.firing.encoding import RECEIPT_KEY as _ENCODING_RECEIPT_KEY
 from levain.firing.isolation import (
+    AMBIGUOUS_ENTITY,
     LEVAIN_ENTITY_DIR_ENV,
+    IsolationError,
     assert_entity_isolated,
     entity_store_paths,
     resolve_entity_dir,
@@ -61,6 +63,13 @@ def _entity_env_path(which: str) -> Path | None:
     so it degrades to no-recall / no-nudge, NEVER a leak. ``resolve_entity_dir`` is intentionally NOT
     used here (it RAISES when unbound; this must return ``None`` to fall through to normal resolution)."""
     raw = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
+    if raw == AMBIGUOUS_ENTITY:
+        # NOT `None`: None falls through to the laptop flow store. A process serving two entities
+        # must refuse an un-pinned default-kind op, never pick one of them or the operator's store.
+        raise IsolationError(
+            "this process hosts more than one entity; a default-kind store op cannot tell which "
+            "entity it serves (use AnnealEntityFiring(entity_dir=...))."
+        )
     if not raw:
         return None
     entity_dir = Path(raw).expanduser()
@@ -358,9 +367,10 @@ class AnnealEntityFiring(AnnealFiring):
 
     Why the KIND carries isolation (not just env): ``firing_kind`` is a SERIALIZED field, so a
     ``fork()`` / reload rebuilds this as ``AnnealEntityFiring`` — never the laptop-defaulting
-    ``AnnealFiring``. The entity DIR rides ``$LEVAIN_ENTITY_DIR`` (re-read per op, never frozen) —
-    the one channel that survives a zero-arg registry rebuild (the same mechanism the legacy
-    ``VAGUS_CRYSTAL_PATH`` override used). So even after a fork the contract holds by construction.
+    ``AnnealFiring``. The entity DIR rides the condenser's serialized ``entity_dir`` (spore-438), so a
+    fork rebuilds this firing on the SAME entity; a firing rebuilt zero-arg falls back to the
+    process-level ``$LEVAIN_ENTITY_DIR``, which refuses once a second entity has bound. Either way the
+    stores are re-derived and re-guarded per op, never frozen.
 
     FAIL-CLOSED-TO-SAFE at runtime: if no entity is bound (env unset) or the guard trips, the
     resolver RAISES — and because ``_recall`` / ``capture`` wrap resolution in the fail-soft
@@ -370,10 +380,10 @@ class AnnealEntityFiring(AnnealFiring):
     """
 
     def __init__(self, entity_dir: Path | str | None = None, **kwargs: object) -> None:
-        # ``entity_dir`` is for in-process / test construction; None → resolve per-op from
-        # ``$LEVAIN_ENTITY_DIR`` (the fork-safe path). It is NOT frozen into crystal_path/
-        # episodic_path — those must RE-resolve so a fork (zero-arg rebuild) still finds the entity
-        # via env. Passing a crystal_path/episodic_path override to an entity firing is refused
+        # ``entity_dir`` is the entity this firing serves (the session path always passes it); None
+        # → resolve per-op from the process-level ``$LEVAIN_ENTITY_DIR``. Either way it is NOT frozen
+        # into crystal_path/episodic_path — those RE-resolve and re-guard per op, so a post-bind
+        # ``.levain`` swap is caught. Passing a crystal_path/episodic_path override to an entity firing is refused
         # (an explicit path could point at flow's store — the exact leak); the entity dir is the
         # single source of truth.
         if kwargs.get("crystal_path") is not None or kwargs.get("episodic_path") is not None:
