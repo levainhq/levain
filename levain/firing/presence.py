@@ -97,16 +97,27 @@ _LAZY_PRESENCE_MODULES: dict[str, str] = {
 }
 
 
-def register_presence(kind: str, factory: Callable[..., PresenceSource]) -> None:
-    """Register a ``PresenceSource`` factory under a serializable ``kind``."""
+# Kinds whose factory takes ``entity_dir`` — mirrors ``contract._ENTITY_FIRING_KINDS``.
+_ENTITY_PRESENCE_KINDS: set[str] = set()
+
+
+def register_presence(
+    kind: str, factory: Callable[..., PresenceSource], *, takes_entity: bool = False
+) -> None:
+    """Register a ``PresenceSource`` factory under a serializable ``kind``. ``takes_entity``: the
+    factory accepts ``entity_dir``."""
     _PRESENCE_REGISTRY[kind] = factory
+    if takes_entity:
+        _ENTITY_PRESENCE_KINDS.add(kind)
+    else:
+        _ENTITY_PRESENCE_KINDS.discard(kind)
 
 
 def build_presence(kind: str, *, entity_dir: str | None = None) -> PresenceSource:
     """Rebuild a ``PresenceSource`` from its registered kind (used on fork / reload).
 
     ``entity_dir``: the per-conversation entity, exactly as :func:`levain.firing.contract.build_firing`
-    takes it (spore-438). ``None`` keeps the zero-argument rebuild.
+    takes it (spore-438): only a kind registered with ``takes_entity=True`` receives it.
 
     Serialization-safe: fork/reload reconstruct from the kind ALONE. A kind may live in an OPTIONAL
     leaf that self-registers on import (:data:`_LAZY_PRESENCE_MODULES`); if it isn't registered yet
@@ -128,7 +139,9 @@ def build_presence(kind: str, *, entity_dir: str | None = None) -> PresenceSourc
         raise ValueError(
             f"unknown presence kind {kind!r}; registered: {sorted(_PRESENCE_REGISTRY)}"
         )
-    return factory() if entity_dir is None else factory(entity_dir=entity_dir)
+    if entity_dir is None or kind not in _ENTITY_PRESENCE_KINDS:
+        return factory()
+    return factory(entity_dir=entity_dir)
 
 
 # --- Slice 1 STUB implementation ----------------------------------------------------

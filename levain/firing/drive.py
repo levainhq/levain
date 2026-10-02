@@ -57,6 +57,7 @@ either depending on the other.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Literal
 
 __all__ = [
@@ -77,8 +78,8 @@ Both enforcers (the bash seatbelt and the file editor's tool-creation-time polic
 from the CONVERSATION they serve (``levain.firing.openhands.tools.bind_conversation``, spore-438),
 because a process-global value can be changed by a second session between one session's resolve and
 its tool build — measured with two ``EntitySession``s in one process before that fix. The channel is
-still written by :func:`bind_drive_mode`, whose widen-refusal guard it carries; :func:`current_drive_mode`
-reads it for a caller with no conversation to ask (in-tree callers: ``git grep -n "current_drive_mode(" levain/``)."""
+still written by :func:`bind_drive_mode`, whose widen refusal now guards no floor (see its docstring).
+:func:`current_drive_mode` is public API; no enforcer calls it."""
 
 DriveMode = Literal["interactive", "headless", "unattended"]
 
@@ -131,6 +132,9 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     return mode not in ("interactive", "headless")
 
 
+_BIND_LOCK = threading.Lock()
+
+
 class DriveModeConflict(RuntimeError):
     """A second session tried to rebind the drive mode in a way that would WIDEN the floor."""
 
@@ -154,20 +158,22 @@ def bind_drive_mode(mode: DriveMode) -> None:
     mode. It is expressed as a comparison over the resolved FLOOR rather than over the mode names,
     because the floor is the thing that must not weaken.
 
-    **This is a guard, not the architecture.** The architecture is codex's diagnosis, built in
-    spore-438: the mode travels in the CONVERSATION state each enforcer resolves, so another session's
-    bind no longer reaches this one's floor. The guard is kept: a process asked to widen its recorded
-    mode still fails loudly ("one process hosts one drive mode — start a new process").
+    **What it protects now: nothing on the floor.** spore-438 built codex's diagnosis: the mode travels
+    in the CONVERSATION state each enforcer resolves, and no enforcer reads this channel. The refusal
+    was kept by the 2026-10-02 brief, so a process that recorded a stricter mode still refuses a
+    wider one — which in a multi-session server blocks a legitimate interactive session after any
+    unattended one. Retiring it is an open ruling, not a defect to work around.
     """
-    current = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
-    if current in DRIVE_MODES and current != mode:
-        if resolve_cred_floor(None, mode=current) and not resolve_cred_floor(None, mode=mode):
-            raise DriveModeConflict(
-                f"this process is already bound to drive mode {current!r}, whose credential floor "
-                f"is STRICTER than {mode!r}; refusing to rebind and widen it. One process hosts "
-                f"one drive mode — start a new process."
-            )
-    os.environ[LEVAIN_DRIVE_MODE_ENV] = str(mode)
+    with _BIND_LOCK:  # read-compare-write as one step, or thread order decides whether it refuses
+        current = os.environ.get(LEVAIN_DRIVE_MODE_ENV, "").strip()
+        if current in DRIVE_MODES and current != mode:
+            if resolve_cred_floor(None, mode=current) and not resolve_cred_floor(None, mode=mode):
+                raise DriveModeConflict(
+                    f"this process is already bound to drive mode {current!r}, whose credential "
+                    f"floor is STRICTER than {mode!r}; refusing to rebind and widen it. One process "
+                    f"hosts one drive mode — start a new process."
+                )
+        os.environ[LEVAIN_DRIVE_MODE_ENV] = str(mode)
 
 
 def current_drive_mode() -> DriveMode:

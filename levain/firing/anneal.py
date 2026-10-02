@@ -61,7 +61,9 @@ def _entity_env_path(which: str) -> Path | None:
     Raises :class:`~levain.firing.isolation.IsolationError` if the bound entity's store escapes — its
     callers (``_recall`` / ``capture`` / ``wrap_nudge``) wrap resolution in their fail-soft boundary,
     so it degrades to no-recall / no-nudge, NEVER a leak. ``resolve_entity_dir`` is intentionally NOT
-    used here (it RAISES when unbound; this must return ``None`` to fall through to normal resolution)."""
+    used here (it RAISES when unbound; this must return ``None`` to fall through to normal resolution).
+    The one exception: a channel marked ambiguous (a second entity bound in this process) RAISES
+    ``IsolationError`` instead, because ``None`` would fall through to the laptop flow store."""
     raw = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
     if raw == AMBIGUOUS_ENTITY:
         # NOT `None`: None falls through to the laptop flow store. A process serving two entities
@@ -410,4 +412,4 @@ class AnnealEntityFiring(AnnealFiring):
 
 
 register_firing("anneal", AnnealFiring)
-register_firing("anneal_entity", AnnealEntityFiring)
+register_firing("anneal_entity", AnnealEntityFiring, takes_entity=True)

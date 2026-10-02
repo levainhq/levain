@@ -114,6 +114,7 @@ __all__ = [
     "CONVERSATION_BINDING_KEY",
     "bind_conversation",
     "conversation_binding",
+    "ConversationBindingError",
 ]
 
 # The REGISTRY keys (the ``Tool(name=...)`` spec names). Deliberately DISTINCT from the stock
@@ -139,6 +140,11 @@ per-conversation channel they have. ``agent_state`` is the SDK's own per-convers
 ``local_conversation.py``), so a forked conversation keeps its parent's binding."""
 
 
+class ConversationBindingError(ConfinementError):
+    """A conversation's binding could not be written or does not agree with its agent. Its own type
+    so a session start does not report it as a malformed ``confinement.json``."""
+
+
 def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveMode) -> None:
     """Record ``entity_dir`` + ``mode`` on ``conversation``'s own state, then READ IT BACK.
 
@@ -147,22 +153,39 @@ def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveM
     describe a floor that is not the one in force. Also refuses a binding that does not read back as
     written: a floor that failed to wire must not present itself as one that did."""
     if conversation.agent._initialized:  # openhands-sdk pinned exactly; a rename fails loudly here
-        raise ConfinementError(
+        raise ConversationBindingError(
             "the conversation's tools were built before its binding — their floor did not come "
             "from this conversation (fail-closed)."
         )
     if mode not in DRIVE_MODES:
-        raise ConfinementError(f"unknown drive mode {mode!r}; expected one of {DRIVE_MODES}")
+        raise ConversationBindingError(
+            f"unknown drive mode {mode!r}; expected one of {DRIVE_MODES}"
+        )
     ed = Path(entity_dir).expanduser().resolve()
+    _require_agent_agrees(conversation.agent, ed)
     state = conversation.state
     state.agent_state = {
         **(state.agent_state or {}),
         CONVERSATION_BINDING_KEY: {"entity_dir": str(ed), "drive_mode": mode},
     }
     if conversation_binding(state) != (ed, mode):
-        raise ConfinementError(
+        raise ConversationBindingError(
             "the conversation binding did not read back as written — refusing to build a floor "
             "from it (fail-closed)."
+        )
+
+
+def _require_agent_agrees(agent: Any, entity_dir: Path) -> None:
+    """Refuse a conversation whose agent's memory serves a DIFFERENT entity than its binding.
+
+    The condenser carries its own ``entity_dir`` (recall + re-anchor) and the binding carries the
+    floor's; ``fork(agent=<another entity's agent>)`` or a resume under another agent would split one
+    conversation across two entities — floor on one, memory on the other (L2, 2026-10-02, run)."""
+    cond_ed = getattr(getattr(agent, "condenser", None), "entity_dir", None)
+    if cond_ed is not None and Path(cond_ed).expanduser().resolve() != entity_dir:
+        raise ConversationBindingError(
+            f"this conversation is bound to {entity_dir} but its agent's memory serves {cond_ed} — "
+            "refusing to build a floor for a conversation split across two entities (fail-closed)."
         )
 
 
@@ -200,6 +223,7 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
     workspace = Path(conv_state.workspace.working_dir).expanduser().resolve()
     bound_entity, mode = conversation_binding(conv_state)
     entity_dir = bound_entity if bound_entity is not None else workspace.parent
+    _require_agent_agrees(getattr(conv_state, "agent", None), entity_dir.resolve())
     cfg = load_confinement_config(entity_dir)
     return build_policy(
         entity_dir,

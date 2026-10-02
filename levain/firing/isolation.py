@@ -34,6 +34,7 @@ complete isolation (the same discipline the firing contract + presence seams hol
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 __all__ = [
@@ -60,6 +61,11 @@ LEVAIN_ENTITY_DIR_ENV = "LEVAIN_ENTITY_DIR"
 # ambient reader cannot know which of the two it is serving, so every reader of the channel refuses
 # this value rather than pick one (or fall through to the laptop store). Not a path anyone can hold.
 AMBIGUOUS_ENTITY = "levain:multiple-entities"
+
+# Serializes bind_entity's read-compare-write. Without it two concurrent binds of different entities
+# both read an empty channel and the later write wins with a plain path — measured (L2, 2026-10-02):
+# 46 of 2000 two-thread trials ended un-ambiguous.
+_BIND_LOCK = threading.Lock()
 
 
 def _refuse_ambiguous() -> IsolationError:
@@ -299,13 +305,14 @@ def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
         )
     crystal, episodic = entity_store_paths(ed)
     assert_entity_isolated(crystal, episodic, entity_dir=ed)  # loud, BEFORE binding
-    existing = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    if existing == AMBIGUOUS_ENTITY:
-        return ed, crystal, episodic  # sticky: a second entity already made ambient reads refuse
-    if existing:
-        existing_path = Path(existing).expanduser()
-        if existing_path.is_dir() and existing_path.resolve() != ed:
-            os.environ[LEVAIN_ENTITY_DIR_ENV] = AMBIGUOUS_ENTITY
-            return ed, crystal, episodic
-    os.environ[LEVAIN_ENTITY_DIR_ENV] = str(ed)  # the ambient process channel (re-read per op)
+    with _BIND_LOCK:
+        existing = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
+        if existing == AMBIGUOUS_ENTITY:
+            return ed, crystal, episodic  # sticky: a second entity already made ambient reads refuse
+        if existing:
+            existing_path = Path(existing).expanduser()
+            if existing_path.is_dir() and existing_path.resolve() != ed:
+                os.environ[LEVAIN_ENTITY_DIR_ENV] = AMBIGUOUS_ENTITY
+                return ed, crystal, episodic
+        os.environ[LEVAIN_ENTITY_DIR_ENV] = str(ed)  # the ambient process channel (re-read per op)
     return ed, crystal, episodic

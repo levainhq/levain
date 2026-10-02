@@ -283,9 +283,9 @@ def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
 
     Since spore-438 neither floor enforcer reads the process channel: both resolve from the
     conversation's own binding (:func:`~levain.firing.openhands.tools.bind_conversation`, called
-    with the same ``mode`` once the conversation exists). The publish stays for
-    :func:`~levain.firing.drive.bind_drive_mode`'s widen-refusal guard, which still fires here; the
-    resolve is the banner's value.
+    with the same ``mode``). The publish stays only for :func:`~levain.firing.drive.bind_drive_mode`'s
+    widen-refusal guard, which no longer protects any floor (kept by the 2026-10-02 brief; whether to
+    retire it is an open ruling). The resolve is the banner's value.
 
     Resolving through :func:`~levain.firing.drive.resolve_cred_floor` rather than reading
     ``cfg.deny_standard_creds`` directly is load-bearing: the field is a TRI-STATE whose ``None``
@@ -547,7 +547,11 @@ class EntitySession:
                 arm_efferent_gate,
                 disarm_efferent_gate,
             )
-            from levain.firing.openhands.tools import bind_conversation, build_entity_tools
+            from levain.firing.openhands.tools import (
+                ConversationBindingError,
+                bind_conversation,
+                build_entity_tools,
+            )
         except ImportError as exc:
             raise SessionStartError(
                 "the OpenHands runtime is not installed.\n"
@@ -583,9 +587,6 @@ class EntitySession:
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
-            # Publish the drive mode (the widen-refusal guard) AND resolve the banner's cred floor.
-            # The tools' floor resolves from the conversation binding set below.
-            deny_standard_creds = _apply_drive_policy(cfg, mode)
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
             allow_container_sockets = cfg.allow_container_sockets if cfg is not None else False
@@ -635,6 +636,11 @@ class EntitySession:
                 arm_efferent_gate(conversation)
             else:
                 disarm_efferent_gate(conversation)
+            # Publish the drive mode (the widen-refusal guard) and resolve the banner's cred floor
+            # LAST, so a session that fails to start leaves the process channel untouched (L1
+            # 2026-10-02, reproduced: a refused unattended open used to block every later
+            # interactive one). The tools' floor comes from the conversation binding above.
+            deny_standard_creds = _apply_drive_policy(cfg, mode)
         except GateArmingError as exc:
             # Its OWN handler, ABOVE the generic one: a gate that will not arm must never be
             # reported as "check --model / --base-url", which would send the operator hunting a
@@ -647,9 +653,16 @@ class EntitySession:
             ) from exc
         except DriveModeConflict as exc:
             # Its own handler for the same reason as the gate's: the generic one below would send the
-            # operator to check --model / --base-url while the news is that this process refuses to
-            # widen another session's credential floor.
+            # operator to check --model / --base-url while the news is the process-level drive-mode
+            # guard (bind_drive_mode) refusing this session.
             raise SessionStartError(f"refusing to start the entity:\n  {exc}") from exc
+        except ConversationBindingError as exc:
+            # ABOVE the ConfinementError handler it subclasses: this is not a malformed
+            # confinement.json, it is a conversation whose floor could not be bound to it.
+            raise SessionStartError(
+                f"the session's floor could not be bound to its conversation — refusing to start:"
+                f"\n  {exc}"
+            ) from exc
         except IsolationError as exc:
             raise SessionStartError(
                 f"sovereignty guard REFUSED to start the entity:\n  {exc}"

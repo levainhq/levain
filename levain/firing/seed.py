@@ -373,4 +373,4 @@ class SeedPresence:
         return f"[presence re-anchor — post-compaction] Re-anchor to who you are:\n\n{body}"
 
 
-register_presence("entity_seed", SeedPresence)
+register_presence("entity_seed", SeedPresence, takes_entity=True)
