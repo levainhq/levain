@@ -830,28 +830,30 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     localhost opt-out is read from the same config ``levain run`` reads."""
     # Lazy import — this module keeps levain imports out of its top level (see `run_doctor`).
     try:
-        from levain.firing.confinement import diagnose_confinement
+        from levain.firing.confinement import (
+            OFFLINE_RESIDUAL,
+            diagnose_confinement,
+            load_confinement_config,
+            resolve_localhost_deny,
+        )
     except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
-        return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
-
-    try:
-        d = diagnose_confinement()
-    except Exception as exc:  # noqa: BLE001
         return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
 
     # The entity's own config first, on EVERY host: `levain run` refuses a broken one whether or not
     # bash is possible, so doctor must not report a working configuration (codex, L3 r2). This is
     # the one outcome here that FAILS — not a missing optional hand, an entity that cannot start.
+    # It runs BEFORE the host diagnosis, so a probe that raises cannot turn it into "not
+    # determinable" (complement + codex, L3 2026-10-01, reproduced).
     try:
-        from levain.firing.confinement import (
-            OFFLINE_RESIDUAL,
-            load_confinement_config,
-            resolve_localhost_deny,
-        )
         cfg = load_confinement_config(install)
     except Exception as exc:  # noqa: BLE001
         return [CheckResult("confinement floor", False,
                             f"`levain run` will refuse to start this entity: {exc}")]
+
+    try:
+        d = diagnose_confinement()
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("confinement floor", True, f"not determinable ({exc})")]
     if d.supported:
         # The host can sandbox bash, but the entity's localhost deny can still drop it or take its
         # network. `levain run` asks the SAME resolver with the same config, so the two agree.

@@ -1817,3 +1817,20 @@ def test_doctor_confinement_check_survives_a_broken_diagnosis(tmp_path, monkeypa
     results = _check_confinement(tmp_path)
     assert results[0].ok is True
     assert "not determinable" in results[0].detail
+
+
+def test_doctor_fails_a_broken_config_even_when_the_diagnosis_raises(tmp_path, monkeypatch):
+    """L3 2026-10-01 (complement + codex), reproduced: the host diagnosis ran first, so a probe that
+    raised returned "not determinable" (ok) before the config was read, and doctor passed an entity
+    `levain run` refuses. The config's failure must win over a broken probe."""
+    from levain.doctor import _check_confinement
+    import levain.firing.confinement as conf
+
+    def boom(*a, **k):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(conf, "diagnose_confinement", boom)
+    (tmp_path / ".levain").mkdir()
+    (tmp_path / ".levain" / "confinement.json").write_text("{not json")
+    r = _check_confinement(tmp_path)[0]
+    assert r.ok is False and "refuse to start" in r.detail
