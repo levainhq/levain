@@ -121,10 +121,14 @@ def test_build_policy_write_denies_jewel_ancestors(tmp_path: Path, monkeypatch) 
 def test_build_policy_does_not_guess_cred_files(tmp_path: Path, monkeypatch) -> None:
     """REGRESSION (L4-live 2026-07-11): a generic, operator-neutral module must NOT invent a cred
     path like ``~/.env.flow`` — that is FALSE SECURITY (it "protects" a path the secret isn't at
-    while missing the real one). With no ``deny_files`` passed, no credential file is denied."""
+    while missing the real one). With no ``deny_files`` passed, no credential file is denied. The
+    only entries are the SQLite sidecar names of a declared jewel (the default store), which are
+    derived, not guessed."""
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = build_policy(_entity(tmp_path))
-    assert policy.deny_files == ()
+    assert set(policy.deny_files) == set(policy.sqlite_sidecars)
+    assert {p.name for p in policy.sqlite_sidecars} <= {
+        ".anneal-memory-wal", ".anneal-memory-shm", ".anneal-memory-journal"}
 
 
 def test_build_policy_denies_caller_declared_cred_files(tmp_path: Path) -> None:
@@ -3311,7 +3315,7 @@ def test_live_a_file_jewels_sqlite_sidecars_are_denied(tmp_path, monkeypatch) ->
         assert b"JEWEL-1002-SECRET" in wal.read_bytes()   # the precondition: the row is in the WAL
         policy = build_policy(ent, ssh_mode="agent")
         if not _LIVE:
-            with pytest.raises(ConfinementError, match="SQLite database in a directory"):
+            with pytest.raises(ConfinementError, match="is a SQLite database"):
                 BwrapProvider().spawn_shell(policy)
             return
         with SeatbeltProvider().spawn_shell(policy) as sh:

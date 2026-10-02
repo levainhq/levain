@@ -1000,6 +1000,16 @@ class SystemdUserProvider(DaemonProvider):
         if proc.returncode != 0:
             failure = (proc.stderr or proc.stdout or f"rc={proc.returncode}").strip()
             if prior_service is not None:
+                rollback_target = (f"{spec.label}.timer" if prior_timer is not None
+                                   else f"{spec.label}.service")
+                if target != rollback_target:
+                    # A shape change: disable what the failed install enabled, BEFORE its unit
+                    # file is replaced, while the [Install] section `enable` read is still on disk
+                    # (complement, L3 2026-10-02). For periodic -> resident that is the service,
+                    # whose default.target.wants symlink the restored periodic file (no [Install])
+                    # would leave behind, starting it at login beside its restored timer (Diogenes
+                    # LOW 2026-10-02). For resident -> periodic it is the timer, disabled again below.
+                    _run(["systemctl", "--user", "disable", "--now", target], check=False)
                 # ROLL BACK to the prior good definition — the same transactional floor as launchd.
                 self._atomic_write(service_path, prior_service)
                 # ⛔ ROLL THE TIMER BACK TO ITS PRIOR **STATE**, NOT ITS PRIOR **CONTENT**, AND
@@ -1025,16 +1035,7 @@ class SystemdUserProvider(DaemonProvider):
                     _run(["systemctl", "--user", "disable", "--now", f"{spec.label}.timer"],
                          check=False)
                     timer_path.unlink(missing_ok=True)
-                rollback_target = (f"{spec.label}.timer" if prior_timer is not None
-                                   else f"{spec.label}.service")
                 _run(["systemctl", "--user", "daemon-reload"], check=False)
-                if target != rollback_target:
-                    # A shape change: disable what the failed install enabled. For periodic ->
-                    # resident that is the service, whose default.target.wants symlink survives
-                    # the restored periodic file (no [Install]), so it would start at login beside
-                    # its restored timer (Diogenes LOW 2026-10-02). For resident -> periodic it is
-                    # the timer, already disabled above, so this is a no-op there.
-                    _run(["systemctl", "--user", "disable", target], check=False)
                 _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
                 raise DaemonError(
                     f"enabling the new unit failed: {failure} — rolled back to the prior installed "

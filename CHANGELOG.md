@@ -10,7 +10,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **A SQLite crown jewel's sidecar files were open to the confined shell.** When a denied store is a file rather than a directory (an `~/.anneal-memory` that is a SQLite database, as on some hosts), only the main file was denied. In WAL mode, recent committed rows live in `<db>-wal` until a checkpoint, so the shell could read them and write `<db>-shm`.
   - **macOS:** the floor now also denies `-wal`, `-shm` and `-journal` beside every file-shaped jewel, by name, whether or not they exist yet.
-  - **Linux:** worse in 0.5.0. With the store closed SQLite deletes its `-wal`, and the shell could create one in the store's directory; the host's next open replayed it into the database, so the entity could rewrite the store. A mount cannot stop a file being created in a writable directory, so `levain run` now refuses bash (the file editor still works) when a crown jewel is a SQLite database in a directory you can write. Before 0.5.0 such a host had no bash at all. Keep the store in a directory, as `~/.anneal-memory/` normally is, to use bash.
+  - **Linux:** worse in 0.5.0, and not fixable with mounts. A mount can only cover a file that exists, and SQLite creates and deletes its sidecars as it runs. With the store closed, the shell could create `<db>-wal` itself, and the host's next open replayed it into the database, so the entity could rewrite the store. A `-wal` the host creates after the shell starts (for a store in any directory, including one only a more privileged service writes) was readable. So `levain run` now **refuses bash on Linux when a crown jewel is a SQLite database**, and when a jewel cannot be read and sits in a directory you can write. The file editor still works. There is no opt-out.
+  - **If your host is affected** (bash is refused with "is a SQLite database"): move the store into a directory, as `~/.anneal-memory/` normally is. Before 0.5.0 such a host had no bash at all.
+
+### Known open issues
+
+- **A crown-jewel path that does not exist when the shell starts, and later becomes a SQLite database, is not refused on Linux.** The check runs at spawn. Credential files and the default store (`~/.anneal-memory/`, created as a directory) are not affected.
+- **An encrypted SQLite store (SQLCipher) has no recognisable header**, so the Linux refusal does not see it. A planted sidecar would need the store's key to be replayed.
 
 ### Fixed
 

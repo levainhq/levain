@@ -226,6 +226,7 @@ import queue
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -609,14 +610,6 @@ class CrownJewelsPolicy:
     # unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
     # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
     # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
-    sqlite_sidecars: tuple[Path, ...] = ()  # the ``-wal``/``-shm``/``-journal`` paths of every
-    # FILE-shaped jewel, a subset of ``deny_files``. A WAL-mode SQLite store keeps committed frames
-    # that have not been checkpointed in ``<db>-wal``, so denying only the main file left them
-    # readable and writable (Diogenes MEDIUM 2026-10-02, run on both providers). Seatbelt denies
-    # them by name whether or not they exist; bwrap mounts only the ones present at spawn, because a
-    # ``/dev/null`` mountpoint for an absent one would leave a 0444 stub on the host that breaks the
-    # host's own SQLite writer (the step (2a) defect, measured 2026-09-30). This field is how
-    # :func:`_bwrap_plan_impl` tells them apart from an operator's ``deny_files``.
     deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
     # class, for a FRESH connection. If this host runs sshd (Remote Login) and it authorises a key
     # the entity can use, ``ssh localhost cat <jewel>`` has sshd — root, OUTSIDE the sandbox — read a
@@ -651,6 +644,15 @@ class CrownJewelsPolicy:
     # hairpin to the router's external IP). And ssh CONNECTION MULTIPLEXING — a live localhost
     # ControlMaster socket the entity can name (AF_UNIX, unseen by this IP deny). Both tracked in
     # spore-1005 / the honest-limits block above.
+    sqlite_sidecars: tuple[Path, ...] = ()  # the ``-wal``/``-shm``/``-journal`` paths of every
+    # non-directory jewel, a subset of ``deny_files``. A WAL-mode SQLite store keeps committed frames
+    # that have not been checkpointed in ``<db>-wal``, so denying only the main file left them
+    # readable and writable (Diogenes MEDIUM 2026-10-02, run on both providers). Seatbelt denies
+    # them by name whether or not they exist. On Linux a mount cannot cover a sidecar created after
+    # spawn, so a jewel that is a SQLite database refuses bash there instead
+    # (:func:`_refuse_plantable_sqlite_jewels`); bwrap mounts only the sidecars present at spawn.
+    # ⚠ LAST FIELD ON PURPOSE: a field inserted earlier shifts every later one for a positional
+    # caller (codex, L3 2026-10-02, reproduced: ``deny_localhost_outbound=True`` landed here).
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -972,12 +974,14 @@ def build_policy(
     # A FILE-shaped jewel may be a SQLite store (argushub's ~/.anneal-memory is one, in WAL mode), and
     # its sidecars hold data the main-file deny does not cover. Same class as
     # ``_OWN_MEMORY_FILENAMES`` for the entity's own store (Diogenes MEDIUM 2026-10-02). Named for
-    # every existing regular file rather than sniffed by header: an absent sidecar costs one literal
-    # on macOS and nothing on Linux, and the host process never reads an operator's credential file.
-    # The paths are the RESOLVED ones, which is what SQLite names its sidecars after.
+    # every non-directory jewel rather than sniffed by header: an absent sidecar costs one literal
+    # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
+    # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
-        if jewel.is_file():
+        # Not a directory, rather than is a file: a jewel absent when the policy is built can be
+        # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
+        if not jewel.is_dir():
             sidecars.extend(jewel.with_name(jewel.name + s) for s in ("-wal", "-shm", "-journal"))
     sqlite_sidecars_t = _dedup(sidecars)
     files.extend(sqlite_sidecars_t)
@@ -2620,39 +2624,68 @@ def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
-def _is_sqlite_file(p: Path) -> bool:
-    """True if ``p`` is a regular file that starts with SQLite's header. Reads 16 bytes in the host
-    process; an unreadable file is not one, because the host's own SQLite could not open it either."""
+def _sqlite_state(p: Path) -> str:
+    """``"sqlite"``, ``"other"``, ``"unreadable"`` or ``"absent"`` for a jewel path. Checks the type
+    with ``lstat`` BEFORE opening and opens non-blocking without following a link, so a FIFO or a
+    device named as a jewel is classified instead of hanging the host process in ``open``
+    (complement + codex, L3 2026-10-02). Reads 16 bytes."""
     try:
-        with open(p, "rb") as fh:
-            return p.is_file() and fh.read(16) == _SQLITE_MAGIC
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return "absent"
     except OSError:
-        return False
+        return "unreadable"
+    if not stat.S_ISREG(st.st_mode):
+        return "other"
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return "unreadable"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):   # replaced between lstat and open
+            return "other"
+        return "sqlite" if os.read(fd, 16) == _SQLITE_MAGIC else "other"
+    except OSError:
+        return "unreadable"
+    finally:
+        os.close(fd)
 
 
 def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
-    """Refuse bash when a crown jewel is a SQLite database in a directory this user can write.
+    """Refuse bash on Linux when a crown jewel is a SQLite database.
 
-    REPRODUCED 2026-10-02 (L1 on the sidecar fix, then end to end in the Linux container): with the
-    store closed, SQLite has deleted its ``-wal``, and nothing a mount can do stops the confined
-    shell CREATING ``<db>-wal`` in a writable directory. The shell copied a valid WAL there, and the
-    host's next open replayed it into the store: ``host reads: [('good',), ('PLANTED',)]``. A
-    planted ``-journal`` is replayed the same way in rollback mode. macOS denies the sidecar names
-    themselves, so its shell cannot create them (the same plant: ``Operation not permitted``).
+    REPRODUCED 2026-10-02, both in the Linux container:
+    · PLANT (L1): with the store closed, SQLite has deleted its ``-wal``, and nothing a mount can do
+      stops the confined shell CREATING ``<db>-wal`` in a writable directory. The shell copied a
+      valid WAL there and the host's next open replayed it: ``host reads: [('good',),
+      ('PLANTED',)]``. A ``-journal`` is replayed the same way in rollback mode.
+    · LATE SIDECAR (codex, L3): for a database in a directory this user CANNOT write, a root
+      service that writes after the shell starts creates a readable ``-wal`` no mount covers; the
+      shell read the new row (``grep`` rc 0) while the main file stayed denied.
+    So no directory makes a SQLite jewel safe on Linux. macOS denies the sidecar names themselves,
+    which covers both (the same plant: ``Operation not permitted``).
+    An unreadable regular file in a directory this user can write is refused too: it may be a
+    database a more privileged process uses, and the shell could plant beside it (codex, L3).
     ⚖ Before 0e09df5 bwrap aborted on a file-shaped root, so such a host had no bash; that commit
-    made bash start and opened this path. Refusing restores fail-closed for exactly this case. A
-    store that is a DIRECTORY is hidden by a read-only tmpfs and is unaffected."""
-    sidecars = set(policy.sqlite_sidecars)
-    candidates = [p for p in policy.deny_read_write if p.is_file()]
-    candidates += [f for f in policy.deny_files if f not in sidecars]
+    made bash start and opened this path. Refusing restores fail-closed. Ruled by Phill 2026-10-02
+    for the writable-directory case, with no opt-out; the late-sidecar run widened it. A store that
+    is a DIRECTORY is hidden by a read-only tmpfs and is unaffected."""
+    candidates = [p for p in policy.deny_read_write if not p.is_dir()] + list(policy.deny_files)
     for jewel in candidates:
-        if _is_sqlite_file(jewel) and os.access(jewel.parent, os.W_OK):
+        state = _sqlite_state(jewel)
+        if state == "sqlite":
             raise ConfinementError(
-                f"{jewel} is a SQLite database in a directory this user can write. On Linux the "
-                "floor cannot stop the shell creating its -wal or -journal file there, and SQLite "
-                "replays such a file into the database on its next open, so the entity could "
-                "rewrite it. Refusing to grant bash hands (fail-closed). Keep the store in a "
-                "directory (as ~/.anneal-memory/ normally is) to use bash."
+                f"{jewel} is a SQLite database. On Linux the floor cannot cover the -wal or "
+                "-journal file SQLite creates beside it after the shell starts, so the shell could "
+                "read recent rows from it, or plant one that SQLite replays into the database. "
+                "Refusing to grant bash hands (fail-closed). Keep the store in a directory (as "
+                "~/.anneal-memory/ normally is) to use bash."
+            )
+        if state == "unreadable" and os.access(jewel.parent, os.W_OK):
+            raise ConfinementError(
+                f"{jewel} cannot be read by this user, and it sits in a directory this user can "
+                "write. If it is a database another process uses, the shell could plant a file "
+                "beside it that the database replays. Refusing to grant bash hands (fail-closed)."
             )
 
 
@@ -2901,10 +2934,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         if f in policy.sqlite_sidecars and not f.exists():
             # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
-            # breaks the host's SQLite writer. A SQLite jewel in a directory this user can write
-            # never gets here (refused above: the shell could plant the sidecar). What remains is a
-            # jewel in a directory this user cannot write, where neither the shell nor this user's
-            # host process can create a sidecar; one another user creates later is visible.
+            # breaks the host's SQLite writer. A jewel that is a SQLite database never gets here
+            # (refused at the top of this plan), so these are the names beside a jewel that is not
+            # one, where no SQLite will create them.
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
