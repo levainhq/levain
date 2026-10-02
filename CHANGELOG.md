@@ -4,7 +4,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased]
+## [0.5.1] — 2026-10-02
 
 ### Security
 
@@ -16,6 +16,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Known open issues
 
 - **A crown-jewel path that does not exist when the shell starts, and later becomes a SQLite database, is not refused on Linux.** The check runs at spawn. Credential files and the default store (`~/.anneal-memory/`, created as a directory) are not affected.
+- **On Linux, a jewel that is an empty (or not yet initialised) file when the shell starts is not refused**, and neither is one this user cannot read in a directory it cannot write. Either can become, or be, a database whose sidecars a later writer creates where the shell can see them.
 - **An encrypted SQLite store (SQLCipher) has no recognisable header**, so the Linux refusal does not see it. A planted sidecar would need the store's key to be replayed.
 
 ### Fixed

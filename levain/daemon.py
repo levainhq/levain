@@ -1009,7 +1009,9 @@ class SystemdUserProvider(DaemonProvider):
                     # whose default.target.wants symlink the restored periodic file (no [Install])
                     # would leave behind, starting it at login beside its restored timer (Diogenes
                     # LOW 2026-10-02). For resident -> periodic it is the timer, disabled again below.
-                    _run(["systemctl", "--user", "disable", "--now", target], check=False)
+                    # No --now: if `enable` itself failed, a turn the OLD timer started may be
+                    # running, and stopping it would lose that work (codex, L3 r2 2026-10-02).
+                    _run(["systemctl", "--user", "disable", target], check=False)
                 # ROLL BACK to the prior good definition — the same transactional floor as launchd.
                 self._atomic_write(service_path, prior_service)
                 # ⛔ ROLL THE TIMER BACK TO ITS PRIOR **STATE**, NOT ITS PRIOR **CONTENT**, AND

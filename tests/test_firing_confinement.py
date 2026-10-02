@@ -127,7 +127,7 @@ def test_build_policy_does_not_guess_cred_files(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = build_policy(_entity(tmp_path))
     assert set(policy.deny_files) == set(policy.sqlite_sidecars)
-    assert {p.name for p in policy.sqlite_sidecars} <= {
+    assert {p.name for p in policy.sqlite_sidecars} == {
         ".anneal-memory-wal", ".anneal-memory-shm", ".anneal-memory-journal"}
 
 
