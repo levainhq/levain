@@ -923,7 +923,12 @@ class SystemdUserProvider(DaemonProvider):
             if pid <= 0:
                 return False
             running = (self.PROC / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
-            return [a.decode("utf-8", "surrogateescape") for a in running] != list(spec.argv)
+            decoded = [a.decode("utf-8", "surrogateescape") for a in running]
+            # Compare the TAIL. When the argv is the `levain` console script, the kernel execs its
+            # shebang, so the cmdline reads `<interpreter> [shebang-arg] <script> <args...>` and
+            # never equals the argv itself; an exact match flagged every identical reinstall as
+            # "another argv" (Diogenes MEDIUM 2026-10-02, run in the Linux container).
+            return decoded[-len(spec.argv):] != list(spec.argv)
         except (ValueError, OSError):
             return prior_service is not None and prior_service != self.render_unit(spec).encode()
 
@@ -1023,6 +1028,13 @@ class SystemdUserProvider(DaemonProvider):
                 rollback_target = (f"{spec.label}.timer" if prior_timer is not None
                                    else f"{spec.label}.service")
                 _run(["systemctl", "--user", "daemon-reload"], check=False)
+                if target != rollback_target:
+                    # periodic -> resident: the failed install already ran `enable` on the
+                    # resident service, which created its default.target.wants symlink. Restoring
+                    # the periodic file (no [Install]) does not remove that symlink, so the
+                    # service would start at login beside its restored timer (Diogenes LOW
+                    # 2026-10-02).
+                    _run(["systemctl", "--user", "disable", target], check=False)
                 _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
                 raise DaemonError(
                     f"enabling the new unit failed: {failure} — rolled back to the prior installed "

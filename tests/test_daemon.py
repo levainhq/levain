@@ -1150,3 +1150,22 @@ def test_systemd_reinstall_during_a_turn_says_that_turn_runs_the_old_definition(
     # L3 (codex): a turn that started after the reload already runs the new argv
     (proc / "4242" / "cmdline").write_bytes(b"\0".join(a.encode() for a in changed.argv) + b"\0")
     assert "PREVIOUS definition" not in systemd.install(changed)
+
+
+def test_systemd_reinstall_during_a_turn_reads_a_shebang_cmdline(systemd, tmp_path, monkeypatch):
+    """Reproduced 2026-10-02 (Diogenes, Linux container): the default argv is the `levain` console
+    script, a shebang script, so the turn's /proc cmdline reads `<python> <script> <args...>`. The
+    exact comparison called every identical reinstall "another argv" and told the operator to stop
+    the turn."""
+    running = {"*": {"LoadState": "loaded", "ActiveState": "activating", "SubState": "start",
+                     "MainPID": "4242", "ExecMainStatus": "0"}}
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(show=running))
+    proc = tmp_path / "proc"
+    monkeypatch.setattr(SystemdUserProvider, "PROC", proc)
+    (proc / "4242").mkdir(parents=True)
+    seat = _seat(tmp_path)
+    kernel_view = ["/home/entity/venv/bin/python3", *seat.argv]
+    (proc / "4242" / "cmdline").write_bytes(b"\0".join(a.encode() for a in kernel_view) + b"\0")
+    assert "PREVIOUS definition" not in systemd.install(seat)
+    changed = replace(seat, argv=[*seat.argv[:-1], "a different task"])
+    assert "PREVIOUS definition" in systemd.install(changed)

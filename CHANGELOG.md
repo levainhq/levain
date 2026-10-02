@@ -9,6 +9,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 
 - **`levain doctor` passed a malformed `confinement.json` when the host diagnosis itself raised.** The diagnosis ran first, and a probe error was reported as "not determinable" before the entity's config was read, so doctor stayed green for an entity `levain run` refuses. The config is now read first, so it fails the check on every host.
+- **On Linux, reinstalling a seat during a turn warned "PREVIOUS definition" even when nothing changed.** The default seat runs the `levain` console script, and the kernel records a script's process as `<interpreter> <script> <args>`, so the exact comparison with the seat's command never matched. The check now compares the end of the command line, which still catches a changed task.
+- **A failed periodic-to-resident reinstall on Linux left the service enabled at login.** The rollback restored the timer but did not disable the resident service that the failed install had enabled, so after the next login the service ran beside its own timer. The rollback now disables it.
+- **The README told non-macOS users there was no sandboxed shell.** It was wrong from 0.5.0, which ships the Linux (`bwrap`) shell. The PyPI 0.5.0 page carries the old sentence; this release replaces it.
 
 ## [0.5.0] — 2026-10-01
 
