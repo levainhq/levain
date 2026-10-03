@@ -53,16 +53,26 @@ __all__ = [
 
 LEVAIN_ENTITY_PROCESS_ENV = "LEVAIN_ENTITY_PROCESS"
 """Set (to ``"1"``) once a process has opened an entity. An env var rather than a module global so a
-child Python process inherits it too; the confined shell builds its env from scratch and does not."""
+child Python process inherits it too; the confined shell builds its env from scratch and does not.
+In-process, :data:`_LATCHED` is the authority (an env var can be scrubbed)."""
+
+
+# The authority in THIS process: a module flag nothing in levain sets back to False, so code that
+# scrubs or restores os.environ cannot un-latch it (codex L3, 2026-10-02). The env var only carries
+# the latch into child processes.
+_LATCHED = False
 
 
 def mark_entity_process() -> None:
     """Latch this process as one that hosts an entity. Idempotent; never cleared."""
+    global _LATCHED
+    _LATCHED = True
     os.environ[LEVAIN_ENTITY_PROCESS_ENV] = "1"
 
 
 def entity_process_latched() -> bool:
-    return os.environ.get(LEVAIN_ENTITY_PROCESS_ENV, "").strip() == "1"
+    """True once this process opened an entity, or when it inherited the latch from its parent."""
+    return _LATCHED or os.environ.get(LEVAIN_ENTITY_PROCESS_ENV, "").strip() == "1"
 
 
 class BindingError(ValueError):

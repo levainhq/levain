@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -279,6 +280,18 @@ class _SharedFloor:
 # --- the file-editor hand (relaxed to the crown-jewels floor) --------------------------------
 
 
+def _drop_editor_history(executor: Any) -> None:
+    """Remove a stock file-editor executor's history tempdir. ``FileEditor`` makes one with
+    ``mkdtemp`` when the executor is CONSTRUCTED and nothing ever removes it, so a long-running host
+    would accumulate one (holding cached copies of edited files) per conversation (codex L3,
+    2026-10-02). Best-effort: a teardown never raises."""
+    try:
+        directory = executor.editor._history_manager.cache.directory
+        shutil.rmtree(directory, ignore_errors=True)
+    except Exception:  # noqa: BLE001 — an SDK that moved the attribute just leaks, as before
+        pass
+
+
 class CrownJewelsFileEditorExecutor(FileEditorExecutor):
     """A :class:`~openhands.tools.file_editor.impl.FileEditorExecutor` fenced to the crown-jewels
     FLOOR (slice 2), relaxing the step-6 ``<entity>/workspace/`` jail.
@@ -329,6 +342,10 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         """Read THROUGH the shared floor, never a cached copy — that copy going stale while the bash
         hand's evolved is exactly the divergence this indirection exists to prevent."""
         return self._floor.policy
+
+    def close(self) -> None:
+        """Remove this executor's history tempdir (the SDK closes executors at conversation close)."""
+        _drop_editor_history(self)
 
     def __call__(
         self,
@@ -402,6 +419,11 @@ class LevainFileEditorTool(FileEditorTool):
         """Build around ``floor`` — the one :class:`LevainHands` builds for both hands. Not registered
         on its own: an entity reaches it only through ``levain_hands``."""
         floored = CrownJewelsFileEditorExecutor(floor=floor)
+        # The stock tool is built only to borrow its description/schema; its own executor (and the
+        # history tempdir that executor made) is discarded here.
+        stocks = FileEditorTool.create(conv_state)
+        for stock in stocks:
+            _drop_editor_history(stock.executor)
         # Build REAL LevainFileEditorTool instances (not stock via set_executor, which keeps the stock
         # class + its raising declared_resources), reusing the stock tool's rich description/schema/
         # annotations by copying its fields — so our declared_resources override is what runs.
@@ -413,7 +435,7 @@ class LevainFileEditorTool(FileEditorTool):
                 annotations=stock.annotations,
                 executor=floored,
             )
-            for stock in FileEditorTool.create(conv_state)
+            for stock in stocks
         ]
 
 

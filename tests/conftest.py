@@ -37,8 +37,13 @@ def _isolate_activation_env(monkeypatch):
 def _reset_entity_process_latch():
     """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so
-    without this every later test would run as an entity process. Popped by hand both sides:
+    without this every later test would run as an entity process. Both halves (the in-process flag
+    and the env var) are reset here, and only here. Popped by hand both sides:
     `monkeypatch.delenv` records nothing for an ABSENT var, so a latch set mid-test would survive."""
+    import levain.firing.binding as _binding
+
     os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
+    _binding._LATCHED = False
     yield
     os.environ.pop("LEVAIN_ENTITY_PROCESS", None)
+    _binding._LATCHED = False

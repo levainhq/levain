@@ -124,6 +124,11 @@ def test_an_entity_process_refuses_every_default_kind_store_op(tmp_path, monkeyp
     assert os.environ[LEVAIN_ENTITY_PROCESS_ENV] == "1"
     with pytest.raises(IsolationError, match="hosts a Levain entity"):
         _env_episodic_path()
+    # codex L3 r1: scrubbing the environment must not un-latch this process (the env var only
+    # carries the latch to children).
+    del os.environ[LEVAIN_ENTITY_PROCESS_ENV]
+    with pytest.raises(IsolationError, match="hosts a Levain entity"):
+        _env_episodic_path()
     with logging_capture() as records:
         assert AnnealFiring().capture(CaptureRequest(content="must never reach flow")) is False
     assert any("episode LOST" in r.getMessage() for r in records)

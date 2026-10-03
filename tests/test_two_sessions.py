@@ -312,3 +312,35 @@ def test_a_fork_of_a_conversation_that_already_ran_keeps_its_binding(tmp_path, h
             forked.close()
     finally:
         s.close()
+
+
+def test_open_creates_nothing_in_an_entity_whose_store_escapes(tmp_path, home):
+    """L3 r1 (complement) moved the workspace fence ahead of the binding; the STORE guard must still
+    come first. An entity whose `.levain` is a symlink out of its tree passes the cheap pre-flight
+    (the marker is readable through the link) and is refused by the store guard — which must happen
+    before `<entity>/workspace` is created. (A dir with no `.levain` at all never gets this far.)"""
+    from levain.session import SessionStartError
+
+    outside = tmp_path / "outside-store"
+    outside.mkdir()
+    (outside / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    ent = tmp_path / "ent"
+    ent.mkdir()
+    (ent / ".levain").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SessionStartError, match="escapes the entity root"):
+        _open(ent, "interactive")
+    assert not (ent / "workspace").exists()
+
+
+def test_a_session_leaks_no_editor_history_dir(tmp_path, home):
+    """L3 r1 (codex): the stock file editor makes a history tempdir when its executor is CONSTRUCTED
+    and never removes it; with the hands built inside open, every session would leak two (ours, and
+    the stock tool's discarded one). Open + close must leave the count unchanged."""
+    import glob
+    import tempfile
+
+    pattern = os.path.join(tempfile.gettempdir(), "oh_editor_history_*")
+    before = set(glob.glob(pattern))
+    s = _open(_entity(tmp_path, "ent"), "interactive")
+    s.close()
+    assert set(glob.glob(pattern)) - before == set()

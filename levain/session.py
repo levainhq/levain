@@ -76,6 +76,7 @@ from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
     assert_workspace_isolated,
+    guard_entity,
 )
 from levain.install import effective_adapter
 
@@ -596,10 +597,17 @@ class EntitySession:
             if bash_ok and cfg is not None:
                 bash_ok, bash_refusal, bash_offline = resolve_localhost_deny(
                     cfg.allow_localhost_outbound)
+            # The STORE guard first, so a dir that is not an entity is refused before anything is
+            # created in it; then fence + create the workspace BEFORE the binding resolves the floor
+            # against it, so floor and conversation name the same guarded directory (complement L3).
+            guard_entity(entity_dir)
             workspace = entity_dir / WORKSPACE_SUBDIR
+            assert_workspace_isolated(workspace, entity_dir=entity_dir)
+            workspace.mkdir(parents=True, exist_ok=True)
+            assert_workspace_isolated(workspace, entity_dir=entity_dir)
             # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
-            # config read above and carried into both hands as data (the tool spec). Nothing in
-            # this process can move it afterwards; another session's binding is another object.
+            # config read above and carried into both hands as data (the tool spec), which are
+            # built from it below before open returns. Another session's binding is another object.
             conv_binding = (
                 ConversationBinding.create(
                     entity_dir, mode=mode, workspace=workspace, config=cfg
@@ -613,9 +621,6 @@ class EntitySession:
                 else None
             )
             binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
-            workspace.mkdir(parents=True, exist_ok=True)
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
 
             conv_kwargs: dict[str, Any] = {
                 "workspace": str(workspace),
