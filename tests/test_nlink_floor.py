@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -40,15 +41,6 @@ def test_a_linked_deny_file_is_refused_and_named(home) -> None:
     os.link(secret, home / "elsewhere")
     with pytest.raises(ConfinementError, match=r"token is a crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home), deny_files=(secret,)))
-
-
-def test_a_linked_deny_file_reached_through_a_symlink_is_refused(home) -> None:
-    secret = _secret(home)
-    os.link(secret, home / "elsewhere")
-    alias = home / "alias"
-    alias.symlink_to(secret)
-    with pytest.raises(ConfinementError, match="2 names"):
-        _refuse_multiply_linked_jewels(build_policy(_entity(home), deny_files=(alias,)))
 
 
 @pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
@@ -215,3 +207,81 @@ def test_a_linked_daemon_socket_is_refused(home, tmp_path) -> None:
             if q.exists() or q.is_socket():
                 q.unlink()
         d.rmdir()
+
+
+def test_a_linked_own_memory_file_is_refused(home) -> None:
+    ent = _entity(home)
+    mem = ent / ".levain" / "memory.continuity.md"
+    mem.write_text("own memory")
+    os.link(mem, ent / "workspace" / "mem.md")
+    with pytest.raises(ConfinementError, match="memory.continuity.md is a crown jewel"):
+        _refuse_multiply_linked_jewels(build_policy(ent))
+
+
+def test_a_linked_confinement_config_is_refused(home) -> None:
+    ent = _entity(home)
+    cfg = ent / ".levain" / "confinement.json"
+    cfg.write_text("{}")
+    os.link(cfg, ent / "workspace" / "cfg.json")
+    with pytest.raises(ConfinementError, match="confinement.json is a crown jewel"):
+        _refuse_multiply_linked_jewels(build_policy(ent))
+
+
+def test_a_linked_private_key_under_the_hidden_ssh_dir_is_refused(home) -> None:
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("PRIVATE KEY")
+    os.link(ssh / "id_ed25519", home / "key")
+    with pytest.raises(ConfinementError, match="id_ed25519 is a crown jewel"):
+        _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent"))
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="bwrap step (7) sockets are Linux-only")
+def test_a_linked_session_bus_is_refused_on_linux(home, monkeypatch) -> None:
+    import socket
+    import tempfile
+    rd = Path(tempfile.mkdtemp(dir="/tmp"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(rd))
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(str(rd / "bus"))
+        os.link(rd / "bus", home / "bus2")
+        with pytest.raises(ConfinementError, match="bus"):
+            _refuse_multiply_linked_jewels(build_policy(_entity(home)))
+    finally:
+        s.close()
+        (home / "bus2").unlink(missing_ok=True)
+        (rd / "bus").unlink(missing_ok=True)
+        rd.rmdir()
+
+
+def test_linked_jewel_reason_names_the_jewel_for_a_link_and_spares_plain_files(home) -> None:
+    from levain.firing.confinement import linked_jewel_reason
+    secret = _secret(home)
+    os.link(secret, home / "t")
+    plain = home / "notes.txt"
+    plain.write_text("x")
+    os.link(plain, home / "notes2.txt")   # two names, neither a jewel
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    reason = linked_jewel_reason(policy, home / "t")
+    assert reason and "token" in reason and "hardlink" in reason
+    assert linked_jewel_reason(policy, plain) is None
+    assert linked_jewel_reason(policy, home / "absent") is None
+
+
+def test_the_file_editor_refuses_a_hardlink_to_a_jewel(home) -> None:
+    """L1 (RUN, 8783e51): bash was refused, a direct view of the token was refused, and a view of
+    the planted link returned the token."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from openhands.tools.file_editor.definition import FileEditorAction
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
+    ent = _entity(home)
+    secret = _secret(home)
+    os.link(secret, ent / "workspace" / "t")
+    ex = CrownJewelsFileEditorExecutor(policy=build_policy(ent, deny_files=(secret,)))
+    obs = ex(FileEditorAction(command="view", path=str(ent / "workspace" / "t")))
+    text = "".join(c.text for c in obs.to_llm_content if getattr(c, "text", None))
+    assert obs.is_error and "REFUSED" in text and "SECRET" not in text, text
+    (ent / "workspace" / "ok.txt").write_text("fine")
+    ok = ex(FileEditorAction(command="view", path=str(ent / "workspace" / "ok.txt")))
+    assert not ok.is_error

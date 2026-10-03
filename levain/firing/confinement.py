@@ -67,12 +67,12 @@ is tabulated above :func:`_bwrap_argv`.
 **Honest limits (welded in, not discovered — apparatus L2-verified, from the scope doc + review):**
   - ``sandbox-exec`` is Apple-DEPRECATED. Works on Darwin 25.5 (proven), Chrome still ships on it,
     but Apple could pull it — acceptable for a first slice; the provider seam is the hedge.
-  - A PRE-POPULATED HARDLINK whose inode is a crown-jewel file, dropped by an untrusted party, could
-    read through (seatbelt matches the path STRING; a hardlink has no path to the crown jewel). The
-    entity itself cannot create one (it can't reference the out-of-tree target). Out of the single-
-    operator threat model; named. (Slice 3 broadened this limit's surface to the WRITE direction too: a
-    third-party pre-planted hardlink to a write-only vector at a writable path lets the entity write
-    through — same out-of-model class.)
+  - A PRE-POPULATED HARDLINK whose inode is a crown-jewel file reads (or, for a write-only vector,
+    writes) through, because both floors match paths. The entity itself cannot create one (``ln`` of a
+    jewel is refused). Since 0.5.5 bash is refused at spawn when a jewel has a name outside the floor
+    (:func:`_refuse_multiply_linked_jewels`), and the file editor refuses any path that is another
+    name for a jewel (:func:`linked_jewel_reason`). Still open: a link a host process creates while a
+    shell is live (checked at spawn only), and copies, which are other files.
   - CUSTOM ``AuthorizedKeysFile`` (apparatus L3 complement): the ssh write-floor covers sshd's DEFAULT
     key files (``~/.ssh/authorized_keys`` + ``authorized_keys2``). An operator whose ``sshd_config``
     sets a non-default ``AuthorizedKeysFile`` (or an ``AuthorizedKeysCommand``) has a persistence path
@@ -1139,7 +1139,8 @@ def build_policy(
     #           path FIRST, so a symlink retargeted AFTER policy construction leaves seatbelt matching
     #           the static lexical literal while the in-process twin resolves to a new, unlisted
     #           target. Denying more endpoints does not fix resolve-first.
-    #       (e) HARDLINKS — pre-existing outside hardlink to a vector; already documented above.
+    #       (e) HARDLINKS — a pre-existing outside hardlink to a vector: refused at spawn and by the
+    #           file editor (see the honest limits above).
     ssh_home = home / ".ssh"
     ssh_home_lexical = home.resolve() / ".ssh"      # resolved HOME + un-deref'd .ssh, as ``ssh_anchor``
     deny_write_files_l: list[Path] = []
@@ -2935,24 +2936,17 @@ def _sqlite_state(p: Path) -> str:
         os.close(fd)
 
 
-def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
-    """Refuse bash when a crown-jewel file or socket has a name outside the floor.
+def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, set[str]]]:
+    """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, the names found inside
+    the floor)``. The names are the named jewels (followed through symlinks) plus every entry under
+    the hidden subtrees and the ssh dir (walked without following symlinks), and on Linux the session
+    bus and the systemd manager socket bwrap step (7) masks. A larger ``st_nlink`` means some name is
+    somewhere the floor does not cover.
 
-    The floor denies PATHS. A hardlink is the same file under another path, so a link planted
-    before the shell starts, at a path the floor does not deny, bypasses it both ways. REPRODUCED
-    2026-10-03 on macOS seatbelt and Linux bwrap at e8f403d: a link to a ``deny_files`` token printed
-    it, and writing through a link to ``authorized_keys`` added a line to the host's real file, while
-    both direct paths were refused; a link to a user-owned daemon socket reached the daemon (L2, RUN
-    on Linux). levain cannot find the other names, so it counts the names it CAN see inside the floor
-    (the named jewels plus every entry under the hidden subtrees and the ssh dir) for each file, and
-    refuses when ``st_nlink`` is larger: some name is somewhere else. Two names that are both inside
-    the floor do not refuse. Checked at spawn only: a link a host process makes while a shell is live
-    is not watched (Phill's ruling, 2026-10-03).
-
-    ⛔ A jewel this user cannot stat or list REFUSES ("cannot verify"), because a chmod on its own
-    directory would otherwise switch the check off while the other name stays readable (L2, RUN:
-    ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). The one exception is the jewel-recheck
-    rule in :func:`_identity`: a path blocked by ANOTHER user's directory is left alone."""
+    ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("cannot verify"):
+    a chmod on its own directory would otherwise switch the check off while the other name stays
+    reachable (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). The one exception
+    is the jewel-recheck rule in :func:`_identity`: a path blocked by ANOTHER user's directory."""
     seen: dict[tuple[int, int], tuple[int, set[str]]] = {}
 
     def unverifiable(path: str, exc: OSError) -> None:
@@ -2971,26 +2965,30 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     def note(path: str, follow: bool) -> None:
         try:
             st = os.stat(path) if follow else os.lstat(path)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             return   # absent (or a dangling link): no file to have other names
         except OSError as exc:
             if not blocked_by_another_user(path):
                 unverifiable(path, exc)
             return
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISSOCK(st.st_mode)):
+        if stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
             return
         real = os.path.realpath(path) if follow else path
-        links, names = seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, set()))
-        names.add(real)
+        seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, set()))[1].add(real)
 
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
              *policy.sqlite_sidecars, *policy.deny_sockets, *policy.socket_spellings]
     if policy.config_file is not None:
         named.append(policy.config_file)
+    if platform.system() == "Linux":
+        for rd in _runtime_dirs():
+            named += [Path(rd) / "bus", Path(rd) / "systemd" / "private"]
     for f in named:
         note(str(f), follow=True)
 
     def walk_error(exc: OSError) -> None:
+        if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+            return
         if not blocked_by_another_user(exc.filename):
             unverifiable(exc.filename, exc)
 
@@ -3008,16 +3006,56 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
             real_dir = os.path.realpath(dirpath)
             for name in files:
                 note(os.path.join(real_dir, name), follow=False)
+    return seen
 
-    for links, names in seen.values():
+
+def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
+    """Refuse bash when a crown-jewel file or socket has a name outside the floor.
+
+    The floor denies PATHS. A hardlink is the same file under another path, so a link planted
+    before the shell starts, at a path the floor does not deny, bypasses it both ways. REPRODUCED
+    2026-10-03 on macOS seatbelt and Linux bwrap at e8f403d: a link to a ``deny_files`` token printed
+    it, and writing through a link to ``authorized_keys`` added a line to the host's real file, while
+    both direct paths were refused; on Linux a link to a user-owned daemon socket reached the daemon
+    (L2, RUN). levain cannot find the other names, so it refuses when :func:`_jewel_names` counts
+    fewer names inside the floor than ``st_nlink``. Two names that are both inside the floor do not
+    refuse. Checked at spawn only: a link a host process makes while a shell is live is not watched
+    (Phill's ruling, 2026-10-03). The file editor checks every path it touches instead
+    (:func:`linked_jewel_reason`)."""
+    for links, names in _jewel_names(policy).values():
         if links > len(names):
             path = sorted(names)[0]
             raise ConfinementError(
                 f"{path} is a crown jewel with {links} names on disk, and only {len(names)} of them "
                 "inside the floor. The floor denies paths, so the other name would let the shell read "
                 "or write it. Refusing to grant bash hands (fail-closed). Find the other names with "
-                f"`find <volume> -samefile {path}` and remove the extra links."
+                f"`find <volume> -samefile {shlex.quote(path)}` and remove the extra links."
             )
+
+
+def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | None:
+    """Why ``path`` must be refused as ANOTHER NAME for a crown jewel, or None.
+
+    :func:`crown_jewel_reason` matches paths, so a hardlink to a jewel at an undenied path passed it:
+    RUN 2026-10-03 (L1), the file editor's ``view`` of the link returned the denied token while bash
+    was refused. The editor checks the exact path it is about to touch, so here the class closes
+    completely: a file with more than one name whose identity is a jewel's, under a name the floor
+    does not cover, is refused. The jewel walk runs only when the target has more than one name."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None   # absent (a create) or unreadable: the editor's own error stands
+    if stat.S_ISDIR(st.st_mode) or st.st_nlink < 2:
+        return None
+    try:
+        jewels = _jewel_names(policy)
+    except ConfinementError as exc:
+        return str(exc)
+    hit = jewels.get((st.st_dev, st.st_ino))
+    if hit is None or os.path.realpath(path) in hit[1]:
+        return None
+    return (f"{path} is another name (a hardlink) for the crown jewel {sorted(hit[1])[0]}, which the "
+            "floor denies")
 
 
 def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
