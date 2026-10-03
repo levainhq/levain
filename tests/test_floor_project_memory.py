@@ -9,6 +9,9 @@ against a control write that must succeed."""
 from __future__ import annotations
 
 import dataclasses
+import json
+import os
+import tempfile
 import platform
 from pathlib import Path
 
@@ -252,3 +255,438 @@ def test_live_a_symlinked_store_cannot_be_swapped_for_a_planted_tree(
         _refused(sh, f"rm '{link}'")
         _refused(sh, f"mv '{link}' '{home}/moved'")
     assert link.is_symlink() and (real / "derive-trust.json").exists()
+
+
+# --- stores the trust files list (a moved project home) ----------------------------------------
+
+
+def _trust(path: Path, *dbs: Path, root: str | None = "/r") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"db": str(d)} | ({"root": root} if root is not None else {}) for d in dbs]
+    path.write_text(json.dumps({"version": 2, "stores": entries}))
+    # Explicit modes: anneal (and this mirror of it) rejects a group-writable trust file or directory,
+    # and a umask of 002 (Ubuntu's default) would make both group-writable.
+    path.parent.chmod(0o755)
+    path.chmod(0o644)
+    return path
+
+
+def _moved_home(root: Path, home: Path) -> tuple[Path, Path]:
+    """A flow project home moved away from ~/.anneal-projects: trust file + one store, listed by db."""
+    moved = _project_home(root / "moved-projects")
+    return moved, _trust(moved / "derive-trust.json", moved / "levain-v2" / "memory.db", root=str(home))
+
+
+def test_a_store_listed_in_the_env_trust_file_is_a_denied_subtree(home, tmp_path, monkeypatch):
+    moved, trust = _moved_home(tmp_path, home)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
+    policy = build_policy(_entity(home))
+    assert (moved / "levain-v2").resolve() in policy.deny_read_write
+    assert crown_jewel_reason(policy, moved / "levain-v2" / "memory.continuity.md") is not None
+
+
+def test_a_store_listed_in_the_default_trust_file_is_denied_without_the_env(home, tmp_path):
+    moved = _project_home(tmp_path / "elsewhere")
+    _trust(home / ".anneal-memory" / "derive-trust.json", moved / "levain-v2" / "memory.db")
+    policy = build_policy(_entity(home))
+    assert (moved / "levain-v2").resolve() in policy.deny_read_write
+
+
+def test_a_large_trust_file_is_still_honoured(home, tmp_path):
+    """anneal has no size cap, so neither may this (codex L3 HIGH: a skipped file left its stores open)."""
+    moved = _project_home(tmp_path / "elsewhere")
+    t = _trust(home / ".anneal-memory" / "derive-trust.json")
+    t.write_text(json.dumps({"version": 2, "stores": [
+        {"db": str(moved / "levain-v2" / "memory.db"), "root": "/r", "pad": "x" * (1 << 20)}]}))
+    assert t.stat().st_size > 1 << 20
+    assert (moved / "levain-v2").resolve() in build_policy(_entity(home)).deny_read_write
+
+
+@pytest.mark.parametrize("content", ["", "{not json", '{"stores": "x"}', '{"stores": [{"db": 7}]}',
+                                     '{"stores": [{"db": "relative/memory.db", "root": "/r"}]}'])
+def test_a_bad_trust_file_adds_nothing_and_the_default_deny_holds(home, monkeypatch, content):
+    trust = _trust(home / ".anneal-memory" / "derive-trust.json")   # explicit modes, then the content
+    trust.write_text(content)
+    entity = _entity(home)
+    policy = build_policy(entity)
+    assert (home / ".anneal-projects").resolve() in policy.deny_read_write
+    trust.unlink()
+    without = build_policy(entity)
+    assert (policy.deny_read_write, policy.deny_files) == (without.deny_read_write, without.deny_files)
+
+
+def test_entries_and_files_anneal_would_reject_widen_nothing(home, tmp_path):
+    """Protect exactly what anneal will trust (codex L3 MED): no root, a group-writable file, a
+    symlinked trust file all load no store in anneal, so they must not hide anything here."""
+    store = _project_home(tmp_path / "s")
+    t = _trust(home / ".anneal-memory" / "derive-trust.json", store / "levain-v2" / "memory.db", root=None)
+    entity = _entity(home)
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
+    _trust(t, store / "levain-v2" / "memory.db")
+    t.chmod(0o664)
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
+    real = _trust(tmp_path / "real-trust.json", store / "levain-v2" / "memory.db")
+    t.unlink()
+    t.symlink_to(real)
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
+
+
+def test_a_fifo_at_a_trust_path_refuses_without_hanging(home, monkeypatch):
+    """anneal would read stores from a FIFO; this cannot without blocking, so it refuses (codex L3 r2)."""
+    fifo = home / "trust.fifo"
+    os.mkfifo(fifo)
+    fifo.chmod(0o644)   # explicit modes: anneal's owner/mode check runs first, and umask 002
+    home.chmod(0o755)   # (argushub) would make both group-writable, so it would reject instead
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
+    with pytest.raises(ConfinementError, match="not a regular file"):
+        build_policy(_entity(home))
+
+
+def test_a_listed_store_whose_directory_is_missing_is_denied_before_it_exists(home, tmp_path):
+    """codex L3 r2: skipping it let the entity create the directory and a store anneal trusts."""
+    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "future" / "memory.db")
+    assert (tmp_path / "future").resolve() in build_policy(_entity(home)).deny_read_write
+
+
+def test_a_missing_store_inside_the_workspace_still_refuses(home):
+    entity = _entity(home)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "future" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity)
+
+
+def test_a_symlinked_db_denies_its_lexical_directory_too(home, tmp_path):
+    real = _project_home(tmp_path / "real")
+    lex = tmp_path / "lex"
+    lex.mkdir()
+    (lex / "memory.db").symlink_to(real / "levain-v2" / "memory.db")
+    _trust(home / ".anneal-memory" / "derive-trust.json", lex / "memory.db")
+    policy = build_policy(_entity(home))
+    assert lex.resolve() in policy.deny_read_write
+    assert (real / "levain-v2").resolve() in policy.deny_read_write
+
+
+@pytest.mark.parametrize("where", ["home", "entity", "workspace", "tmp"])
+def test_a_store_that_cannot_be_hidden_whole_refuses_the_floor(home, tmp_path, where):
+    """codex L3 HIGH: denying only the db left its continuity writable; anneal writes too many names
+    beside a db to deny them one by one, so the store needs a directory of its own."""
+    entity = _entity(home)
+    d = {"home": home, "entity": entity / "notes", "workspace": entity / "workspace" / "proj",
+         "tmp": Path(tempfile.gettempdir())}[where]
+    d.mkdir(parents=True, exist_ok=True)
+    _trust(home / ".anneal-memory" / "derive-trust.json", d / f"levain-1308-{where}.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity)
+
+
+def test_the_entitys_own_canonical_store_is_left_to_its_memory_rules(home):
+    entity = _entity(home)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / ".levain" / "memory.db")
+    policy = build_policy(entity)
+    assert (entity / ".levain").resolve() not in policy.deny_read_write
+
+
+@mac_live
+def test_a_case_variant_workspace_spelling_is_still_the_workspace(home):
+    """Containment by identity: on case-insensitive APFS a store listed under an upper-cased spelling
+    of a workspace outside the entity is the workspace, so it refuses instead of hiding it."""
+    entity = _entity(home)
+    ws = home / "wsout"
+    ws.mkdir()
+    _trust(home / ".anneal-memory" / "derive-trust.json", home / "WSOUT" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity, workspace=ws)
+
+
+def test_a_store_trusted_after_the_policy_was_built_is_denied_at_the_next_spawn(home, tmp_path):
+    from levain.firing.confinement import refresh_socket_denies
+    entity = _entity(home)
+    policy = build_policy(entity)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    assert (late / "levain-v2").resolve() not in policy.deny_read_write
+    refreshed = refresh_socket_denies(policy)
+    assert (late / "levain-v2").resolve() in refreshed.deny_read_write
+    assert set(policy.deny_read_write) <= set(refreshed.deny_read_write)
+    (home / ".anneal-memory" / "derive-trust.json").unlink()            # the entry goes away...
+    assert (late / "levain-v2").resolve() in refresh_socket_denies(refreshed).deny_read_write  # ...kept
+
+
+def test_the_file_editor_floor_absorbs_a_late_store(home, tmp_path):
+    """codex L3 r2: the shared floor merged only socket fields, so a store trusted mid-session was
+    denied to bash and left open to the file editor."""
+    from levain.firing.confinement import refresh_socket_denies
+    from levain.firing.openhands.tools import _SharedFloor
+    policy = build_policy(_entity(home))
+    floor = _SharedFloor(policy)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    floor.absorb(refresh_socket_denies(floor.policy))
+    assert crown_jewel_reason(floor.policy, late / "levain-v2" / "memory.continuity.md") is not None
+
+
+@live
+def test_live_a_moved_project_home_found_through_its_trust_file_is_refused(
+    home, tmp_path, monkeypatch
+):
+    moved, trust = _moved_home(tmp_path, home)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
+    entity = _entity(home)
+    with select_provider().spawn_shell(build_policy(entity)) as sh:
+        _ok(sh, f"touch '{entity}/workspace/control'")
+        _refused(sh, f"head -c 10 '{moved}/levain-v2/memory.db'")
+        _refused(sh, f"touch '{moved}/levain-v2/probe'")
+        _refused(sh, f"echo PLANT >> '{moved}/levain-v2/memory.continuity.md'")
+        _refused(sh, f": >> '{trust}'")
+    assert not (moved / "levain-v2" / "probe").exists()
+
+
+# --- L3 r3: stale entries, bounds, odd trust paths, a floor both hands refuse --------------------
+
+
+def test_an_absent_store_under_a_read_only_directory_is_still_denied(home, tmp_path):
+    """L3 r4 (codex, complement): skipping it because this user "cannot create it" was fail-open, since
+    a same-uid shell can chmod its own directory back. It is denied; on Linux the renderer refuses,
+    naming the path, because bwrap cannot create the mountpoint."""
+    from levain.firing.confinement import _bwrap_argv
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        _trust(home / ".anneal-memory" / "derive-trust.json", locked / "gone" / "memory.db")
+        policy = build_policy(_entity(home))
+        assert (locked / "gone").resolve() in policy.deny_read_write
+        if os.geteuid() != 0:
+            with pytest.raises(ConfinementError, match="remove that entry"):
+                _bwrap_argv(policy)
+    finally:
+        locked.chmod(0o755)
+
+
+def test_more_reachable_stores_than_the_bound_refuses(home, tmp_path):
+    from levain.firing.confinement import _MAX_LISTED_STORES
+    t = _trust(home / ".anneal-memory" / "derive-trust.json")
+    t.write_text(json.dumps({"version": 2, "stores": [
+        {"db": str(tmp_path / f"s{i}" / "memory.db"), "root": "/r"}
+        for i in range(_MAX_LISTED_STORES + 1)]}))
+    with pytest.raises(ConfinementError, match="Prune the trust files"):
+        build_policy(_entity(home))
+
+
+def test_a_directory_at_a_trust_path_loads_nothing_and_does_not_refuse(home):
+    (home / ".anneal-memory" / "derive-trust.json").mkdir(parents=True)
+    (home / ".anneal-memory").chmod(0o755)
+    build_policy(_entity(home))
+
+
+def test_a_fifo_anneal_would_reject_for_its_mode_does_not_refuse(home, monkeypatch):
+    fifo = home / "trust.fifo"
+    os.mkfifo(fifo)
+    fifo.chmod(0o662)   # group-writable: anneal rejects it before reading
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
+    build_policy(_entity(home))
+
+
+def test_a_refresh_that_fails_refuses_both_hands_and_stays_refused(home, tmp_path):
+    """codex L3 r3: the refreshed floor was published only after a successful shell start, so a late
+    unsafe entry refused bash while the file editor kept the old floor."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor, _SharedFloor
+    from openhands.tools.file_editor import FileEditorAction
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    editor = CrownJewelsFileEditorExecutor(floor=floor)
+    ok = editor(FileEditorAction(command="create", path=str(entity / "workspace" / "a.txt"), file_text="x"))
+    assert not ok.is_error
+    trust = _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
+    refused = editor(FileEditorAction(command="create", path=str(entity / "workspace" / "b.txt"), file_text="x"))
+    assert refused.is_error and "could not be refreshed" in refused.text
+    assert floor.refusal is not None
+    trust.unlink()                        # fixing the trust file does not un-refuse this conversation
+    with pytest.raises(ConfinementError):
+        floor.refresh()
+
+
+def test_the_file_editor_alone_picks_up_a_late_store(home, tmp_path):
+    """A conversation that never uses bash still refreshes (complement L3 r3)."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor, _SharedFloor
+    from openhands.tools.file_editor import FileEditorAction
+    floor = _SharedFloor(build_policy(_entity(home)))
+    editor = CrownJewelsFileEditorExecutor(floor=floor)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    obs = editor(FileEditorAction(command="view", path=str(late / "levain-v2" / "memory.continuity.md")))
+    assert obs.is_error and "crown-jewels floor" in obs.text
+
+
+def test_a_bash_refresh_failure_refuses_the_shared_floor_before_any_spawn(home):
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    bash = SandboxedBashExecutor(floor=floor)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        bash._ensure_shell()
+    assert floor.refusal is not None
+
+
+def test_a_listed_store_directory_gets_no_sidecar_names(home, tmp_path):
+    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "future" / "memory.db")
+    policy = build_policy(_entity(home))
+    assert not [p for p in policy.sqlite_sidecars if p.name.startswith("future-")]
+
+
+def test_absorb_refuses_once_the_floor_is_refused(home):
+    """codex/glm L3 r4: a spawn that refreshed before the other hand refused must not publish after."""
+    from levain.firing.openhands.tools import _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+    snapshot = floor.policy
+    floor.refuse("refused by the other hand")
+    with pytest.raises(ConfinementError, match="other hand"):
+        floor.absorb(snapshot)
+
+
+def test_a_live_bash_shell_is_torn_down_by_a_refusal_from_the_editor(home):
+    """complement L3 r4: bash checked the refusal only when it had no live shell."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    from openhands.tools.terminal.definition import TerminalAction
+
+    class _Live:
+        closed = False
+        def close(self):
+            self.closed = True
+
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+    live = _Live()
+    bash._shell = live
+    floor.refuse("a trust file named an unsafe store")
+    assert live.closed            # revoked by the refusal itself, before any bash call (codex L3 r5)
+    obs = bash(TerminalAction(command="echo hi"))
+    assert obs.is_error and "refused" in obs.text
+
+
+def test_a_shell_start_failure_does_not_refuse_the_floor(home, monkeypatch):
+    """A plain start failure (no bwrap, a bad host) is not a floor refusal: the editor stays usable."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            raise ConfinementError("bwrap cannot establish a namespace")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    with pytest.raises(ConfinementError):
+        bash._ensure_shell()
+    assert floor.refusal is None
+
+
+def test_a_failure_in_the_providers_own_refresh_refuses_the_floor(home, monkeypatch):
+    """codex L3 r4: the provider refreshes again inside spawn_shell; if that derivation fails the
+    refusal must reach the shared floor, not only this bash call."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    bash = SandboxedBashExecutor(floor=floor)
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            from levain.firing.confinement import FloorRefreshError
+            raise FloorRefreshError("the provider's refresh found an unsafe store")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    with pytest.raises(ConfinementError):
+        bash._ensure_shell()
+    assert floor.refusal is not None
+
+
+def test_the_bound_counts_distinct_directories(home, tmp_path, monkeypatch):
+    """codex/complement L3 r4: one store named in several trust files counted several times."""
+    from levain.firing.confinement import _MAX_LISTED_STORES
+    stores = [tmp_path / f"s{i}" / "memory.db" for i in range(_MAX_LISTED_STORES // 2 + 1)]
+    for t in (home / ".anneal-memory" / "derive-trust.json", home / ".anneal-projects" / "derive-trust.json"):
+        _trust(t, *stores)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(home / ".anneal-memory" / "derive-trust.json"))
+    build_policy(_entity(home))   # 129 distinct directories, listed three times over: under the bound
+
+
+def test_any_refresh_failure_refuses_the_floor(home, monkeypatch):
+    """complement L3 r4: only ConfinementError was made sticky; an OSError escaped raw and retried."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+
+    def boom(policy):
+        raise PermissionError(13, "Permission denied", "x")
+
+    monkeypatch.setattr(tools_mod, "refresh_socket_denies", boom)
+    with pytest.raises(ConfinementError):
+        floor.refresh()
+    assert floor.refusal is not None
+
+
+def test_the_providers_refresh_failure_is_typed(home, monkeypatch):
+    """The base spawn_shell reports its own refresh failing as FloorRefreshError, so the executor can
+    refuse the floor without replaying the derivation (codex L3 r5)."""
+    import levain.firing.confinement as conf
+    from levain.firing.confinement import FloorRefreshError
+
+    def boom(policy):
+        raise ConfinementError("a trust file names a store that cannot be hidden")
+
+    monkeypatch.setattr(conf, "refresh_socket_denies", boom)
+    with pytest.raises(FloorRefreshError):
+        conf.select_provider().spawn_shell(build_policy(_entity(home)))
+
+
+@pytest.mark.parametrize("when", ["before_absorb", "after_absorb"])
+def test_a_refusal_during_candidate_publication_never_lets_a_command_run(home, monkeypatch, when):
+    """codex L3 r6 (reproduced): a refusal landing between a successful absorb and the shell's
+    publication found nothing to revoke, and the command ran on the live candidate."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    from openhands.tools.terminal.definition import TerminalAction
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+    ran = []
+
+    class _Candidate:
+        def __init__(self, policy):
+            self.effective_policy = policy
+            self.closed = False
+        def close(self):
+            self.closed = True
+        def run(self, command, timeout=None):
+            if self.closed:
+                raise ConfinementError("shell is not running")
+            ran.append(command)
+            raise AssertionError("a command ran after the floor was refused")
+
+    candidates = []
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            candidates.append(_Candidate(policy))
+            return candidates[-1]
+
+    real_absorb = _SharedFloor.absorb
+    calls = []
+
+    def absorb(self, spawned):
+        calls.append(1)
+        if len(calls) < 2:                 # the first absorb is the pre-spawn refresh; leave it be
+            return real_absorb(self, spawned)
+        if when == "before_absorb":       # the candidate's absorb: refuse just before it ...
+            self.refuse("refused by the editor mid-spawn")
+            return real_absorb(self, spawned)
+        real_absorb(self, spawned)         # ... or just after it
+        self.refuse("refused by the editor mid-spawn")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    monkeypatch.setattr(_SharedFloor, "absorb", absorb)
+    obs = bash(TerminalAction(command="cat ~/secret-store/memory.db"))
+    assert obs.is_error
+    assert not ran
+    assert candidates and candidates[0].closed

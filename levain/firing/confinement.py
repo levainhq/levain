@@ -472,6 +472,12 @@ class ConfinementError(RuntimeError):
     unconfined host shell (``structural_invariants_beat_discipline``)."""
 
 
+class FloorRefreshError(ConfinementError):
+    """The floor's evolving denies could not be re-derived (a trust file naming a store that cannot be
+    hidden, an unreadable trust path). Distinct from a shell that failed to start, so a caller can
+    record it as a refusal of the whole floor without replaying the derivation (codex L3 r5)."""
+
+
 # --- the OS-agnostic policy (the canonical object) -------------------------------------------
 
 @dataclass(frozen=True)
@@ -733,6 +739,172 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     return subtrees, spellings, store_links
 
 
+def _anneal_trusted_dbs(path: Path) -> list[str]:
+    """The ``stores[].db`` strings anneal itself would trust in the trust file at ``path``, or ``[]``.
+
+    Mirrors anneal's loader (``anneal_memory.rederive._load_trust``, read path): no symlink, a regular
+    file owned by this user and not writable by others, in a directory with the same properties, with
+    a ``stores`` list whose entries carry string ``db`` and ``root``. A file anneal would reject loads
+    no store, so it protects nothing and must not widen the floor either (codex L3 2026-10-03: an
+    untrusted file could otherwise hide a system directory). There is no size cap, because anneal has
+    none and a skipped valid file would leave its stores open. Checks run in anneal's order: owner and
+    mode first (anneal rejects, so nothing to protect), then type. A directory loads nothing in anneal
+    either. Any other non-regular file (a FIFO, a device) REFUSES the floor: anneal does not check the
+    type and could read stores from it, and this cannot read it without blocking (codex L3 r2, r3)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+    except OSError:
+        return []
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            return []
+        if stat.S_ISDIR(st.st_mode):
+            return []
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfinementError(
+                f"the anneal trust path {path} is not a regular file, so the stores it may name cannot "
+                "be read — refusing to build the floor (fail-closed). Replace it with a regular file."
+            )
+        pst = os.stat(os.path.dirname(os.path.abspath(path)))
+        if pst.st_uid != os.geteuid() or pst.st_mode & 0o022:
+            return []
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except ConfinementError:
+        raise   # a RuntimeError subclass: the refusal above must not be read as "unreadable"
+    except (OSError, ValueError, RuntimeError):   # RuntimeError: RecursionError on deep nesting
+        return []
+    finally:
+        os.close(fd)
+    stores = data.get("stores") if isinstance(data, dict) else None
+    if not isinstance(stores, list):
+        return []
+    return [s["db"] for s in stores
+            if isinstance(s, dict) and isinstance(s.get("db"), str) and isinstance(s.get("root"), str)]
+
+
+def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[Path]:
+    """Directories of the project stores the operator's anneal trust files name, to deny read+write
+    (spore-1308 follow-on, ruled by Phill 2026-10-03: "yes for trust file thing").
+
+    A store lives wherever its trust file's ``stores[].db`` points, so naming one directory does not
+    cover a moved project home. Read at each policy build and each spawn (:func:`refresh_socket_denies`):
+    ``$ANNEAL_MEMORY_DERIVE_TRUST`` if set in this process, anneal's default
+    ``~/.anneal-memory/derive-trust.json`` and flow's ``~/.anneal-projects/derive-trust.json``, each
+    through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
+    ``~/.anneal-projects`` subtree still applies.
+
+    Both the db's real directory and, for a symlinked db, its lexical directory are denied, whether or
+    not they exist: an absent one could be created by the entity and filled with a store anneal already
+    trusts (codex L3 r2), and "this user cannot create it" is not something a same-uid shell is bound by
+    (it can chmod its own directories, or rename them away: L3 r4), so it is never a reason to skip.
+    On Linux an absent one becomes bwrap's mountpoint; one bwrap could not create refuses bash there
+    with the path named, so a stale entry is pruned rather than silently skipped. More than a bounded
+    number of distinct listed store directories refuses the floor. The entity's own
+    canonical store (``<entity>/.levain/memory.db``) is skipped, since ``own_memory_files`` governs it.
+    ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
+    filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
+    the workspace, or one inside the entity or workspace. anneal writes more than twenty names beside a
+    db (continuity, crystal, spores, temp files, backups, locks), new ones by rename, so a partial deny
+    of those files would be a guard to be bypassed one name at a time; the store needs a directory of its
+    own. Containment is decided by file identity, so a case- or link-variant spelling cannot dodge it.
+    NOT covered: a trust file this process cannot locate (a flow home moved by
+    ``$FLOW_PROJECT_MEMORY_HOME`` without ``$ANNEAL_MEMORY_DERIVE_TRUST`` exported to levain), and a
+    store added after a shell spawned, until the next spawn."""
+    candidates = [home / ".anneal-memory" / "derive-trust.json",
+                  home / PROJECT_MEMORY_HOME / "derive-trust.json"]
+    raw = os.environ.get(DERIVE_TRUST_ENV, "")
+    if raw:
+        try:
+            candidates.insert(0, Path(raw).expanduser())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV}={raw!r} cannot be resolved ({exc}) — refusing to build the "
+                "floor (fail-closed)."
+            ) from exc
+    canonical = (entity_dir / ".levain" / "memory.db").resolve()
+    listed = 0
+    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for trust in candidates:
+        for db in _anneal_trusted_dbs(trust):
+            try:
+                lexical = Path(db).expanduser()
+                if not lexical.is_absolute():
+                    continue
+                if lexical.resolve() == canonical:
+                    continue
+                dirs = {lexical.parent.resolve(), lexical.resolve().parent}
+            except (OSError, RuntimeError, ValueError):
+                continue
+            for d in sorted(dirs):
+                if d in seen:
+                    continue
+                listed += 1
+                if listed > _MAX_LISTED_STORES:
+                    raise ConfinementError(
+                        f"the anneal trust files list more than {_MAX_LISTED_STORES} store "
+                        "directories this user could reach — refusing to build the floor "
+                        "(fail-closed). Prune the trust files."
+                    )
+                unsafe = (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
+                          or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
+                          or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
+                if unsafe:
+                    raise ConfinementError(
+                        f"the anneal store {db} (listed in {trust}) sits in {d}, which cannot be "
+                        "hidden from the entity without hiding its own home, entity or workspace. "
+                        "Refusing to build the floor (fail-closed). Move the store into a directory "
+                        "of its own and update the trust file."
+                    )
+                seen.add(d)
+                out.append(d)
+    return out
+
+
+_MAX_LISTED_STORES = 256
+
+
+def _mountpoint_creatable(d: Path) -> bool:
+    """Whether bwrap could create ``d`` as a mountpoint: its nearest existing ancestor is a directory
+    this process can write and search. Used ONLY to refuse with a clear message (a wrong answer there
+    fails closed), never to skip a deny: a same-uid shell can change what this returns."""
+    effective = os.access in os.supports_effective_ids
+    for a in d.parents:
+        try:
+            if a.exists():
+                return a.is_dir() and os.access(a, os.W_OK | os.X_OK, effective_ids=effective)
+        except OSError:
+            return False
+    return False
+
+
+def _inside_by_identity(container: Path, p: Path, *, include_self: bool = True) -> bool:
+    """True if ``p`` is ``container`` or lies under it, by file identity: each existing ancestor of
+    ``p`` (``p`` itself too, unless ``include_self`` is False, which tests strictly inside) is compared
+    with ``container`` via ``samefile``. A path that does not exist falls back to resolved-path
+    comparison."""
+    chain = [p, *p.parents] if include_self else list(p.parents)
+    try:
+        cont_exists = container.exists()
+    except OSError:
+        cont_exists = False
+    for a in chain:
+        try:
+            if cont_exists and a.exists():
+                if os.path.samefile(a, container):
+                    return True
+            elif a.resolve() == container.resolve():
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def _sibling_entity_stores(entity_dir: Path) -> tuple[Path, ...]:
     """The ``.levain/`` stores of SIBLING entities under the same parent — crown jewels this entity
     must never read (one sovereign mind can't reach another's memory).
@@ -874,6 +1046,8 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
+    listed_dirs = _trust_listed_stores(home, ed, ws)
+    subtrees.extend(listed_dirs)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
@@ -1052,6 +1226,8 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
+        if jewel in listed_dirs and not jewel.is_file():
+            continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
         if not jewel.is_dir():
@@ -1278,6 +1454,18 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     that target the full three-arm treatment — so the refresh closes the unlisted socket a listed
     name reaches. It does NOT close unlisted sockets generally; that is ``spore-754`` (an
     operator-declared socket list) and is deliberately a separate change."""
+    # Trust-listed project stores are re-derived at the same seam, as a union for the same reason
+    # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
+    # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
+    listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
+    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    if new_dirs:
+        policy = replace(
+            policy,
+            deny_read_write=_dedup_paths(list(policy.deny_read_write) + new_dirs),
+            deny_write_dirs=_dedup_paths(list(policy.deny_write_dirs)
+                                         + list(_write_deny_ancestors(new_dirs))),
+        )
     if not policy.socket_sources:
         return policy  # opt-out (`allow_container_sockets=True`) or nothing enumerated
 
@@ -2227,7 +2415,10 @@ class ConfinementProvider(ABC):
         # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
         # `refresh_socket_denies` is a monotonic union — so a second resolution can only ever widen
         # what the first produced. Round 4's lost-update came from keeping the EARLIER answer.
-        refreshed = refresh_socket_denies(policy)
+        try:
+            refreshed = refresh_socket_denies(policy)
+        except Exception as exc:
+            raise FloorRefreshError(str(exc)) from exc
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
@@ -2934,6 +3125,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
+        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+            raise ConfinementError(
+                f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
+                "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
+                "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
+                "(fail-closed)."
+            )
         if _absent_in_ro_store(sub):
             continue
         if sub.exists() and not sub.is_dir():
