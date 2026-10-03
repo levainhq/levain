@@ -85,6 +85,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from levain.chat import ChatError, ChatHost
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -296,6 +297,12 @@ _ASSETS: dict[str, tuple[str, str]] = {
 }
 
 
+# The chat routes (K1 part 2, `levain serve --chat`). Served only when the server holds a ChatHost;
+# reserved either way, so a downstream route can never claim them.
+_CHAT_GET_ROUTES = ("/chat.json", "/chat/session.json", "/chat/job.json")
+_CHAT_POST_ROUTES = ("/chat/open", "/chat/turn", "/chat/approve", "/chat/reject", "/chat/close")
+
+
 # Paths a downstream-registered extra route may NEVER shadow: the built-in static
 # assets + the two dynamic read routes + the one write route. A control plane
 # (the flow Bridge's FleetView) registers ADDITIONAL read-only views; it must not
@@ -307,7 +314,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-}
+} | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
 def load_web_asset(filename: str) -> str:
@@ -601,6 +608,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # ledger_root + a bounded executor) and sweeps orphaned jobs at startup. apply_action routes a
     # job verb's propose through it; GET /job.json polls it.
     job_runtime: "JobRuntime | None"
+    # The chat host (K1 part 2): live entity conversations, driven by jobs. None unless the operator
+    # passed `--chat`; then the /chat routes are served, and make_server keeps the bind loopback-only.
+    chat_host: "ChatHost | None"
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -808,6 +818,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
+        if path in _CHAT_GET_ROUTES and self.server.chat_host is not None:
+            self._send_chat(self._chat_get(path, self.server.chat_host), head=head)
+            return
+
         if path == "/job.json":
             # The async-job POLL (the propose→job→POLL seam). A read like /substrate.json
             # (gated, GET/HEAD only — no write path), so it rides this same envelope. Returns the
@@ -892,6 +906,51 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
 
+    def _chat_get(self, path: str, host: ChatHost) -> tuple[dict[str, Any], int]:
+        """The chat READ routes. In-memory reads of the host's registry; never raise."""
+        from urllib.parse import parse_qs, urlsplit
+
+        try:
+            if path == "/chat.json":
+                return host.listing(), 200
+            ident = parse_qs(urlsplit(self.path).query).get("id", [""])[0].strip()
+            if not ident:
+                return {"error": "bad_request", "message": "id is required"}, 400
+            if path == "/chat/session.json":
+                return host.session_status(ident), 200
+            return host.job_status(ident), 200
+        except ChatError as exc:
+            return {"error": exc.code, "message": str(exc)}, exc.http_status
+        except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+            return {"error": "internal", "message": type(exc).__name__}, 500
+
+    def _chat_post(self, route: str, host: ChatHost, req: Any) -> tuple[dict[str, Any], int]:
+        """The chat OPERATIONS. The request names an entity the operator registered, a session id,
+        message text or a refusal reason, and nothing else is read from it: no agent, tool spec,
+        model or mode is accepted from a client (the binding design's section 7.1)."""
+        if not isinstance(req, dict):
+            return {"error": "bad_request", "message": "body must be a JSON object"}, 400
+        try:
+            if route == "/chat/open":
+                return host.open(req.get("entity")), 202
+            sid = req.get("session_id")
+            if route == "/chat/turn":
+                return host.turn(sid, req.get("message")), 202
+            if route == "/chat/approve":
+                return host.approve(sid), 202
+            if route == "/chat/reject":
+                return host.reject(sid, req.get("reason")), 202
+            return host.close(sid), 200
+        except ChatError as exc:
+            return {"error": exc.code, "message": str(exc)}, exc.http_status
+        except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+            return {"error": "internal", "message": type(exc).__name__}, 500
+
+    def _send_chat(self, out: tuple[dict[str, Any], int], *, head: bool = False) -> None:
+        payload, status = out
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
+                   status=status, head=head)
+
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         self._route(head=False)
 
@@ -966,7 +1025,8 @@ class _Handler(BaseHTTPRequestHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # the spore-129 governance already covers /action with no change here.
         route = self.path.split("?", 1)[0]
-        if route not in ("/edit", "/action"):
+        is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
+        if route not in ("/edit", "/action") and not is_chat:
             return self._reject(404, "not_found", "no such route")
         # Content-Length: required + numeric (checked before reading a byte).
         clen_raw = self.headers.get("Content-Length")
@@ -1030,6 +1090,13 @@ class _Handler(BaseHTTPRequestHandler):
                     {"error": "bad_json", "message": "body is not valid JSON"}, 400
                 )
                 return
+            if is_chat:
+                # Chat acts through the ENTITY's own governed floor, not the substrate's write
+                # scope, so the read-only refusal below does not apply to it. It rode every
+                # check above (Host, CSRF, Content-Type, length, the rate gate).
+                assert self.server.chat_host is not None
+                self._send_chat(self._chat_post(route, self.server.chat_host, req))
+                return
             scope = self.server.levain_source.write_scope
             if scope is None:
                 # Distinct from writes.py's `no_install` (a writable source whose seed/
@@ -1075,6 +1142,7 @@ def make_server(
     extra_verbs: "Mapping[str, ActionVerb] | None" = None,
     write_token: str | None = None,
     job_runtime: "JobRuntime | None" = None,
+    chat_host: "ChatHost | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1127,6 +1195,13 @@ def make_server(
         raise ValueError(
             f"refusing to bind {host!r}: {reason}. Pass a SPECIFIC private interface "
             "IP (e.g. your Tailscale IP), not a wildcard or a public address."
+        )
+    if chat_host is not None and not _is_loopback_host(host):
+        # A chat host drives entities with hands. Its routes have no off-box auth factor (the write
+        # token governs the substrate's write scope, not an entity's), so it is loopback-only.
+        raise ValueError(
+            f"refusing to bind {host!r}: a server with --chat is loopback-only "
+            "(127.0.0.1 / localhost) — chat drives an entity's hands and has no off-box auth."
         )
     if not _is_loopback_host(host):
         # An INSTALL-bearing source is loopback-only UNCONDITIONALLY — its seed/config is
@@ -1281,6 +1356,7 @@ def make_server(
     httpd.extra_panels = extra_panels
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
+    httpd.chat_host = chat_host
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the token-free localhost-sovereign path is
@@ -1320,6 +1396,13 @@ def make_server(
     #       /action verbs) would be served off-box without the token the off-box factor requires
     #       (writes still token-gate / 422, but the GET read path does not) [L2 LOW]. A writable
     #       source WITH a token is a legitimate off-box mesh bind — not refused here.
+    if not httpd.is_loopback_bind and chat_host is not None:
+        bound = str(httpd.server_address[0])
+        httpd.server_close()
+        raise ValueError(
+            f"refusing to serve: requested host {host!r} bound a non-loopback address ({bound}), "
+            "and a server with --chat is loopback-only."
+        )
     if not httpd.is_loopback_bind and (
         _is_install_bearing(source)
         or (source.write_scope is not None and not write_token)
@@ -1351,6 +1434,11 @@ def run_web_server(
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
     write: bool = False,
+    chat: "list[Path] | tuple[Path, ...]" = (),
+    model: str = "glm-5.2:cloud",
+    base_url: str = "http://localhost:11434",
+    api_key: str | None = None,
+    max_iterations: int | None = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -1391,8 +1479,16 @@ def run_web_server(
         )
         return 1
 
+    chat_host = None
+    if chat:
+        chat_host, chat_err = _build_chat_host(
+            chat, model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations)
+        if chat_host is None:
+            print(chat_err, file=sys.stderr)
+            return 1
+
     try:
-        httpd = make_server(source, host=host, port=port)
+        httpd = make_server(source, host=host, port=port, chat_host=chat_host)
     except ValueError as exc:  # bind refused — wildcard/public, or an install-bearing/writable source off-loopback
         print(str(exc), file=sys.stderr)
         return 1
@@ -1416,6 +1512,9 @@ def run_web_server(
     print(f"  store: {source.anneal.episodic_db}")
     mode = "GOVERNED WRITABLE" if source.write_scope is not None else "read-only"
     print(f"  {mode} · localhost-only · Ctrl+C to stop")
+    if chat_host is not None:
+        names = ", ".join(chat_host.listing()["entities"])
+        print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
@@ -1434,4 +1533,35 @@ def run_web_server(
         print("\nstopped.")
     finally:
         httpd.server_close()
+        if chat_host is not None:
+            chat_host.shutdown()
     return 0
+
+
+def _build_chat_host(
+    paths: "list[Path] | tuple[Path, ...]",
+    *,
+    model: str,
+    base_url: str,
+    api_key: str | None,
+    max_iterations: int | None,
+) -> "tuple[ChatHost | None, str]":
+    """The operator's ``--chat`` entities, checked before the socket is bound. Each must be a clean
+    OpenHands entity; a client addresses it by its directory name, so two with the same name are
+    refused rather than one silently shadowing the other."""
+    from levain.session import require_openhands_entity
+
+    entities: dict[str, Path] = {}
+    for raw in paths:
+        entity_dir = Path(raw).expanduser().resolve()
+        err = require_openhands_entity(entity_dir)
+        if err:
+            return None, f"--chat {raw}: {err}"
+        if entity_dir.name in entities:
+            return None, (
+                f"--chat: two entities are named {entity_dir.name!r} ({entities[entity_dir.name]} "
+                f"and {entity_dir}); a client addresses an entity by its directory name."
+            )
+        entities[entity_dir.name] = entity_dir
+    return ChatHost(entities, model=model, base_url=base_url, api_key=api_key,
+                    max_iterations=max_iterations), ""

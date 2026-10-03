@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- **`levain serve --chat <entity>`: chat with an entity through the local web server.** Pass `--chat` once per OpenHands entity. The server holds each conversation in memory and drives its turns as jobs: `POST /chat/open {"entity": <dir name>}` starts a session, `POST /chat/turn {"session_id", "message"}` sends a message, and `GET /chat/job.json?id=` reports the job. A running job's `activity` list grows as the entity uses its tools, and the finished job carries the turn's result (reply, tool activity, error, and `exit_code` as `levain run --task` reports it). `GET /chat.json` lists the entities and sessions; `/chat/approve`, `/chat/reject` and `/chat/close` complete the set. `--model`, `--base-url`, `--api-key` and `--max-iterations` work as they do for `levain run`. There is no chat page yet; this is the API only.
+  - **The server builds every agent itself.** A request names an entity the operator passed on the command line, plus message text. It cannot supply an agent, a tool spec, a model or a drive mode; such fields in a request body are ignored. The crown-jewels floor travels in the hands' tool spec, so a client-supplied spec would be the client writing its own floor.
+  - **Sessions are `interactive`,** because the person at the client watches the activity as it happens. An entity whose `confinement.json` sets `"efferent_gate": "gated"` halts at the gate as it does in the REPL, and a halted session refuses a new message until the held actions are approved or rejected.
+  - **Several entities, one process.** Each session's hands enforce its own entity's floor, and each turn is captured into its own entity's store. A session whose turn errors or times out is marked `broken` and its shell is released; it takes no further turns.
+  - **Loopback-only, nothing persisted.** A server with `--chat` refuses a non-loopback bind, because its chat routes have no off-box auth. The routes use the same Host check, cross-site refusal and JSON-only body rule as the write routes. A restart ends every conversation; resuming one after a restart is not offered.
+  - At most four live sessions per server. When a session fails to start, the server keeps the error text and drops the exception, so tools built before the failure are released.
+
 ## [0.5.2] — 2026-10-02
 
 ### Changed

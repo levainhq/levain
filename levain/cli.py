@@ -596,6 +596,44 @@ def main(argv: list[str] | None = None) -> int:
             "Default is read-only."
         ),
     )
+    web_p.add_argument(
+        "--chat",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="ENTITY",
+        help=(
+            "Also serve CHAT with the OpenHands entity at this directory (repeatable, one per "
+            "entity). Conversations are held in server memory and driven through POST /chat/open "
+            "and /chat/turn, polled at GET /chat/job.json. The server builds every agent itself "
+            "from the entity; a client sends only text. Loopback-only. Nothing is persisted: a "
+            "restart ends every conversation."
+        ),
+    )
+    web_p.add_argument(
+        "--model",
+        default="glm-5.2:cloud",
+        help="With --chat: the model the entities run on (default: glm-5.2:cloud, as `levain run`).",
+    )
+    web_p.add_argument(
+        "--base-url",
+        default="http://localhost:11434",
+        dest="base_url",
+        help="With --chat: the model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    web_p.add_argument(
+        "--api-key",
+        default=None,
+        dest="api_key",
+        help="With --chat: API key for the endpoint, if it needs one.",
+    )
+    web_p.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        dest="max_iterations",
+        help="With --chat: bound each turn to at most N agent steps. Default: the SDK's own limit.",
+    )
     web_p.set_defaults(func=_cmd_serve)
 
     serve_p = subparsers.add_parser(
@@ -1192,6 +1230,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         port=args.port,
         open_browser=not args.no_open,
         write=args.write,
+        chat=args.chat,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        max_iterations=args.max_iterations,
     )
 
 
