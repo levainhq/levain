@@ -556,7 +556,8 @@ class EntitySession:
                 f"  ({exc})"
             ) from exc
 
-        # Before any construction (only the import check above precedes it): this process now hosts
+        # Before any construction (only the mode, entity and import checks above precede it, and they
+        # build nothing): this process now hosts
         # an entity, so a stray DEFAULT-kind store op anywhere in it refuses rather than reach
         # ~/.anneal-memory (spore-438; a one-way latch, so a failed start that set it can only make
         # such an op refuse).
@@ -573,6 +574,8 @@ class EntitySession:
         #   - assert_workspace_isolated ENFORCES the FILE fence BEFORE the workspace exists;
         #   - it fires AGAIN after mkdir (codex L3 TOCTOU — mkdir(exist_ok=True) follows a
         #     symlink swapped in after the first assert, so the invariant fires at USE);
+        #   - and a THIRD time on the workspace the binding resolved, which is then the one path
+        #     the floor, the tools and the conversation all receive (codex L3 r2);
         #   - a bad --model/--base-url is a usage error → clean exit 2, not a raw traceback.
         # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`, which
         # under-declares the concrete `send_message` / `state` surface.
@@ -606,7 +609,8 @@ class EntitySession:
                     cfg.allow_localhost_outbound)
             # The STORE guard first, so a dir that is not an entity is refused before anything is
             # created in it; then fence + create the workspace BEFORE the binding resolves the floor
-            # against it, so floor and conversation name the same guarded directory (complement L3).
+            # against it (complement L3). That floor and conversation name the same directory comes
+            # from the reassignment below, not from this order.
             guard_entity(entity_dir)
             workspace = entity_dir / WORKSPACE_SUBDIR
             assert_workspace_isolated(workspace, entity_dir=entity_dir)

@@ -425,3 +425,52 @@ def test_a_workspace_swapped_after_the_fence_is_refused(tmp_path, home, monkeypa
     monkeypatch.setattr(binding_mod.ConversationBinding, "create", classmethod(swapping_create))
     with pytest.raises(SessionStartError, match="escapes the entity dir"):
         _open(ent, "interactive")
+
+
+def test_a_failure_after_the_hands_build_leaks_no_editor_history_dir(
+    tmp_path, home, editor_tmp, monkeypatch
+):
+    """L1 (2026-10-02, RAN): when the SDK's agent init fails AFTER levain_hands built (a default
+    tool's create raising), the built tools never reach the agent, `conversation.close()` closes
+    nothing, and the editor's history dir was left behind. Once the failed open's references are
+    gone, no dir may remain."""
+    import gc
+
+    from openhands.sdk.agent import base as agent_base
+
+    from levain.session import SessionStartError
+
+    class _Raising:
+        @classmethod
+        def create(cls, *a, **k):
+            raise RuntimeError("a default tool failed to build")
+
+    monkeypatch.setattr(
+        agent_base, "BUILT_IN_TOOL_CLASSES",
+        {name: _Raising for name in agent_base.BUILT_IN_TOOL_CLASSES},
+    )
+    try:
+        _open(_entity(tmp_path, "ent"), "interactive")
+    except SessionStartError:
+        pass
+    else:
+        pytest.fail("open must refuse when a default tool cannot be built")
+    gc.collect()
+    assert _history_dirs(editor_tmp) == []
+
+
+def test_the_conversation_gets_the_workspace_the_floor_fences(tmp_path, home):
+    """L3 r2 (codex) + L1 (mutation): floor and conversation must name ONE workspace. An in-tree
+    symlinked workspace passes every fence, the floor resolves it, and the conversation used to get
+    the unresolved spelling."""
+    ent = _entity(tmp_path, "ent")
+    (ent / "real-ws").mkdir()
+    (ent / "workspace").symlink_to(ent / "real-ws", target_is_directory=True)
+    s = _open(ent, "interactive")
+    try:
+        floor_ws = s.conversation.agent.tools_map["file_editor"].executor._policy.workspace
+        assert floor_ws == (ent / "real-ws").resolve()
+        assert Path(s.conversation.workspace.working_dir) == floor_ws
+        assert s.workspace == floor_ws
+    finally:
+        s.close()

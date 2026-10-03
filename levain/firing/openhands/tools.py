@@ -65,8 +65,9 @@ import dataclasses
 import logging
 import shutil
 import threading
+import weakref
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from openhands.sdk.tool import (
     Action,
@@ -292,6 +293,16 @@ def _drop_editor_history(executor: Any) -> None:
         pass
 
 
+def _history_finalizer(executor: Any) -> Callable[[], Any]:
+    """A run-once callable that removes ``executor``'s history tempdir, also run when the executor is
+    garbage-collected or at interpreter exit. A no-op if the SDK moved the attribute."""
+    try:
+        directory = executor.editor._history_manager.cache.directory
+    except Exception:  # noqa: BLE001 — same tolerance as _drop_editor_history
+        return lambda: None
+    return weakref.finalize(executor, shutil.rmtree, directory, ignore_errors=True)
+
+
 class CrownJewelsFileEditorExecutor(FileEditorExecutor):
     """A :class:`~openhands.tools.file_editor.impl.FileEditorExecutor` fenced to the crown-jewels
     FLOOR (slice 2), relaxing the step-6 ``<entity>/workspace/`` jail.
@@ -336,6 +347,16 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
             floor = _SharedFloor(policy)  # type: ignore[arg-type]
         self._floor = floor
         super().__init__(workspace_root=str(self._floor.policy.workspace), **kwargs)
+        # The history dir is removed when this executor is closed OR collected, whichever comes
+        # first: an executor built by a tool build that failed later (in the SDK's agent init) never
+        # reaches the agent, so nothing would ever close it (L1, 2026-10-02, reproduced). A per-
+        # instance finalizer holding only the dir's path: no lock, no shared state.
+        self._history_cleanup = _history_finalizer(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "CrownJewelsFileEditorExecutor":
+        # Same reason as `SandboxedBashExecutor.__deepcopy__`, plus one: a copy would share the
+        # history dir that only this instance's finalizer owns.
+        return self
 
     @property
     def _policy(self) -> CrownJewelsPolicy:
@@ -347,7 +368,7 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         """Remove this executor's history tempdir (the SDK closes executors at conversation close),
         then run the parent's close, so cleanup a future SDK adds there still happens."""
         try:
-            _drop_editor_history(self)
+            self._history_cleanup()
         finally:
             # Chained for whatever a later SDK puts there; no test, because there was nothing to run
             # [judged 2026-10-02 against openhands-tools 1.26.0: FileEditorExecutor defines no close,
@@ -448,6 +469,7 @@ class LevainFileEditorTool(FileEditorTool):
                 for stock in stocks
             ]
         except BaseException:
+            # Reasoned, no test: only the pydantic validation inside `cls(...)` can raise here (L1).
             floored.close()
             raise
 
