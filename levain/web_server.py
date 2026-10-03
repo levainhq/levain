@@ -85,7 +85,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from levain.chat import ChatError, ChatHost
+from levain.chat import ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -303,11 +303,10 @@ _CHAT_GET_ROUTES = ("/chat.json", "/chat/session.json", "/chat/job.json")
 _CHAT_POST_ROUTES = ("/chat/open", "/chat/turn", "/chat/approve", "/chat/reject", "/chat/close")
 
 
-# Paths a downstream-registered extra route may NEVER shadow: the built-in static
-# assets + the two dynamic read routes + the one write route. A control plane
-# (the flow Bridge's FleetView) registers ADDITIONAL read-only views; it must not
-# be able to override the substrate dashboard, the JSON reads, or the governed write
-# route. make_server refuses a collision loudly (a packaging-class bug, not runtime).
+# Paths a downstream-registered extra route may NEVER shadow: every built-in route this module
+# serves (the set below). A control plane (the flow Bridge's FleetView) registers ADDITIONAL
+# read-only views; it must not be able to override the dashboard, its reads, the write routes or the
+# chat routes. make_server refuses a collision loudly (a packaging-class bug, not runtime).
 _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/substrate.json",
     "/recall.json",
@@ -982,9 +981,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json({"error": error, "message": message}, status)
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        """The governed write routes — ``POST /edit`` + ``POST /action`` — behind the
-        write/auth boundary. Both fork only at dispatch, AFTER the shared auth checks;
-        both refuse with 422 ``read_only`` when the source carries no ``write_scope``.
+        """The POST routes — the governed writes ``/edit`` + ``/action``, and the ``/chat`` operations
+        when a chat host is attached — behind one auth boundary. They fork only at dispatch, AFTER the
+        shared checks. The two writes refuse with 422 ``read_only`` when the source carries no
+        ``write_scope``; chat does not, because it acts through the entity's floor, not the substrate.
 
         The cheap fail-closed checks (Host → CSRF → Content-Type → route →
         Content-Length) run BEFORE any body read and each closes the connection on
@@ -1452,8 +1452,12 @@ def run_web_server(
     ``serve`` never binds off-box — a posture that fits a network surface: read-only
     is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).
 
-    Returns nonzero only if the store is unreachable before the server starts, or
-    the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
+    ``chat`` (``--chat``, repeatable) also serves the chat routes over those entities
+    (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only
+    or not.
+
+    Returns nonzero only if the store is unreachable before the server starts, a ``--chat``
+    entity is refused, or the bind fails (e.g. the port is in use) — mirroring ``levain dashboard`` /
     ``serve-app``. A degraded sub-tier renders visibly and is not a startup
     failure. Blocks in ``serve_forever`` until interrupted (Ctrl+C → clean exit 0).
     """
@@ -1489,7 +1493,7 @@ def run_web_server(
 
     try:
         httpd = make_server(source, host=host, port=port, chat_host=chat_host)
-    except ValueError as exc:  # bind refused — wildcard/public, or an install-bearing/writable source off-loopback
+    except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1
     except OSError as exc:
@@ -1547,8 +1551,9 @@ def _build_chat_host(
     max_iterations: int | None,
 ) -> "tuple[ChatHost | None, str]":
     """The operator's ``--chat`` entities, checked before the socket is bound. Each must be a clean
-    OpenHands entity; a client addresses it by its directory name, so two with the same name are
-    refused rather than one silently shadowing the other."""
+    OpenHands entity that chat may host (:func:`levain.chat.chat_refusal`); a client addresses it by
+    its directory name, so two with the same name are refused rather than one silently shadowing the
+    other."""
     from levain.session import require_openhands_entity
 
     entities: dict[str, Path] = {}
@@ -1557,6 +1562,9 @@ def _build_chat_host(
         err = require_openhands_entity(entity_dir)
         if err:
             return None, f"--chat {raw}: {err}"
+        refusal = chat_refusal(entity_dir)
+        if refusal is not None:
+            return None, f"--chat {raw}: {refusal}"
         if entity_dir.name in entities:
             return None, (
                 f"--chat: two entities are named {entity_dir.name!r} ({entities[entity_dir.name]} "

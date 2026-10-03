@@ -13,11 +13,31 @@ through ``build_entity_agent``. This is the K1-part-2 requirement of the approve
 client-supplied spec would be a client writing its own floor. There is no code path here that
 accepts one, which is a stronger claim than a validator that refuses one.
 
-**The drive mode is ``interactive``, decided by the server.** A person at a chat client reads the
-turn's tool activity as it happens (the job's ``activity`` list grows during the turn and every poll
-returns it), which is the fan-in the REPL's interactive mode stands for. The entity's own
-``confinement.json`` still decides the efferent gate: an entity that declares ``"gated"`` halts here
-exactly as in the REPL, and the routes expose approve and reject.
+**The drive mode is ``headless``, decided by the server.** The binding design (section 7.1) gives
+``interactive`` to an *authenticated human at a chat client*. These routes authenticate nobody (any
+local process that passes the loopback, Host and CSRF checks can drive a session, and activity is
+pull-only, so nothing guarantees anyone reads it), so the precondition is not met and the server
+does not claim it. In ``headless`` an entity whose ``efferent_gate`` is ``"auto"`` is GATED: a turn
+that proposes an efferent action halts, and the client approves or rejects it. The crown-jewels cred
+floor is the same for ``headless`` as for ``interactive`` (:mod:`levain.firing.drive`), so this
+choice moves the gate and nothing else. (L1 review 2026-10-03; if the chat routes gain an
+authenticated client, that is the moment to revisit it.)
+
+**An entity that may connect to localhost is refused.** With ``allow_localhost_outbound`` its shell
+could call these routes itself: list the sessions, approve its own held actions, drive the other
+entities. Every other entity's shell is denied loopback by its floor. (L2 review 2026-10-03.)
+
+**Activity is what was ISSUED; the result is what RAN.** A job's ``activity`` grows as the entity
+issues tool actions, which for a gated action is before the gate stops it, so while the turn runs a
+poll can show a line for an action that will be held. When the turn finishes gated, ``activity`` is
+replaced by the result's ``tool_activity`` (held actions removed); the held ones are in ``pending``.
+
+**A turn has no wall-clock bound here.** ``--max-iterations`` bounds its steps and the SDK's HTTP
+timeout bounds each model call, but a turn is not cancelled at a deadline: the SDK's synchronous run
+can only be paused between steps, and a paused turn needs the session to classify it as timed out
+and not capture it, which is not built yet. A turn that never returns keeps its session ``busy``.
+Workers are daemon threads, so stopping the server does not wait for one; the SDK closes every live
+conversation, and its shell, at interpreter exit.
 
 **Why the job registry is in memory, unlike** :mod:`levain.jobs` **(which is on disk).** A turn job is
 meaningful only while its conversation exists, and the conversation lives in this process (nothing
@@ -31,23 +51,31 @@ cannot write, and never an agent rebuilt from the persisted record).
 exception's traceback holds the frames of the failed start, and those frames hold whatever the start
 had built: hands whose editor history directory is removed only when they are collected (codex L3
 r1 on the binding branch). A server that stored the exception would keep them alive for as long as
-it kept the record.
+it kept the record. Dropping it is not enough on its own: the SDK's tool build keeps the exception in
+a reference cycle (a Future held by a frame inside its own traceback; L1 review 2026-10-03, run), so
+a failed start also runs one cyclic collection.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import secrets
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
+
+if TYPE_CHECKING:
+    from levain.firing.drive import DriveMode
 
 __all__ = [
+    "CHAT_DRIVE_MODE",
     "ChatError",
     "ChatHost",
     "MAX_ACTIVITY_LINES",
+    "MAX_LINE_CHARS",
     "MAX_MESSAGE_CHARS",
+    "chat_refusal",
 ]
 
 _log = logging.getLogger("levain.chat")
@@ -56,20 +84,26 @@ SessionState = Literal["opening", "idle", "busy", "gated", "broken", "failed", "
 JobKind = Literal["open", "turn", "approve", "reject"]
 JobStatus = Literal["running", "done", "failed"]
 
+CHAT_DRIVE_MODE: "DriveMode" = "headless"
+"""The drive mode every chat session opens in. See the module docstring for why not interactive."""
+
 MAX_MESSAGE_CHARS = 64_000
-"""A message longer than this is refused with 413: it bounds what reaches the model's context from
-one request, whatever the transport allows."""
+"""A message longer than this is refused with 413. It bounds what one request can put into the
+model's context; the transport's own body limit may refuse a long escaped message first."""
 
 MAX_ACTIVITY_LINES = 500
-"""A job keeps at most this many streamed activity lines; past it the oldest are dropped and the
-job says how many. A runaway turn must not grow server memory without bound."""
+"""A job keeps at most this many activity lines; past it the oldest are dropped and the job says how
+many. A result's ``tool_activity`` is cut to the same count."""
+
+MAX_LINE_CHARS = 2_000
+"""An activity line longer than this is cut, ending in " …"."""
 
 _ENDED_SESSIONS_KEPT = 100
 """How many ended sessions (closed, failed, broken) stay readable. Older ones are forgotten."""
 
 _LIVE_STATES = ("opening", "idle", "busy", "gated")
-"""The states that hold, or are about to hold, a conversation. Only these count toward the cap: a
-broken session has already released its conversation and its shell."""
+"""The states that hold, or are about to hold, a conversation. Only these count toward the cap; a
+broken session's conversation is closed by the worker right after it is marked."""
 
 _FINISHED_JOBS_KEPT = 200
 """How many finished jobs stay pollable. Older finished jobs are forgotten (a poll answers
@@ -86,6 +120,29 @@ class ChatError(Exception):
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+
+
+def chat_refusal(entity_dir: Path) -> str | None:
+    """Why ``entity_dir`` may not be hosted for chat, or ``None``. A config that does not load is not
+    refused HERE: opening the session reports it in full."""
+    from levain.firing.confinement import ConfinementError, load_confinement_config
+
+    try:
+        cfg = load_confinement_config(entity_dir)
+    except ConfinementError:
+        return None
+    if cfg.allow_localhost_outbound:
+        return (
+            f"{entity_dir} allows its shell to connect to localhost (allow_localhost_outbound), so "
+            "it could call this server's chat routes itself, approve its own held actions and drive "
+            "the other entities. Chat refuses to host it; use `levain run` for this entity."
+        )
+    return None
+
+
+def _cap_line(line: Any) -> str:
+    text = str(line)
+    return text if len(text) <= MAX_LINE_CHARS else text[:MAX_LINE_CHARS] + " …"
 
 
 @dataclass
@@ -115,9 +172,10 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     """A :class:`~levain.session.TurnResult` as JSON-shaped data. ``ok`` and ``exit_code`` are the
     result's own derived properties, so a client reads the harness's classification rather than
     re-deriving it."""
+    activity = [_cap_line(x) for x in result.tool_activity]
     return {
         "reply": result.reply,
-        "tool_activity": list(result.tool_activity),
+        "tool_activity": activity[-MAX_ACTIVITY_LINES:],
         "error": result.error,
         "nudged": result.nudged,
         "gated": result.gated,
@@ -138,6 +196,9 @@ def _default_factory(
     def _open(entity_dir: Path, *, on_event: Callable[[str], None]) -> Any:
         from levain.session import EntitySession
 
+        refusal = chat_refusal(entity_dir)
+        if refusal is not None:
+            raise ChatError("refused_entity", refusal, 403)
         return EntitySession.open(
             entity_dir,
             model=model,
@@ -146,7 +207,7 @@ def _default_factory(
             with_tools=True,
             on_event=on_event,
             max_iterations=max_iterations,
-            mode="interactive",
+            mode=CHAT_DRIVE_MODE,
         )
 
     return _open
@@ -157,7 +218,7 @@ class ChatHost:
 
     ``entities`` maps a NAME to an entity directory; it is fixed at construction and is the whole
     of what a client can address. ``session_factory`` is a test seam; production passes ``None`` and
-    gets :meth:`EntitySession.open` with the operator's model settings and ``mode="interactive"``.
+    gets :meth:`EntitySession.open` with the operator's model settings and :data:`CHAT_DRIVE_MODE`.
     """
 
     def __init__(
@@ -184,9 +245,6 @@ class ChatHost:
         self._lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
         self._jobs: dict[str, _Job] = {}
-        # One worker per possible session: a session runs one job at a time, so no job ever waits
-        # behind another session's turn.
-        self._pool = ThreadPoolExecutor(max_workers=max_sessions, thread_name_prefix="levain-chat")
         self._shut = False
 
     # -- reads ---------------------------------------------------------------
@@ -196,6 +254,7 @@ class ChatHost:
             return {
                 "entities": sorted(self._entities),
                 "model": self._model,
+                "drive_mode": CHAT_DRIVE_MODE,
                 "max_sessions": self._max_sessions,
                 "sessions": [self._session_view(s) for s in self._sessions.values()],
             }
@@ -245,7 +304,10 @@ class ChatHost:
             rec = _Session(session_id=sid, entity=entity)
             self._sessions[sid] = rec
             job = self._new_job(rec, "open")
-        self._pool.submit(self._run_open, rec, job)
+            if not self._spawn(self._run_open, rec, job):
+                del self._sessions[sid]
+                del self._jobs[job.job_id]
+                raise ChatError("busy", "could not start a worker; try again", 503)
         return {"session_id": sid, "job_id": job.job_id, "state": "opening"}
 
     def turn(self, session_id: Any, message: Any) -> dict[str, Any]:
@@ -267,13 +329,13 @@ class ChatHost:
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
-        itself); a closed, failed or broken session closes as a no-op."""
+        itself). A failed session stays ``failed``; any other ends ``closed``."""
         with self._lock:
             rec = self._get(session_id)
             if rec.state in ("opening", "busy"):
                 raise ChatError("busy", "the session is running a job; close it when it finishes", 409)
             session, rec.session = rec.session, None
-            if rec.state not in ("failed",):
+            if rec.state != "failed":
                 rec.state = "closed"
             view = self._session_view(rec)
         if session is not None:
@@ -281,8 +343,9 @@ class ChatHost:
         return view
 
     def shutdown(self) -> None:
-        """Close every session and stop accepting work. Running jobs are not interrupted; their
-        sessions close when they finish."""
+        """Close every idle or gated session and stop accepting work. A job still running is not
+        interrupted; its worker closes the session when the job ends, and if the process exits first
+        the SDK closes the conversation at interpreter exit."""
         with self._lock:
             self._shut = True
             to_close = []
@@ -293,8 +356,6 @@ class ChatHost:
                     rec.state = "closed"
         for s in to_close:
             s.close()
-        # Not cancel_futures: a cancelled job would leave its session open with nobody to close it.
-        self._pool.shutdown(wait=False)
 
     # -- internals -----------------------------------------------------------
 
@@ -318,6 +379,37 @@ class ChatHost:
             del self._jobs[old.job_id]
         return job
 
+    def _spawn(self, target: Callable[..., None], *args: Any) -> bool:
+        """Start ``target`` on its own daemon thread. Caller holds the lock and has already checked
+        ``_shut``, so a shutdown cannot land between that check and the start. A session runs at most
+        one job, so there are never more workers than live sessions."""
+        thread = threading.Thread(
+            target=self._guarded, args=(target, *args), daemon=True, name="levain-chat")
+        try:
+            thread.start()
+        except RuntimeError:
+            return False
+        return True
+
+    def _guarded(self, target: Callable[..., None], rec: _Session, job: _Job, *args: Any) -> None:
+        """Run a worker so that nothing escaping it leaves a job ``running`` or a session ``busy``.
+        The workers settle their own results; this only catches a fault in that settling."""
+        try:
+            target(rec, job, *args)
+        except BaseException as exc:  # noqa: BLE001 — a worker must always settle its records
+            text = f"{type(exc).__name__}: {exc}"
+            _log.error("chat %s job %s escaped its worker: %s", job.kind, job.job_id, text)
+            to_close: Any = None
+            with self._lock:
+                if job.status == "running":
+                    job.status, job.error = "failed", text
+                if rec.job_id == job.job_id:
+                    rec.job_id = None
+                    to_close, rec.session = rec.session, None
+                    rec.state, rec.error = ("failed" if job.kind == "open" else "broken"), text
+            if to_close is not None:
+                to_close.close()
+
     def _start(
         self,
         session_id: Any,
@@ -334,9 +426,13 @@ class ChatHost:
                     f"the session is {rec.state}; {kind} needs it {' or '.join(accepts)}",
                     409,
                 )
+            before = rec.state
             rec.state = "busy"
             job = self._new_job(rec, kind)
-        self._pool.submit(self._run_job, rec, job, call)
+            if not self._spawn(self._run_job, rec, job, call):
+                rec.state, rec.job_id = before, None
+                del self._jobs[job.job_id]
+                raise ChatError("busy", "could not start a worker; try again", 503)
         return {"session_id": rec.session_id, "job_id": job.job_id, "state": "busy"}
 
     def _run_open(self, rec: _Session, job: _Job) -> None:
@@ -344,10 +440,14 @@ class ChatHost:
         session: Any = None
         try:
             session = self._factory(self._entities[rec.entity], on_event=self._route_events(rec))
-        except Exception as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
+        except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
             error = str(exc) or type(exc).__name__
         # `exc` is unbound here (Python deletes it at the end of the except clause), so nothing in
-        # this frame still references the traceback of the failed start.
+        # this frame still references the traceback of the failed start. The SDK keeps that failure
+        # in a reference cycle (module docstring), so collect it now, BEFORE the failure is published:
+        # a client that sees "failed" must not still have the failed hands alive behind it.
+        if error is not None:
+            gc.collect()
         with self._lock:
             if error is not None:
                 rec.state, rec.error = "failed", error
@@ -374,7 +474,7 @@ class ChatHost:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
                 if job is None or job.status != "running":
                     return
-                job.activity.append(str(line))
+                job.activity.append(_cap_line(line))
                 if len(job.activity) > MAX_ACTIVITY_LINES:
                     del job.activity[0]
                     job.dropped += 1
@@ -389,7 +489,7 @@ class ChatHost:
         try:
             result = call(rec.session)
             payload = _turn_payload(result)
-        except Exception as exc:  # noqa: BLE001 — EntitySession's turn methods do not raise; this is a backstop
+        except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
             error = f"{type(exc).__name__}: {exc}"
         to_close: Any = None
         with self._lock:
@@ -399,19 +499,16 @@ class ChatHost:
             else:
                 job.status, job.result = "done", payload
                 if payload["gated"]:
-                    # The stream fired as each action was ISSUED, which for a held action is before
-                    # the gate stopped it. The result's tool_activity has the held actions removed,
-                    # so it replaces the stream: nothing held may read as work that ran. What is
-                    # held is in the result's `pending`.
+                    # The result's tool_activity has the held actions removed; it replaces what was
+                    # streamed, so nothing held stays listed as work (module docstring).
                     job.activity, job.dropped = list(payload["tool_activity"]), 0
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
                 elif payload["error"] is not None:
-                    # A turn that raised, timed out or could not read its own gate leaves the
-                    # conversation in a state a later turn would resume FROM (EXIT_TURN_FAILED's
-                    # contract), and a refusal that did not take is still holding actions. Either
-                    # way the session takes no further turn. Its shell is released now rather than
-                    # held until someone closes it.
+                    # A turn that raised or could not read its own gate leaves the conversation in a
+                    # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a
+                    # refusal that did not take is still holding actions. Either way the session
+                    # takes no further turn, and its shell is released now.
                     rec.state, rec.error = "broken", payload["error"]
                 else:
                     rec.state = "idle"

@@ -323,6 +323,165 @@ def test_the_premises_this_module_rests_on_still_hold():
     assert "persistence_dir" not in inspect.getsource(session_mod)
 
 
+class _Escape(BaseException):
+    """Not an Exception, like TurnTimeout and CancelledError."""
+
+
+def test_a_base_exception_from_a_turn_settles_the_job_and_frees_the_slot(tmp_path):
+    f = _Factory([])
+    host = _host(tmp_path, f, max_sessions=1)
+    sid = _opened(host)
+    f.made[0].run_turn = lambda m: (_ for _ in ()).throw(_Escape("stop"))
+    st = _wait(host, host.turn(sid, "x")["job_id"])
+    assert st["status"] == "failed" and "_Escape" in st["error"]
+    assert host.session_status(sid)["state"] == "broken" and f.made[0].closed
+    _opened(host)   # the slot came back
+
+
+def test_a_fault_while_settling_a_job_still_settles_it(tmp_path):
+    class _BadLabel(_Stub):
+        @property
+        def label(self):          # read by _describe while the open is being recorded
+            raise RuntimeError("label broke")
+
+    made = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_BadLabel(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory)
+    out = host.open("alpha")
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and "label broke" in st["error"]
+    assert host.session_status(out["session_id"])["state"] == "failed"
+    assert made[0].closed
+
+
+def test_shutdown_during_a_turn_closes_the_session_when_the_turn_ends(tmp_path):
+    hold = threading.Event()
+    f = _Factory([_Result()], hold=hold)
+    host = _host(tmp_path, f)
+    hold.set()
+    sid = _opened(host)
+    hold.clear()
+    job = host.turn(sid, "x")["job_id"]
+    host.shutdown()
+    assert host.session_status(sid)["state"] == "busy" and not f.made[0].closed
+    hold.set()
+    _wait(host, job)
+    assert host.session_status(sid)["state"] == "closed" and f.made[0].closed
+
+
+def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
+    gate = threading.Event()
+    made = []
+
+    def factory(entity_dir, *, on_event):
+        assert gate.wait(5)
+        made.append(_Stub(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory)
+    out = host.open("alpha")
+    host.shutdown()
+    gate.set()
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and "shut down" in st["error"]
+    assert host.session_status(out["session_id"])["state"] == "closed" and made[0].closed
+
+
+def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch):
+    f = _Factory([])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+
+    def no_thread(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.http_status == 503
+    with pytest.raises(ChatError) as e:
+        host.turn(sid, "x")
+    assert e.value.http_status == 503
+    assert host.session_status(sid)["state"] == "idle"
+    assert [s["session_id"] for s in host.listing()["sessions"]] == [sid]
+
+
+def test_a_hung_turn_does_not_keep_the_process_alive(tmp_path):
+    """L1 + L2, both run: worker threads joined at interpreter exit, so a turn that never returned
+    kept the server process alive after it stopped serving."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(f"""
+        import threading, time
+        from pathlib import Path
+        from levain.chat import ChatHost
+
+        class S:
+            def run_turn(self, m):
+                threading.Event().wait()   # never returns
+            def close(self):
+                pass
+
+        host = ChatHost({{"a": Path({str(tmp_path)!r})}},
+                        session_factory=lambda d, on_event: S())
+        out = host.open("a")
+        while host.session_status(out["session_id"])["state"] != "idle":
+            time.sleep(0.01)
+        host.turn(out["session_id"], "hang")
+        host.shutdown()
+        print("main done", flush=True)
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          timeout=20)
+    assert proc.returncode == 0 and "main done" in proc.stdout, proc.stderr
+
+
+def test_activity_lines_and_result_activity_are_size_bounded(tmp_path):
+    from levain.chat import MAX_ACTIVITY_LINES, MAX_LINE_CHARS
+
+    big = _Result(reply="r", tool_activity=["y" * (MAX_LINE_CHARS * 3)] * (MAX_ACTIVITY_LINES + 7))
+    f = _Factory([big])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    f.made[0].on_event("x" * (MAX_LINE_CHARS * 3))
+    st = _wait(host, host.turn(sid, "x")["job_id"])
+    assert all(len(line) <= MAX_LINE_CHARS + 2 for line in st["activity"])
+    acts = st["result"]["tool_activity"]
+    assert len(acts) == MAX_ACTIVITY_LINES and all(len(a) <= MAX_LINE_CHARS + 2 for a in acts)
+
+
+def test_chat_opens_headless_and_refuses_an_entity_that_may_reach_localhost(tmp_path, monkeypatch):
+    """HIGH-1 (L1): the routes authenticate nobody, so a session is not `interactive` (the design
+    gives that to an authenticated human). L2: an entity allowed to reach localhost could call the
+    chat routes from its own shell."""
+    import levain.chat as chat_mod
+    from levain.session import EntitySession
+
+    seen = {}
+    monkeypatch.setattr(EntitySession, "open", classmethod(
+        lambda cls, path, **kw: seen.update(kw) or _Stub(kw["on_event"], [])))
+    ok = _entity(tmp_path, "ok")
+    open_ = _entity(tmp_path, "open_", deny=None)
+    (open_ / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
+    host = ChatHost({"ok": ok, "open_": open_})
+    assert _wait(host, host.open("ok")["job_id"])["status"] == "done"
+    assert seen["mode"] == chat_mod.CHAT_DRIVE_MODE == "headless"
+    st = _wait(host, host.open("open_")["job_id"])
+    assert st["status"] == "failed" and "localhost" in st["error"]
+
+    from levain.web_server import _build_chat_host
+
+    built, err = _build_chat_host([ok, open_], model="m", base_url="u", api_key=None,
+                                  max_iterations=None)
+    assert built is None and "allow_localhost_outbound" in err
+
+
 def test_unknown_ids_read_as_unknown_or_404(tmp_path):
     host = _host(tmp_path, _Factory([]))
     assert host.job_status("nope") == {"job_id": "nope", "status": "unknown"}
@@ -559,12 +718,15 @@ def test_a_start_that_fails_after_its_hands_were_built_releases_them(
     register_tool(tools_mod.LEVAIN_HANDS_TOOL, FailingHands)
     request.addfinalizer(lambda: register_tool(tools_mod.LEVAIN_HANDS_TOOL, tools_mod.LevainHands))
     host = ChatHost({"alpha": _entity(tmp_path, "alpha")})
+    # Automatic collection off and no collect() here: the SDK holds the failure in a reference
+    # cycle, so only the HOST's own collection can release the hands (L1 review, run).
+    gc.disable()
     try:
         out = host.open("alpha")
         st = _wait(host, out["job_id"], 60)
         assert st["status"] == "failed" and "injected" in st["error"]
         assert built, "the injection never ran: the test would grade nothing"
-        gc.collect()
         assert [d for d in built if os.path.exists(d)] == []
     finally:
+        gc.enable()
         host.shutdown()
