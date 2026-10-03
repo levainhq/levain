@@ -152,10 +152,13 @@ def test_a_closed_shell_reports_closed_not_a_jewel_change(tmp_path, monkeypatch)
 def test_nothing_is_adopted_after_the_start(tmp_path, monkeypatch):
     """L3 r3 codex: a post-start settle could adopt a replacement as the baseline. The manifest is
     recorded once, before the start; a path recorded absent that appears later is a change."""
+    from levain.firing.confinement import _prepare_mountpoints
     absent = tmp_path / "creds" / "absent-token"
-    absent.parent.mkdir()
+    _prepare_mountpoints({str(absent): "file"})      # what the provider does before bwrap
     sh = _shell(tmp_path, monkeypatch, deny_files=(absent,))
-    absent.write_text("appeared after the start")
+    new = absent.with_name("absent-token.new")
+    new.write_text("rotated in after the start")
+    os.replace(new, absent)
     with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
 
@@ -211,9 +214,10 @@ def test_an_error_recording_the_manifest_refuses_before_any_start(tmp_path, monk
         raise PermissionError(13, "Permission denied", str(p))
 
     monkeypatch.setattr(conf, "_identity", boom)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)   # fail in _identity only
     started = []
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
-    with pytest.raises(ConfinementError, match="could not prepare or record"):
+    with pytest.raises(ConfinementError, match="could not (prepare or record|inspect)"):
         conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
     assert not started
 
@@ -302,3 +306,93 @@ def test_live_an_unchanged_session_keeps_running(tmp_path, monkeypatch):
         assert not sh.closed
     finally:
         sh.close()
+
+
+def test_a_directory_created_at_an_unmounted_root_is_watched(tmp_path, monkeypatch):
+    """codex L3 r4: an absent root under the read-only store, created as a directory between the plan
+    and the manifest, was neither mounted nor watched (is_dir() dropped it)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    entity = _entity(tmp_path)
+    vault = entity / ".levain" / "vaultdir"
+    policy = build_policy(entity, extra_deny_read_write=(vault,))
+    mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
+    assert str(vault.resolve()) in unmounted
+    sh = _BwrapShell(policy=policy, argv=["/bin/false"], cwd=tmp_path, env={},
+                     manifest={q: _identity(Path(q)) for q in [*mounted, *unmounted]})
+    vault.mkdir()
+    with pytest.raises(ConfinementError, match=_CHANGED):
+        sh.run("echo x")
+
+
+def test_an_unreachable_path_costs_nothing_until_it_changes(tmp_path, monkeypatch):
+    """codex L3 r4: a socket in another user's runtime dir made lstat raise EACCES and refused every
+    spawn. It is recorded as unreachable and only a change closes the shell."""
+    if os.geteuid() == 0:
+        pytest.skip("root can stat anything")
+    from levain.firing.confinement import _UNREACHABLE
+    locked = tmp_path / "otheruser"
+    locked.mkdir()
+    sock = locked / "docker.sock"
+    locked.chmod(0o000)
+    try:
+        assert _identity(sock) == _UNREACHABLE
+        monkeypatch.setenv("HOME", str(tmp_path))
+        policy = build_policy(_entity(tmp_path))
+        sh = _BwrapShell(policy=policy, manifest={str(sock): _UNREACHABLE},
+                         argv=["/bin/false"], cwd=tmp_path, env={})
+        with pytest.raises(ConfinementError, match="not running"):   # unchanged: base run
+            sh.run("echo x")
+        sh2 = _BwrapShell(policy=policy, manifest={str(sock): _UNREACHABLE},
+                          argv=["/bin/false"], cwd=tmp_path, env={})
+        locked.chmod(0o755)
+        with pytest.raises(ConfinementError, match=_CHANGED):
+            sh2.run("echo x")
+    finally:
+        locked.chmod(0o755)
+
+
+def test_only_tmpfs_and_dev_null_targets_are_created():
+    """codex/complement L3 r4: a self-bind or a --*-try bind target must never be created."""
+    class _P:
+        deny_files = deny_write_files = own_memory_files = sqlite_sidecars = deny_read_write = ()
+        config_file = None
+
+    argv = ["--tmpfs", "/a/t", "--ro-bind", "/dev/null", "/a/f", "--ro-bind", "/a/s", "/a/s",
+            "--bind-try", "/a/c", "/a/c", "--ro-bind-try", "/dev/null", "/a/g", "--bind", "/a/p", "/a/p"]
+    mounted, _ = _mount_plan_paths(argv, _P())
+    assert mounted == {"/a/t": "dir", "/a/f": "file", "/a/s": None, "/a/c": None,
+                       "/a/g": None, "/a/p": None}
+
+
+def test_a_stub_under_an_absent_directory_is_created_with_its_parents(tmp_path):
+    """complement L3 r4: bwrap created missing parents; without them bash was refused."""
+    from levain.firing.confinement import _prepare_mountpoints
+    f = tmp_path / "config" / "gh" / "hosts.yml"
+    d = tmp_path / "x" / "y" / "store"
+    _prepare_mountpoints({str(f): "file", str(d): "dir", str(tmp_path / "skip"): None})
+    assert f.is_file() and f.stat().st_size == 0 and d.is_dir()
+    assert not (tmp_path / "skip").exists()
+
+
+def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_path, monkeypatch):
+    """codex L3 r4: an absent root created as a directory between the plan and the manifest was
+    recorded in its new state, unmounted, and never seen as a change; the shell could read it."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    entity = _entity(tmp_path)
+    vault = entity / ".levain" / "vaultdir"
+    real_plan = conf._bwrap_plan
+
+    def plan_then_race(policy):
+        out = real_plan(policy)
+        vault.mkdir()                      # the host creates it right after the plan read the disk
+        return out
+
+    monkeypatch.setattr(conf, "_bwrap_plan", plan_then_race)
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="changed while the floor was being planned"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(entity, extra_deny_read_write=(vault,)))
+    assert not started

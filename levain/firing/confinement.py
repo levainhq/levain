@@ -3235,36 +3235,47 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
+_UNREACHABLE = (-1, -1, -1)   # lstat refused (EACCES/EPERM): watched for becoming reachable
+
+
 def _identity(p: Path) -> tuple[int, int, int] | None:
-    """``(st_dev, st_ino, file type)`` of ``p`` without following a link, or None if it is absent.
-    Any other ``lstat`` error propagates (the caller refuses)."""
+    """``(st_dev, st_ino, file type)`` of ``p`` without following a link, None if it is absent, or
+    ``_UNREACHABLE`` if this user cannot even stat it (another user's runtime directory: the plan
+    leaves such a path alone, so it must not cost the shell either; L3 r4). Any other ``lstat``
+    error propagates (the caller refuses)."""
     try:
         st = os.lstat(p)
     except FileNotFoundError:
         return None
+    except PermissionError:
+        return _UNREACHABLE
     return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
 
 
 def _describe(ident: tuple[int, int, int] | None) -> str:
     if ident is None:
         return "absent"
+    if ident == _UNREACHABLE:
+        return "unreachable"
     kind = {stat.S_IFREG: "file", stat.S_IFDIR: "dir", stat.S_IFLNK: "symlink"}.get(ident[2], "other")
     return f"{kind} inode {ident[1]}"
 
 
 def _mount_plan_paths(
     argv: list[str], policy: CrownJewelsPolicy
-) -> tuple[dict[str, str], list[str]]:
+) -> tuple[dict[str, str | None], list[str]]:
     """What the bwrap plan covers on the host: ``(mounted, unmounted)``.
 
-    ``mounted`` maps each host path the plan mounts over to the kind of mountpoint it needs if absent
-    (``"dir"`` for a tmpfs or a directory bind, ``"file"`` for a ``/dev/null`` bind). ``unmounted`` is
+    ``mounted`` maps each host path the plan mounts over to the mountpoint the provider may create if
+    it is absent: ``"dir"`` for a tmpfs, ``"file"`` for a ``/dev/null`` bind, or None for a bind it must
+    never create (a self-bind of something that exists, a ``--*-try`` bind the plan lets bwrap skip,
+    an ancestor pin the provider makes separately) (L3 r4). ``unmounted`` is
     every jewel path the policy names that the plan does NOT mount (an absent jewel under a read-only
     store, a SQLite sidecar absent at spawn): nothing covers those, so they are watched for appearing.
     A path strictly inside a tmpfs root is left out of both, by EXACT containment: the tmpfs hides the
     host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
     (L3 2026-10-03)."""
-    mounted: dict[str, str] = {}
+    mounted: dict[str, str | None] = {}
     tmpfs: list[Path] = []
     i = 0
     while i < len(argv):
@@ -3276,7 +3287,8 @@ def _mount_plan_paths(
         elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
             src, dst = argv[i + 1], argv[i + 2]
             if dst != "/":
-                mounted.setdefault(dst, "file" if src == "/dev/null" else "dir")
+                kind = "file" if src == "/dev/null" and not op.endswith("-try") else None
+                mounted.setdefault(dst, kind)
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
             i += 2
@@ -3288,16 +3300,29 @@ def _mount_plan_paths(
         return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
 
     mounted = {q: k for q, k in mounted.items() if not hidden(q)}
-    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
-             *policy.sqlite_sidecars, *[p for p in policy.deny_read_write if not p.is_dir()]]
-    if policy.config_file is not None:
-        named.append(policy.config_file)
-    unmounted = [q for q in dict.fromkeys(str(p) for p in named)
-                 if q not in mounted and not hidden(q)]
+    unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
     return mounted, unmounted
 
 
-def _prepare_mountpoints(mounted: dict[str, str]) -> None:
+def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
+    """Every jewel path the policy names, spelled as the plan spells it (real parent, final component
+    unresolved). EVERY deny_read_write root, not only file-shaped ones: an absent root created as a
+    directory would otherwise be neither mounted nor watched (codex L3 r4)."""
+    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
+             *policy.sqlite_sidecars, *policy.deny_read_write]
+    if policy.config_file is not None:
+        named.append(policy.config_file)
+
+    def spelled(p: Path) -> str:
+        try:
+            return str(p.parent.resolve() / p.name)
+        except (OSError, RuntimeError):
+            return str(p)
+
+    return list(dict.fromkeys(spelled(Path(p)) for p in named))
+
+
+def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
     """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
@@ -3305,8 +3330,11 @@ def _prepare_mountpoints(mounted: dict[str, str]) -> None:
     which is still recorded before bwrap mounts over it."""
     for q, kind in mounted.items():
         p = Path(q)
-        if os.path.lexists(p):
+        if kind is None or os.path.lexists(p):
             continue
+        # bwrap would create missing parents too; without them a jewel under an absent directory
+        # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if kind == "dir":
             p.mkdir(mode=0o700, exist_ok=True)
         else:
@@ -3451,6 +3479,16 @@ class BwrapProvider(ConfinementProvider):
                 "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
+        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
+        # and the manifest (an absent root created as a directory, say) would be recorded in its new
+        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
+        try:
+            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
+                "(fail-closed)."
+            ) from exc
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
         argv = argv + ["/bin/bash", "--noprofile", "--norc"]
@@ -3475,6 +3513,12 @@ class BwrapProvider(ConfinementProvider):
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
                 "bash hands (fail-closed)."
             ) from exc
+        moved = [q for q in unmounted if q in before_plan and manifest.get(q) != before_plan[q]]
+        if moved:
+            raise ConfinementError(
+                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
+                "— refusing to grant bash hands (fail-closed). Try again."
+            )
         shell = _BwrapShell(
             policy=policy,
             manifest=manifest,
