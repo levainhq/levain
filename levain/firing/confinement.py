@@ -3235,6 +3235,25 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
+def _file_type(p: Path) -> str:
+    """``lstat`` file type of ``p`` as a word (``"absent"`` if missing, ``"unknown"`` if unstattable)."""
+    try:
+        mode = os.lstat(p).st_mode
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    for test, word in ((stat.S_ISREG, "file"), (stat.S_ISDIR, "dir"), (stat.S_ISLNK, "symlink")):
+        if test(mode):
+            return word
+    return "other"
+
+
+def _file_shaped_jewels(policy: CrownJewelsPolicy) -> list[Path]:
+    """The jewels the SQLite check classifies: file-shaped read+write roots and ``deny_files``."""
+    return [p for p in policy.deny_read_write if not p.is_dir()] + list(policy.deny_files)
+
+
 class _BwrapShell(SandboxedShell):
     """A :class:`SandboxedShell` that re-runs the spawn-time SQLite jewel check before every command
     (spore-1312, rec C, ruled by Phill 2026-10-03).
@@ -3243,8 +3262,11 @@ class _BwrapShell(SandboxedShell):
     A jewel that was an empty file at spawn and is initialised as a WAL database afterwards was RUN on
     Linux at 3838801: the live shell read a row out of the host's ``-wal``. So the same check runs
     here at the point each command is issued; if a jewel has become a database (or an unreadable file
-    in a writable directory) the shell is closed, which kills its process group, and the command is
-    refused. The next spawn is refused by the spawn check itself, so bash stays off until the condition
+    in a writable directory), a SQLite sidecar has appeared that was not there (so not mounted) at
+    spawn, or a jewel's file type changed (unlinked, replaced by a link), the shell is closed, which
+    kills its process group, and the command is refused. RUN on Linux before each arm was added: a
+    host that unlinked the database while its connection kept the ``-wal`` let the next command read
+    the ``-wal`` (L3 codex 2026-10-03). The next spawn is refused by the spawn check itself, so bash stays off until the condition
     the refusal names is cleared. A filesystem error while re-checking refuses the same way.
     NOT covered: a command already running when the jewel changes, or one backgrounded earlier, can
     read a ``-wal``/``-journal`` or plant one that SQLite replays, for as long as it runs; so can a
@@ -3263,11 +3285,42 @@ class _BwrapShell(SandboxedShell):
     ) -> None:
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
+        self._sidecars_at_spawn: set[Path] = set()
+        self._jewel_types: dict[Path, str] = {}
+
+    def start(self) -> "SandboxedShell":
+        # Snapshot AFTER the sandbox exists: bwrap creates an empty stub for an absent write-denied
+        # path as it mounts, so a snapshot taken before start would read that stub as a change.
+        # What is recorded is what the mounts covered: the sidecar names present (only those were
+        # mounted) and each file-shaped jewel's file type.
+        shell = super().start()
+        pol = self._jewel_policy
+        self._sidecars_at_spawn = {p for p in pol.sqlite_sidecars if os.path.lexists(p)}
+        self._jewel_types = {p: _file_type(p) for p in _file_shaped_jewels(pol)}
+        return shell
+
+    def _recheck(self) -> None:
+        _refuse_plantable_sqlite_jewels(self._jewel_policy)
+        for p in self._jewel_policy.sqlite_sidecars:
+            if p not in self._sidecars_at_spawn and os.path.lexists(p):
+                raise ConfinementError(
+                    f"{p} appeared after the shell started; it was not mounted, so the shell could "
+                    "read or plant it."
+                )
+        for p, was in self._jewel_types.items():
+            now = _file_type(p)
+            if now != was:
+                raise ConfinementError(
+                    f"{p} changed type since the shell started ({was} -> {now}); its mount no longer "
+                    "describes what is on disk."
+                )
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
+        if self.closed:
+            return super().run(command, timeout=timeout)   # the base refusal names the real reason
         try:
-            _refuse_plantable_sqlite_jewels(self._jewel_policy)
-        except (ConfinementError, OSError, RuntimeError) as exc:
+            self._recheck()
+        except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
             # A filesystem error while re-inspecting is a refusal too, as it is at spawn
             # (_bwrap_plan): a raw OSError would crash the tool call and leave the shell alive.
             self.close()
