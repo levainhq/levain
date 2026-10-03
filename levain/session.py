@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from levain.firing.encoding import scan_text
 from levain.firing.agent_reply import (
     LEVAIN_ACT_NUDGE,
     finish_message,
@@ -447,7 +448,13 @@ def latest_agent_text(events) -> str | None:
     ``MessageEvent`` (``message_event_text``) or an ``ActionEvent(FinishAction)``
     (``finish_message`` — the SDK routes a no-tool answer through the built-in ``finish`` tool,
     not a MessageEvent). The boundary skips the SDK's synthetic corrective nudge so a
-    weak-model turn keys on the real question. ``None`` when there is no agent text yet."""
+    weak-model turn keys on the real question. ``None`` when there is no agent text yet.
+
+    The text goes through the same mojibake shield as every capture
+    (:func:`levain.firing.encoding.scan_text`): provably double-decoded UTF-8 is repaired and
+    anything else is left as it arrived. Without it the person read the damaged reply while the
+    store held the repaired one (UD-1, RUN on the released 0.5.4 via ``levain serve --chat``:
+    ``café —`` came back as ``cafÃ© â\x80\x94``)."""
     evs = list(events)
     start = turn_start(evs)
     parts: list[str] = []
@@ -459,7 +466,7 @@ def latest_agent_text(events) -> str | None:
             text = humanize_finish_json(text)  # spore-297: unwrap finish/think-as-JSON-text
             if text not in parts:  # dedup a finish echoing a prior MessageEvent
                 parts.append(text)
-    return "\n".join(parts) if parts else None
+    return scan_text("\n".join(parts)).text if parts else None
 
 
 def _one_turn(method: Callable[..., TurnResult]) -> Callable[..., TurnResult]:

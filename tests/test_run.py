@@ -168,6 +168,23 @@ def test_latest_agent_text_joins_agent_messages_of_latest_turn():
     assert _latest_agent_text(events) == "first part\nsecond part"
 
 
+def test_latest_agent_text_repairs_provable_mojibake_as_capture_does():
+    """UD-1, RUN on the released 0.5.4 (`levain serve --chat`, glm-5.2 via Ollama): the reply came
+    back double-decoded while the captured episode was repaired by the capture shield."""
+    from levain.firing.contract import CaptureRequest
+    broken = "caf\u00c3\u00a9 \u00e2\x80\x94 done"
+    events = [_Event("user", ["say it"]), _Event("agent", [broken])]
+    shown = _latest_agent_text(events)
+    assert shown == "caf\u00e9 \u2014 done"
+    assert shown == CaptureRequest(content=broken).content   # shown and stored agree
+
+
+def test_latest_agent_text_leaves_clean_non_ascii_and_unprovable_text_alone():
+    for text in ("caf\u00e9 \u2014 real", "\u65e5\u672c\u8a9e", "orphan \u00e2 lead"):
+        events = [_Event("user", ["q"]), _Event("agent", [text])]
+        assert _latest_agent_text(events) == text
+
+
 def test_latest_agent_text_excludes_non_agent_sources():
     # system / environment (the vagus inject rides source="environment") must never echo back.
     events = [
