@@ -741,22 +741,25 @@ def _anneal_trusted_dbs(path: Path) -> list[str]:
     a ``stores`` list whose entries carry string ``db`` and ``root``. A file anneal would reject loads
     no store, so it protects nothing and must not widen the floor either (codex L3 2026-10-03: an
     untrusted file could otherwise hide a system directory). There is no size cap, because anneal has
-    none and a skipped valid file would leave its stores open. A trust path that is not a regular file
-    (a FIFO, a device) REFUSES the floor: anneal does not check the type and could read stores from it,
-    and this cannot read it without blocking (codex L3 r2)."""
+    none and a skipped valid file would leave its stores open. Checks run in anneal's order: owner and
+    mode first (anneal rejects, so nothing to protect), then type. A directory loads nothing in anneal
+    either. Any other non-regular file (a FIFO, a device) REFUSES the floor: anneal does not check the
+    type and could read stores from it, and this cannot read it without blocking (codex L3 r2, r3)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
     except OSError:
         return []
     try:
         st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            return []
+        if stat.S_ISDIR(st.st_mode):
+            return []
         if not stat.S_ISREG(st.st_mode):
             raise ConfinementError(
                 f"the anneal trust path {path} is not a regular file, so the stores it may name cannot "
                 "be read — refusing to build the floor (fail-closed). Replace it with a regular file."
             )
-        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
-            return []
         pst = os.stat(os.path.dirname(os.path.abspath(path)))
         if pst.st_uid != os.geteuid() or pst.st_mode & 0o022:
             return []
@@ -788,10 +791,12 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
     through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
     ``~/.anneal-projects`` subtree still applies.
 
-    Both the db's real directory and, for a symlinked db, its lexical directory are denied, whether or
-    not they exist yet: a skipped absent directory could be created by the entity and filled with a
-    store anneal already trusts (codex L3 r2). On Linux an absent one is created as bwrap's mountpoint,
-    and one under a directory this user cannot write refuses bash. The entity's own
+    Both the db's real directory and, for a symlinked db, its lexical directory are denied. An absent
+    one is denied too when this user could create it (its nearest existing ancestor is writable), since
+    the entity could create it and fill it with a store anneal already trusts (codex L3 r2); on Linux
+    it becomes bwrap's mountpoint. An absent one nobody here can create is skipped, so stale entries on
+    unmounted or root-owned paths neither abort bwrap nor leave directories behind (L3 r3). More than
+    a bounded number of reachable listed stores refuses the floor. The entity's own
     canonical store (``<entity>/.levain/memory.db``) is skipped, since ``own_memory_files`` governs it.
     ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
     filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
@@ -814,6 +819,7 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
                 "floor (fail-closed)."
             ) from exc
     canonical = (entity_dir / ".levain" / "memory.db").resolve()
+    listed = 0
     shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
     out: list[Path] = []
     seen: set[Path] = set()
@@ -829,6 +835,15 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
             except (OSError, RuntimeError, ValueError):
                 continue
             for d in sorted(dirs):
+                if not d.exists() and not _creatable_by_this_user(d):
+                    continue   # nobody here can create it, so nothing can be planted (stale entries)
+                listed += 1
+                if listed > _MAX_LISTED_STORES:
+                    raise ConfinementError(
+                        f"the anneal trust files list more than {_MAX_LISTED_STORES} store "
+                        "directories this user could reach — refusing to build the floor "
+                        "(fail-closed). Prune the trust files."
+                    )
                 unsafe = (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
                           or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
                           or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
@@ -843,6 +858,21 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
                     seen.add(d)
                     out.append(d)
     return out
+
+
+_MAX_LISTED_STORES = 256
+
+
+def _creatable_by_this_user(d: Path) -> bool:
+    """True if ``d`` does not exist and its nearest existing ancestor is writable by this user, so
+    this user (and so a confined shell) could create it."""
+    for a in d.parents:
+        try:
+            if a.exists():
+                return os.access(a, os.W_OK)
+        except OSError:
+            return False
+    return False
 
 
 def _inside_by_identity(container: Path, p: Path, *, include_self: bool = True) -> bool:
@@ -1008,7 +1038,8 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
-    subtrees.extend(_trust_listed_stores(home, ed, ws))
+    listed_dirs = _trust_listed_stores(home, ed, ws)
+    subtrees.extend(listed_dirs)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
@@ -1187,6 +1218,8 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
+        if jewel in listed_dirs:
+            continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
         if not jewel.is_dir():

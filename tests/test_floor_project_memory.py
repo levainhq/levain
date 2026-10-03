@@ -437,3 +437,92 @@ def test_live_a_moved_project_home_found_through_its_trust_file_is_refused(
         _refused(sh, f"echo PLANT >> '{moved}/levain-v2/memory.continuity.md'")
         _refused(sh, f": >> '{trust}'")
     assert not (moved / "levain-v2" / "probe").exists()
+
+
+# --- L3 r3: stale entries, bounds, odd trust paths, a floor both hands refuse --------------------
+
+
+def test_an_absent_store_nobody_here_can_create_is_skipped(home, tmp_path):
+    """A stale entry on an unmounted or root-owned path: the entity cannot create it either, so it
+    is skipped rather than aborting bwrap or leaving a directory behind (L3 r3)."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        _trust(home / ".anneal-memory" / "derive-trust.json", locked / "gone" / "memory.db")
+        policy = build_policy(_entity(home))
+        assert (locked / "gone").resolve() not in policy.deny_read_write
+    finally:
+        locked.chmod(0o755)
+
+
+def test_more_reachable_stores_than_the_bound_refuses(home, tmp_path):
+    from levain.firing.confinement import _MAX_LISTED_STORES
+    t = _trust(home / ".anneal-memory" / "derive-trust.json")
+    t.write_text(json.dumps({"version": 2, "stores": [
+        {"db": str(tmp_path / f"s{i}" / "memory.db"), "root": "/r"}
+        for i in range(_MAX_LISTED_STORES + 1)]}))
+    with pytest.raises(ConfinementError, match="Prune the trust files"):
+        build_policy(_entity(home))
+
+
+def test_a_directory_at_a_trust_path_loads_nothing_and_does_not_refuse(home):
+    (home / ".anneal-memory" / "derive-trust.json").mkdir(parents=True)
+    (home / ".anneal-memory").chmod(0o755)
+    build_policy(_entity(home))
+
+
+def test_a_fifo_anneal_would_reject_for_its_mode_does_not_refuse(home, monkeypatch):
+    fifo = home / "trust.fifo"
+    os.mkfifo(fifo)
+    fifo.chmod(0o662)   # group-writable: anneal rejects it before reading
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
+    build_policy(_entity(home))
+
+
+def test_a_refresh_that_fails_refuses_both_hands_and_stays_refused(home, tmp_path):
+    """codex L3 r3: the refreshed floor was published only after a successful shell start, so a late
+    unsafe entry refused bash while the file editor kept the old floor."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor, _SharedFloor
+    from openhands.tools.file_editor import FileEditorAction
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    editor = CrownJewelsFileEditorExecutor(floor=floor)
+    ok = editor(FileEditorAction(command="create", path=str(entity / "workspace" / "a.txt"), file_text="x"))
+    assert not ok.is_error
+    trust = _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
+    refused = editor(FileEditorAction(command="create", path=str(entity / "workspace" / "b.txt"), file_text="x"))
+    assert refused.is_error and "could not be refreshed" in refused.text
+    assert floor.refusal is not None
+    trust.unlink()                        # fixing the trust file does not un-refuse this conversation
+    with pytest.raises(ConfinementError):
+        floor.refresh()
+
+
+def test_the_file_editor_alone_picks_up_a_late_store(home, tmp_path):
+    """A conversation that never uses bash still refreshes (complement L3 r3)."""
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor, _SharedFloor
+    from openhands.tools.file_editor import FileEditorAction
+    floor = _SharedFloor(build_policy(_entity(home)))
+    editor = CrownJewelsFileEditorExecutor(floor=floor)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    obs = editor(FileEditorAction(command="view", path=str(late / "levain-v2" / "memory.continuity.md")))
+    assert obs.is_error and "crown-jewels floor" in obs.text
+
+
+def test_a_bash_refresh_failure_refuses_the_shared_floor_before_any_spawn(home):
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    bash = SandboxedBashExecutor(floor=floor)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        bash._ensure_shell()
+    assert floor.refusal is not None
+
+
+def test_a_listed_store_directory_gets_no_sidecar_names(home, tmp_path):
+    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "future" / "memory.db")
+    policy = build_policy(_entity(home))
+    assert not [p for p in policy.sqlite_sidecars if p.name.startswith("future-")]

@@ -236,7 +236,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "_lock")
+    __slots__ = ("_policy", "_lock", "_refusal")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -247,6 +247,33 @@ class _SharedFloor:
     def __init__(self, policy: CrownJewelsPolicy) -> None:
         self._policy = policy
         self._lock = threading.Lock()
+        self._refusal: str | None = None
+
+    @property
+    def refusal(self) -> str | None:
+        """Why this conversation's floor can no longer be trusted, or None. Sticky once set."""
+        return self._refusal
+
+    def refuse(self, reason: str) -> None:
+        """Mark the floor unusable for BOTH hands (spore-1308 follow-on, codex L3 2026-10-03): a refresh
+        that fails, e.g. on a store a trust file started naming in an unsafe place, used to leave the
+        file editor on the old floor while only bash refused."""
+        with self._lock:
+            if self._refusal is None:
+                self._refusal = reason
+
+    def refresh(self) -> CrownJewelsPolicy:
+        """Re-derive the evolving denies (sockets, trust-listed stores) and absorb them, before a hand
+        acts. A failure refuses the floor and re-raises."""
+        if self._refusal is not None:
+            raise ConfinementError(self._refusal)
+        try:
+            refreshed = refresh_socket_denies(self.policy)
+        except ConfinementError as exc:
+            self.refuse(str(exc))
+            raise
+        self.absorb(refreshed)
+        return self.policy
 
     @property
     def policy(self) -> CrownJewelsPolicy:
@@ -402,7 +429,15 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         action: "FileEditorAction",
         conversation: Any = None,
     ) -> FileEditorObservation:
-        reason = crown_jewel_reason(self._policy, action.path)
+        try:
+            policy = self._floor.refresh()
+        except ConfinementError as exc:
+            return FileEditorObservation.from_text(
+                text=f"REFUSED (crown-jewels floor could not be refreshed): {exc}",
+                command=action.command,
+                is_error=True,
+            )
+        reason = crown_jewel_reason(policy, action.path)
         if reason is not None:
             return FileEditorObservation.from_text(
                 text=(
@@ -574,7 +609,10 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # (A comment here once claimed the K4c branch's BwrapProvider inherited this by
                 # construction; it overrode `spawn_shell` directly and did not. The port fixed it,
                 # and `test_no_shipped_provider_overrides_spawn_shell` holds it.)
-                refreshed = refresh_socket_denies(self._floor.policy)
+                # Refreshed and PUBLISHED to the shared floor before the start, so the file editor
+                # holds the same denies even if the start fails; a refresh failure refuses both hands
+                # (codex L3 2026-10-03).
+                refreshed = self._floor.refresh()
                 candidate = provider.spawn_shell(
                     refreshed, default_timeout=self._default_timeout
                 )
