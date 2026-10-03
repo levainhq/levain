@@ -999,3 +999,36 @@ def test_a_tool_that_started_and_raised_stays_listed_and_reused_call_ids_pair_by
     skip = ParallelToolExecutor(max_workers=1).execute_batch([step2], lambda a: [], None, token)[0]
     events = [_Event("user", ["build"]), step1, raised, step2, *skip]
     assert turn_tool_activity(events, tmp_path / "workspace") == ["⚙ terminal: make"]
+
+
+@pytest.mark.parametrize("fault", ["raise", "timeout"])
+def test_a_turn_that_faults_partway_still_lists_what_ran(tmp_path: Path, fault):
+    """A turn whose run raised (or hit its TurnTimeout) after a tool ran returned an empty activity,
+    and the chat host settles a job's activity from the result on every finish: the command that
+    ran would vanish from the job. The fault paths report what the turn's events show."""
+    pytest.importorskip("openhands.tools.terminal")
+    from levain.firing.deadline import TurnTimeout
+    from levain.session import EntitySession
+
+    ran = _sdk_terminal_action("make", "c1")
+
+    class _Conv:
+        def __init__(self):
+            self.state = type("S", (), {"events": [_Event("user", ["build"])]})()
+
+        def send_message(self, message):
+            pass
+
+        def run(self):
+            self.state.events.append(ran)
+            raise TurnTimeout(5.0) if fault == "timeout" else RuntimeError("model exploded")
+
+    sess = EntitySession(
+        entity_dir=tmp_path, binding=object(), conversation=_Conv(),
+        workspace=tmp_path / "workspace", model_label="m", with_tools=False, bash_ok=False,
+        gate_mode="ungated",
+    )
+    result = sess.run_turn("build")
+    assert sess.conversation.state.events[-1] is ran        # the run (and its fault) happened
+    assert result.error and result.timed_out is (fault == "timeout")
+    assert result.tool_activity == ["⚙ terminal: make"]

@@ -1008,10 +1008,14 @@ class EntitySession:
             # record. That the bound covers capture too is deliberate — capture opens the store and
             # can itself block, so exempting it would leave a hole in the very bound being added.
             return TurnResult(
-                reply=None, tool_activity=[], error=str(exc), nudged=nudged, timed_out=True,
+                reply=None, tool_activity=self._activity_after_fault(), error=str(exc),
+                nudged=nudged, timed_out=True,
             )
         except Exception as exc:  # noqa: BLE001 — a failed turn is a RESULT, not a crash
-            return TurnResult(reply=None, tool_activity=[], error=str(exc), nudged=nudged)
+            return TurnResult(
+                reply=None, tool_activity=self._activity_after_fault(), error=str(exc),
+                nudged=nudged,
+            )
 
         events = self.conversation.state.events
         return TurnResult(
@@ -1108,6 +1112,17 @@ class EntitySession:
         except Exception:  # noqa: BLE001 — a display filter must never break a turn
             pass
         return turn_tool_activity(events, self.workspace)
+
+    def _activity_after_fault(self) -> list[str]:
+        """Activity for a turn that faulted partway: tools that ran before the fault did run, and an
+        empty list would hide them from any driver that shows the result's activity. Unlike
+        :meth:`_executed_activity` it does not subtract actions that have no observation: after a
+        fault such an action may have been in flight, and partly run, so it stays listed. Never
+        raises: an unreadable event log gives an empty list."""
+        try:
+            return turn_tool_activity(self.conversation.state.events, self.workspace)
+        except Exception:  # noqa: BLE001 — a display filter must never break a turn
+            return []
 
     def _gate_status(self) -> bool | None:
         """AUTHORITY: did the runtime stop this turn at the gate? ``None`` = undeterminable.

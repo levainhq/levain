@@ -729,9 +729,9 @@ class _Handler(GuardedHandler):
 
         if path in _CHAT_GET_ROUTES and self.server.chat_host is not None:
             if not self._chat_token_valid():
-                self._send_json({"error": "chat_token", "message": (
+                self._send_chat(({"error": "chat_token", "message": (
                     f"this route needs the chat token printed when `levain serve --chat` started, "
-                    f"sent as {_CHAT_TOKEN_HEADER}")}, 403)
+                    f"sent as {_CHAT_TOKEN_HEADER}")}, 403), head=head)
                 return
             self._send_chat(self._chat_get(path, self.server.chat_host), head=head)
             return

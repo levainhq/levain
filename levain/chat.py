@@ -13,15 +13,17 @@ through ``build_entity_agent``. This is the K1-part-2 requirement of the approve
 client-supplied spec would be a client writing its own floor. There is no code path here that
 accepts one, which is a stronger claim than a validator that refuses one.
 
-**The drive mode is ``headless``, decided by the server.** The binding design (section 7.1) gives
-``interactive`` to an *authenticated human at a chat client*. These routes authenticate nobody (any
-local process that passes the loopback, Host and CSRF checks can drive a session, and activity is
-pull-only, so nothing guarantees anyone reads it), so the precondition is not met and the server
-does not claim it. In ``headless`` an entity whose ``efferent_gate`` is ``"auto"`` is GATED: a turn
-that proposes an efferent action halts, and the client approves or rejects it. The crown-jewels cred
-floor is the same for ``headless`` as for ``interactive`` (:mod:`levain.firing.drive`), so this
-choice moves the gate and nothing else. (L1 review 2026-10-03; if the chat routes gain an
-authenticated client, that is the moment to revisit it.)
+**The drive mode is ``headless``, decided by the server, and a chat token does not change that.**
+The binding design (section 7.1) gives ``interactive`` to an *authenticated human at a chat client*.
+The routes take a per-launch chat token (``spore-1310``), but a token authenticates a holder, not a
+person: whatever read it from the server's output (a script, a supervisor, a log reader) can drive a
+session, and activity is pull-only, so nothing guarantees a human reads it. The precondition is not
+met, so the server does not claim it, and a client that presents the token does not earn
+``interactive``. In ``headless`` an entity whose ``efferent_gate`` is ``"auto"`` is GATED: a turn that
+proposes an efferent action halts, and the client approves or rejects it. The crown-jewels cred floor
+is the same for ``headless`` as for ``interactive`` (:mod:`levain.firing.drive`), so this choice moves
+the gate and nothing else. (L1 review 2026-10-03; revisit only if a chat client can show that a
+present human, not just a token holder, is driving.)
 
 **An entity that may connect to localhost is refused.** With ``allow_localhost_outbound`` its shell
 could call these routes itself and approve its own held actions. Every other entity's shell is denied
@@ -31,13 +33,17 @@ between the two reads (codex L3 r1) and only the second is the floor that will r
 
 **A session id is a capability.** ``/chat.json`` lists sessions by entity and state, never by id: the
 id is returned only to the caller that opened the session, and every operation on a session names
-it. Under no authentication this is what keeps one local caller from approving another's held
-actions without being handed the id (L3 r1, complement).
+it. Every client of one launch presents the same chat token, so the token cannot tell them apart;
+the id is what keeps one caller from approving another's held actions without being handed it (L3
+r1, complement).
 
 **Activity is what was ISSUED; the result is what RAN.** A job's ``activity`` grows as the entity
-issues tool actions, which for a gated action is before the gate stops it, so while the turn runs a
-poll can show a line for an action that will be held. When the turn finishes gated, ``activity`` is
-replaced by the result's ``tool_activity`` (held actions removed); the held ones are in ``pending``.
+issues tool actions, which is before the gate holds one and before a stop request skips one, so while
+the turn runs a poll can show a line for an action that never runs. When the turn finishes, however
+it finishes (normally, gated, timed out or with an error), ``activity`` is replaced by the result's
+``tool_activity``, which leaves out held actions (they are in ``pending``) and actions a stop request
+skipped. After a fault it keeps an action that may have been in flight, since that one may have run.
+A job that failed without a result keeps what was streamed, and carries an ``error`` instead.
 
 **A turn's wall-clock bound is a STOP REQUEST, honoured at the next step boundary.** Each turn,
 approval or refusal job has a watcher; at ``turn_seconds`` it marks the job ``deadline_hit`` and
@@ -632,10 +638,12 @@ class ChatHost:
     ) -> None:
         payload: dict[str, Any] | None = None
         error: str | None = None
+        cut = 0
         try:
             try:
                 result = call(rec.session)
                 payload = _turn_payload(result)
+                cut = max(0, len(result.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
                 error = f"{type(exc).__name__}: {exc}"
         finally:
@@ -659,10 +667,9 @@ class ChatHost:
                 job.status, job.error = "failed", error
             else:
                 job.status, job.result = "done", payload
-                if payload["gated"]:
-                    # The result's tool_activity has the held actions removed; it replaces what was
-                    # streamed, so nothing held stays listed as work (module docstring).
-                    job.activity, job.dropped = list(payload["tool_activity"]), 0
+                # The result's tool_activity leaves out held and stop-skipped actions; it replaces
+                # what was streamed on every finish (module docstring).
+                job.activity, job.dropped = list(payload["tool_activity"]), cut
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
                 elif payload["error"] is not None:

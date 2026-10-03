@@ -133,10 +133,16 @@ def test_open_then_turn_streams_activity_and_returns_the_turn_result(tmp_path):
     assert host.session_status(sid)["state"] == "idle"
     assert host.session_status(sid)["model_label"] == "stub-model"
 
+    hold = f.made[0].hold = threading.Event()
     job = host.turn(sid, "say hi")
+    deadline = time.monotonic() + 5
+    while host.job_status(job["job_id"])["activity"] != ["⚙ terminal: run_turn"]:
+        assert time.monotonic() < deadline, "the issued line never streamed"
+        time.sleep(0.01)
+    hold.set()
     st = _wait(host, job["job_id"])
     assert st["status"] == "done" and st["kind"] == "turn"
-    assert st["activity"] == ["⚙ terminal: run_turn"]
+    assert st["activity"] == ["⚙ terminal: ls"]       # settled: the result's list of what ran
     assert st["result"]["reply"] == "hi there" and st["result"]["ok"] is True
     assert st["result"]["exit_code"] == 0
     assert f.made[0].calls == [("run_turn", "say hi")]
@@ -466,6 +472,7 @@ def test_activity_lines_and_result_activity_are_size_bounded(tmp_path):
     assert all(len(line) <= MAX_LINE_CHARS + 2 for line in st["activity"])
     acts = st["result"]["tool_activity"]
     assert len(acts) == MAX_ACTIVITY_LINES and all(len(a) <= MAX_LINE_CHARS + 2 for a in acts)
+    assert st["activity"] == acts and st["activity_dropped"] == 7    # the cut is still counted
 
 
 class _Floored(_Stub):
@@ -840,6 +847,45 @@ def test_a_turn_past_its_deadline_is_stopped_and_its_session_released(tmp_path):
     assert st["deadline_hit"] is True and st["result"]["timed_out"] is True
     assert host.session_status(sid)["state"] == "broken" and made[0].closed
     assert made[0].stops >= 1
+
+
+class _StoppedBeforeItRan(_Stoppable):
+    """Streams a command as ISSUED, then the stop lands before it runs: the session's result lists
+    only what ran (here one read), the way ``_stopped_result`` drops cancelled actions."""
+
+    def run_turn(self, message):
+        self.on_event("⚙ file_editor: view README.md")
+        self.on_event("⚙ terminal: rm -rf build")
+        assert self.stop.wait(5), "the deadline never asked the turn to stop"
+        return _Result(reply=None, error="stopped at its wall-clock bound", timed_out=True,
+                       tool_activity=["⚙ file_editor: view README.md"])
+
+
+def test_a_timed_out_jobs_activity_lists_only_what_ran(tmp_path):
+    """L1 HIGH-A: activity was settled from the result only on a gated finish, so a timed-out job
+    kept listing the streamed command the stop had skipped."""
+    made: list[_StoppedBeforeItRan] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_StoppedBeforeItRan(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.2)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "long")["job_id"])
+    assert st["result"]["timed_out"] is True and st["deadline_hit"] is True
+    assert st["activity"] == ["⚙ file_editor: view README.md"]
+    assert st["activity_dropped"] == 0
+
+
+def test_an_errored_jobs_activity_is_the_results(tmp_path):
+    """The same settling on an error finish: the stream showed an issued line the result does not."""
+    f = _Factory([_Result(reply=None, error="boom", tool_activity=[])])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "x")["job_id"])
+    assert f.made[0].calls == [("run_turn", "x")]     # the stub streamed "⚙ terminal: run_turn"
+    assert st["result"]["error"] == "boom" and st["activity"] == []
 
 
 def test_a_turn_inside_its_deadline_is_not_marked(tmp_path):
@@ -1262,11 +1308,68 @@ def test_chat_routes_refuse_a_missing_or_wrong_token(tmp_path, token):
         assert code == 403 and body["error"] == "chat_token"
 
 
+def test_a_head_refused_for_its_chat_token_carries_no_body(tmp_path):
+    """L1 LOW-D: the GET routes' token refusal wrote its JSON body on HEAD too. Read off the raw
+    socket, because http.client never reads a HEAD body (stray bytes would land in the next
+    response on a kept-alive connection)."""
+    import socket
+    from urllib.parse import urlsplit
+
+    with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
+        u = urlsplit(base)
+        with socket.create_connection((u.hostname, u.port), timeout=5) as sock:
+            sock.sendall(f"HEAD /chat.json HTTP/1.1\r\nHost: {u.netloc}\r\n"
+                         "Connection: close\r\n\r\n".encode())
+            raw = b""
+            while chunk := sock.recv(65536):
+                raw += chunk
+        head, _, body = raw.partition(b"\r\n\r\n")
+        assert head.startswith(b"HTTP/1.") and b" 403 " in head.split(b"\r\n")[0]
+        assert body == b""
+
+
 def test_the_chat_token_does_not_gate_the_substrate_routes(tmp_path):
     """/edit and the reads stay token-free on loopback (principle #6); only /chat takes the factor."""
     with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
         code, _ = _call(f"{base}/substrate.json", token=None)
         assert code == 200
+
+
+def test_serve_publishes_the_chat_token_on_piped_stdout_before_it_blocks(tmp_path):
+    """L1 LOW-B: the token line is the only place the token is published, and a piped stdout is
+    block-buffered, so without its flush it would sit in the buffer while the server blocks."""
+    import selectors
+    import subprocess
+    import sys
+
+    from anneal_memory import Store
+
+    (tmp_path / "inst" / ".levain").mkdir(parents=True)
+    with Store(tmp_path / "inst" / ".levain" / "memory.db"):
+        pass
+    ent = _entity(tmp_path, "ent")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "levain", "serve", "--path", str(tmp_path / "inst"), "--port", "0",
+         "--no-open", "--chat", str(ent)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        out, deadline = b"", time.monotonic() + 30
+        while b"chat token" not in out and time.monotonic() < deadline:
+            if sel.select(timeout=0.5):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                out += chunk
+        assert proc.poll() is None, proc.stderr.read().decode()   # still serving, i.e. blocked
+        line = next((x for x in out.decode().splitlines() if "chat token" in x), None)
+        assert line is not None, f"no token line on stdout while serving: {out!r}"
+        assert len(line.rsplit(": ", 1)[1].strip()) >= 32
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 def test_each_launch_gets_its_own_token(tmp_path):
