@@ -456,3 +456,73 @@ def test_live_the_file_editor_check_refuses_a_real_bind_alias(home) -> None:
                          timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "REFUSED", out.stdout
+
+
+@pytest.mark.skipif(_ROOT, reason="the drop is never taken as root")
+@pytest.mark.parametrize("rd", [os.path.realpath("/tmp"), "/"])
+def test_a_reachable_socket_under_a_foreign_owned_runtime_dir_is_still_counted(home, monkeypatch, rd) -> None:
+    """L2 (RUN at 29ed753): owning the runtime dir proves nothing about reach. With
+    $XDG_RUNTIME_DIR at a root-owned shared dir, or at /, a socket this user owns, with a second
+    link beside it, was dropped from the check."""
+    import socket
+    monkeypatch.setattr(confinement, "_runtime_dirs", lambda: [rd])
+    d = Path(os.path.realpath("/tmp"))
+    sock, link = d / f"lv-nlink-{os.getpid()}.sock", d / f"lv-nlink-{os.getpid()}-2.sock"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(str(sock))
+        try:
+            os.link(sock, link)
+        except OSError as exc:
+            pytest.skip(f"this filesystem does not hardlink sockets: {exc}")
+        assert confinement._foreign_runtime_dirs(), "precondition: the runtime dir reads as foreign"
+        policy = dataclasses.replace(build_policy(_entity(home)), deny_sockets=(sock,),
+                                     socket_spellings=(sock,))
+        with pytest.raises(ConfinementError, match="2 names on disk"):
+            _refuse_multiply_linked_jewels(policy)
+    finally:
+        s.close()
+        link.unlink(missing_ok=True)
+        sock.unlink(missing_ok=True)
+
+
+@pytest.mark.skipif(_ROOT, reason="root searches every directory")
+def test_a_socket_blocked_by_this_users_own_dir_inside_a_foreign_runtime_dir_refuses(home, monkeypatch) -> None:
+    """A directory this user owns can be chmod-ed open again, so a socket behind it is not
+    unreachable: it refuses instead of being dropped."""
+    d = Path(os.path.realpath("/tmp"))
+    monkeypatch.setattr(confinement, "_runtime_dirs", lambda: [str(d)])
+    mine = d / f"lv-nlink-{os.getpid()}-locked"
+    mine.mkdir()
+    try:
+        mine.chmod(0o000)
+        sock = mine / "docker.sock"
+        policy = dataclasses.replace(build_policy(_entity(home)), deny_sockets=(sock,),
+                                     socket_spellings=(sock,))
+        with pytest.raises(ConfinementError, match="could not check"):
+            _refuse_multiply_linked_jewels(policy)
+    finally:
+        mine.chmod(0o700)
+        mine.rmdir()
+
+
+def test_a_read_denied_jewel_linked_as_the_entitys_own_memory_refuses(home) -> None:
+    """L1 (RUN at 29ed753): the floor lets bash READ the entity's own memory files, so a deny_files
+    token whose second name is memory.continuity.md counted 2 of 2 names inside the floor and bash
+    was granted, with the token readable through the memory path."""
+    ent = _entity(home)
+    secret = _secret(home)
+    os.link(secret, ent / ".levain" / "memory.continuity.md")
+    with pytest.raises(ConfinementError, match="the shell may not read.*memory.continuity.md"):
+        _refuse_multiply_linked_jewels(build_policy(ent, deny_files=(secret,)))
+
+
+def test_a_read_denied_jewel_linked_as_rebound_known_hosts_refuses(home) -> None:
+    """In agent mode ~/.ssh is hidden but known_hosts is bound back read-write for ssh itself."""
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    secret = _secret(home)
+    os.link(secret, ssh / "known_hosts")
+    with pytest.raises(ConfinementError, match="known_hosts is another name"):
+        _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent",
+                                                    deny_files=(secret,)))
