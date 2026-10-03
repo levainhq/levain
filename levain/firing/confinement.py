@@ -733,6 +733,89 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     return subtrees, spellings, store_links
 
 
+_TRUST_FILE_MAX = 1 << 20
+
+
+def _trust_listed_stores(
+    home: Path, entity_dir: Path, workspace: Path
+) -> tuple[list[Path], list[Path]]:
+    """Project stores the operator's anneal trust files name, as ``(dirs, db_files)`` to deny
+    read+write (spore-1308 follow-on, ruled by Phill 2026-10-03: "yes for trust file thing").
+
+    A store can live anywhere its trust file's ``stores[].db`` points, so naming one directory does
+    not cover a moved project home. Read here at policy build: ``$ANNEAL_MEMORY_DERIVE_TRUST`` if set
+    in this process, anneal's default ``~/.anneal-memory/derive-trust.json``, and flow's
+    ``~/.anneal-projects/derive-trust.json``. A missing, unreadable, oversized or malformed file adds
+    nothing (the ``~/.anneal-projects`` subtree still applies). The confinement core imports no
+    anneal, so the JSON is read directly.
+
+    Each listed db's directory is denied as a subtree, unless that directory is the filesystem root,
+    is or contains ``$HOME``, the entity or its workspace, or lies inside the entity (whose own memory
+    is governed by ``own_memory_files``); then only the db file is denied, which also denies its
+    SQLite sidecars. Containment is decided by file identity, so a case- or link-variant spelling
+    neither hides the workspace nor escapes the check.
+    NOT covered: a trust file this process cannot locate, which is the case for a flow project home
+    moved by ``$FLOW_PROJECT_MEMORY_HOME`` unless ``$ANNEAL_MEMORY_DERIVE_TRUST`` is also set here."""
+    candidates = [home / ".anneal-memory" / "derive-trust.json",
+                  home / PROJECT_MEMORY_HOME / "derive-trust.json"]
+    raw = os.environ.get(DERIVE_TRUST_ENV, "")
+    if raw:
+        candidates.insert(0, Path(raw).expanduser())
+    own = [p for p in (home, entity_dir, workspace)]
+    dirs: list[Path] = []
+    dbs: list[Path] = []
+    for trust in candidates:
+        try:
+            if trust.stat().st_size > _TRUST_FILE_MAX:
+                continue
+            data = json.loads(trust.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RuntimeError):
+            continue
+        stores = data.get("stores") if isinstance(data, dict) else None
+        if not isinstance(stores, list):
+            continue
+        for entry in stores:
+            db = entry.get("db") if isinstance(entry, dict) else None
+            if not isinstance(db, str) or not db:
+                continue
+            try:
+                dbp = Path(db).expanduser()
+                if not dbp.is_absolute():
+                    continue
+                dbp = dbp.resolve()
+                d = dbp.parent
+                if (str(d) == d.anchor or _inside_by_identity(entity_dir, d, include_self=False)
+                        or any(_inside_by_identity(d, p) for p in own)):
+                    dbs.append(dbp)
+                else:
+                    dirs.append(d)
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return dirs, dbs
+
+
+def _inside_by_identity(container: Path, p: Path, *, include_self: bool = True) -> bool:
+    """True if ``p`` is ``container`` or lies under it, by file identity: each existing ancestor of
+    ``p`` (``p`` itself too, unless ``include_self`` is False, which tests strictly inside) is compared
+    with ``container`` via ``samefile``. A path that does not exist falls back to resolved-path
+    comparison."""
+    chain = [p, *p.parents] if include_self else list(p.parents)
+    try:
+        cont_exists = container.exists()
+    except OSError:
+        cont_exists = False
+    for a in chain:
+        try:
+            if cont_exists and a.exists():
+                if os.path.samefile(a, container):
+                    return True
+            elif a.resolve() == container.resolve():
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def _sibling_entity_stores(entity_dir: Path) -> tuple[Path, ...]:
     """The ``.levain/`` stores of SIBLING entities under the same parent — crown jewels this entity
     must never read (one sovereign mind can't reach another's memory).
@@ -874,6 +957,8 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
+    listed_dirs, listed_dbs = _trust_listed_stores(home, ed, ws)
+    subtrees.extend(listed_dirs)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
@@ -890,6 +975,7 @@ def build_policy(
     ]
 
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
+    files.extend(listed_dbs)
 
     # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
     # locations, not a guess — but denying their READ breaks the entity's own gh/aws/curl hands, so the

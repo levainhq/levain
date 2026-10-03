@@ -9,6 +9,7 @@ against a control write that must succeed."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import platform
 from pathlib import Path
 
@@ -252,3 +253,98 @@ def test_live_a_symlinked_store_cannot_be_swapped_for_a_planted_tree(
         _refused(sh, f"rm '{link}'")
         _refused(sh, f"mv '{link}' '{home}/moved'")
     assert link.is_symlink() and (real / "derive-trust.json").exists()
+
+
+# --- stores the trust files list (a moved project home) ----------------------------------------
+
+
+def _moved_home(root: Path, home: Path) -> tuple[Path, Path]:
+    """A flow project home moved away from ~/.anneal-projects: trust file + one store, listed by db."""
+    moved = _project_home(root / "moved-projects")
+    trust = moved / "derive-trust.json"
+    trust.write_text(json.dumps({"version": 2, "stores": [
+        {"db": str(moved / "levain-v2" / "memory.db"), "root": str(home)}]}))
+    return moved, trust
+
+
+def test_a_store_listed_in_the_env_trust_file_is_a_denied_subtree(home, tmp_path, monkeypatch):
+    moved, trust = _moved_home(tmp_path, home)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
+    policy = build_policy(_entity(home))
+    assert (moved / "levain-v2").resolve() in policy.deny_read_write
+    assert crown_jewel_reason(policy, moved / "levain-v2" / "memory.continuity.md") is not None
+
+
+def test_a_store_listed_in_the_default_trust_file_is_denied_without_the_env(home, tmp_path):
+    """anneal's own default trust file is read too, so a store it lists anywhere is covered."""
+    moved = _project_home(tmp_path / "elsewhere")
+    (home / ".anneal-memory").mkdir()
+    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
+        {"version": 2, "stores": [{"db": str(moved / "levain-v2" / "memory.db"), "root": "/r"}]}))
+    policy = build_policy(_entity(home))
+    assert (moved / "levain-v2").resolve() in policy.deny_read_write
+
+
+@pytest.mark.parametrize("content", ["", "{not json", '{"stores": "x"}', '{"stores": [{"db": 7}]}',
+                                     '{"stores": [{"db": "relative/memory.db"}]}'])
+def test_a_bad_trust_file_adds_nothing_and_the_default_deny_holds(home, monkeypatch, content):
+    (home / ".anneal-memory").mkdir()
+    trust = home / ".anneal-memory" / "derive-trust.json"
+    trust.write_text(content)
+    entity = _entity(home)
+    policy = build_policy(entity)
+    assert (home / ".anneal-projects").resolve() in policy.deny_read_write
+    trust.unlink()
+    without = build_policy(entity)
+    assert (policy.deny_read_write, policy.deny_files) == (without.deny_read_write, without.deny_files)
+
+
+def test_a_store_beside_home_denies_only_its_db_never_home(home):
+    (home / ".anneal-memory").mkdir()
+    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
+        {"version": 2, "stores": [{"db": str(home / "memory.db"), "root": "/r"}]}))
+    entity = _entity(home)
+    policy = build_policy(entity)
+    assert home.resolve() not in policy.deny_read_write
+    assert (home / "memory.db").resolve() in policy.deny_files
+    assert crown_jewel_reason(policy, entity / "workspace" / "notes.md") is None
+
+
+def test_a_store_inside_the_entity_is_left_to_its_own_memory_rules(home):
+    entity = _entity(home)
+    (home / ".anneal-memory").mkdir()
+    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
+        {"version": 2, "stores": [{"db": str(entity / ".levain" / "memory.db"), "root": "/r"}]}))
+    policy = build_policy(entity)
+    assert (entity / ".levain").resolve() not in policy.deny_read_write
+
+
+@mac_live
+def test_a_case_variant_workspace_spelling_is_still_the_workspace(home):
+    """Containment by identity (L1 MED-4 on the first cut): on case-insensitive APFS a db listed under
+    an upper-cased spelling of a workspace outside the entity must not hide that workspace."""
+    entity = _entity(home)
+    ws = home / "wsout"
+    ws.mkdir()
+    variant = home / "WSOUT"
+    (home / ".anneal-memory").mkdir()
+    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
+        {"version": 2, "stores": [{"db": str(variant / "memory.db"), "root": "/r"}]}))
+    policy = build_policy(entity, workspace=ws)
+    assert crown_jewel_reason(policy, ws / "notes.md") is None
+
+
+@live
+def test_live_a_moved_project_home_found_through_its_trust_file_is_refused(
+    home, tmp_path, monkeypatch
+):
+    moved, trust = _moved_home(tmp_path, home)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
+    entity = _entity(home)
+    with select_provider().spawn_shell(build_policy(entity)) as sh:
+        _ok(sh, f"touch '{entity}/workspace/control'")
+        _refused(sh, f"head -c 10 '{moved}/levain-v2/memory.db'")
+        _refused(sh, f"touch '{moved}/levain-v2/probe'")
+        _refused(sh, f"echo PLANT >> '{moved}/levain-v2/memory.continuity.md'")
+        _refused(sh, f": >> '{trust}'")
+    assert not (moved / "levain-v2" / "probe").exists()
