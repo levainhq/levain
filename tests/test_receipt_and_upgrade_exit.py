@@ -286,7 +286,7 @@ def test_carrier_freshness_stale_is_pending(tmp_path: Path):
 
     name = sorted(ON_DEMAND_SEED)[0]
     carrier = tmp_path / "CLAUDE.md"
-    carrier.write_text(f"@seed/{name}\n", encoding="utf-8")
+    carrier.write_text(f"@seed/{name}\n@.levain/memory.continuity.md\n", encoding="utf-8")
     r = doctor._check_carrier_freshness(tmp_path, carrier)[0]
     assert not r.ok and r.upgrade_pending
 

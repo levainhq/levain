@@ -431,8 +431,8 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # in the file that OWNS it, for the same reason as every sentinel above.
     linkgate_owner = _COVERAGE_SENTINELS["AM-LINKGATE"][0]
     assert "[evidence: <id1>, <id2>" in seed_files[linkgate_owner], (
-        f"the co-citation example must live in {linkgate_owner} — a single-id example there "
-        "would teach the exact habit AM-LINKGATE exists to end"
+        f"the honest multi-episode evidence example must live in {linkgate_owner} (one genuine "
+        "citation is enough since anneal 0.9.26; the example shows how to cite plural support)"
     )
 
     # AM-HOP-RETIRED (0.9.26), the negative half: recall no longer reads links, so the seed must
@@ -440,7 +440,8 @@ def test_seed_templates_carry_the_reconciled_guidance():
     for retired in ("associative recall goes dark", "that is what forms the Hebbian link",
                     "Co-citing 2+ episodes in one graduation", "allow_unlinked"):
         for name, text in seed_files.items():
-            assert retired not in text, f"{name} still teaches the retired claim {retired!r}"
+            assert retired.lower() not in text.lower(), (
+                f"{name} still teaches the retired claim {retired!r}")
 
 
 def test_am_wrap_generated_inline_end_state_is_structurally_guarded():

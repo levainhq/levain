@@ -75,7 +75,24 @@ def test_doctor_flags_a_carrier_without_the_import_as_a_pending_upgrade(make_ins
 
 
 def test_the_context_surface_counts_the_living_memory(make_install):
+    import re
+
     install = make_install()
+    total = lambda d: int(re.match(r"([\d,]+) B", d).group(1).replace(",", ""))  # noqa: E731
+    [before] = _check_context_surface(install, install / "CLAUDE.md")
     install.joinpath(*LEVAIN_CONTINUITY_REL).write_text("x" * 5000)
     [row] = _check_context_surface(install, install / "CLAUDE.md")
     assert "living memory 5,000B" in row.detail
+    assert total(row.detail) == total(before.detail) + 5000
+
+
+def test_an_import_doctor_cannot_see_claude_code_evaluate_does_not_count(tmp_path):
+    from levain.doctor import _imports_continuity
+
+    assert _imports_continuity("@.levain/memory.continuity.md\n")
+    assert _imports_continuity("  @./.levain/memory.continuity.md  \n")
+    assert not _imports_continuity("```\n@.levain/memory.continuity.md\n```\n")
+    assert not _imports_continuity("<!--\n@.levain/memory.continuity.md\n-->\n")
+    assert not _imports_continuity("<!-- @.levain/memory.continuity.md -->\n")
+    assert not _imports_continuity("    @.levain/memory.continuity.md\n")   # indented code
+    assert not _imports_continuity("- @.levain/memory.continuity.md\n")

@@ -1401,8 +1401,30 @@ CONTINUITY_IMPORT = "@.levain/memory.continuity.md"
 
 
 def _imports_continuity(text: str) -> bool:
-    """The carrier has the continuity import on a line of its own (surrounding whitespace allowed)."""
-    return any(line.strip() == CONTINUITY_IMPORT for line in text.splitlines())
+    """The carrier has the continuity import as a line Claude Code evaluates: on a line of its
+    own (``./`` allowed, under four spaces of indent), and NOT inside a fenced code block or an
+    HTML comment, where Claude Code does not read imports (codex + complement, the 0.5.5 L3)."""
+    wanted = {CONTINUITY_IMPORT, "@./" + CONTINUITY_IMPORT[1:]}
+    fence = None
+    in_comment = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_comment:
+            in_comment = "-->" not in stripped
+            continue
+        if fence:
+            if stripped.startswith(fence):
+                fence = None
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            continue
+        if stripped.startswith("<!--"):
+            in_comment = "-->" not in stripped
+            continue
+        if stripped in wanted and len(line) - len(line.lstrip(" ")) < 4:
+            return True
+    return False
 
 
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:

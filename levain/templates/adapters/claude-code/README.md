@@ -19,7 +19,7 @@ post-v1 item.)
 
 > **This README documents the adapter and a manual install path for dogfooding
 > it.** The supported end-to-end install — running an interview to fill the
-> seed templates, initializing the store, loading the continuity scaffold,
+> seed templates, initializing the store,
 > resolving the placeholder tokens below — is `levain init` (build step 4).
 > Until that ships, the manual sequence here stands up a working install.
 
@@ -104,7 +104,8 @@ ships the correct registration; do not rename the server.
 
 The store is pinned to **`.levain/memory.db` inside the install** — see
 *Store scoping* below. Its continuity, `.levain/memory.continuity.md`, is also
-imported by `CLAUDE.md`, so it is in context from the first turn of every session.
+imported by `CLAUDE.md`, so once the first `levain wrap` has written it, it is in context
+from the first turn of every session.
 
 ## Prerequisites
 
@@ -205,8 +206,8 @@ MCP server and the hooks will read different stores.
 - **The `CLAUDE.md` `@`-import list is curated.** It imports four seed files;
   `seed/continuity.md` is intentionally *not* imported — it is only the starting
   template for the living memory. The living memory itself,
-  `.levain/memory.continuity.md`, IS imported, so it is in context from the
-  first turn. If you add a seed file, add it to `CLAUDE.md`. The seed files
+  `.levain/memory.continuity.md`, IS imported, so after the first wrap it is in
+  context from the first turn. If you add a seed file, add it to `CLAUDE.md`. The seed files
   must not `@`-import *each other* — they cross-reference by section title,
   which is what keeps them placement-agnostic.
 

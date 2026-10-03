@@ -20,7 +20,7 @@ The operational rule: consume a **digest**, never the canonical. A digest carrie
 
 ## Session workflow
 
-**Start of session:** Your continuity is your compressed self-model from prior sessions. In Claude Code it is already in your context when the session starts; in a harness that does not load it, read the `anneal://continuity` resource. Early on it will be near-empty; that is expected. Call `recall` to find specific prior episodes when you need context.
+**Start of session:** Your continuity is your compressed self-model from prior sessions. If your `CLAUDE.md` imports `.levain/memory.continuity.md` and you can see that content above, it is already in your context. Otherwise (another harness, a carrier without that line, or before your first wrap, when the file does not exist yet) read the `anneal://continuity` resource. Early on it will be near-empty; that is expected. Call `recall` to find specific prior episodes when you need context.
 
 **During work:** Call `record` when something important happens:
 - `observation` — a pattern noticed, an insight, a learning ("Tests revealed the connection pool is the real bottleneck")
