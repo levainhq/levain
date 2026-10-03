@@ -7,6 +7,7 @@ back whenever the two spellings name one dentry (RUN on argushub 2026-10-03, bwr
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 import pytest
@@ -119,11 +120,11 @@ def test_live_a_case_sensitive_sibling_reads_and_the_denied_file_does_not(home, 
     opt = _write_only_link(home, d / "config", monkeypatch)
     try:
         with select_provider().spawn_shell(build_policy(_entity(home), deny_files=(d / "CONFIG",))) as sh:
-            r = sh.run(f"cat {d / 'config'} 2>&1", timeout=20)
+            r = sh.run(f"cat {shlex.quote(str(d / 'config'))} 2>&1", timeout=20)
             assert r.exit_code == 0 and "READABLE" in r.output, r.output
-            r = sh.run(f"cat {d / 'CONFIG'} 2>&1", timeout=20)
+            r = sh.run(f"cat {shlex.quote(str(d / 'CONFIG'))} 2>&1", timeout=20)
             assert r.exit_code != 0 and "DENIED" not in r.output, r.output
-            r = sh.run(f"echo x >> {d / 'config'} 2>&1", timeout=20)
+            r = sh.run(f"echo x >> {shlex.quote(str(d / 'config'))} 2>&1", timeout=20)
             assert r.exit_code != 0, r.output   # still write-denied
     finally:
         opt.chmod(0o755)
