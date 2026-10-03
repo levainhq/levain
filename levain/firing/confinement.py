@@ -472,6 +472,12 @@ class ConfinementError(RuntimeError):
     unconfined host shell (``structural_invariants_beat_discipline``)."""
 
 
+class FloorRefreshError(ConfinementError):
+    """The floor's evolving denies could not be re-derived (a trust file naming a store that cannot be
+    hidden, an unreadable trust path). Distinct from a shell that failed to start, so a caller can
+    record it as a refusal of the whole floor without replaying the derivation (codex L3 r5)."""
+
+
 # --- the OS-agnostic policy (the canonical object) -------------------------------------------
 
 @dataclass(frozen=True)
@@ -733,6 +739,172 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     return subtrees, spellings, store_links
 
 
+def _anneal_trusted_dbs(path: Path) -> list[str]:
+    """The ``stores[].db`` strings anneal itself would trust in the trust file at ``path``, or ``[]``.
+
+    Mirrors anneal's loader (``anneal_memory.rederive._load_trust``, read path): no symlink, a regular
+    file owned by this user and not writable by others, in a directory with the same properties, with
+    a ``stores`` list whose entries carry string ``db`` and ``root``. A file anneal would reject loads
+    no store, so it protects nothing and must not widen the floor either (codex L3 2026-10-03: an
+    untrusted file could otherwise hide a system directory). There is no size cap, because anneal has
+    none and a skipped valid file would leave its stores open. Checks run in anneal's order: owner and
+    mode first (anneal rejects, so nothing to protect), then type. A directory loads nothing in anneal
+    either. Any other non-regular file (a FIFO, a device) REFUSES the floor: anneal does not check the
+    type and could read stores from it, and this cannot read it without blocking (codex L3 r2, r3)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+    except OSError:
+        return []
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            return []
+        if stat.S_ISDIR(st.st_mode):
+            return []
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfinementError(
+                f"the anneal trust path {path} is not a regular file, so the stores it may name cannot "
+                "be read — refusing to build the floor (fail-closed). Replace it with a regular file."
+            )
+        pst = os.stat(os.path.dirname(os.path.abspath(path)))
+        if pst.st_uid != os.geteuid() or pst.st_mode & 0o022:
+            return []
+        chunks = []
+        while chunk := os.read(fd, 1 << 16):
+            chunks.append(chunk)
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except ConfinementError:
+        raise   # a RuntimeError subclass: the refusal above must not be read as "unreadable"
+    except (OSError, ValueError, RuntimeError):   # RuntimeError: RecursionError on deep nesting
+        return []
+    finally:
+        os.close(fd)
+    stores = data.get("stores") if isinstance(data, dict) else None
+    if not isinstance(stores, list):
+        return []
+    return [s["db"] for s in stores
+            if isinstance(s, dict) and isinstance(s.get("db"), str) and isinstance(s.get("root"), str)]
+
+
+def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[Path]:
+    """Directories of the project stores the operator's anneal trust files name, to deny read+write
+    (spore-1308 follow-on, ruled by Phill 2026-10-03: "yes for trust file thing").
+
+    A store lives wherever its trust file's ``stores[].db`` points, so naming one directory does not
+    cover a moved project home. Read at each policy build and each spawn (:func:`refresh_socket_denies`):
+    ``$ANNEAL_MEMORY_DERIVE_TRUST`` if set in this process, anneal's default
+    ``~/.anneal-memory/derive-trust.json`` and flow's ``~/.anneal-projects/derive-trust.json``, each
+    through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
+    ``~/.anneal-projects`` subtree still applies.
+
+    Both the db's real directory and, for a symlinked db, its lexical directory are denied, whether or
+    not they exist: an absent one could be created by the entity and filled with a store anneal already
+    trusts (codex L3 r2), and "this user cannot create it" is not something a same-uid shell is bound by
+    (it can chmod its own directories, or rename them away: L3 r4), so it is never a reason to skip.
+    On Linux an absent one becomes bwrap's mountpoint; one bwrap could not create refuses bash there
+    with the path named, so a stale entry is pruned rather than silently skipped. More than a bounded
+    number of distinct listed store directories refuses the floor. The entity's own
+    canonical store (``<entity>/.levain/memory.db``) is skipped, since ``own_memory_files`` governs it.
+    ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
+    filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
+    the workspace, or one inside the entity or workspace. anneal writes more than twenty names beside a
+    db (continuity, crystal, spores, temp files, backups, locks), new ones by rename, so a partial deny
+    of those files would be a guard to be bypassed one name at a time; the store needs a directory of its
+    own. Containment is decided by file identity, so a case- or link-variant spelling cannot dodge it.
+    NOT covered: a trust file this process cannot locate (a flow home moved by
+    ``$FLOW_PROJECT_MEMORY_HOME`` without ``$ANNEAL_MEMORY_DERIVE_TRUST`` exported to levain), and a
+    store added after a shell spawned, until the next spawn."""
+    candidates = [home / ".anneal-memory" / "derive-trust.json",
+                  home / PROJECT_MEMORY_HOME / "derive-trust.json"]
+    raw = os.environ.get(DERIVE_TRUST_ENV, "")
+    if raw:
+        try:
+            candidates.insert(0, Path(raw).expanduser())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV}={raw!r} cannot be resolved ({exc}) — refusing to build the "
+                "floor (fail-closed)."
+            ) from exc
+    canonical = (entity_dir / ".levain" / "memory.db").resolve()
+    listed = 0
+    shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for trust in candidates:
+        for db in _anneal_trusted_dbs(trust):
+            try:
+                lexical = Path(db).expanduser()
+                if not lexical.is_absolute():
+                    continue
+                if lexical.resolve() == canonical:
+                    continue
+                dirs = {lexical.parent.resolve(), lexical.resolve().parent}
+            except (OSError, RuntimeError, ValueError):
+                continue
+            for d in sorted(dirs):
+                if d in seen:
+                    continue
+                listed += 1
+                if listed > _MAX_LISTED_STORES:
+                    raise ConfinementError(
+                        f"the anneal trust files list more than {_MAX_LISTED_STORES} store "
+                        "directories this user could reach — refusing to build the floor "
+                        "(fail-closed). Prune the trust files."
+                    )
+                unsafe = (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
+                          or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
+                          or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
+                if unsafe:
+                    raise ConfinementError(
+                        f"the anneal store {db} (listed in {trust}) sits in {d}, which cannot be "
+                        "hidden from the entity without hiding its own home, entity or workspace. "
+                        "Refusing to build the floor (fail-closed). Move the store into a directory "
+                        "of its own and update the trust file."
+                    )
+                seen.add(d)
+                out.append(d)
+    return out
+
+
+_MAX_LISTED_STORES = 256
+
+
+def _mountpoint_creatable(d: Path) -> bool:
+    """Whether bwrap could create ``d`` as a mountpoint: its nearest existing ancestor is a directory
+    this process can write and search. Used ONLY to refuse with a clear message (a wrong answer there
+    fails closed), never to skip a deny: a same-uid shell can change what this returns."""
+    effective = os.access in os.supports_effective_ids
+    for a in d.parents:
+        try:
+            if a.exists():
+                return a.is_dir() and os.access(a, os.W_OK | os.X_OK, effective_ids=effective)
+        except OSError:
+            return False
+    return False
+
+
+def _inside_by_identity(container: Path, p: Path, *, include_self: bool = True) -> bool:
+    """True if ``p`` is ``container`` or lies under it, by file identity: each existing ancestor of
+    ``p`` (``p`` itself too, unless ``include_self`` is False, which tests strictly inside) is compared
+    with ``container`` via ``samefile``. A path that does not exist falls back to resolved-path
+    comparison."""
+    chain = [p, *p.parents] if include_self else list(p.parents)
+    try:
+        cont_exists = container.exists()
+    except OSError:
+        cont_exists = False
+    for a in chain:
+        try:
+            if cont_exists and a.exists():
+                if os.path.samefile(a, container):
+                    return True
+            elif a.resolve() == container.resolve():
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
 def _sibling_entity_stores(entity_dir: Path) -> tuple[Path, ...]:
     """The ``.levain/`` stores of SIBLING entities under the same parent — crown jewels this entity
     must never read (one sovereign mind can't reach another's memory).
@@ -874,21 +1046,11 @@ def build_policy(
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
+    listed_dirs = _trust_listed_stores(home, ed, ws)
+    subtrees.extend(listed_dirs)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
-    # A trust spelling whose own location (the final component unresolved) is inside a subtree
-    # assembled so far (the operator stores, sibling entity stores, caller extras) is dropped: the
-    # subtree denies it both ways, and a write-only self-bind of it on Linux would take its source
-    # from the host tree and re-expose it. NOT checked: the credential subtrees, ~/.ssh and
-    # deny_files, which are added below (L3 r2, routed), nor a spelling that is a link INTO a hidden
-    # subtree, which step (5) maps to its target (L3 r2 codex, routed).
-    trust_spellings = [
-        sp for sp in trust_spellings
-        if not any((loc := sp.parent.resolve() / sp.name) == t or loc.is_relative_to(t)
-                   for t in subtrees)
-    ]
-
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
     # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
@@ -988,6 +1150,25 @@ def build_policy(
         deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
+    # A trust spelling whose own location (final component unresolved) is already denied both ways
+    # is dropped: inside any read+write subtree (operator stores, siblings, extras, credential
+    # subtrees), inside ~/.ssh in agent mode, or equal to a deny_files entry. Listing it again would
+    # only add a redundant write-only mount. A spelling that is a link INTO a hidden subtree stays,
+    # and bwrap step (5) binds /dev/null at its target rather than re-exposing it.
+    covered = list(subtrees) + ([ssh_dir] if ssh_dir is not None else [])
+    kept: list[Path] = []
+    for sp in trust_spellings:
+        try:
+            loc = sp.parent.resolve() / sp.name
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV} spelling {sp} cannot be resolved ({exc}) — refusing to build "
+                "the floor (fail-closed)."
+            ) from exc
+        if loc in files or any(loc == t or loc.is_relative_to(t) for t in covered):
+            continue
+        kept.append(sp)
+    trust_spellings = kept
     deny_write_files_l.extend(trust_spellings)
 
     # De-dup while preserving order (a sibling could coincide with an extra).
@@ -1052,6 +1233,8 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
+        if jewel in listed_dirs and not jewel.is_file():
+            continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
         if not jewel.is_dir():
@@ -1278,6 +1461,18 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     that target the full three-arm treatment — so the refresh closes the unlisted socket a listed
     name reaches. It does NOT close unlisted sockets generally; that is ``spore-754`` (an
     operator-declared socket list) and is deliberately a separate change."""
+    # Trust-listed project stores are re-derived at the same seam, as a union for the same reason
+    # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
+    # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
+    listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
+    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    if new_dirs:
+        policy = replace(
+            policy,
+            deny_read_write=_dedup_paths(list(policy.deny_read_write) + new_dirs),
+            deny_write_dirs=_dedup_paths(list(policy.deny_write_dirs)
+                                         + list(_write_deny_ancestors(new_dirs))),
+        )
     if not policy.socket_sources:
         return policy  # opt-out (`allow_container_sockets=True`) or nothing enumerated
 
@@ -2227,7 +2422,10 @@ class ConfinementProvider(ABC):
         # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
         # `refresh_socket_denies` is a monotonic union — so a second resolution can only ever widen
         # what the first produced. Round 4's lost-update came from keeping the EARLIER answer.
-        refreshed = refresh_socket_denies(policy)
+        try:
+            refreshed = refresh_socket_denies(policy)
+        except Exception as exc:
+            raise FloorRefreshError(str(exc)) from exc
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
@@ -2794,6 +2992,17 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
+def _masked_both_ways(target: Path, masked: set[str]) -> bool:
+    """True iff ``target`` names a destination step (2) or (4) masked, as spelled or as resolved,
+    compared case- and normalization-insensitively (``masked`` holds ``_canon`` strings)."""
+    if _canon(str(target)) in masked:
+        return True
+    try:
+        return _canon(str(target.resolve())) in masked
+    except (OSError, RuntimeError):
+        return False
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
     return _bwrap_plan(policy)[0]
@@ -2921,6 +3130,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
     file_roots: list[Path] = []   # subtree roots that are files: denied both ways, like step (4)
+    # Every destination steps (2) and (4) mask with /dev/null, recorded AS EMITTED. Step (5) checks
+    # its self-bind targets against these, never against a second resolve of the policy paths.
+    masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
@@ -2934,6 +3146,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
+        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+            raise ConfinementError(
+                f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
+                "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
+                "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
+                "(fail-closed)."
+            )
         if _absent_in_ro_store(sub):
             continue
         if sub.exists() and not sub.is_dir():
@@ -2941,6 +3160,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
             # Deny it the way step (4) denies a file, which refuses both read and write.
             argv += ["--ro-bind", "/dev/null", str(sub)]
+            masked_both.append(str(sub))
             file_roots.append(sub)
             continue
         tmpfs_roots.append(sub)
@@ -2969,6 +3189,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         for sub in nested_in_ssh:
             if sub.exists() and not sub.is_dir():
                 argv += ["--ro-bind", "/dev/null", str(sub)]
+                masked_both.append(str(sub))
                 file_roots.append(sub)
             else:
                 argv += ["--tmpfs", str(sub)]
@@ -3017,7 +3238,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        argv += ["--ro-bind", "/dev/null", str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))]
+        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        argv += ["--ro-bind", "/dev/null", dest]
+        masked_both.append(dest)
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
     # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
@@ -3039,6 +3262,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
+    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
+    # plus each one's resolved spelling, compared through `_canon`. Two corrections (codex, L3 r2):
+    # a second resolve of the policy paths can observe a symlink retargeted after step (4) mounted,
+    # so the emitted string is the authority; and `resolve()` folds neither case nor Unicode
+    # normalization, so on a casefolded Linux volume an alternate spelling of a masked dentry would
+    # miss an exact compare. Over-matching only turns a self-bind into a /dev/null mask, which
+    # denies MORE (fail-closed).
+    denied_both_targets: set[str] = set()
+    for dest in masked_both:
+        denied_both_targets.add(_canon(dest))
+        try:
+            denied_both_targets.add(_canon(str(Path(dest).resolve())))
+        except (OSError, RuntimeError):
+            pass
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
@@ -3075,8 +3312,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            t = str(_bwrap_file_target(f))
-            argv += ["--ro-bind", t, t]
+            target = _bwrap_file_target(f)
+            if _shadowed_by(target, roots) or _masked_both_ways(target, denied_both_targets):
+                # The spelling is outside every hidden subtree but its TARGET is inside one, or is
+                # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
+                # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
+                # self-bind takes its source from the host tree, so it would put the hidden file
+                # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
+                # link in a non-writable directory pointing into a sibling entity's store): the
+                # confined shell read the sibling's file. /dev/null denies both ways instead.
+                argv += ["--ro-bind", "/dev/null", str(target)]
+            else:
+                argv += ["--ro-bind", str(target), str(target)]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 
@@ -3312,6 +3559,197 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
+_UNREACHABLE = (-1, -1, -1)   # lstat refused (EACCES/EPERM): watched for becoming reachable
+
+
+_STARTUP_EXEC_VARS = frozenset({"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND"})
+
+
+def _identity(p: Path) -> tuple[int, int, int] | None:
+    """``(st_dev, st_ino, file type)`` of ``p`` without following a link, None if it is absent, or
+    ``_UNREACHABLE`` if this user cannot even stat it (another user's runtime directory: the plan
+    leaves such a path alone, so it must not cost the shell either; L3 r4). Any other ``lstat``
+    error propagates (the caller refuses)."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        # Unreachable only when the directory blocking the way belongs to ANOTHER user: one this user
+        # owns, a same-uid shell can chmod open, read through and close again (complement L3 r5).
+        for a in p.parents:
+            try:
+                ast = os.lstat(a)
+            except PermissionError:
+                continue
+            if ast.st_uid == os.geteuid():
+                raise
+            return _UNREACHABLE
+        raise
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
+
+
+def _describe(ident: tuple[int, int, int] | None) -> str:
+    if ident is None:
+        return "absent"
+    if ident == _UNREACHABLE:
+        return "unreachable"
+    kind = {stat.S_IFREG: "file", stat.S_IFDIR: "dir", stat.S_IFLNK: "symlink"}.get(ident[2], "other")
+    return f"{kind} inode {ident[1]}"
+
+
+def _mount_plan_paths(
+    argv: list[str], policy: CrownJewelsPolicy
+) -> tuple[dict[str, str | None], list[str]]:
+    """What the bwrap plan covers on the host: ``(mounted, unmounted)``.
+
+    ``mounted`` maps each host path the plan mounts over to the mountpoint the provider may create if
+    it is absent: ``"dir"`` for a tmpfs, ``"file"`` for a ``/dev/null`` bind, or None for a bind it must
+    never create (a self-bind of something that exists, a ``--*-try`` bind the plan lets bwrap skip,
+    an ancestor pin the provider makes separately) (L3 r4). ``unmounted`` is
+    every jewel path the policy names that the plan does NOT mount (an absent jewel under a read-only
+    store, a SQLite sidecar absent at spawn): nothing covers those, so they are watched for appearing.
+    A path strictly inside a tmpfs root is left out of both, by EXACT containment: the tmpfs hides the
+    host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
+    (L3 2026-10-03)."""
+    mounted: dict[str, str | None] = {}
+    tmpfs: list[Path] = []
+    i = 0
+    while i < len(argv):
+        op = argv[i]
+        if op == "--tmpfs":
+            mounted.setdefault(argv[i + 1], "dir")
+            tmpfs.append(Path(argv[i + 1]))
+            i += 2
+        elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+            src, dst = argv[i + 1], argv[i + 2]
+            if dst != "/":
+                kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
+                mounted.setdefault(dst, kind)
+            i += 3
+        elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
+            i += 2
+        else:
+            i += 1
+
+    def hidden(q: str) -> bool:
+        pq = Path(q)
+        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+
+    mounted = {q: k for q, k in mounted.items() if not hidden(q)}
+    unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
+    return mounted, unmounted
+
+
+def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
+    """Every jewel path the policy names, spelled as the plan spells it (real parent, final component
+    unresolved). EVERY deny_read_write root, not only file-shaped ones: an absent root created as a
+    directory would otherwise be neither mounted nor watched (codex L3 r4)."""
+    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
+             *policy.sqlite_sidecars, *policy.deny_read_write]
+    if policy.config_file is not None:
+        named.append(policy.config_file)
+
+    def spelled(p: Path) -> str:
+        try:
+            return str(p.parent.resolve() / p.name)
+        except (OSError, RuntimeError):
+            return str(p)
+
+    return list(dict.fromkeys(spelled(Path(p)) for p in named))
+
+
+def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
+    """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
+    the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
+    file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
+    it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
+    which is still recorded before bwrap mounts over it."""
+    for q, kind in mounted.items():
+        p = Path(q)
+        if kind is None or os.path.lexists(p):
+            continue
+        # bwrap would create missing parents too; without them a jewel under an absent directory
+        # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
+        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
+        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
+            a.mkdir(mode=0o700, exist_ok=True)
+        if kind == "dir":
+            p.mkdir(mode=0o700, exist_ok=True)
+        else:
+            try:
+                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+            except FileExistsError:
+                pass
+
+
+class _BwrapShell(SandboxedShell):
+    """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
+    mounts it was started with (spore-1312, rec C, ruled by Phill 2026-10-03, widened by its L3).
+
+    Two checks, one rule each:
+      - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
+        empty jewel can be initialised as a database IN PLACE, keeping its inode (RUN on Linux at
+        3838801: the next command read a row out of the host's ``-wal``);
+      - every path in the mount manifest still has the identity it had when
+        the mounts were made, which covers every way the host can put something new where a mount
+        was: an atomic rewrite, an unlink while a connection keeps a ``-wal``, a swap for a link, a
+        sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
+        2026-10-03 before this replaced the per-case checks.
+    If either fires, the shell is closed (its process group killed) and the command refused; the next
+    spawn mounts what is there now, or refuses at the spawn check. A filesystem error while checking
+    refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
+    including a ``levain wrap`` rewriting the entity's own continuity, or a daemon recreating its socket:
+    that rewrite detached the mount, so the shell could no longer be trusted with it.
+    The manifest is recorded once, before bwrap runs, after the provider has created every absent
+    host mountpoint itself (:func:`_prepare_mountpoints`), so nothing is adopted after the start. It
+    covers every mounted path and every jewel the plan leaves unmounted (:func:`_mount_plan_paths`).
+    NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
+    its access for as long as it runs; so does a command whose path changes between this check and
+    its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
+    with no recognisable header (SQLCipher) is never classified as a database."""
+
+    def __init__(
+        self,
+        *,
+        policy: CrownJewelsPolicy,
+        manifest: dict[str, tuple[int, int, int] | None],
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        default_timeout: float = 120.0,
+    ) -> None:
+        super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
+        self._jewel_policy = policy
+        self._manifest = dict(manifest)   # recorded before the start; never updated
+
+    def _recheck(self) -> None:
+        _refuse_plantable_sqlite_jewels(self._jewel_policy)
+        for q, was in self._manifest.items():
+            now = _identity(Path(q))
+            if now != was:
+                raise ConfinementError(
+                    f"{q} changed since the shell started ({_describe(was)} -> {_describe(now)}); "
+                    "the floor no longer covers what is on disk there."
+                )
+
+    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
+        if self.closed:
+            return super().run(command, timeout=timeout)   # the base refusal names the real reason
+        try:
+            self._recheck()
+        except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
+            # A filesystem error while re-inspecting is a refusal too, as it is at spawn
+            # (_bwrap_plan): a raw OSError would crash the tool call and leave the shell alive.
+            self.close()
+            raise ConfinementError(
+                f"a crown jewel changed since this shell started, or could not be re-checked, so "
+                f"the shell was closed and the command was not run. {exc}"
+            ) from exc
+        return super().run(command, timeout=timeout)
+
+
 class BwrapProvider(ConfinementProvider):
     """Linux ``bubblewrap`` (mount-namespace) provider — the K4c counterpart to
     :class:`SeatbeltProvider`.
@@ -3380,8 +3818,21 @@ class BwrapProvider(ConfinementProvider):
                 "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
+        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
+        # and the manifest (an absent root created as a directory, say) would be recorded in its new
+        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
+        try:
+            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
+                "(fail-closed)."
+            ) from exc
         argv, create_first = _bwrap_plan(policy)
-        argv = argv + ["/bin/bash", "--noprofile", "--norc"]
+        mounted, unmounted = _mount_plan_paths(argv, policy)
+        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
+        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
+        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         for d in create_first:
@@ -3395,13 +3846,53 @@ class BwrapProvider(ConfinementProvider):
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
-        shell = SandboxedShell(
+        try:
+            _prepare_mountpoints(mounted)
+            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
+                "bash hands (fail-closed)."
+            ) from exc
+        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
+        if moved:
+            raise ConfinementError(
+                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
+                "— refusing to grant bash hands (fail-closed). Try again."
+            )
+        # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
+        # expand these before the first per-command check, so a jewel that appeared after the manifest
+        # could be read before anything looked (codex L3 r5, r6).
+        shell_env = {
+            k: v for k, v in (env if env is not None else _default_shell_env()).items()
+            if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
+        }
+        shell = _BwrapShell(
+            policy=policy,
+            manifest=manifest,
             argv=argv,
             cwd=policy.workspace,
-            env=env if env is not None else _default_shell_env(),
+            env=shell_env,
             default_timeout=default_timeout,
         )
-        return shell.start()
+        try:
+            shell.start()
+            shell._recheck()   # whatever changed during the start closes it before any command
+        except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
+            shell.close()
+            raise
+        except (OSError, RuntimeError) as exc:
+            # A filesystem error in the recheck is a refusal like every other spawn-time inspection,
+            # not a crash past the caller's ConfinementError handler (codex + complement L3 r6).
+            shell.close()
+            raise ConfinementError(
+                f"could not re-check the floor's jewels after the shell started ({exc}) — refusing "
+                "to grant bash hands (fail-closed)."
+            ) from exc
+        except BaseException:
+            shell.close()   # never orphan a started shell (glm L3 r2)
+            raise
+        return shell
 
 
 def sandbox_exec_available() -> bool:

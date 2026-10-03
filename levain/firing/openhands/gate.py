@@ -262,6 +262,34 @@ def held_action_ids(conversation: Any) -> set[str]:
         return set()
 
 
+def unmatched_action_ids(conversation: Any) -> set[str] | None:
+    """The ids of proposed actions with no observation yet, which the next ``run()`` executes.
+    ``None`` when they CANNOT BE READ: unlike :func:`held_action_ids` (a display filter), this
+    answers a gate question, so "could not tell" must not read as "none"."""
+    try:
+        from openhands.sdk.conversation.state import ConversationState
+
+        pending = ConversationState.get_unmatched_actions(conversation.state.events)
+        return {str(_safe_attr(e, "id")) for e in pending}
+    except Exception:  # noqa: BLE001 — undeterminable, which is NOT "none"
+        return None
+
+
+def rejected_action_ids(conversation: Any) -> set[str] | None:
+    """The ids of actions answered by a ``UserRejectObservation`` (refused, never executed).
+    ``None`` when the history cannot be read. Distinct from "unmatched": an action that RAN also
+    stops being unmatched, so only this proves a refusal took."""
+    try:
+        from openhands.sdk.event import UserRejectObservation
+
+        return {
+            str(e.action_id) for e in conversation.state.events
+            if isinstance(e, UserRejectObservation)
+        }
+    except Exception:  # noqa: BLE001 — undeterminable, which is NOT "refused"
+        return None
+
+
 def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
     """The actions the gate stopped, in the order the agent proposed them.
 

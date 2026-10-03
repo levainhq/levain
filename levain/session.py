@@ -522,6 +522,10 @@ class EntitySession:
     _turn_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
+    # Set when a refusal could not be confirmed (see `reject_turn`): the refused actions may still
+    # be unanswered, and every turn method's `run()` would execute them, so the session refuses
+    # every further turn instead of trusting each driver to stop.
+    _refusal_unconfirmed: bool = field(default=False, init=False, repr=False, compare=False)
 
     # -- construction --------------------------------------------------------
 
@@ -855,6 +859,8 @@ class EntitySession:
             return TurnResult(
                 reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR,
             )
+        if self._refusal_unconfirmed:
+            return self._unconfirmed_refusal_result()
 
         # REFUSE A NEW MESSAGE WHILE THE GATE IS HOLDING (codex L3, HIGH). ``send_message`` does
         # NOT clear ``WAITING_FOR_CONFIRMATION`` — but the ``run()`` that follows it DOES, and
@@ -914,6 +920,8 @@ class EntitySession:
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        if self._refusal_unconfirmed:
+            return self._unconfirmed_refusal_result()
         return self._drive()
 
     @_one_turn
@@ -925,9 +933,21 @@ class EntitySession:
         PR instead of pushing") and one that narrates success over a world it never touched. The
         turn then continues, which is why this returns a :class:`TurnResult` rather than
         ``None``: a refusal is a move in the conversation, not a dead end.
+
+        A refusal that cannot be CONFIRMED (the runtime still reports a halt, its status cannot be
+        read, or an action is left without its rejection) ends the turn with the actions not run,
+        and the session then refuses every further turn: any later ``run()`` would execute them.
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        if self._refusal_unconfirmed:
+            return self._unconfirmed_refusal_result()
+        try:
+            from levain.firing.openhands.gate import unmatched_action_ids
+
+            held = unmatched_action_ids(self.conversation) if self.gate_mode == "gated" else set()
+        except Exception:  # noqa: BLE001 — undeterminable: the refusal cannot be confirmed
+            held = None
         try:
             from levain.firing.openhands.gate import reject_pending
 
@@ -944,18 +964,42 @@ class EntitySession:
         # driver") applied to a SECURITY boundary, where the two goals point opposite ways. On a
         # gate, uptime loses. Same discipline as `arm_efferent_gate`: check the STATE, never the
         # call's return — `verify_the_output_not_the_run`.
-        if self._gate_halted():
-            return TurnResult(
-                reply=None,
-                tool_activity=[],
-                error=(
-                    "the refusal did NOT take — the actions are still held and were NOT run. "
-                    "Do not resume this session; restart it."
-                ),
-                gated=True,
-                pending=self._gate_report(),
-            )
+        # Fail CLOSED on anything short of a confirmed refusal (codex L3, 2026-10-03): an
+        # unreadable status, or a status that reads idle while an action still has no
+        # observation (the SDK clears the halt BEFORE it records the rejections, so a failure
+        # between the two leaves exactly that), would let `_drive()`'s `run()` execute the
+        # refused action.
+        if self.gate_mode == "gated" and not self._refusal_landed(held):
+            self._refusal_unconfirmed = True
+            return self._unconfirmed_refusal_result()
         return self._drive()
+
+    def _unconfirmed_refusal_result(self) -> TurnResult:
+        return TurnResult(
+            reply=None,
+            tool_activity=[],
+            error=(
+                "the refusal could not be confirmed — the actions were NOT run, and this session "
+                "refuses every further turn. Restart it."
+            ),
+            gated=True,
+            pending=self._gate_report(),
+        )
+
+    def _refusal_landed(self, held: set[str] | None) -> bool:
+        """True only when the runtime positively reports no halt, no action is left unanswered,
+        and every action held before the refusal (``held``) was answered by a REJECTION: an
+        action that ran instead also stops being unanswered (codex L3 r1)."""
+        if held is None or self._gate_status() is not False:
+            return False
+        try:
+            from levain.firing.openhands.gate import rejected_action_ids, unmatched_action_ids
+
+            remaining = unmatched_action_ids(self.conversation)
+            rejected = rejected_action_ids(self.conversation)
+        except Exception:  # noqa: BLE001 — undeterminable, NOT "landed"
+            return False
+        return remaining == set() and rejected is not None and held <= rejected
 
     def pending_efferent(self) -> tuple[PendingEfferent, ...]:
         """The actions the gate is currently holding, or ``()`` if it is not holding any.

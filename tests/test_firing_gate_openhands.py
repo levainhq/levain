@@ -378,11 +378,19 @@ class _DriveConversation(_FakeConversation):
             self.state.events = []
 
     def reject_pending_actions(self, reason="rejected"):
+        # As OpenHands 1.26 does: clear the halt, then answer each held action with a REAL
+        # UserRejectObservation. The action event stays in the history (deleting it would let a
+        # check that only asks "is anything unanswered?" pass for the wrong reason).
         from openhands.sdk import ConversationExecutionStatus
+        from openhands.sdk.conversation.state import ConversationState
+        from openhands.sdk.event import UserRejectObservation
 
         self.rejections.append(reason)
         self.state.execution_status = ConversationExecutionStatus.IDLE
-        self.state.events = []
+        pending = ConversationState.get_unmatched_actions(self.state.events)
+        self.state.events = [*self.state.events, *(UserRejectObservation(
+            action_id=a.id, tool_name=a.tool_name, tool_call_id=a.tool_call_id,
+            rejection_reason=reason) for a in pending)]
 
     def close(self):
         self.closed = True
@@ -701,3 +709,149 @@ def test_a_halt_the_report_cannot_describe_still_reports_as_gated(tmp_path):
     assert len(result.pending) == 1
     assert result.pending[0].recognized is False
     assert "could not be read" in result.pending[0].detail
+
+
+def test_a_refusal_that_cleared_the_halt_but_left_the_action_unanswered_runs_nothing(tmp_path):
+    """codex L3 (2026-10-03): the SDK clears WAITING_FOR_CONFIRMATION before it records the
+    rejection observations, so a failure between the two reads as idle with the action still
+    unmatched — and the next run() executes it. The refusal must be confirmed, not inferred."""
+    from openhands.sdk import ConversationExecutionStatus
+
+    class _HalfRejects(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            self.state.execution_status = ConversationExecutionStatus.IDLE
+            raise RuntimeError("event emission failed")   # the action event stays unmatched
+
+    conv = _HalfRejects([True])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    runs_before = conv.runs
+
+    result = sess.reject_turn("no")
+
+    assert conv.runs == runs_before, "run() would have executed the refused, unanswered action"
+    assert result.error is not None and result.gated is True
+
+
+def test_a_refusal_with_an_unreadable_status_runs_nothing(tmp_path):
+    """codex L3 (2026-10-03): `_gate_halted()` read an unreadable status as not halted."""
+
+    class _StatusVanishes(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            del self.state.execution_status   # the status can no longer be read
+
+    conv = _StatusVanishes([True])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    runs_before = conv.runs
+
+    result = sess.reject_turn("no")
+
+    assert conv.runs == runs_before
+    assert result.error is not None and result.gated is True
+
+
+def test_a_refusal_the_sdk_recorded_as_a_real_rejection_continues_the_turn(tmp_path):
+    """The positive twin, against the SDK's own matching: the action event stays in the history
+    and a REAL UserRejectObservation answers it, as `reject_pending_actions` records it."""
+    from openhands.sdk import ConversationExecutionStatus
+    from openhands.sdk.event import UserRejectObservation
+
+    class _RealRejection(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            self.state.execution_status = ConversationExecutionStatus.IDLE
+            action = self.state.events[-1]
+            self.state.events = [*self.state.events, UserRejectObservation(
+                action_id=action.id, tool_name=action.tool_name,
+                tool_call_id=action.tool_call_id, rejection_reason=reason)]
+
+    conv = _RealRejection([True, False])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    runs_before = conv.runs
+
+    result = sess.reject_turn("no")
+
+    assert result.error is None and result.gated is False
+    assert conv.runs == runs_before + 1, "a confirmed refusal continues the turn"
+
+
+def test_a_refusal_whose_events_cannot_be_read_runs_nothing(tmp_path):
+    """L1 (2026-10-03): the status reads idle but the event history cannot be read, so whether the
+    refused action was answered is unknown. Unknown is not "answered"."""
+    from openhands.sdk import ConversationExecutionStatus
+
+    class _EventsVanish(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            self.state.execution_status = ConversationExecutionStatus.IDLE
+            self.state.events = object()   # not iterable: the unmatched read raises
+
+    conv = _EventsVanish([True])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    runs_before = conv.runs
+
+    result = sess.reject_turn("no")
+
+    assert conv.runs == runs_before
+    assert result.error is not None and result.gated is True
+
+
+def test_after_an_unconfirmed_refusal_no_turn_method_runs_the_conversation(tmp_path):
+    """L1 (2026-10-03): the failed-refusal result only TOLD the driver to stop; run_turn and
+    resume_turn would still run() the unanswered action. The object refuses instead."""
+    from openhands.sdk import ConversationExecutionStatus
+
+    class _HalfRejects(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            self.state.execution_status = ConversationExecutionStatus.IDLE
+            raise RuntimeError("event emission failed")
+
+    conv = _HalfRejects([True])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    sess.reject_turn("no")
+    runs_before = conv.runs
+
+    for result in (sess.run_turn("ok, carry on"), sess.resume_turn(), sess.reject_turn("no")):
+        assert result.error is not None and result.gated is True
+    assert conv.runs == runs_before, "a later turn would have executed the refused action"
+
+
+def test_a_held_action_that_RAN_instead_of_being_refused_is_not_a_landed_refusal(tmp_path):
+    """codex L3 r1 (2026-10-03): an action answered by an ordinary observation (it executed, e.g.
+    a racing approve) is no longer unmatched either, so "nothing unanswered" read as a refusal
+    that took. Only a UserRejectObservation for each held action confirms it."""
+    from openhands.sdk import ConversationExecutionStatus
+    from openhands.sdk.event import ObservationEvent
+    from openhands.tools.terminal import TerminalObservation
+
+    class _RanInstead(_DriveConversation):
+        def reject_pending_actions(self, reason="rejected"):
+            self.rejections.append(reason)
+            self.state.execution_status = ConversationExecutionStatus.IDLE
+            a = self.state.events[-1]
+            self.state.events = [*self.state.events, ObservationEvent(
+                action_id=a.id, tool_name=a.tool_name, tool_call_id=a.tool_call_id,
+                observation=TerminalObservation.from_text("pushed", command="git push"))]
+
+    conv = _RanInstead([True])
+    sess = _session(tmp_path, conv)
+    sess.run_turn("push the branch")
+    runs_before = conv.runs
+
+    result = sess.reject_turn("no")
+
+    from openhands.sdk.conversation.state import ConversationState
+    assert ConversationState.get_unmatched_actions(conv.state.events) == [], (
+        "the fake must leave the action ANSWERED (by a normal observation), or this test passes "
+        "for the wrong reason"
+    )
+
+    assert conv.runs == runs_before
+    assert result.error is not None and result.gated is True
