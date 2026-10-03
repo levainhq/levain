@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import tempfile
 import platform
 from pathlib import Path
 
@@ -258,13 +260,17 @@ def test_live_a_symlinked_store_cannot_be_swapped_for_a_planted_tree(
 # --- stores the trust files list (a moved project home) ----------------------------------------
 
 
+def _trust(path: Path, *dbs: Path, root: str | None = "/r") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"db": str(d)} | ({"root": root} if root is not None else {}) for d in dbs]
+    path.write_text(json.dumps({"version": 2, "stores": entries}))
+    return path
+
+
 def _moved_home(root: Path, home: Path) -> tuple[Path, Path]:
     """A flow project home moved away from ~/.anneal-projects: trust file + one store, listed by db."""
     moved = _project_home(root / "moved-projects")
-    trust = moved / "derive-trust.json"
-    trust.write_text(json.dumps({"version": 2, "stores": [
-        {"db": str(moved / "levain-v2" / "memory.db"), "root": str(home)}]}))
-    return moved, trust
+    return moved, _trust(moved / "derive-trust.json", moved / "levain-v2" / "memory.db", root=str(home))
 
 
 def test_a_store_listed_in_the_env_trust_file_is_a_denied_subtree(home, tmp_path, monkeypatch):
@@ -276,20 +282,29 @@ def test_a_store_listed_in_the_env_trust_file_is_a_denied_subtree(home, tmp_path
 
 
 def test_a_store_listed_in_the_default_trust_file_is_denied_without_the_env(home, tmp_path):
-    """anneal's own default trust file is read too, so a store it lists anywhere is covered."""
     moved = _project_home(tmp_path / "elsewhere")
-    (home / ".anneal-memory").mkdir()
-    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
-        {"version": 2, "stores": [{"db": str(moved / "levain-v2" / "memory.db"), "root": "/r"}]}))
+    _trust(home / ".anneal-memory" / "derive-trust.json", moved / "levain-v2" / "memory.db")
     policy = build_policy(_entity(home))
     assert (moved / "levain-v2").resolve() in policy.deny_read_write
 
 
+def test_a_large_trust_file_is_still_honoured(home, tmp_path):
+    """anneal has no size cap, so neither may this (codex L3 HIGH: a skipped file left its stores open)."""
+    moved = _project_home(tmp_path / "elsewhere")
+    filler = [{"db": f"/nonexistent/{i}/memory.db", "root": "/r"} for i in range(30000)]
+    t = home / ".anneal-memory" / "derive-trust.json"
+    t.parent.mkdir()
+    t.write_text(json.dumps({"version": 2, "stores": filler + [
+        {"db": str(moved / "levain-v2" / "memory.db"), "root": "/r"}]}))
+    assert t.stat().st_size > 1 << 20
+    assert (moved / "levain-v2").resolve() in build_policy(_entity(home)).deny_read_write
+
+
 @pytest.mark.parametrize("content", ["", "{not json", '{"stores": "x"}', '{"stores": [{"db": 7}]}',
-                                     '{"stores": [{"db": "relative/memory.db"}]}'])
+                                     '{"stores": [{"db": "relative/memory.db", "root": "/r"}]}'])
 def test_a_bad_trust_file_adds_nothing_and_the_default_deny_holds(home, monkeypatch, content):
-    (home / ".anneal-memory").mkdir()
     trust = home / ".anneal-memory" / "derive-trust.json"
+    trust.parent.mkdir()
     trust.write_text(content)
     entity = _entity(home)
     policy = build_policy(entity)
@@ -299,39 +314,88 @@ def test_a_bad_trust_file_adds_nothing_and_the_default_deny_holds(home, monkeypa
     assert (policy.deny_read_write, policy.deny_files) == (without.deny_read_write, without.deny_files)
 
 
-def test_a_store_beside_home_denies_only_its_db_never_home(home):
-    (home / ".anneal-memory").mkdir()
-    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
-        {"version": 2, "stores": [{"db": str(home / "memory.db"), "root": "/r"}]}))
+def test_entries_and_files_anneal_would_reject_widen_nothing(home, tmp_path):
+    """Protect exactly what anneal will trust (codex L3 MED): no root, a group-writable file, a
+    symlinked trust file all load no store in anneal, so they must not hide anything here."""
+    store = _project_home(tmp_path / "s")
+    t = _trust(home / ".anneal-memory" / "derive-trust.json", store / "levain-v2" / "memory.db", root=None)
     entity = _entity(home)
-    policy = build_policy(entity)
-    assert home.resolve() not in policy.deny_read_write
-    assert (home / "memory.db").resolve() in policy.deny_files
-    assert crown_jewel_reason(policy, entity / "workspace" / "notes.md") is None
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
+    _trust(t, store / "levain-v2" / "memory.db")
+    t.chmod(0o664)
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
+    real = _trust(tmp_path / "real-trust.json", store / "levain-v2" / "memory.db")
+    t.unlink()
+    t.symlink_to(real)
+    assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
 
 
-def test_a_store_inside_the_entity_is_left_to_its_own_memory_rules(home):
+def test_a_fifo_at_a_trust_path_neither_hangs_nor_widens(home, monkeypatch):
+    fifo = home / "trust.fifo"
+    os.mkfifo(fifo)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
+    build_policy(_entity(home))   # returns: the open is non-blocking and the type check refuses it
+
+
+def test_a_listed_store_whose_directory_is_missing_is_skipped(home, tmp_path):
+    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "gone" / "memory.db")
+    assert (tmp_path / "gone").resolve() not in build_policy(_entity(home)).deny_read_write
+
+
+def test_a_symlinked_db_denies_its_lexical_directory_too(home, tmp_path):
+    real = _project_home(tmp_path / "real")
+    lex = tmp_path / "lex"
+    lex.mkdir()
+    (lex / "memory.db").symlink_to(real / "levain-v2" / "memory.db")
+    _trust(home / ".anneal-memory" / "derive-trust.json", lex / "memory.db")
+    policy = build_policy(_entity(home))
+    assert lex.resolve() in policy.deny_read_write
+    assert (real / "levain-v2").resolve() in policy.deny_read_write
+
+
+@pytest.mark.parametrize("where", ["home", "entity", "workspace", "tmp"])
+def test_a_store_that_cannot_be_hidden_whole_refuses_the_floor(home, tmp_path, where):
+    """codex L3 HIGH: denying only the db left its continuity writable; anneal writes too many names
+    beside a db to deny them one by one, so the store needs a directory of its own."""
     entity = _entity(home)
-    (home / ".anneal-memory").mkdir()
-    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
-        {"version": 2, "stores": [{"db": str(entity / ".levain" / "memory.db"), "root": "/r"}]}))
+    d = {"home": home, "entity": entity / "notes", "workspace": entity / "workspace" / "proj",
+         "tmp": Path(tempfile.gettempdir())}[where]
+    d.mkdir(parents=True, exist_ok=True)
+    _trust(home / ".anneal-memory" / "derive-trust.json", d / f"levain-1308-{where}.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity)
+
+
+def test_the_entitys_own_canonical_store_is_left_to_its_memory_rules(home):
+    entity = _entity(home)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / ".levain" / "memory.db")
     policy = build_policy(entity)
     assert (entity / ".levain").resolve() not in policy.deny_read_write
 
 
 @mac_live
 def test_a_case_variant_workspace_spelling_is_still_the_workspace(home):
-    """Containment by identity (L1 MED-4 on the first cut): on case-insensitive APFS a db listed under
-    an upper-cased spelling of a workspace outside the entity must not hide that workspace."""
+    """Containment by identity: on case-insensitive APFS a store listed under an upper-cased spelling
+    of a workspace outside the entity is the workspace, so it refuses instead of hiding it."""
     entity = _entity(home)
     ws = home / "wsout"
     ws.mkdir()
-    variant = home / "WSOUT"
-    (home / ".anneal-memory").mkdir()
-    (home / ".anneal-memory" / "derive-trust.json").write_text(json.dumps(
-        {"version": 2, "stores": [{"db": str(variant / "memory.db"), "root": "/r"}]}))
-    policy = build_policy(entity, workspace=ws)
-    assert crown_jewel_reason(policy, ws / "notes.md") is None
+    _trust(home / ".anneal-memory" / "derive-trust.json", home / "WSOUT" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity, workspace=ws)
+
+
+def test_a_store_trusted_after_the_policy_was_built_is_denied_at_the_next_spawn(home, tmp_path):
+    from levain.firing.confinement import refresh_socket_denies
+    entity = _entity(home)
+    policy = build_policy(entity)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    assert (late / "levain-v2").resolve() not in policy.deny_read_write
+    refreshed = refresh_socket_denies(policy)
+    assert (late / "levain-v2").resolve() in refreshed.deny_read_write
+    assert (late / "levain-v2").resolve() in refreshed.deny_read_write   # union: never dropped
+    assert set(policy.deny_read_write) <= set(refreshed.deny_read_write)
 
 
 @live
