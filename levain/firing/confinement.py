@@ -2497,7 +2497,11 @@ def _caller_denies(path: Path, policy: CrownJewelsPolicy) -> bool:
     Matched case- AND normalization-insensitively (:func:`_ci_within`), consistently with
     ``crown_jewel_reason`` (apparatus L3 codex MED): a case-sensitive compare here would let the ssh
     convenience-allow override an operator deny declared as a case/Unicode variant (e.g. ``~/.SSH/
-    config``) for the bash hand while the file editor still denies it — a two-enforcer split."""
+    config``) for the bash hand while the file editor still denies it — a two-enforcer split.
+    ⚠ Not made exact with step (5)'s compare: a rebind lands inside the case-sensitive ssh tmpfs, so a
+    mask on a case variant there is another dentry and would not cover it (L1, 2026-10-03). Cost: a
+    deny of ``~/.ssh/Known_Hosts`` on a case-sensitive volume also drops the distinct
+    ``known_hosts`` rebind."""
     p = path.resolve()
     if any(_ci_within(p, f) for f in policy.deny_files):
         return True
@@ -2892,7 +2896,11 @@ def _shadowed_by(path: Path, roots: tuple[Path, ...]) -> bool:
     to deny. A ``/dev/null`` bind exposes nothing and is therefore the correct form here — see the
     write-only block in :func:`_bwrap_argv` for why it is applied rather than skipping outright.
     Matched with :func:`_ci_within` for consistency with the rest of the module (and see that
-    function on why the fold is macOS-shaped)."""
+    function on why the fold is macOS-shaped). ⚠ The fold stays even though step (5)'s mask compare is
+    exact: masks-last covers a self-bind with a later /dev/null mask, but a tmpfs is not a mask, and
+    a tmpfs is case-sensitive even on a casefolded host, so an exact match here would let a case
+    variant self-bind back into the subtree it hides (L1, 2026-10-03). Cost: on a case-sensitive
+    volume a write-only file under a directory differing only in case from a root is hidden."""
     return any(_ci_within(path, r) for r in roots)
 
 
@@ -2992,16 +3000,26 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
+_MASK_OPS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
+# Every bwrap op that can put content on a path. One of these after a mask could cover it.
+_CONTENT_OPS = _MASK_OPS + ("--dev-bind", "--dev-bind-try", "--bind-fd", "--ro-bind-fd",
+                            "--bind-data", "--ro-bind-data", "--file", "--overlay",
+                            "--tmp-overlay", "--ro-overlay")
+
+
 def _refuse_bind_after_mask(argv: list[str]) -> None:
-    """Refuse a plan in which a bind with a host source follows a ``/dev/null`` mask. A later mount on
-    the same dentry wins, so such a bind could put a masked file back (see the masks-last rule in
-    :func:`_bwrap_plan_impl`). This holds the rule for every future step, not only step (5)."""
+    """Refuse a plan in which an op that puts content on a path (``_CONTENT_OPS``) follows a
+    ``/dev/null`` mask. A later mount on the same dentry wins, so such an op could put a masked file
+    back (see the masks-last rule in :func:`_bwrap_plan_impl`). Checked on the finished argv, so it
+    binds any step added later, not only step (5). The scan reads one token at a time; a plan path is
+    absolute, so it never equals an op name."""
     first_mask = None
-    for i in range(len(argv) - 2):
-        op, src = argv[i], argv[i + 1]
-        if op not in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+    for i in range(len(argv) - 1):
+        op = argv[i]
+        if op not in _CONTENT_OPS:
             continue
-        if src == "/dev/null":
+        src = argv[i + 1]
+        if op in _MASK_OPS and src == "/dev/null":
             if first_mask is None:
                 first_mask = i
         elif first_mask is not None:
@@ -3077,8 +3095,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the two spellings name one dentry (a case variant on a casefolded volume is the reasoned case;
     # any spelling a string compare does not match is the general one). RUN on argushub 2026-10-03,
     # bwrap 0.9.0, with the aliases `dir//D`, `dir/./D` and `dir/x/../D` for a masked `dir/D`: mask
-    # then self-bind printed the file, self-bind then mask refused it. Ordering closes that however
-    # the paths are spelled, so step (5) compares spellings exactly. The parked samefile branch put an
+    # then self-bind printed the file, self-bind then mask refused it. Ordering closes that whenever
+    # the two spellings reach the same mount and dentry, so step (5) compares spellings exactly. It
+    # does not cover a hardlink or a second bind of a parent directory: those are other dentries, which
+    # no mask ever covered, in either order (RUN, L2 2026-10-03). The parked samefile branch put an
     # identity check between the plan and bwrap instead; five review rounds each found a different
     # way past it.
     masks: list[str] = []
@@ -3326,13 +3346,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         elif f.exists():
             target = _bwrap_file_target(f)
             if _shadowed_by(target, roots) or str(target) in denied_both_targets:
-                # The spelling is outside every hidden subtree but its TARGET is inside one, or is
-                # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
-                # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
+                # The spelling is outside every hidden subtree but its TARGET is inside one: a
                 # self-bind takes its source from the host tree, so it would put the hidden file
-                # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
-                # link in a non-writable directory pointing into a sibling entity's store): the
-                # confined shell read the sibling's file. /dev/null denies both ways instead.
+                # back, readable, inside the tmpfs that hid it, and no mask is there to land on top.
+                # RUN on argushub 2026-10-03 (a trust link in a non-writable directory pointing into
+                # a sibling entity's store): the confined shell read the sibling's file. /dev/null
+                # denies both ways instead. The second test (the target is itself a step (2)/(4)
+                # mask) only saves a redundant mount: that mask is emitted after any self-bind.
                 masks.append(str(target))
             else:
                 argv += ["--ro-bind", str(target), str(target)]
@@ -3628,7 +3648,9 @@ def _mount_plan_paths(
     an ancestor pin the provider makes separately) (L3 r4). ``unmounted`` is
     every jewel path the policy names that the plan does NOT mount (an absent jewel under a read-only
     store, a SQLite sidecar absent at spawn): nothing covers those, so they are watched for appearing.
-    A path strictly inside a tmpfs root is left out of both, by EXACT containment: the tmpfs hides the
+    The first op on a path decides its kind, so a path both self-bound and masked records None (the
+    self-bind comes first; its source exists, so nothing is created). A path strictly inside a tmpfs
+    root is left out of both, by EXACT containment: the tmpfs hides the
     host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
     (L3 2026-10-03)."""
     mounted: dict[str, str | None] = {}

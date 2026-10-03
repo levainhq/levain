@@ -882,6 +882,7 @@ def test_a_case_variant_link_to_a_read_denied_file_is_masked_after_its_self_bind
         mask_at = [i for i, s, d in binds if s == "/dev/null" and d.casefold().endswith("/secrets/token")]
         self_at = [i for i, s, d in binds if s == d and s.casefold().endswith("/secrets/token")]
         assert mask_at, binds
+        assert self_at, binds   # the exact compare self-binds the variant; the mask must follow it
         assert all(i < min(mask_at) for i in self_at), binds
     finally:
         opt.chmod(0o755)

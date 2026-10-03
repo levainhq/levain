@@ -21,15 +21,12 @@ from levain.firing.confinement import (
 )
 from tests.test_floor_project_memory import _case_insensitive, _entity, home, live, _LINUX  # noqa: F401
 
-_BINDS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
-
-
 def _assert_masks_last(argv: list[str]) -> None:
-    ops = [(i, argv[i + 1]) for i in range(len(argv) - 2) if argv[i] in _BINDS]
-    masks = [i for i, src in ops if src == "/dev/null"]
-    hosts = [i for i, src in ops if src != "/dev/null"]
+    ops = [(i, argv[i], argv[i + 1]) for i in range(len(argv) - 1) if argv[i] in confinement._CONTENT_OPS]
+    masks = [i for i, op, src in ops if op in confinement._MASK_OPS and src == "/dev/null"]
+    hosts = [i for i, op, src in ops if i not in masks]
     assert masks, "the plan masks nothing; this check would be vacuous"
-    assert max(hosts) < min(masks), [argv[i:i + 3] for i, _ in ops]
+    assert max(hosts) < min(masks), [argv[i:i + 3] for i, _, _ in ops]
 
 
 def _write_only_link(root: Path, target: Path, monkeypatch) -> Path:
@@ -69,10 +66,13 @@ def test_the_plan_refuses_a_bind_after_a_mask() -> None:
     ok = ["bwrap", "--bind", "/", "/", "--ro-bind", "/a", "/a", "--ro-bind", "/dev/null", "/b",
           "--tmpfs", "/c", "--remount-ro", "/c"]
     _refuse_bind_after_mask(ok)
-    for op in _BINDS:
+    for op in confinement._CONTENT_OPS:
         bad = ["bwrap", "--ro-bind", "/dev/null", "/b", op, "/a", "/a"]
         with pytest.raises(ConfinementError, match="re-expose"):
             _refuse_bind_after_mask(bad)
+    # a mask after another mask, or a tmpfs after a mask, puts no content back
+    _refuse_bind_after_mask(["bwrap", "--ro-bind", "/dev/null", "/b", "--ro-bind", "/dev/null", "/c",
+                             "--tmpfs", "/d", "--remount-ro", "/d"])
 
 
 def test_the_plan_runs_the_order_check_on_what_it_returns(home, monkeypatch) -> None:
