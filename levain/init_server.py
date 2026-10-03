@@ -535,8 +535,8 @@ class _InitHandler(BaseHTTPRequestHandler):
                             require_empty=not self.server.force,
                         )
                     except InstallLockError as exc:
-                        # Refused before any write (busy, or the target filled up meanwhile): not
-                        # a partial install, so not the 500 "partial" shape below.
+                        # Refused before any write, not a partial install. With the lock held above,
+                        # what reaches here is the target filling up meanwhile (InstallTargetTaken).
                         self._send_json(
                             {"error": "install_refused", "message": exc.message,
                              "partial": False, "messages": messages}, 409
@@ -580,23 +580,26 @@ class _InitHandler(BaseHTTPRequestHandler):
                             f"(compose with `levain docs`)"
                         )
 
-                # The install SUCCEEDED (apply_init returned). Shaping the response
-                # manifest does post-success filesystem I/O (_manifest_rows globs the
-                # seed/activation trees), so a fault HERE must not flip a good install
-                # to "failed" via the generic outer handler — the same misreport class
-                # the docs step guards, one function later (complement L3 MED). Degrade
-                # the manifest, keep ok/partial sourced from result.store_ok.
-                store = install / ".levain" / "memory.db"
-                try:
-                    rows = _manifest_rows(install, chosen, store, result.store_ok)
-                    next_steps = _next_steps_lines(install, chosen, result.store_ok)
-                except OSError as shape_exc:
-                    messages.append(
-                        f"note: install complete, but could not build the file "
-                        f"manifest ({shape_exc})."
-                    )
-                    rows = []
-                    next_steps = []
+                    # Shaped INSIDE the lock (codex L3 2026-10-03): it reads the live seed/activation
+                    # trees, and a CLI init/update taking the lock as soon as it is released could
+                    # swap them mid-read. The response itself is written after the lock is released.
+                    # The install SUCCEEDED (apply_init returned). Shaping the response
+                    # manifest does post-success filesystem I/O (_manifest_rows globs the
+                    # seed/activation trees), so a fault HERE must not flip a good install
+                    # to "failed" via the generic outer handler — the same misreport class
+                    # the docs step guards, one function later (complement L3 MED). Degrade
+                    # the manifest, keep ok/partial sourced from result.store_ok.
+                    store = install / ".levain" / "memory.db"
+                    try:
+                        rows = _manifest_rows(install, chosen, store, result.store_ok)
+                        next_steps = _next_steps_lines(install, chosen, result.store_ok)
+                    except OSError as shape_exc:
+                        messages.append(
+                            f"note: install complete, but could not build the file "
+                            f"manifest ({shape_exc})."
+                        )
+                        rows = []
+                        next_steps = []
         except InitError as exc:
             # PRE-write compose fault: open_init_templates raised at the `with` entry
             # (corrupt/missing base templates, or a pack that no longer composes) —

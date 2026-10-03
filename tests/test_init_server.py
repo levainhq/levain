@@ -907,9 +907,8 @@ def test_a_busy_install_is_refused_before_any_write_not_reported_partial(tmp_pat
             release.set()
             t.join(5)
     assert status == 409 and body["error"] == "install_refused" and body["partial"] is False
-    assert sorted(p.name for p in install.iterdir()) == [".levain"]
-    assert sorted(p.name for p in (install / ".levain").iterdir()) in (
-        ["install.lock"], [".gitignore", "install.lock"])
+    assert sorted(p.name for p in install.iterdir()) == [".levain"]   # no seed, no adapter files
+    assert not (install / ".levain" / "answers.json").exists()
 
 
 def test_a_docs_refresh_fault_never_turns_a_good_install_into_a_failure(tmp_path: Path) -> None:
@@ -927,3 +926,33 @@ def test_a_docs_refresh_fault_never_turns_a_good_install_into_a_failure(tmp_path
                 base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
     assert status == 200 and body["ok"] is True
     assert any("could not refresh pack docs" in m for m in body["messages"])
+
+
+def test_the_response_manifest_is_read_inside_the_install_lock(tmp_path: Path) -> None:
+    """codex L3 2026-10-03: the manifest/next-steps shaping read the live trees after the lock was
+    released, so a CLI writer could swap them mid-read. Same probe as the docs-refresh test."""
+    import levain.init_server as init_server_mod
+    from levain.install import InstallBusy, install_lock
+
+    seen: list[str] = []
+    real = init_server_mod._manifest_rows
+
+    def probing(install, *a, **k):
+        def other_thread():
+            try:
+                with install_lock(install):
+                    seen.append("acquired")
+            except InstallBusy:
+                seen.append("busy")
+
+        t = threading.Thread(target=other_thread)
+        t.start()
+        t.join(5)
+        return real(install, *a, **k)
+
+    with mock.patch.object(init_server_mod, "_manifest_rows", probing):
+        with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, _body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+    assert status == 200 and seen == ["busy"], seen
