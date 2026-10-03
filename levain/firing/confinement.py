@@ -235,7 +235,7 @@ import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, NoReturn
 
 # The efferent gate's accepted settings, imported rather than restated: the config loader and the
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
@@ -2936,30 +2936,52 @@ def _sqlite_state(p: Path) -> str:
         os.close(fd)
 
 
-def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, dict[tuple, str]]]:
-    """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, the names found inside
-    the floor)``. The names are the named jewels (followed through symlinks) plus every entry under
-    the hidden subtrees and the ssh dir (walked without following symlinks), and on Linux the session
-    bus and the systemd manager socket bwrap step (7) masks. A larger ``st_nlink`` means some name is
-    somewhere the floor does not cover.
+def _foreign_runtime_dirs() -> list[str]:
+    """The user runtime dirs (:func:`_runtime_dirs`) that are real directories owned by ANOTHER user,
+    at both their given and resolved spellings. Under ``su`` the inherited ``$XDG_RUNTIME_DIR`` is
+    the first user's ``/run/user/<uid>``, mode 0700: nothing under it can be stat-ed, and the entity
+    cannot reach it either. Ownership is read from ``lstat`` of the directory itself, so a symlink
+    spelled like a runtime dir is never taken for one. A dir that cannot be ``lstat``-ed is not
+    listed, and the sockets under it then fail closed."""
+    out: list[str] = []
+    for rd in _runtime_dirs():
+        try:
+            st = os.lstat(rd)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid != os.geteuid():
+            out += [rd, os.path.realpath(rd)]
+    return out
 
-    Each name is keyed by its DIRECTORY ENTRY, not its spelling: the parent directory's identity plus
-    the case-folded final component. Two spellings of one entry (a case variant on a case-insensitive
-    volume, a bind-mount alias of the parent) therefore count once, so they cannot stand in for an
-    outside link (codex + complement L3 r1). Folding can only merge two real entries that differ by
-    case, which undercounts and refuses: the safe direction.
 
-    ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("cannot verify"):
-    a chmod on its own directory would otherwise switch the check off while the other name stays
-    reachable (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). That includes a
-    file under another user's directory (codex L3 r1). Only a SOCKET path blocked by another user's
-    directory is left alone (the jewel-recheck rule in :func:`_identity`): the socket roster names
-    runtime directories that belong to another user under ``su``, and Linux's protected_hardlinks
-    stops linking another user's socket."""
-    seen: dict[tuple[int, int], tuple[int, dict[tuple, str]]] = {}
-    sockets = {str(p) for p in (*policy.deny_sockets, *policy.socket_spellings)}
+def _jewel_names(
+    policy: CrownJewelsPolicy,
+) -> dict[tuple[int, int], tuple[int, dict[tuple, set[str]]]]:
+    """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, {entry: spellings})``,
+    the directory entries found inside the floor and every spelling each was found at. The names
+    are the named jewels (followed through symlinks) plus every entry under the hidden subtrees and
+    the ssh dir (walked without following symlinks), and on Linux the session bus and the systemd
+    manager socket bwrap step (7) masks. A larger ``st_nlink`` means some name is somewhere the
+    floor does not cover.
 
-    def unverifiable(path: str, exc: OSError) -> None:
+    An entry is keyed by the parent directory's identity plus the case-folded final component, so
+    two spellings of one entry (a case variant on a case-insensitive volume, a bind-mount alias of
+    the parent) COUNT once and cannot stand in for an outside link (codex + complement L3 r1).
+    Folding can only merge two real entries that differ by case, which undercounts and refuses.
+    ⛔ The key is for counting only. Whether a path IS a covered name is decided on the exact
+    spellings (:func:`linked_jewel_reason`): a bind alias or a same-dir case link matches the key
+    of a name it is not (codex + complement, the r1 fix-diff round).
+
+    ⛔ A jewel this user cannot stat or list, or whose parent cannot be stat-ed, raises
+    :class:`ConfinementError` ("could not check"), whoever owns the directory in the way: a chmod
+    on its own directory would otherwise switch the check off while the other name stays reachable
+    (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``), and a roster spelling
+    proves neither the type nor the owner of what sits behind another user's directory (codex, the
+    r1 fix-diff round). The one thing left out is a SOCKET path under another user's runtime dir
+    (:func:`_foreign_runtime_dirs`), dropped from the list before anything is stat-ed."""
+    seen: dict[tuple[int, int], tuple[int, dict[tuple, set[str]]]] = {}
+
+    def unverifiable(path: str, exc: OSError) -> NoReturn:
         raise ConfinementError(
             f"could not check {path} for other names ({exc.strerror or exc}). The floor denies paths, "
             "so an unchecked crown jewel could be reachable through a hardlink. Refusing this hand "
@@ -2970,15 +2992,9 @@ def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, 
         parent, name = os.path.split(path)
         try:
             pst = os.stat(parent or ".")
-            return (pst.st_dev, pst.st_ino, unicodedata.normalize("NFC", name).casefold())
-        except OSError:
-            return ("unresolved", path)
-
-    def blocked_by_another_user(path: str) -> bool:
-        try:
-            return _identity(Path(path)) == _UNREACHABLE
-        except OSError:
-            return False
+        except OSError as exc:
+            unverifiable(path, exc)
+        return (pst.st_dev, pst.st_ino, unicodedata.normalize("NFC", name).casefold())
 
     def note(path: str, follow: bool) -> None:
         try:
@@ -2986,24 +3002,32 @@ def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, 
         except (FileNotFoundError, NotADirectoryError):
             return   # absent (or a dangling link): no file to have other names
         except OSError as exc:
-            if not (path in sockets and blocked_by_another_user(path)):
-                unverifiable(path, exc)
-            return
+            unverifiable(path, exc)
         if stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
             return
         real = os.path.realpath(path) if follow else path
-        seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, {}))[1][entry_key(real)] = real
+        entries = seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, {}))[1]
+        entries.setdefault(entry_key(real), set()).add(real)
 
+    foreign = _foreign_runtime_dirs()
+
+    def under_foreign(p: Path) -> bool:
+        return any(str(p) == rd or str(p).startswith(rd.rstrip(os.sep) + os.sep) for rd in foreign)
+
+    sockets: list[Path] = [*policy.deny_sockets, *policy.socket_spellings]
+    if platform.system() == "Linux":
+        sockets += [b for rd in _runtime_dirs()
+                    for b in (Path(rd) / "bus", Path(rd) / "systemd" / "private")]
+    socket_names = {str(s) for s in sockets}
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
-             *policy.sqlite_sidecars, *policy.deny_sockets, *policy.socket_spellings]
+             *policy.sqlite_sidecars, *sockets]
     if policy.config_file is not None:
         named.append(policy.config_file)
-    if platform.system() == "Linux":
-        for rd in _runtime_dirs():
-            bus = [Path(rd) / "bus", Path(rd) / "systemd" / "private"]
-            named += bus
-            sockets.update(str(b) for b in bus)
     for f in named:
+        # build_policy also write-denies every socket spelling through deny_write_files, so the
+        # drop keys on the spelling, whichever list carries it.
+        if str(f) in socket_names and under_foreign(f):
+            continue
         note(str(f), follow=True)
 
     def walk_error(exc: OSError) -> None:
@@ -3042,11 +3066,10 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     (Phill's ruling, 2026-10-03). The file editor checks every path it touches instead
     (:func:`linked_jewel_reason`)."""
     for links, entries in _jewel_names(policy).values():
-        names = sorted(entries.values())
-        if links > len(names):
-            path = names[0]
+        if links > len(entries):
+            path = sorted(min(spellings) for spellings in entries.values())[0]
             raise ConfinementError(
-                f"{path} is a crown jewel with {links} names on disk, and only {len(names)} of them "
+                f"{path} is a crown jewel with {links} names on disk, and only {len(entries)} of them "
                 "inside the floor. The floor denies paths, so the other name would let the shell read "
                 "or write it. Refusing to grant bash hands (fail-closed). Find the other names with "
                 f"`find <volume> -samefile {shlex.quote(path)}` and remove the extra links."
@@ -3059,10 +3082,14 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     :func:`crown_jewel_reason` matches paths, so a hardlink to a jewel at an undenied path passed it:
     RUN 2026-10-03 (L1), the file editor's ``view`` of the link returned the denied token while bash
     was refused. The editor checks the exact path it is about to touch: a file with more than one
-    name whose identity is a jewel's, under an entry the floor does not cover, is refused. Not
+    name whose identity is a jewel's is refused unless its resolved spelling is EXACTLY one the
+    floor walk found. A matching directory-entry key is not enough: a bind alias of a hidden dir,
+    or ``TOKEN`` beside ``token`` on a case-sensitive volume, shares the key of a name it is not
+    (codex + complement, the r1 fix-diff round). Not
     covered: a host process that swaps a link into place between this check and the editor's open
     (codex L3 r1; the same host-process class as a link made while a shell is live). The jewel walk
     runs only when the target has more than one name."""
+    path = os.path.expanduser(str(path))
     try:
         st = os.stat(path)
     except OSError:
@@ -3076,16 +3103,10 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     hit = jewels.get((st.st_dev, st.st_ino))
     if hit is None:
         return None
-    real = os.path.realpath(path)
-    parent, name = os.path.split(real)
-    try:
-        pst = os.stat(parent)
-        key: tuple = (pst.st_dev, pst.st_ino, unicodedata.normalize("NFC", name).casefold())
-    except OSError:
-        key = ("unresolved", real)
-    if key in hit[1]:
-        return None   # this IS a jewel's own entry; crown_jewel_reason already judged that path
-    return (f"{path} is another name (a hardlink) for the crown jewel {sorted(hit[1].values())[0]}, "
+    covered = set().union(*hit[1].values())
+    if os.path.realpath(path) in covered:
+        return None   # this exact spelling IS a jewel's own name; crown_jewel_reason judged that path
+    return (f"{path} is another name (a hardlink) for the crown jewel {sorted(covered)[0]}, "
             "which the floor denies")
 
 

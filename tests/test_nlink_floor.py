@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import platform
+import shutil
 from pathlib import Path
 
 import pytest
@@ -170,7 +171,6 @@ def _blocked(monkeypatch, target: Path) -> None:
         return real_stat(p, *a, **k)
 
     monkeypatch.setattr(confinement.os, "stat", stat)
-    monkeypatch.setattr(confinement, "_identity", lambda p: confinement._UNREACHABLE)
 
 
 def test_a_file_blocked_by_another_users_dir_refuses(home, monkeypatch) -> None:
@@ -182,11 +182,73 @@ def test_a_file_blocked_by_another_users_dir_refuses(home, monkeypatch) -> None:
         _refuse_multiply_linked_jewels(policy)
 
 
-def test_a_socket_blocked_by_another_users_dir_is_left_alone(home, monkeypatch) -> None:
-    sock = home / "other-runtime" / "docker.sock"
-    policy = dataclasses.replace(build_policy(_entity(home)), deny_sockets=(sock,))
-    _blocked(monkeypatch, sock)
+def _foreign_dir() -> Path:
+    """A real directory owned by another user that this user cannot search (``/var/audit`` on macOS,
+    ``/root`` on Linux), so a path under it cannot be stat-ed for real."""
+    for d in ("/var/audit", "/root", "/var/lib/private", "/etc/ssl/private"):
+        try:
+            if os.lstat(d).st_uid == os.geteuid():
+                continue
+            os.stat(os.path.join(d, "levain-probe"))
+        except PermissionError:
+            return Path(d)
+        except OSError:
+            continue
+    pytest.skip("no directory owned by another user that this user cannot search")
+
+
+@pytest.mark.skipif(_ROOT, reason="root searches every directory")
+@pytest.mark.parametrize("field", ["deny_files", "deny_sockets"])
+def test_a_path_behind_another_users_dir_refuses_whatever_list_names_it(home, field) -> None:
+    """codex, the r1 fix-diff round: the socket exception trusted the roster spelling, so a
+    socket-listed path behind another user's directory was skipped without checking its type or
+    owner. Behind a REAL root-owned directory, both a deny file and a socket path now refuse."""
+    hidden = _foreign_dir() / "docker.sock"
+    policy = dataclasses.replace(build_policy(_entity(home)), **{field: (hidden,)})
+    with pytest.raises(ConfinementError, match="could not check"):
+        _refuse_multiply_linked_jewels(policy)
+
+
+@pytest.mark.skipif(_ROOT, reason="root searches every directory")
+def test_sockets_in_another_users_runtime_dir_are_dropped_upstream(home, monkeypatch) -> None:
+    """The ``su`` case: the inherited ``$XDG_RUNTIME_DIR`` is the first user's 0700 dir. Its sockets
+    are dropped from the list by the directory's owner, so they cost the shell nothing; the same
+    path under a directory that is not a runtime dir still refuses (the test above)."""
+    foreign = _foreign_dir()
+    monkeypatch.setattr(confinement, "_runtime_dirs", lambda: [str(foreign)])
+    assert confinement._foreign_runtime_dirs() == [str(foreign), os.path.realpath(foreign)]
+    policy = build_policy(_entity(home))   # the $XDG_RUNTIME_DIR roster entries land under it
+    under = [f for f in policy.deny_write_files if str(f).startswith(os.path.realpath(foreign))]
+    assert under, policy.deny_write_files
     _refuse_multiply_linked_jewels(policy)
+
+
+def test_a_symlink_spelled_as_a_runtime_dir_is_not_foreign(home, monkeypatch, tmp_path) -> None:
+    """Ownership is read from the directory itself: a link this user owns, pointing at another
+    user's directory, does not drop the sockets under it."""
+    foreign = _foreign_dir()
+    link = tmp_path / "rt"
+    link.symlink_to(foreign)
+    monkeypatch.setattr(confinement, "_runtime_dirs", lambda: [str(link)])
+    assert confinement._foreign_runtime_dirs() == []
+
+
+def test_a_parent_that_cannot_be_stated_refuses(home, monkeypatch) -> None:
+    """complement, the r1 fix-diff round: when stat(parent) failed, the per-spelling fallback key
+    let two spellings of one entry count twice."""
+    secret = _secret(home)
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    real_stat = os.stat
+    parent = str(secret.parent.resolve())
+
+    def stat(q, *a, **k):
+        if str(q) == parent:
+            raise PermissionError(13, "Permission denied", str(q))
+        return real_stat(q, *a, **k)
+
+    monkeypatch.setattr(confinement.os, "stat", stat)
+    with pytest.raises(ConfinementError, match="could not check"):
+        _refuse_multiply_linked_jewels(policy)
 
 
 def _case_insensitive(d: Path) -> bool:
@@ -318,3 +380,79 @@ def test_the_file_editor_refuses_a_hardlink_to_a_jewel(home) -> None:
     (ent / "workspace" / "ok.txt").write_text("fine")
     ok = ex(FileEditorAction(command="view", path=str(ent / "workspace" / "ok.txt")))
     assert not ok.is_error
+
+
+def _alias_parent(monkeypatch, alias: Path, real: Path) -> None:
+    """Make ``alias`` stat as ``real``: the identity a bind mount of ``real`` at ``alias`` has."""
+    real_stat = os.stat
+
+    def stat(q, *a, **k):
+        if str(q) == str(alias):
+            return real_stat(real, *a, **k)
+        return real_stat(q, *a, **k)
+
+    monkeypatch.setattr(confinement.os, "stat", stat)
+
+
+def test_linked_jewel_reason_refuses_a_name_that_only_shares_the_entry_key(home, monkeypatch) -> None:
+    """codex + complement, the r1 fix-diff round (a regression in r1's own fix): the editor allowed a
+    path whose directory-entry key matched a jewel's. A bind alias of a hidden directory has its
+    parent's identity and the same file name, so it matched and the editor read the jewel."""
+    from levain.firing.confinement import linked_jewel_reason
+    store = home / ".anneal-memory"
+    store.mkdir()
+    (store / "x.db").write_text("STORE")
+    alias = (home / "alias").resolve()
+    alias.mkdir()
+    os.link(store / "x.db", alias / "x.db")
+    _alias_parent(monkeypatch, alias, store.resolve())
+    policy = build_policy(_entity(home))
+    reason = linked_jewel_reason(policy, alias / "x.db")
+    assert reason and "x.db" in reason and "hardlink" in reason
+    assert linked_jewel_reason(policy, store.resolve() / "x.db") is None   # its own exact name
+
+
+def test_linked_jewel_reason_refuses_a_same_dir_case_variant_link(home) -> None:
+    """The second shape of the same finding: on a case-sensitive volume ``TOKEN`` beside ``token``
+    is a separate entry with the jewel's key."""
+    from levain.firing.confinement import linked_jewel_reason
+    secret = _secret(home)
+    if _case_insensitive(secret.parent):
+        pytest.skip("needs a case-sensitive volume")
+    os.link(secret, secret.parent / "TOKEN")
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    reason = linked_jewel_reason(policy, secret.parent / "TOKEN")
+    assert reason and "hardlink" in reason
+
+
+@pytest.mark.skipif(platform.system() != "Linux" or not shutil.which("bwrap"),
+                    reason="a real bind alias needs bwrap")
+def test_live_the_file_editor_check_refuses_a_real_bind_alias(home) -> None:
+    """RUN on argushub at c02ee1e before the fix: inside ``bwrap --bind <hidden> <alias>``, both
+    crown_jewel_reason and linked_jewel_reason returned None for ``<alias>/x.db`` and the editor
+    would have read the store."""
+    import subprocess
+    import sys
+    store = home / ".anneal-memory"
+    store.mkdir()
+    (store / "x.db").write_text("STORE")
+    os.link(store / "x.db", home / "elsewhere.db")
+    alias = home / "alias"
+    alias.mkdir()
+    ent = _entity(home)
+    code = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from levain.firing.confinement import build_policy, crown_jewel_reason, linked_jewel_reason\n"
+        f"p = build_policy(Path({str(ent)!r}))\n"
+        f"t = Path({str(alias / 'x.db')!r})\n"
+        "r = crown_jewel_reason(p, t) or linked_jewel_reason(p, t)\n"
+        "print('REFUSED' if r else 'READ ' + t.read_text())\n"
+    )
+    env = {**os.environ, "HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONPATH": str(Path(confinement.__file__).parents[2])}
+    out = subprocess.run(["bwrap", "--dev-bind", "/", "/", "--bind", str(store), str(alias),
+                          sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                         timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "REFUSED", out.stdout
