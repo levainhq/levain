@@ -17,7 +17,9 @@ in one ordered, fail-safe operation:
    contract) and never auto-ack; ``--ack`` advances the marker AFTER the operator
    has applied the edits, as a separate deliberate intent.
 3.5 **pack drift** -> reconcile a pulled pack source into the install
-   (``levain.reconcile``).
+   (``levain.reconcile``). ``--ack`` is recorded only AFTER this, and skipped when the
+   reconcile holds changes for review: a held seed keeps its old text installed, so
+   the proposals are not done yet.
 3.6 **activation tree + adapter files** -> re-composed from THIS levain, per file, so an
    upgrade (``pip install -U levain``) reaches the hooks and the carrier without
    ``init --force`` (``install.refresh_adapter``; an operator's edit is kept). This also
@@ -197,6 +199,10 @@ def _run_update(
             installed = manifest.discover_installed_set(store, anneal_path)
 
     # -- 3. methodology-content (surface proposals; never auto-apply / auto-ack) --
+    # The proposals are SHOWN here; an `--ack` is only DECIDED here and RECORDED after
+    # the pack reconcile (3.5), which can hold a seed file for review and leave its old
+    # instruction text installed (complement L3, 2026-10-03).
+    ack_target: str | None = None
     if installed.pending_count:
         emit(f"\n• {installed.pending_count} anneal migration proposal(s) — "
              f"review and apply these to your instruction files (anneal never "
@@ -219,18 +225,8 @@ def _run_update(
             # Ack to the INSTALLED version (what `migrate check` just showed and
             # the operator reviewed), never past it (complement L3: this sidesteps
             # the pre-release `_cmp`-equality quirk, and anneal refuses an ack
-            # ahead of the installed version anyway).
+            # ahead of the installed version anyway). Recorded after step 3.5.
             ack_target = _ack_target(installed.anneal, declared.anneal)
-            emit(f"\n• --ack: recording instruction files reconciled up to "
-                 f"anneal {ack_target}...")
-            ack_ok, ack_out = _run_anneal(
-                store, anneal_path, ["migrate", "ack", ack_target]
-            )
-            emit(f"  {'acknowledged up to ' + ack_target + '.' if ack_ok else 'FAILED: ' + ack_out}")
-            if ack_ok:
-                # Re-discover so the final verdict reflects the now-cleared pending
-                # set — else `--ack` returns 1 even on a successful ack (codex L3).
-                installed = manifest.discover_installed_set(store, anneal_path)
         else:
             emit("\n  After applying the edits, run `levain update --ack` (or "
                  f"`{manifest.anneal_invocation('--db', str(store), 'migrate', 'ack')}`) to record "
@@ -247,6 +243,27 @@ def _run_update(
     pack_provenance, _pack_drifted, pack_needs_review = reconcile.run_pack_reconcile(
         install, dry_run=False, emit=emit
     )
+
+    # -- 3.5b record the `--ack` decided at step 3, now that the reconcile has run. A
+    #    held pack change (a seed whose new text sits at `<file>.new`, a render slot not
+    #    yet answered, an unreadable pack lock) means the installed instruction text is
+    #    not what the proposals assume, so the marker stays where it is. --
+    if ack_target is not None and pack_needs_review:
+        emit("\n• --ack SKIPPED — the pack reconcile held changes for your review "
+             "(listed above), so seed / instruction text the proposals depend on may "
+             "still be the old version; marker unchanged. Resolve the held files, then "
+             "re-run `levain update --ack`.")
+    elif ack_target is not None:
+        emit(f"\n• --ack: recording instruction files reconciled up to "
+             f"anneal {ack_target}...")
+        ack_ok, ack_out = _run_anneal(
+            store, anneal_path, ["migrate", "ack", ack_target]
+        )
+        emit(f"  {'acknowledged up to ' + ack_target + '.' if ack_ok else 'FAILED: ' + ack_out}")
+        if ack_ok:
+            # Re-discover so the final verdict reflects the now-cleared pending
+            # set — else `--ack` returns 1 even on a successful ack (codex L3).
+            installed = manifest.discover_installed_set(store, anneal_path)
 
     # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
     #    `pip install -U levain` changes neither; only `init --force` used to). After the

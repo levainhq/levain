@@ -592,3 +592,86 @@ def test_doctor_names_update_for_a_stale_hook_and_carrier_and_update_clears_both
     _refresh(install)
     assert _check_hook_freshness(install)[0].ok
     assert _check_carrier_freshness(install, carrier)[0].ok
+
+
+def _install_with_render_pack(tmp_path, capsys, monkeypatch) -> tuple[Path, Path]:
+    """A real install (run_init + a real anneal store) composed with one pack whose
+    ``zz_role.md`` is a RENDER seed, with the store's migrate marker set back by a real
+    ``anneal migrate ack`` so a real proposal is pending and `--ack` has something to
+    record (no anneal stub; independent of where levain caps the init-time marker)."""
+    import subprocess
+
+    from levain import manifest
+    from tests.test_init_answers import _filled
+    from tests.test_reconcile import _write_pack
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    pack = _write_pack(tmp_path / "pack", name="zzpack", render=["zz_role.md"],
+                       seed={"zz_role.md": "Operator: {{OPERATOR_NAME}}\n"})
+    af = tmp_path / "a.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    install = tmp_path / "ent"
+    assert run_init(install, "claude-code", force=False, packs=[pack], answers_file=af) == 0
+    capsys.readouterr()
+    subprocess.run([manifest.resolve_anneal_bin(), "--db", str(install / ".levain" / "memory.db"),
+                    "migrate", "ack", "0.4.6"], check=True, capture_output=True)
+    return install, pack
+
+
+def _migrate_state(install: Path):
+    from levain import manifest
+
+    return manifest.discover_installed_set(install / ".levain" / "memory.db",
+                                           manifest.resolve_anneal_bin())
+
+
+def test_ack_is_not_recorded_while_the_reconcile_holds_a_seed_for_review(tmp_path, capsys,
+                                                                         monkeypatch):
+    """complement L3 (2026-10-03): `--ack` was recorded at step 3, BEFORE the pack
+    reconcile. An operator who had edited a seed file ran `levain update --ack`; the
+    reconcile then held that file for review (the new text at `.new`, the old text still
+    installed) while the migration proposal was already marked done. The ack must wait
+    for the reconcile and be skipped when it holds a seed change."""
+    from levain.update import run_update
+
+    install, pack = _install_with_render_pack(tmp_path, capsys, monkeypatch)
+    before = _migrate_state(install)
+    assert before.pending_count, "a fresh store should carry a real pending proposal"
+    role = install / "seed" / "zz_role.md"
+    role.write_text("Operator: MY HAND EDIT\n", encoding="utf-8")            # operator edit
+    (pack / "seed" / "zz_role.md").write_text("Operator v2: {{OPERATOR_NAME}}\n")  # pulled
+
+    lines: list[str] = []
+    rc = run_update(install, no_pip=True, ack=True, emit=lines.append,
+                    confirm=lambda _p: False)
+    out = "\n".join(lines)
+    assert rc == 1
+    assert (install / "seed" / "zz_role.md.new").exists()          # the seed WAS held
+    assert role.read_text() == "Operator: MY HAND EDIT\n"
+    after = _migrate_state(install)
+    assert after.migrate_acked == before.migrate_acked, "ack recorded over a held seed"
+    assert after.pending_count == before.pending_count
+    assert "--ack SKIPPED" in out and "held" in out
+    assert "acknowledged up to" not in out
+
+
+def test_ack_is_recorded_after_a_pack_reconcile_that_holds_nothing(tmp_path, capsys,
+                                                                   monkeypatch):
+    """No regression: the same pulled template change on an UNEDITED seed fast-forwards,
+    nothing is held, and `--ack` records the marker up to the installed anneal."""
+    from levain.update import run_update
+
+    install, pack = _install_with_render_pack(tmp_path, capsys, monkeypatch)
+    before = _migrate_state(install)
+    assert before.pending_count
+    (pack / "seed" / "zz_role.md").write_text("Operator v2: {{OPERATOR_NAME}}\n")
+
+    lines: list[str] = []
+    rc = run_update(install, no_pip=True, ack=True, emit=lines.append,
+                    confirm=lambda _p: False)
+    out = "\n".join(lines)
+    assert (install / "seed" / "zz_role.md").read_text() == "Operator v2: Chris\n"
+    after = _migrate_state(install)
+    assert after.migrate_acked == before.anneal and after.pending_count == 0
+    assert f"acknowledged up to {before.anneal}." in out and "SKIPPED" not in out
+    assert rc == 0, out
