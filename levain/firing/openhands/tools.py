@@ -61,6 +61,7 @@ Requires the ``openhands`` extra.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 import threading
@@ -96,6 +97,7 @@ from levain.firing.confinement import (
     select_provider,
 )
 from levain.firing.drive import DRIVE_MODES, DriveMode, resolve_cred_floor
+from levain.firing.isolation import ENTITY_STORE_SUBDIR
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
 
@@ -142,7 +144,11 @@ carried into a fork (``fork_conv._state.agent_state = copy.deepcopy(...)`` in th
 # anything that did not get it from :func:`bind_conversation` in this process — a resume, a fork, a
 # state rebuilt from disk — reads ``unattended`` (codex L3 HIGH, 2026-10-02).
 _MODES: dict[int, tuple["weakref.ref[Any]", DriveMode]] = {}
-_MODES_LOCK = threading.Lock()
+# REENTRANT for the reason `_FLOORS_LOCK` is (codex L3 r2 HIGH): an allocation made while holding it
+# can run a cyclic GC, which can run `_drop_mode` for a dead state ON THIS THREAD, which takes it.
+# Lock order everywhere is the SDK's conversation-state lock FIRST, then this one: the SDK holds the
+# state lock while it builds tools, and the tool build reaches `_live_mode`.
+_MODES_LOCK = threading.RLock()
 
 
 def _drop_mode(key: int) -> None:
@@ -165,39 +171,70 @@ class ConversationBindingError(ConfinementError):
 
 def bind_conversation(conversation: Any, *, entity_dir: Path | str, mode: DriveMode) -> None:
     """Bind ``conversation`` to ``entity_dir`` (persisted on its state) and ``mode`` (this process
-    only), then READ IT BACK.
+    only), ONCE, then READ IT BACK.
 
-    Refuses (:class:`ConversationBindingError`) unless the conversation's agent has provably NOT yet
-    built its tools — their floors would have been resolved without this binding. Also refuses a
-    binding that does not read back as written: a floor that failed to wire must not present itself
-    as one that did."""
-    if getattr(conversation.agent, "_initialized", None) is not False:
-        raise ConversationBindingError(
-            "cannot confirm the conversation's tools are unbuilt — their floor would not come from "
-            "this conversation (fail-closed)."
-        )
+    The whole transaction runs under the SDK's conversation-state lock, which the SDK holds while it
+    builds tools, so "the tools are unbuilt" cannot change between the check and the write.
+
+    Refuses (:class:`ConversationBindingError`):
+    - unless the agent has provably NOT built its tools, and no floor exists yet for this state (a
+      tool build that failed part-way leaves ``_initialized`` False but a floor already cached);
+    - a REBIND to a different entity or mode once this live state is bound — the binding is
+      immutable for the life of the state object, so no rebind can race a tool build (codex L3 r2
+      HIGH, reproduced 2026-10-02); an identical rebind is a no-op;
+    - a binding that does not read back as written."""
     if mode not in DRIVE_MODES:
         raise ConversationBindingError(
             f"unknown drive mode {mode!r}; expected one of {DRIVE_MODES}"
         )
     ed = Path(entity_dir).expanduser().resolve()
-    _require_agent_agrees(conversation.agent, ed)
     state = conversation.state
-    record = {**(state.agent_state or {}), CONVERSATION_BINDING_KEY: {"entity_dir": str(ed)}}
-    if hasattr(state, "__enter__"):
-        with state:  # the SDK's own state lock (autosave / a concurrent run mutate under it)
-            state.agent_state = record
-    else:
-        state.agent_state = record
     key = id(state)
-    with _MODES_LOCK:
-        _MODES[key] = (weakref.ref(state), mode)
-    weakref.finalize(state, _drop_mode, key)
-    if conversation_binding(state) != (ed, mode):
-        raise ConversationBindingError(
-            "the conversation binding did not read back as written — refusing to build a floor "
-            "from it (fail-closed)."
-        )
+    # Lock order: the SDK state lock, then (separately, never nested) _FLOORS_LOCK and _MODES_LOCK.
+    # A tool build takes _FLOORS_LOCK then _MODES_LOCK, so this function never holds _MODES_LOCK
+    # while it takes _FLOORS_LOCK.
+    with state if hasattr(state, "__enter__") else contextlib.nullcontext():
+        with _MODES_LOCK:
+            live = _live_mode(state)
+            if live is not None:
+                bound, _ = conversation_binding(state)
+                if (bound, live) == (ed, mode):
+                    return
+                raise ConversationBindingError(
+                    f"this conversation is already bound to {bound} ({live}); a binding is fixed "
+                    "for the life of the conversation — refusing to rebind it (fail-closed)."
+                )
+        if getattr(conversation.agent, "_initialized", None) is not False or _floor_exists(state):
+            raise ConversationBindingError(
+                "cannot confirm the conversation's tools are unbuilt — their floor would not come "
+                "from this conversation (fail-closed)."
+            )
+        _require_agent_agrees(conversation.agent, ed)
+        with _MODES_LOCK:
+            previous = state.agent_state
+            finalizer = weakref.finalize(state, _drop_mode, key)  # installed BEFORE publishing
+            try:
+                state.agent_state = {
+                    **(previous or {}), CONVERSATION_BINDING_KEY: {"entity_dir": str(ed)}
+                }
+                _MODES[key] = (weakref.ref(state), mode)
+                if conversation_binding(state) != (ed, mode):
+                    raise ConversationBindingError(
+                        "the conversation binding did not read back as written — refusing to "
+                        "build a floor from it (fail-closed)."
+                    )
+            except BaseException:
+                _MODES.pop(key, None)             # roll back both halves: a failed bind binds nothing
+                state.agent_state = previous
+                finalizer.detach()
+                raise
+
+
+def _floor_exists(conv_state: Any) -> bool:
+    """Has a floor already been built (and cached) for this live state?"""
+    with _FLOORS_LOCK:
+        entry = _FLOORS.get(id(conv_state))
+    return entry is not None and entry[0]() is conv_state
 
 
 def _require_agent_agrees(agent: Any, entity_dir: Path) -> None:
@@ -217,17 +254,20 @@ def _require_agent_agrees(agent: Any, entity_dir: Path) -> None:
 def conversation_binding(conv_state: Any) -> tuple[Path | None, DriveMode]:
     """``(entity_dir, drive_mode)`` this conversation is bound to.
 
-    ALL OR NOTHING: unless the persisted record names an entity AND this process bound a mode to
-    this very state object, the answer is ``(None, "unattended")`` — no half of a record is trusted
-    on its own (codex L3 HIGH, 2026-10-02: a record carrying only a mode used to fail open). The mode
-    fails CLOSED: wrongly denying is a visible refusal the operator fixes, wrongly granting is a silent
-    credential exposure with nobody watching. The entity is left for the caller to derive."""
+    ASYMMETRIC, because the two halves have different lifetimes. The entity is the conversation's
+    identity and is PERSISTED: a valid recorded entity is returned even when this process holds no
+    mode for the state (a resume, a fork), so the caller still checks that entity exists — dropping
+    it let a deleted entity's floor be rebuilt without its ``deny_files`` (codex L3 r2 HIGH,
+    reproduced 2026-10-02). The mode is how the conversation is driven NOW and lives only in this
+    process: without it the answer is ``unattended``. A mode with no recorded entity binds nothing:
+    ``(None, "unattended")``. The mode fails CLOSED because wrongly denying is a visible refusal the
+    operator fixes, and wrongly granting is a silent credential exposure with nobody watching."""
     raw = (getattr(conv_state, "agent_state", None) or {}).get(CONVERSATION_BINDING_KEY)
     ed = raw.get("entity_dir") if isinstance(raw, dict) else None
-    mode = _live_mode(conv_state)
-    if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES:
+    if not (isinstance(ed, str) and ed):
         return None, "unattended"
-    return Path(ed), mode
+    mode = _live_mode(conv_state)
+    return Path(ed), mode if mode in DRIVE_MODES else "unattended"
 
 
 # --- the shared crown-jewels floor for a run -------------------------------------------------
@@ -249,7 +289,7 @@ def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
     silently yield a floor with holes)."""
     workspace = Path(conv_state.workspace.working_dir).expanduser().resolve()
     bound_entity, mode = conversation_binding(conv_state)
-    if bound_entity is not None and not (bound_entity / ".levain").is_dir():
+    if bound_entity is not None and not (bound_entity / ENTITY_STORE_SUBDIR).is_dir():
         # A bound entity that is gone (moved, renamed, a stale resumed record) would load NO
         # confinement.json — a floor silently missing the operator's declarations. Refuse.
         raise ConversationBindingError(

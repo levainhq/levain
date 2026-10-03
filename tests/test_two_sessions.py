@@ -136,3 +136,92 @@ def test_an_interactive_session_opens_after_an_unattended_one_with_its_own_floor
     finally:
         u.close()
         i.close()
+
+
+def _bare_conversation(ent: Path, **kw):
+    """An entity agent + a real Conversation, without EntitySession, so a test can drive the binding
+    and the lazy tool build itself."""
+    from openhands.sdk import LLM, Conversation
+
+    from levain.firing.openhands.entity import build_entity_agent
+    from levain.firing.openhands.tools import build_entity_tools
+
+    b = build_entity_agent(ent, LLM(usage_id="t", model="openai/x", api_key="x"),
+                           tools=build_entity_tools(with_bash=False), publish_entity=False)
+    return b.agent, Conversation(b.agent, workspace=str(ent / "workspace"), visualizer=None, **kw)
+
+
+def test_a_resumed_conversation_of_a_deleted_entity_is_refused_not_rebuilt_without_its_denies(
+        tmp_path, home):
+    """d65d63e (codex L3 r2 HIGH, reproduced): the persisted binding was dropped whenever this process
+    held no mode for the state, so a resumed conversation whose entity had been deleted got a floor
+    derived from <workspace>/.. with NO confinement.json — the operator's deny_files readable. The
+    persisted entity is now kept, so the floor build sees it is gone and refuses."""
+    import shutil
+
+    from levain.firing.confinement import crown_jewel_reason
+    from levain.firing.openhands.tools import (
+        ConversationBindingError,
+        bind_conversation,
+        policy_for_conv_state,
+    )
+
+    secret = home / "secret-token.txt"
+    secret.write_text("S3CRET")
+    ent = _entity(tmp_path, "ent")
+    (ent / ".levain" / "confinement.json").write_text(json.dumps({"deny_files": [str(secret)]}))
+    pdir = tmp_path / "persist"
+    agent, c = _bare_conversation(ent, persistence_dir=str(pdir))
+    bind_conversation(c, entity_dir=ent, mode="interactive")
+    assert crown_jewel_reason(policy_for_conv_state(c.state), secret) is not None
+    cid = c.id
+    c.close()
+
+    shutil.rmtree(ent / ".levain")          # the entity is deleted between runs
+    from openhands.sdk import Conversation
+
+    resumed = Conversation(agent.model_copy(), workspace=str(ent / "workspace"),
+                           persistence_dir=str(pdir), conversation_id=cid, visualizer=None)
+    try:
+        with pytest.raises(ConversationBindingError, match="not an initialized entity"):
+            policy_for_conv_state(resumed.state)
+    finally:
+        resumed.close()
+
+
+def test_a_bound_conversation_cannot_be_rebound_so_no_rebind_can_race_its_tool_build(
+        tmp_path, home, monkeypatch):
+    """d65d63e (codex L3 r2 HIGH, reproduced): a rebind passed its "tools unbuilt" check, the first
+    turn built the tools on the OLD (interactive) floor inside that window, and the rebind then
+    published "unattended" — a conversation whose binding said unattended while its tools read gh.
+    The binding is now fixed for the life of the state, so the rebind is refused before any window;
+    an identical rebind is a no-op."""
+    import levain.firing.openhands.tools as T
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    ent = _entity(tmp_path, "ent")
+    _, c = _bare_conversation(ent)
+    T.bind_conversation(c, entity_dir=ent, mode="interactive")
+    T.bind_conversation(c, entity_dir=ent, mode="interactive")       # identical: no-op
+
+    real = T._require_agent_agrees
+    fired: list = []
+
+    def window(agent, ed):              # the first turn lands INSIDE the rebind, after its check
+        real(agent, ed)
+        if not fired:
+            fired.append(1)
+            c._ensure_agent_ready()
+
+    monkeypatch.setattr(T, "_require_agent_agrees", window)
+    try:
+        with pytest.raises(T.ConversationBindingError, match="already bound"):
+            T.bind_conversation(c, entity_dir=ent, mode="unattended")
+        monkeypatch.setattr(T, "_require_agent_agrees", real)
+        c._ensure_agent_ready()
+        gh = home / ".config" / "gh" / "hosts.yml"
+        reads = TOKEN in str(c.agent.tools_map["file_editor"].executor(
+            FileEditorAction(command="view", path=str(gh))))
+        assert T.conversation_binding(c.state)[1] == "interactive" and reads   # binding == floor
+    finally:
+        c.close()
