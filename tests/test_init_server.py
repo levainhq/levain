@@ -910,3 +910,20 @@ def test_a_busy_install_is_refused_before_any_write_not_reported_partial(tmp_pat
     assert sorted(p.name for p in install.iterdir()) == [".levain"]
     assert sorted(p.name for p in (install / ".levain").iterdir()) in (
         ["install.lock"], [".gitignore", "install.lock"])
+
+
+def test_a_docs_refresh_fault_never_turns_a_good_install_into_a_failure(tmp_path: Path) -> None:
+    """L2 2026-10-03 (run): a refresh fault outside (OSError, InitError, PackError) fell through to the
+    outer handler, which reported the SUCCESSFUL install as a partial failure. The refresh is non-fatal."""
+    import levain.init_server as init_server_mod
+
+    def broken(target, packs):
+        raise RuntimeError("refresh exploded")
+
+    with mock.patch.object(init_server_mod, "_copy_pack_docs", broken):
+        with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+    assert status == 200 and body["ok"] is True
+    assert any("could not refresh pack docs" in m for m in body["messages"])

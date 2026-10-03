@@ -350,7 +350,8 @@ class _InitHandler(BaseHTTPRequestHandler):
 
     def _run_install(self, req: object) -> None:
         """Validate the submitted ``{adapter, answers}`` at the input boundary,
-        then run ``apply_init`` and report. Holds ``install_lock``."""
+        then run ``apply_init`` and report. Holds the server's ``install_lock`` (a threading lock;
+        the per-install file lock is taken inside, around ``apply_init`` and the docs refresh)."""
         if not isinstance(req, dict):
             self._send_json({"error": "bad_request", "message": "body must be a JSON object"}, 400)
             return
@@ -508,7 +509,7 @@ class _InitHandler(BaseHTTPRequestHandler):
                 # could interleave its own (spore-1250, reproduced 2026-10-03). apply_init takes the
                 # same lock; it is reentrant per (install, thread), so that acquisition nests. A busy
                 # lock is refused here, before any write, with the same 409 apply_init's own refusal
-                # gets (an outer InitError handler would call it a partial install).
+                # gets (uncaught, the outer InitError handler reports it as a 500 "templates" fault).
                 with contextlib.ExitStack() as held:
                     try:
                         held.enter_context(_install_flock(install))
@@ -563,7 +564,7 @@ class _InitHandler(BaseHTTPRequestHandler):
                         copied_docs = _copy_pack_docs(
                             install, [(load_pack_manifest(p), p) for p in pack_dirs]
                         )
-                    except (OSError, InitError, PackError) as doc_exc:
+                    except Exception as doc_exc:  # noqa: BLE001 — the refresh is non-fatal (below)
                         # HONEST message (complement L3): a failed refresh may have cleared
                         # only PART of a prior pack's chapters, so do NOT claim "base only"
                         # — any prior (possibly proprietary) chapters MAY remain. Tell the
