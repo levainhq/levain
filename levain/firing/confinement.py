@@ -556,8 +556,6 @@ class CrownJewelsPolicy:
     # an ssh vector without calling `.resolve()` inside the predicate, where a resolution error
     # would escape the fail-closed guard. Enforcement remains `deny_sockets` (resolved, arm i)
     # plus `deny_write_files` (both spellings, arms ii/iii).
-    trust_spellings: tuple[Path, ...] = ()  # the relocated derive-trust file's spellings (spore-1308) —
-    # MESSAGE CLASSIFICATION ONLY, like `socket_spellings`. Enforcement is `deny_write_files`.
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
@@ -653,8 +651,11 @@ class CrownJewelsPolicy:
     # them by name whether or not they exist. On Linux a mount cannot cover a sidecar created after
     # spawn, so a jewel that is a SQLite database refuses bash there instead
     # (:func:`_refuse_plantable_sqlite_jewels`); bwrap mounts only the sidecars present at spawn.
-    # ⚠ LAST FIELD ON PURPOSE: a field inserted earlier shifts every later one for a positional
-    # caller (codex, L3 2026-10-02, reproduced: ``deny_localhost_outbound=True`` landed here).
+    trust_spellings: tuple[Path, ...] = ()  # the derive-trust file's write-denied spellings
+    # (spore-1308) — MESSAGE CLASSIFICATION ONLY, like `socket_spellings`; enforcement is
+    # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
+    # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
+    # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -682,55 +683,50 @@ PROJECT_MEMORY_HOME = ".anneal-projects"
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
-def _project_memory_jewels(
-    home: Path, entity_dir: Path, workspace: Path
-) -> tuple[list[Path], list[Path]]:
-    """The operator's PROJECT memory: subtrees to deny read+write, and trust-file spellings to deny
-    write (spore-1308, ruled by Phill 2026-10-03, option A).
+def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    """The operator's PROJECT memory: ``(subtrees, trust_spellings, store_links)`` (spore-1308, ruled
+    by Phill 2026-10-03, option A).
 
     ``~/.anneal-projects`` holds per-project anneal stores and, by flow's convention, the derive-trust
     file that binds re-derive labels to repo roots. It is operator memory exactly as ``~/.anneal-memory``
     is, and a project store's continuity may be loaded into an operator session's prompt (flow did so
     for every levain seat when this was ruled), so a confined write there is an injection path. A run
-    on 2026-10-03 showed a confined seatbelt shell could read and write both.
+    on 2026-10-03 showed a confined seatbelt shell could read and write both. It is denied read+write.
 
-    ``$ANNEAL_MEMORY_DERIVE_TRUST``, read here at policy build, can move the trust file. When it is set:
-      - the file itself is write-denied at its lexical and resolved spellings (a read only reveals
-        which repo roots are trusted; a write rebinds them), except a spelling that already sits
-        inside a subtree denied here, which is denied both ways;
-      - its parent directory, which is where the moved project stores live, is denied as a subtree,
-        UNLESS that subtree would swallow the entity's own working area: the filesystem root, ``$HOME``
-        or any ancestor of it, or any directory containing the entity or its workspace. There the file
-        literal (and the ancestor pin every jewel gets) is all that applies, because denying the
-        subtree would leave the shell unable to write its own workspace.
-    An empty variable counts as unset."""
+    ``$ANNEAL_MEMORY_DERIVE_TRUST``, if set in THIS process when the floor is built, names the trust
+    file anneal reads. Its spellings are write-denied: the path as given, its real parent with the
+    final component unresolved (a symlink's own location, which is what ``rm`` and ``rename`` act on),
+    and the fully resolved target. Its parent directory is write-denied as a literal by the ancestor
+    pin every jewel gets, so it cannot be renamed. A spelling whose own location is inside a denied
+    subtree is dropped: the subtree covers it both ways, and a write-only self-bind of it on Linux
+    would take its source from the host tree and re-expose it for reading.
+    NOT covered, by design of this cut: a project home moved away from ``~/.anneal-projects`` (its
+    stores are wherever the trust file's entries point); a symlink hop in the env path beyond its
+    last directory (the replaceable-intermediate-symlink class this module documents for ssh); and
+    a value set only in another process's environment, which is how flow sets it, so there the
+    default subtree is what protects. A relative value resolves against this process's cwd.
+
+    ``store_links``: when ``~/.anneal-memory`` or ``~/.anneal-projects`` is itself a symlink, the link
+    (resolved HOME, final component unresolved) is returned so it is pinned like ``~/.ssh``; the
+    subtree deny lands on the target, and without the pin the link can be removed and a planted tree
+    put in its place (L2, run 2026-10-03). On Linux a pinned symlink in a writable directory refuses
+    bash (fail-closed)."""
     subtrees: list[Path] = [(home / PROJECT_MEMORY_HOME).resolve()]
+    home_r = home.resolve()
+    store_links = [home_r / n for n in (".anneal-memory", PROJECT_MEMORY_HOME)
+                   if (home_r / n).is_symlink()]
     spellings: list[Path] = []
     raw = os.environ.get(DERIVE_TRUST_ENV, "")
     if raw:
         lexical = Path(raw).expanduser()
         if not lexical.is_absolute():
             lexical = Path.cwd() / lexical
-        resolved = lexical.resolve()
-        spellings = [lexical, resolved] if lexical != resolved else [resolved]
-        parent = resolved.parent
-        home_r = home.resolve()
-        swallows_own = (
-            str(parent) == parent.anchor
-            or home_r == parent
-            or home_r.is_relative_to(parent)
-            or entity_dir == parent
-            or entity_dir.is_relative_to(parent)
-            or workspace == parent
-            or workspace.is_relative_to(parent)
-        )
-        if not swallows_own:
-            subtrees.append(parent)
-        # A spelling inside a denied subtree is already denied both ways. Listing it again would ask
-        # bwrap for a file mount inside a read-only tmpfs.
-        spellings = [s for s in spellings
-                     if not any(s == t or s.is_relative_to(t) for t in subtrees)]
-    return subtrees, spellings
+        covered = subtrees + [(home / ".anneal-memory").resolve()]
+        for sp in (lexical, lexical.parent.resolve() / lexical.name, lexical.resolve()):
+            loc = sp.parent.resolve() / sp.name
+            if sp not in spellings and not any(loc == t or loc.is_relative_to(t) for t in covered):
+                spellings.append(sp)
+    return subtrees, spellings, store_links
 
 
 def _sibling_entity_stores(entity_dir: Path) -> tuple[Path, ...]:
@@ -872,7 +868,7 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
-    project_subtrees, trust_spellings = _project_memory_jewels(home, ed, ws)
+    project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
@@ -1142,7 +1138,7 @@ def build_policy(
     # Deny the lexical dir path (resolved HOME + un-deref'd ``.ssh``) so ``rm``/``mv``/replace of ~/.ssh
     # ITSELF is blocked; child reads/writes still resolve through it, so raw mode is not re-jailed.
     ssh_anchor = home.resolve() / ".ssh"
-    write_dirs = _dedup(list(_write_deny_ancestors(all_jewels)) + [ssh_anchor])
+    write_dirs = _dedup(list(_write_deny_ancestors(all_jewels)) + [ssh_anchor] + store_links)
 
     return CrownJewelsPolicy(
         entity_dir=ed,
