@@ -2995,15 +2995,15 @@ def _bwrap_file_target(f: Path) -> Path:
 @dataclass(frozen=True)
 class _MaskedFiles:
     """What steps (2) and (4) masked with /dev/null: each destination as emitted and as resolved,
-    the ``(st_dev, st_ino)`` of every one that could be stat'ed when step (5) began, and whether any
-    could not be (absent, unreadable, or mid-rename)."""
+    and the ``(st_dev, st_ino)`` of every one that could be stat'ed when step (5) began. This only
+    CHOOSES the plan; :func:`_mask_exposed_by_self_bind` is the guard, checked against the manifest
+    the shell is rechecked against."""
     spellings: frozenset[str]
     identities: frozenset[tuple[int, int]]
-    unidentified: bool
 
     @classmethod
     def collect(cls, masked: list[str]) -> "_MaskedFiles":
-        spellings, identities, unidentified = set(masked), set(), False
+        spellings, identities = set(masked), set()
         for dest in masked:
             try:
                 spellings.add(str(Path(dest).resolve()))
@@ -3013,19 +3013,15 @@ class _MaskedFiles:
                 st = os.stat(dest)
                 identities.add((st.st_dev, st.st_ino))
             except OSError:
-                unidentified = True
-        return cls(frozenset(spellings), frozenset(identities), unidentified)
+                pass   # absent or unreadable: the manifest check at spawn decides
+        return cls(frozenset(spellings), frozenset(identities))
 
 
 def _masked_both_ways(target: Path, masked: _MaskedFiles) -> bool:
-    """True iff the write-only ``target`` is, or may be, a file steps (2)/(4) masked.
-
-    By spelling (as given or resolved); by identity, which covers a case or normalization variant
-    on a volume that folds them and a hardlink, without matching a merely similar name (codex,
-    floor-r2 L3 r3); and, when some masked destination could not be identified, any target with a
-    second link, since it could be that file under another name (codex, samefile L3 r1: a
-    destination renamed away and back mid-plan). A target that cannot be stat'ed counts as masked.
-    An unreadable destination no longer masks unrelated single-link files (same round)."""
+    """True iff the write-only ``target`` is a file steps (2)/(4) masked: by spelling (as given or
+    resolved), or by identity, which covers a case or normalization variant on a volume that folds
+    them and a hardlink, without matching a merely similar name (codex, floor-r2 L3 r3). A target
+    that cannot be stat'ed counts as masked."""
     try:
         resolved = str(target.resolve())
         st = os.stat(target)
@@ -3033,9 +3029,35 @@ def _masked_both_ways(target: Path, masked: _MaskedFiles) -> bool:
         return True
     if str(target) in masked.spellings or resolved in masked.spellings:
         return True
-    if (st.st_dev, st.st_ino) in masked.identities:
-        return True
-    return masked.unidentified and st.st_nlink > 1
+    return (st.st_dev, st.st_ino) in masked.identities
+
+
+def _mask_exposed_by_self_bind(argv: list[str], manifest: dict) -> tuple[str, str] | None:
+    """A ``(self-bound path, masked path)`` pair that name the SAME file in ``manifest``, or None.
+
+    A self-bind takes its source from the host, so one that is the same inode as a /dev/null mask
+    puts the masked content back under another name (a hardlink, or a case variant on a folding
+    volume). Planning matches by identity already; this re-checks the finished plan against the
+    identities recorded for the shell, which every command is then rechecked against, so a file
+    swapped, unlinked or relinked while the plan was made cannot slip between the two (codex,
+    samefile L3 r1 and r2)."""
+    masks: dict[tuple[int, int], str] = {}
+    self_binds: list[str] = []
+    for i in range(len(argv) - 2):
+        if argv[i] not in ("--ro-bind", "--bind"):
+            continue
+        src, dst = argv[i + 1], argv[i + 2]
+        if src == "/dev/null":
+            ident = manifest.get(dst)
+            if ident and ident != _UNREACHABLE:
+                masks[(ident[0], ident[1])] = dst
+        elif src == dst:
+            self_binds.append(dst)
+    for dst in self_binds:
+        ident = manifest.get(dst)
+        if ident and ident != _UNREACHABLE and (ident[0], ident[1]) in masks:
+            return dst, masks[(ident[0], ident[1])]
+    return None
 
 
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
@@ -3879,6 +3901,13 @@ class BwrapProvider(ConfinementProvider):
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
                 "bash hands (fail-closed)."
             ) from exc
+        exposed = _mask_exposed_by_self_bind(argv, manifest)
+        if exposed:
+            raise ConfinementError(
+                f"{exposed[0]} is the same file as {exposed[1]}, which the floor denies, so binding "
+                "it would expose that file — refusing to grant bash hands (fail-closed). Try again; "
+                "if it persists, remove the extra link."
+            )
         moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
         if moved:
             raise ConfinementError(

@@ -940,33 +940,75 @@ def test_a_write_only_link_to_a_hardlink_of_a_denied_file_never_self_binds_it(ho
         opt.chmod(0o755)
 
 
-def test_a_mask_destination_renamed_away_mid_plan_still_masks_its_hardlink(tmp_path):
-    """codex L3 (samefile r1): a denied file renamed away while the plan identified its mask
-    destination, and back before the shell started, left its hardlink self-bound. A rename keeps
-    the link count, so a target with a second link is masked whenever a destination is unidentified."""
-    from levain.firing.confinement import _MaskedFiles, _masked_both_ways
+def test_the_finished_plan_never_self_binds_a_file_it_masks():
+    """The guard, as a pure function: a self-bind whose recorded identity equals a /dev/null
+    destination's is reported; distinct or unreachable identities are not."""
+    from levain.firing.confinement import _UNREACHABLE, _mask_exposed_by_self_bind
+    argv = ["--ro-bind", "/dev/null", "/s/token", "--ro-bind", "/o/alias", "/o/alias",
+            "--ro-bind", "/o/other", "/o/other"]
+    manifest = {"/s/token": (1, 42, 0o100000), "/o/alias": (1, 42, 0o100000),
+                "/o/other": (1, 7, 0o100000)}
+    assert _mask_exposed_by_self_bind(argv, manifest) == ("/o/alias", "/s/token")
+    manifest["/o/alias"] = (1, 43, 0o100000)
+    assert _mask_exposed_by_self_bind(argv, manifest) is None
+    manifest["/o/alias"] = _UNREACHABLE
+    manifest["/s/token"] = _UNREACHABLE
+    assert _mask_exposed_by_self_bind(argv, manifest) is None
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_hardlink_the_planner_missed_is_refused_at_spawn(home, tmp_path, monkeypatch):
+    """codex L3 (samefile r1, r2): a destination renamed, or unlinked and relinked, while the plan
+    is made can hide a hardlink from the planner. The spawn re-checks the finished plan against the
+    identities the shell is then held to, and refuses."""
+    import levain.firing.confinement as conf
     secret = tmp_path / "secrets" / "token"
     secret.parent.mkdir()
     secret.write_text("SECRET")
-    alias = tmp_path / "alias"
+    alias = tmp_path / "elsewhere" / "alias"
+    alias.parent.mkdir()
     try:
         os.link(secret, alias)
     except OSError as exc:
         pytest.skip(f"no hardlinks here ({exc})")
-    away = tmp_path / "away"
-    secret.rename(away)                     # the race: gone while the plan looks
-    masked = _MaskedFiles.collect([str(secret)])
-    away.rename(secret)                     # and back before the shell starts
-    assert masked.unidentified
-    assert _masked_both_ways(alias, masked)
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(alias)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+        monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+        monkeypatch.setattr(conf, "_masked_both_ways", lambda target, masked: False)  # fooled
+        monkeypatch.setattr(conf._BwrapShell, "start", lambda self: pytest.fail("shell started"))
+        with pytest.raises(ConfinementError, match="same file as"):
+            conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(home), deny_files=(secret,)))
+    finally:
+        opt.chmod(0o755)
 
 
-def test_an_unidentifiable_mask_destination_does_not_mask_unrelated_single_link_files(tmp_path):
-    """codex L3 (samefile r1): one destination that could not be stat'ed masked EVERY write-only
-    target, hiding readable files that cannot be it. A single-link file is no other file's alias."""
-    from levain.firing.confinement import _MaskedFiles, _masked_both_ways
-    readable = tmp_path / "config"
-    readable.write_text("READABLE")
-    masked = _MaskedFiles.collect([str(tmp_path / "never-there")])
-    assert masked.unidentified
-    assert not _masked_both_ways(readable, masked)
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_an_absent_deny_file_does_not_hide_an_unrelated_hardlinked_file(home, tmp_path, monkeypatch):
+    """complement + glm L3 (samefile r2): an ABSENT deny file (an ordinary missing credential)
+    counted as unidentified and hid every multi-link write-only file. Absent is not a match."""
+    from levain.firing.confinement import _bwrap_argv
+    shared = tmp_path / "data" / "notes"
+    shared.parent.mkdir()
+    shared.write_text("READABLE")
+    try:
+        os.link(shared, tmp_path / "data" / "notes-dedup")
+    except OSError as exc:
+        pytest.skip(f"no hardlinks here ({exc})")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(shared)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        missing = tmp_path / "nowhere" / ".netrc"
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(missing,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(shared.resolve())
+        assert ["--ro-bind", t, t] in binds
+    finally:
+        opt.chmod(0o755)
