@@ -229,21 +229,7 @@ class _InitHandler(GuardedHandler):
         clen = self._declared_length()
         if clen is None:
             return
-        if clen > _MAX_INIT_BODY:
-            # Refuse oversize: ALWAYS close the connection (never keep-alive after a
-            # rejected body — a truncated/lying body would otherwise desync the next
-            # request on the socket), and drain a bounded amount first so the client
-            # can read the 413 cleanly. Guard the drain so a stalled/short body can't
-            # strand the thread past the socket timeout (codex LOW / nemotron).
-            self.close_connection = True
-            if clen <= _DRAIN_CAP:
-                try:
-                    self._drain(clen)
-                except OSError:
-                    pass
-            self._send_json(
-                {"error": "too_large", "message": f"body exceeds {_MAX_INIT_BODY} bytes"}, 413
-            )
+        if self._refuse_oversize(clen, _MAX_INIT_BODY, _DRAIN_CAP):
             return
 
         # Serialize installs: only one runs at a time (concurrent installs into the

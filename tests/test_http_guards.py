@@ -114,3 +114,44 @@ def test_each_security_header_appears_once_on_a_normal_response(tmp_path, kind):
         c.close()
     for h in SECURITY_HEADERS:
         assert names.count(h) == 1, f"{kind}: {h} sent {names.count(h)} times"
+
+
+WRITE_ROUTES = {"serve": "/edit", "init": "/init"}
+
+
+def _raw_post(port: int, path: str, headers: dict, body: bytes = b""):
+    """A POST whose headers are exactly ``headers`` plus Host (no automatic Content-Length)."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    c.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+    for k, v in {"Host": "127.0.0.1", **headers}.items():
+        c.putheader(k, v)
+    c.endheaders()
+    if body:
+        c.send(body)
+    r = c.getresponse()
+    data = r.read()
+    out = (r.status, dict(r.getheaders()), data)
+    c.close()
+    return out
+
+
+@pytest.mark.parametrize("kind", ["serve", "init"])
+@pytest.mark.parametrize("headers,status", [
+    ({"Host": "evil.example", "Content-Type": "application/json", "Content-Length": "2"}, 403),
+    ({"Sec-Fetch-Site": "cross-site", "Content-Type": "application/json", "Content-Length": "2"}, 403),
+    ({"Sec-Fetch-Site": "same-site", "Content-Type": "application/json", "Content-Length": "2"}, 403),
+    ({"Content-Type": "text/plain", "Content-Length": "2"}, 415),
+    ({"Content-Type": "application/json"}, 411),
+    ({"Content-Type": "application/json", "Content-Length": "²".encode().decode("latin-1")}, 411),
+    ({"Content-Type": "application/json", "Content-Length": "-1"}, 411),
+    ({"Content-Type": "application/json", "Content-Length": str(10**12)}, 413),
+], ids=["bad-host", "cross-site", "same-site", "text-plain", "no-length", "superscript-length",
+        "negative-length", "oversize"])
+def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, headers, status):
+    """L1 2026-10-03 MED-1 (run): with either server's Content-Length guard swapped for a bare int(),
+    every existing test still passed. Each refusal is now driven through BOTH write servers, live,
+    and every refusal before the body is read closes the connection."""
+    with _server(kind, tmp_path) as port:
+        got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers, b"{}")
+    assert got == status, f"{kind}: {headers} -> {got}"
+    assert resp_headers.get("Connection") == "close"

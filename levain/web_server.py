@@ -86,12 +86,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import (  # noqa: F401 — re-exported: callers import these from here
-    _CSP,
-    _WRITE_SEC_FETCH_ALLOWED,
-    GuardedHandler,
-    host_header_allowed,
-)
+from levain.http_guards import GuardedHandler
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
@@ -554,7 +549,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
 
-        ``_Handler.protocol_version = "HTTP/1.1"`` keeps connections alive, so a
+        ``protocol_version = "HTTP/1.1"`` (set on :class:`~levain.http_guards.GuardedHandler`) keeps connections alive, so a
         browser pools several and RESETs the idle ones as normal lifecycle; on a mesh
         (``--host``) bind, several devices each bring a pool. Each reset raises a
         ``ConnectionError`` (or a socket ``TimeoutError``) up through ``socketserver``'s
@@ -849,36 +844,7 @@ class _Handler(GuardedHandler):
             return self._reject(503, "busy", "server busy")
         result: dict[str, object] | None = None
         try:
-            if clen > _MAX_POST_BYTES:
-                # ⛔ ALWAYS CLOSE, AND GUARD THE DRAIN — BOTH HALVES WERE MISSING HERE WHILE THE
-                # SIBLING `init_server.py` HAD THEM, under a comment crediting the review that
-                # found them. A hardening fix landed in one of two ~90%-duplicated HTTP handlers
-                # and never reached the other.
-                #
-                # ⚡ RUN-VERIFIED, ONE PROBE AGAINST BOTH REAL SERVERS (Diogenes 2026-08-19):
-                # declare a drainable oversize Content-Length, send ten bytes, stall.
-                # `init_server` answers `413 Content Too Large` after 30s; this server answered
-                # NOTHING and closed. `self.rfile.read()` hit the socket timeout and raised —
-                # and `socket.timeout IS TimeoutError`, which `_LevainHTTPServer.handle_error`
-                # deliberately swallows as a benign keep-alive reset. So the operator saw no
-                # traceback, the client saw no status, and the docstring a few lines up went on
-                # describing a 413 that never arrived. `absence_of_signal_rendered_as_health`,
-                # at the one place the code took the trouble to promise otherwise.
-                #
-                # `close_connection` is UNCONDITIONAL because a truncated or LYING body would
-                # otherwise desync the next request on a kept-alive socket — it used to be set
-                # only in the `else`, so exactly the drained case stayed alive with whatever the
-                # client left in the buffer.
-                self.close_connection = True
-                if clen <= _DRAIN_CAP:
-                    try:
-                        self._drain(clen)
-                    except OSError:
-                        pass  # stalled/short body — send the 413 anyway; TimeoutError is an OSError
-                self._send_json(
-                    {"error": "too_large",
-                     "message": f"body exceeds {_MAX_POST_BYTES} bytes"}, 413
-                )
+            if self._refuse_oversize(clen, _MAX_POST_BYTES, _DRAIN_CAP):
                 return
             try:
                 raw = self.rfile.read(clen)

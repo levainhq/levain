@@ -8,8 +8,9 @@ on a write. The copies drifted: a fix that moved the security headers into ``end
 stdlib's own error responses carry them too) reached two of the three, and ``levain serve`` answered
 an OPTIONS or PUT with a 501 that had no CSP, no ``nosniff`` and no ``X-Frame-Options`` (spore-1013,
 reproduced 2026-10-03). Every guard now lives here once, in :class:`GuardedHandler`, and each server
-subclasses it. A server keeps only what is its own: its routes, and the ORDER in which it applies the
-write checks.
+subclasses it. A server keeps only what is its own: its routes, its body limit, and the ORDER in which
+it applies the write checks. (Server-level setup, the allowed-hosts set and ``handle_error``, is still
+per server; see the routed list in Levain's project notes.)
 
 Stdlib only; nothing here imports another Levain module, so every server can import it.
 """
@@ -50,11 +51,9 @@ def host_header_allowed(
 ) -> bool:
     """True iff a request's raw ``Host`` header names one of ``allowed_hosts``.
 
-    The SECURITY-CRITICAL DNS-rebinding parse, factored out so the dashboard
-    server (``_Handler._host_ok``) and the standalone init server
-    (``levain.init_server``) share ONE implementation and can never DIVERGE on it
-    — a divergence here is a rebinding read-disclosure hole, exactly the class a
-    shared structural invariant beats per-surface discipline at. Strict RFC-7230:
+    The SECURITY-CRITICAL DNS-rebinding parse, in one place so every server
+    (through :meth:`GuardedHandler._host_ok`) uses ONE implementation and none can
+    DIVERGE on it: a divergence here is a rebinding read-disclosure hole. Strict RFC-7230:
     absent Host → refuse (fail-closed); a bracketed IPv6 literal must be
     well-formed (``[host]`` optionally ``:port``); a non-bracket Host with a ``:``
     must carry a clean numeric port; the hostname is normalized (trailing FQDN dot
@@ -183,6 +182,28 @@ class GuardedHandler(BaseHTTPRequestHandler):
             self._reject(415, "unsupported_media_type", "Content-Type must be application/json")
             return True
         return False
+
+    def _refuse_oversize(self, clen: int, limit: int, drain_cap: int) -> bool:
+        """Refuse a body declared larger than ``limit`` with a 413. Sends it and returns True when
+        refused.
+
+        ⛔ ALWAYS CLOSE, AND GUARD THE DRAIN. Both halves were once missing from ``levain serve``
+        while ``levain init --web`` had them (a hardening fix that reached one of two copies; run
+        against both real servers by Diogenes 2026-08-19). The connection is closed unconditionally,
+        because a truncated or lying body would otherwise desync the next request on a kept-alive
+        socket. The drain is bounded by ``drain_cap`` and its socket timeout is caught: a stalled
+        body raised ``TimeoutError``, which the servers' ``handle_error`` swallows as a benign
+        keep-alive reset, so the client got no status at all instead of the 413."""
+        if clen <= limit:
+            return False
+        self.close_connection = True
+        if clen <= drain_cap:
+            try:
+                self._drain(clen)
+            except OSError:
+                pass  # stalled/short body: send the 413 anyway (TimeoutError is an OSError)
+        self._send_json({"error": "too_large", "message": f"body exceeds {limit} bytes"}, 413)
+        return True
 
     def _declared_length(self) -> int | None:
         """The request's Content-Length, or ``None`` after sending a 411 when it is missing or not
