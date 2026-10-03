@@ -335,6 +335,8 @@ def test_a_fifo_at_a_trust_path_refuses_without_hanging(home, monkeypatch):
     """anneal would read stores from a FIFO; this cannot without blocking, so it refuses (codex L3 r2)."""
     fifo = home / "trust.fifo"
     os.mkfifo(fifo)
+    fifo.chmod(0o644)   # explicit modes: anneal's owner/mode check runs first, and umask 002
+    home.chmod(0o755)   # (argushub) would make both group-writable, so it would reject instead
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
     with pytest.raises(ConfinementError, match="not a regular file"):
         build_policy(_entity(home))
