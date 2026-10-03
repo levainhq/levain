@@ -799,3 +799,102 @@ def test_a_start_that_fails_after_its_hands_were_built_releases_them(
     finally:
         gc.enable()
         host.shutdown()
+
+
+# -- the turn's wall-clock bound and the counted teardown (K1p2 follow-ons, 2026-10-03) ------------
+
+
+class _Stoppable(_Stub):
+    """run_turn blocks until request_stop, then returns the timed-out result a session would."""
+
+    def __init__(self, on_event):
+        super().__init__(on_event, [])
+        self.stop = threading.Event()
+        self.stops = 0
+
+    def run_turn(self, message):
+        self.on_event("⚙ terminal: sleep")
+        assert self.stop.wait(5), "the deadline never asked the turn to stop"
+        return _Result(reply=None, error="stopped at its wall-clock bound", timed_out=True)
+
+    def request_stop(self):
+        self.stops += 1
+        self.stop.set()
+
+
+def test_a_turn_past_its_deadline_is_stopped_and_its_session_released(tmp_path):
+    made: list[_Stoppable] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_Stoppable(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.2)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "long")["job_id"])
+    assert st["deadline_hit"] is True and st["result"]["timed_out"] is True
+    assert host.session_status(sid)["state"] == "broken" and made[0].closed
+    assert made[0].stops >= 1
+
+
+def test_a_turn_inside_its_deadline_is_not_marked(tmp_path):
+    host = _host(tmp_path, _Factory([_Result()]), turn_seconds=30)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "quick")["job_id"])
+    assert st["deadline_hit"] is False and host.session_status(sid)["state"] == "idle"
+
+
+class _SlowClose(_Stub):
+    def __init__(self, on_event, release: threading.Event):
+        super().__init__(on_event, [])
+        self.release = release
+
+    def close(self):
+        assert self.release.wait(5)
+        self.closed = True
+
+
+def test_a_session_being_closed_still_holds_its_slot(tmp_path):
+    """codex L3 r2 (MED), reproduced here: close published `closed` before its teardown, so a slow
+    teardown let an open exceed max_sessions."""
+    release = threading.Event()
+    made: list[_Stub] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_SlowClose(on_event, release) if not made else _Stub(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
+                    session_factory=factory, max_sessions=1)
+    sid = _opened(host)
+    closer = threading.Thread(target=host.close, args=(sid,))
+    closer.start()
+    deadline = time.monotonic() + 5
+    while host.session_status(sid)["state"] != "closing":
+        assert time.monotonic() < deadline, host.session_status(sid)
+        time.sleep(0.01)
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.http_status == 429
+    with pytest.raises(ChatError) as e:
+        host.close(sid)
+    assert e.value.http_status == 409
+    release.set()
+    closer.join(5)
+    assert host.session_status(sid)["state"] == "closed" and made[0].closed
+    _opened(host, "beta")
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+def test_a_turn_bound_that_would_never_fire_is_refused(tmp_path, bad):
+    with pytest.raises(ValueError):
+        _host(tmp_path, _Factory([]), turn_seconds=bad)
+
+
+@pytest.mark.parametrize("text", ["0", "-5", "nan", "inf", "soon"])
+def test_serve_refuses_a_turn_seconds_that_would_never_fire(text, capsys):
+    from levain.cli import main
+
+    with pytest.raises(SystemExit) as e:
+        main(["serve", "--turn-seconds", text])
+    assert e.value.code == 2

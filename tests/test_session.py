@@ -908,3 +908,37 @@ def test_run_task_DOES_claim_no_capture_when_the_session_vouches_for_it(tmp_path
     assert rc == EXIT_TIMEOUT == 5
     assert "Nothing was captured" in err
     assert "UNKNOWN" not in err
+
+
+# ---------- what the turn DID: pauses and refusals (K1p2 runs, 2026-10-03) ----------
+
+
+def test_a_pause_does_not_reset_the_turns_activity(tmp_path: Path):
+    """The SDK's PauseEvent is source "user". Read as the start of the turn, it dropped every action
+    the turn ran before a wall-clock stop (real-model run: a stopped turn reported no activity after
+    `sleep 12; echo one` had run)."""
+    pytest.importorskip("openhands.sdk")
+    from openhands.sdk.event import PauseEvent
+
+    ws = tmp_path / "workspace"
+    events = [_Event("user", ["run three commands"]),
+              _ToolEvent(command="sleep 12; echo one"),
+              PauseEvent()]
+    assert turn_tool_activity(events, ws) == ["⚙ terminal: sleep 12; echo one"]
+
+
+def test_an_action_the_operator_refused_is_not_listed_as_work(tmp_path: Path):
+    """Real-model control run on 94c20c6: after a rejection, the turn's tool_activity listed the
+    rejected `cat` as work, on the same screen as the refusal. An action that ran stays listed."""
+    pytest.importorskip("openhands.sdk")
+    from openhands.sdk.event import UserRejectObservation
+
+    ws = tmp_path / "workspace"
+    refused = _ToolEvent(command="cat secret.txt")
+    refused.id = "a-refused"
+    ran = _ToolEvent(command="ls")
+    ran.id = "a-ran"
+    events = [_Event("user", ["read it"]), ran, refused,
+              UserRejectObservation(action_id="a-refused", tool_name="terminal",
+                                    tool_call_id="c1", rejection_reason="not now")]
+    assert turn_tool_activity(events, ws) == ["⚙ terminal: ls"]

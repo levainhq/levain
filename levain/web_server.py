@@ -85,7 +85,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from levain.chat import ChatError, ChatHost, chat_refusal
+from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -1442,6 +1442,7 @@ def run_web_server(
     base_url: str = "http://localhost:11434",
     api_key: str | None = None,
     max_iterations: int | None = None,
+    turn_seconds: float | None = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -1489,7 +1490,8 @@ def run_web_server(
     chat_host = None
     if chat:
         chat_host, chat_err = _build_chat_host(
-            chat, model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations)
+            chat, model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations,
+            turn_seconds=turn_seconds)
         if chat_host is None:
             print(chat_err, file=sys.stderr)
             return 1
@@ -1552,6 +1554,7 @@ def _build_chat_host(
     base_url: str,
     api_key: str | None,
     max_iterations: int | None,
+    turn_seconds: float | None = None,
 ) -> "tuple[ChatHost | None, str]":
     """The operator's ``--chat`` entities, checked before the socket is bound. Each must be a clean
     OpenHands entity that chat may host (:func:`levain.chat.chat_refusal`); a client addresses it by
@@ -1577,4 +1580,5 @@ def _build_chat_host(
             )
         entities[entity_dir.name] = entity_dir
     return ChatHost(entities, model=model, base_url=base_url, api_key=api_key,
-                    max_iterations=max_iterations), ""
+                    max_iterations=max_iterations,
+                    turn_seconds=DEFAULT_TURN_SECONDS if turn_seconds is None else turn_seconds), ""

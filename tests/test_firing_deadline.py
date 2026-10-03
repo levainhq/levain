@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -724,3 +725,53 @@ def test_a_stale_handler_cannot_report_a_second_deadlines_bound():
         pass
     with TurnDeadline(22):
         first._on_alarm(14, None)  # noqa: SLF001 — must not raise 11s into the 22s region
+
+
+# ---------- a THREADED driver's bound: request_stop (K1p2 chat, 2026-10-03) ----------
+
+
+class _PausableConversation:
+    """``run()`` blocks until ``interrupt()`` (the SDK's pause, from another thread), then returns
+    NORMALLY, as the SDK's synchronous run does when it sees PAUSED at a step boundary."""
+
+    def __init__(self) -> None:
+        self.state = _State()
+        self.paused = threading.Event()
+        self.interrupts = 0
+
+    def send_message(self, message):
+        pass
+
+    def run(self):
+        assert self.paused.wait(5), "run() was never paused"
+
+    def interrupt(self):
+        self.interrupts += 1
+        self.paused.set()
+
+
+def test_request_stop_ends_the_turn_timed_out_and_never_captures_it(tmp_path) -> None:
+    from levain.session import EXIT_TIMEOUT
+
+    conv = _PausableConversation()
+    sess = _session(tmp_path, conv)
+    threading.Timer(0.1, sess.request_stop).start()
+
+    result = sess.run_turn("a long task")
+
+    assert result.timed_out is True and result.exit_code == EXIT_TIMEOUT
+    assert sess.binding.captures == 0, "a stopped turn was captured as if it had completed"
+    assert conv.interrupts >= 1
+
+
+def test_a_stop_requested_before_a_turn_does_not_end_the_next_one(tmp_path) -> None:
+    """The flag is cleared when a turn begins, so a stop that arrived while the session was idle
+    (a deadline that lost the race with the turn's end) cannot kill the following turn."""
+    conv = _PausableConversation()
+    conv.paused.set()            # run() returns at once: an ordinary, completed turn
+    sess = _session(tmp_path, conv)
+    sess.request_stop()
+
+    result = sess.run_turn("next")
+
+    assert result.timed_out is False and sess.binding.captures == 1

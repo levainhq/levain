@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from levain import __version__
+from levain.chat import DEFAULT_TURN_SECONDS
 
 
 def _positive_int(text: str) -> int:
@@ -24,6 +25,18 @@ def _positive_int(text: str) -> int:
         raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
+def _positive_seconds(text: str) -> float:
+    """An argparse type for a wall-clock bound: a finite number of seconds above 0. ``nan`` and
+    ``inf`` are refused because both read as a bound and neither ever fires."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds above 0, got {text!r}")
     return value
 
 
@@ -646,6 +659,18 @@ def main(argv: list[str] | None = None) -> int:
         dest="max_iterations",
         help="With --chat: bound each turn to at most N agent steps. Default: the SDK's own limit.",
     )
+    web_p.add_argument(
+        "--turn-seconds",
+        type=_positive_seconds,
+        default=None,
+        dest="turn_seconds",
+        help=(
+            "With --chat: stop a turn that runs longer than N seconds of wall-clock time (default "
+            f"{DEFAULT_TURN_SECONDS:g}). The stop lands at the next step boundary, so a model call or shell command "
+            "already in flight finishes first; the turn is reported timed out, nothing from it is "
+            "captured, and its session is closed."
+        ),
+    )
     web_p.set_defaults(func=_cmd_serve)
 
     serve_p = subparsers.add_parser(
@@ -1247,6 +1272,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         base_url=args.base_url,
         api_key=args.api_key,
         max_iterations=args.max_iterations,
+        turn_seconds=args.turn_seconds,
     )
 
 

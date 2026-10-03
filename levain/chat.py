@@ -39,12 +39,20 @@ issues tool actions, which for a gated action is before the gate stops it, so wh
 poll can show a line for an action that will be held. When the turn finishes gated, ``activity`` is
 replaced by the result's ``tool_activity`` (held actions removed); the held ones are in ``pending``.
 
-**A turn has no wall-clock bound here.** ``--max-iterations`` bounds its steps and the SDK's HTTP
-timeout bounds each model call, but a turn is not cancelled at a deadline: the SDK's synchronous run
-can only be paused between steps, and a paused turn needs the session to classify it as timed out
-and not capture it, which is not built yet. A turn that never returns keeps its session ``busy``.
-Workers are daemon threads, so stopping the server does not wait for one; the SDK closes every live
-conversation, and its shell, at interpreter exit.
+**A turn's wall-clock bound is a STOP REQUEST, honoured at the next step boundary.** Each turn,
+approval or refusal job has a watcher; at ``turn_seconds`` it marks the job ``deadline_hit`` and
+calls :meth:`EntitySession.request_stop` until the job ends. The session returns the turn
+``timed_out``, uncaptured, and the host breaks the session and releases its shell. The SDK's
+synchronous run cannot be cancelled inside a step, so a step already in flight finishes first: a
+shell command within its own timeout, a model call within the SDK's HTTP timeout and retries. So
+the bound is the deadline plus at most one step, not the deadline. A session stays ``busy`` (and
+counted) until its worker returns. Workers are daemon threads, so stopping the server does not wait
+for one; the SDK closes every live conversation, and its shell, at interpreter exit.
+
+**A session is counted toward the cap until its shell is released.** ``close`` marks it ``closing``
+(still counted, refusing every operation), tears it down outside the lock, and only then publishes
+``closed``; an open that lands after shutdown is torn down while it still reads ``opening``. So a
+slow teardown can never let an ``open`` exceed ``max_sessions`` (codex L3 r2).
 
 **Why the job registry is in memory, unlike** :mod:`levain.jobs` **(which is on disk).** A turn job is
 meaningful only while its conversation exists, and the conversation lives in this process (nothing
@@ -66,6 +74,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import secrets
 import threading
 from dataclasses import dataclass, field
@@ -77,6 +86,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CHAT_DRIVE_MODE",
+    "DEFAULT_TURN_SECONDS",
     "ChatError",
     "ChatHost",
     "MAX_ACTIVITY_LINES",
@@ -87,7 +97,7 @@ __all__ = [
 
 _log = logging.getLogger("levain.chat")
 
-SessionState = Literal["opening", "idle", "busy", "gated", "broken", "failed", "closed"]
+SessionState = Literal["opening", "idle", "busy", "gated", "closing", "broken", "failed", "closed"]
 JobKind = Literal["open", "turn", "approve", "reject"]
 JobStatus = Literal["running", "done", "failed"]
 
@@ -108,9 +118,9 @@ MAX_LINE_CHARS = 2_000
 _ENDED_SESSIONS_KEPT = 100
 """How many ended sessions (closed, failed, broken) stay readable. Older ones are forgotten."""
 
-_LIVE_STATES = ("opening", "idle", "busy", "gated")
-"""The states that hold, or are about to hold, a conversation. Only these count toward the cap; a
-broken session's conversation is closed by the worker right after it is marked."""
+_LIVE_STATES = ("opening", "idle", "busy", "gated", "closing")
+"""The states that hold, or are about to hold, a conversation. Only these count toward the cap. A
+broken session's shell is released by the worker BEFORE it is marked broken."""
 
 _FINISHED_JOBS_KEPT = 200
 """How many finished jobs stay pollable. Older finished jobs are forgotten (a poll answers
@@ -118,6 +128,14 @@ _FINISHED_JOBS_KEPT = 200
 
 DEFAULT_MAX_SESSIONS = 4
 """Live sessions per server. Each holds a conversation and, once used, a sandboxed shell."""
+
+DEFAULT_TURN_SECONDS = 1800.0
+"""A job's wall-clock deadline (``levain serve --turn-seconds``): long enough for real multi-step
+work, short enough that a stuck turn gives its session back the same hour."""
+
+_WATCHER_JOIN_SECONDS = 10.0
+"""How long a worker waits for its deadline watcher to exit after the job returns. The watcher's
+stop request blocks only while a step runs, and none is running by then, so this is a backstop."""
 
 
 class ChatError(Exception):
@@ -158,6 +176,7 @@ class _Job:
     session_id: str
     kind: JobKind
     status: JobStatus = "running"
+    deadline_hit: bool = False
     activity: list[str] = field(default_factory=list)
     dropped: int = 0
     result: dict[str, Any] | None = None
@@ -260,6 +279,7 @@ class ChatHost:
         api_key: str | None = None,
         max_iterations: int | None = None,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
+        turn_seconds: float | None = DEFAULT_TURN_SECONDS,
         session_factory: Callable[..., Any] | None = None,
     ) -> None:
         if not entities:
@@ -268,12 +288,16 @@ class ChatHost:
             raise ValueError("max_sessions must be at least 1")
         if max_iterations is not None and max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
+        if turn_seconds is not None and not (math.isfinite(turn_seconds) and turn_seconds > 0):
+            # `nan > 0` is False and `inf` never fires, so both read as bounded and are not.
+            raise ValueError("turn_seconds must be a finite number of seconds above 0, or None")
         self._entities = {name: Path(p) for name, p in entities.items()}
         self._factory = session_factory or _default_factory(
             model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations
         )
         self._model = model
         self._max_sessions = max_sessions
+        self._turn_seconds = turn_seconds
         self._lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
         self._jobs: dict[str, _Job] = {}
@@ -288,6 +312,7 @@ class ChatHost:
                 "model": self._model,
                 "drive_mode": CHAT_DRIVE_MODE,
                 "max_sessions": self._max_sessions,
+                "turn_seconds": self._turn_seconds,
                 "sessions": [
                     {k: v for k, v in self._session_view(s).items()
                      if k not in ("session_id", "job_id")}
@@ -311,6 +336,7 @@ class ChatHost:
                 "status": job.status,
                 "activity": list(job.activity),
                 "activity_dropped": job.dropped,
+                "deadline_hit": job.deadline_hit,
             }
             if job.result is not None:
                 out["result"] = dict(job.result)
@@ -365,18 +391,23 @@ class ChatHost:
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
-        itself). A failed session stays ``failed``; any other ends ``closed``."""
+        itself) and while another close is tearing it down. A failed session stays ``failed``; any
+        other ends ``closed``, published only after its shell is released (module docstring)."""
         with self._lock:
             rec = self._get(session_id)
-            if rec.state in ("opening", "busy"):
-                raise ChatError("busy", "the session is running a job; close it when it finishes", 409)
+            if rec.state in ("opening", "busy", "closing"):
+                raise ChatError(
+                    "busy", f"the session is {rec.state}; close it when that finishes", 409)
             session, rec.session = rec.session, None
-            if rec.state != "failed":
-                rec.state = "closed"
-            view = self._session_view(rec)
-        if session is not None:
-            session.close()
-        return view
+            if session is None:
+                if rec.state != "failed":
+                    rec.state = "closed"
+                return self._session_view(rec)
+            rec.state = "closing"
+        session.close()
+        with self._lock:
+            rec.state = "closed"
+            return self._session_view(rec)
 
     def shutdown(self) -> None:
         """Close every idle or gated session and stop accepting work. A job still running is not
@@ -386,12 +417,14 @@ class ChatHost:
             self._shut = True
             to_close = []
             for rec in self._sessions.values():
-                if rec.state not in ("opening", "busy") and rec.session is not None:
-                    to_close.append(rec.session)
+                if rec.state not in ("opening", "busy", "closing") and rec.session is not None:
+                    to_close.append((rec, rec.session))
                     rec.session = None
-                    rec.state = "closed"
-        for s in to_close:
+                    rec.state = "closing"
+        for rec, s in to_close:
             s.close()
+            with self._lock:
+                rec.state = "closed"
 
     # -- internals -----------------------------------------------------------
 
@@ -465,11 +498,47 @@ class ChatHost:
             before = rec.state
             rec.state = "busy"
             job = self._new_job(rec, kind)
-            if not self._spawn(self._run_job, rec, job, call):
+            done = threading.Event()
+            watcher = None
+            if self._turn_seconds is not None:
+                # Started BEFORE the worker, so a worker never runs without its bound: if the
+                # watcher cannot start, nothing has run yet and the job is refused.
+                watcher = threading.Thread(
+                    target=self._watch, args=(job, rec.session, done), daemon=True,
+                    name="levain-chat-deadline")
+                try:
+                    watcher.start()
+                except RuntimeError:
+                    watcher = None
+                    started = False
+                else:
+                    started = True
+            else:
+                started = True
+            if not started or not self._spawn(self._run_job, rec, job, call, done, watcher):
+                done.set()
                 rec.state, rec.job_id = before, None
                 del self._jobs[job.job_id]
                 raise ChatError("busy", "could not start a worker; try again", 503)
         return {"session_id": rec.session_id, "job_id": job.job_id, "state": "busy"}
+
+    def _watch(self, job: _Job, session: Any, done: threading.Event) -> None:
+        """A job's wall-clock bound: at the deadline, mark it and ask the session to stop until the
+        job returns. The stop request is repeated because one that lands before the SDK's run loop
+        starts is undone by it (:meth:`EntitySession.request_stop`)."""
+        assert self._turn_seconds is not None
+        if done.wait(self._turn_seconds):
+            return
+        with self._lock:
+            if job.status != "running":
+                return
+            job.deadline_hit = True
+        _log.warning("chat %s job %s passed its %ss deadline; stopping it",
+                     job.kind, job.job_id, self._turn_seconds)
+        while True:
+            session.request_stop()
+            if done.wait(1.0):
+                return
 
     def _run_open(self, rec: _Session, job: _Job) -> None:
         error: str | None = None
@@ -484,33 +553,29 @@ class ChatHost:
         # a client that sees "failed" must not still have the failed hands alive behind it.
         if error is not None:
             gc.collect()
-        if session is not None and self._shut:
-            # Shut while opening: close it BEFORE reporting, so "failed" never stands in front of a
-            # live shell (codex L3 r1).
-            session.close()
-            session = None
-            error = "the server shut down while the session opened"
-            closed_by_shutdown = True
-        else:
-            closed_by_shutdown = False
-        late: Any = None
         with self._lock:
+            # ONE decision, under the lock, so it cannot disagree with a shutdown that lands
+            # alongside it (r2, all three seats: an open finishing as shutdown landed reported
+            # done/idle for a session already closed).
+            accepted = error is None and not self._shut
             if error is not None:
-                rec.state, rec.error = ("closed" if closed_by_shutdown else "failed"), (
-                    None if closed_by_shutdown else error)
+                rec.state, rec.error = "failed", error
                 job.status, job.error = "failed", error
-            else:
+                rec.job_id = None
+            elif accepted:
                 rec.session = session
                 rec.state = "idle"
                 rec.info = self._describe(session)
+                rec.job_id = None
                 job.status, job.result = "done", {"session": self._session_view(rec)}
-                if self._shut:
-                    # Shut after the check above: shutdown() skipped this record while it was
-                    # opening, so nobody else will close it.
-                    late, rec.session, rec.state = session, None, "closed"
-            rec.job_id = None
-        if late is not None:
-            late.close()
+            # else: shut while opening. shutdown() skipped this record (it was opening), so the
+            # worker closes it, and the record keeps reading "opening" (counted, job running)
+            # until the shell is released below.
+        if error is None and not accepted:
+            session.close()
+            with self._lock:
+                rec.state, rec.job_id = "closed", None
+                job.status, job.error = "failed", "the server shut down while the session opened"
 
     def _route_events(self, rec: _Session) -> Callable[[str], None]:
         """The session's ``on_event`` sink. Bound once at open, it forwards each tool-activity line
@@ -529,17 +594,30 @@ class ChatHost:
         return _emit
 
     def _run_job(
-        self, rec: _Session, job: _Job, call: Callable[[Any], Any]
+        self,
+        rec: _Session,
+        job: _Job,
+        call: Callable[[Any], Any],
+        done: threading.Event,
+        watcher: threading.Thread | None,
     ) -> None:
         payload: dict[str, Any] | None = None
         error: str | None = None
         try:
-            result = call(rec.session)
-            payload = _turn_payload(result)
-        except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
-            error = f"{type(exc).__name__}: {exc}"
-        broken = payload is None or (payload["error"] is not None
-                                     and not (payload["gated"] and payload["error"] is None))
+            try:
+                result = call(rec.session)
+                payload = _turn_payload(result)
+            except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
+                error = f"{type(exc).__name__}: {exc}"
+        finally:
+            done.set()
+        if watcher is not None:
+            # The next job must not start while this one's stop request can still arrive: it
+            # would land in that job's turn. A watcher that does not exit breaks the session.
+            watcher.join(_WATCHER_JOIN_SECONDS)
+            if watcher.is_alive() and error is None:
+                payload, error = None, "the turn's deadline watcher did not exit"
+        broken = payload is None or payload["error"] is not None
         if broken and rec.session is not None:
             # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
             # so the cap can never be exceeded by a teardown still in progress (codex L3 r1).

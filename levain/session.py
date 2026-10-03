@@ -373,14 +373,21 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
     evs = list(events)
     last_user = None
     for i in range(len(evs) - 1, -1, -1):
-        if getattr(evs[i], "source", None) == "user" and not is_corrective_nudge(evs[i]):
+        # A user MESSAGE, not any user-sourced event: the SDK's PauseEvent is source "user" too,
+        # and treating a pause as the turn's start dropped every action the turn ran before its
+        # wall-clock stop (K1p2 run, 2026-10-03).
+        if (getattr(evs[i], "source", None) == "user" and hasattr(evs[i], "llm_message")
+                and not is_corrective_nudge(evs[i])):
             last_user = i
             break
     start = 0 if last_user is None else last_user
     prefix = str(workspace).rstrip(os.sep) + os.sep
+    refused = _refused_action_ids(evs[start:])
     lines: list[str] = []
     for e in evs[start:]:
         if getattr(e, "source", None) != "agent":
+            continue
+        if refused and str(getattr(e, "id", "")) in refused:
             continue
         summary = tool_action_summary(e)
         if summary is None:
@@ -388,6 +395,19 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
         tool_name, detail = summary
         lines.append(f"⚙ {tool_name}: {detail.replace(prefix, '')}")
     return lines
+
+
+def _refused_action_ids(events) -> set[str]:
+    """The ids of actions a ``UserRejectObservation`` answered (refused at the gate, or blocked by a
+    hook): proposed, never run. An action list is "what the entity DID", so these are left out of
+    it; without this a turn that resumed after a refusal listed the refused command as work, on the
+    same screen as the rejection (L4 run, K1p2, 2026-10-03). Never raises: if the SDK type cannot be
+    imported nothing is removed."""
+    try:
+        from openhands.sdk.event import UserRejectObservation
+    except Exception:  # noqa: BLE001 — a display filter must never break a turn
+        return set()
+    return {str(e.action_id) for e in events if isinstance(e, UserRejectObservation)}
 
 
 def latest_agent_text(events) -> str | None:
@@ -454,6 +474,7 @@ class EntitySession:
     """Why bash was dropped when the cause is THIS entity's floor rather than the host's sandbox
     (the host-side reasons come from ``diagnose_confinement``). The banner prints it verbatim."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    _stop_requested: bool = field(default=False, init=False, repr=False, compare=False)
 
     # -- construction --------------------------------------------------------
 
@@ -785,6 +806,7 @@ class EntitySession:
             return TurnResult(
                 reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR,
             )
+        self._stop_requested = False
 
         # REFUSE A NEW MESSAGE WHILE THE GATE IS HOLDING (codex L3, HIGH). ``send_message`` does
         # NOT clear ``WAITING_FOR_CONFIRMATION`` — but the ``run()`` that follows it DOES, and
@@ -843,6 +865,7 @@ class EntitySession:
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        self._stop_requested = False
         return self._drive()
 
     def reject_turn(self, reason: str = "the operator declined this action") -> TurnResult:
@@ -856,6 +879,7 @@ class EntitySession:
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
+        self._stop_requested = False
         try:
             from levain.firing.openhands.gate import reject_pending
 
@@ -903,7 +927,11 @@ class EntitySession:
         """
         nudged = False
         try:
+            if self._stop_requested:
+                return self._stopped_result(nudged=nudged)
             self.conversation.run()
+            if self._stop_requested:
+                return self._stopped_result(nudged=nudged)
 
             # The gate check comes FIRST, before the act-first backstop, because a halted turn
             # looks exactly like a stalled one from the outside: no tool ran, no reply arrived.
@@ -920,6 +948,8 @@ class EntitySession:
                 nudged = True
                 self.conversation.send_message(LEVAIN_ACT_NUDGE)
                 self.conversation.run()
+                if self._stop_requested:
+                    return self._stopped_result(nudged=nudged)
                 # Same three-valued treatment as the pre-nudge check — the post-nudge run() is
                 # a second chance to halt, and an unreadable status here cascades identically.
                 status = self._gate_status()
@@ -966,6 +996,40 @@ class EntitySession:
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
+        )
+
+    def request_stop(self) -> None:
+        """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
+
+        The turn ends at its next step boundary and returns ``timed_out=True``, NOT captured: a turn
+        stopped partway has no completed work to record (the same rule as the in-process bound).
+        The SDK's synchronous ``run()`` cannot be cancelled inside a step, so a step in flight (a
+        model call, a shell command) finishes first, and this call itself blocks until it does
+        (the SDK's pause waits for the state lock a running step holds). Calling it again is
+        harmless, and a driver should keep calling it until the turn returns: ``run()`` turns a
+        pause that landed before it started back into running.
+
+        The flag is cleared when the next turn, approval or refusal begins, so a driver must not
+        start one while an earlier stop request can still arrive. Never raises."""
+        self._stop_requested = True
+        try:
+            # `interrupt()` sets the SDK's cancellation token (tools may check it) and, with no
+            # async run to cancel, pauses.
+            self.conversation.interrupt()
+        except Exception:  # noqa: BLE001 — a stop request must never take down its caller
+            pass
+
+    def _stopped_result(self, *, nudged: bool) -> TurnResult:
+        """A turn ended by :meth:`request_stop`: timed out, nothing captured."""
+        return TurnResult(
+            reply=None,
+            tool_activity=self._executed_activity(),
+            error=(
+                "the turn was stopped at its wall-clock bound (at the first step boundary after "
+                "the deadline); nothing from it was captured. Restart the session; do not resume it."
+            ),
+            nudged=nudged,
+            timed_out=True,
         )
 
     def _undeterminable_gate_result(self, *, nudged: bool) -> TurnResult:
