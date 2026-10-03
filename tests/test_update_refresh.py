@@ -655,10 +655,10 @@ def test_ack_is_not_recorded_while_the_reconcile_holds_a_seed_for_review(tmp_pat
     assert "acknowledged up to" not in out
 
 
-def test_ack_is_recorded_after_a_pack_reconcile_that_holds_nothing(tmp_path, capsys,
-                                                                   monkeypatch):
-    """No regression: the same pulled template change on an UNEDITED seed fast-forwards,
-    nothing is held, and `--ack` records the marker up to the installed anneal."""
+def test_ack_waits_for_a_run_that_changes_nothing(tmp_path, capsys, monkeypatch):
+    """codex, the ack L3 round: an unedited seed that the reconcile fast-forwards is held
+    for nothing, yet the proposals were shown against the OLD file, so this run must not
+    record the ack. The next `update --ack`, which changes nothing, records it."""
     from levain.update import run_update
 
     install, pack = _install_with_render_pack(tmp_path, capsys, monkeypatch)
@@ -667,11 +667,43 @@ def test_ack_is_recorded_after_a_pack_reconcile_that_holds_nothing(tmp_path, cap
     (pack / "seed" / "zz_role.md").write_text("Operator v2: {{OPERATOR_NAME}}\n")
 
     lines: list[str] = []
+    run_update(install, no_pip=True, ack=True, emit=lines.append, confirm=lambda _p: False)
+    out = "\n".join(lines)
+    assert (install / "seed" / "zz_role.md").read_text() == "Operator v2: Chris\n"
+    mid = _migrate_state(install)
+    assert mid.migrate_acked == before.migrate_acked, "ack recorded on the run that changed a seed"
+    assert "--ack SKIPPED" in out and "pack reconcile changed" in out
+
+    lines = []
     rc = run_update(install, no_pip=True, ack=True, emit=lines.append,
                     confirm=lambda _p: False)
     out = "\n".join(lines)
-    assert (install / "seed" / "zz_role.md").read_text() == "Operator v2: Chris\n"
     after = _migrate_state(install)
     assert after.migrate_acked == before.anneal and after.pending_count == 0
     assert f"acknowledged up to {before.anneal}." in out and "SKIPPED" not in out
     assert rc == 0, out
+
+
+def test_ack_is_skipped_on_a_run_that_refreshes_the_carrier(tmp_path, capsys, monkeypatch):
+    """The adapter refresh rewrites CLAUDE.md, an instruction file, so it gates the ack
+    the same way the pack reconcile does."""
+    from levain.update import run_update
+
+    install, _pack = _install_with_render_pack(tmp_path, capsys, monkeypatch)
+    before = _migrate_state(install)
+    carrier = install / "CLAUDE.md"
+    current = carrier.read_text()
+    older = current.replace("Edit the seed files", "Edit the old seed files")
+    assert older != current
+    carrier.write_text(older)
+    receipt_path = install.joinpath(*ADAPTER_RECEIPT_REL)
+    receipt = json.loads(receipt_path.read_text())
+    receipt["files"]["CLAUDE.md"] = _sha(older.encode())
+    receipt_path.write_text(json.dumps(receipt))
+
+    lines: list[str] = []
+    run_update(install, no_pip=True, ack=True, emit=lines.append, confirm=lambda _p: False)
+    out = "\n".join(lines)
+    assert carrier.read_text() == current
+    assert _migrate_state(install).migrate_acked == before.migrate_acked
+    assert "--ack SKIPPED" in out and "refreshed" in out

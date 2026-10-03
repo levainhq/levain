@@ -199,9 +199,9 @@ def _run_update(
             installed = manifest.discover_installed_set(store, anneal_path)
 
     # -- 3. methodology-content (surface proposals; never auto-apply / auto-ack) --
-    # The proposals are SHOWN here; an `--ack` is only DECIDED here and RECORDED after
-    # the pack reconcile (3.5), which can hold a seed file for review and leave its old
-    # instruction text installed (complement L3, 2026-10-03).
+    # The proposals are SHOWN here; an `--ack` is only DECIDED here and RECORDED at 3.7,
+    # after the pack reconcile (3.5) and the adapter refresh (3.6), either of which can
+    # change or hold an instruction file (complement + codex L3, 2026-10-03).
     ack_target: str | None = None
     if installed.pending_count:
         emit(f"\n• {installed.pending_count} anneal migration proposal(s) — "
@@ -225,7 +225,7 @@ def _run_update(
             # Ack to the INSTALLED version (what `migrate check` just showed and
             # the operator reviewed), never past it (complement L3: this sidesteps
             # the pre-release `_cmp`-equality quirk, and anneal refuses an ack
-            # ahead of the installed version anyway). Recorded after step 3.5.
+            # ahead of the installed version anyway). Recorded at step 3.7.
             ack_target = _ack_target(installed.anneal, declared.anneal)
         else:
             emit("\n  After applying the edits, run `levain update --ack` (or "
@@ -240,19 +240,33 @@ def _run_update(
     # -- 3.5 pack-layer drift (the DOWNSTREAM axis) — reconcile a pulled pack source
     #    into the install: verbatim doctrine fast-forwarded (operator edits backed up),
     #    docs rebuilt, render/activation/manifest changes surfaced for review. --
-    pack_provenance, _pack_drifted, pack_needs_review = reconcile.run_pack_reconcile(
+    pack_provenance, pack_drifted, pack_needs_review = reconcile.run_pack_reconcile(
         install, dry_run=False, emit=emit
     )
 
-    # -- 3.5b record the `--ack` decided at step 3, now that the reconcile has run. A
-    #    held pack change (a seed whose new text sits at `<file>.new`, a render slot not
-    #    yet answered, an unreadable pack lock) means the installed instruction text is
-    #    not what the proposals assume, so the marker stays where it is. --
-    if ack_target is not None and pack_needs_review:
-        emit("\n• --ack SKIPPED — the pack reconcile held changes for your review "
-             "(listed above), so seed / instruction text the proposals depend on may "
-             "still be the old version; marker unchanged. Resolve the held files, then "
-             "re-run `levain update --ack`.")
+    # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
+    #    `pip install -U levain` changes neither; only `init --force` used to). After the
+    #    pack reconcile, which may have changed the roster the carrier lists. --
+    adapter = refresh_adapter(install, apply=True, emit=emit, carrier=not pack_needs_review)
+    adapter_needs_review = bool(adapter.review)
+
+    # -- 3.7 record the `--ack` decided at step 3, now that everything that can rewrite an
+    #    instruction file has run. The proposals were shown against the files as they were
+    #    BEFORE 3.5 and 3.6, so if either step changed or held one (a pack seed replaced or
+    #    staged, a carrier or seed refreshed or staged), the operator has not reviewed the
+    #    text now installed, and the marker stays where it is (codex, the ack L3 round: a
+    #    reconcile that backed up an edited seed and replaced it reported no review, and
+    #    the ack recorded proposals the replaced file no longer applied). --
+    changed = [label for label, hit in (
+        ("the pack reconcile changed or held pack files", pack_drifted or pack_needs_review),
+        ("adapter or seed files were refreshed", bool(adapter.refreshed)),
+        ("adapter or seed files were held for review", adapter_needs_review),
+    ) if hit]
+    if ack_target is not None and changed:
+        emit(f"\n• --ack SKIPPED — this run changed what is installed ({'; '.join(changed)}), "
+             "so the proposals above were reviewed against files that are no longer the "
+             "installed ones; marker unchanged. Check the proposals against the files as they "
+             "are now, settle anything listed for review, then re-run `levain update --ack`.")
     elif ack_target is not None:
         emit(f"\n• --ack: recording instruction files reconciled up to "
              f"anneal {ack_target}...")
@@ -264,12 +278,6 @@ def _run_update(
             # Re-discover so the final verdict reflects the now-cleared pending
             # set — else `--ack` returns 1 even on a successful ack (codex L3).
             installed = manifest.discover_installed_set(store, anneal_path)
-
-    # -- 3.6 the activation tree + adapter files, re-composed from THIS levain (gap #19:
-    #    `pip install -U levain` changes neither; only `init --force` used to). After the
-    #    pack reconcile, which may have changed the roster the carrier lists. --
-    adapter_needs_review = bool(refresh_adapter(
-        install, apply=True, emit=emit, carrier=not pack_needs_review).review)
 
     # -- 4. record the lock (reality after reconcile) — carry the updated pack
     #    provenance so a reconciled pack stops re-drifting; write_lock always writes
