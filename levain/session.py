@@ -444,7 +444,8 @@ def latest_agent_text(events) -> str | None:
 
     Shares its event-shape parsing with ``capture.render_turn`` via
     :mod:`levain.firing.agent_reply` (pure/duck-typed, so this stays SDK-free for the tests),
-    so the shown reply and the captured episode never diverge: an agent reply is either a
+    so the shown reply and the captured episode read the same agent text (one known difference: a
+    message repeated verbatim in one turn is shown once and captured twice): an agent reply is either a
     ``MessageEvent`` (``message_event_text``) or an ``ActionEvent(FinishAction)``
     (``finish_message`` — the SDK routes a no-tool answer through the built-in ``finish`` tool,
     not a MessageEvent). The boundary skips the SDK's synthetic corrective nudge so a
@@ -454,7 +455,7 @@ def latest_agent_text(events) -> str | None:
     (:func:`levain.firing.encoding.scan_text`): provably double-decoded UTF-8 is repaired and
     anything else is left as it arrived. Without it the person read the damaged reply while the
     store held the repaired one (UD-1, RUN on the released 0.5.4 via ``levain serve --chat``:
-    ``café —`` came back as ``cafÃ© â\x80\x94``)."""
+    ``café —`` came back as ``cafÃ© â\\x80\\x94``)."""
     evs = list(events)
     start = turn_start(evs)
     parts: list[str] = []

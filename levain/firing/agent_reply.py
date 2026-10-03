@@ -238,6 +238,10 @@ def planned_without_acting(events) -> bool:
     if not reply:
         return False
     reply = humanize_finish_json(reply)  # parity with the other consumers — unwrap a JSON-wrapped plan
+    # Then the same mojibake repair as the shown reply and the capture: a double-decoded apostrophe
+    # ("Iâ€™ll") otherwise misses the plan-opener match and the stall goes un-nudged (L1, RUN 10-03).
+    from levain.firing.encoding import scan_text
+    reply = scan_text(reply).text
     if "?" in reply:
         return False  # a clarifying question ("which file did you mean?") is a legitimate pause, never
         # a stall — nudging it would override the agent's correct decision to wait for the human (L2).

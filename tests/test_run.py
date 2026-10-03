@@ -185,6 +185,15 @@ def test_latest_agent_text_leaves_clean_non_ascii_and_unprovable_text_alone():
         assert _latest_agent_text(events) == text
 
 
+def test_a_double_decoded_plan_opener_still_reads_as_a_stall():
+    """L1 (RUN): 'Iâ€™ll run the tests now.' missed the plan-opener match the clean form hits."""
+    from levain.firing.agent_reply import planned_without_acting
+    clean = [_Event("user", ["go"]), _Event("agent", ["I\u2019ll run the tests now."])]
+    broken = [_Event("user", ["go"]), _Event("agent", ["I\u00e2\u20ac\u2122ll run the tests now."])]
+    assert planned_without_acting(clean) is True
+    assert planned_without_acting(broken) is True
+
+
 def test_latest_agent_text_excludes_non_agent_sources():
     # system / environment (the vagus inject rides source="environment") must never echo back.
     events = [

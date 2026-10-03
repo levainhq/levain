@@ -12,7 +12,7 @@ A shield is not a cure. Everything here stays open until the upstream layer fixe
 ## UD-1 — mis-decoded text arrives at the capture boundary (open)
 
 **Status:** open upstream · shielded in levain since 2026-07-20
-**Shield:** `levain/firing/encoding.py`, invoked from `CaptureRequest.__post_init__`
+**Shield:** `levain/firing/encoding.py`, invoked from `CaptureRequest.__post_init__` (capture), from `levain.session.latest_agent_text` (the reply shown by the REPL, `--task` and `levain serve --chat`), and from `levain.firing.agent_reply.planned_without_acting` (the stall check)
 **Suspected layer:** the streaming decode path in Ollama `/v1` → litellm → OpenHands SDK
 
 ### What was observed
@@ -62,6 +62,11 @@ before text becomes memory:
   under `levain_encoding`, and logged as a warning during the session. For a product whose
   claim is "a memory you can trust because you can see what is in it", a silent repair would
   be its own trust defect.
+- **shows the person the same text it stores** (since 0.5.5). The reply printed by the REPL and
+  `--task`, and returned by `levain serve --chat`, goes through the same repair, so what the
+  person reads matches the episode. Unlike the episode, the shown reply carries no marker yet:
+  text that quotes mojibake on purpose (code or notes about encodings) is shown repaired with
+  nothing on screen saying so; the receipt is only in the episode.
 
 ### What is still missing
 
