@@ -264,6 +264,10 @@ def _trust(path: Path, *dbs: Path, root: str | None = "/r") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = [{"db": str(d)} | ({"root": root} if root is not None else {}) for d in dbs]
     path.write_text(json.dumps({"version": 2, "stores": entries}))
+    # Explicit modes: anneal (and this mirror of it) rejects a group-writable trust file or directory,
+    # and a umask of 002 (Ubuntu's default) would make both group-writable.
+    path.parent.chmod(0o755)
+    path.chmod(0o644)
     return path
 
 
@@ -292,8 +296,7 @@ def test_a_large_trust_file_is_still_honoured(home, tmp_path):
     """anneal has no size cap, so neither may this (codex L3 HIGH: a skipped file left its stores open)."""
     moved = _project_home(tmp_path / "elsewhere")
     filler = [{"db": f"/nonexistent/{i}/memory.db", "root": "/r"} for i in range(30000)]
-    t = home / ".anneal-memory" / "derive-trust.json"
-    t.parent.mkdir()
+    t = _trust(home / ".anneal-memory" / "derive-trust.json")
     t.write_text(json.dumps({"version": 2, "stores": filler + [
         {"db": str(moved / "levain-v2" / "memory.db"), "root": "/r"}]}))
     assert t.stat().st_size > 1 << 20
