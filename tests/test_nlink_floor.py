@@ -9,7 +9,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import platform
-import shutil
 from pathlib import Path
 
 import pytest
@@ -210,17 +209,16 @@ def test_a_path_behind_another_users_dir_refuses_whatever_list_names_it(home, fi
 
 
 @pytest.mark.skipif(_ROOT, reason="root searches every directory")
-def test_sockets_in_another_users_runtime_dir_are_dropped_upstream(home, monkeypatch) -> None:
-    """The ``su`` case: the inherited ``$XDG_RUNTIME_DIR`` is the first user's 0700 dir. Its sockets
-    are dropped from the list by the directory's owner, so they cost the shell nothing; the same
-    path under a directory that is not a runtime dir still refuses (the test above)."""
+def test_a_socket_in_another_users_runtime_dir_refuses_and_names_the_fix(home, monkeypatch) -> None:
+    """The su case. An earlier version skipped these sockets; codex + glm (nlink L3) showed the skip
+    misses a link the socket's owner made at a public path, which a check that never sees the inode
+    cannot count. So it refuses, and says how to fix the inherited variable."""
     foreign = _foreign_dir()
     monkeypatch.setattr(confinement, "_runtime_dirs", lambda: [str(foreign)])
-    assert confinement._foreign_runtime_dirs() == [str(foreign), os.path.realpath(foreign)]
     policy = build_policy(_entity(home))   # the $XDG_RUNTIME_DIR roster entries land under it
-    under = [f for f in policy.deny_write_files if str(f).startswith(os.path.realpath(foreign))]
-    assert under, policy.deny_write_files
-    _refuse_multiply_linked_jewels(policy)
+    assert [f for f in policy.deny_write_files if str(f).startswith(os.path.realpath(foreign))]
+    with pytest.raises(ConfinementError, match="unset XDG_RUNTIME_DIR"):
+        _refuse_multiply_linked_jewels(policy)
 
 
 def test_a_symlink_spelled_as_a_runtime_dir_is_not_foreign(home, monkeypatch, tmp_path) -> None:
@@ -425,8 +423,8 @@ def test_linked_jewel_reason_refuses_a_same_dir_case_variant_link(home) -> None:
     assert reason and "hardlink" in reason
 
 
-@pytest.mark.skipif(platform.system() != "Linux" or not shutil.which("bwrap"),
-                    reason="a real bind alias needs bwrap")
+@pytest.mark.skipif(platform.system() != "Linux" or not confinement.bwrap_available(),
+                    reason="a real bind alias needs a working bwrap")
 def test_live_the_file_editor_check_refuses_a_real_bind_alias(home) -> None:
     """RUN on argushub at c02ee1e before the fix: inside ``bwrap --bind <hidden> <alias>``, both
     crown_jewel_reason and linked_jewel_reason returned None for ``<alias>/x.db`` and the editor
@@ -458,7 +456,7 @@ def test_live_the_file_editor_check_refuses_a_real_bind_alias(home) -> None:
     assert out.stdout.strip() == "REFUSED", out.stdout
 
 
-@pytest.mark.skipif(_ROOT, reason="the drop is never taken as root")
+@pytest.mark.skipif(_ROOT, reason="root searches every directory")
 @pytest.mark.parametrize("rd", [os.path.realpath("/tmp"), "/"])
 def test_a_reachable_socket_under_a_foreign_owned_runtime_dir_is_still_counted(home, monkeypatch, rd) -> None:
     """L2 (RUN at 29ed753): owning the runtime dir proves nothing about reach. With
@@ -526,3 +524,47 @@ def test_a_read_denied_jewel_linked_as_rebound_known_hosts_refuses(home) -> None
     with pytest.raises(ConfinementError, match="known_hosts is another name"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent",
                                                     deny_files=(secret,)))
+
+
+def test_a_hidden_write_only_file_linked_as_own_memory_refuses(home) -> None:
+    """codex (nlink L3): agent mode hides ~/.ssh, so ~/.ssh/rc is not readable, but it is also a
+    deny_write_file, which a two-tier rule called readable; linked to the entity's memory (readable)
+    it passed, and bash read rc through the memory name."""
+    ent = _entity(home)
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    (ssh / "rc").write_text("hidden")
+    os.link(ssh / "rc", ent / ".levain" / "memory.continuity.md")
+    with pytest.raises(ConfinementError, match="rc is a crown jewel the shell may not read"):
+        _refuse_multiply_linked_jewels(build_policy(ent, ssh_mode="agent"))
+
+
+def test_authorized_keys_linked_as_the_rebound_known_hosts_refuses(home) -> None:
+    """complement (nlink L3): known_hosts is bound back read-write in agent mode, so a link from
+    authorized_keys to it would let bash append a key."""
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA real\n")
+    os.link(ssh / "authorized_keys", ssh / "known_hosts")
+    with pytest.raises(ConfinementError, match="known_hosts is another name.*read and write"):
+        _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent"))
+
+
+def test_two_names_with_the_same_access_do_not_refuse(home) -> None:
+    """raw mode: authorized_keys and authorized_keys2 are both read-only binds."""
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA real\n")
+    os.link(ssh / "authorized_keys", ssh / "authorized_keys2")
+    _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="raw"))
+
+
+def test_an_unresolvable_floor_path_refuses_instead_of_crashing(home) -> None:
+    """codex (nlink L3), RUN at 6cf411c: ~/.ssh replaced by a symlink loop after the policy was
+    built raised RuntimeError out of spawn instead of a refusal."""
+    (home / ".ssh").mkdir()
+    policy = build_policy(_entity(home), ssh_mode="agent")
+    (home / ".ssh").rmdir()
+    (home / ".ssh").symlink_to(home / ".ssh")
+    with pytest.raises(ConfinementError):
+        _refuse_multiply_linked_jewels(policy)

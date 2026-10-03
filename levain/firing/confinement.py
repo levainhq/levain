@@ -2938,11 +2938,9 @@ def _sqlite_state(p: Path) -> str:
 
 def _foreign_runtime_dirs() -> list[str]:
     """The user runtime dirs (:func:`_runtime_dirs`) that are real directories owned by ANOTHER user,
-    at both their given and resolved spellings. Under ``su`` the inherited ``$XDG_RUNTIME_DIR`` is
-    the first user's ``/run/user/<uid>``, mode 0700: nothing under it can be stat-ed, and the entity
-    cannot reach it either. Ownership is read from ``lstat`` of the directory itself, so a symlink
-    spelled like a runtime dir is never taken for one. A dir that cannot be ``lstat``-ed is not
-    listed, and the sockets under it then fail closed."""
+    at both their given and resolved spellings: under ``su`` the inherited ``$XDG_RUNTIME_DIR`` is
+    the first user's. Used only to explain a refusal, never to skip a check. Ownership is read from
+    ``lstat`` of the directory itself, so a symlink spelled like a runtime dir is never listed."""
     out: list[str] = []
     for rd in _runtime_dirs():
         try:
@@ -2977,16 +2975,23 @@ def _jewel_names(
     on its own directory would otherwise switch the check off while the other name stays reachable
     (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``), and a roster spelling
     proves neither the type nor the owner of what sits behind another user's directory (codex, the
-    r1 fix-diff round). The one thing left out is a SOCKET spelling under another user's runtime
-    dir (:func:`_foreign_runtime_dirs`) that this non-root user cannot reach because another
-    user's directory blocks it: the confined shell, with the same euid, cannot reach it either."""
+    r1 fix-diff round). That includes a socket in another user's runtime dir: an earlier version
+    skipped those, and each way of deciding which to skip (spelling, owner, reachability of the
+    listed name) was defeated by a name it did not look at, including a link the socket's owner
+    made at a public path (codex + glm, the nlink L3 round). The refusal names the inherited
+    ``$XDG_RUNTIME_DIR`` when that is the cause (:func:`_foreign_runtime_dirs`)."""
     seen: dict[tuple[int, int], tuple[int, dict[tuple, set[str]]]] = {}
 
     def unverifiable(path: str, exc: OSError) -> NoReturn:
+        hint = ""
+        if any(path == rd or path.startswith(rd.rstrip(os.sep) + os.sep)
+               for rd in _foreign_runtime_dirs()):
+            hint = (" It is under another user's runtime directory, usually an XDG_RUNTIME_DIR "
+                    "inherited through su: run `unset XDG_RUNTIME_DIR` and start again.")
         raise ConfinementError(
             f"could not check {path} for other names ({exc.strerror or exc}). The floor denies paths, "
             "so an unchecked crown jewel could be reachable through a hardlink. Refusing this hand "
-            "(fail-closed). Make it readable to this user, or remove it from the floor."
+            "(fail-closed). Make it readable to this user, or remove it from the floor." + hint
         ) from exc
 
     def entry_key(path: str) -> tuple:
@@ -3010,36 +3015,16 @@ def _jewel_names(
         entries = seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, {}))[1]
         entries.setdefault(entry_key(real), set()).add(real)
 
-    foreign = _foreign_runtime_dirs()
-
-    def under_foreign(p: Path) -> bool:
-        return any(str(p) == rd or str(p).startswith(rd.rstrip(os.sep) + os.sep) for rd in foreign)
-
     sockets: list[Path] = [*policy.deny_sockets, *policy.socket_spellings]
     if platform.system() == "Linux":
         sockets += [b for rd in _runtime_dirs()
                     for b in (Path(rd) / "bus", Path(rd) / "systemd" / "private")]
-    socket_names = {str(s) for s in sockets}
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
              *policy.sqlite_sidecars, *sockets]
     if policy.config_file is not None:
         named.append(policy.config_file)
-    def dropped(f: Path) -> bool:
-        # build_policy also write-denies every socket spelling through deny_write_files, so the
-        # drop keys on the spelling, whichever list carries it. Owning the runtime dir proves
-        # nothing about reach (L2, RUN: $XDG_RUNTIME_DIR=/private/tmp or / skipped a socket this
-        # user owns, with an outside link): the socket itself must be unreachable to this euid,
-        # blocked by another user's directory (:func:`_identity`). Root is never blocked.
-        if str(f) not in socket_names or os.geteuid() == 0 or not under_foreign(f):
-            return False
-        try:
-            return _identity(f) == _UNREACHABLE
-        except OSError:
-            return False   # blocked by a directory this user owns: note() refuses it
-
     for f in named:
-        if not dropped(f):
-            note(str(f), follow=True)
+        note(str(f), follow=True)
 
     def walk_error(exc: OSError) -> None:
         if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
@@ -3063,6 +3048,55 @@ def _jewel_names(
     return seen
 
 
+_TIER_ALLOWS = ("not read", "read but not write", "read and write")
+
+
+def _access_tiers(policy: CrownJewelsPolicy):
+    """``spelling -> 0 | 1 | 2``: what the shell may do through a name the jewel walk records,
+    0 = not read, 1 = read but not write, 2 = read and write. Read off the renderers, most
+    specific rule first: a named read-deny or socket (0), the ``known_hosts`` (2) and ``config``
+    (1) bound back into an agent-mode ``~/.ssh``, anything else under a hidden subtree or that
+    ``~/.ssh`` (0), then ``deny_write_files`` and the entity's own memory files (1; both are
+    read-only binds). Two tiers were not enough: a write-only file under a hidden subtree is not
+    readable, and the rebound ``known_hosts`` is writable (complement + codex, the nlink L3
+    round). A path that cannot be resolved raises :class:`ConfinementError`."""
+    def real(p: Path) -> str:
+        return os.path.realpath(p)
+
+    try:
+        none = {real(p) for p in (*policy.deny_files, *policy.sqlite_sidecars, *policy.deny_sockets,
+                                  *policy.socket_spellings,
+                                  *([policy.config_file] if policy.config_file is not None else []))}
+        hidden = [real(p) for p in (*policy.deny_read_write,
+                                    *([policy.ssh_dir] if policy.ssh_dir is not None else []))]
+        rw: set[str] = set()
+        ro_rebound: set[str] = set()
+        if policy.ssh_dir is not None:
+            for name, into in (("known_hosts", rw), ("config", ro_rebound)):
+                r = policy.ssh_dir / name
+                if not _caller_denies(r, policy):
+                    into.add(real(r))
+        read_only = {real(p) for p in (*policy.deny_write_files, *policy.own_memory_files)}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfinementError(
+            f"could not resolve the floor's paths to check them for other names ({exc}). Refusing to "
+            "grant bash hands (fail-closed)."
+        ) from exc
+
+    def tier(sp: str) -> int:
+        if sp in none:
+            return 0
+        if sp in rw:
+            return 2
+        if sp in ro_rebound:
+            return 1
+        if any(sp == h or sp.startswith(h.rstrip(os.sep) + os.sep) for h in hidden):
+            return 0
+        return 1 if sp in read_only else 0
+
+    return tier
+
+
 def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     """Refuse bash when a crown-jewel file or socket has a name outside the floor.
 
@@ -3073,28 +3107,24 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     both direct paths were refused; on Linux a link to a user-owned daemon socket reached the daemon
     (L2, RUN). levain cannot find the other names, so it refuses when :func:`_jewel_names` counts
     fewer names inside the floor than ``st_nlink``. Two names that are both inside the floor do not
-    refuse, unless the floor lets the shell READ one and not the other: a read-denied token whose
-    second name is the entity's own memory file counted 2 of 2 inside the floor and bash got it
-    (L1, RUN). So an inode with names in both tiers refuses too. Checked at spawn only: a link a
-    host process makes while a shell is live is not watched (Phill's ruling, 2026-10-03). The file
-    editor checks every path it touches instead (:func:`linked_jewel_reason`)."""
-    strong = {os.path.realpath(p) for p in (
-        *policy.deny_files, *policy.sqlite_sidecars, *policy.deny_sockets, *policy.socket_spellings,
-        *([policy.config_file] if policy.config_file is not None else []))}
-    rebound = ([policy.ssh_dir / "known_hosts", policy.ssh_dir / "config"]
-               if policy.ssh_dir is not None else [])
-    readable = {os.path.realpath(p) for p in (
-        *policy.deny_write_files, *policy.own_memory_files,
-        *(r for r in rebound if not _caller_denies(r, policy)))} - strong
+    refuse, unless the floor gives the shell different access through them: a read-denied token
+    whose second name is the entity's own memory file counted 2 of 2 inside the floor and bash got
+    it (L1, RUN). So an inode whose names fall in different :func:`_access_tiers` refuses too.
+    Checked at spawn only: a link a host process makes while a shell is live is not watched (Phill's
+    ruling, 2026-10-03). The file editor checks every path it touches instead
+    (:func:`linked_jewel_reason`)."""
+    tier = _access_tiers(policy)
     for links, entries in _jewel_names(policy).values():
-        spellings = set().union(*entries.values())
-        weak = spellings & readable
-        if weak and spellings - readable:
+        spellings = sorted(set().union(*entries.values()))
+        tiers = {sp: tier(sp) for sp in spellings}
+        if len(set(tiers.values())) > 1:
+            weakest = max(spellings, key=lambda sp: tiers[sp])
+            strongest = min(spellings, key=lambda sp: tiers[sp])
             raise ConfinementError(
-                f"{sorted(spellings - readable)[0]} is a crown jewel the shell may not read, and "
-                f"{sorted(weak)[0]} is another name for the same file that the shell may read "
-                "(a write-protected file or the entity's own memory). Refusing to grant bash hands "
-                "(fail-closed). Remove the extra link."
+                f"{strongest} is a crown jewel the shell may {_TIER_ALLOWS[tiers[strongest]]}, and "
+                f"{weakest} is another name for the same file that the shell may "
+                f"{_TIER_ALLOWS[tiers[weakest]]}. Refusing to grant bash hands (fail-closed). "
+                "Remove the extra link."
             )
         if links > len(entries):
             path = sorted(min(spellings) for spellings in entries.values())[0]
