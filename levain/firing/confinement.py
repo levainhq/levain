@@ -2972,7 +2972,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
 
     def unverifiable(path: str, exc: OSError) -> NoReturn:
         hint = ""
-        if any(rd != os.sep and (path == rd or path.startswith(rd.rstrip(os.sep) + os.sep))
+        if any(rd.strip(os.sep) and (path == rd or path.startswith(rd.rstrip(os.sep) + os.sep))
                for rd in _foreign_runtime_dirs()):
             hint = (" It is under another user's runtime directory, usually an XDG_RUNTIME_DIR "
                     "inherited through su: run `unset XDG_RUNTIME_DIR` and start again.")
@@ -3078,8 +3078,7 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     try:
         jewels = _jewel_inodes(policy)
     except ConfinementError as exc:
-        return (f"{path} has more than one name, and whether one of them is a crown jewel "
-                f"could not be checked: {exc}")
+        return f"{path} has more than one name, and the crown-jewel check failed: {exc}"
     hit = jewels.get((st.st_dev, st.st_ino))
     if hit is None:
         return None

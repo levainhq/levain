@@ -571,10 +571,12 @@ def test_linked_jewel_reason_returns_none_for_a_nul_byte(home) -> None:
     assert linked_jewel_reason(policy, str(home / "a\x00b")) is None
 
 
-def test_an_unverifiable_jewel_under_a_root_runtime_dir_gets_no_xdg_hint(home, monkeypatch) -> None:
+@pytest.mark.parametrize("roots", [[os.sep], ["//", os.sep]])
+def test_an_unverifiable_jewel_under_a_root_runtime_dir_gets_no_xdg_hint(home, monkeypatch, roots) -> None:
     """complement, the nlink L3 round: a foreign runtime dir of ``/`` matched every path, so any
-    unverifiable jewel was blamed on an inherited XDG_RUNTIME_DIR."""
-    monkeypatch.setattr(confinement, "_foreign_runtime_dirs", lambda: [os.sep])
+    unverifiable jewel was blamed on an inherited XDG_RUNTIME_DIR; codex, its fix-diff round:
+    ``XDG_RUNTIME_DIR=//`` did too."""
+    monkeypatch.setattr(confinement, "_foreign_runtime_dirs", lambda: roots)
     secret = _secret(home)
     policy = build_policy(_entity(home), deny_files=(secret,))
     monkeypatch.setattr(confinement.os, "stat", _raise_eacces_for(str(secret), os.stat))
