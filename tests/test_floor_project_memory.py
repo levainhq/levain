@@ -457,6 +457,7 @@ def _link_into_sibling(home: Path, tmp_path: Path) -> tuple[Path, Path, Path]:
     return me, target, opt
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
 def test_a_write_only_link_into_a_hidden_subtree_binds_dev_null_at_its_target(
     home, tmp_path, monkeypatch
 ):
@@ -472,6 +473,7 @@ def test_a_write_only_link_into_a_hidden_subtree_binds_dev_null_at_its_target(
         opt.chmod(0o755)
 
 
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
 @pytest.mark.skipif(not _LINUX, reason="the step (5) self-bind is Linux-only")
 def test_live_a_trust_link_into_a_sibling_store_does_not_re_expose_it(home, tmp_path, monkeypatch):
     me, target, opt = _link_into_sibling(home, tmp_path)
@@ -501,3 +503,45 @@ def test_a_trust_spelling_equal_to_a_deny_file_is_not_listed_again(home, monkeyp
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(t))
     policy = build_policy(_entity(home), deny_files=(t,))
     assert policy.trust_spellings == ()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_write_only_link_to_a_read_denied_file_never_self_binds_it(home, tmp_path, monkeypatch):
+    """codex + glm L3 (floor-r2 r1): a trust link in a non-writable directory pointing at a deny_files
+    entry was self-bound on top of that entry's /dev/null mask, making the secret readable."""
+    from levain.firing.confinement import _bwrap_argv
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("SECRET")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(secret)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(secret,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(secret.resolve())
+        assert ["--ro-bind", t, t] not in binds
+        assert ["--ro-bind", "/dev/null", t] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the step (5) self-bind is Linux-only")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_live_a_trust_link_to_a_denied_file_does_not_expose_it(home, tmp_path, monkeypatch):
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("DENIED-SECRET-1308")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(secret)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        with select_provider().spawn_shell(build_policy(_entity(home), deny_files=(secret,))) as sh:
+            assert "DENIED-SECRET-1308" not in sh.run(f"cat '{secret}' 2>&1", timeout=20).output
+            assert "DENIED-SECRET-1308" not in sh.run(f"cat '{opt}/trust.json' 2>&1", timeout=20).output
+    finally:
+        opt.chmod(0o755)

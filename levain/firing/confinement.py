@@ -3193,6 +3193,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
+    # Targets already denied both ways (steps 2 and 4), as step (4) mounts them: resolved.
+    denied_both_targets = set()
+    for jewel in [*deny_both, *file_roots]:
+        try:
+            denied_both_targets.add(Path(jewel).resolve())
+        except (OSError, RuntimeError):
+            denied_both_targets.add(Path(jewel))
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
@@ -3230,8 +3237,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             )
         elif f.exists():
             target = _bwrap_file_target(f)
-            if _shadowed_by(target, roots):
-                # The spelling is outside every hidden subtree but its TARGET is inside one. A
+            if _shadowed_by(target, roots) or target in denied_both_targets:
+                # The spelling is outside every hidden subtree but its TARGET is inside one, or is
+                # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
+                # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
                 # self-bind takes its source from the host tree, so it would put the hidden file
                 # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
                 # link in a non-writable directory pointing into a sibling entity's store): the
