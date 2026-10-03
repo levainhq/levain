@@ -295,10 +295,9 @@ def test_a_store_listed_in_the_default_trust_file_is_denied_without_the_env(home
 def test_a_large_trust_file_is_still_honoured(home, tmp_path):
     """anneal has no size cap, so neither may this (codex L3 HIGH: a skipped file left its stores open)."""
     moved = _project_home(tmp_path / "elsewhere")
-    filler = [{"db": f"/nonexistent/{i}/memory.db", "root": "/r"} for i in range(30000)]
     t = _trust(home / ".anneal-memory" / "derive-trust.json")
-    t.write_text(json.dumps({"version": 2, "stores": filler + [
-        {"db": str(moved / "levain-v2" / "memory.db"), "root": "/r"}]}))
+    t.write_text(json.dumps({"version": 2, "stores": [
+        {"db": str(moved / "levain-v2" / "memory.db"), "root": "/r", "pad": "x" * (1 << 20)}]}))
     assert t.stat().st_size > 1 << 20
     assert (moved / "levain-v2").resolve() in build_policy(_entity(home)).deny_read_write
 
@@ -306,8 +305,7 @@ def test_a_large_trust_file_is_still_honoured(home, tmp_path):
 @pytest.mark.parametrize("content", ["", "{not json", '{"stores": "x"}', '{"stores": [{"db": 7}]}',
                                      '{"stores": [{"db": "relative/memory.db", "root": "/r"}]}'])
 def test_a_bad_trust_file_adds_nothing_and_the_default_deny_holds(home, monkeypatch, content):
-    trust = home / ".anneal-memory" / "derive-trust.json"
-    trust.parent.mkdir()
+    trust = _trust(home / ".anneal-memory" / "derive-trust.json")   # explicit modes, then the content
     trust.write_text(content)
     entity = _entity(home)
     policy = build_policy(entity)
@@ -333,16 +331,26 @@ def test_entries_and_files_anneal_would_reject_widen_nothing(home, tmp_path):
     assert (store / "levain-v2").resolve() not in build_policy(entity).deny_read_write
 
 
-def test_a_fifo_at_a_trust_path_neither_hangs_nor_widens(home, monkeypatch):
+def test_a_fifo_at_a_trust_path_refuses_without_hanging(home, monkeypatch):
+    """anneal would read stores from a FIFO; this cannot without blocking, so it refuses (codex L3 r2)."""
     fifo = home / "trust.fifo"
     os.mkfifo(fifo)
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(fifo))
-    build_policy(_entity(home))   # returns: the open is non-blocking and the type check refuses it
+    with pytest.raises(ConfinementError, match="not a regular file"):
+        build_policy(_entity(home))
 
 
-def test_a_listed_store_whose_directory_is_missing_is_skipped(home, tmp_path):
-    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "gone" / "memory.db")
-    assert (tmp_path / "gone").resolve() not in build_policy(_entity(home)).deny_read_write
+def test_a_listed_store_whose_directory_is_missing_is_denied_before_it_exists(home, tmp_path):
+    """codex L3 r2: skipping it let the entity create the directory and a store anneal trusts."""
+    _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "future" / "memory.db")
+    assert (tmp_path / "future").resolve() in build_policy(_entity(home)).deny_read_write
+
+
+def test_a_missing_store_inside_the_workspace_still_refuses(home):
+    entity = _entity(home)
+    _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "future" / "memory.db")
+    with pytest.raises(ConfinementError, match="directory of its own"):
+        build_policy(entity)
 
 
 def test_a_symlinked_db_denies_its_lexical_directory_too(home, tmp_path):
@@ -397,8 +405,22 @@ def test_a_store_trusted_after_the_policy_was_built_is_denied_at_the_next_spawn(
     assert (late / "levain-v2").resolve() not in policy.deny_read_write
     refreshed = refresh_socket_denies(policy)
     assert (late / "levain-v2").resolve() in refreshed.deny_read_write
-    assert (late / "levain-v2").resolve() in refreshed.deny_read_write   # union: never dropped
     assert set(policy.deny_read_write) <= set(refreshed.deny_read_write)
+    (home / ".anneal-memory" / "derive-trust.json").unlink()            # the entry goes away...
+    assert (late / "levain-v2").resolve() in refresh_socket_denies(refreshed).deny_read_write  # ...kept
+
+
+def test_the_file_editor_floor_absorbs_a_late_store(home, tmp_path):
+    """codex L3 r2: the shared floor merged only socket fields, so a store trusted mid-session was
+    denied to bash and left open to the file editor."""
+    from levain.firing.confinement import refresh_socket_denies
+    from levain.firing.openhands.tools import _SharedFloor
+    policy = build_policy(_entity(home))
+    floor = _SharedFloor(policy)
+    late = _project_home(tmp_path / "late")
+    _trust(home / ".anneal-memory" / "derive-trust.json", late / "levain-v2" / "memory.db")
+    floor.absorb(refresh_socket_denies(floor.policy))
+    assert crown_jewel_reason(floor.policy, late / "levain-v2" / "memory.continuity.md") is not None
 
 
 @live

@@ -740,16 +740,22 @@ def _anneal_trusted_dbs(path: Path) -> list[str]:
     file owned by this user and not writable by others, in a directory with the same properties, with
     a ``stores`` list whose entries carry string ``db`` and ``root``. A file anneal would reject loads
     no store, so it protects nothing and must not widen the floor either (codex L3 2026-10-03: an
-    untrusted file could otherwise hide a system directory). Opened non-blocking so a FIFO or device
-    at the path is refused instead of hanging; there is no size cap, because anneal has none and a
-    skipped valid file would leave its stores open."""
+    untrusted file could otherwise hide a system directory). There is no size cap, because anneal has
+    none and a skipped valid file would leave its stores open. A trust path that is not a regular file
+    (a FIFO, a device) REFUSES the floor: anneal does not check the type and could read stores from it,
+    and this cannot read it without blocking (codex L3 r2)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        if not stat.S_ISREG(st.st_mode):
+            raise ConfinementError(
+                f"the anneal trust path {path} is not a regular file, so the stores it may name cannot "
+                "be read — refusing to build the floor (fail-closed). Replace it with a regular file."
+            )
+        if st.st_uid != os.geteuid() or st.st_mode & 0o022:
             return []
         pst = os.stat(os.path.dirname(os.path.abspath(path)))
         if pst.st_uid != os.geteuid() or pst.st_mode & 0o022:
@@ -758,7 +764,9 @@ def _anneal_trusted_dbs(path: Path) -> list[str]:
         while chunk := os.read(fd, 1 << 16):
             chunks.append(chunk)
         data = json.loads(b"".join(chunks).decode("utf-8"))
-    except (OSError, ValueError):
+    except ConfinementError:
+        raise   # a RuntimeError subclass: the refusal above must not be read as "unreadable"
+    except (OSError, ValueError, RuntimeError):   # RuntimeError: RecursionError on deep nesting
         return []
     finally:
         os.close(fd)
@@ -780,8 +788,10 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
     through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
     ``~/.anneal-projects`` subtree still applies.
 
-    Both the db's real directory and, for a symlinked db, its lexical directory are denied. A directory
-    that does not exist is skipped (nothing to hide; a later spawn re-derives). The entity's own
+    Both the db's real directory and, for a symlinked db, its lexical directory are denied, whether or
+    not they exist yet: a skipped absent directory could be created by the entity and filled with a
+    store anneal already trusts (codex L3 r2). On Linux an absent one is created as bwrap's mountpoint,
+    and one under a directory this user cannot write refuses bash. The entity's own
     canonical store (``<entity>/.levain/memory.db``) is skipped, since ``own_memory_files`` governs it.
     ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
     filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
@@ -798,11 +808,15 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
     if raw:
         try:
             candidates.insert(0, Path(raw).expanduser())
-        except RuntimeError:
-            pass   # an unresolvable value is refused by _project_memory_jewels
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV}={raw!r} cannot be resolved ({exc}) — refusing to build the "
+                "floor (fail-closed)."
+            ) from exc
     canonical = (entity_dir / ".levain" / "memory.db").resolve()
     shared = {Path("/tmp").resolve(), Path("/var/tmp").resolve(), Path(tempfile.gettempdir()).resolve()}
     out: list[Path] = []
+    seen: set[Path] = set()
     for trust in candidates:
         for db in _anneal_trusted_dbs(trust):
             try:
@@ -815,8 +829,6 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
             except (OSError, RuntimeError, ValueError):
                 continue
             for d in sorted(dirs):
-                if not d.is_dir():
-                    continue
                 unsafe = (str(d) == d.anchor or len(d.parts) <= 2 or d in shared
                           or any(_inside_by_identity(d, p) for p in (home, entity_dir, workspace))
                           or _inside_by_identity(entity_dir, d) or _inside_by_identity(workspace, d))
@@ -827,7 +839,8 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
                         "Refusing to build the floor (fail-closed). Move the store into a directory "
                         "of its own and update the trust file."
                     )
-                if d not in out:
+                if d not in seen:
+                    seen.add(d)
                     out.append(d)
     return out
 

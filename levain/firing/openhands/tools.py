@@ -253,8 +253,10 @@ class _SharedFloor:
         return self._policy
 
     def absorb(self, spawned: CrownJewelsPolicy) -> None:
-        """UNION the four evolving socket fields of ``spawned`` into the live policy, under the
-        floor's own lock. Monotonic: a merge can only ever ADD a deny, never drop one — the same
+        """UNION the evolving fields of ``spawned`` into the live policy, under the floor's own lock:
+        the four socket fields, and ``deny_read_write``, which gains the project stores a trust file
+        names after the conversation opened (spore-1308 follow-on; without it a late store was denied
+        to bash and left open to the file editor, codex L3 2026-10-03). Monotonic: a merge can only ever ADD a deny, never drop one — the same
         fail-closed property :func:`refresh_socket_denies` provides within a single spawn, extended
         across concurrent spawners."""
         def _union(a: tuple[Path, ...], b: tuple[Path, ...]) -> tuple[Path, ...]:
@@ -276,6 +278,7 @@ class _SharedFloor:
                 deny_write_files=_union(cur.deny_write_files, spawned.deny_write_files),
                 socket_spellings=_union(cur.socket_spellings, spawned.socket_spellings),
                 deny_write_dirs=_union(cur.deny_write_dirs, spawned.deny_write_dirs),
+                deny_read_write=_union(cur.deny_read_write, spawned.deny_read_write),
             )
 
 
