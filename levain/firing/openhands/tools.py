@@ -269,10 +269,10 @@ class _SharedFloor:
             raise ConfinementError(self._refusal)
         try:
             refreshed = refresh_socket_denies(self.policy)
-        except ConfinementError as exc:
+        except Exception as exc:   # any failure: a floor that could not be re-derived is not trusted
             self.refuse(str(exc))
-            raise
-        self.absorb(refreshed)
+            raise ConfinementError(str(exc)) from exc
+        self.absorb(refreshed)   # raises if another hand refused meanwhile
         return self.policy
 
     @property
@@ -296,6 +296,10 @@ class _SharedFloor:
             return tuple(out)
 
         with self._lock:
+            if self._refusal is not None:
+                # Refused by another hand while this one was refreshing or spawning: publishing
+                # now would let it act on a floor the conversation already gave up (codex L3 r4).
+                raise ConfinementError(self._refusal)
             cur = self._policy
             # Named explicitly rather than **kwargs: `dataclasses.replace` is type-checked per field,
             # and a **dict defeats that on the one object where a wrong field is a security defect.
@@ -613,9 +617,16 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # holds the same denies even if the start fails; a refresh failure refuses both hands
                 # (codex L3 2026-10-03).
                 refreshed = self._floor.refresh()
-                candidate = provider.spawn_shell(
-                    refreshed, default_timeout=self._default_timeout
-                )
+                try:
+                    candidate = provider.spawn_shell(
+                        refreshed, default_timeout=self._default_timeout
+                    )
+                except ConfinementError:
+                    # The provider refreshes again on its own; if THAT derivation is what failed,
+                    # record it for both hands (codex L3 r4). A failure of the start itself
+                    # (no bwrap, a bad host) leaves the editor usable.
+                    self._floor.refresh()
+                    raise
                 try:
                     # `effective_policy` is Optional on the TYPE because a SandboxedShell built
                     # directly (not through the provider seam) legitimately has none.
@@ -664,6 +675,9 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 "non-interactive dev commands + agent-auth SSH, with no PTY. Run the program "
                 "non-interactively instead (flags/env, a heredoc, or `yes |`).",
             )
+        if self._floor.refusal is not None:
+            self._teardown()   # a live shell must not outlive a refusal set by the other hand
+            return self._error(action, f"crown-jewels floor refused: {self._floor.refusal}")
         if action.reset:
             self._teardown()
             if not action.command.strip():

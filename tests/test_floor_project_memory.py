@@ -444,16 +444,21 @@ def test_live_a_moved_project_home_found_through_its_trust_file_is_refused(
 # --- L3 r3: stale entries, bounds, odd trust paths, a floor both hands refuse --------------------
 
 
-def test_an_absent_store_nobody_here_can_create_is_skipped(home, tmp_path):
-    """A stale entry on an unmounted or root-owned path: the entity cannot create it either, so it
-    is skipped rather than aborting bwrap or leaving a directory behind (L3 r3)."""
+def test_an_absent_store_under_a_read_only_directory_is_still_denied(home, tmp_path):
+    """L3 r4 (codex, complement): skipping it because this user "cannot create it" was fail-open, since
+    a same-uid shell can chmod its own directory back. It is denied; on Linux the renderer refuses,
+    naming the path, because bwrap cannot create the mountpoint."""
+    from levain.firing.confinement import _bwrap_argv
     locked = tmp_path / "locked"
     locked.mkdir()
     locked.chmod(0o555)
     try:
         _trust(home / ".anneal-memory" / "derive-trust.json", locked / "gone" / "memory.db")
         policy = build_policy(_entity(home))
-        assert (locked / "gone").resolve() not in policy.deny_read_write
+        assert (locked / "gone").resolve() in policy.deny_read_write
+        if os.geteuid() != 0:
+            with pytest.raises(ConfinementError, match="remove that entry"):
+                _bwrap_argv(policy)
     finally:
         locked.chmod(0o755)
 
@@ -528,3 +533,78 @@ def test_a_listed_store_directory_gets_no_sidecar_names(home, tmp_path):
     _trust(home / ".anneal-memory" / "derive-trust.json", tmp_path / "future" / "memory.db")
     policy = build_policy(_entity(home))
     assert not [p for p in policy.sqlite_sidecars if p.name.startswith("future-")]
+
+
+def test_absorb_refuses_once_the_floor_is_refused(home):
+    """codex/glm L3 r4: a spawn that refreshed before the other hand refused must not publish after."""
+    from levain.firing.openhands.tools import _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+    snapshot = floor.policy
+    floor.refuse("refused by the other hand")
+    with pytest.raises(ConfinementError, match="other hand"):
+        floor.absorb(snapshot)
+
+
+def test_a_live_bash_shell_is_torn_down_by_a_refusal_from_the_editor(home):
+    """complement L3 r4: bash checked the refusal only when it had no live shell."""
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    from openhands.tools.terminal.definition import TerminalAction
+
+    class _Live:
+        closed = False
+        def close(self):
+            self.closed = True
+
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+    live = _Live()
+    bash._shell = live
+    floor.refuse("a trust file named an unsafe store")
+    obs = bash(TerminalAction(command="echo hi"))
+    assert obs.is_error and "refused" in obs.text
+    assert live.closed and bash._shell is None
+
+
+def test_a_failure_in_the_providers_own_refresh_refuses_the_floor(home, monkeypatch):
+    """codex L3 r4: the provider refreshes again inside spawn_shell; if that derivation fails the
+    refusal must reach the shared floor, not only this bash call."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    entity = _entity(home)
+    floor = _SharedFloor(build_policy(entity))
+    bash = SandboxedBashExecutor(floor=floor)
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
+            raise ConfinementError("the provider's refresh found an unsafe store")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    with pytest.raises(ConfinementError):
+        bash._ensure_shell()
+    assert floor.refusal is not None
+
+
+def test_the_bound_counts_distinct_directories(home, tmp_path, monkeypatch):
+    """codex/complement L3 r4: one store named in several trust files counted several times."""
+    from levain.firing.confinement import _MAX_LISTED_STORES
+    stores = [tmp_path / f"s{i}" / "memory.db" for i in range(_MAX_LISTED_STORES // 2 + 1)]
+    for t in (home / ".anneal-memory" / "derive-trust.json", home / ".anneal-projects" / "derive-trust.json"):
+        _trust(t, *stores)
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(home / ".anneal-memory" / "derive-trust.json"))
+    build_policy(_entity(home))   # 129 distinct directories, listed three times over: under the bound
+
+
+def test_any_refresh_failure_refuses_the_floor(home, monkeypatch):
+    """complement L3 r4: only ConfinementError was made sticky; an OSError escaped raw and retried."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+
+    def boom(policy):
+        raise PermissionError(13, "Permission denied", "x")
+
+    monkeypatch.setattr(tools_mod, "refresh_socket_denies", boom)
+    with pytest.raises(ConfinementError):
+        floor.refresh()
+    assert floor.refusal is not None

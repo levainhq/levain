@@ -791,12 +791,13 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
     through :func:`_anneal_trusted_dbs`. A missing or rejected file adds nothing, and the
     ``~/.anneal-projects`` subtree still applies.
 
-    Both the db's real directory and, for a symlinked db, its lexical directory are denied. An absent
-    one is denied too when this user could create it (its nearest existing ancestor is writable), since
-    the entity could create it and fill it with a store anneal already trusts (codex L3 r2); on Linux
-    it becomes bwrap's mountpoint. An absent one nobody here can create is skipped, so stale entries on
-    unmounted or root-owned paths neither abort bwrap nor leave directories behind (L3 r3). More than
-    a bounded number of reachable listed stores refuses the floor. The entity's own
+    Both the db's real directory and, for a symlinked db, its lexical directory are denied, whether or
+    not they exist: an absent one could be created by the entity and filled with a store anneal already
+    trusts (codex L3 r2), and "this user cannot create it" is not something a same-uid shell is bound by
+    (it can chmod its own directories, or rename them away: L3 r4), so it is never a reason to skip.
+    On Linux an absent one becomes bwrap's mountpoint; one bwrap could not create refuses bash there
+    with the path named, so a stale entry is pruned rather than silently skipped. More than a bounded
+    number of distinct listed store directories refuses the floor. The entity's own
     canonical store (``<entity>/.levain/memory.db``) is skipped, since ``own_memory_files`` governs it.
     ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
     filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
@@ -835,8 +836,8 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
             except (OSError, RuntimeError, ValueError):
                 continue
             for d in sorted(dirs):
-                if not d.exists() and not _creatable_by_this_user(d):
-                    continue   # nobody here can create it, so nothing can be planted (stale entries)
+                if d in seen:
+                    continue
                 listed += 1
                 if listed > _MAX_LISTED_STORES:
                     raise ConfinementError(
@@ -854,22 +855,23 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
                         "Refusing to build the floor (fail-closed). Move the store into a directory "
                         "of its own and update the trust file."
                     )
-                if d not in seen:
-                    seen.add(d)
-                    out.append(d)
+                seen.add(d)
+                out.append(d)
     return out
 
 
 _MAX_LISTED_STORES = 256
 
 
-def _creatable_by_this_user(d: Path) -> bool:
-    """True if ``d`` does not exist and its nearest existing ancestor is writable by this user, so
-    this user (and so a confined shell) could create it."""
+def _mountpoint_creatable(d: Path) -> bool:
+    """Whether bwrap could create ``d`` as a mountpoint: its nearest existing ancestor is a directory
+    this process can write and search. Used ONLY to refuse with a clear message (a wrong answer there
+    fails closed), never to skip a deny: a same-uid shell can change what this returns."""
+    effective = os.access in os.supports_effective_ids
     for a in d.parents:
         try:
             if a.exists():
-                return os.access(a, os.W_OK)
+                return a.is_dir() and os.access(a, os.W_OK | os.X_OK, effective_ids=effective)
         except OSError:
             return False
     return False
@@ -1218,7 +1220,7 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs:
+        if jewel in listed_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -3114,6 +3116,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
+        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+            raise ConfinementError(
+                f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
+                "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
+                "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
+                "(fail-closed)."
+            )
         if _absent_in_ro_store(sub):
             continue
         if sub.exists() and not sub.is_dir():
