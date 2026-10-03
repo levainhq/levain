@@ -2936,39 +2936,64 @@ def _sqlite_state(p: Path) -> str:
 
 
 def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
-    """Refuse bash when a crown-jewel FILE has more than one name (``st_nlink > 1``).
+    """Refuse bash when a crown-jewel file or socket has a name outside the floor.
 
     The floor denies PATHS. A hardlink is the same file under another path, so a link planted
     before the shell starts, at a path the floor does not deny, bypasses it both ways. REPRODUCED
     2026-10-03 on macOS seatbelt and Linux bwrap at e8f403d: a link to a ``deny_files`` token printed
     it, and writing through a link to ``authorized_keys`` added a line to the host's real file, while
-    both direct paths were refused. levain cannot find the other names (they can be anywhere on the
-    volume), so it refuses and names the file instead. Checked at spawn only: a link a host process
-    makes while a shell is live is not watched (Phill's ruling, 2026-10-03).
+    both direct paths were refused; a link to a user-owned daemon socket reached the daemon (L2, RUN
+    on Linux). levain cannot find the other names, so it counts the names it CAN see inside the floor
+    (the named jewels plus every entry under the hidden subtrees and the ssh dir) for each file, and
+    refuses when ``st_nlink`` is larger: some name is somewhere else. Two names that are both inside
+    the floor do not refuse. Checked at spawn only: a link a host process makes while a shell is live
+    is not watched (Phill's ruling, 2026-10-03).
 
-    Covered: the named jewel files (followed through symlinks, the file the floor protects) and every
-    regular file under the hidden subtrees and the ssh dir (walked without following symlinks). An
-    entry this user cannot stat is skipped: a link to it would be unreadable to the shell too."""
+    ⛔ A jewel this user cannot stat or list REFUSES ("cannot verify"), because a chmod on its own
+    directory would otherwise switch the check off while the other name stays readable (L2, RUN:
+    ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). The one exception is the jewel-recheck
+    rule in :func:`_identity`: a path blocked by ANOTHER user's directory is left alone."""
+    seen: dict[tuple[int, int], tuple[int, set[str]]] = {}
+
+    def unverifiable(path: str, exc: OSError) -> None:
+        raise ConfinementError(
+            f"could not check {path} for other names ({exc.strerror or exc}). The floor denies paths, "
+            "so an unchecked crown jewel could be reachable through a hardlink. Refusing to grant bash "
+            "hands (fail-closed). Make it readable to this user, or remove it from the floor."
+        ) from exc
+
+    def blocked_by_another_user(path: str) -> bool:
+        try:
+            return _identity(Path(path)) == _UNREACHABLE
+        except OSError:
+            return False
+
+    def note(path: str, follow: bool) -> None:
+        try:
+            st = os.stat(path) if follow else os.lstat(path)
+        except FileNotFoundError:
+            return   # absent (or a dangling link): no file to have other names
+        except OSError as exc:
+            if not blocked_by_another_user(path):
+                unverifiable(path, exc)
+            return
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISSOCK(st.st_mode)):
+            return
+        real = os.path.realpath(path) if follow else path
+        links, names = seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, set()))
+        names.add(real)
+
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
-             *policy.sqlite_sidecars]
+             *policy.sqlite_sidecars, *policy.deny_sockets, *policy.socket_spellings]
     if policy.config_file is not None:
         named.append(policy.config_file)
-
-    def refuse(path: str, links: int) -> None:
-        raise ConfinementError(
-            f"{path} is a crown jewel with {links} names on disk. The floor denies paths, so another "
-            "name for the same file would let the shell read or write it. Refusing to grant bash hands "
-            f"(fail-closed). Find the other names with `find <volume> -samefile {path}` and remove the "
-            "extra links."
-        )
-
     for f in named:
-        try:
-            st = os.stat(f)
-        except OSError:
-            continue   # absent or unreachable: no file to have other names
-        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
-            refuse(str(f), st.st_nlink)
+        note(str(f), follow=True)
+
+    def walk_error(exc: OSError) -> None:
+        if not blocked_by_another_user(exc.filename):
+            unverifiable(exc.filename, exc)
+
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
                    key=lambda p: str(p))
     walked: list[Path] = []
@@ -2976,23 +3001,23 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
         if any(root == w or root.is_relative_to(w) for w in walked):
             continue
         walked.append(root)
-        try:
-            st = os.stat(root)
-        except OSError:
+        if not os.path.isdir(root):
+            note(str(root), follow=True)   # a subtree root that is a file (argushub's ~/.anneal-memory)
             continue
-        if stat.S_ISREG(st.st_mode):   # a subtree root that is a file (argushub's ~/.anneal-memory)
-            if st.st_nlink > 1:
-                refuse(str(root), st.st_nlink)
-            continue
-        for dirpath, _dirs, files in os.walk(root):   # os.walk does not follow directory symlinks
+        for dirpath, _dirs, files in os.walk(root, onerror=walk_error):   # symlinked dirs not followed
+            real_dir = os.path.realpath(dirpath)
             for name in files:
-                q = os.path.join(dirpath, name)
-                try:
-                    st = os.lstat(q)
-                except OSError:
-                    continue
-                if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
-                    refuse(q, st.st_nlink)
+                note(os.path.join(real_dir, name), follow=False)
+
+    for links, names in seen.values():
+        if links > len(names):
+            path = sorted(names)[0]
+            raise ConfinementError(
+                f"{path} is a crown jewel with {links} names on disk, and only {len(names)} of them "
+                "inside the floor. The floor denies paths, so the other name would let the shell read "
+                "or write it. Refusing to grant bash hands (fail-closed). Find the other names with "
+                f"`find <volume> -samefile {path}` and remove the extra links."
+            )
 
 
 def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:

@@ -6,6 +6,7 @@ REPRODUCED 2026-10-03 at e8f403d on macOS seatbelt and Linux bwrap: a pre-plante
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 
@@ -129,3 +130,88 @@ def test_live_a_planted_link_refuses_the_shell_and_the_host_file_is_untouched(ho
         r = sh.run(f"echo planted >> {ak} 2>&1", timeout=20)
         assert r.exit_code != 0, r.output
     assert ak.read_text() == "ssh-ed25519 AAAA real\n"
+
+
+_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(_ROOT, reason="root ignores directory modes")
+@pytest.mark.parametrize("mode", [0o300, 0o600])
+def test_a_jewel_dir_made_unreadable_refuses_instead_of_skipping(home, mode) -> None:
+    """L2 (RUN): chmod on the jewel's own directory made the check skip it while the planted link
+    stayed readable. Unverifiable is now a refusal."""
+    store = home / ".anneal-memory"
+    locked = store / "locked"
+    locked.mkdir(parents=True)
+    (locked / "memory.db").write_text("store")
+    os.link(locked / "memory.db", home / "copy.db")
+    locked.chmod(mode)
+    try:
+        with pytest.raises(ConfinementError, match="could not check"):
+            _refuse_multiply_linked_jewels(build_policy(_entity(home)))
+    finally:
+        locked.chmod(0o700)
+
+
+@pytest.mark.skipif(_ROOT, reason="root ignores directory modes")
+def test_a_linked_authorized_keys_behind_a_locked_ssh_dir_is_refused(home) -> None:
+    """L2's worst case: link authorized_keys out, then chmod 0600 ~/.ssh so stat fails. sshd (root)
+    still honours the key."""
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA real\n")
+    os.link(ssh / "authorized_keys", home / "ak")
+    ssh.chmod(0o600)
+    try:
+        with pytest.raises(ConfinementError, match="could not check"):
+            _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="raw"))
+    finally:
+        ssh.chmod(0o700)
+
+
+def test_a_path_blocked_by_another_users_dir_is_left_alone(home, monkeypatch) -> None:
+    secret = _secret(home)
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    real_stat = os.stat
+
+    def stat(p, *a, **k):
+        if str(p) == str(secret):
+            raise PermissionError(13, "Permission denied", str(p))
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(confinement.os, "stat", stat)
+    monkeypatch.setattr(confinement, "_identity", lambda p: confinement._UNREACHABLE)
+    _refuse_multiply_linked_jewels(policy)
+
+
+def test_two_names_both_inside_the_floor_do_not_refuse(home) -> None:
+    store = home / ".anneal-memory"
+    store.mkdir()
+    (store / "a.db").write_text("store")
+    os.link(store / "a.db", store / "b.db")
+    _refuse_multiply_linked_jewels(build_policy(_entity(home)))
+
+
+def test_a_linked_daemon_socket_is_refused(home, tmp_path) -> None:
+    """L2 (RUN on Linux bwrap): a link to a user-owned daemon socket reached the daemon while the
+    socket's own path was denied."""
+    import socket
+    import tempfile
+    d = Path(tempfile.mkdtemp(dir="/tmp"))   # AF_UNIX paths are length-limited
+    sock_path = d / "daemon.sock"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(str(sock_path))
+        try:
+            os.link(sock_path, d / "link.sock")
+        except OSError as exc:
+            pytest.skip(f"this filesystem does not hardlink sockets: {exc}")
+        with pytest.raises(ConfinementError, match="daemon.sock|link.sock"):
+            policy = dataclasses.replace(build_policy(_entity(home)), deny_sockets=(sock_path,))
+            _refuse_multiply_linked_jewels(policy)
+    finally:
+        s.close()
+        for q in (d / "link.sock", sock_path):
+            if q.exists() or q.is_socket():
+                q.unlink()
+        d.rmdir()
