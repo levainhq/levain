@@ -49,10 +49,10 @@ from levain.firing.agent_reply import (
     LEVAIN_ACT_NUDGE,
     finish_message,
     humanize_finish_json,
-    is_corrective_nudge,
     message_event_text,
     planned_without_acting,
     tool_action_summary,
+    turn_start,
 )
 from levain.firing.confinement import (
     ConfinementError,
@@ -371,16 +371,7 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
     workspace-relative; the boundary skips the SDK's synthetic corrective nudge exactly as
     :func:`latest_agent_text` does, so activity keys on the real turn."""
     evs = list(events)
-    last_user = None
-    for i in range(len(evs) - 1, -1, -1):
-        # A user MESSAGE, not any user-sourced event: the SDK's PauseEvent is source "user" too,
-        # and treating a pause as the turn's start dropped every action the turn ran before its
-        # wall-clock stop (K1p2 run, 2026-10-03).
-        if (getattr(evs[i], "source", None) == "user" and hasattr(evs[i], "llm_message")
-                and not is_corrective_nudge(evs[i])):
-            last_user = i
-            break
-    start = 0 if last_user is None else last_user
+    start = turn_start(evs)
     prefix = str(workspace).rstrip(os.sep) + os.sep
     refused = _refused_action_ids(evs[start:])
     lines: list[str] = []
@@ -422,12 +413,7 @@ def latest_agent_text(events) -> str | None:
     not a MessageEvent). The boundary skips the SDK's synthetic corrective nudge so a
     weak-model turn keys on the real question. ``None`` when there is no agent text yet."""
     evs = list(events)
-    last_user = None
-    for i in range(len(evs) - 1, -1, -1):
-        if getattr(evs[i], "source", None) == "user" and not is_corrective_nudge(evs[i]):
-            last_user = i
-            break
-    start = 0 if last_user is None else last_user
+    start = turn_start(evs)
     parts: list[str] = []
     for e in evs[start:]:
         if getattr(e, "source", None) != "agent":
@@ -947,6 +933,8 @@ class EntitySession:
             if self.with_tools and planned_without_acting(self.conversation.state.events):
                 nudged = True
                 self.conversation.send_message(LEVAIN_ACT_NUDGE)
+                if self._stop_requested:
+                    return self._stopped_result(nudged=nudged)
                 self.conversation.run()
                 if self._stop_requested:
                     return self._stopped_result(nudged=nudged)

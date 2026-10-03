@@ -192,6 +192,22 @@ def is_corrective_nudge(event) -> bool:
     return CORRECTIVE_NUDGE_MARKER in text or text.lstrip().startswith(LEVAIN_ACT_NUDGE_MARKER)
 
 
+def turn_start(events) -> int:
+    """Index of the current turn's start: the last genuine user MESSAGE (``0`` if there is none).
+
+    A user message, not any user-sourced event: the SDK's ``PauseEvent`` is source ``"user"`` too,
+    and reading a pause as the start of the turn dropped every action the turn ran before a
+    wall-clock stop (K1p2 run, 2026-10-03). The SDK's synthetic corrective nudge is skipped, so a
+    weak-model turn keys on the real question. The ONE home of this rule: activity, reply text and
+    the act-first check all read the turn from here. Duck-typed; no ``openhands`` import."""
+    for i in range(len(events) - 1, -1, -1):
+        e = events[i]
+        if (getattr(e, "source", None) == "user" and hasattr(e, "llm_message")
+                and not is_corrective_nudge(e)):
+            return i
+    return 0
+
+
 def planned_without_acting(events) -> bool:
     """True iff the just-completed agent turn took ZERO real tool actions AND its reply reads as a
     forward PLAN (intent to act), not an answer — the narrate-first stall where a weak open model ENDS
@@ -204,12 +220,7 @@ def planned_without_acting(events) -> bool:
     this to inject ONE :data:`LEVAIN_ACT_NUDGE` and re-run — the structural equivalent of the act-first
     prompt that measured glm 2/3 -> 3/3 (bake-off 2026-07-17). Duck-typed; no ``openhands`` import."""
     evs = list(events)
-    last_user = None
-    for i in range(len(evs) - 1, -1, -1):
-        if getattr(evs[i], "source", None) == "user" and not is_corrective_nudge(evs[i]):
-            last_user = i
-            break
-    start = 0 if last_user is None else last_user
+    start = turn_start(evs)
     reply: str | None = None
     for e in evs[start:]:
         if getattr(e, "source", None) != "agent":

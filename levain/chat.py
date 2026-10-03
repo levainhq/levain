@@ -41,7 +41,8 @@ replaced by the result's ``tool_activity`` (held actions removed); the held ones
 
 **A turn's wall-clock bound is a STOP REQUEST, honoured at the next step boundary.** Each turn,
 approval or refusal job has a watcher; at ``turn_seconds`` it marks the job ``deadline_hit`` and
-calls :meth:`EntitySession.request_stop` until the job ends. The session returns the turn
+calls :meth:`EntitySession.request_stop` until the job ends (a settled job keeps ``deadline_hit``
+only if the deadline stopped it). The session returns the turn
 ``timed_out``, uncaptured, and the host breaks the session and releases its shell. The SDK's
 synchronous run cannot be cancelled inside a step, so a step already in flight finishes first: a
 shell command within its own timeout, a model call within the SDK's HTTP timeout and retries. So
@@ -404,9 +405,12 @@ class ChatHost:
                     rec.state = "closed"
                 return self._session_view(rec)
             rec.state = "closing"
-        session.close()
+        try:
+            session.close()
+        finally:
+            with self._lock:
+                rec.state = "closed"
         with self._lock:
-            rec.state = "closed"
             return self._session_view(rec)
 
     def shutdown(self) -> None:
@@ -422,9 +426,13 @@ class ChatHost:
                     rec.session = None
                     rec.state = "closing"
         for rec, s in to_close:
-            s.close()
-            with self._lock:
-                rec.state = "closed"
+            try:
+                s.close()
+            except Exception as exc:  # noqa: BLE001 — one failed teardown must not strand the rest
+                _log.error("chat session %s: close failed at shutdown: %s", rec.session_id, exc)
+            finally:
+                with self._lock:
+                    rec.state = "closed"
 
     # -- internals -----------------------------------------------------------
 
@@ -469,15 +477,23 @@ class ChatHost:
             text = f"{type(exc).__name__}: {exc}"
             _log.error("chat %s job %s escaped its worker: %s", job.kind, job.job_id, text)
             to_close: Any = None
+            ended: SessionState = "failed" if job.kind == "open" else "broken"
             with self._lock:
                 if job.status == "running":
                     job.status, job.error = "failed", text
                 if rec.job_id == job.job_id:
                     rec.job_id = None
                     to_close, rec.session = rec.session, None
-                    rec.state, rec.error = ("failed" if job.kind == "open" else "broken"), text
+                    rec.error = text
+                    # Still counted while its shell is released (L2 review: publishing the ended
+                    # state first let an open exceed the cap during the teardown).
+                    rec.state = "closing" if to_close is not None else ended
             if to_close is not None:
-                to_close.close()
+                try:
+                    to_close.close()
+                finally:
+                    with self._lock:
+                        rec.state = ended
 
     def _start(
         self,
@@ -530,13 +546,19 @@ class ChatHost:
         if done.wait(self._turn_seconds):
             return
         with self._lock:
-            if job.status != "running":
+            # `done`, not the job's status: the status changes only after the worker has joined
+            # this thread, and a refused job's `done` is set under this lock (L2 review: a refused
+            # job's watcher stopped the session's NEXT turn).
+            if done.is_set():
                 return
             job.deadline_hit = True
         _log.warning("chat %s job %s passed its %ss deadline; stopping it",
                      job.kind, job.job_id, self._turn_seconds)
         while True:
-            session.request_stop()
+            try:
+                session.request_stop()
+            except Exception as exc:  # noqa: BLE001 — keep asking; a dead watcher is no bound
+                _log.error("chat job %s: stop request failed: %s", job.job_id, exc)
             if done.wait(1.0):
                 return
 
@@ -646,11 +668,23 @@ class ChatHost:
                     rec.state = "idle"
             if rec.state == "broken" or self._shut:
                 to_close, rec.session = rec.session, None
-                if self._shut:
+                if self._shut and to_close is not None:
+                    rec.state = "closing"     # counted until the shell is released, below
+                elif self._shut:
                     rec.state = "closed"
+            if not (payload is not None and payload["timed_out"]):
+                # `deadline_hit` while running means "the deadline passed, a stop was asked for";
+                # once settled it means "the deadline stopped this turn". A turn that finished as
+                # the deadline arrived was not stopped by it.
+                job.deadline_hit = False
             rec.job_id = None
         if to_close is not None:
-            to_close.close()
+            try:
+                to_close.close()
+            finally:
+                if self._shut:
+                    with self._lock:
+                        rec.state = "closed"
 
     @staticmethod
     def _describe(session: Any) -> dict[str, Any]:
