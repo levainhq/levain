@@ -1089,25 +1089,6 @@ def _sdk_like_session(tmp_path: Path, step):
     return sess, binding
 
 
-def test_a_turn_that_completes_as_the_stop_lands_returns_its_result(tmp_path: Path):
-    """glm L3 r1 HIGH: the step finished the turn, then the stop landed (the SDK's pause waits for
-    the step's lock, then finds FINISHED and does nothing). run() returned a completed turn, and
-    `_drive` threw it away as stopped because the flag was set."""
-    holder = {}
-
-    def step(conv):
-        conv.state.events.append(_Event("agent", ["done"]))
-        conv.state.execution_status = "finished"
-        holder["sess"].request_stop()
-
-    sess, binding = _sdk_like_session(tmp_path, step)
-    holder["sess"] = sess
-    result = sess.run_turn("go")
-    assert sess.conversation.interrupts == 1                 # the stop did land
-    assert result.timed_out is False and result.error is None and result.reply == "done"
-    assert binding.captured == 1
-
-
 def test_a_turn_the_stop_paused_is_still_stopped(tmp_path: Path):
     """The control: the stop landed while the turn was still running, so run() returned PAUSED."""
     holder = {}
@@ -1117,29 +1098,6 @@ def test_a_turn_the_stop_paused_is_still_stopped(tmp_path: Path):
 
     sess, binding = _sdk_like_session(tmp_path, step)
     holder["sess"] = sess
-    result = sess.run_turn("go")
-    assert result.timed_out is True and binding.captured == 0
-
-
-def test_an_unreadable_status_after_a_stop_reads_as_stopped(tmp_path: Path):
-    """Fail-closed: when the status cannot be read, a requested stop is taken to have ended the turn."""
-    holder = {}
-
-    def step(conv):
-        conv.state.events.append(_Event("agent", ["done"]))
-        conv.state.execution_status = "finished"
-        holder["sess"].request_stop()
-
-    sess, binding = _sdk_like_session(tmp_path, step)
-    holder["sess"] = sess
-    conv = sess.conversation
-    original = conv.run
-
-    def run():
-        original()
-        del conv.state.execution_status          # the run returned; its status cannot be read
-
-    conv.run = run
     result = sess.run_turn("go")
     assert result.timed_out is True and binding.captured == 0
 

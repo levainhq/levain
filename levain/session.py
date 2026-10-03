@@ -976,7 +976,7 @@ class EntitySession:
             if self._stop_requested:
                 return self._stopped_result(nudged=nudged)
             self.conversation.run()
-            if self._stop_requested and self._stop_ended_run():
+            if self._stop_requested:
                 return self._stopped_result(nudged=nudged)
 
             # The gate check comes FIRST, before the act-first backstop, because a halted turn
@@ -996,7 +996,7 @@ class EntitySession:
                 if self._stop_requested:
                     return self._stopped_result(nudged=nudged)
                 self.conversation.run()
-                if self._stop_requested and self._stop_ended_run():
+                if self._stop_requested:
                     return self._stopped_result(nudged=nudged)
                 # Same three-valued treatment as the pre-nudge check — the post-nudge run() is
                 # a second chance to halt, and an unreadable status here cascades identically.
@@ -1054,9 +1054,7 @@ class EntitySession:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
 
         The turn ends at its next step boundary and returns ``timed_out=True``, NOT captured: a turn
-        stopped partway has no completed work to record (the same rule as the in-process bound). If
-        the step in flight finishes the turn instead, the turn returns its ordinary result
-        (:meth:`_stop_ended_run`).
+        stopped partway has no completed work to record (the same rule as the in-process bound).
         The SDK's synchronous ``run()`` cannot be cancelled inside a step, so a step in flight (a
         model call, a shell command) finishes first, and this call itself blocks until it does
         (the SDK's pause waits for the state lock a running step holds). Tool calls of that step
@@ -1081,20 +1079,6 @@ class EntitySession:
                 self.conversation.interrupt()
             except Exception:  # noqa: BLE001 — a stop request must never take down its caller
                 pass
-
-    def _stop_ended_run(self) -> bool:
-        """After ``run()`` returned with a stop requested: did the stop end it? The SDK's pause
-        waits for a running step to finish and then changes only a RUNNING (or IDLE) status, so a
-        step that finished the turn leaves it FINISHED: that turn completed and gets its ordinary
-        result, as does IDLE. Any other status, including a halt at the gate, or one that cannot
-        be read, counts as stopped (fail-closed)."""
-        try:
-            from openhands.sdk.conversation.state import ConversationExecutionStatus as Status
-
-            status = self.conversation.state.execution_status
-        except Exception:  # noqa: BLE001 — unreadable: the stop is taken to have ended the turn
-            return True
-        return status not in (Status.FINISHED, Status.IDLE)
 
     def _stopped_result(self, *, nudged: bool) -> TurnResult:
         """A turn ended by :meth:`request_stop`: timed out, nothing captured."""

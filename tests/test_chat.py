@@ -594,6 +594,10 @@ def test_an_opened_floor_that_opted_out_of_the_socket_denies_has_no_socket_sourc
         s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True,
                                mode="headless")
         try:
+            if not s.bash_ok:
+                # No usable confinement provider here (e.g. Linux without bwrap): the session has no
+                # shell, so there is no floor to read and nothing for the check to refuse.
+                pytest.skip("this host opens bash-free sessions; the socket floor needs a shell")
             reach = _hands_reach_this_server(s)
             assert (reach == "may reach the container daemon sockets") is refused, (cfg, reach)
             assert (reach is None) is not refused

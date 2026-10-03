@@ -55,10 +55,10 @@ says the deadline passed while the job ran, and the result's ``timed_out`` says 
 ended the turn. A stopped turn comes back ``timed_out``, uncaptured, and the host breaks the session
 and releases its shell. The SDK's synchronous run cannot be cancelled inside a step, so a step
 already in flight finishes first: a shell command within its own timeout, a model call within the
-SDK's HTTP timeout and retries. If that step finishes the turn, the turn returns its ordinary result
-and the session stays usable. So the bound is the deadline plus at most one step, not the deadline,
-and it does NOT cover capture: a turn that finished runs ``capture_turn`` to the end, and a capture
-that hangs holds the job past the deadline (not bounded here). A session stays ``busy`` (and
+SDK's HTTP timeout and retries. A stop that lands while the turn's run is going ends the turn as
+stopped, even if that last step finished it. So the bound is the deadline plus at most one step, not
+the deadline, and it does NOT cover capture: a deadline that passes during ``capture_turn`` does not
+stop it, and a capture that hangs holds the job past the deadline (not bounded here). A session stays ``busy`` (and
 counted) until its worker returns. Workers are daemon threads, so stopping the server does not wait
 for one; the SDK closes every live conversation, and its shell, at interpreter exit.
 
