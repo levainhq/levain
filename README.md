@@ -22,7 +22,7 @@ If you've worked with an AI partner long enough to feel the session-amnesia prob
 
 It packages four things that work together:
 
-1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, an association graph that surfaces related memories on its own, and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
+1. **A memory substrate you own.** Episodes from every session, a rolling summary your partner reads to orient each new conversation, a record of which memories you cite together (links form at each wrap and are there to inspect; recall follows the evidence a pattern cites), and an affect layer that tracks what mattered. All in a local SQLite file. Two more stores sit on top: proven patterns graduate into a **crystallized** tier, kept out of the always-loaded context and recalled only when what you're doing calls for it; **open loops** surface the moment your prompt touches them and resolve out of your field of view once your partner marks them done.
 
 2. **A methodology-core seed.** A small, dense set of files defining who your partner is, how the partnership works, how memory accrues, and who you are to it. Written so your partner lives *inside* the method instead of pointing at it.
 
@@ -260,7 +260,7 @@ Operator-class developers: the people who already feel session-amnesia as a real
 
 ## What it's built on
 
-Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=0.9.10,<0.10`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
+Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pinned `>=0.9.26,<0.10`). The division of labor is the whole idea: **anneal-memory is the substrate; Levain is the harness that fires it.** anneal-memory deliberately can't reach into your session. A memory library that hooked every prompt would forfeit the neutrality that lets it run under any harness. So on its own it gives you the stores and manual recall; Levain wires the hooks that surface the right memory automatically. Clean dependency direction, both on PyPI: Levain depends on anneal-memory, never the reverse.
 
 ## Build on it
 

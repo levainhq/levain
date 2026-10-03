@@ -1400,6 +1400,11 @@ def _check_openhands(install: Path) -> list[CheckResult]:
 CONTINUITY_IMPORT = "@.levain/memory.continuity.md"
 
 
+def _imports_continuity(text: str) -> bool:
+    """The carrier has the continuity import on a line of its own (surrounding whitespace allowed)."""
+    return any(line.strip() == CONTINUITY_IMPORT for line in text.splitlines())
+
+
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
@@ -1438,28 +1443,18 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     # A Claude Code carrier written before 0.5.5 does not import the live continuity, so the
     # entity starts each session without its memory unless it thinks to read it (1003+21's
     # demo runs: memory read on 4-5 of 8 days). Same remedy: `levain update` rewrites it.
-    if carrier.name == "CLAUDE.md" and CONTINUITY_IMPORT not in text.splitlines():
-        return [
-            CheckResult(
-                f"{carrier.name} freshness",
-                False,
-                f"does not import the living memory ({CONTINUITY_IMPORT}), so a session "
-                "starts without it",
-                f"This install predates the change. Run `levain update --path "
-                f"{install}`: it rewrites {carrier.name} if it is still the copy levain "
-                f"wrote. If you edited it, or levain has no record of writing it, the "
-                f"new version is staged under .levain/pending/ for you to merge; or add "
-                f"the line `{CONTINUITY_IMPORT}` yourself.",
-                upgrade_pending=True,
-            )
-        ]
+    problems: list[str] = []
     if stale:
+        problems.append("eagerly loads seed file(s) now classified on-demand: " + ", ".join(stale))
+    if carrier.name == "CLAUDE.md" and not _imports_continuity(text):
+        problems.append(f"does not import the living memory ({CONTINUITY_IMPORT}), so a "
+                        "session starts without it")
+    if problems:
         return [
             CheckResult(
                 f"{carrier.name} freshness",
                 False,
-                "eagerly loads seed file(s) now classified on-demand: "
-                + ", ".join(stale),
+                "; ".join(problems),
                 f"This install predates the change. Run `levain update --path "
                 f"{install}`: it rewrites {carrier.name} if it is still the copy levain "
                 f"wrote. If you edited it, or levain has no record of writing it, the "
@@ -1869,7 +1864,7 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
 
     by_role: dict[str, int] = {}
     total = len(text.encode("utf-8"))  # the carrier itself loads too
-    if CONTINUITY_IMPORT in text.splitlines():
+    if _imports_continuity(text):
         try:   # the living memory loads every session too; absent until the first wrap
             by_role["living memory"] = (install / CONTINUITY_IMPORT[1:]).stat().st_size
             total += by_role["living memory"]

@@ -140,10 +140,10 @@ imported by `CLAUDE.md`, so it is in context from the first turn of every sessio
 7. **Start a Claude Code session** in the partnership directory.
 
 `levain init` (build step 4) automates steps 2–6, resolves the placeholder
-tokens, fills `world.md`/`origin.md` from an interview, and loads
-`seed/continuity.md` into the store. In this manual path the entity starts
-from an empty continuity — the expected near-empty start anyway
-(`seed/memory.md`: "early on it will be near-empty").
+tokens, fills `world.md`/`origin.md` from an interview, and initialises the
+store. Either way the entity starts with no continuity: the first `levain wrap`
+writes `.levain/memory.continuity.md`, and until then the `CLAUDE.md` import of
+it is skipped (`seed/memory.md`: "early on it will be near-empty").
 
 ## First-run approvals
 
@@ -203,9 +203,10 @@ MCP server and the hooks will read different stores.
   directives do not leak into contexts that must stay independent. A typical
   operator never needs to set it.
 - **The `CLAUDE.md` `@`-import list is curated.** It imports four seed files;
-  `seed/continuity.md` is intentionally *not* imported — it is the entity's
-  living memory and loads through the anneal-memory server, not as a static
-  context file. If you add a seed file, add it to `CLAUDE.md`. The seed files
+  `seed/continuity.md` is intentionally *not* imported — it is only the starting
+  template for the living memory. The living memory itself,
+  `.levain/memory.continuity.md`, IS imported, so it is in context from the
+  first turn. If you add a seed file, add it to `CLAUDE.md`. The seed files
   must not `@`-import *each other* — they cross-reference by section title,
   which is what keeps them placement-agnostic.
 
