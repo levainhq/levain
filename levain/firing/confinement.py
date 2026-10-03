@@ -2992,15 +2992,24 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
-def _masked_both_ways(target: Path, masked: set[str]) -> bool:
-    """True iff ``target`` names a destination step (2) or (4) masked, as spelled or as resolved,
-    compared case- and normalization-insensitively (``masked`` holds ``_canon`` strings)."""
-    if _canon(str(target)) in masked:
-        return True
-    try:
-        return _canon(str(target.resolve())) in masked
-    except (OSError, RuntimeError):
-        return False
+def _refuse_bind_after_mask(argv: list[str]) -> None:
+    """Refuse a plan in which a bind with a host source follows a ``/dev/null`` mask. A later mount on
+    the same dentry wins, so such a bind could put a masked file back (see the masks-last rule in
+    :func:`_bwrap_plan_impl`). This holds the rule for every future step, not only step (5)."""
+    first_mask = None
+    for i in range(len(argv) - 2):
+        op, src = argv[i], argv[i + 1]
+        if op not in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+            continue
+        if src == "/dev/null":
+            if first_mask is None:
+                first_mask = i
+        elif first_mask is not None:
+            raise ConfinementError(
+                f"internal: the floor's plan binds {src} after the /dev/null mask on "
+                f"{argv[first_mask + 2]}, which could re-expose a masked file. Refusing to grant "
+                "bash hands (fail-closed)."
+            )
 
 
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
@@ -3062,6 +3071,17 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # still writable, or bwrap aborts.
     head, argv = argv, []
     remount_ro: list[str] = []
+    # ⛔ EVERY ``/dev/null`` FILE MASK IS EMITTED AFTER EVERY HOST-SOURCED BIND, and
+    # :func:`_refuse_bind_after_mask` refuses a plan that breaks that order. A later mount on the same
+    # dentry wins, so a self-bind emitted after a mask puts the host file back on top of it whenever
+    # the two spellings name one dentry (a case variant on a casefolded volume is the reasoned case;
+    # any spelling a string compare does not match is the general one). RUN on argushub 2026-10-03,
+    # bwrap 0.9.0, with the aliases `dir//D`, `dir/./D` and `dir/x/../D` for a masked `dir/D`: mask
+    # then self-bind printed the file, self-bind then mask refused it. Ordering closes that however
+    # the paths are spelled, so step (5) compares spellings exactly. The parked samefile branch put an
+    # identity check between the plan and bwrap instead; five review rounds each found a different
+    # way past it.
+    masks: list[str] = []
 
     # (2a) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
     # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
@@ -3159,7 +3179,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
             # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
             # Deny it the way step (4) denies a file, which refuses both read and write.
-            argv += ["--ro-bind", "/dev/null", str(sub)]
+            masks.append(str(sub))
             masked_both.append(str(sub))
             file_roots.append(sub)
             continue
@@ -3188,7 +3208,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             rebound.append(config)
         for sub in nested_in_ssh:
             if sub.exists() and not sub.is_dir():
-                argv += ["--ro-bind", "/dev/null", str(sub)]
+                masks.append(str(sub))
                 masked_both.append(str(sub))
                 file_roots.append(sub)
             else:
@@ -3239,7 +3259,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
         dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
-        argv += ["--ro-bind", "/dev/null", dest]
+        masks.append(dest)
         masked_both.append(dest)
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
@@ -3262,20 +3282,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
-    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
-    # plus each one's resolved spelling, compared through `_canon`. Two corrections (codex, L3 r2):
-    # a second resolve of the policy paths can observe a symlink retargeted after step (4) mounted,
-    # so the emitted string is the authority; and `resolve()` folds neither case nor Unicode
-    # normalization, so on a casefolded Linux volume an alternate spelling of a masked dentry would
-    # miss an exact compare. Over-matching only turns a self-bind into a /dev/null mask, which
-    # denies MORE (fail-closed).
-    denied_both_targets: set[str] = set()
-    for dest in masked_both:
-        denied_both_targets.add(_canon(dest))
-        try:
-            denied_both_targets.add(_canon(str(Path(dest).resolve())))
-        except (OSError, RuntimeError):
-            pass
+    # Targets steps (2) and (4) already mask, as those steps EMITTED them (codex, L3 r2: a second
+    # resolve of the policy paths can observe a symlink retargeted after step (4) ran). EXACT
+    # strings: a self-bind of a spelling this misses is emitted before the mask, so the mask still
+    # lands on top of it (the masks-last rule above). The case-folded compare this replaced also hid
+    # a distinct, write-only file on a case-sensitive volume (0.5.4 known open issue).
+    denied_both_targets = set(masked_both)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
@@ -3303,7 +3315,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # on exactly the paths that matter: the vectors are a fixed, enumerable list.
             # ⚡ AND THE MOUNTPOINT LANDS INSIDE THE TMPFS, so unlike the missing-file case below this
             # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
-            argv += ["--ro-bind", "/dev/null", str(f)]
+            masks.append(str(f))
         elif f.is_symlink() and not f.exists():
             # A dangling link: masking its target would make bwrap create a stub wherever the link
             # points (complement, L3 r2). Refuse it, with the reason.
@@ -3313,7 +3325,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             )
         elif f.exists():
             target = _bwrap_file_target(f)
-            if _shadowed_by(target, roots) or _masked_both_ways(target, denied_both_targets):
+            if _shadowed_by(target, roots) or str(target) in denied_both_targets:
                 # The spelling is outside every hidden subtree but its TARGET is inside one, or is
                 # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
                 # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
@@ -3321,11 +3333,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
                 # link in a non-writable directory pointing into a sibling entity's store): the
                 # confined shell read the sibling's file. /dev/null denies both ways instead.
-                argv += ["--ro-bind", "/dev/null", str(target)]
+                masks.append(str(target))
             else:
                 argv += ["--ro-bind", str(target), str(target)]
         else:
-            argv += ["--ro-bind", "/dev/null", str(f)]
+            masks.append(str(f))
 
     # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
     # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
@@ -3365,7 +3377,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue   # another user's runtime dir: this user (and so the entity) cannot reach it
         if parent.resolve() in shared:
             if s.exists():
-                argv += ["--ro-bind", "/dev/null", str(s)]
+                masks.append(str(s))
             continue
         if parent in hidden_dirs:
             continue
@@ -3394,7 +3406,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             remount_ro.append(str(sysd))
         bus = rd / "bus"
         if _reachable(bus) and bus.exists():
-            argv += ["--ro-bind", "/dev/null", str(bus)]
+            masks.append(str(bus))
+
+    # The masks close the body (the masks-last rule above). They are appended BEFORE step (1), which
+    # pins every directory the body makes bwrap create, so a mask's absent parent is pinned too
+    # ("test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it" fails if not).
+    for m in masks:
+        argv += ["--ro-bind", "/dev/null", m]
 
     # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
     # applies ops in sequence and a child mount must land inside an already-pinned parent); sorting
@@ -3449,6 +3467,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     out = head + ancestors + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
+    _refuse_bind_after_mask(out)
     return out, create_first
 
 

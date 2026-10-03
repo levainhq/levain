@@ -6,6 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **On a case-sensitive Linux filesystem, a write-protected file whose name differs only in letter case from a denied file in the same directory is readable again** (a known open issue in 0.5.4). The floor had compared those names ignoring case, so it hid the second file as if it were the first. It now compares them exactly, which is safe because of the change below. Not changed: a write-protected file under a directory whose name differs only in case from a hidden directory is still hidden on a case-sensitive filesystem (it fails closed).
+- **On Linux, every file the floor denies is now masked after every file it binds, and the plan refuses to start bash if that order is ever broken.** When two binds land on the same file, the later one wins. A read-only bind emitted after a mask could therefore put the denied file back, whenever the two paths named the same file through a spelling the floor did not compare equal (a letter-case variant on a case-insensitive volume, for example). Masking last closes that however the paths are spelled. Not changed: a hardlink to a denied file, at a path the floor does not deny, still reads that file (the 0.5.4 known open issue).
+
 ## [0.5.4] — 2026-10-03
 
 Adds `levain serve --chat`, a chat with an entity through the local web server (K1 part 2), and fixes a refusal at the efferent gate that could still run the refused action.
