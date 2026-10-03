@@ -940,32 +940,29 @@ def test_a_write_only_link_to_a_hardlink_of_a_denied_file_never_self_binds_it(ho
         opt.chmod(0o755)
 
 
-def test_the_finished_plan_never_self_binds_a_file_it_masks():
+def test_the_finished_plan_never_self_binds_a_file_it_masks(monkeypatch):
     """The guard, as a pure function: a self-bind whose recorded identity equals a /dev/null
     destination's is reported; distinct or unreachable identities are not."""
     from levain.firing.confinement import _UNREACHABLE, _mask_exposed_by_self_bind
     argv = ["--ro-bind", "/dev/null", "/s/token", "--ro-bind", "/o/alias", "/o/alias",
             "--ro-bind", "/o/other", "/o/other"]
-    import os as _os
-    real_stat = _os.stat
+    import levain.firing.confinement as conf
+    real_stat = os.stat
 
     def fake_stat(path, *a, **k):
         if path == "/s/token":
-            return _os.stat_result((0o100644, 42, 1, 1, 0, 0, 0, 0, 0, 0))
+            return os.stat_result((0o100644, 42, 1, 1, 0, 0, 0, 0, 0, 0))
+        if path in ("/o/alias", "/o/other"):
+            raise FileNotFoundError(path)   # only the manifest identities speak for these
         return real_stat(path, *a, **k)
 
-    import levain.firing.confinement as conf
-    orig = conf.os.stat
-    conf.os.stat = fake_stat
-    try:
-        manifest = {"/o/alias": (1, 42, 0o100000), "/o/other": (1, 7, 0o100000)}
-        assert _mask_exposed_by_self_bind(argv, manifest) == ("/o/alias", "/s/token")
-        manifest["/o/alias"] = (1, 43, 0o100000)
-        assert _mask_exposed_by_self_bind(argv, manifest) is None
-        manifest["/o/alias"] = _UNREACHABLE
-        assert _mask_exposed_by_self_bind(argv, manifest) is None
-    finally:
-        conf.os.stat = orig
+    monkeypatch.setattr(conf.os, "stat", fake_stat)
+    manifest = {"/o/alias": (1, 42, 0o100000), "/o/other": (1, 7, 0o100000)}
+    assert _mask_exposed_by_self_bind(argv, manifest) == ("/o/alias", "/s/token")
+    manifest["/o/alias"] = (1, 43, 0o100000)
+    assert _mask_exposed_by_self_bind(argv, manifest) is None
+    manifest["/o/alias"] = _UNREACHABLE
+    assert _mask_exposed_by_self_bind(argv, manifest) is None
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
@@ -1061,3 +1058,34 @@ def test_a_hardlink_to_a_masked_file_under_a_hidden_subtree_is_refused_at_spawn(
             conf.BwrapProvider()._spawn_shell_impl(policy)
     finally:
         opt.chmod(0o755)
+
+
+def test_an_unreadable_mask_refuses_instead_of_passing(tmp_path, monkeypatch):
+    """codex L3 (samefile r4): an unreadable mask was treated as absent, so a hardlink elsewhere
+    passed the guard. Only absent is absent."""
+    import levain.firing.confinement as conf
+    real_stat = os.stat
+
+    def stat(path, *a, **k):
+        if str(path) == "/s/locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(conf.os, "stat", stat)
+    argv = ["--ro-bind", "/dev/null", "/s/locked"]
+    with pytest.raises(ConfinementError, match="could not identify"):
+        conf._mask_exposed_by_self_bind(argv, {})
+    assert conf._mask_exposed_by_self_bind(["--ro-bind", "/dev/null", str(tmp_path / "gone")], {}) is None
+
+
+def test_a_symlinked_self_bind_to_a_masked_file_is_caught(tmp_path):
+    """complement L3 (samefile r4): the manifest holds a symlink's OWN inode, but bwrap mounts what
+    it points at; the guard compares the followed identity too."""
+    from levain.firing.confinement import _identity, _mask_exposed_by_self_bind
+    secret = tmp_path / "secret"
+    secret.write_text("SECRET")
+    link = tmp_path / "link"
+    link.symlink_to(secret)
+    argv = ["--ro-bind", "/dev/null", str(secret), "--ro-bind", str(link), str(link)]
+    manifest = {str(link): _identity(link)}
+    assert _mask_exposed_by_self_bind(argv, manifest) == (str(link), str(secret))

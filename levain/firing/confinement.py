@@ -3050,15 +3050,33 @@ def _mask_exposed_by_self_bind(argv: list[str], manifest: dict) -> tuple[str, st
         if src == "/dev/null":
             try:
                 st = os.stat(dst)
-            except OSError:
-                continue   # absent or unreadable: no file for a self-bind to be
+            except FileNotFoundError:
+                continue   # absent: no file for a self-bind to be
+            except (OSError, ValueError) as exc:
+                # Unreadable is not absent: a hardlink elsewhere could still expose it (codex L3 r4).
+                raise ConfinementError(
+                    f"could not identify the denied file {dst} ({exc}) to check that nothing "
+                    "the shell can read is the same file — refusing to grant bash hands "
+                    "(fail-closed)."
+                ) from exc
             masks[(st.st_dev, st.st_ino)] = dst
         elif src == dst:
             self_binds.append(dst)
     for dst in self_binds:
+        # Both the identity the recheck holds the path to and the file it resolves to now: bwrap
+        # mounts what a symlinked path points at (complement L3 r4).
+        idents = []
         ident = manifest.get(dst)
-        if ident and ident != _UNREACHABLE and (ident[0], ident[1]) in masks:
-            return dst, masks[(ident[0], ident[1])]
+        if ident and ident != _UNREACHABLE:
+            idents.append((ident[0], ident[1]))
+        try:
+            st = os.stat(dst)
+            idents.append((st.st_dev, st.st_ino))
+        except (OSError, ValueError):
+            pass   # a self-bind source that cannot be read here is checked by the manifest entry
+        for key in idents:
+            if key in masks:
+                return dst, masks[key]
     return None
 
 
