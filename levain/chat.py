@@ -398,6 +398,12 @@ class ChatHost:
                 job.status, job.error = "failed", error
             else:
                 job.status, job.result = "done", payload
+                if payload["gated"]:
+                    # The stream fired as each action was ISSUED, which for a held action is before
+                    # the gate stopped it. The result's tool_activity has the held actions removed,
+                    # so it replaces the stream: nothing held may read as work that ran. What is
+                    # held is in the result's `pending`.
+                    job.activity, job.dropped = list(payload["tool_activity"]), 0
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
                 elif payload["error"] is not None:

@@ -100,6 +100,10 @@ def finish_message(event) -> str | None:
     return message.strip() if isinstance(message, str) and message.strip() else None
 
 
+_ACTIVITY_COMMAND_CHARS = 160
+"""A shell command longer than this (or spanning lines) is shown cut, ending in " …"."""
+
+
 def tool_action_summary(event) -> tuple[str, str] | None:
     """``(tool_name, detail)`` for an agent ActionEvent that is a REAL tool call, else ``None``.
 
@@ -107,8 +111,11 @@ def tool_action_summary(event) -> tuple[str, str] | None:
     test tier. Returns ``None`` for a non-action event, a message event, or a built-in control action
     (``finish`` — surfaced as the reply by :func:`finish_message`; ``think`` — the model's private
     scratchpad, on every agent even ``tools=None``); neither is workspace activity. ``detail`` is
-    a compact ``"<command> <path>"`` for a file-editor action, else the action ``kind`` — enough for
-    the operator to SEE what the entity DID to its workspace (a file op must never be invisible)."""
+    a compact ``"<command> <path>"`` for a file-editor action, the command's first line for a shell
+    action (cut at :data:`_ACTIVITY_COMMAND_CHARS`), else the action ``kind`` — enough for the operator
+    to SEE what the entity DID to its workspace (a file op must never be invisible, and neither may a
+    shell command: until 2026-10-03 bash rendered as its kind, ``TerminalAction``, so a person
+    watching the stream never saw a command)."""
     tool_name = getattr(event, "tool_name", None)
     action = getattr(event, "action", None)
     if not tool_name or action is None:
@@ -119,6 +126,11 @@ def tool_action_summary(event) -> tuple[str, str] | None:
     path = getattr(action, "path", None)
     if command and path:
         return tool_name, f"{command} {path}"
+    if isinstance(command, str) and command.strip():
+        lines = command.strip().splitlines()
+        shown = lines[0]
+        cut = len(shown) > _ACTIVITY_COMMAND_CHARS or len(lines) > 1
+        return tool_name, shown[:_ACTIVITY_COMMAND_CHARS] + (" …" if cut else "")
     return tool_name, str(getattr(action, "kind", "") or "")
 
 

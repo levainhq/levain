@@ -626,11 +626,9 @@ def test_a_held_action_is_not_reported_as_completed_work(tmp_path):
     execution, so an unfiltered activity list prints ``⚙ terminal: git push`` — the standard
     "here is what it DID" line — on the same screen where the gate says nothing was executed.
     Two true-looking statements that contradict each other, with the operator left to guess."""
-    # A FILE EDITOR action deliberately, not bash: `turn_tool_activity` renders a terminal
-    # action as its KIND ("⚙ terminal: TerminalAction") but a file edit as "⚙ file_editor:
-    # create x.txt" — the real, readable "here is what it DID" line. An assertion written
-    # against the bash rendering is VACUOUS (it can never contain the command), which is how
-    # the first version of this test passed against the unfiltered implementation.
+    # A FILE EDITOR action. The first version of this test used bash while bash still rendered as
+    # its KIND ("⚙ terminal: TerminalAction"), so its assertion could never contain the command and
+    # it passed against the unfiltered implementation (bash shows its command since 2026-10-03).
     class _HeldFileWrite(_DriveConversation):
         def run(self):
             from openhands.sdk import ConversationExecutionStatus

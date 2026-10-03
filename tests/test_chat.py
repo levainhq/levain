@@ -204,6 +204,21 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     assert f.made[0].calls[-1] == ("reject_turn", "open a PR instead")
 
 
+def test_a_held_action_streamed_mid_turn_does_not_stay_in_the_jobs_activity(tmp_path):
+    """The stream fires when an action is ISSUED, before the gate holds it. At a gated finish the
+    job's activity becomes the result's tool_activity (held actions removed), so a held push never
+    reads as work that ran."""
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,),
+                          tool_activity=["⚙ file_editor: view README.md"])])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "push it")["job_id"])
+    assert f.made[0].calls == [("run_turn", "push it")]     # the stub streamed "⚙ terminal: run_turn"
+    assert st["activity"] == ["⚙ file_editor: view README.md"]
+    assert st["result"]["pending"][0]["detail"] == "git push"
+
+
 @pytest.mark.parametrize("bad", [
     _Result(reply=None, error="boom"),
     _Result(reply=None, error="took too long", timed_out=True),

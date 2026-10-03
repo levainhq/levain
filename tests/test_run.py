@@ -410,6 +410,31 @@ def test_tool_action_summary_reads_command_and_path():
     assert tool_action_summary(ev) == ("file_editor", "create /ws/plan.md")
 
 
+class _ShellAction:
+    """A TerminalAction stand-in: a command, no path."""
+
+    def __init__(self, command, kind="TerminalAction"):
+        self.command = command
+        self.kind = kind
+
+
+def test_tool_action_summary_shows_a_shell_command_not_its_kind():
+    # It used to render as "TerminalAction": a person watching the stream never saw the command.
+    ev = _ActionEvent("terminal", _ShellAction("git push --force origin main"))
+    assert tool_action_summary(ev) == ("terminal", "git push --force origin main")
+
+
+def test_tool_action_summary_cuts_a_long_or_multiline_command():
+    from levain.firing.agent_reply import _ACTIVITY_COMMAND_CHARS
+
+    long = tool_action_summary(_ActionEvent("terminal", _ShellAction("x" * 1000)))
+    assert long == ("terminal", "x" * _ACTIVITY_COMMAND_CHARS + " …")
+    multi = tool_action_summary(_ActionEvent("terminal", _ShellAction("cd /w\nrm -rf build\n")))
+    assert multi == ("terminal", "cd /w …")
+    assert tool_action_summary(_ActionEvent("terminal", _ShellAction("   "))) == (
+        "terminal", "TerminalAction")
+
+
 def test_tool_action_summary_ignores_finish():
     # The finish IS the reply (surfaced by finish_message), not tool activity.
     assert tool_action_summary(_FinishEvent("done")) is None

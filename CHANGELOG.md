@@ -15,6 +15,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - **Loopback-only, nothing persisted.** A server with `--chat` refuses a non-loopback bind, because its chat routes have no off-box auth. The routes use the same Host check, cross-site refusal and JSON-only body rule as the write routes. A restart ends every conversation; resuming one after a restart is not offered.
   - At most four live sessions per server. When a session fails to start, the server keeps the error text and drops the exception, so tools built before the failure are released.
 
+### Fixed
+
+- **Tool activity now shows the shell command an entity runs.** A bash action used to appear as `⚙ terminal: TerminalAction` in the REPL's stream, in `--task` output and in a turn's `tool_activity`, so the person watching never saw the command. It now shows the command's first line, cut at 160 characters.
+
 ## [0.5.2] — 2026-10-02
 
 ### Changed
