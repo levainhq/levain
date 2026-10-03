@@ -284,6 +284,35 @@ class TestOptionalDependency:
             _require_mcp()
         assert "levain[app]" in str(ei.value)
 
+    def test_require_mcp_names_an_mcp_2_install_instead_of_saying_install_app(
+        self, monkeypatch
+    ) -> None:
+        """Measured 2026-10-02 in a real env with mcp 2.3.0 (`[openhands]` installed alone pulled
+        it): the import fails because mcp 2 renamed FastMCP, and the hint told the operator to
+        install `levain[app]`, which they had. It must name the installed version instead."""
+        import builtins
+        import importlib.metadata
+
+        from levain.app_server import _require_mcp
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "mcp.server.fastmcp":
+                raise ModuleNotFoundError("No module named 'mcp.server.fastmcp'")
+            return real_import(name, *args, **kwargs)
+
+        real_version = importlib.metadata.version
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(
+            importlib.metadata, "version",
+            lambda dist: "2.3.0" if dist == "mcp" else real_version(dist),
+        )
+        with pytest.raises(ImportError) as ei:
+            _require_mcp()
+        assert "mcp 2.3.0" in str(ei.value)
+        assert "mcp>=1.27,<2" in str(ei.value)
+
     def test_module_imports_with_mcp_blocked(self) -> None:
         """Structural proof (not a trivially-passing reload): the module imports
         cleanly in a subprocess where `mcp` is BLOCKED — so the CLI can import it

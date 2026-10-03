@@ -27,6 +27,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **A session that failed to start after its conversation was built left that conversation open** until the process exited. It is now closed.
 - **Forking a conversation whose hands had been built crashed** (`cannot pickle '_thread.lock' object`). A fork now gets its own hands, fenced by the same floor.
+- **Installing `levain[openhands]` and `levain[app]` in two steps broke one of them.** `openhands-sdk` 1.26.0 accepts any `fastmcp>=3`, and fastmcp 4 requires mcp 2, while the MCP-App server needs mcp 1. So `[openhands]` alone pulled mcp 2.x. Adding `[app]` afterwards then broke the OpenHands import, and installing in the other order broke `levain serve-app`. Neither pip nor uv reported a problem. The `openhands` extra now also requires `mcp>=1.27,<2`, which keeps fastmcp on 3.x. Installing both extras in one command already worked and still does.
+- **`levain serve-app` with mcp 2.x installed told you to install `levain[app]`**, which you already had. It now names the mcp version it found and how to pin it.
+- **A session that failed to start no longer leaves a file-editor history directory behind**, whichever step failed. A session that closed normally already removed it.
 
 ## [0.5.1] — 2026-10-02
 

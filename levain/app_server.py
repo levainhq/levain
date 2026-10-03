@@ -88,6 +88,23 @@ _MCP_MISSING_HINT = (
 )
 
 
+def _mcp_import_hint() -> str:
+    """The install hint, unless the SDK IS installed at a major version the server cannot use: then
+    "install [app]" would send the operator to something they already have."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        installed = version("mcp")
+    except PackageNotFoundError:
+        return _MCP_MISSING_HINT
+    if installed.split(".", 1)[0].isdigit() and int(installed.split(".", 1)[0]) >= 2:
+        return (
+            f"The Levain MCP-App server needs MCP SDK 1.x, and this environment has mcp {installed}.\n"
+            "Reinstall the extra so it can pin the version:  pip install 'levain[app]' 'mcp>=1.27,<2'"
+        )
+    return _MCP_MISSING_HINT
+
+
 def _require_mcp() -> tuple[Any, Any]:
     """Import the optional ``mcp`` SDK, or raise a clear, actionable error.
 
@@ -98,7 +115,7 @@ def _require_mcp() -> tuple[Any, Any]:
         from mcp import types
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:  # not-installed OR broken/partial install — both
-        raise ImportError(_MCP_MISSING_HINT) from exc
+        raise ImportError(_mcp_import_hint()) from exc
     return FastMCP, types
 
 

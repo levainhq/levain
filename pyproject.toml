@@ -109,7 +109,11 @@ app = ["mcp>=1.27,<2"]
 # the base `anneal-memory` dep for the real recall/capture). NO vagus dependency. The
 # harness-neutral seam `levain.firing` imports NO OpenHands, so a plain `pip install levain` never
 # pulls any of this (the leaf stays isolated; the adapter loads only on `import levain.firing.openhands`).
-openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0"]
+# mcp<2 rides this extra too: openhands-sdk 1.26.0 asks only for fastmcp>=3, and fastmcp 4 requires
+# mcp 2, while the app server needs mcp 1's `mcp.server.fastmcp`. Without it, installing
+# [openhands] and [app] one after the other left one of them broken, in either order, with no
+# warning from pip or uv (measured 2026-10-02, macOS + Linux, pip + uv).
+openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "mcp>=1.27,<2"]
 dev = ["pytest>=7.4", "mcp>=1.27,<2"]
 
 [project.scripts]
