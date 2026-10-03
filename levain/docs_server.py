@@ -85,14 +85,8 @@ class _DocsHandler(GuardedHandler):
     server: _DocsServer  # narrow the type for typed attribute access
 
     def _route(self, *, head: bool) -> None:
-        if not self._host_ok():
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
-            return
-        # Defense-in-depth: refuse a cross-site browser read (a same-origin fetch
-        # sends same-origin; a top-level nav sends none; non-browser clients omit
-        # it). The same cheap layer the dashboard/init read paths use.
-        if self._cross_site_read():
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+        # Host allowlist, then the cross-site read refusal (the shared read preamble).
+        if self._refuse_read(head=head):
             return
 
         path = self.path.split("?", 1)[0]

@@ -87,6 +87,7 @@ from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import GuardedHandler
+from levain.http_guards import host_header_allowed  # noqa: F401 — its public home until 2026-10-03
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
@@ -600,22 +601,9 @@ class _Handler(GuardedHandler):
         )
 
     def _route(self, *, head: bool) -> None:
-        if not self._host_ok():
-            self._send(
-                b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head
-            )
-            return
-
-        # Reject cross-site browser requests. A same-origin page fetch sends
-        # `Sec-Fetch-Site: same-origin`; a top-level navigation sends `none`; only
-        # a hostile cross-site page sends `cross-site`. Non-browser clients (curl,
-        # urllib) omit the header entirely → allowed. This stops a cross-origin
-        # page from even TRIGGERING the per-request store read (it can't read the
-        # response anyway, post-Host-check) — a cheap defense-in-depth layer.
-        if self._cross_site_read():
-            self._send(
-                b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head
-            )
+        # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
+        # cannot even TRIGGER the per-request store read.
+        if self._refuse_read(head=head):
             return
 
         # Strip any query string; route on the bare path against the allowlist.

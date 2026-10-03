@@ -144,6 +144,15 @@ class GuardedHandler(BaseHTTPRequestHandler):
         ``cross-site``. Refusing it stops such a page from even triggering a read."""
         return self.headers.get("Sec-Fetch-Site") == "cross-site"
 
+    def _refuse_read(self, *, head: bool) -> bool:
+        """The read preamble every server runs first: the Host allowlist, then the cross-site
+        refusal, each answered with a plain 403. Sends it and returns True when refused. A server
+        adds its own read gates after this (the dashboard's off-box token)."""
+        if not self._host_ok() or self._cross_site_read():
+            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+            return True
+        return False
+
     def _reject(self, status: int, error: str, message: str) -> None:
         """Refuse a write BEFORE its body is read: close the connection (so the unread body cannot
         desync a kept-alive socket) and send the error JSON."""
@@ -216,7 +225,13 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if raw is None or not (raw.isascii() and raw.isdigit()):
             self._reject(411, "length_required", "Content-Length required")
             return None
-        return int(raw)
+        try:
+            return int(raw)
+        except ValueError:
+            # More digits than Python converts (sys.int_info.str_digits_check_threshold): not a
+            # length any body could have (codex L3 2026-10-03).
+            self._reject(411, "length_required", "Content-Length required")
+            return None
 
     # -- routing and logging, the same on every server ------------------------
 

@@ -21,10 +21,11 @@ import pytest
 
 from levain.http_guards import GuardedHandler
 
-GUARD_METHODS = (
-    "end_headers", "_send", "_send_json", "version_string", "_host_ok", "_cross_site_read",
-    "_reject", "_drain", "_refuse_write_origin", "_refuse_non_json", "_declared_length",
-    "do_GET", "do_HEAD", "log_message",
+# Derived, so a guard added to the base later is covered too (L3 2026-10-03). `_route` is the one
+# method every server must define for itself.
+GUARD_METHODS = tuple(
+    name for name, value in vars(GuardedHandler).items()
+    if callable(value) and not name.startswith("__") and name != "_route"
 )
 
 SECURITY_HEADERS = ("Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options",
@@ -42,6 +43,7 @@ def _handlers():
 @pytest.mark.parametrize("cls", _handlers(), ids=lambda c: c.__name__)
 def test_every_server_inherits_the_guards_and_copies_none(cls):
     assert issubclass(cls, GuardedHandler)
+    assert {"_refuse_read", "_refuse_oversize", "_declared_length"} <= set(GUARD_METHODS)
     copied = [name for name in GUARD_METHODS if name in cls.__dict__]
     assert copied == [], f"{cls.__name__} defines its own {copied}; the shared copy is the only one"
 
@@ -145,13 +147,16 @@ def _raw_post(port: int, path: str, headers: dict, body: bytes = b""):
     ({"Content-Type": "application/json", "Content-Length": "²".encode().decode("latin-1")}, 411),
     ({"Content-Type": "application/json", "Content-Length": "-1"}, 411),
     ({"Content-Type": "application/json", "Content-Length": str(10**12)}, 413),
+    ({"Content-Type": "application/json", "Content-Length": "9" * 5000}, 411),
 ], ids=["bad-host", "cross-site", "same-site", "text-plain", "no-length", "superscript-length",
-        "negative-length", "oversize"])
+        "negative-length", "oversize", "too-many-digits"])
 def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, headers, status):
     """L1 2026-10-03 MED-1 (run): with either server's Content-Length guard swapped for a bare int(),
     every existing test still passed. Each refusal is now driven through BOTH write servers, live,
     and every refusal before the body is read closes the connection."""
     with _server(kind, tmp_path) as port:
-        got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers, b"{}")
+        # No body: a refused request's unread bytes can make the kernel reset the socket before the
+        # response is read (complement L3).
+        got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers)
     assert got == status, f"{kind}: {headers} -> {got}"
     assert resp_headers.get("Connection") == "close"
