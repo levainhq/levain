@@ -31,7 +31,7 @@ import sys
 import threading
 from collections.abc import Sequence
 from dataclasses import asdict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -49,12 +49,10 @@ from levain.install import (
 from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
+from levain.http_guards import GuardedHandler
 from levain.web_server import (
-    _CSP,
     _LOOPBACK_HOSTS,
-    _WRITE_SEC_FETCH_ALLOWED,
     _is_loopback_host,
-    host_header_allowed,
     load_web_asset,
 )
 
@@ -140,68 +138,20 @@ class _InitServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class _InitHandler(BaseHTTPRequestHandler):
+class _InitHandler(GuardedHandler):
     """Serves the init form (GET/HEAD) + the one governed write route
     (``POST /init``). Behind the same DNS-rebinding Host allowlist + CSRF +
-    application/json boundary the dashboard server uses."""
+    application/json boundary the dashboard server uses (the shared
+    :class:`~levain.http_guards.GuardedHandler`)."""
 
-    protocol_version = "HTTP/1.1"
     server_version = "levain-init"
-    timeout = 30
     server: _InitServer  # narrow the type for typed attribute access
-
-    # ---- shared response discipline (CSP + security headers, like the dashboard) ----
-
-    def end_headers(self) -> None:
-        """Stamp the security headers on EVERY response — structurally, so the
-        invariant can't be skipped. ``_send`` is the normal path, but the stdlib's
-        ``send_error`` (an unsupported method, an OPTIONS preflight, a malformed
-        request) builds its own response that never passes through ``_send``; putting
-        the headers here covers those framework-generated responses too (codex L3
-        MED). Nothing else sets these (``_send`` deliberately does not), so a plain
-        add is exactly-once per response."""
-        self.send_header("Content-Security-Policy", _CSP)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        if not head:
-            self.wfile.write(body)
-
-    def _send_json(self, payload: dict[str, object], status: int = 200) -> None:
-        self._send(
-            json.dumps(payload).encode("utf-8"),
-            "application/json; charset=utf-8",
-            status=status,
-        )
-
-    def version_string(self) -> str:
-        return self.server_version
-
-    def _host_ok(self) -> bool:
-        return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     # ---- reads (GET/HEAD) ----
 
     def _route(self, *, head: bool) -> None:
-        if not self._host_ok():
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
-            return
-        # Defense-in-depth: refuse a cross-site browser read (a same-origin fetch
-        # sends same-origin; a top-level nav sends none; non-browser clients omit
-        # it). Same cheap layer the dashboard read path uses.
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+        # Host allowlist, then the cross-site read refusal (the shared read preamble).
+        if self._refuse_read(head=head):
             return
 
         path = self.path.split("?", 1)[0]
@@ -229,12 +179,6 @@ class _InitHandler(BaseHTTPRequestHandler):
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
 
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        self._route(head=False)
-
-    def do_HEAD(self) -> None:  # noqa: N802 — same routing, headers only
-        self._route(head=True)
-
     def _build_plan_json(self) -> bytes:
         """The ``/init-plan.json`` body: the shared interview field plan projected
         to JSON (every field, pre-filled `current`, section grouping), plus the
@@ -259,23 +203,6 @@ class _InitHandler(BaseHTTPRequestHandler):
 
     # ---- the write route (POST /init) ----
 
-    def _reject(self, status: int, error: str, message: str) -> None:
-        """Refuse a write BEFORE its body is read: close the connection (so the
-        unread body can't desync a kept-alive socket) and send the error JSON."""
-        self.close_connection = True
-        self._send_json({"error": error, "message": message}, status)
-
-    def _drain(self, n: int) -> None:
-        """Read and discard up to ``n`` bytes of the request body in bounded chunks,
-        so a rejected oversize request's body doesn't dangle on a kept-alive
-        connection — the client can finish its send and read the error cleanly."""
-        remaining = n
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """``POST /init`` — run the install from the submitted ``{adapter,
         answers}``. The cheap fail-closed checks (Host → CSRF → Content-Type →
@@ -284,47 +211,19 @@ class _InitHandler(BaseHTTPRequestHandler):
         ``install_lock`` (one install at a time — two into one dir would race) and
         owns its try/except → HTTP + partial-install reporting (no rollback; codex
         installs touch global ~/.codex)."""
-        if not self._host_ok():
-            return self._reject(403, "forbidden", "bad Host header")
-        # CSRF layer 1: same-origin (our page) or a non-browser client only.
-        sfs = self.headers.get("Sec-Fetch-Site")
-        if sfs is not None and sfs != _WRITE_SEC_FETCH_ALLOWED:
-            return self._reject(403, "forbidden", "cross-origin write refused")
+        # Host, then CSRF layer 1 (same-origin or a non-browser client only).
+        if self._refuse_write_origin():
+            return
         # CSRF layer 2: require application/json (a cross-origin page can't send it
         # without a CORS preflight this server never answers).
-        ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if ctype != "application/json":
-            return self._reject(
-                415, "unsupported_media_type", "Content-Type must be application/json"
-            )
+        if self._refuse_non_json():
+            return
         if self.path.split("?", 1)[0] != "/init":
             return self._reject(404, "not_found", "no such route")
-        clen_raw = self.headers.get("Content-Length")
-        # ⛔ `isascii()` IS LOAD-BEARING, NOT BELT-AND-BRACES. `str.isdigit()` is TRUE for
-        # characters `int()` REFUSES — superscripts and other Unicode digit-category
-        # characters. Measured: `"²".isdigit()` is True and `int("²")` raises ValueError, so a
-        # `Content-Length: ²` header passed this guard and blew up on the next line, turning a
-        # clean 411 into an unhandled exception. A guard that admits values the very next
-        # statement rejects is not narrowing anything. RFC 7230 makes Content-Length ASCII
-        # DIGITS, so this is also the spec-correct test.
-        if clen_raw is None or not (clen_raw.isascii() and clen_raw.isdigit()):
-            return self._reject(411, "length_required", "Content-Length required")
-        clen = int(clen_raw)
-        if clen > _MAX_INIT_BODY:
-            # Refuse oversize: ALWAYS close the connection (never keep-alive after a
-            # rejected body — a truncated/lying body would otherwise desync the next
-            # request on the socket), and drain a bounded amount first so the client
-            # can read the 413 cleanly. Guard the drain so a stalled/short body can't
-            # strand the thread past the socket timeout (codex LOW / nemotron).
-            self.close_connection = True
-            if clen <= _DRAIN_CAP:
-                try:
-                    self._drain(clen)
-                except OSError:
-                    pass
-            self._send_json(
-                {"error": "too_large", "message": f"body exceeds {_MAX_INIT_BODY} bytes"}, 413
-            )
+        clen = self._declared_length()
+        if clen is None:
+            return
+        if self._refuse_oversize(clen, _MAX_INIT_BODY, _DRAIN_CAP):
             return
 
         # Serialize installs: only one runs at a time (concurrent installs into the
@@ -619,13 +518,6 @@ class _InitHandler(BaseHTTPRequestHandler):
             },
             200,
         )
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet by default; set ``LEVAIN_SERVE_VERBOSE`` to restore the access log."""
-        import os
-
-        if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
 
 
 def make_init_server(
