@@ -161,19 +161,52 @@ def test_a_linked_authorized_keys_behind_a_locked_ssh_dir_is_refused(home) -> No
         ssh.chmod(0o700)
 
 
-def test_a_path_blocked_by_another_users_dir_is_left_alone(home, monkeypatch) -> None:
-    secret = _secret(home)
-    policy = build_policy(_entity(home), deny_files=(secret,))
+def _blocked(monkeypatch, target: Path) -> None:
     real_stat = os.stat
 
     def stat(p, *a, **k):
-        if str(p) == str(secret):
+        if str(p) == str(target):
             raise PermissionError(13, "Permission denied", str(p))
         return real_stat(p, *a, **k)
 
     monkeypatch.setattr(confinement.os, "stat", stat)
     monkeypatch.setattr(confinement, "_identity", lambda p: confinement._UNREACHABLE)
+
+
+def test_a_file_blocked_by_another_users_dir_refuses(home, monkeypatch) -> None:
+    """codex L3 r1: the another-user exception let an unverifiable jewel file through."""
+    secret = _secret(home)
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    _blocked(monkeypatch, secret)
+    with pytest.raises(ConfinementError, match="could not check"):
+        _refuse_multiply_linked_jewels(policy)
+
+
+def test_a_socket_blocked_by_another_users_dir_is_left_alone(home, monkeypatch) -> None:
+    sock = home / "other-runtime" / "docker.sock"
+    policy = dataclasses.replace(build_policy(_entity(home)), deny_sockets=(sock,))
+    _blocked(monkeypatch, sock)
     _refuse_multiply_linked_jewels(policy)
+
+
+def _case_insensitive(d: Path) -> bool:
+    (d / "CaseProbe").write_text("")
+    try:
+        return (d / "caseprobe").exists()
+    finally:
+        (d / "CaseProbe").unlink()
+
+
+def test_two_spellings_of_one_entry_do_not_hide_an_outside_link(home) -> None:
+    """codex + complement L3 r1: names were counted as strings, so `token` and `TOKEN` (one entry on
+    a case-insensitive volume) counted as two and hid the outside link."""
+    secret = _secret(home)
+    if not _case_insensitive(secret.parent):
+        pytest.skip("needs a case-insensitive volume")
+    os.link(secret, home / "outside")
+    policy = build_policy(_entity(home), deny_files=(secret, secret.parent / "TOKEN"))
+    with pytest.raises(ConfinementError, match="2 names on disk, and only 1"):
+        _refuse_multiply_linked_jewels(policy)
 
 
 def test_two_names_both_inside_the_floor_do_not_refuse(home) -> None:

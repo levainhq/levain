@@ -2936,25 +2936,43 @@ def _sqlite_state(p: Path) -> str:
         os.close(fd)
 
 
-def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, set[str]]]:
+def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, dict[tuple, str]]]:
     """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, the names found inside
     the floor)``. The names are the named jewels (followed through symlinks) plus every entry under
     the hidden subtrees and the ssh dir (walked without following symlinks), and on Linux the session
     bus and the systemd manager socket bwrap step (7) masks. A larger ``st_nlink`` means some name is
     somewhere the floor does not cover.
 
+    Each name is keyed by its DIRECTORY ENTRY, not its spelling: the parent directory's identity plus
+    the case-folded final component. Two spellings of one entry (a case variant on a case-insensitive
+    volume, a bind-mount alias of the parent) therefore count once, so they cannot stand in for an
+    outside link (codex + complement L3 r1). Folding can only merge two real entries that differ by
+    case, which undercounts and refuses: the safe direction.
+
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("cannot verify"):
     a chmod on its own directory would otherwise switch the check off while the other name stays
-    reachable (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). The one exception
-    is the jewel-recheck rule in :func:`_identity`: a path blocked by ANOTHER user's directory."""
-    seen: dict[tuple[int, int], tuple[int, set[str]]] = {}
+    reachable (L2, RUN: ``chmod 0600 ~/.ssh`` plus a link to ``authorized_keys``). That includes a
+    file under another user's directory (codex L3 r1). Only a SOCKET path blocked by another user's
+    directory is left alone (the jewel-recheck rule in :func:`_identity`): the socket roster names
+    runtime directories that belong to another user under ``su``, and Linux's protected_hardlinks
+    stops linking another user's socket."""
+    seen: dict[tuple[int, int], tuple[int, dict[tuple, str]]] = {}
+    sockets = {str(p) for p in (*policy.deny_sockets, *policy.socket_spellings)}
 
     def unverifiable(path: str, exc: OSError) -> None:
         raise ConfinementError(
             f"could not check {path} for other names ({exc.strerror or exc}). The floor denies paths, "
-            "so an unchecked crown jewel could be reachable through a hardlink. Refusing to grant bash "
-            "hands (fail-closed). Make it readable to this user, or remove it from the floor."
+            "so an unchecked crown jewel could be reachable through a hardlink. Refusing this hand "
+            "(fail-closed). Make it readable to this user, or remove it from the floor."
         ) from exc
+
+    def entry_key(path: str) -> tuple:
+        parent, name = os.path.split(path)
+        try:
+            pst = os.stat(parent or ".")
+            return (pst.st_dev, pst.st_ino, unicodedata.normalize("NFC", name).casefold())
+        except OSError:
+            return ("unresolved", path)
 
     def blocked_by_another_user(path: str) -> bool:
         try:
@@ -2968,13 +2986,13 @@ def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, 
         except (FileNotFoundError, NotADirectoryError):
             return   # absent (or a dangling link): no file to have other names
         except OSError as exc:
-            if not blocked_by_another_user(path):
+            if not (path in sockets and blocked_by_another_user(path)):
                 unverifiable(path, exc)
             return
         if stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
             return
         real = os.path.realpath(path) if follow else path
-        seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, set()))[1].add(real)
+        seen.setdefault((st.st_dev, st.st_ino), (st.st_nlink, {}))[1][entry_key(real)] = real
 
     named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
              *policy.sqlite_sidecars, *policy.deny_sockets, *policy.socket_spellings]
@@ -2982,15 +3000,16 @@ def _jewel_names(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, 
         named.append(policy.config_file)
     if platform.system() == "Linux":
         for rd in _runtime_dirs():
-            named += [Path(rd) / "bus", Path(rd) / "systemd" / "private"]
+            bus = [Path(rd) / "bus", Path(rd) / "systemd" / "private"]
+            named += bus
+            sockets.update(str(b) for b in bus)
     for f in named:
         note(str(f), follow=True)
 
     def walk_error(exc: OSError) -> None:
         if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
             return
-        if not blocked_by_another_user(exc.filename):
-            unverifiable(exc.filename, exc)
+        unverifiable(str(exc.filename or "a crown-jewel directory"), exc)
 
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
                    key=lambda p: str(p))
@@ -3022,9 +3041,10 @@ def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
     refuse. Checked at spawn only: a link a host process makes while a shell is live is not watched
     (Phill's ruling, 2026-10-03). The file editor checks every path it touches instead
     (:func:`linked_jewel_reason`)."""
-    for links, names in _jewel_names(policy).values():
+    for links, entries in _jewel_names(policy).values():
+        names = sorted(entries.values())
         if links > len(names):
-            path = sorted(names)[0]
+            path = names[0]
             raise ConfinementError(
                 f"{path} is a crown jewel with {links} names on disk, and only {len(names)} of them "
                 "inside the floor. The floor denies paths, so the other name would let the shell read "
@@ -3038,9 +3058,11 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
 
     :func:`crown_jewel_reason` matches paths, so a hardlink to a jewel at an undenied path passed it:
     RUN 2026-10-03 (L1), the file editor's ``view`` of the link returned the denied token while bash
-    was refused. The editor checks the exact path it is about to touch, so here the class closes
-    completely: a file with more than one name whose identity is a jewel's, under a name the floor
-    does not cover, is refused. The jewel walk runs only when the target has more than one name."""
+    was refused. The editor checks the exact path it is about to touch: a file with more than one
+    name whose identity is a jewel's, under an entry the floor does not cover, is refused. Not
+    covered: a host process that swaps a link into place between this check and the editor's open
+    (codex L3 r1; the same host-process class as a link made while a shell is live). The jewel walk
+    runs only when the target has more than one name."""
     try:
         st = os.stat(path)
     except OSError:
@@ -3052,10 +3074,19 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     except ConfinementError as exc:
         return str(exc)
     hit = jewels.get((st.st_dev, st.st_ino))
-    if hit is None or os.path.realpath(path) in hit[1]:
+    if hit is None:
         return None
-    return (f"{path} is another name (a hardlink) for the crown jewel {sorted(hit[1])[0]}, which the "
-            "floor denies")
+    real = os.path.realpath(path)
+    parent, name = os.path.split(real)
+    try:
+        pst = os.stat(parent)
+        key: tuple = (pst.st_dev, pst.st_ino, unicodedata.normalize("NFC", name).casefold())
+    except OSError:
+        key = ("unresolved", real)
+    if key in hit[1]:
+        return None   # this IS a jewel's own entry; crown_jewel_reason already judged that path
+    return (f"{path} is another name (a hardlink) for the crown jewel {sorted(hit[1].values())[0]}, "
+            "which the floor denies")
 
 
 def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
