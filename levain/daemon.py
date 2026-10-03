@@ -1038,10 +1038,17 @@ class SystemdUserProvider(DaemonProvider):
                          check=False)
                     timer_path.unlink(missing_ok=True)
                 _run(["systemctl", "--user", "daemon-reload"], check=False)
-                _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
+                back = _run(["systemctl", "--user", "enable", "--now", rollback_target], check=False)
+                # Say what the re-enable did; it is not checked anywhere else (L3 codex, 2026-10-03).
+                if back.returncode == 0:
+                    restored = f"re-enabled {rollback_target}"
+                else:
+                    why = (back.stderr or back.stdout or f"rc={back.returncode}").strip()
+                    restored = (f"re-enabling {rollback_target} FAILED ({why}); the prior unit is on "
+                                f"disk but NOT enabled or running")
                 raise DaemonError(
                     f"enabling the new unit failed: {failure} — rolled back to the prior installed "
-                    f"unit at {service_path} (re-enabled {rollback_target})")
+                    f"unit at {service_path} ({restored})")
             raise DaemonError(
                 f"enabling failed: {failure} — the unit is KEPT at {service_path}. "
                 # ⚠ THIS USED TO SAY "(it is valid)". Nothing here checks that, and systemd will
