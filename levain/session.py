@@ -39,8 +39,10 @@ commands), never ask the agent how it did.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -460,6 +462,25 @@ def latest_agent_text(events) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def _one_turn(method: Callable[..., TurnResult]) -> Callable[..., TurnResult]:
+    """Run ``method`` as THE turn: a stop request left from before it is cleared as it begins, and
+    :meth:`EntitySession.request_stop` acts only while it runs. Both happen under one lock, so a
+    stop either lands in this turn or is a no-op; it is never cleared after the turn began."""
+
+    @functools.wraps(method)
+    def _wrapped(self: "EntitySession", *args: Any, **kwargs: Any) -> TurnResult:
+        with self._turn_lock:
+            self._stop_requested = False
+            self._turn_active = True
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            with self._turn_lock:
+                self._turn_active = False
+
+    return _wrapped
+
+
 @dataclass
 class EntitySession:
     """A live sovereign entity: binding + conversation + workspace, driven by :meth:`run_turn`.
@@ -495,6 +516,10 @@ class EntitySession:
     (the host-side reasons come from ``diagnose_confinement``). The banner prints it verbatim."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
     _stop_requested: bool = field(default=False, init=False, repr=False, compare=False)
+    _turn_active: bool = field(default=False, init=False, repr=False, compare=False)
+    _turn_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     # -- construction --------------------------------------------------------
 
@@ -794,6 +819,7 @@ class EntitySession:
 
     # -- the one operation ---------------------------------------------------
 
+    @_one_turn
     def run_turn(self, message: str) -> TurnResult:
         """Send ``message``, run the turn to completion, capture it, and report what happened.
 
@@ -827,7 +853,6 @@ class EntitySession:
             return TurnResult(
                 reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR,
             )
-        self._stop_requested = False
 
         # REFUSE A NEW MESSAGE WHILE THE GATE IS HOLDING (codex L3, HIGH). ``send_message`` does
         # NOT clear ``WAITING_FOR_CONFIRMATION`` — but the ``run()`` that follows it DOES, and
@@ -873,6 +898,7 @@ class EntitySession:
             return TurnResult(reply=None, tool_activity=[], error=str(exc))
         return self._drive()
 
+    @_one_turn
     def resume_turn(self) -> TurnResult:
         """APPROVE the actions the gate is holding and carry the turn on.
 
@@ -886,9 +912,9 @@ class EntitySession:
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
-        self._stop_requested = False
         return self._drive()
 
+    @_one_turn
     def reject_turn(self, reason: str = "the operator declined this action") -> TurnResult:
         """REFUSE the actions the gate is holding, and let the entity answer for it.
 
@@ -900,7 +926,6 @@ class EntitySession:
         """
         if self._closed:
             return TurnResult(reply=None, tool_activity=[], error=_CLOSED_SESSION_ERROR)
-        self._stop_requested = False
         try:
             from levain.firing.openhands.gate import reject_pending
 
@@ -951,7 +976,7 @@ class EntitySession:
             if self._stop_requested:
                 return self._stopped_result(nudged=nudged)
             self.conversation.run()
-            if self._stop_requested:
+            if self._stop_requested and self._stop_ended_run():
                 return self._stopped_result(nudged=nudged)
 
             # The gate check comes FIRST, before the act-first backstop, because a halted turn
@@ -971,7 +996,7 @@ class EntitySession:
                 if self._stop_requested:
                     return self._stopped_result(nudged=nudged)
                 self.conversation.run()
-                if self._stop_requested:
+                if self._stop_requested and self._stop_ended_run():
                     return self._stopped_result(nudged=nudged)
                 # Same three-valued treatment as the pre-nudge check — the post-nudge run() is
                 # a second chance to halt, and an unreadable status here cascades identically.
@@ -1029,7 +1054,9 @@ class EntitySession:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
 
         The turn ends at its next step boundary and returns ``timed_out=True``, NOT captured: a turn
-        stopped partway has no completed work to record (the same rule as the in-process bound).
+        stopped partway has no completed work to record (the same rule as the in-process bound). If
+        the step in flight finishes the turn instead, the turn returns its ordinary result
+        (:meth:`_stop_ended_run`).
         The SDK's synchronous ``run()`` cannot be cancelled inside a step, so a step in flight (a
         model call, a shell command) finishes first, and this call itself blocks until it does
         (the SDK's pause waits for the state lock a running step holds). Tool calls of that step
@@ -1038,15 +1065,36 @@ class EntitySession:
         harmless, and a driver should keep calling it until the turn returns: ``run()`` turns a
         pause that landed before it started back into running.
 
-        The flag is cleared when the next turn, approval or refusal begins, so a driver must not
-        start one while an earlier stop request can still arrive. Never raises."""
-        self._stop_requested = True
+        It acts only while a turn, approval or refusal is running. With none running it does
+        nothing: it leaves no state on an idle session, and one that lands before a turn begins is
+        not carried into it (a driver re-asks once the turn runs). A stop that lands while one runs
+        is never cleared by it. Never raises."""
+        with self._turn_lock:
+            # Held across `interrupt()`, so the turn cannot end (and the session go idle) between
+            # the check and the interrupt.
+            if not self._turn_active:
+                return
+            self._stop_requested = True
+            try:
+                # `interrupt()` sets the SDK's cancellation token (tools may check it) and, with no
+                # async run to cancel, pauses.
+                self.conversation.interrupt()
+            except Exception:  # noqa: BLE001 — a stop request must never take down its caller
+                pass
+
+    def _stop_ended_run(self) -> bool:
+        """After ``run()`` returned with a stop requested: did the stop end it? The SDK's pause
+        waits for a running step to finish and then changes only a RUNNING (or IDLE) status, so a
+        step that finished the turn leaves it FINISHED: that turn completed and gets its ordinary
+        result, as does IDLE. Any other status, including a halt at the gate, or one that cannot
+        be read, counts as stopped (fail-closed)."""
         try:
-            # `interrupt()` sets the SDK's cancellation token (tools may check it) and, with no
-            # async run to cancel, pauses.
-            self.conversation.interrupt()
-        except Exception:  # noqa: BLE001 — a stop request must never take down its caller
-            pass
+            from openhands.sdk.conversation.state import ConversationExecutionStatus as Status
+
+            status = self.conversation.state.execution_status
+        except Exception:  # noqa: BLE001 — unreadable: the stop is taken to have ended the turn
+            return True
+        return status not in (Status.FINISHED, Status.IDLE)
 
     def _stopped_result(self, *, nudged: bool) -> TurnResult:
         """A turn ended by :meth:`request_stop`: timed out, nothing captured."""

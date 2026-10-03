@@ -1032,3 +1032,182 @@ def test_a_turn_that_faults_partway_still_lists_what_ran(tmp_path: Path, fault):
     assert sess.conversation.state.events[-1] is ran        # the run (and its fault) happened
     assert result.error and result.timed_out is (fault == "timeout")
     assert result.tool_activity == ["⚙ terminal: make"]
+
+
+# ---------- the stop request vs a turn that completes (k1p2 L3 r1) ----------
+
+
+class _SdkLikeConv:
+    """The SDK's synchronous run() as far as a stop request sees it: run() makes a fresh cancellation
+    flag and turns an IDLE or PAUSED status back into RUNNING; interrupt() sets the flag and falls
+    back to pause(), which flips only IDLE or RUNNING to PAUSED (a FINISHED turn stays finished);
+    the loop runs `step` until the status leaves RUNNING."""
+
+    def __init__(self, step):
+        from types import SimpleNamespace
+
+        self.state = SimpleNamespace(events=[], execution_status="idle")
+        self.step = step
+        self.cancelled = False
+        self.interrupts = 0
+
+    def send_message(self, message):
+        self.state.events.append(_Event("user", [message]))
+        self.state.execution_status = "idle"
+
+    def run(self):
+        self.cancelled = False
+        if self.state.execution_status in ("idle", "paused"):
+            self.state.execution_status = "running"
+        while self.state.execution_status == "running":
+            self.step(self)
+
+    def interrupt(self):
+        self.interrupts += 1
+        self.cancelled = True
+        if self.state.execution_status in ("idle", "running"):
+            self.state.execution_status = "paused"
+
+
+class _Binding:
+    def __init__(self):
+        self.captured = 0
+
+    def capture_turn(self, conversation):
+        self.captured += 1
+
+
+def _sdk_like_session(tmp_path: Path, step):
+    from levain.session import EntitySession
+
+    binding = _Binding()
+    sess = EntitySession(
+        entity_dir=tmp_path, binding=binding, conversation=_SdkLikeConv(step),
+        workspace=tmp_path / "workspace", model_label="m", with_tools=False, bash_ok=False,
+        gate_mode="ungated",
+    )
+    return sess, binding
+
+
+def test_a_turn_that_completes_as_the_stop_lands_returns_its_result(tmp_path: Path):
+    """glm L3 r1 HIGH: the step finished the turn, then the stop landed (the SDK's pause waits for
+    the step's lock, then finds FINISHED and does nothing). run() returned a completed turn, and
+    `_drive` threw it away as stopped because the flag was set."""
+    holder = {}
+
+    def step(conv):
+        conv.state.events.append(_Event("agent", ["done"]))
+        conv.state.execution_status = "finished"
+        holder["sess"].request_stop()
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    result = sess.run_turn("go")
+    assert sess.conversation.interrupts == 1                 # the stop did land
+    assert result.timed_out is False and result.error is None and result.reply == "done"
+    assert binding.captured == 1
+
+
+def test_a_turn_the_stop_paused_is_still_stopped(tmp_path: Path):
+    """The control: the stop landed while the turn was still running, so run() returned PAUSED."""
+    holder = {}
+
+    def step(conv):
+        holder["sess"].request_stop()
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    result = sess.run_turn("go")
+    assert result.timed_out is True and binding.captured == 0
+
+
+def test_an_unreadable_status_after_a_stop_reads_as_stopped(tmp_path: Path):
+    """Fail-closed: when the status cannot be read, a requested stop is taken to have ended the turn."""
+    holder = {}
+
+    def step(conv):
+        conv.state.events.append(_Event("agent", ["done"]))
+        conv.state.execution_status = "finished"
+        holder["sess"].request_stop()
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    conv = sess.conversation
+    original = conv.run
+
+    def run():
+        original()
+        del conv.state.execution_status          # the run returned; its status cannot be read
+
+    conv.run = run
+    result = sess.run_turn("go")
+    assert result.timed_out is True and binding.captured == 0
+
+
+def test_a_stop_with_no_turn_running_touches_nothing(tmp_path: Path):
+    """complement MED + codex MED-4 (L3 r1): a stop that lands on an idle session (the deadline fired
+    as the turn returned) set the flag and interrupted the conversation, leaving state behind.
+    With no turn running it is a no-op, before the first turn and after one."""
+    def step(conv):
+        conv.state.events.append(_Event("agent", ["done"]))
+        conv.state.execution_status = "finished"
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    sess.request_stop()
+    assert sess.conversation.interrupts == 0 and sess._stop_requested is False
+    assert sess.run_turn("one").reply == "done"
+    sess.request_stop()
+    assert sess.conversation.interrupts == 0 and sess._stop_requested is False
+    assert sess.conversation.state.execution_status == "finished"
+    result = sess.run_turn("two")
+    assert result.reply == "done" and result.timed_out is False and binding.captured == 2
+
+
+def test_a_stop_that_lands_after_the_turn_began_is_kept(tmp_path: Path):
+    """Clearing a stale stop happens only as a turn begins. A stop that arrives once the turn is
+    running, here before its run() starts, ends that turn."""
+    def step(conv):
+        conv.state.events.append(_Event("agent", ["done"]))
+        conv.state.execution_status = "finished"
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    conv = sess.conversation
+    original = conv.send_message
+
+    def send_message(message):
+        original(message)
+        sess.request_stop()          # the turn has begun; its run() has not
+
+    conv.send_message = send_message
+    result = sess.run_turn("go")
+    assert result.timed_out is True and binding.captured == 0
+
+
+def test_the_chat_watcher_stops_a_running_turn_through_the_turn_flag(tmp_path: Path):
+    """End to end on threads: the chat host's watcher calls request_stop from its own thread while
+    the worker is inside the turn, the stop lands, and the job settles stopped and marked."""
+    import time
+
+    from levain.chat import ChatHost
+
+    def step(conv):
+        time.sleep(0.01)          # a step that never finishes the turn on its own
+
+    made = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_sdk_like_session(tmp_path, step)[0])
+        return made[-1]
+
+    host = ChatHost({"e": tmp_path}, session_factory=factory, turn_seconds=0.2)
+    out = host.open("e")
+    deadline = time.monotonic() + 5
+    while host.job_status(out["job_id"])["status"] == "running":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    job = host.turn(out["session_id"], "go")["job_id"]
+    while (st := host.job_status(job))["status"] == "running":
+        assert time.monotonic() < deadline + 5, "the watcher never stopped the turn"
+        time.sleep(0.01)
+    assert st["deadline_hit"] is True and st["result"]["timed_out"] is True
+    assert made[0].conversation.interrupts >= 1 and made[0]._turn_active is False

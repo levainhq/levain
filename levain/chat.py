@@ -25,9 +25,12 @@ is the same for ``headless`` as for ``interactive`` (:mod:`levain.firing.drive`)
 the gate and nothing else. (L1 review 2026-10-03; revisit only if a chat client can show that a
 present human, not just a token holder, is driving.)
 
-**An entity that may connect to localhost is refused.** With ``allow_localhost_outbound`` its shell
-could call these routes itself and approve its own held actions. Every other entity's shell is denied
-loopback by its floor. (L2 review 2026-10-03.) The refusal fires twice: early from the config, and
+**An entity that may reach this server is refused.** With ``allow_localhost_outbound`` its shell
+could call these routes itself and approve its own held actions; with ``allow_container_sockets`` it
+could do the same from a container it starts on the host network. Every other entity's shell is
+denied loopback and the container daemon sockets its floor lists. (L2 review, codex L3 r1,
+2026-10-03.)
+The refusal fires twice: early from the config, and
 after the session opens, from the floor its hands actually enforce, because the config can change
 between the two reads (codex L3 r1) and only the second is the floor that will run.
 
@@ -47,12 +50,15 @@ A job that failed without a result keeps what was streamed, and carries an ``err
 
 **A turn's wall-clock bound is a STOP REQUEST, honoured at the next step boundary.** Each turn,
 approval or refusal job has a watcher; at ``turn_seconds`` it marks the job ``deadline_hit`` and
-calls :meth:`EntitySession.request_stop` until the job ends (a settled job keeps ``deadline_hit``
-only if the deadline stopped it). The session returns the turn
-``timed_out``, uncaptured, and the host breaks the session and releases its shell. The SDK's
-synchronous run cannot be cancelled inside a step, so a step already in flight finishes first: a
-shell command within its own timeout, a model call within the SDK's HTTP timeout and retries. So
-the bound is the deadline plus at most one step, not the deadline. A session stays ``busy`` (and
+calls :meth:`EntitySession.request_stop` until the job ends. ``deadline_hit`` is never cleared: it
+says the deadline passed while the job ran, and the result's ``timed_out`` says whether the stop
+ended the turn. A stopped turn comes back ``timed_out``, uncaptured, and the host breaks the session
+and releases its shell. The SDK's synchronous run cannot be cancelled inside a step, so a step
+already in flight finishes first: a shell command within its own timeout, a model call within the
+SDK's HTTP timeout and retries. If that step finishes the turn, the turn returns its ordinary result
+and the session stays usable. So the bound is the deadline plus at most one step, not the deadline,
+and it does NOT cover capture: a turn that finished runs ``capture_turn`` to the end, and a capture
+that hangs holds the job past the deadline (not bounded here). A session stays ``busy`` (and
 counted) until its worker returns. Workers are daemon threads, so stopping the server does not wait
 for one; the SDK closes every live conversation, and its shell, at interpreter exit.
 
@@ -172,6 +178,13 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "it could call this server's chat routes itself, approve its own held actions and drive "
             "the other entities. Chat refuses to host it; use `levain run` for this entity."
         )
+    if cfg.allow_container_sockets:
+        return (
+            f"{entity_dir} allows its shell to reach the container daemon sockets "
+            "(allow_container_sockets), so it could start a container on the host network and call "
+            "this server's chat routes from there, approving its own held actions. Chat refuses to "
+            "host it; use `levain run` for this entity."
+        )
     return None
 
 
@@ -226,17 +239,23 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     }
 
 
-def _hands_allow_localhost(session: Any) -> bool:
-    """True when ``session`` has a shell whose floor allows connecting to this host, read from the
-    floor the hands enforce. An unreadable floor on a session with a shell counts as allowing it
-    (fail-closed)."""
+def _hands_reach_this_server(session: Any) -> str | None:
+    """What lets ``session``'s shell reach this server, read from the floor the hands enforce, or
+    ``None``. Two ways: connecting to localhost, and a container daemon socket (a container on the
+    host network connects to localhost). The floor carries no socket sources only when the
+    entity opted out of the socket denies. An unreadable floor on a session with a shell counts
+    as reaching it (fail-closed)."""
     if not getattr(session, "bash_ok", False):
-        return False
+        return None
     try:
         floor = session.conversation.agent.tools_map["file_editor"].executor._policy
-        return not bool(floor.deny_localhost_outbound)
+        if not bool(floor.deny_localhost_outbound):
+            return "may connect to localhost"
+        if not tuple(floor.socket_sources):
+            return "may reach the container daemon sockets"
+        return None
     except Exception:  # noqa: BLE001 — cannot read the floor: assume the worst
-        return True
+        return "has a floor that cannot be read"
 
 
 def _default_factory(
@@ -258,13 +277,13 @@ def _default_factory(
             max_iterations=max_iterations,
             mode=CHAT_DRIVE_MODE,
         )
-        if _hands_allow_localhost(session):
+        reach = _hands_reach_this_server(session)
+        if reach is not None:
             session.close()
             raise ChatError(
                 "refused_entity",
-                f"{entity_dir}: the opened session's shell may connect to localhost, so it could "
-                "call this server's chat routes itself. Refused (its confinement.json changed, or "
-                "allows it).",
+                f"{entity_dir}: the opened session's shell {reach}, so it could call this "
+                "server's chat routes itself. Refused (its confinement.json changed, or allows it).",
                 403,
             )
         return session
@@ -686,11 +705,6 @@ class ChatHost:
                     rec.state = "closing"     # counted until the shell is released, below
                 elif self._shut:
                     rec.state = "closed"
-            if not (payload is not None and payload["timed_out"]):
-                # `deadline_hit` while running means "the deadline passed, a stop was asked for";
-                # once settled it means "the deadline stopped this turn". A turn that finished as
-                # the deadline arrived was not stopped by it.
-                job.deadline_hit = False
             rec.job_id = None
         if to_close is not None:
             try:

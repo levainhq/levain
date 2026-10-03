@@ -478,10 +478,11 @@ def test_activity_lines_and_result_activity_are_size_bounded(tmp_path):
 class _Floored(_Stub):
     """A stub whose hands report a floor, as EntitySession's do."""
 
-    def __init__(self, on_event, *, deny_localhost: bool | None):
+    def __init__(self, on_event, *, deny_localhost: bool | None, sockets: tuple = ("/run/docker.sock",)):
         super().__init__(on_event, [])
         if deny_localhost is not None:
-            policy = type("P", (), {"deny_localhost_outbound": deny_localhost})()
+            policy = type("P", (), {"deny_localhost_outbound": deny_localhost,
+                                    "socket_sources": tuple(Path(x) for x in sockets)})()
             executor = type("E", (), {"_policy": policy})()
             tool = type("T", (), {"executor": executor})()
             agent = type("A", (), {"tools_map": {"file_editor": tool}})()
@@ -503,7 +504,8 @@ def test_a_session_whose_hands_may_reach_localhost_is_refused_after_open(
         or made[-1]))
     host = ChatHost({"ok": _entity(tmp_path, "ok")})
     st = _wait(host, host.open("ok")["job_id"])
-    assert st["status"] == "failed" and "localhost" in st["error"]
+    why = "localhost" if deny_localhost is False else "cannot be read"
+    assert st["status"] == "failed" and why in st["error"]
     assert made[0].closed
 
 
@@ -552,6 +554,51 @@ def test_chat_opens_headless_and_refuses_an_entity_that_may_reach_localhost(tmp_
     built, err = _build_chat_host([ok, open_], model="m", base_url="u", api_key=None,
                                   max_iterations=None)
     assert built is None and "allow_localhost_outbound" in err
+
+
+def test_chat_refuses_an_entity_that_may_reach_the_container_sockets(tmp_path, monkeypatch):
+    """codex L3 r1 HIGH-2: a live container socket is a total bypass of the floor, and a container on
+    the host network reaches this server's loopback, so it could approve its own held actions.
+    Refused from the config, and from the opened floor when the config changed between the reads."""
+    import levain.chat as chat_mod
+    from levain.session import EntitySession
+    from levain.web_server import _build_chat_host
+
+    ent = _entity(tmp_path, "socky")
+    (ent / ".levain" / "confinement.json").write_text('{"allow_container_sockets": true}')
+    assert "allow_container_sockets" in (chat_mod.chat_refusal(ent) or "")
+    built, err = _build_chat_host([ent], model="m", base_url="u", api_key=None, max_iterations=None)
+    assert built is None and "allow_container_sockets" in err
+
+    made = []
+    monkeypatch.setattr(chat_mod, "chat_refusal", lambda d: None)   # the config read passes
+    monkeypatch.setattr(EntitySession, "open", classmethod(
+        lambda cls, path, **kw: made.append(_Floored(kw["on_event"], deny_localhost=True,
+                                                     sockets=())) or made[-1]))
+    host = ChatHost({"socky": ent})
+    st = _wait(host, host.open("socky")["job_id"])
+    assert st["status"] == "failed" and "container daemon sockets" in st["error"]
+    assert made[0].closed
+
+
+def test_an_opened_floor_that_opted_out_of_the_socket_denies_has_no_socket_sources(tmp_path, home):
+    """The post-open check reads `socket_sources`; this pins that a really opened session's floor
+    carries none exactly when the entity opted out, and that the check refuses only that one."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from levain.chat import _hands_reach_this_server
+    from levain.session import EntitySession
+
+    ent = _entity(tmp_path, "e")
+    for cfg, refused in (('{"allow_container_sockets": true}', True), ("{}", False)):
+        (ent / ".levain" / "confinement.json").write_text(cfg)
+        s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True,
+                               mode="headless")
+        try:
+            reach = _hands_reach_this_server(s)
+            assert (reach == "may reach the container daemon sockets") is refused, (cfg, reach)
+            assert (reach is None) is not refused
+        finally:
+            s.close()
 
 
 def test_unknown_ids_read_as_unknown_or_404(tmp_path):
@@ -1263,9 +1310,10 @@ class _FinishesWhenAsked(_Stub):
         self.asked.set()
 
 
-def test_a_turn_that_completes_as_its_deadline_arrives_is_not_marked_stopped(tmp_path):
-    """LOW-1 / L2's settle rule: a settled `deadline_hit` means the deadline stopped the turn. A turn
-    that completed (and was captured) as the stop arrived reads as an ordinary finished turn."""
+def test_a_turn_that_completes_as_its_deadline_arrives_keeps_its_deadline_mark(tmp_path):
+    """codex L3 r1 HIGH-3: the deadline passed, so `deadline_hit` stays set even though the turn
+    completed (and was captured) as the stop arrived; `timed_out` is what says it was not stopped.
+    The settle rule that cleared it erased the fact that the bound fired."""
     made: list[_FinishesWhenAsked] = []
 
     def factory(entity_dir, *, on_event):
@@ -1276,7 +1324,8 @@ def test_a_turn_that_completes_as_its_deadline_arrives_is_not_marked_stopped(tmp
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "x")["job_id"])
     assert made[0].stops >= 1
-    assert st["result"]["ok"] is True and st["deadline_hit"] is False
+    assert st["result"]["ok"] is True and st["result"]["timed_out"] is False
+    assert st["deadline_hit"] is True
     assert host.session_status(sid)["state"] == "idle"
 
 
