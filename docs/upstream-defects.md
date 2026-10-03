@@ -12,7 +12,7 @@ A shield is not a cure. Everything here stays open until the upstream layer fixe
 ## UD-1 — mis-decoded text arrives at the capture boundary (open)
 
 **Status:** open upstream · shielded in levain since 2026-07-20
-**Shield:** `levain/firing/encoding.py`, invoked from `CaptureRequest.__post_init__` (capture), from `levain.session.latest_agent_text` (the reply shown by the REPL, `--task` and `levain serve --chat`), and from `levain.firing.agent_reply.planned_without_acting` (the stall check)
+**Shield:** `levain/firing/encoding.py`, invoked from `CaptureRequest.__post_init__` (capture) and from `levain.session.latest_agent_text` (the reply shown by the REPL, `--task` and `levain serve --chat`). Not from the narrate-first stall check: a repair there would turn an answer that quotes mojibake into a detected plan and a nudge (codex L3, 2026-10-03)
 **Suspected layer:** the streaming decode path in Ollama `/v1` → litellm → OpenHands SDK
 
 ### What was observed
