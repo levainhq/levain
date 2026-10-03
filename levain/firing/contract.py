@@ -168,12 +168,25 @@ class FiringContract(Protocol):
 
 # --- the firing registry (serialization-safe reconstruction) ------------------------
 
-_FIRING_REGISTRY: dict[str, Callable[[], FiringContract]] = {}
+_FIRING_REGISTRY: dict[str, Callable[..., FiringContract]] = {}
 
 
-def register_firing(kind: str, factory: Callable[[], FiringContract]) -> None:
-    """Register a ``FiringContract`` factory under a serializable ``kind``."""
+# Kinds whose factory serves ONE entity and takes ``entity_dir`` (spore-438). Every other kind is
+# handed no entity, so a zero-arg factory (the stub, a third party's) keeps working when the
+# condenser that rebuilds it carries one.
+_ENTITY_FIRING_KINDS: set[str] = set()
+
+
+def register_firing(
+    kind: str, factory: Callable[..., FiringContract], *, takes_entity: bool = False
+) -> None:
+    """Register a ``FiringContract`` factory under a serializable ``kind``. ``takes_entity``: the
+    factory accepts ``entity_dir`` (an isolated per-entity firing)."""
     _FIRING_REGISTRY[kind] = factory
+    if takes_entity:
+        _ENTITY_FIRING_KINDS.add(kind)
+    else:
+        _ENTITY_FIRING_KINDS.discard(kind)
 
 
 # Explicit allowlist of lazily-importable firing leaves (kind → module). An explicit map
@@ -190,8 +203,15 @@ _LAZY_FIRING_MODULES: dict[str, str] = {
 }
 
 
-def build_firing(kind: str) -> FiringContract:
+def build_firing(kind: str, *, entity_dir: str | None = None) -> FiringContract:
     """Rebuild a ``FiringContract`` from its registered kind (used on fork / reload).
+
+    ``entity_dir`` is the per-conversation entity an isolated kind serves (spore-438). It travels as
+    serialized DATA on the object being rebuilt (the condenser), so a server holding several
+    entities' conversations in one process rebuilds each firing against its OWN store rather than
+    whatever the process-global channel last said. It reaches only a kind registered with
+    ``takes_entity=True``; any other kind serves no entity and is built zero-arg. ``None`` keeps the
+    zero-argument rebuild.
 
     A kind may live in an OPTIONAL leaf that self-registers on import (e.g. the anneal leaf
     ``vagus.firing.anneal``). If ``kind`` isn't registered yet but is a BLESSED leaf
@@ -212,7 +232,9 @@ def build_firing(kind: str) -> FiringContract:
         raise ValueError(
             f"unknown firing kind {kind!r}; registered: {sorted(_FIRING_REGISTRY)}"
         )
-    return factory()
+    if entity_dir is None or kind not in _ENTITY_FIRING_KINDS:
+        return factory()
+    return factory(entity_dir=entity_dir)
 
 
 # --- Slice 1 STUB implementation ----------------------------------------------------

@@ -96,7 +96,7 @@ class LevainCondenser(VagusCondenser):
         # apparatus L2/L3: pydantic keys model-validators by name, so a differently-named subclass
         # validator does not shadow the inherited one; both fire.)
         if self._presence is None:
-            self._presence = build_presence(self.presence_kind)
+            self._presence = build_presence(self.presence_kind, entity_dir=self.entity_dir)
         return self
 
     @classmethod
@@ -107,14 +107,19 @@ class LevainCondenser(VagusCondenser):
         firing_kind: str = "stub",
         presence: PresenceSource | None = None,
         presence_kind: str = "stub",
+        *,
+        entity_dir: str | None = None,
     ) -> "LevainCondenser":
         """Construct with both serializable kinds, then apply any live handles (test doubles /
         in-process handles). A live handle does NOT survive fork — production passes a non-stub
         KIND, never a live override with the default kind (see the fork-downgrade warning).
 
         Signature keeps ``firing``/``firing_kind`` positional to match ``VagusCondenser.build`` (LSP);
-        ``presence``/``presence_kind`` are trailing optionals a subclass may add."""
-        obj = cls(inner=inner, firing_kind=firing_kind, presence_kind=presence_kind)
+        ``presence``/``presence_kind`` are trailing optionals a subclass may add. ``entity_dir`` is the
+        inherited per-conversation entity (spore-438); it feeds the presence rebuild too."""
+        obj = cls(
+            inner=inner, firing_kind=firing_kind, presence_kind=presence_kind, entity_dir=entity_dir
+        )
         if firing is not None:
             _warn_live_override_wont_survive_fork(firing, firing_kind, StubFiring, "firing")
             obj._firing = firing
@@ -199,7 +204,7 @@ class LevainCondenser(VagusCondenser):
             if presence is None:
                 # Self-heal on unsafe construction paths (model_construct bypasses the validator) —
                 # a structural guard, not an -O-strippable assert (mirrors VagusCondenser).
-                presence = self._presence = build_presence(self.presence_kind)
+                presence = self._presence = build_presence(self.presence_kind, entity_dir=self.entity_dir)
             text = presence.reanchor(req)
             if text is not None and not isinstance(text, str):
                 # A source DEFECT: the contract is str | None, but a buggy source returned something

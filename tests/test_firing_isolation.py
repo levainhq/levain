@@ -10,7 +10,7 @@ These prove it STRUCTURALLY (``structural_invariants_beat_discipline``), not by 
   - the MOAT proof, two halves: recall ROUTING (which crystal path is opened — decoy flow store
     present) is deterministic; capture ROUTING is REAL end-to-end (the episode lands in the entity
     db; flow's db is never created),
-  - fork/reload survival (the env-bound entity survives a zero-arg registry rebuild),
+  - fork/reload survival (the serialized entity survives a registry rebuild),
   - the dependency-isolated-leaf invariant for the new pure module.
 """
 from __future__ import annotations
@@ -26,7 +26,6 @@ from anneal_memory.types import RelevantPattern
 from levain.firing import CaptureRequest, InjectRequest, build_firing
 from levain.firing.anneal import AnnealEntityFiring
 from levain.firing.isolation import (
-    LEVAIN_ENTITY_DIR_ENV,
     IsolationError,
     assert_entity_isolated,
     assert_path_within_workspace,
@@ -187,20 +186,21 @@ def test_entity_store_paths_derives_under_levain(tmp_path):
 # --- the pure guard: resolve_entity_dir (fail-closed when unbound) -------------------
 
 
-def test_resolve_entity_dir_explicit_wins(tmp_path, monkeypatch):
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
+def test_resolve_entity_dir_explicit_wins(tmp_path):
     assert resolve_entity_dir(tmp_path / "e") == (tmp_path / "e")
 
 
-def test_resolve_entity_dir_reads_env(tmp_path, monkeypatch):
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(tmp_path / "envent"))
-    assert resolve_entity_dir() == (tmp_path / "envent")
+def test_resolve_entity_dir_ignores_a_stale_process_env(tmp_path, monkeypatch):
+    """spore-438: there is no process-level entity channel. A leftover $LEVAIN_ENTITY_DIR (the retired
+    channel) names nothing — an entity is carried by the object being served, never looked up."""
+    monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(tmp_path / "envent"))
+    with pytest.raises(IsolationError, match="no entity given"):
+        resolve_entity_dir()
 
 
 def test_resolve_entity_dir_unbound_raises(monkeypatch):
-    """No explicit dir + no env → FAIL CLOSED (never a default that could be flow's store)."""
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
-    with pytest.raises(IsolationError, match="no entity bound"):
+    """No explicit dir → FAIL CLOSED (never a default that could be flow's store)."""
+    with pytest.raises(IsolationError, match="no entity given"):
         resolve_entity_dir()
 
 
@@ -292,17 +292,6 @@ def test_recall_opens_entity_crystal_never_flow(tmp_path, monkeypatch):
     assert flow_crystal.resolve() not in opened   # NEVER the flow store — the moat holds
 
 
-def test_recall_env_bound_matches_explicit(tmp_path, monkeypatch):
-    """Binding via $LEVAIN_ENTITY_DIR resolves identically to an explicit entity_dir — the
-    fork-safe channel and the in-process channel agree."""
-    ent = _entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
-    f_env = AnnealEntityFiring()          # env-bound (the fork-rebuilt shape)
-    f_explicit = AnnealEntityFiring(entity_dir=ent)
-    assert f_env._resolve_crystal_path() == f_explicit._resolve_crystal_path()
-    assert f_env._resolve_episodic_path() == f_explicit._resolve_episodic_path()
-
-
 # --- MOAT: capture ROUTING is REAL end-to-end ---------------------------------------
 
 
@@ -314,9 +303,8 @@ def test_capture_writes_entity_db_never_flow_db(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))  # a fresh, empty flow-store home
     ent = _entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
 
-    ok = AnnealEntityFiring().capture(
+    ok = AnnealEntityFiring(entity_dir=ent).capture(
         CaptureRequest(content="entity turn: the sovereign build ran", source="vagus", session_id="s1")
     )
     assert ok is True
@@ -332,10 +320,9 @@ def test_capture_writes_entity_db_never_flow_db(tmp_path, monkeypatch):
 
 
 def test_unbound_recall_fails_soft_never_reads_flow(tmp_path, monkeypatch):
-    """Env unset + no entity_dir: recall degrades to a marker (IsolationError caught by fail-soft)
+    """No entity_dir: recall degrades to a marker (IsolationError caught by fail-soft)
     and NEVER opens the flow crystal — fail-closed-to-safe, not fail-open-to-leak."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
     _existing_crystal(flow_store_dir() / "memory.crystal.json")  # a flow store IS present
 
     opened: list[Path] = []
@@ -349,11 +336,10 @@ def test_unbound_recall_fails_soft_never_reads_flow(tmp_path, monkeypatch):
 
 
 def test_unbound_capture_fails_soft_never_writes_flow(tmp_path, monkeypatch, caplog):
-    """Env unset: capture returns False + logs loud, and the flow db is NEVER written."""
+    """No entity_dir: capture returns False + logs loud, and the flow db is NEVER written."""
     import logging
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
     with caplog.at_level(logging.WARNING, logger="levain.firing.anneal"):
         ok = AnnealEntityFiring().capture(CaptureRequest(content="should never land in flow"))
     assert ok is False
@@ -366,11 +352,10 @@ def test_unbound_capture_fails_soft_never_writes_flow(tmp_path, monkeypatch, cap
 
 def test_entity_firing_survives_registry_rebuild(tmp_path, monkeypatch):
     """The isolation contract rides the SERIALIZED firing_kind: build_firing('anneal_entity') (the
-    zero-arg rebuild a fork/reload performs) reconstructs an AnnealEntityFiring that STILL resolves
-    to the env-bound entity — never the laptop-defaulting AnnealFiring."""
+    rebuild a fork/reload performs, with the entity the condenser serializes) reconstructs an
+    AnnealEntityFiring on THAT entity — never the laptop-defaulting AnnealFiring."""
     ent = _entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
-    rebuilt = build_firing("anneal_entity")
+    rebuilt = build_firing("anneal_entity", entity_dir=str(ent))
     assert type(rebuilt).__name__ == "AnnealEntityFiring"
     assert rebuilt._resolve_crystal_path() == (ent / ".levain" / "memory.crystal.json").resolve()
 
@@ -446,7 +431,6 @@ def test_entity_firing_real_recall_end_to_end(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))
     ent = _entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
     crystal, _ = entity_store_paths(ent)
     CrystalStore(crystal).crystallize(
         name="entity_sovereign_isolation",
@@ -454,7 +438,7 @@ def test_entity_firing_real_recall_end_to_end(tmp_path, monkeypatch):
         explanation="isolation keeps the entity memory sovereign under its own levain dir",
         tags=["architecture", "isolation"],
     )
-    out = AnnealEntityFiring().inject(
+    out = AnnealEntityFiring(entity_dir=ent).inject(
         InjectRequest(query="how does isolation keep entity memory sovereign", turn_index=0)
     )
     assert "entity_sovereign_isolation" in out  # the REAL entity pattern recalled end-to-end
@@ -466,15 +450,14 @@ def test_entity_firing_real_recall_end_to_end(tmp_path, monkeypatch):
 
 def test_entity_firing_session_start_constitution_when_unbound(monkeypatch):
     """session_start returns the constitution WITHOUT resolving any store — so vagus_agent_context
-    can build the suffix even before an entity is bound (no env). No IsolationError, no store touch.
+    can build the suffix with no entity given. No IsolationError, no store touch.
     (build_entity_agent relies on this: a fresh AnnealEntityFiring's session_start inject.)"""
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
     out = AnnealEntityFiring().inject(InjectRequest(lifecycle_point="session_start"))
     assert "governed cognitive substrate" in out  # the default constitution, no resolution
 
 
 def test_capture_guard_trip_mid_op_fails_soft(tmp_path, monkeypatch, caplog):
-    """env IS bound, but the entity's .levain symlinks OUT of the entity tree → the guard trips
+    """an entity IS given, but the entity's .levain symlinks OUT of the entity tree → the guard trips
     INSIDE capture → fail-soft-loud (episode lost, returns False), never a write to the escaped
     store. (L1 gap: only the unbound + pure-guard cases were covered before.)"""
     import logging
@@ -484,9 +467,8 @@ def test_capture_guard_trip_mid_op_fails_soft(tmp_path, monkeypatch, caplog):
     ent = tmp_path / "entity"
     ent.mkdir()
     (ent / ".levain").symlink_to(external, target_is_directory=True)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
     with caplog.at_level(logging.WARNING, logger="levain.firing.anneal"):
-        ok = AnnealEntityFiring().capture(CaptureRequest(content="must not escape the entity tree"))
+        ok = AnnealEntityFiring(entity_dir=ent).capture(CaptureRequest(content="must not escape the entity tree"))
     assert ok is False
     assert any("episode LOST" in r.message for r in caplog.records)
     assert not (external / "memory.db").exists()  # nothing written to the escaped external store

@@ -721,34 +721,10 @@ class _Cfg:
         self.deny_standard_creds = deny
 
 
-def test_apply_drive_policy_binds_the_fork_safe_channel(monkeypatch):
-    """Bind WITHOUT resolve and bash gets the wrong floor; resolve WITHOUT bind and the FILE
-    EDITOR does — and the file editor is the `view` path. Pin that the bind actually happens."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV, current_drive_mode
-    from levain.session import _apply_drive_policy
-
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    _apply_drive_policy(_Cfg(None), "interactive")
-    assert current_drive_mode() == "interactive"
-    _apply_drive_policy(_Cfg(None), "unattended")
-    assert current_drive_mode() == "unattended"
-
-
 def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(monkeypatch):
     """`deny_standard_creds` is a TRI-STATE whose None means "derive". Reading it raw treats an
     undeclared entity as opted-OUT — the exact hole this closes."""
-    from levain.session import _apply_drive_policy
-
-    import os
-
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
-    def fresh(cfg, mode):
-        # Each assertion is a SEPARATE process in reality; bind_drive_mode now refuses a rebind
-        # that would widen the floor, so clear the binding between them rather than weakening the
-        # guard to suit the test.
-        os.environ.pop(LEVAIN_DRIVE_MODE_ENV, None)
-        return _apply_drive_policy(cfg, mode)
+    from levain.session import _apply_drive_policy as fresh
 
     assert fresh(_Cfg(None), "unattended") is True     # absent + seat → DENY
     assert fresh(_Cfg(None), "headless") is False      # absent + human → allow
@@ -757,13 +733,11 @@ def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(
 
 
 def test_apply_drive_policy_handles_a_toolless_session(monkeypatch):
-    """`cfg` is None when the session runs with --no-tools. It must still bind the mode (nothing
-    else will) and must not crash resolving a floor for hands that do not exist."""
-    from levain.firing.drive import current_drive_mode
+    """`cfg` is None when the session runs with --no-tools. It must not crash resolving a floor for
+    hands that do not exist."""
     from levain.session import _apply_drive_policy
 
     assert _apply_drive_policy(None, "unattended") is True
-    assert current_drive_mode() == "unattended"
 
 
 # ---------- the WALL-CLOCK BOUND reaches the driver (K4a ⑥, `spore-434`) ----------

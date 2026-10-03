@@ -1462,7 +1462,7 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
     SECURITY floors are — both ``deny_standard_creds`` AND ``deny_localhost_outbound``.
 
     Both default to ``False`` because this function is the MECHANISM and the POLICY lives one layer
-    up (``resolve_cred_floor`` for creds; ``policy_for_conv_state`` for the localhost deny). That
+    up (``resolve_cred_floor`` for creds; ``ConversationBinding.create`` for the localhost deny). That
     split is right, but it leaves a real hole (glm L3 for creds; codex L3 HIGH#1 2026-09-13 for the
     localhost deny): a future production path that builds a floor directly and forgets an argument
     would silently ship the PERMISSIVE default — allowing ~/.config/gh on an unattended seat, or
@@ -3372,19 +3372,17 @@ def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, 
 
 @pytest.mark.parametrize("mode,expected", [("interactive", False), ("unattended", True)])
 def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypatch, mode, expected):
-    """complement L3: policy_for_conv_state (the file editor's / bash executor's policy, built at
-    tool-creation time from the process channel) is where the two enforcers once disagreed."""
-    from types import SimpleNamespace
-
-    from levain.firing.openhands.tools import policy_for_conv_state
+    """complement L3: the hands' floor (resolved once into the conversation's binding, then carried to
+    both hands as data) is where the two enforcers once disagreed."""
+    from levain.firing.binding import ConversationBinding
 
     ent = _entity(tmp_path)
     ws = ent / "workspace"
     ws.mkdir()
-    monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(ent))
-    monkeypatch.setenv("LEVAIN_DRIVE_MODE", mode)
-    state = SimpleNamespace(workspace=SimpleNamespace(working_dir=str(ws)))
-    assert policy_for_conv_state(state).deny_keychain is expected
+    binding = ConversationBinding.create(ent, mode=mode, workspace=ws)
+    # through the serialized form the tool spec carries, not just the in-memory object
+    carried = ConversationBinding.from_params(binding.to_params())
+    assert carried.floor.deny_keychain is expected
 
 
 def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:

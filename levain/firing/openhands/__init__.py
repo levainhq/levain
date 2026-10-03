@@ -17,7 +17,7 @@ from levain.firing.openhands.condenser import VagusCondenser
 from levain.firing.openhands.entity import (
     ENTITY_FIRING_KIND,
     EntityBinding,
-    bind_entity,
+    guard_entity,
     build_entity_agent,
 )
 from levain.firing.openhands.levain_condenser import LevainCondenser
@@ -31,7 +31,7 @@ __all__ = [
     "wrap_nudge",
     # the isolated-entity agent chokepoint (spore-277)
     "build_entity_agent",
-    "bind_entity",
+    "guard_entity",
     "EntityBinding",
     "ENTITY_FIRING_KIND",
 ]

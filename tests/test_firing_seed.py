@@ -13,16 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
 from levain.firing.presence import ReanchorRequest, build_presence
 from levain.firing.seed import SEED_SUBDIR, EntitySeed, SeedPresence, _clean
-
-
-@pytest.fixture(autouse=True)
-def _unbound_env(monkeypatch):
-    """Every test starts UNBOUND — no ambient $LEVAIN_ENTITY_DIR from another test. ("" reads as
-    unbound: resolve_entity_dir .strip()s it to falsy.)"""
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, "")
 
 
 def _seed_entity(
@@ -131,25 +123,18 @@ def test_reanchor_none_when_origin_absent(tmp_path):
 # --- resolution + isolation ---------------------------------------------------------
 
 
-def test_resolves_from_env_when_dir_unset(tmp_path, monkeypatch):
-    """A zero-arg EntitySeed (as build_presence rebuilds on fork) resolves the entity from
-    $LEVAIN_ENTITY_DIR — the fork-safe channel, never a frozen path."""
+def test_a_zero_arg_seed_reads_nothing_even_with_a_stale_process_env(tmp_path, monkeypatch):
+    """spore-438: a zero-arg EntitySeed has no entity — the retired $LEVAIN_ENTITY_DIR is not a
+    fallback (a fork rebuilds the presence WITH the entity the condenser serializes)."""
     ent = _seed_entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
-    assert (EntitySeed().constitution() or "").find("Coyote") >= 0
+    monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(ent))
+    assert EntitySeed().constitution() is None
 
 
 def test_unbound_is_fail_soft_none(tmp_path):
-    """No explicit dir + no env → None, never a raise (and never a fallback to some default store)."""
+    """No explicit dir → None, never a raise (and never a fallback to some default store)."""
     assert EntitySeed().constitution() is None
     assert EntitySeed().reanchor() is None
-
-
-def test_explicit_dir_wins_over_env(tmp_path, monkeypatch):
-    a = _seed_entity(tmp_path / "a", name="Anansi")
-    b = _seed_entity(tmp_path / "b", name="Coyote")
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(b))
-    assert "Anansi" in (EntitySeed(a).constitution() or "")
 
 
 def test_symlinked_seed_escaping_the_tree_is_refused(tmp_path):
@@ -472,10 +457,9 @@ def test_has_body_excludes_rules_and_fence_markers(tmp_path):
 # --- SeedPresence + the registry (serialization-safe reconstruction) ----------------
 
 
-def test_seed_presence_reanchors_from_env(tmp_path, monkeypatch):
+def test_seed_presence_reanchors_on_its_entity(tmp_path):
     ent = _seed_entity(tmp_path)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent))
-    out = SeedPresence().reanchor(ReanchorRequest())
+    out = SeedPresence(entity_dir=ent).reanchor(ReanchorRequest())
     assert out is not None
     assert "re-anchor" in out.lower() and "Coyote" in out
 

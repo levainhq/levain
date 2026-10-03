@@ -10,8 +10,11 @@ constructor, not a discipline scattered across call sites):
      operator-laptop flow store or escape ``<entity>/.levain/``;
   2. verify the dir is an INITIALIZED entity (has ``.levain/``) — a friendly error, not a cryptic
      store-open failure three turns in;
-  3. bind ``$LEVAIN_ENTITY_DIR`` — the serialization-safe channel the firing re-reads on fork, so
-     isolation survives ``fork()`` / reload (a zero-arg registry rebuild finds the entity via env);
+  3. latch the process as an entity process (:func:`~levain.firing.binding.mark_entity_process`), so a
+     stray DEFAULT-kind store op here refuses instead of reaching ``~/.anneal-memory``; the agent
+     itself carries its entity as data — its condenser serializes it and its hands' spec carries the
+     :class:`~levain.firing.binding.ConversationBinding` (spore-438) — so ``fork()`` / reload rebuild
+     the firing + presence on it, and nothing is looked up;
   4. build ``Agent(agent_context=vagus_agent_context(firing_kind="anneal_entity"),
      condenser=LevainCondenser.build(firing_kind="anneal_entity", ...))`` — EVERY firing/condenser
      uses the isolated kind, whose resolver has NO ``~/.anneal-memory/`` fallback, so the whole
@@ -36,12 +39,14 @@ from typing import Any
 from openhands.sdk import LLM, Agent, LLMSummarizingCondenser
 from openhands.sdk.context.condenser import CondenserBase
 
+from levain.firing.binding import BindingError, ConversationBinding, mark_entity_process
+from levain.firing.contract import build_firing
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
     assert_entity_isolated,
-    bind_entity,
     entity_store_paths,
+    guard_entity,
 )
 from levain.firing.openhands.agent import vagus_agent_context
 from levain.firing.openhands.levain_condenser import LevainCondenser
@@ -53,7 +58,7 @@ _log = logging.getLogger("levain.firing.openhands.entity")
 # fallback (see levain.firing.anneal.AnnealEntityFiring), so the whole agent stays sovereign.
 ENTITY_FIRING_KIND = "anneal_entity"
 
-__all__ = ["ENTITY_FIRING_KIND", "EntityBinding", "bind_entity", "build_entity_agent"]
+__all__ = ["ENTITY_FIRING_KIND", "EntityBinding", "build_entity_agent", "guard_entity"]
 
 
 @dataclass(frozen=True)
@@ -68,17 +73,23 @@ class EntityBinding:
     agent: Agent
 
     def capture_turn(self, conversation: object, *, session_id: str | None = None) -> None:
-        """Run + capture a completed turn to the ENTITY store, pinning ``firing_kind="anneal_entity"``.
+        """Run + capture a completed turn to THIS binding's entity store (an explicit
+        ``AnnealEntityFiring`` on ``self.entity_dir``).
 
         Use this — NOT a bare ``vagus_run(conv)``, whose default ``firing_kind="anneal"`` resolves to
         the laptop flow store ``~/.anneal-memory/`` (the capture WRITE-leak, apparatus F1). The binding
-        OWNS capture so the run loop can't wire an unisolated one; the pinned ``anneal_entity`` kind
+        OWNS capture so the run loop can't wire an unisolated one; the isolated firing
         re-guards the store PER OP (``AnnealEntityFiring``), so it stays isolated even if ``.levain``
-        is mutated after binding. (The entity-aware ``_env_*`` resolution also redirects a stray bare
-        ``vagus_run`` to the entity, re-guarded — belt-and-suspenders; this is the belt.)"""
+        is mutated after binding. (A stray bare ``vagus_run`` in an entity process REFUSES rather than
+        reach the laptop store — ``anneal._refuse_in_entity_process``; this is the path that works.)"""
+        from levain.firing.anneal import AnnealEntityFiring
         from levain.firing.openhands.capture import vagus_run
 
-        vagus_run(conversation, firing_kind=ENTITY_FIRING_KIND, session_id=session_id)
+        # spore-438: an EXPLICIT firing on this binding's own entity — an entity is carried, never
+        # looked up. The firing still re-guards its store per op.
+        vagus_run(
+            conversation, AnnealEntityFiring(entity_dir=self.entity_dir), session_id=session_id
+        )
 
     def wrap_nudge(self, *, threshold: int | None = None) -> str | None:
         """The SessionEnd wrap-nudge against THIS entity's episodic store (never flow's, apparatus
@@ -202,6 +213,25 @@ def _compose_constitution(seed_constitution: str | None, memory_block: str | Non
     return f"{seed_constitution}\n\n{memory_block}"
 
 
+def _require_tools_serve(tools: list[Any] | None, entity_dir: Path) -> None:
+    """Refuse hands bound to another entity. Checked once, at construction, against the one value
+    each side was built from — the agent is frozen afterwards, so there is nothing to re-check."""
+    from levain.firing.openhands.tools import LEVAIN_HANDS_TOOL
+
+    for spec in tools or ():
+        if getattr(spec, "name", None) != LEVAIN_HANDS_TOOL:
+            continue
+        try:
+            bound = ConversationBinding.from_params(getattr(spec, "params", {}).get("binding"))
+        except BindingError as exc:
+            raise IsolationError(f"the entity's hands carry no valid binding: {exc}") from exc
+        if bound.entity_dir.resolve() != entity_dir:
+            raise IsolationError(
+                f"the hands are bound to {bound.entity_dir} but this agent serves {entity_dir} — "
+                "refusing to build one conversation split across two entities (fail-closed)."
+            )
+
+
 def build_entity_agent(
     entity_dir: Path | str,
     llm: LLM,
@@ -214,7 +244,9 @@ def build_entity_agent(
 ) -> EntityBinding:
     """Build an isolated OpenHands ``Agent`` for the entity at ``entity_dir``, running on ``llm``.
 
-    Fail-closes on the sovereignty guard (via :func:`bind_entity`) BEFORE constructing anything.
+    Fail-closes on the sovereignty guard (via :func:`~levain.firing.isolation.guard_entity`) BEFORE
+    constructing anything, and refuses ``tools`` whose hands are bound to a DIFFERENT entity (one
+    conversation's floor and memory must serve the same entity).
     Every firing/condenser is wired with ``firing_kind="anneal_entity"`` — the isolated kind — so
     the agent recalls + captures ONLY under ``<entity>/.levain/`` and never touches flow's store,
     across fork/reload.
@@ -230,13 +262,16 @@ def build_entity_agent(
         fresh "who are you?" answers with the seed identity, not the model's stock "I am OpenHands". A
         bare ``.levain``-only entity (no seed) falls back to the firing's generic default constitution.
       - the **re-anchor** (``presence_kind="entity_seed"``, the default) re-asserts that identity at
-        recency on the post-compaction recovery turn (``SeedPresence``, resolved per-op from the bound
-        ``$LEVAIN_ENTITY_DIR`` — fork-safe like the store). Pass ``presence_kind="stub"`` to opt out.
+        recency on the post-compaction recovery turn (``SeedPresence`` on this entity, carried by the
+        condenser's serialized ``entity_dir`` — fork-safe like the store). Pass
+        ``presence_kind="stub"`` to opt out.
 
     The constitution rides a STRING baked into the AgentContext (fork-safe as data, so the per-turn
     firing kind need not carry it); the re-anchor rides the serializable ``presence_kind`` (rebuilt on
     fork). Both read only the ENTITY's own seed — never flow's fossil (isolation applies to the seed)."""
-    ed, crystal, episodic = bind_entity(entity_dir)
+    ed, crystal, episodic = guard_entity(entity_dir)
+    mark_entity_process()
+    _require_tools_serve(tools, ed)
     resolved_inner = (
         inner
         if inner is not None
@@ -274,7 +309,11 @@ def build_entity_agent(
     memory_block = _entity_continuity_block(ed) if seed_constitution is not None else None
     constitution = _compose_constitution(seed_constitution, memory_block)
     agent_ctx = vagus_agent_context(
-        firing_kind=ENTITY_FIRING_KIND, constitution=constitution
+        firing_kind=ENTITY_FIRING_KIND,
+        # spore-438: consulted only for a seedless entity's generic constitution — on THIS entity,
+        # not whatever the process-level channel names.
+        firing=build_firing(ENTITY_FIRING_KIND, entity_dir=str(ed)),
+        constitution=constitution,
     )
     # Pre-emptive act-first directive (bake-off 2026-07-17): bake the proven act-first prompt into the
     # system message so a task turn STARTS with a tool call instead of a plan-as-prose stall — the
@@ -304,6 +343,8 @@ def build_entity_agent(
             inner=resolved_inner,
             firing_kind=ENTITY_FIRING_KIND,
             presence_kind=presence_kind,
+            # spore-438: recall + re-anchor resolve THIS entity, not the process-global channel.
+            entity_dir=str(ed),
         ),
     )
     return EntityBinding(entity_dir=ed, crystal_path=crystal, episodic_path=episodic, agent=agent)

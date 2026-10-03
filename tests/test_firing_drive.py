@@ -13,9 +13,6 @@ import pytest
 
 from levain.firing.drive import (
     DRIVE_MODES,
-    LEVAIN_DRIVE_MODE_ENV,
-    bind_drive_mode,
-    current_drive_mode,
     human_present,
     resolve_cred_floor,
 )
@@ -68,83 +65,10 @@ def test_the_floor_does_NOT_collapse_headless_and_unattended() -> None:
     assert resolve_cred_floor(None, mode="headless") != resolve_cred_floor(None, mode="unattended")
 
 
-# --- the fork-safe channel ---------------------------------------------------------------------
-
-def test_bind_then_read_round_trips(monkeypatch) -> None:
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    bind_drive_mode("interactive")
-    assert current_drive_mode() == "interactive"
-    bind_drive_mode("unattended")
-    assert current_drive_mode() == "unattended"
-
-
-def test_unbound_fails_CLOSED_to_unattended(monkeypatch) -> None:
-    """The asymmetry, pinned: wrongly denying is a visible refusal fixed in one config line;
-    wrongly granting is a silent credential exposure on an unattended seat with nobody watching.
-    The only way this is unset in a real run is a WIRING failure, which must never widen the floor."""
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    assert current_drive_mode() == "unattended"
-    assert resolve_cred_floor(None, mode=current_drive_mode()) is True
-
-
-def test_a_garbage_env_value_also_fails_closed(monkeypatch) -> None:
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "INTERACTIVE!!")   # not a valid mode
-    assert current_drive_mode() == "unattended"
-
-
-# --- the widening-rebind refusal (codex L3 HIGH x2) --------------------------------------------
-
-def test_rebind_may_TIGHTEN_the_floor(monkeypatch) -> None:
-    """Nothing is exposed by denying more, so a tightening rebind is allowed."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    bind_drive_mode("interactive")
-    bind_drive_mode("unattended")          # must not raise
-    assert current_drive_mode() == "unattended"
-
-
-def test_rebind_may_NOT_WIDEN_the_floor(monkeypatch) -> None:
-    """The race codex found: this channel is process-global and the two floor enforcers read it at
-    DIFFERENT moments (each tool's own create()), both AFTER the session resolved its own value. In
-    a multi-session process a second session could flip it between those points and an unattended
-    session's tools would be built with an interactive floor — while its banner, resolved earlier,
-    still claimed the credentials were denied. Refusing the widening direction makes the race
-    HARMLESS rather than merely unlikely."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV, DriveModeConflict
-
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    bind_drive_mode("unattended")
-    for weaker in ("headless", "interactive"):
-        with pytest.raises(DriveModeConflict, match="STRICTER"):
-            bind_drive_mode(weaker)
-    assert current_drive_mode() == "unattended"     # binding unchanged by the refusal
-
-
-def test_rebinding_the_same_mode_is_idempotent(monkeypatch) -> None:
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    bind_drive_mode("unattended")
-    bind_drive_mode("unattended")
-    assert current_drive_mode() == "unattended"
-
-
-def test_a_failed_second_session_cannot_poison_the_binding(monkeypatch) -> None:
-    """codex: a second session that later FAILS to start still binds first. If that bind could
-    widen, the failure would leave the live unattended session exposed."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV, DriveModeConflict
-
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
-    bind_drive_mode("unattended")
-    with pytest.raises(DriveModeConflict):
-        bind_drive_mode("interactive")     # the doomed session's bind
-    assert resolve_cred_floor(None, mode=current_drive_mode()) is True
-
-
 def test_garbage_mode_denies_on_BOTH_halves_of_the_authority() -> None:
-    """`current_drive_mode` maps garbage to "unattended"; `resolve_cred_floor` must agree, or a
-    direct library caller with a typo'd mode gets "allowed" from one half and "denied" from the
-    other — one authority reporting two answers (codex L3 LOW)."""
+    """A binding refuses an unknown mode outright (`ConversationBinding.create`);
+    `resolve_cred_floor` must deny a garbage mode just the same, or a direct library caller with a
+    typo'd mode gets "allowed" from one half and "denied" from the other — one authority reporting
+    two answers (codex L3 LOW)."""
     assert resolve_cred_floor(None, mode="NONSENSE") is True
-    assert resolve_cred_floor(None, mode=current_drive_mode()) is True
+    assert resolve_cred_floor(None, mode="unattended") is True

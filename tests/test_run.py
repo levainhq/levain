@@ -506,11 +506,18 @@ def test_run_entity_refuses_residue_bearing_openhands_marker(tmp_path: Path, cap
 # a module-level importorskip would silently skip).
 
 
+def _hands(tools) -> list[str]:
+    """The hands one ``levain_hands`` spec grants (spore-438: both hands are ONE spec carrying the
+    binding, with ``with_bash`` deciding the second)."""
+    assert [t.name for t in tools] == ["levain_hands"]
+    return ["file_editor", "bash"] if tools[0].params["with_bash"] else ["file_editor"]
+
+
 @pytest.fixture
 def _clean_entity_env(monkeypatch):
-    from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
-
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
+    """No ambient entity state: the conftest latch reset covers $LEVAIN_ENTITY_PROCESS, and the retired
+    $LEVAIN_ENTITY_DIR is removed in case an outer shell still exports it."""
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
 
 
 def test_run_entity_returns_2_on_isolation_refusal(
@@ -558,7 +565,7 @@ def test_run_entity_passes_confined_tools_by_default(
     rc = run_entity(entity, with_tools=True)
     assert rc == 2
     assert captured["tools"] is not None
-    assert [t.name for t in captured["tools"]] == ["levain_file_editor", "levain_bash"]
+    assert _hands(captured["tools"]) == ["file_editor", "bash"]
 
 
 class _LocalhostProvider:
@@ -585,7 +592,7 @@ def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, with_tools=True) == 2
-    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+    assert _hands(captured["tools"]) == ["file_editor"]
 
 
 def test_run_entity_drops_bash_where_the_deny_cannot_make_a_network_namespace(
@@ -602,7 +609,7 @@ def test_run_entity_drops_bash_where_the_deny_cannot_make_a_network_namespace(
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, with_tools=True) == 2
-    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+    assert _hands(captured["tools"]) == ["file_editor"]
 
 
 def test_run_entity_keeps_bash_when_the_operator_opts_out_of_the_localhost_deny(
@@ -618,7 +625,7 @@ def test_run_entity_keeps_bash_when_the_operator_opts_out_of_the_localhost_deny(
     captured: dict = {}
     _spy_build_entity_agent(monkeypatch, captured)
     assert run_entity(entity, with_tools=True) == 2
-    assert [t.name for t in captured["tools"]] == ["levain_file_editor", "levain_bash"]
+    assert _hands(captured["tools"]) == ["file_editor", "bash"]
 
 
 def test_run_entity_drops_bash_without_an_os_sandbox(
@@ -633,7 +640,7 @@ def test_run_entity_drops_bash_without_an_os_sandbox(
     _spy_build_entity_agent(monkeypatch, captured)
     rc = run_entity(entity, with_tools=True)
     assert rc == 2
-    assert [t.name for t in captured["tools"]] == ["levain_file_editor"]
+    assert _hands(captured["tools"]) == ["file_editor"]
 
 
 def test_run_entity_no_tools_passes_none(
@@ -800,6 +807,14 @@ class _ReplBinding:
         return None
 
 
+class _ReplState:
+    """The conversation state surface the driver touches."""
+
+    def __init__(self) -> None:
+        self.events: list = []
+        self.agent_state: dict = {}
+
+
 class _ReplConversation:
     """A stand-in for the SDK Conversation that records every message it is SENT."""
 
@@ -807,7 +822,8 @@ class _ReplConversation:
 
     def __init__(self, _agent, workspace=None, visualizer=None) -> None:
         self.id = "conv-test"
-        self.state = types.SimpleNamespace(events=[], agent_state={})
+        self.state = _ReplState()
+        self.agent = types.SimpleNamespace(_initialized=False)
 
     def send_message(self, message) -> None:
         type(self).sent.append(message)

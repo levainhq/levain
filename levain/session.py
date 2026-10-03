@@ -63,7 +63,6 @@ from levain.firing.confinement import (
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
     DriveMode,
-    bind_drive_mode,
     human_present,
     resolve_cred_floor,
 )
@@ -72,6 +71,7 @@ from levain.firing.gate import (
     PendingEfferent,
     resolve_gate_mode,
 )
+from levain.firing.binding import BindingError, ConversationBinding, mark_entity_process
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -278,25 +278,17 @@ class TurnResult:
 
 
 def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
-    """Publish the drive mode on the fork-safe channel AND resolve the cred floor from it.
-
-    **One function on purpose, because the two must not drift.** The crown-jewels floor has one
-    policy and two enforcers: the bash seatbelt is rendered from the value this RETURNS, while the
-    file-editor policy is rebuilt PER CALL outside the session (fork-safety) and reads the mode
-    back off ``$LEVAIN_DRIVE_MODE``. Bind without resolving and bash gets the wrong floor; resolve
-    without binding and the FILE EDITOR does — and the file editor is the ``view`` path, i.e. the
-    afferent read the unattended cred floor exists to close. Two adjacent statements held together
-    by a comment is exactly how that drifts, so they are one call with one test.
+    """The banner's cred floor for ``mode`` — the same value the conversation's tools resolve.
 
     Resolving through :func:`~levain.firing.drive.resolve_cred_floor` rather than reading
     ``cfg.deny_standard_creds`` directly is load-bearing: the field is a TRI-STATE whose ``None``
     means "derive from the drive", so a raw read silently treats an UNDECLARED entity as opted-OUT
-    and reinstates the exact hole this closes.
+    and reinstates the exact hole this closes. (Until 2026-10-02 this also published the mode on
+    ``$LEVAIN_DRIVE_MODE``; that channel is retired — see :mod:`levain.firing.drive`.)
 
-    ``cfg`` is ``None`` for a ``--no-tools`` session; the mode is still published (nothing else
-    would) and the floor still resolves, harmlessly, for hands that do not exist.
+    ``cfg`` is ``None`` for a ``--no-tools`` session; the floor still resolves, harmlessly, for hands
+    that do not exist.
     """
-    bind_drive_mode(mode)
     return resolve_cred_floor(
         cfg.deny_standard_creds if cfg is not None else None, mode=mode
     )
@@ -556,6 +548,12 @@ class EntitySession:
                 f"  ({exc})"
             ) from exc
 
+        # Before any construction (only the import check above precedes it): this process now hosts
+        # an entity, so a stray DEFAULT-kind store op anywhere in it refuses rather than reach
+        # ~/.anneal-memory (spore-438; a one-way latch, so a failed start that set it can only make
+        # such an op refuse).
+        mark_entity_process()
+
         # Quiet the SDK's own INFO/WARNING chatter + litellm's cost warnings, so the banner's
         # clean-output promise holds; real ERRORs still surface.
         for noisy in ("openhands", "LiteLLM", "litellm"):
@@ -568,6 +566,10 @@ class EntitySession:
         #   - it fires AGAIN after mkdir (codex L3 TOCTOU — mkdir(exist_ok=True) follows a
         #     symlink swapped in after the first assert, so the invariant fires at USE);
         #   - a bad --model/--base-url is a usage error → clean exit 2, not a raw traceback.
+        # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`, which
+        # under-declares the concrete `send_message` / `state` surface.
+        conversation: Any = None
+        started = False
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -584,9 +586,6 @@ class EntitySession:
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
-            # Publish the drive mode AND resolve the cred floor — ONE call, because the two must
-            # not drift (see `_apply_drive_policy`). Must run BEFORE any tool policy is built.
-            deny_standard_creds = _apply_drive_policy(cfg, mode)
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
             allow_container_sockets = cfg.allow_container_sockets if cfg is not None else False
@@ -597,9 +596,23 @@ class EntitySession:
             if bash_ok and cfg is not None:
                 bash_ok, bash_refusal, bash_offline = resolve_localhost_deny(
                     cfg.allow_localhost_outbound)
-            entity_tools = build_entity_tools(with_bash=bash_ok) if with_tools else None
-            binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             workspace = entity_dir / WORKSPACE_SUBDIR
+            # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
+            # config read above and carried into both hands as data (the tool spec). Nothing in
+            # this process can move it afterwards; another session's binding is another object.
+            conv_binding = (
+                ConversationBinding.create(
+                    entity_dir, mode=mode, workspace=workspace, config=cfg
+                )
+                if cfg is not None
+                else None
+            )
+            entity_tools = (
+                build_entity_tools(conv_binding, with_bash=bash_ok)
+                if conv_binding is not None
+                else None
+            )
+            binding = build_entity_agent(entity_dir, llm, tools=entity_tools)
             assert_workspace_isolated(workspace, entity_dir=entity_dir)
             workspace.mkdir(parents=True, exist_ok=True)
             assert_workspace_isolated(workspace, entity_dir=entity_dir)
@@ -614,9 +627,7 @@ class EntitySession:
                 conv_kwargs["callbacks"] = [_activity_callback(on_event, workspace)]
             if max_iterations is not None:
                 conv_kwargs["max_iteration_per_run"] = max_iterations
-            # `Any`: the SDK types `Conversation(...)` as the abstract `BaseConversation`,
-            # which under-declares the concrete `send_message` / `state` surface.
-            conversation: Any = Conversation(binding.agent, **conv_kwargs)
+            conversation = Conversation(binding.agent, **conv_kwargs)
 
             # The EFFERENT GATE (K3), armed on the live conversation — and this is the LAST step
             # of construction on purpose: it needs the conversation, and a session that reached
@@ -632,6 +643,13 @@ class EntitySession:
                 arm_efferent_gate(conversation)
             else:
                 disarm_efferent_gate(conversation)
+            # The banner prints the floor the hands enforce: the binding's resolved value.
+            deny_standard_creds = (
+                conv_binding.deny_standard_creds
+                if conv_binding is not None
+                else _apply_drive_policy(cfg, mode)
+            )
+            started = True
         except GateArmingError as exc:
             # Its OWN handler, ABOVE the generic one: a gate that will not arm must never be
             # reported as "check --model / --base-url", which would send the operator hunting a
@@ -641,6 +659,13 @@ class EntitySession:
                 f"the efferent gate could not be armed — refusing to start:\n  {exc}\n"
                 f"  This entity is configured to gate efferent actions "
                 f"(.levain/confinement.json → efferent_gate), and the runtime did not accept it."
+            ) from exc
+        except BindingError as exc:
+            # ABOVE the generic handler: a binding that cannot be built is not a model/endpoint
+            # problem, it is a session whose floor could not be resolved.
+            raise SessionStartError(
+                f"the session's floor could not be bound to its conversation — refusing to start:"
+                f"\n  {exc}"
             ) from exc
         except IsolationError as exc:
             raise SessionStartError(
@@ -656,6 +681,17 @@ class EntitySession:
                 f"could not start the entity ({exc}).\n"
                 f"  Check --model / --base-url (default: an open model via local Ollama)."
             ) from exc
+        finally:
+            # A start that failed AFTER the conversation was built must not abandon it: the SDK
+            # registers each conversation's close() with atexit, so a refused open would otherwise
+            # live until process exit (L3 2026-10-02, three seats). Best-effort; the start error wins.
+            if not started and conversation is not None:
+                try:
+                    conversation.close()
+                except Exception:  # noqa: BLE001
+                    logging.getLogger("levain.session").warning(
+                        "closing a conversation from a failed start raised", exc_info=True
+                    )
 
         return cls(
             entity_dir=entity_dir,

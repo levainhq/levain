@@ -10,6 +10,8 @@ Guarded on the ``openhands`` extra — skips cleanly where it's absent (levain's
 """
 from __future__ import annotations
 
+import os
+
 from pathlib import Path
 
 import pytest
@@ -19,12 +21,13 @@ pytest.importorskip("openhands.sdk", reason="openhands.sdk not importable (openh
 from openhands.sdk import LLM  # noqa: E402
 
 from levain.firing import build_firing  # noqa: E402
-from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV, IsolationError, flow_store_dir  # noqa: E402
+from levain.firing.binding import LEVAIN_ENTITY_PROCESS_ENV, ConversationBinding  # noqa: E402
+from levain.firing.isolation import IsolationError, flow_store_dir  # noqa: E402
 from levain.firing.openhands import (  # noqa: E402
     ENTITY_FIRING_KIND,
     EntityBinding,
-    bind_entity,
     build_entity_agent,
+    guard_entity,
 )
 from levain.firing.openhands.levain_condenser import LevainCondenser  # noqa: E402
 
@@ -58,6 +61,15 @@ def _seed(entity_dir: Path, *, name: str = "Coyote", operator: str = "Avery Lane
     return entity_dir
 
 
+def _hands(ent: Path, *, mode: str = "interactive") -> list:
+    """The entity's confined hands, built the way the session builds them: from ONE binding."""
+    from levain.firing.openhands.tools import build_entity_tools
+
+    return build_entity_tools(
+        ConversationBinding.create(ent, mode=mode, workspace=ent / "workspace")  # type: ignore[arg-type]
+    )
+
+
 def _stub_llm() -> LLM:
     # Builds with no network — an Ollama endpoint config, never called by these tests.
     return LLM(model="ollama/nemotron-3-ultra:cloud", base_url="http://localhost:11434", usage_id="entity-test")
@@ -65,84 +77,92 @@ def _stub_llm() -> LLM:
 
 @pytest.fixture(autouse=True)
 def _track_entity_env(monkeypatch):
-    """Clean, UNBOUND slate for every entity test. bind_entity writes $LEVAIN_ENTITY_DIR directly
-    (its process binding); the $VAGUS_* keys are the legacy "anneal"-kind overrides that the entity-
-    aware _env_* consults as a FALLBACK — clear all three so a leak from another test can't skew
-    resolution. Set to "" (not delenv): setenv ALWAYS records an undo, whereas delenv of an already-
-    absent key is skipped by pytest and would leak bind_entity's later $LEVAIN_ENTITY_DIR write into
-    the next file. "" reads as UNBOUND everywhere (.strip() → falsy); teardown deletes the keys."""
-    for key in (LEVAIN_ENTITY_DIR_ENV, "VAGUS_EPISODIC_PATH", "VAGUS_CRYSTAL_PATH"):
+    """Clean slate for every entity test: the $VAGUS_* keys are the legacy "anneal"-kind overrides,
+    and $LEVAIN_ENTITY_DIR is the retired process channel (cleared in case an outer shell exports
+    it). The entity-process latch is reset by conftest. Set to "" (not delenv): setenv ALWAYS
+    records an undo."""
+    for key in ("LEVAIN_ENTITY_DIR", "VAGUS_EPISODIC_PATH", "VAGUS_CRYSTAL_PATH"):
         monkeypatch.setenv(key, "")
 
 
-# --- bind_entity: the fail-closed guard ---------------------------------------------
+# --- guard_entity: the fail-closed guard ---------------------------------------------
 
 
-def test_bind_entity_returns_resolved_stores_and_binds_env(tmp_path):
-    import os
-
+def test_guard_entity_returns_resolved_stores_and_writes_no_process_state(tmp_path):
     ent = _entity(tmp_path)
-    ed, crystal, episodic = bind_entity(ent)
+    ed, crystal, episodic = guard_entity(ent)
     assert ed == ent.resolve()
     assert crystal == (ent / ".levain" / "memory.crystal.json").resolve()
     assert episodic == (ent / ".levain" / "memory.db").resolve()
-    assert os.environ[LEVAIN_ENTITY_DIR_ENV] == str(ent.resolve())  # the fork-safe binding is set
-    # NO $VAGUS_* backstop is written — the "anneal"-kind default is entity-aware + re-guarded per op
-    # instead (a runtime guard, not a cached bind-time path — codex round-2).
+    # spore-438: an entity is carried by the objects that serve it, never published to the process.
+    assert os.environ.get("LEVAIN_ENTITY_DIR", "") == ""
+    assert os.environ.get(LEVAIN_ENTITY_PROCESS_ENV) is None
     assert os.environ.get("VAGUS_EPISODIC_PATH", "") == ""
 
 
-def test_bound_process_default_anneal_kind_resolves_to_entity(tmp_path):
-    """After bind_entity, the laptop-defaulting "anneal" kind resolves to the ENTITY (not flow), via
-    the entity-aware _env_* — so a stray bare vagus_run/wrap_nudge in the entity process can't leak
-    (F1/F2), and it's re-guarded PER OP (a runtime guard, not a cached path — codex round-2)."""
-    from levain.firing.anneal import AnnealFiring, _env_episodic_path
+def test_an_entity_process_refuses_every_default_kind_store_op(tmp_path, monkeypatch):
+    """spore-438 §6 (Phill 2026-10-02, "approve levain design"): once a process has built an entity
+    agent, the laptop-defaulting "anneal" kind REFUSES — a stray bare vagus_run / wrap_nudge can
+    neither read nor write ~/.anneal-memory, and is never redirected to an entity (the latch names
+    none, so two entities in one process change nothing). An explicit entity firing is unaffected."""
 
-    ent = _entity(tmp_path)
-    _, _, episodic = bind_entity(ent)
-    assert _env_episodic_path() == episodic              # the "anneal" default now → the entity
-    assert AnnealFiring()._resolve_episodic_path() == episodic
+    from levain.firing import CaptureRequest
+    from levain.firing.anneal import AnnealEntityFiring, AnnealFiring, _env_episodic_path
 
+    import levain.firing.anneal as anneal_mod
 
-def test_env_default_reguards_per_op_on_post_bind_escape(tmp_path):
-    """The entity-aware _env_* RE-GUARDS at USE time: bind a good entity, then swap .levain to escape
-    the tree → _env_episodic_path RAISES (not a cached bind-time pass). Callers wrap it fail-soft."""
-    from levain.firing.anneal import _env_episodic_path
-
-    ent = _entity(tmp_path)
-    bind_entity(ent)  # binds $LEVAIN_ENTITY_DIR; .levain is a real dir → passes
-    # now relocate .levain OUT of the entity tree (post-bind FS mutation)
-    (ent / ".levain").rmdir()
-    (ent / ".levain").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
-    (tmp_path / "elsewhere").mkdir()
-    with pytest.raises(IsolationError, match="escapes the entity root"):
-        _env_episodic_path()  # re-derived + re-guarded → refuses the escaped store
-
-
-def test_bind_entity_refuses_rebind_to_different_entity(tmp_path):
-    """Single-entity-per-process: a second bind to a DIFFERENT initialized entity is refused
-    (the entity↔entity cross-wire, apparatus L1/complement). Idempotent same-entity re-bind is OK."""
+    # The defaults are frozen at import (real HOME), so point them at a tmp "flow store" — otherwise
+    # the "never created" check below would look at a path the op never could have used.
+    fake_flow = tmp_path / ".anneal-memory"
+    monkeypatch.setattr(anneal_mod, "DEFAULT_EPISODIC_PATH", fake_flow / "memory.db")
+    monkeypatch.setattr(anneal_mod, "DEFAULT_CRYSTAL_PATH", fake_flow / "memory.crystal.json")
     a = _entity(tmp_path, "entity_a")
     b = _entity(tmp_path, "entity_b")
-    bind_entity(a)
-    bind_entity(a)  # idempotent — same entity, no raise
-    with pytest.raises(IsolationError, match="already bound to a different entity"):
-        bind_entity(b)
+    assert AnnealFiring()._resolve_episodic_path() == fake_flow / "memory.db"  # not latched yet
+    build_entity_agent(a, _stub_llm())
+    build_entity_agent(b, _stub_llm())
+    assert os.environ[LEVAIN_ENTITY_PROCESS_ENV] == "1"
+    with pytest.raises(IsolationError, match="hosts a Levain entity"):
+        _env_episodic_path()
+    with logging_capture() as records:
+        assert AnnealFiring().capture(CaptureRequest(content="must never reach flow")) is False
+    assert any("episode LOST" in r.getMessage() for r in records)
+    assert not (fake_flow / "memory.db").exists()                    # flow's store never created
+    for ent in (a, b):                                               # each explicit entity: its own
+        got = AnnealEntityFiring(entity_dir=ent)._resolve_episodic_path()
+        assert got.parent == (ent / ".levain").resolve()
 
 
-def test_bind_entity_rejects_uninitialized_dir(tmp_path):
+class logging_capture:
+    """Collect WARNING+ records from levain.firing.anneal for the duration of a block."""
+
+    def __enter__(self):
+        import logging
+
+        self.records: list = []
+        self._h = logging.Handler(level=logging.WARNING)
+        self._h.emit = self.records.append  # type: ignore[method-assign]
+        self._log = logging.getLogger("levain.firing.anneal")
+        self._log.addHandler(self._h)
+        return self.records
+
+    def __exit__(self, *exc):
+        self._log.removeHandler(self._h)
+
+
+def test_guard_entity_rejects_uninitialized_dir(tmp_path):
     """A dir with no .levain/ isn't an entity — fail loud, not a cryptic store-open failure later."""
     with pytest.raises(IsolationError, match="not an initialized Levain entity"):
-        bind_entity(tmp_path / "never-init'd")
+        guard_entity(tmp_path / "never-init'd")
 
 
-def test_bind_entity_rejects_dir_inside_flow_store(tmp_path, monkeypatch):
+def test_guard_entity_rejects_dir_inside_flow_store(tmp_path, monkeypatch):
     """An entity dir UNDER the flow store would derive stores inside ~/.anneal-memory/ — refused."""
     monkeypatch.setenv("HOME", str(tmp_path))
     inside = flow_store_dir() / "sneaky-entity"
     (inside / ".levain").mkdir(parents=True)
     with pytest.raises(IsolationError, match="operator-laptop flow store"):
-        bind_entity(inside)
+        guard_entity(inside)
 
 
 # --- build_entity_agent: the isolated agent -----------------------------------------
@@ -157,15 +177,12 @@ def test_confined_file_tool_lands_on_the_built_agent(tmp_path):
     still green. This asserts the resolved runtime tool, so that regression fails LOUD."""
     from openhands.sdk import Conversation
 
-    from levain.firing.openhands.tools import (
-        CrownJewelsFileEditorExecutor,
-        build_entity_tools,
-    )
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
 
     ent = _seed(_entity(tmp_path))
     ws = ent / "workspace"
     ws.mkdir()
-    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    binding = build_entity_agent(ent, _stub_llm(), tools=_hands(ent))
     conv = Conversation(binding.agent, workspace=str(ws), visualizer=None)
     try:
         conv.agent.init_state(conv._state, on_event=lambda _e: None)  # resolves tools, no LLM call
@@ -357,10 +374,8 @@ def test_neocortex_injection_fail_soft_on_non_utf8(tmp_path):
 def test_act_first_directive_injected_when_the_entity_has_tools(tmp_path):
     """Pre-emptive act-first fix (bake-off 2026-07-17): a tool-having entity's system message carries
     the act-first directive, so a task turn starts with a tool call, not a plan-as-prose stall."""
-    from levain.firing.openhands.tools import build_entity_tools
-
     ent = _seed(_entity(tmp_path))
-    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    binding = build_entity_agent(ent, _stub_llm(), tools=_hands(ent))
     suffix = binding.agent.agent_context.system_message_suffix or ""
     assert "ACT, don't narrate" in suffix
     assert "Coyote" in suffix  # …still after the seed identity, not replacing it
@@ -379,10 +394,8 @@ def test_act_first_directive_injected_for_a_seedless_but_tooled_entity(tmp_path)
     still has tools (it boots the generic default constitution) must get it too. The old
     `constitution is not None` gate skipped this path, so a seedless+tooled run silently lost the
     pre-emptive half of the fix and leaned on the run-loop backstop alone."""
-    from levain.firing.openhands.tools import build_entity_tools
-
     ent = _entity(tmp_path)  # .levain but NO seed/ → generic default constitution
-    binding = build_entity_agent(ent, _stub_llm(), tools=build_entity_tools())
+    binding = build_entity_agent(ent, _stub_llm(), tools=_hands(ent))
     suffix = binding.agent.agent_context.system_message_suffix or ""
     assert "ACT, don't narrate" in suffix
 
@@ -402,16 +415,31 @@ def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_
     assert "Your Memory — carried from your prior sessions" not in suffix
 
 
-def test_built_agents_firing_resolves_to_entity_store(tmp_path):
-    """The isolation carries THROUGH the built agent: with the binding env set, the agent's firing
-    kind rebuilds (as a fork would) to an AnnealEntityFiring resolving to the ENTITY crystal — never
-    the laptop default."""
+def test_built_agents_firing_resolves_to_entity_store(tmp_path, monkeypatch):
+    """The isolation carries THROUGH the built agent AND a fork: the condenser serializes its kind AND
+    its entity (spore-438), so the serialize→validate round-trip a fork performs rebuilds an
+    AnnealEntityFiring + SeedPresence on THIS entity — and a rebuild with no entity carried has no
+    store at all (there is no process-level entity to fall back to)."""
     ent = _entity(tmp_path)
-    build_entity_agent(ent, _stub_llm())  # sets $LEVAIN_ENTITY_DIR
+    binding = build_entity_agent(ent, _stub_llm())
 
-    firing = build_firing(ENTITY_FIRING_KIND)  # the zero-arg rebuild a fork performs
+    cond = binding.agent.condenser
+    forked = type(cond).model_validate(cond.model_dump())  # the round-trip fork/reload performs
+    firing = forked._firing
     assert type(firing).__name__ == "AnnealEntityFiring"
     assert firing._resolve_crystal_path() == (ent / ".levain" / "memory.crystal.json").resolve()
+    assert Path(forked._presence.entity_dir).resolve() == ent.resolve()
+    with pytest.raises(IsolationError, match="no entity given"):
+        build_firing(ENTITY_FIRING_KIND)._resolve_crystal_path()
+
+
+def test_hands_bound_to_another_entity_are_refused(tmp_path):
+    """One conversation's floor and memory serve ONE entity: hands built from entity B's binding
+    cannot be put on entity A's agent (its condenser would recall A while the floor fenced B)."""
+    a = _entity(tmp_path, "entity_a")
+    b = _entity(tmp_path, "entity_b")
+    with pytest.raises(IsolationError, match="split across two entities"):
+        build_entity_agent(a, _stub_llm(), tools=_hands(b))
 
 
 def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
@@ -425,18 +453,23 @@ def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
 
 
 def test_capture_turn_pins_entity_kind(tmp_path, monkeypatch):
-    """binding.capture_turn drives vagus_run with firing_kind='anneal_entity' (NOT vagus_run's
-    laptop-defaulting 'anneal' default) — the owned, correct-by-construction capture path (F1)."""
+    """binding.capture_turn drives vagus_run with an explicit ISOLATED firing on the binding's own
+    entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; spore-438: carried, never
+    looked up)."""
     import levain.firing.openhands.capture as capmod
+    from levain.firing.anneal import AnnealEntityFiring
 
     ent = _entity(tmp_path)
     binding = build_entity_agent(ent, _stub_llm())
     seen: dict = {}
-    monkeypatch.setattr(capmod, "vagus_run", lambda conv, **kw: seen.update(conv=conv, **kw))
+    monkeypatch.setattr(
+        capmod, "vagus_run", lambda conv, firing=None, **kw: seen.update(conv=conv, firing=firing, **kw)
+    )
     sentinel_conv = object()
     binding.capture_turn(sentinel_conv, session_id="s1")
     assert seen["conv"] is sentinel_conv
-    assert seen["firing_kind"] == ENTITY_FIRING_KIND == "anneal_entity"
+    assert isinstance(seen["firing"], AnnealEntityFiring)
+    assert seen["firing"]._resolve_episodic_path().parent == (ent / ".levain").resolve()
     assert seen["session_id"] == "s1"
 
 
@@ -448,8 +481,8 @@ def test_binding_wrap_nudge_reads_entity_never_flow(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HOME", str(tmp_path))  # fresh empty flow-store home
     ent = _entity(tmp_path)
-    binding = build_entity_agent(ent, _stub_llm())  # binds env
-    f = AnnealEntityFiring()  # env-bound → the entity store
+    binding = build_entity_agent(ent, _stub_llm())
+    f = AnnealEntityFiring(entity_dir=ent)  # the entity store, carried explicitly
     for i in range(4):
         f.capture(CaptureRequest(content=f"entity episode {i}", source="vagus"))
     out = binding.wrap_nudge(threshold=3)

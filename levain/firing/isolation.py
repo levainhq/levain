@@ -37,7 +37,6 @@ import os
 from pathlib import Path
 
 __all__ = [
-    "LEVAIN_ENTITY_DIR_ENV",
     "ENTITY_STORE_SUBDIR",
     "IsolationError",
     "flow_store_dir",
@@ -46,15 +45,8 @@ __all__ = [
     "assert_entity_isolated",
     "assert_workspace_isolated",
     "assert_path_within_workspace",
-    "bind_entity",
+    "guard_entity",
 ]
-
-# The serialization-safe binding channel: the entity's ROOT dir. Read per-inject/-capture by
-# ``AnnealEntityFiring`` (re-read, never frozen), so it survives a fork/reload — the ONE channel
-# that round-trips a zero-arg registry rebuild, exactly as the legacy ``VAGUS_CRYSTAL_PATH``
-# override does. ``levain run`` / :func:`~levain.firing.openhands.entity.build_entity_agent`
-# set it (the process owns exactly one entity).
-LEVAIN_ENTITY_DIR_ENV = "LEVAIN_ENTITY_DIR"
 
 # The per-entity substrate dir (matches ``doctor._check_store`` / ``dashboard`` / ``install``).
 ENTITY_STORE_SUBDIR = ".levain"
@@ -92,24 +84,19 @@ def entity_store_paths(entity_dir: Path | str) -> tuple[Path, Path]:
 
 
 def resolve_entity_dir(explicit: Path | str | None = None) -> Path:
-    """The bound entity root: ``explicit`` if given, else ``$LEVAIN_ENTITY_DIR``.
+    """The entity root a firing serves: ``explicit``, which the session path always passes.
 
-    Raises :class:`IsolationError` if NEITHER is available — an isolated firing with no bound
-    entity FAILS CLOSED (no store) rather than falling back to a default, because the only
-    conceivable default is the operator-laptop store this module exists to refuse."""
-    raw = (
-        str(explicit)
-        if explicit is not None
-        else os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    )
+    Raises :class:`IsolationError` when there is none — an isolated firing with no entity FAILS
+    CLOSED (no store) rather than falling back to a default, because the only conceivable default is
+    the operator-laptop store this module exists to refuse. There is no process-level entity channel
+    to fall back to (spore-438: an entity is carried by the object being served, never looked up)."""
+    raw = str(explicit).strip() if explicit is not None else ""
     if not raw:
         raise IsolationError(
-            f"no entity bound: set ${LEVAIN_ENTITY_DIR_ENV} (or pass entity_dir) — an isolated "
-            "entity firing has NO default store (refusing to fall back to the operator-laptop "
-            "flow store ~/.anneal-memory/)."
+            "no entity given — an isolated entity firing has NO default store (refusing to fall "
+            "back to the operator-laptop flow store ~/.anneal-memory/). Pass entity_dir."
         )
     return Path(raw).expanduser()
-
 
 def _is_within(path: Path, root: Path) -> bool:
     """True iff ``path`` is ``root`` or lives under it. Both are assumed already-resolved."""
@@ -251,24 +238,12 @@ def assert_path_within_workspace(path: Path | str, *, workspace_root: Path | str
         )
 
 
-def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
-    """Resolve + GUARD an entity dir, then bind ``$LEVAIN_ENTITY_DIR`` (the process's single-entity
-    binding). Returns ``(entity_dir, crystal_path, episodic_path)`` — all resolved.
+def guard_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
+    """Resolve + GUARD an entity dir. Returns ``(entity_dir, crystal_path, episodic_path)``, all resolved.
 
-    Raises :class:`IsolationError` if the dir is not an initialized entity or the derived stores would
-    escape isolation. PURE — only ``os`` + this module's guard, NO anneal / NO openhands — so the
-    ``levain run`` CLI (and any non-SDK caller) can bind + display paths WITHOUT the openhands extra.
-    It lives HERE, not in the openhands adapter, precisely so that promise is true (apparatus codex
-    round-2).
-
-    The env write is the single-entity-per-process contract: this process owns exactly one entity, and
-    a second bind to a DIFFERENT initialized entity is REFUSED (the entity↔entity cross-wire — the
-    firing re-reads ``$LEVAIN_ENTITY_DIR`` every op, so a silent rebind would swap the first agent's
-    store on its next turn). Idempotent re-bind to the same entity is fine; a leftover empty / non-dir
-    value is not a live binding. NO ``$VAGUS_*`` backstop is written — the ``"anneal"``-kind default
-    resolution is itself entity-aware + re-guarded PER OP when ``$LEVAIN_ENTITY_DIR`` is set
-    (``anneal._env_*`` → ``_entity_env_path``), so a stray bare ``vagus_run`` / ``wrap_nudge`` in the
-    entity process resolves to the entity at USE time — a runtime guard, not a cached bind-time path."""
+    Raises :class:`IsolationError` if the dir is not an initialized entity or its derived stores would
+    escape isolation. It writes NO process state: the entity is then carried by the objects that serve
+    it (:class:`~levain.firing.binding.ConversationBinding`, the condenser's ``entity_dir``)."""
     ed = Path(entity_dir).expanduser().resolve()
     if not (ed / ENTITY_STORE_SUBDIR).is_dir():
         raise IsolationError(
@@ -276,14 +251,5 @@ def bind_entity(entity_dir: Path | str) -> tuple[Path, Path, Path]:
             "Run `levain init --adapter openhands` in it first."
         )
     crystal, episodic = entity_store_paths(ed)
-    assert_entity_isolated(crystal, episodic, entity_dir=ed)  # loud, BEFORE binding
-    existing = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    if existing:
-        existing_path = Path(existing).expanduser()
-        if existing_path.is_dir() and existing_path.resolve() != ed:
-            raise IsolationError(
-                f"this process is already bound to a different entity ({existing_path.resolve()}); "
-                f"refusing to rebind to {ed}. One process hosts one entity — start a new process."
-            )
-    os.environ[LEVAIN_ENTITY_DIR_ENV] = str(ed)  # the serialization-safe binding (re-read per op)
+    assert_entity_isolated(crystal, episodic, entity_dir=ed)
     return ed, crystal, episodic

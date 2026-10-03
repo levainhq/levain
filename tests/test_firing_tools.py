@@ -21,7 +21,6 @@ import pytest
 pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
 pytest.importorskip("openhands.tools.terminal", reason="openhands extra absent")
 
-from openhands.sdk.tool import Tool  # noqa: E402
 from openhands.tools.file_editor import FileEditorTool  # noqa: E402
 from openhands.tools.file_editor.definition import FileEditorAction  # noqa: E402
 from openhands.tools.terminal.definition import TerminalAction  # noqa: E402
@@ -32,16 +31,16 @@ from levain.firing.confinement import (  # noqa: E402
     confinement_supported,
     crown_jewel_reason,
 )
-from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV  # noqa: E402
+from levain.firing.binding import BindingError, ConversationBinding  # noqa: E402
 from levain.firing.openhands.tools import (  # noqa: E402
-    LEVAIN_BASH_TOOL,
-    LEVAIN_FILE_EDITOR_TOOL,
+    LEVAIN_HANDS_TOOL,
     CrownJewelsFileEditorExecutor,
     LevainBashTool,
     LevainFileEditorTool,
+    LevainHands,
     SandboxedBashExecutor,
+    _SharedFloor,
     build_entity_tools,
-    policy_for_conv_state,
 )
 
 _needs_sandbox = pytest.mark.skipif(
@@ -51,10 +50,9 @@ _needs_sandbox = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _clean_entity_env(monkeypatch):
-    # policy_for_conv_state falls back to <workspace>/.. when $LEVAIN_ENTITY_DIR is unset; clear a
-    # leaked env from another test so the derived entity dir is deterministic (the fakes put the
-    # entity at <workspace>/..).
-    monkeypatch.delenv(LEVAIN_ENTITY_DIR_ENV, raising=False)
+    # The retired process channel, cleared in case an outer shell still exports it: nothing may
+    # read it, and a test that set it would be testing nothing.
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
 
 
 # --- fakes: the minimal conv_state surface the tools' .create touches ------------------------
@@ -75,18 +73,13 @@ class _FakeWorkspace:
 
 
 class _FakeConvState:
-    # `id` mirrors the real ConversationState (a required UUID) — the floor registry keys on the
-    # CONVERSATION, so a fake without one would silently fall back to object identity and hide
-    # whether create() actually shares.
-    _n = 0
+    """The conv_state surface the stock tools' ``create`` reads (workspace + agent.llm). It carries
+    NO binding: since spore-438 the floor reaches the hands as data, never from the state."""
 
-    def __init__(self, wd: Path, conv_id: str | None = None) -> None:
+    def __init__(self, wd: Path) -> None:
         self.workspace = _FakeWorkspace(wd)
         self.agent = _FakeAgent()
-        if conv_id is None:
-            type(self)._n += 1
-            conv_id = f"fake-conv-{type(self)._n}"
-        self.id = conv_id
+        self.agent_state: dict = {}
 
 
 def _entity(tmp_path: Path) -> tuple[Path, Path]:
@@ -98,54 +91,104 @@ def _entity(tmp_path: Path) -> tuple[Path, Path]:
     return ent, ws
 
 
+def _binding(ws: Path, *, mode: str = "unattended", entity: Path | None = None) -> ConversationBinding:
+    """The binding the session would create for an entity at ``<ws>/..`` (or ``entity``)."""
+    return ConversationBinding.create(
+        entity if entity is not None else ws.parent, mode=mode, workspace=ws  # type: ignore[arg-type]
+    )
+
+
+def _policy(ws: Path, **kw):
+    """The floor both hands get: the binding's, through the serialized form the tool spec carries."""
+    return ConversationBinding.from_params(_binding(ws, **kw).to_params()).floor
+
+
+def _floor(ws: Path, **kw) -> _SharedFloor:
+    return _SharedFloor(_policy(ws, **kw))
+
+
 # --- the bundle + registration ---------------------------------------------------------------
 
 
-def test_build_entity_tools_bundle_is_editor_plus_bash():
-    both = build_entity_tools()
-    assert [t.name for t in both] == [LEVAIN_FILE_EDITOR_TOOL, LEVAIN_BASH_TOOL]
-    assert all(isinstance(t, Tool) for t in both)
-    # --with_bash=False (no OS sandbox on the platform) drops bash, keeps the file editor — NEVER an
-    # unconfined shell as a fallback.
-    editor_only = build_entity_tools(with_bash=False)
-    assert [t.name for t in editor_only] == [LEVAIN_FILE_EDITOR_TOOL]
+def test_build_entity_tools_bundle_is_one_hands_spec_carrying_the_binding(tmp_path: Path):
+    """spore-438: BOTH hands are ONE spec, so ONE ``create`` builds one floor for both. The binding
+    rides the spec's params as data; ``with_bash`` decides the second hand."""
+    ent, ws = _entity(tmp_path)
+    b = _binding(ws)
+    both = build_entity_tools(b)
+    assert [t.name for t in both] == [LEVAIN_HANDS_TOOL]
+    assert both[0].params == {"binding": b.to_params(), "with_bash": True}
+    assert build_entity_tools(b, with_bash=False)[0].params["with_bash"] is False
 
 
-def test_registry_keys_distinct_but_llm_names_are_familiar():
-    # Two identifiers per tool: the REGISTRY key (distinct → an entity spec can never resolve the
-    # unconfined stock tool) vs the LLM-visible .name (familiar → better weak-model tool use).
-    assert LEVAIN_FILE_EDITOR_TOOL == "levain_file_editor"
-    assert LEVAIN_BASH_TOOL == "levain_bash"
+def test_registry_key_distinct_but_llm_names_are_familiar():
+    """The registry key never collides with a stock tool (so an entity can never resolve to an
+    UNCONFINED one), while each resolved tool keeps the familiar LLM-visible name."""
+    assert LEVAIN_HANDS_TOOL == "levain_hands" == LevainHands.name
     assert LevainFileEditorTool.name == "file_editor"
     assert LevainBashTool.name == "terminal"
-    assert LEVAIN_FILE_EDITOR_TOOL != LevainFileEditorTool.name
-    assert LEVAIN_BASH_TOOL != LevainBashTool.name
 
 
-def test_policy_for_conv_state_prefers_env_then_workspace_parent(tmp_path: Path, monkeypatch):
+def test_levain_hands_builds_both_hands_on_ONE_floor_from_the_binding(tmp_path: Path):
+    """The two hands share one floor by construction — a local value inside one ``create`` call, not
+    a registry entry keyed on the conversation — and that floor IS the binding's, unchanged."""
     ent, ws = _entity(tmp_path)
-    # env UNSET → entity dir derived as <workspace>/..
-    pol = policy_for_conv_state(_FakeConvState(ws))
-    assert pol.entity_dir == ent.resolve() and pol.workspace == ws.resolve()
-    # env SET (as levain run binds it) → that is authoritative
+    b = _binding(ws, mode="unattended")
+    tools = LevainHands.create(_FakeConvState(ws), binding=b.to_params(), with_bash=True)
+    editor, bash = tools
+    assert isinstance(editor, LevainFileEditorTool) and isinstance(bash, LevainBashTool)
+    assert editor.executor._floor is bash.executor._floor
+    assert editor.executor._policy == b.floor
+    only = LevainHands.create(_FakeConvState(ws), binding=b.to_params(), with_bash=False)
+    assert [type(t) for t in only] == [LevainFileEditorTool]
+
+
+def test_two_conversations_never_share_a_floor(tmp_path) -> None:
+    """Each ``create`` (one per conversation's agent init — a resume is a new init) builds its own
+    floor, so no conversation can inherit another's evolved or permissive floor, and no id() can
+    alias one: there is no registry for an id to index (spore-438)."""
+    ent, ws = _entity(tmp_path)
+    params = _binding(ws).to_params()
+    first = LevainHands.create(_FakeConvState(ws), binding=params)
+    second = LevainHands.create(_FakeConvState(ws), binding=params)
+    assert first[0].executor._floor is not second[0].executor._floor
+
+
+def test_levain_hands_refuses_a_malformed_binding(tmp_path: Path):
+    """The spec's binding is deserialized, never re-resolved — so a shape this code did not write
+    (a missing floor field would default to an EMPTY deny tuple) refuses instead of building a floor
+    with a hole."""
+    ent, ws = _entity(tmp_path)
+    params = _binding(ws).to_params()
+    holed = {**params, "floor": {k: v for k, v in params["floor"].items() if k != "deny_files"}}
+    with pytest.raises(BindingError):
+        LevainHands.create(_FakeConvState(ws), binding=holed)
+    with pytest.raises(BindingError):
+        LevainHands.create(_FakeConvState(ws), binding={**params, "mode": "nonsense"})
+
+
+def test_the_binding_serves_the_entity_it_was_created_for_and_ignores_process_env(tmp_path: Path,
+                                                                                 monkeypatch):
+    ent, ws = _entity(tmp_path)
+    assert _policy(ws).entity_dir == ent.resolve() and _policy(ws).workspace == ws.resolve()
     other = tmp_path / "other"
     (other / ".levain").mkdir(parents=True)
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(other))
-    pol2 = policy_for_conv_state(_FakeConvState(ws))
-    assert pol2.entity_dir == other.resolve()
+    assert _policy(ws, mode="interactive", entity=other.resolve()).entity_dir == other.resolve()
+    # the retired process channel names nothing (spore-438)
+    third = tmp_path / "third"
+    (third / ".levain").mkdir(parents=True)
+    monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(third))
+    assert _policy(ws).entity_dir == ent.resolve()
 
 
-def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
-    """The confinement.json ``deny_standard_creds`` opt-in threads through policy_for_conv_state into
+def test_the_binding_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
+    """The confinement.json ``deny_standard_creds`` opt-in threads through the binding into
     the built policy (apparatus L1/complement: nothing pinned this end-to-end wiring — a dropped
     pass-through in tools.py would silently lose the opt-in while every other test still passed)."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
     ent, ws = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
-    pol = policy_for_conv_state(_FakeConvState(ws))
+    pol = _policy(ws, mode="interactive")
     assert crown_jewel_reason(pol, tmp_path / ".config" / "gh" / "hosts.yml") is not None
     # a DIFFERENT entity with no confinement.json does NOT fold them in AT AN INTERACTIVE DRIVE
     # (gh hands intact for the operator who is sitting right there)
@@ -153,82 +196,72 @@ def test_policy_for_conv_state_threads_deny_standard_creds(tmp_path: Path, monke
     (ent2 / ".levain").mkdir(parents=True)
     ws2 = ent2 / "workspace"
     ws2.mkdir()
-    monkeypatch.setenv(LEVAIN_ENTITY_DIR_ENV, str(ent2))
-    pol2 = policy_for_conv_state(_FakeConvState(ws2))
+    pol2 = _policy(ws2, mode="interactive")
     assert crown_jewel_reason(pol2, tmp_path / ".config" / "gh" / "hosts.yml") is None
 
 
-def test_policy_for_conv_state_wires_deny_localhost_outbound_both_modes(tmp_path: Path, monkeypatch):
-    """spore-755. policy_for_conv_state turns the connect-to-self deny ON by default in BOTH
+def test_the_binding_wires_deny_localhost_outbound_both_modes(tmp_path: Path, monkeypatch):
+    """spore-755. The binding turns the connect-to-self deny ON by default in BOTH
     ssh_modes (Phill 2026-09-13, 0.4.6 = A+B; codex L3 HIGH#1 reproduced the raw-mode variant — the
     entity's own key is readable there but the OTHER jewels stay denied and a local sshd reads them
     just the same), and OFF only when the operator opts out with allow_localhost_outbound. A dropped
     pass-through in tools.py would silently leave the bypass open with every other test still green."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ent, ws = _entity(tmp_path)  # no config → ssh_mode defaults to "agent"
-    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is True
+    assert _policy(ws).deny_localhost_outbound is True
 
     (ent / ".levain" / "confinement.json").write_text('{"ssh_mode": "raw"}')
-    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is True  # raw too now
+    assert _policy(ws).deny_localhost_outbound is True  # raw too now
 
     (ent / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
-    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False
+    assert _policy(ws).deny_localhost_outbound is False
 
     (ent / ".levain" / "confinement.json").write_text(
         '{"ssh_mode": "raw", "allow_localhost_outbound": true}'
     )
-    assert policy_for_conv_state(_FakeConvState(ws)).deny_localhost_outbound is False
+    assert _policy(ws).deny_localhost_outbound is False
 
 
-def test_policy_for_conv_state_denies_standard_creds_on_an_UNATTENDED_drive(tmp_path: Path,
+def test_the_binding_denies_standard_creds_on_an_UNATTENDED_drive(tmp_path: Path,
                                                                             monkeypatch):
     """K4a: with no declaration, an UNATTENDED seat folds the standard cred stores into the floor
     while an interactive drive does not — same entity, same (absent) config, drive mode the only
     variable. This is the FILE-EDITOR enforcer, which is the one that matters: `view` is afferent,
     so the K3 gate never sees the read."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
     ent, ws = _entity(tmp_path)          # no confinement.json at all → the tri-state ABSENT
     gh = tmp_path / ".config" / "gh" / "hosts.yml"
 
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "interactive")
-    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is None
+    assert crown_jewel_reason(
+        _policy(ws, mode="interactive"), gh) is None
+    assert crown_jewel_reason(
+        _policy(ws, mode="unattended"), gh) is not None
 
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
-    assert crown_jewel_reason(policy_for_conv_state(_FakeConvState(ws)), gh) is not None
 
-
-def test_policy_for_conv_state_honours_an_EXPLICIT_false_even_unattended(tmp_path: Path,
+def test_the_binding_honours_an_EXPLICIT_false_even_unattended(tmp_path: Path,
                                                                          monkeypatch):
     """An explicit ``false`` is an operator OPT-IN and must survive an unattended seat — a seat
     whose job is "open a PR nightly" genuinely needs gh. The unattended default is a DEFAULT, not a
     prohibition, and the tri-state exists precisely so this can be said."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LEVAIN_DRIVE_MODE_ENV, "unattended")
     ent, ws = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": false}')
     assert crown_jewel_reason(
-        policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"
+        _policy(ws, mode="unattended"),
+        tmp_path / ".config" / "gh" / "hosts.yml",
     ) is None
 
 
-def test_policy_for_conv_state_fails_CLOSED_when_the_drive_mode_is_unbound(tmp_path: Path,
-                                                                           monkeypatch):
-    """An UNBOUND drive mode must deny, not allow. The only way it is unset in a real run is a
-    WIRING failure, and a wiring failure must never WIDEN the floor: wrongly denying surfaces as a
-    visible refusal the operator fixes in one line, while wrongly granting is a silent credential
-    exposure on an unattended seat with nobody watching."""
-    from levain.firing.drive import LEVAIN_DRIVE_MODE_ENV
-
+def test_a_binding_has_no_unbound_mode_and_refuses_an_unknown_one(tmp_path: Path, monkeypatch):
+    """An unbound drive mode is no longer representable: ``create`` requires one and refuses a mode
+    it does not know (a garbage mode must never silently resolve). A stale $LEVAIN_DRIVE_MODE in an
+    operator's shell is read by nothing (retired 2026-10-02, ruling (b))."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LEVAIN_DRIVE_MODE_ENV, raising=False)
+    monkeypatch.setenv("LEVAIN_DRIVE_MODE", "interactive")
     ent, ws = _entity(tmp_path)
-    assert crown_jewel_reason(
-        policy_for_conv_state(_FakeConvState(ws)), tmp_path / ".config" / "gh" / "hosts.yml"
-    ) is not None
+    with pytest.raises(BindingError, match="unknown drive mode"):
+        _binding(ws, mode="NONSENSE")
+    assert crown_jewel_reason(_policy(ws), tmp_path / ".config" / "gh" / "hosts.yml") is not None
 
 
 # --- the file-editor hand: create + declared_resources + the floor ---------------------------
@@ -236,7 +269,7 @@ def test_policy_for_conv_state_fails_CLOSED_when_the_drive_mode_is_unbound(tmp_p
 
 def test_file_editor_create_wires_the_floored_executor(tmp_path: Path):
     ent, ws = _entity(tmp_path)
-    tools = LevainFileEditorTool.create(_FakeConvState(ws))
+    tools = LevainFileEditorTool.create(_FakeConvState(ws), floor=_floor(ws))
     assert len(tools) == 1
     tool = tools[0]
     # A REAL LevainFileEditorTool (so OUR declared_resources override runs — codex L3), .name familiar,
@@ -257,7 +290,7 @@ def test_file_editor_declared_resources_never_raises_and_fences(tmp_path: Path, 
     (fake_home / ".anneal-memory").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_home))
     ent, ws = _entity(tmp_path)
-    tool = LevainFileEditorTool.create(_FakeConvState(ws))[0]
+    tool = LevainFileEditorTool.create(_FakeConvState(ws), floor=_floor(ws))[0]
 
     dr_nul = tool.declared_resources(FileEditorAction(command="view", path="in\x00jected"))
     assert dr_nul.declared and tuple(dr_nul.keys) == ()
@@ -404,7 +437,7 @@ def test_declared_resources_fix_reaches_executor_at_runtime(tmp_path: Path, monk
     assert stock_ran is False
     assert type(stock_ev).__name__ == "AgentErrorEvent"
 
-    confined_ran, confined_obs = _run_batch(LevainFileEditorTool.create(cs)[0])
+    confined_ran, confined_obs = _run_batch(LevainFileEditorTool.create(cs, floor=_floor(ws))[0])
     assert confined_ran is True
     assert getattr(confined_obs, "is_error", False) and "REFUSED" in confined_obs.text
 
@@ -414,7 +447,7 @@ def test_declared_resources_fix_reaches_executor_at_runtime(tmp_path: Path, monk
 
 def test_bash_create_wires_the_sandboxed_executor(tmp_path: Path):
     ent, ws = _entity(tmp_path)
-    tools = LevainBashTool.create(_FakeConvState(ws))
+    tools = LevainBashTool.create(_FakeConvState(ws), floor=_floor(ws))
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, LevainBashTool)
@@ -426,7 +459,7 @@ def test_bash_declared_resources_always_serializes(tmp_path: Path):
     # The SandboxedShell is single-caller → bash calls MUST serialize (unconditionally, unlike the
     # stock TerminalTool which opts out under a tmux pool).
     ent, ws = _entity(tmp_path)
-    tool = LevainBashTool.create(_FakeConvState(ws))[0]
+    tool = LevainBashTool.create(_FakeConvState(ws), floor=_floor(ws))[0]
     dr = tool.declared_resources(TerminalAction(command="echo hi"))
     assert dr.declared and tuple(dr.keys) == ("terminal:session",)
 
@@ -582,32 +615,6 @@ def test_the_floor_merge_is_monotonic_under_concurrent_spawners(tmp_path) -> Non
     assert b in floor.policy.deny_sockets, "spawner B's deny was lost"
 
 
-def test_two_conversations_never_share_a_floor(tmp_path) -> None:
-    """⛔ THE DESIGN CHANGE, and it dissolves TWO codex findings at once (L3, 2026-09-04).
-
-    The registry used to key on `(entity_dir, workspace)`, which made sharing and freshness the same
-    variable pulling opposite ways: share the object and a later conversation inherits a STALE cred
-    floor (fail-open); rebuild it on a changed baseline and the two hands of ONE conversation get
-    DIFFERENT floors (`view /secret` through the editor while bash denies it). Each was fixed one
-    review round apart, each breaking the other.
-
-    A CONVERSATION HAS EXACTLY ONE BASELINE BY CONSTRUCTION — so keying on `ConversationState.id`
-    removes both failure modes rather than balancing them, and the baseline comparison is DELETED."""
-    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()
-
-    c1, c2 = _FakeConvState(ws), _FakeConvState(ws)   # same entity+workspace, different conversations
-    f1, f2 = floor_for_conv_state(c1), floor_for_conv_state(c2)
-    keep = (f1, f2)  # hold refs: the registry is weak-valued
-    assert f1 is not f2, "a second conversation inherited the first's floor — the stale-floor fail-open"
-
-    # ...and the SAME conversation still gets the SAME floor, or the two hands diverge.
-    assert floor_for_conv_state(c1) is f1
-    assert len(keep) == 2
-
-
 def test_an_executor_needs_exactly_one_of_policy_or_floor(tmp_path) -> None:
     """⛔ codex L3 LOW. Accepting both and silently preferring `floor` is FAIL-OPEN: a strict policy
     beside an accidentally permissive floor yielded the permissive one with no error."""
@@ -653,57 +660,6 @@ def test_a_provider_returning_a_non_shell_is_refused_at_the_source(tmp_path, mon
         ex._ensure_shell()
 
 
-def test_a_resumed_conversation_never_inherits_the_live_floor(tmp_path) -> None:
-    """⛔ codex L3 HIGH round 5, and it FALSIFIED THE PREMISE OF ROUND 5's DESIGN.
-
-    Keying on `ConversationState.id` rested on "a conversation has exactly one baseline by
-    construction". That is FALSE: `ConversationState.create()` is documented as *"Create a new
-    conversation state OR RESUME FROM PERSISTENCE"*, and a resume may run under a different drive
-    mode and even a different workspace. Start `U` interactively (creds ALLOWED), keep the old agent
-    alive so its entry stays live, resume `U` unattended → the resumed agent skips
-    `policy_for_conv_state()` and inherits the permissive floor. **The identical fail-open as the
-    entity key, through a new door.**
-
-    ⚡ A UUID names the LOGICAL conversation; a runtime baseline belongs to the RUNTIME. Two objects
-    carrying the SAME id are two runs and must not share."""
-    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()
-
-    first = _FakeConvState(ws, conv_id="U")
-    resumed = _FakeConvState(ws, conv_id="U")   # SAME persisted id, a DIFFERENT runtime object
-    f1 = floor_for_conv_state(first)
-    f2 = floor_for_conv_state(resumed)
-    keep = (f1, f2, first, resumed)
-
-    assert f1 is not f2, (
-        "the resumed conversation inherited the live floor — a run that should be MORE restricted "
-        "silently keeps the earlier run's permissive floor"
-    )
-    assert floor_for_conv_state(first) is f1, "the same runtime object must still share one floor"
-    assert len(keep) == 4
-
-
-def test_a_dead_conversations_floor_is_evicted_so_a_recycled_id_cannot_alias_it(tmp_path) -> None:
-    """The `id()` key's own hazard, closed by `weakref.finalize`: the entry must disappear when the
-    ConversationState is collected, BEFORE CPython can hand that `id()` to a different object.
-    Without the finalizer this key would be strictly worse than the UUID it replaced."""
-    import gc
-    from levain.firing.openhands.tools import _FLOORS, floor_for_conv_state
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()
-
-    cs = _FakeConvState(ws)
-    floor = floor_for_conv_state(cs)
-    key = id(cs)
-    assert key in _FLOORS
-    del cs, floor
-    gc.collect()
-    assert key not in _FLOORS, "a dead conversation's floor was left behind for a recycled id()"
-
-
 def test_an_unverified_shell_is_never_cached_fail_once_open_next(tmp_path, monkeypatch) -> None:
     """⛔ codex L3 HIGH round 5. `_ensure_shell` committed the shell to `self._shell` BEFORE
     validating `effective_policy`. The first command was refused while the LIVE shell stayed cached;
@@ -736,27 +692,6 @@ def test_an_unverified_shell_is_never_cached_fail_once_open_next(tmp_path, monke
     assert all(sh.closed for sh in made), "a rejected live shell was leaked instead of closed"
 
 
-def test_the_floor_registry_lock_survives_a_finalizer_reentering_on_the_same_thread(tmp_path) -> None:
-    """⛔ complement L3 HIGH round 6. `_drop_floor` is a `weakref.finalize` callback and takes
-    `_FLOORS_LOCK`. A finalizer for a cyclically-collected object fires SYNCHRONOUSLY on whatever
-    thread crossed the GC threshold — and that trigger can be any allocation, including the ones
-    inside `policy_for_conv_state()` which run WHILE THE LOCK IS HELD. With a plain `threading.Lock`
-    the thread blocks acquiring a lock it already owns, forever, still holding it: every
-    `floor_for_conv_state` in the process freezes.
-
-    ⚡ The failure is SILENT — no exception, no log. A hang with no error is the worst shape a
-    security-path defect can take, because every surface reads healthy.
-
-    Drive the reentry directly rather than trying to provoke the GC: call `_drop_floor` from inside
-    a held `_FLOORS_LOCK` on this thread, which is exactly what the finalizer does."""
-    import levain.firing.openhands.tools as _t
-
-    with _t._FLOORS_LOCK:
-        # Under a non-reentrant Lock this blocks forever and the test hangs rather than fails.
-        _t._drop_floor(-12345)          # a key that is not present; the acquire is the point
-    assert True
-
-
 def test_a_failing_close_does_not_mask_the_fail_closed_reason(tmp_path, monkeypatch) -> None:
     """⛔ complement L3 MED round 6. If `candidate.close()` raises while tearing down an unverified
     shell, that I/O error would propagate INSTEAD of the ConfinementError — so a caller matching on
@@ -783,34 +718,6 @@ def test_a_failing_close_does_not_mask_the_fail_closed_reason(tmp_path, monkeypa
     monkeypatch.setattr(_t, "select_provider", lambda: _BadProvider())
     with pytest.raises(ConfinementError, match="no effective policy"):
         ex._ensure_shell()          # NOT OSError
-
-
-def test_a_recycled_id_cannot_inherit_a_stale_floor_even_if_eviction_failed(tmp_path) -> None:
-    """⛔ codex L3 MED round 7. An `id()` is unique only among LIVE objects. The registry now stores
-    `(weakref, floor)` and verifies `ref() is conv_state` on lookup, so a stale entry — finalizer
-    failed to install, or failed to run — cannot hand a NEW conversation the OLD floor.
-    ⚡ The point is that the fail-open no longer depends on a callback firing. Simulate the worst
-    case directly: leave an entry whose weakref is dead and confirm it is not handed out."""
-    import weakref as _wr
-    from levain.firing.openhands.tools import _FLOORS, _SharedFloor, floor_for_conv_state
-    from levain.firing.confinement import build_policy
-
-    ent, ws = _entity(tmp_path)
-    _FLOORS.clear()
-
-    victim = _FakeConvState(ws)
-    key = id(victim)
-    stale_floor = _SharedFloor(build_policy(tmp_path / "OTHER", workspace=ws))
-    dead = _FakeConvState(ws)
-    ref = _wr.ref(dead)
-    del dead
-    import gc
-    gc.collect()
-    _FLOORS[key] = (ref, stale_floor)          # an entry whose object is gone, at victim's id
-
-    got = floor_for_conv_state(victim)
-    assert got is not stale_floor, "a recycled id inherited a dead conversation's floor"
-    assert got.policy.entity_dir != stale_floor.policy.entity_dir
 
 
 def test_a_rejected_shell_is_torn_down_even_when_its_own_close_raises(tmp_path, monkeypatch) -> None:

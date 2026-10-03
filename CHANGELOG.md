@@ -6,6 +6,27 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **Each conversation's crown-jewels floor, drive mode and entity are now one value created when the session opens, and handed to every part that enforces them.** Before this, `$LEVAIN_DRIVE_MODE` and `$LEVAIN_ENTITY_DIR` were the only channel the floor and the memory firings had. With two `EntitySession`s in one process (which no CLI path reaches yet; the server-held conversation will), we measured three crossovers, on macOS and on Linux:
+  - A second session's drive mode set the first session's file-editor and bash floor. The first session's banner said one thing while its tools enforced another.
+  - A second session that failed to open still moved the first session's floor.
+  - Once the process named a second entity, the first session's recall, re-anchor and capture all used the second entity's store.
+  The new `levain.firing.binding.ConversationBinding` holds the entity, the drive mode and the resolved floor. It reaches both hands as data in their tool spec, and the condenser carries the entity, so a fork keeps all of it and nothing is looked up by conversation. Two entities can be open in one process, and each reads and writes only its own store. A conversation's binding cannot be changed after it is created.
+- **Both hands are now one tool spec, `levain_hands`,** built by `build_entity_tools(binding, with_bash=...)`. The registry names `levain_file_editor` and `levain_bash` are gone. The tool names the model sees (`file_editor`, `terminal`) are unchanged.
+- **A process that has opened an entity refuses every default-kind (`"anneal"`) store operation** (`$LEVAIN_ENTITY_PROCESS`). A stray bare `vagus_run` or `wrap_nudge` there used to be redirected to the entity; it now refuses loudly, so it can never reach the operator's `~/.anneal-memory`. Levain's own capture always names its entity and is unaffected.
+- **`confinement.json` is read once at session start.** The banner and the floor come from the same read (it was read twice; listed under 0.5.0's known open issues).
+- **Hands built for one entity cannot be put on another entity's agent**: `build_entity_agent` refuses them.
+
+### Removed
+
+- **`$LEVAIN_DRIVE_MODE` and its "one process hosts one drive mode" refusal** (`bind_drive_mode`, `current_drive_mode`, `DriveModeConflict`). Once any unattended session had opened, the process could never open an interactive one. An interactive session now opens beside an unattended one, each with its own floor.
+- **`$LEVAIN_ENTITY_DIR`, `bind_entity` and the "one process hosts one entity" refusal.** `guard_entity` checks an entity without touching process state. An isolated firing or seed built with no entity now has no store, instead of reading the variable.
+
+### Fixed
+
+- **A session that failed to start after its conversation was built left that conversation open** until the process exited. It is now closed.
+
 ## [0.5.1] — 2026-10-02
 
 ### Security

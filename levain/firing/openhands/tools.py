@@ -15,9 +15,9 @@ matter what the model is told to do:
     together, protected by the floor rather than a jail.
 
 **One floor, two enforcers (``structural_invariants_beat_discipline``).** A
-:class:`~levain.firing.confinement.CrownJewelsPolicy` — built by EACH hand's ``create`` from the SAME
-inputs (the entity dir + ``<entity>/.levain/confinement.json``) via :func:`policy_for_conv_state`, so
-the two are equivalent — fences BOTH hands. bash rides the rendered platform sandbox — macOS
+:class:`~levain.firing.confinement.CrownJewelsPolicy` — resolved ONCE per conversation into its
+:class:`~levain.firing.binding.ConversationBinding` and handed to both hands as one
+:class:`_SharedFloor` by :class:`LevainHands` (spore-438) — fences BOTH hands. bash rides the rendered platform sandbox — macOS
 ``sandbox-exec`` or, since K4c, a Linux ``bwrap`` mount namespace (the OS fences it — a persistent
 shell whose cwd wanders can't be confined in-process, which is the whole reason bash needed an OS
 sandbox). The POLICY is identical on both; only the enforcement model differs. The file editor is ordinary in-process Python, NOT
@@ -61,18 +61,18 @@ Requires the ``openhands`` extra.
 """
 from __future__ import annotations
 
-import os
 import dataclasses
 import logging
 import threading
-import weakref
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from openhands.sdk.tool import (
     Action,
     DeclaredResources,
+    Observation,
     Tool,
+    ToolDefinition,
     ToolExecutor,
     register_tool,
 )
@@ -90,14 +90,11 @@ from levain.firing.confinement import (
     ConfinementError,
     CrownJewelsPolicy,
     SandboxedShell,
-    build_policy,
     crown_jewel_reason,
-    load_confinement_config,
     refresh_socket_denies,
     select_provider,
 )
-from levain.firing.drive import current_drive_mode, resolve_cred_floor
-from levain.firing.isolation import LEVAIN_ENTITY_DIR_ENV
+from levain.firing.binding import ConversationBinding
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
 
@@ -105,85 +102,21 @@ if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
 
 __all__ = [
-    "LEVAIN_FILE_EDITOR_TOOL",
-    "LEVAIN_BASH_TOOL",
+    "LEVAIN_HANDS_TOOL",
     "CrownJewelsFileEditorExecutor",
     "LevainFileEditorTool",
     "SandboxedBashExecutor",
     "LevainBashTool",
-    "policy_for_conv_state",
+    "LevainHands",
     "build_entity_tools",
 ]
 
-# The REGISTRY keys (the ``Tool(name=...)`` spec names). Deliberately DISTINCT from the stock
-# ``"file_editor"`` / ``"terminal"`` so an entity's tool set can never resolve to an UNCONFINED stock
-# tool. Each resolved tool keeps its own ``.name`` == the stock name (the SDK's tools_map keys on
-# ``tool.name``, not the spec name), so the LLM still sees the FAMILIAR function name (better tool-use
-# reliability for weak open models) while the registry stays collision-free.
-LEVAIN_FILE_EDITOR_TOOL = "levain_file_editor"
-LEVAIN_BASH_TOOL = "levain_bash"
-
-
-# --- the shared crown-jewels floor for a run -------------------------------------------------
-
-
-def policy_for_conv_state(conv_state: "ConversationState") -> CrownJewelsPolicy:
-    """Build the ONE :class:`~levain.firing.confinement.CrownJewelsPolicy` that fences BOTH hands for
-    this run — the shared floor.
-
-    The entity dir is the authoritative ``$LEVAIN_ENTITY_DIR`` (bound by
-    :func:`~levain.firing.isolation.bind_entity` BEFORE the conversation — and its tools — are built,
-    fork-safe), falling back to ``<workspace>/..`` (``levain run`` always creates the workspace as
-    ``<entity>/workspace/``) when the env is unset (e.g. a direct unit test). The universal floor
-    (flow store + sibling stores + ssh key material) is always applied by ``build_policy``; the
-    operator's app-specific credential files/subtrees come from ``<entity>/.levain/confinement.json``
-    (fail-closed if that file is present but malformed — a broken crown-jewels declaration must not
-    silently yield a floor with holes)."""
-    workspace = Path(conv_state.workspace.working_dir).expanduser().resolve()
-    env = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    entity_dir = Path(env).expanduser().resolve() if env else workspace.parent
-    cfg = load_confinement_config(entity_dir)
-    return build_policy(
-        entity_dir,
-        workspace=workspace,
-        ssh_mode=cfg.ssh_mode,
-        deny_files=cfg.deny_files,
-        extra_deny_read_write=cfg.deny_subtrees,
-        # RESOLVED, never the raw config value. `deny_standard_creds` is a TRI-STATE whose
-        # `None` means "derive from the drive mode", and this policy is built OUTSIDE the session
-        # object (at tool-creation time, then cached on the executor) — so it reads the mode from
-        # the process channel rather than closing over session state. Passing the raw
-        # value here would let the FILE EDITOR allow the standard cred stores on an unattended
-        # seat while the bash seatbelt denied them: one policy, two enforcers, disagreeing — and
-        # the file editor is the `view` path the unattended cred floor exists to close.
-        deny_standard_creds=resolve_cred_floor(
-            cfg.deny_standard_creds, mode=current_drive_mode()
-        ),
-        # spore-725. Passed straight through — NOT drive-resolved like the line above, because a
-        # reachable container daemon is a total bypass in every drive mode (an interactive operator
-        # watching the stream is not a mitigation for `docker run -v /:/host`). Both hands read the
-        # same value. ⚠ AND "the same value" IS NOW LITERALLY THE SAME OBJECT, via `_SharedFloor`:
-        # this sentence was briefly FALSE (glm L3, 2026-09-04) because each hand's `create` built
-        # its own policy and only the bash hand's evolved at spawn. Read `_SharedFloor` before
-        # weakening this — the invariant is what makes the two hands' socket rulings comparable.
-        allow_container_sockets=cfg.allow_container_sockets,
-        # spore-755. Deny outbound connect() to THIS host so a local sshd can't be asked to read a
-        # floor-denied file as unsandboxed root (REPRODUCED 2026-09-13). BOTH ssh_modes (Phill
-        # 2026-09-13, 0.4.6 = A+B): codex L3 HIGH#1 reproduced a raw-mode variant — the entity reads
-        # its OWN key directly, but the OTHER jewels (~/.anneal-memory, sibling stores, deny_files)
-        # stay floor-denied and a local sshd authenticated with that key reads THEM as unsandboxed
-        # root just the same. It ALSO closes the local-service side channel (argushub:8420 etc.) in
-        # both modes, independent of the ssh oracle. The carrier does not vary by ssh_mode or drive
-        # mode, so neither gates the deny; the only switch is the operator opt-out
-        # (allow_localhost_outbound=true) for an entity that genuinely needs a local service.
-        # ⚠ This closes the FRESH-CONNECTION self-sshd path only. It does NOT close the class — the
-        # forwarded agent is a signing oracle reachable via a REMOTE relay/ProxyCommand, and a live
-        # localhost ssh ControlMaster socket is an AF_UNIX path this IP deny can't see. Both are
-        # DOCUMENTED RESIDUALS (confinement.py honest-limits; spore-1005), and the root fix — a
-        # scoped credential instead of the forwarded agent — is 0.5 work (default F, D2 opt-in).
-        deny_localhost_outbound=(not cfg.allow_localhost_outbound),
-    )
-
+# The REGISTRY key (the ``Tool(name=...)`` spec name) for BOTH hands. Deliberately DISTINCT from the
+# stock ``"file_editor"`` / ``"terminal"`` so an entity's tool set can never resolve to an UNCONFINED
+# stock tool. Each resolved tool keeps its own ``.name`` == the stock name (the SDK's tools_map keys
+# on ``tool.name``, not the spec name), so the LLM still sees the FAMILIAR function names (better
+# tool-use reliability for weak open models) while the registry stays collision-free.
+LEVAIN_HANDS_TOOL = "levain_hands"
 
 
 def _log_never_raises(msg: str) -> None:
@@ -280,8 +213,8 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
 class _SharedFloor:
     """The ONE evolving :class:`CrownJewelsPolicy` for ONE CONVERSATION, read by BOTH hands.
 
-    ⛔ WHY IT EXISTS — glm-5.2 L3, 2026-09-04. Each hand's ``create`` called
-    :func:`policy_for_conv_state` separately, producing two EQUAL BUT DISTINCT policy objects. That
+    ⛔ WHY IT EXISTS — glm-5.2 L3, 2026-09-04. Each hand's ``create`` then built its own policy
+    separately, producing two EQUAL BUT DISTINCT policy objects. That
     was harmless while the spawn-time socket refresh touched only ``deny_sockets`` (the connect arm
     has no in-process twin), and stopped being harmless once the refresh also updated
     ``deny_write_files`` / ``socket_spellings`` / ``deny_write_dirs``, which the file editor DOES
@@ -300,10 +233,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    # ⛔ `__weakref__` MUST be in __slots__ for the WeakValueDictionary registry — without it the
-    # first `floor_for_conv_state()` raises `TypeError: cannot create weak reference`. Caught by the
-    # suite within seconds of the change, which is the argument for the suite and not for care.
-    __slots__ = ("_policy", "_lock", "__weakref__")
+    __slots__ = ("_policy", "_lock")
 
     def __init__(self, policy: CrownJewelsPolicy) -> None:
         self._policy = policy
@@ -338,98 +268,6 @@ class _SharedFloor:
                 socket_spellings=_union(cur.socket_spellings, spawned.socket_spellings),
                 deny_write_dirs=_union(cur.deny_write_dirs, spawned.deny_write_dirs),
             )
-
-
-# ⛔⛔ KEYED ON THE `ConversationState` **INSTANCE** — NOT ON ITS PERSISTED UUID, AND NOT ON
-# `(entity_dir, workspace)`. codex L3 HIGH, 2026-09-04. This is the SECOND correction to this key in
-# one evening, and both earlier choices were wrong for the SAME underlying reason: **neither
-# identified ONE RUNTIME POLICY BASELINE.**
-#   · `(entity_dir, workspace)` made sharing and freshness the same variable pulling opposite ways:
-#     share the object and a later conversation inherits a STALE permissive cred floor (fail-open);
-#     rebuild it when the baseline changes and the two hands of ONE conversation get DIFFERENT floors
-#     (`view /secret` through the editor while bash denies it). Each fix broke the other.
-#   · `ConversationState.id` LOOKED like it dissolved that, on the premise that "a conversation has
-#     exactly one baseline by construction". ⛔ **THAT PREMISE IS FALSE.**
-#     `ConversationState.create()` is documented as *"Create a new conversation state OR RESUME FROM
-#     PERSISTENCE"*, and OpenHands permits a resume under a different drive mode and even a different
-#     workspace. Start `U` interactively (creds ALLOWED), keep the old agent alive so its entry stays
-#     live, resume `U` unattended → the resumed agent never calls `policy_for_conv_state()` and
-#     inherits the permissive floor. **The identical fail-open as the entity key, through a new door.**
-# ⚡ A UUID names the LOGICAL conversation; a runtime baseline belongs to the RUNTIME. The INSTANCE
-# is the runtime — a resume constructs a NEW object, while the two tool factories of one run receive
-# the SAME object. Of the three candidate keys, only this one has that property.
-#
-# ⚠ `ConversationState` is weakref-able but NOT hashable (pydantic default), so a
-# `WeakKeyDictionary` is unavailable. `id()` plus a `weakref.finalize` gives the same semantics: the
-# entry is evicted when THAT object is collected, **before** its `id()` can be recycled onto a
-# different object. That aliasing is the whole hazard of an `id()` key, so the finalizer is
-# load-bearing, not tidiness.
-_FLOORS: dict[int, tuple["weakref.ref[ConversationState]", _SharedFloor]] = {}
-# ⛔ RLock, NOT Lock — REENTRANT BY NECESSITY (complement L3 HIGH, 2026-09-04). `_drop_floor` is a
-# `weakref.finalize` callback and it takes this lock. A finalizer for a cyclically-collected object
-# fires SYNCHRONOUSLY, on whatever thread happened to cross the GC threshold — and that trigger can
-# be any allocation, including the ones inside `policy_for_conv_state()` / `_SharedFloor()`, which
-# run WHILE THIS LOCK IS HELD. A plain `Lock` would then self-deadlock: the thread blocks acquiring
-# a lock it already owns, forever, holding it — freezing `floor_for_conv_state` for every
-# conversation in the process.
-# ⚡ The failure is SILENT: no exception, no log, nothing to point at. A hang with no error is the
-# worst shape a security-path defect can take, because every surface reads healthy.
-# ⚠ Reentry is SAFE here as well as necessary: a nested `_drop_floor` pops a DIFFERENT (dead) key,
-# and the key being inserted by the outer frame belongs to a conversation object we hold a live
-# reference to, so it cannot be the one being finalized.
-_FLOORS_LOCK = threading.RLock()
-
-
-def _drop_floor(key: int) -> None:
-    """Evict a dead conversation's floor. Registered via `weakref.finalize`, so it runs when the
-    ConversationState is collected — BEFORE its `id()` can be handed to a different object."""
-    with _FLOORS_LOCK:
-        _FLOORS.pop(key, None)
-
-
-def floor_for_conv_state(conv_state: "ConversationState") -> _SharedFloor:
-    """The shared floor for THIS RUNTIME conversation object — created on first use, reused by the
-    other hand of the same run, and never inherited by a resume."""
-    key = id(conv_state)
-    with _FLOORS_LOCK:
-        entry = _FLOORS.get(key)
-        if entry is not None:
-            ref, floor = entry
-            # ⛔ VERIFY THE IDENTITY, DO NOT TRUST THE KEY (codex L3 MED, 2026-09-04). An `id()` is
-            # only unique among LIVE objects. If an entry ever outlives its conversation — the
-            # finalizer failed to install, or failed to run — a recycled `id()` would silently hand
-            # a NEW conversation the OLD, possibly permissive floor. Comparing the stored weakref
-            # against the caller makes that impossible regardless of whether eviction worked, so
-            # the fail-open does not depend on a callback firing.
-            if ref() is conv_state:
-                return floor
-            _FLOORS.pop(key, None)          # stale: the id was recycled
-
-        floor = _SharedFloor(policy_for_conv_state(conv_state))
-        # ⛔ FINALIZER FIRST, THEN PUBLISH (codex L3 MED). The previous order published the entry and
-        # then installed the finalizer, so if `weakref.finalize()` raised — an async
-        # KeyboardInterrupt, an allocation failure — the entry was live with NO eviction callback at
-        # all. Registering first means a failure leaves nothing published to leak.
-        # ⚠ Safe to register inside the lock ONLY because `_FLOORS_LOCK` is reentrant: `finalize`
-        # can fire a callback synchronously on this thread, and that callback takes this lock.
-        finalizer = weakref.finalize(conv_state, _drop_floor, key)
-        _FLOORS[key] = (weakref.ref(conv_state), floor)
-        # ⛔ A REAL CHECK, NOT AN `assert` (glm-5.2 L3 MED, 2026-09-04). The previous line was
-        # `assert finalizer.alive or conv_state is None`, which is wrong twice: **asserts are
-        # STRIPPED under `python -O`**, so in an optimized run there is no guard at all; and
-        # `conv_state is None` is a required argument, so that disjunct is dead code implying a
-        # None-path that does not exist. If `finalize` ever returns an already-dead finalizer — the
-        # object being cyclically collected on a thread that just crossed the GC threshold, which
-        # this module's own comments describe — the entry would be published with NO eviction and
-        # leak one floor per dead conversation, unbounded, in a long-running daemon.
-        if not finalizer.alive:
-            _FLOORS.pop(key, None)
-            raise ConfinementError(
-                "the conversation floor's finalizer was already dead at publish time — refusing to "
-                "publish an entry that can never be evicted (fail-closed)."
-            )
-        return floor
-
 
 
 # --- the file-editor hand (relaxed to the crown-jewels floor) --------------------------------
@@ -505,13 +343,13 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
 
 
 class LevainFileEditorTool(FileEditorTool):
-    """The floored file editor, registered under :data:`LEVAIN_FILE_EDITOR_TOOL`.
+    """The floored file editor, built by :class:`LevainHands` (registry key :data:`LEVAIN_HANDS_TOOL`).
 
     Reuses the stock tool's rich (vision-aware) description + schema + annotations and swaps in the
     crown-jewels-floored executor — so the model sees the identical, familiar ``file_editor`` contract,
     now fenced to the floor. The LLM-visible ``.name`` stays ``"file_editor"`` (familiar → better
-    tool-use on weak open models; the SDK keys ``tools_map`` on it) while the REGISTRY key stays
-    ``"levain_file_editor"`` (``register_tool`` below), so the unconfined stock tool is never reachable
+    tool-use on weak open models; the SDK keys ``tools_map`` on it) while the REGISTRY key is
+    ``"levain_hands"`` (``register_tool`` below), so the unconfined stock tool is never reachable
     from an entity. The explicit ``name`` short-circuits the SDK's ``__init_subclass__`` auto-derivation.
 
     It must be a REAL ``LevainFileEditorTool`` instance (not a stock ``FileEditorTool`` with a swapped
@@ -552,8 +390,12 @@ class LevainFileEditorTool(FileEditorTool):
         return self.executor._policy
 
     @classmethod
-    def create(cls, conv_state: "ConversationState") -> list["LevainFileEditorTool"]:  # type: ignore[override]
-        floored = CrownJewelsFileEditorExecutor(floor=floor_for_conv_state(conv_state))
+    def create(  # type: ignore[override]
+        cls, conv_state: "ConversationState", *, floor: "_SharedFloor"
+    ) -> list["LevainFileEditorTool"]:
+        """Build around ``floor`` — the one :class:`LevainHands` builds for both hands. Not registered
+        on its own: an entity reaches it only through ``levain_hands``."""
+        floored = CrownJewelsFileEditorExecutor(floor=floor)
         # Build REAL LevainFileEditorTool instances (not stock via set_executor, which keeps the stock
         # class + its raising declared_resources), reusing the stock tool's rich description/schema/
         # annotations by copying its fields — so our declared_resources override is what runs.
@@ -789,13 +631,13 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
 
 
 class LevainBashTool(TerminalTool):
-    """The confined bash tool, registered under :data:`LEVAIN_BASH_TOOL`.
+    """The confined bash tool, built by :class:`LevainHands` (registry key :data:`LEVAIN_HANDS_TOOL`).
 
     Reuses the stock terminal tool's schema (``TerminalAction``/``TerminalObservation``) + platform
     description + annotations and swaps in the :class:`SandboxedBashExecutor` — so the model sees the
     familiar ``terminal`` contract, now riding an OS sandbox instead of the un-confinable host shell.
     The LLM-visible ``.name`` stays ``"terminal"`` (the SDK keys ``tools_map`` on it) while the REGISTRY
-    key stays ``"levain_bash"``, so the unconfined stock terminal is never reachable from an entity."""
+    key is ``"levain_hands"``, so the unconfined stock terminal is never reachable from an entity."""
 
     name: ClassVar[str] = "terminal"
 
@@ -809,8 +651,11 @@ class LevainBashTool(TerminalTool):
         return DeclaredResources(keys=("terminal:session",), declared=True)
 
     @classmethod
-    def create(cls, conv_state: "ConversationState") -> list["LevainBashTool"]:  # type: ignore[override]
-        executor = SandboxedBashExecutor(floor=floor_for_conv_state(conv_state))
+    def create(  # type: ignore[override]
+        cls, conv_state: "ConversationState", *, floor: "_SharedFloor"
+    ) -> list["LevainBashTool"]:
+        """Build around ``floor`` (see :meth:`LevainFileEditorTool.create`)."""
+        executor = SandboxedBashExecutor(floor=floor)
         # Pass our executor to the stock create so it does NOT build a host TerminalExecutor; then copy
         # its (platform-correct) description/schema/annotations into a REAL LevainBashTool so OUR
         # declared_resources override runs.
@@ -826,18 +671,48 @@ class LevainBashTool(TerminalTool):
         ]
 
 
-# Register at import so ``Tool(name="levain_file_editor")`` / ``Tool(name="levain_bash")`` resolve.
-# Importing this module also imports the stock definitions (which self-register ``"file_editor"`` /
-# ``"terminal"``) — harmless: an entity only ever references the levain names. A duplicate re-import
-# just warns (registry is last-write-wins with the same resolver), never raises.
-register_tool(LEVAIN_FILE_EDITOR_TOOL, LevainFileEditorTool)
-register_tool(LEVAIN_BASH_TOOL, LevainBashTool)
+class LevainHands(ToolDefinition[Action, Observation]):
+    """BOTH hands for one conversation, registered under :data:`LEVAIN_HANDS_TOOL` (spore-438).
+
+    The SDK resolves a spec as ``create(conv_state=..., **spec.params)``, and may resolve separate
+    specs concurrently. One spec for both hands means ONE ``create`` call builds ONE
+    :class:`_SharedFloor` and hands it to both executors as a local value — so the two hands share the
+    floor by construction, with no registry keyed on the conversation.
+    The floor itself comes from ``binding``, the
+    :class:`~levain.firing.binding.ConversationBinding` the session resolved once; this reads no file
+    and resolves no mode."""
+
+    name: ClassVar[str] = LEVAIN_HANDS_TOOL
+
+    @classmethod
+    def create(  # type: ignore[override]
+        cls,
+        conv_state: "ConversationState",
+        *,
+        binding: dict[str, Any],
+        with_bash: bool = True,
+    ) -> list[ToolDefinition[Any, Any]]:
+        floor = _SharedFloor(ConversationBinding.from_params(binding).floor)
+        tools: list[ToolDefinition[Any, Any]] = [
+            *LevainFileEditorTool.create(conv_state, floor=floor)
+        ]
+        if with_bash:
+            tools.extend(LevainBashTool.create(conv_state, floor=floor))
+        return tools
 
 
-def build_entity_tools(*, with_bash: bool = True) -> list[Tool]:
+# Register at import so ``Tool(name="levain_hands")`` resolves. Importing this module also imports the
+# stock definitions (which self-register ``"file_editor"`` / ``"terminal"``) — harmless: an entity only
+# ever references the levain name. A duplicate re-import just warns (registry is last-write-wins with
+# the same resolver), never raises.
+register_tool(LEVAIN_HANDS_TOOL, LevainHands)
+
+
+def build_entity_tools(binding: ConversationBinding, *, with_bash: bool = True) -> list[Tool]:
     """The confined executor-tool bundle for a ``levain run`` entity: the crown-jewels-floored file
-    editor + (``with_bash``) the OS-sandboxed bash. Returns ``Tool`` SPECS (resolved to the confined
-    executors at conversation-build time via the registry, where the shared floor is built).
+    editor + (``with_bash``) the OS-sandboxed bash, both fenced by ``binding``'s floor. Returns ONE
+    ``Tool`` SPEC carrying the binding as data; the SDK resolves it into both hands at
+    conversation-build time (:class:`LevainHands`).
 
     These are the ONLY blessed executor-tool builders Levain ships, and both are confined by
     construction. ``with_bash=False`` drops bash — the caller (``levain run``) passes it when no OS
@@ -850,7 +725,9 @@ def build_entity_tools(*, with_bash: bool = True) -> list[Tool]:
     case is a supported platform that still cannot establish a floor (AppArmor-restricted user
     namespaces). The bash-free entity is therefore a normal Linux configuration rather than an
     exotic one, and the file-editor floor is fully cross-platform by design."""
-    tools: list[Tool] = [Tool(name=LEVAIN_FILE_EDITOR_TOOL)]
-    if with_bash:
-        tools.append(Tool(name=LEVAIN_BASH_TOOL))
-    return tools
+    return [
+        Tool(
+            name=LEVAIN_HANDS_TOOL,
+            params={"binding": binding.to_params(), "with_bash": with_bash},
+        )
+    ]

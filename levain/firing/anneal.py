@@ -27,8 +27,9 @@ from pathlib import Path
 
 from levain.firing.contract import CaptureRequest, InjectRequest, register_firing, select_directive
 from levain.firing.encoding import RECEIPT_KEY as _ENCODING_RECEIPT_KEY
+from levain.firing.binding import LEVAIN_ENTITY_PROCESS_ENV, entity_process_latched
 from levain.firing.isolation import (
-    LEVAIN_ENTITY_DIR_ENV,
+    IsolationError,
     assert_entity_isolated,
     entity_store_paths,
     resolve_entity_dir,
@@ -49,42 +50,34 @@ MAX_PATTERNS = 3  # precision bias — matches the flow recall hook's per-prompt
 DEFAULT_WRAP_NUDGE_THRESHOLD = 12
 
 
-def _entity_env_path(which: str) -> Path | None:
-    """When an entity is bound (``$LEVAIN_ENTITY_DIR`` set), the DEFAULT (``"anneal"``-kind) store
-    resolution is entity-isolated and RE-GUARDED **per op** — never a cached bind-time path (closes
-    the post-bind ``.levain`` symlink-swap TOCTOU, apparatus codex round-2). So a stray bare
-    ``vagus_run`` / ``wrap_nudge`` in an entity process resolves to the ENTITY store, guarded at USE
-    time, not flow's. No entity bound → ``None`` (the normal ``$VAGUS_*`` / default resolution).
-
-    Raises :class:`~levain.firing.isolation.IsolationError` if the bound entity's store escapes — its
-    callers (``_recall`` / ``capture`` / ``wrap_nudge``) wrap resolution in their fail-soft boundary,
-    so it degrades to no-recall / no-nudge, NEVER a leak. ``resolve_entity_dir`` is intentionally NOT
-    used here (it RAISES when unbound; this must return ``None`` to fall through to normal resolution)."""
-    raw = os.environ.get(LEVAIN_ENTITY_DIR_ENV, "").strip()
-    if not raw:
-        return None
-    entity_dir = Path(raw).expanduser()
-    crystal, episodic = entity_store_paths(entity_dir)
-    assert_entity_isolated(crystal, episodic, entity_dir=entity_dir)
-    return crystal if which == "crystal" else episodic
+def _refuse_in_entity_process() -> None:
+    """The DEFAULT (``"anneal"``-kind) store is the operator's laptop store. In a process that has
+    opened an entity (:func:`~levain.firing.binding.entity_process_latched`) a default-kind op REFUSES
+    (:class:`~levain.firing.isolation.IsolationError`) rather than resolve it — so a stray bare
+    ``vagus_run`` / ``wrap_nudge`` there can never read or write ``~/.anneal-memory``, and it is never
+    redirected to an entity either (the latch names none; ruled by Phill 2026-10-02, "approve levain
+    design"). Callers (``_recall`` / ``capture`` / ``wrap_nudge``) wrap resolution in their fail-soft
+    boundary, so it degrades to no-recall / a loud lost capture. An entity's own ops go through
+    :class:`AnnealEntityFiring` with an explicit entity and never reach here."""
+    if entity_process_latched():
+        raise IsolationError(
+            f"this process hosts a Levain entity (${LEVAIN_ENTITY_PROCESS_ENV}); refusing a "
+            "default-kind store op, which would resolve the operator's ~/.anneal-memory. Use "
+            "AnnealEntityFiring(entity_dir=...)."
+        )
 
 
 def _env_crystal_path() -> Path:
-    """The default crystal path for the ``"anneal"`` kind. When an entity is bound it resolves under
-    the entity's ``.levain/`` (re-guarded per op — :func:`_entity_env_path`); otherwise
-    ``$VAGUS_CRYSTAL_PATH`` override, else flow's laptop store. (``AnnealEntityFiring`` never falls
-    through here — it resolves via its own ``_entity_paths``.)"""
-    entity = _entity_env_path("crystal")
-    if entity is not None:
-        return entity
+    """The default crystal path for the ``"anneal"`` kind: ``$VAGUS_CRYSTAL_PATH``, else flow's laptop
+    store — refused outright in an entity process (:func:`_refuse_in_entity_process`).
+    (``AnnealEntityFiring`` never falls through here — it resolves via its own ``_entity_paths``.)"""
+    _refuse_in_entity_process()
     env = os.environ.get("VAGUS_CRYSTAL_PATH", "").strip()
     return Path(env) if env else DEFAULT_CRYSTAL_PATH
 
 
 def _env_episodic_path() -> Path:
-    entity = _entity_env_path("episodic")
-    if entity is not None:
-        return entity
+    _refuse_in_entity_process()
     env = os.environ.get("VAGUS_EPISODIC_PATH", "").strip()
     return Path(env) if env else DEFAULT_EPISODIC_PATH
 
@@ -352,17 +345,18 @@ class AnnealFiring:
 
 class AnnealEntityFiring(AnnealFiring):
     """An ISOLATED entity firing (kind ``"anneal_entity"``): resolves its crystal + episodic stores
-    ONLY under the bound entity dir (``$LEVAIN_ENTITY_DIR`` / an explicit ``entity_dir``), behind
+    ONLY under the entity dir it is given (``entity_dir``), behind
     the fail-closed sovereignty guard. It has NO ``~/.anneal-memory/`` fallback — the operator-
     laptop leak is structurally IMPOSSIBLE for this kind (``structural_invariants_beat_discipline``).
 
     Why the KIND carries isolation (not just env): ``firing_kind`` is a SERIALIZED field, so a
     ``fork()`` / reload rebuilds this as ``AnnealEntityFiring`` — never the laptop-defaulting
-    ``AnnealFiring``. The entity DIR rides ``$LEVAIN_ENTITY_DIR`` (re-read per op, never frozen) —
-    the one channel that survives a zero-arg registry rebuild (the same mechanism the legacy
-    ``VAGUS_CRYSTAL_PATH`` override used). So even after a fork the contract holds by construction.
+    ``AnnealFiring``. The entity DIR rides the condenser's serialized ``entity_dir`` (spore-438), so a
+    fork rebuilds this firing on the SAME entity. A firing built with no entity has no store at all —
+    there is no process-level entity to fall back to. The stores are re-derived and re-guarded per op,
+    never frozen.
 
-    FAIL-CLOSED-TO-SAFE at runtime: if no entity is bound (env unset) or the guard trips, the
+    FAIL-CLOSED-TO-SAFE at runtime: if no entity was given or the guard trips, the
     resolver RAISES — and because ``_recall`` / ``capture`` wrap resolution in the fail-soft
     boundary, that degrades to no-recall / a loud lost-capture, NEVER a silent read of the wrong
     store. The loud build-time guard (``build_entity_agent``) surfaces a misconfig before the REPL;
@@ -370,10 +364,10 @@ class AnnealEntityFiring(AnnealFiring):
     """
 
     def __init__(self, entity_dir: Path | str | None = None, **kwargs: object) -> None:
-        # ``entity_dir`` is for in-process / test construction; None → resolve per-op from
-        # ``$LEVAIN_ENTITY_DIR`` (the fork-safe path). It is NOT frozen into crystal_path/
-        # episodic_path — those must RE-resolve so a fork (zero-arg rebuild) still finds the entity
-        # via env. Passing a crystal_path/episodic_path override to an entity firing is refused
+        # ``entity_dir`` is the entity this firing serves (the session path always passes it); None
+        # → every op refuses (no store). It is NOT frozen
+        # into crystal_path/episodic_path — those RE-resolve and re-guard per op, so a post-bind
+        # ``.levain`` swap is caught. Passing a crystal_path/episodic_path override to an entity firing is refused
         # (an explicit path could point at flow's store — the exact leak); the entity dir is the
         # single source of truth.
         if kwargs.get("crystal_path") is not None or kwargs.get("episodic_path") is not None:
@@ -400,4 +394,4 @@ class AnnealEntityFiring(AnnealFiring):
 
 
 register_firing("anneal", AnnealFiring)
-register_firing("anneal_entity", AnnealEntityFiring)
+register_firing("anneal_entity", AnnealEntityFiring, takes_entity=True)

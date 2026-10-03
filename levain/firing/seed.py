@@ -19,9 +19,10 @@ it into the two seams that carry IDENTITY:
     the two seams' temporal asymmetry is explicit.)
   - the **re-anchor** (``SeedPresence`` — presence kind ``"entity_seed"``) → the ``LevainCondenser``
     injects it at recency on the post-compaction recovery turn (the third CC presence hook). Unlike
-    the constitution, this rebuilds from its serializable KIND on fork/reload — so ``SeedPresence``
-    resolves the entity dir from ``$LEVAIN_ENTITY_DIR`` PER re-anchor (never a frozen path), exactly
-    the fork-safe channel :class:`~levain.firing.anneal.AnnealEntityFiring` uses for the store.
+    the constitution, this rebuilds from its serializable KIND on fork/reload — with the entity the
+    condenser serializes beside it (spore-438; with none it has no seed) — and resolves the
+    seed dir PER re-anchor (never a frozen path), exactly as
+    :class:`~levain.firing.anneal.AnnealEntityFiring` does for the store.
 
 **Dependency-isolated leaf.** stdlib + :mod:`levain.firing.isolation` only (no anneal, no OpenHands),
 so importing it never widens ``levain.firing``'s import closure. It is a BLESSED lazy leaf of
@@ -243,16 +244,14 @@ def _clean(text: str) -> str:
 class EntitySeed:
     """Reads a Levain entity's ``seed/`` dir into presence content. Afferent-only, READ-ONLY, fail-soft.
 
-    ``entity_dir`` is for in-process / test construction; ``None`` resolves per-read from
-    ``$LEVAIN_ENTITY_DIR`` (the fork-safe channel) — so a ``SeedPresence`` rebuilt cold by
-    :func:`~levain.firing.presence.build_presence` still finds the entity's seed via the env the
-    binding set. A late-moved seed / late-set env is picked up on the next read (nothing is frozen)."""
+    ``entity_dir`` is the entity to read (a session passes it); ``None`` reads nothing (there is no
+    process-level entity to fall back to). The root is re-resolved on every read (nothing is frozen)."""
 
     entity_dir: Path | str | None = None
 
     def _root(self) -> Path | None:
         """The RESOLVED entity root, or ``None`` if unbound / unresolvable. Never raises:
-        ``resolve_entity_dir`` raises :class:`IsolationError` when unbound (no explicit dir + no env),
+        ``resolve_entity_dir`` raises :class:`IsolationError` when no entity was given,
         and ``expanduser``/``resolve`` can raise ``RuntimeError`` (no home for a ``~`` path) / ``OSError``
         — all degrade to ``None`` (no seed), never a fallback to some default store."""
         try:
@@ -358,9 +357,10 @@ class SeedPresence:
     """A :class:`~levain.firing.presence.PresenceSource` (kind ``"entity_seed"``) that re-anchors to
     the entity's OWN seed. Registered as an optional lazy leaf of ``build_presence``.
 
-    Serialization-safe: rebuilt zero-arg by the registry factory on fork/reload, then resolves the
-    entity dir from ``$LEVAIN_ENTITY_DIR`` at re-anchor time (never a frozen path) — the same fork-safe
-    discipline as :class:`~levain.firing.anneal.AnnealEntityFiring`. Afferent-only + READ-ONLY +
+    Serialization-safe: rebuilt by the registry factory on fork/reload with the entity the condenser
+    serialized (zero-arg, it re-anchors to nothing), and resolved at re-anchor time
+    (never a frozen path) — the same discipline as
+    :class:`~levain.firing.anneal.AnnealEntityFiring`. Afferent-only + READ-ONLY +
     fail-soft (:class:`EntitySeed` already degrades any failure to ``None``)."""
 
     entity_dir: Path | str | None = None
@@ -372,4 +372,4 @@ class SeedPresence:
         return f"[presence re-anchor — post-compaction] Re-anchor to who you are:\n\n{body}"
 
 
-register_presence("entity_seed", SeedPresence)
+register_presence("entity_seed", SeedPresence, takes_entity=True)
