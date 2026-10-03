@@ -65,6 +65,23 @@ def test_run_passes_through_when_no_jewel_changed(tmp_path, monkeypatch):
         sh.run("echo x")
 
 
+def test_a_jewel_that_cannot_be_re_checked_refuses_and_closes(tmp_path, monkeypatch):
+    """L1 MED-1 (run): an OSError while re-inspecting escaped run() raw, with the shell left alive."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = tmp_path / "locked" / "store.db"
+    store.parent.mkdir()
+    store.write_bytes(b"")
+    sh = _BwrapShell(policy=build_policy(_entity(tmp_path), extra_deny_read_write=(store,)),
+                     argv=["/bin/false"], cwd=tmp_path, env={})
+    store.parent.chmod(0o000)
+    try:
+        with pytest.raises(ConfinementError, match="could not be re-checked"):
+            sh.run("echo x")
+        assert sh.closed
+    finally:
+        store.parent.chmod(0o755)
+
+
 @linux_live
 def test_live_an_empty_jewel_initialised_as_a_wal_database_closes_the_shell(tmp_path, monkeypatch):
     """The reproduced failure (argushub, 3838801): the next command read the row out of the -wal."""

@@ -3244,11 +3244,13 @@ class _BwrapShell(SandboxedShell):
     Linux at 3838801: the live shell read a row out of the host's ``-wal``. So the same check runs
     here at the point each command is issued; if a jewel has become a database (or an unreadable file
     in a writable directory) the shell is closed, which kills its process group, and the command is
-    refused. The next spawn is refused by the spawn check itself, so bash stays off until the jewel is
-    moved into a directory.
-    NOT covered: a command already running, or one backgrounded earlier, reads during its own life;
-    a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store with no
-    recognisable header (SQLCipher) is never classified as a database."""
+    refused. The next spawn is refused by the spawn check itself, so bash stays off until the condition
+    the refusal names is cleared. A filesystem error while re-checking refuses the same way.
+    NOT covered: a command already running when the jewel changes, or one backgrounded earlier, can
+    read a ``-wal``/``-journal`` or plant one that SQLite replays, for as long as it runs; so can a
+    command whose jewel changes between this check and its start; a ``setsid`` child survives the
+    group kill (the module's known slice-2 limit); a store with no recognisable header (SQLCipher)
+    is never classified as a database."""
 
     def __init__(
         self,
@@ -3265,11 +3267,13 @@ class _BwrapShell(SandboxedShell):
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
         try:
             _refuse_plantable_sqlite_jewels(self._jewel_policy)
-        except ConfinementError as exc:
+        except (ConfinementError, OSError, RuntimeError) as exc:
+            # A filesystem error while re-inspecting is a refusal too, as it is at spawn
+            # (_bwrap_plan): a raw OSError would crash the tool call and leave the shell alive.
             self.close()
             raise ConfinementError(
-                f"a crown jewel changed since this shell started, so the shell was closed and the "
-                f"command was not run. {exc}"
+                f"a crown jewel changed since this shell started, or could not be re-checked, so "
+                f"the shell was closed and the command was not run. {exc}"
             ) from exc
         return super().run(command, timeout=timeout)
 
