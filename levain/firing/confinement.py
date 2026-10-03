@@ -3510,6 +3510,197 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
+_UNREACHABLE = (-1, -1, -1)   # lstat refused (EACCES/EPERM): watched for becoming reachable
+
+
+_STARTUP_EXEC_VARS = frozenset({"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND"})
+
+
+def _identity(p: Path) -> tuple[int, int, int] | None:
+    """``(st_dev, st_ino, file type)`` of ``p`` without following a link, None if it is absent, or
+    ``_UNREACHABLE`` if this user cannot even stat it (another user's runtime directory: the plan
+    leaves such a path alone, so it must not cost the shell either; L3 r4). Any other ``lstat``
+    error propagates (the caller refuses)."""
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        # Unreachable only when the directory blocking the way belongs to ANOTHER user: one this user
+        # owns, a same-uid shell can chmod open, read through and close again (complement L3 r5).
+        for a in p.parents:
+            try:
+                ast = os.lstat(a)
+            except PermissionError:
+                continue
+            if ast.st_uid == os.geteuid():
+                raise
+            return _UNREACHABLE
+        raise
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
+
+
+def _describe(ident: tuple[int, int, int] | None) -> str:
+    if ident is None:
+        return "absent"
+    if ident == _UNREACHABLE:
+        return "unreachable"
+    kind = {stat.S_IFREG: "file", stat.S_IFDIR: "dir", stat.S_IFLNK: "symlink"}.get(ident[2], "other")
+    return f"{kind} inode {ident[1]}"
+
+
+def _mount_plan_paths(
+    argv: list[str], policy: CrownJewelsPolicy
+) -> tuple[dict[str, str | None], list[str]]:
+    """What the bwrap plan covers on the host: ``(mounted, unmounted)``.
+
+    ``mounted`` maps each host path the plan mounts over to the mountpoint the provider may create if
+    it is absent: ``"dir"`` for a tmpfs, ``"file"`` for a ``/dev/null`` bind, or None for a bind it must
+    never create (a self-bind of something that exists, a ``--*-try`` bind the plan lets bwrap skip,
+    an ancestor pin the provider makes separately) (L3 r4). ``unmounted`` is
+    every jewel path the policy names that the plan does NOT mount (an absent jewel under a read-only
+    store, a SQLite sidecar absent at spawn): nothing covers those, so they are watched for appearing.
+    A path strictly inside a tmpfs root is left out of both, by EXACT containment: the tmpfs hides the
+    host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
+    (L3 2026-10-03)."""
+    mounted: dict[str, str | None] = {}
+    tmpfs: list[Path] = []
+    i = 0
+    while i < len(argv):
+        op = argv[i]
+        if op == "--tmpfs":
+            mounted.setdefault(argv[i + 1], "dir")
+            tmpfs.append(Path(argv[i + 1]))
+            i += 2
+        elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+            src, dst = argv[i + 1], argv[i + 2]
+            if dst != "/":
+                kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
+                mounted.setdefault(dst, kind)
+            i += 3
+        elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
+            i += 2
+        else:
+            i += 1
+
+    def hidden(q: str) -> bool:
+        pq = Path(q)
+        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+
+    mounted = {q: k for q, k in mounted.items() if not hidden(q)}
+    unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
+    return mounted, unmounted
+
+
+def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
+    """Every jewel path the policy names, spelled as the plan spells it (real parent, final component
+    unresolved). EVERY deny_read_write root, not only file-shaped ones: an absent root created as a
+    directory would otherwise be neither mounted nor watched (codex L3 r4)."""
+    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
+             *policy.sqlite_sidecars, *policy.deny_read_write]
+    if policy.config_file is not None:
+        named.append(policy.config_file)
+
+    def spelled(p: Path) -> str:
+        try:
+            return str(p.parent.resolve() / p.name)
+        except (OSError, RuntimeError):
+            return str(p)
+
+    return list(dict.fromkeys(spelled(Path(p)) for p in named))
+
+
+def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
+    """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
+    the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
+    file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
+    it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
+    which is still recorded before bwrap mounts over it."""
+    for q, kind in mounted.items():
+        p = Path(q)
+        if kind is None or os.path.lexists(p):
+            continue
+        # bwrap would create missing parents too; without them a jewel under an absent directory
+        # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
+        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
+        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
+            a.mkdir(mode=0o700, exist_ok=True)
+        if kind == "dir":
+            p.mkdir(mode=0o700, exist_ok=True)
+        else:
+            try:
+                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+            except FileExistsError:
+                pass
+
+
+class _BwrapShell(SandboxedShell):
+    """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
+    mounts it was started with (spore-1312, rec C, ruled by Phill 2026-10-03, widened by its L3).
+
+    Two checks, one rule each:
+      - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
+        empty jewel can be initialised as a database IN PLACE, keeping its inode (RUN on Linux at
+        3838801: the next command read a row out of the host's ``-wal``);
+      - every path in the mount manifest still has the identity it had when
+        the mounts were made, which covers every way the host can put something new where a mount
+        was: an atomic rewrite, an unlink while a connection keeps a ``-wal``, a swap for a link, a
+        sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
+        2026-10-03 before this replaced the per-case checks.
+    If either fires, the shell is closed (its process group killed) and the command refused; the next
+    spawn mounts what is there now, or refuses at the spawn check. A filesystem error while checking
+    refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
+    including a ``levain wrap`` rewriting the entity's own continuity, or a daemon recreating its socket:
+    that rewrite detached the mount, so the shell could no longer be trusted with it.
+    The manifest is recorded once, before bwrap runs, after the provider has created every absent
+    host mountpoint itself (:func:`_prepare_mountpoints`), so nothing is adopted after the start. It
+    covers every mounted path and every jewel the plan leaves unmounted (:func:`_mount_plan_paths`).
+    NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
+    its access for as long as it runs; so does a command whose path changes between this check and
+    its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
+    with no recognisable header (SQLCipher) is never classified as a database."""
+
+    def __init__(
+        self,
+        *,
+        policy: CrownJewelsPolicy,
+        manifest: dict[str, tuple[int, int, int] | None],
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        default_timeout: float = 120.0,
+    ) -> None:
+        super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
+        self._jewel_policy = policy
+        self._manifest = dict(manifest)   # recorded before the start; never updated
+
+    def _recheck(self) -> None:
+        _refuse_plantable_sqlite_jewels(self._jewel_policy)
+        for q, was in self._manifest.items():
+            now = _identity(Path(q))
+            if now != was:
+                raise ConfinementError(
+                    f"{q} changed since the shell started ({_describe(was)} -> {_describe(now)}); "
+                    "the floor no longer covers what is on disk there."
+                )
+
+    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
+        if self.closed:
+            return super().run(command, timeout=timeout)   # the base refusal names the real reason
+        try:
+            self._recheck()
+        except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
+            # A filesystem error while re-inspecting is a refusal too, as it is at spawn
+            # (_bwrap_plan): a raw OSError would crash the tool call and leave the shell alive.
+            self.close()
+            raise ConfinementError(
+                f"a crown jewel changed since this shell started, or could not be re-checked, so "
+                f"the shell was closed and the command was not run. {exc}"
+            ) from exc
+        return super().run(command, timeout=timeout)
+
+
 class BwrapProvider(ConfinementProvider):
     """Linux ``bubblewrap`` (mount-namespace) provider — the K4c counterpart to
     :class:`SeatbeltProvider`.
@@ -3578,8 +3769,21 @@ class BwrapProvider(ConfinementProvider):
                 "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
+        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
+        # and the manifest (an absent root created as a directory, say) would be recorded in its new
+        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
+        try:
+            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
+                "(fail-closed)."
+            ) from exc
         argv, create_first = _bwrap_plan(policy)
-        argv = argv + ["/bin/bash", "--noprofile", "--norc"]
+        mounted, unmounted = _mount_plan_paths(argv, policy)
+        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
+        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
+        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         for d in create_first:
@@ -3593,13 +3797,53 @@ class BwrapProvider(ConfinementProvider):
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
-        shell = SandboxedShell(
+        try:
+            _prepare_mountpoints(mounted)
+            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
+                "bash hands (fail-closed)."
+            ) from exc
+        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
+        if moved:
+            raise ConfinementError(
+                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
+                "— refusing to grant bash hands (fail-closed). Try again."
+            )
+        # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
+        # expand these before the first per-command check, so a jewel that appeared after the manifest
+        # could be read before anything looked (codex L3 r5, r6).
+        shell_env = {
+            k: v for k, v in (env if env is not None else _default_shell_env()).items()
+            if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
+        }
+        shell = _BwrapShell(
+            policy=policy,
+            manifest=manifest,
             argv=argv,
             cwd=policy.workspace,
-            env=env if env is not None else _default_shell_env(),
+            env=shell_env,
             default_timeout=default_timeout,
         )
-        return shell.start()
+        try:
+            shell.start()
+            shell._recheck()   # whatever changed during the start closes it before any command
+        except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
+            shell.close()
+            raise
+        except (OSError, RuntimeError) as exc:
+            # A filesystem error in the recheck is a refusal like every other spawn-time inspection,
+            # not a crash past the caller's ConfinementError handler (codex + complement L3 r6).
+            shell.close()
+            raise ConfinementError(
+                f"could not re-check the floor's jewels after the shell started ({exc}) — refusing "
+                "to grant bash hands (fail-closed)."
+            ) from exc
+        except BaseException:
+            shell.close()   # never orphan a started shell (glm L3 r2)
+            raise
+        return shell
 
 
 def sandbox_exec_available() -> bool:
