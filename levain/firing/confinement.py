@@ -2948,6 +2948,17 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
+def _masked_both_ways(target: Path, masked: set[str]) -> bool:
+    """True iff ``target`` names a destination step (2) or (4) masked, as spelled or as resolved,
+    compared case- and normalization-insensitively (``masked`` holds ``_canon`` strings)."""
+    if _canon(str(target)) in masked:
+        return True
+    try:
+        return _canon(str(target.resolve())) in masked
+    except (OSError, RuntimeError):
+        return False
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
     return _bwrap_plan(policy)[0]
@@ -3075,6 +3086,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
     file_roots: list[Path] = []   # subtree roots that are files: denied both ways, like step (4)
+    # Every destination steps (2) and (4) mask with /dev/null, recorded AS EMITTED. Step (5) checks
+    # its self-bind targets against these, never against a second resolve of the policy paths.
+    masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
@@ -3095,6 +3109,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
             # Deny it the way step (4) denies a file, which refuses both read and write.
             argv += ["--ro-bind", "/dev/null", str(sub)]
+            masked_both.append(str(sub))
             file_roots.append(sub)
             continue
         tmpfs_roots.append(sub)
@@ -3123,6 +3138,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         for sub in nested_in_ssh:
             if sub.exists() and not sub.is_dir():
                 argv += ["--ro-bind", "/dev/null", str(sub)]
+                masked_both.append(str(sub))
                 file_roots.append(sub)
             else:
                 argv += ["--tmpfs", str(sub)]
@@ -3171,7 +3187,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        argv += ["--ro-bind", "/dev/null", str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))]
+        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        argv += ["--ro-bind", "/dev/null", dest]
+        masked_both.append(dest)
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
     # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
@@ -3193,13 +3211,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
-    # Targets already denied both ways (steps 2 and 4), as step (4) mounts them: resolved.
-    denied_both_targets = set()
-    for jewel in [*deny_both, *file_roots]:
+    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
+    # plus each one's resolved spelling, compared through `_canon`. Two corrections (codex, L3 r2):
+    # a second resolve of the policy paths can observe a symlink retargeted after step (4) mounted,
+    # so the emitted string is the authority; and `resolve()` folds neither case nor Unicode
+    # normalization, so on a casefolded Linux volume an alternate spelling of a masked dentry would
+    # miss an exact compare. Over-matching only turns a self-bind into a /dev/null mask, which
+    # denies MORE (fail-closed).
+    denied_both_targets: set[str] = set()
+    for dest in masked_both:
+        denied_both_targets.add(_canon(dest))
         try:
-            denied_both_targets.add(Path(jewel).resolve())
+            denied_both_targets.add(_canon(str(Path(dest).resolve())))
         except (OSError, RuntimeError):
-            denied_both_targets.add(Path(jewel))
+            pass
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
@@ -3237,7 +3262,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             )
         elif f.exists():
             target = _bwrap_file_target(f)
-            if _shadowed_by(target, roots) or target in denied_both_targets:
+            if _shadowed_by(target, roots) or _masked_both_ways(target, denied_both_targets):
                 # The spelling is outside every hidden subtree but its TARGET is inside one, or is
                 # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
                 # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
