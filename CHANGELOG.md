@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **`levain init --web` now holds the install lock while it refreshes the pack docs**, as `levain init` in the terminal already did. The refresh clears and recopies `.levain/docs/`; it used to run after the install had released the lock, so a `levain init` or `levain update` started at that moment could interleave its own copy. A busy install is still refused before anything is written (409, not reported as a partial install).
+
 ## [0.5.2] — 2026-10-02
 
 ### Changed
