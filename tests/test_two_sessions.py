@@ -205,9 +205,11 @@ def test_a_sessions_binding_cannot_change_after_open(tmp_path, home):
     """r2-3 (codex L3, REPRODUCED on d65d63e: a rebind raced the tool build). That needed a write path
     onto a live binding. On the session path there is none:
       - the binding is a frozen value and no bind function exists;
-      - the hands are built and their floor read back INSIDE open, so the spec params they were
-        built from are never read again — mutating them afterwards (L1's run against the lazy build,
-        2026-10-02) moves nothing.
+      - the hands are built and their floor read back INSIDE open, so THIS session's hands are
+        never rebuilt from the spec params — mutating them afterwards (L1's run against the lazy
+        build, 2026-10-02) moves nothing here. A later fork() DOES build its hands from the spec as
+        it stands then (codex L3 r1), so in-process code that edits it is trusted host code — the
+        same boundary as passing fork() any agent it likes.
     Not claimed here: a raw-SDK resume of entity A's persisted conversation under entity B's agent
     is accepted by the SDK (it checks tool names only; L1, run). No Levain path resumes; K1 part 2
     must derive a conversation's persistence from its entity."""
