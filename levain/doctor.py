@@ -1396,6 +1396,10 @@ def _check_openhands(install: Path) -> list[CheckResult]:
     ]
 
 
+# The Claude Code carrier's import of the live continuity, exactly as the template writes it.
+CONTINUITY_IMPORT = "@.levain/memory.continuity.md"
+
+
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
@@ -1431,6 +1435,24 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
         for name in ON_DEMAND_SEED
         if f"@seed/{name}" in text or f". `seed/{name}`" in text
     ]
+    # A Claude Code carrier written before 0.5.5 does not import the live continuity, so the
+    # entity starts each session without its memory unless it thinks to read it (1003+21's
+    # demo runs: memory read on 4-5 of 8 days). Same remedy: `levain update` rewrites it.
+    if carrier.name == "CLAUDE.md" and CONTINUITY_IMPORT not in text.splitlines():
+        return [
+            CheckResult(
+                f"{carrier.name} freshness",
+                False,
+                f"does not import the living memory ({CONTINUITY_IMPORT}), so a session "
+                "starts without it",
+                f"This install predates the change. Run `levain update --path "
+                f"{install}`: it rewrites {carrier.name} if it is still the copy levain "
+                f"wrote. If you edited it, or levain has no record of writing it, the "
+                f"new version is staged under .levain/pending/ for you to merge; or add "
+                f"the line `{CONTINUITY_IMPORT}` yourself.",
+                upgrade_pending=True,
+            )
+        ]
     if stale:
         return [
             CheckResult(
@@ -1847,6 +1869,12 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
 
     by_role: dict[str, int] = {}
     total = len(text.encode("utf-8"))  # the carrier itself loads too
+    if CONTINUITY_IMPORT in text.splitlines():
+        try:   # the living memory loads every session too; absent until the first wrap
+            by_role["living memory"] = (install / CONTINUITY_IMPORT[1:]).stat().st_size
+            total += by_role["living memory"]
+        except OSError:
+            pass
     seen: set[str] = set()
     for name in names:
         if name in seen:

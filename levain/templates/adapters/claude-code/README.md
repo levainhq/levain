@@ -103,7 +103,8 @@ only if the server is registered under exactly that name. `mcp.template.json`
 ships the correct registration; do not rename the server.
 
 The store is pinned to **`.levain/memory.db` inside the install** — see
-*Store scoping* below.
+*Store scoping* below. Its continuity, `.levain/memory.continuity.md`, is also
+imported by `CLAUDE.md`, so it is in context from the first turn of every session.
 
 ## Prerequisites
 
