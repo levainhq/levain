@@ -3235,6 +3235,45 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
+class _BwrapShell(SandboxedShell):
+    """A :class:`SandboxedShell` that re-runs the spawn-time SQLite jewel check before every command
+    (spore-1312, rec C, ruled by Phill 2026-10-03).
+
+    The spawn check (:func:`_refuse_plantable_sqlite_jewels`) classifies each file-shaped jewel once.
+    A jewel that was an empty file at spawn and is initialised as a WAL database afterwards was RUN on
+    Linux at 3838801: the live shell read a row out of the host's ``-wal``. So the same check runs
+    here at the point each command is issued; if a jewel has become a database (or an unreadable file
+    in a writable directory) the shell is closed, which kills its process group, and the command is
+    refused. The next spawn is refused by the spawn check itself, so bash stays off until the jewel is
+    moved into a directory.
+    NOT covered: a command already running, or one backgrounded earlier, reads during its own life;
+    a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store with no
+    recognisable header (SQLCipher) is never classified as a database."""
+
+    def __init__(
+        self,
+        *,
+        policy: CrownJewelsPolicy,
+        argv: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        default_timeout: float = 120.0,
+    ) -> None:
+        super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
+        self._jewel_policy = policy
+
+    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
+        try:
+            _refuse_plantable_sqlite_jewels(self._jewel_policy)
+        except ConfinementError as exc:
+            self.close()
+            raise ConfinementError(
+                f"a crown jewel changed since this shell started, so the shell was closed and the "
+                f"command was not run. {exc}"
+            ) from exc
+        return super().run(command, timeout=timeout)
+
+
 class BwrapProvider(ConfinementProvider):
     """Linux ``bubblewrap`` (mount-namespace) provider — the K4c counterpart to
     :class:`SeatbeltProvider`.
@@ -3318,7 +3357,8 @@ class BwrapProvider(ConfinementProvider):
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
-        shell = SandboxedShell(
+        shell = _BwrapShell(
+            policy=policy,
             argv=argv,
             cwd=policy.workspace,
             env=env if env is not None else _default_shell_env(),
