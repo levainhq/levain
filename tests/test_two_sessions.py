@@ -235,6 +235,25 @@ def test_a_sessions_binding_cannot_change_after_open(tmp_path, home):
         s.close()
 
 
+def test_open_refuses_hands_that_do_not_report_the_resolved_floor(tmp_path, home, monkeypatch):
+    """The start-time read-back is fail-closed (Diogenes 10-03, run: with the check removed, hands
+    built from a skewed binding opened with an emptied deny list and the suite stayed green)."""
+    import dataclasses
+
+    from levain.firing.binding import ConversationBinding
+    from levain.session import SessionStartError
+
+    real = ConversationBinding.from_params.__func__
+
+    def skewed(cls, data):
+        b = real(cls, data)
+        return dataclasses.replace(b, floor=dataclasses.replace(b.floor, deny_files=()))
+
+    monkeypatch.setattr(ConversationBinding, "from_params", classmethod(skewed))
+    with pytest.raises(SessionStartError, match="did not report the floor"):
+        _open(_entity(tmp_path, "ent"), "unattended")
+
+
 def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_own_floor(
         tmp_path, home):
     """The c6a6b6e test whose injected race window never ran, replaced by a RUN. r2-1 + r3-1 (a GC

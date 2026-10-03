@@ -905,6 +905,21 @@ def test_systemd_install_rolls_back_to_the_prior_unit_on_failure(systemd, tmp_pa
     assert (systemd.UNIT_DIR / "levain-cockpit.service").read_text() == prior
 
 
+def test_systemd_rollback_disables_the_service_a_failed_shape_change_enabled(
+        systemd, tmp_path, monkeypatch) -> None:
+    """periodic -> resident, enable fails: the restored periodic service file has no [Install], so the
+    default.target.wants link the failed enable made would start the service at login beside its
+    restored timer unless the rollback disables it (Diogenes LOW 2026-10-02; untested per 10-03)."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-cockpit.service").write_text("[Unit]\nDescription=PRIOR\n")
+    (systemd.UNIT_DIR / "levain-cockpit.timer").write_text("[Timer]\nOnUnitActiveSec=900\n")
+    fake = _FakeSystemctl(rc_for={"enable": 1})
+    monkeypatch.setattr(daemon, "_run", fake)
+    with pytest.raises(DaemonError, match="rolled back"):
+        systemd.install(_resident(tmp_path))
+    assert ["systemctl", "--user", "disable", "levain-cockpit.service"] in fake.calls
+
+
 # --- systemd's OWN parser is the oracle, not our string assertions ----------------------------
 
 _HAS_SYSTEMD_ANALYZE = shutil.which("systemd-analyze") is not None
