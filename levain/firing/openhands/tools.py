@@ -91,6 +91,7 @@ from openhands.tools.terminal.metadata import CmdOutputMetadata
 
 from levain.firing.confinement import (
     ConfinementError,
+    FloorRefreshError,
     CrownJewelsPolicy,
     SandboxedShell,
     crown_jewel_reason,
@@ -236,7 +237,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "_lock", "_refusal")
+    __slots__ = ("_policy", "_lock", "_refusal", "_on_refuse")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -248,6 +249,13 @@ class _SharedFloor:
         self._policy = policy
         self._lock = threading.Lock()
         self._refusal: str | None = None
+        self._on_refuse: list[Any] = []   # weak references to hands' revoke callbacks
+
+    def on_refuse(self, callback: Any) -> None:
+        """Register a bound method to call once, outside the lock, when the floor is refused. Held
+        weakly, so a discarded hand is not kept alive by its floor."""
+        with self._lock:
+            self._on_refuse.append(weakref.WeakMethod(callback))
 
     @property
     def refusal(self) -> str | None:
@@ -259,8 +267,18 @@ class _SharedFloor:
         that fails, e.g. on a store a trust file started naming in an unsafe place, used to leave the
         file editor on the old floor while only bash refused."""
         with self._lock:
-            if self._refusal is None:
-                self._refusal = reason
+            if self._refusal is not None:
+                return
+            self._refusal = reason
+            callbacks = [ref() for ref in self._on_refuse]
+        # Revoke actively, not at the next poll: a live shell (and anything it backgrounded) is
+        # killed now, so it cannot keep acting on a floor that was just given up (codex L3 r5).
+        for cb in callbacks:
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:  # noqa: BLE001 — a failing revoke must not stop the others
+                    pass
 
     def refresh(self) -> CrownJewelsPolicy:
         """Re-derive the evolving denies (sockets, trust-listed stores) and absorb them, before a hand
@@ -576,6 +594,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             floor = _SharedFloor(policy)  # type: ignore[arg-type]
         self._floor = floor
         self._default_timeout = default_timeout
+        floor.on_refuse(self._revoke)
 
         self._shell: SandboxedShell | None = None
         # Guards the lazy spawn / teardown against interrupt()/close() from another thread. Bash calls
@@ -621,11 +640,12 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     candidate = provider.spawn_shell(
                         refreshed, default_timeout=self._default_timeout
                     )
-                except ConfinementError:
-                    # The provider refreshes again on its own; if THAT derivation is what failed,
-                    # record it for both hands (codex L3 r4). A failure of the start itself
-                    # (no bwrap, a bad host) leaves the editor usable.
-                    self._floor.refresh()
+                except FloorRefreshError as exc:
+                    # The provider's own refresh failed: a refusal of the floor for both hands,
+                    # recorded from the typed error rather than by replaying the derivation (codex
+                    # L3 r5). A failure of the start itself (no bwrap, a bad host) is a plain
+                    # ConfinementError and leaves the editor usable.
+                    self._floor.refuse(str(exc))
                     raise
                 try:
                     # `effective_policy` is Optional on the TYPE because a SandboxedShell built
@@ -654,6 +674,18 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                     raise
             return self._shell
 
+    def _revoke(self) -> None:
+        """Called by the floor when it is refused: kill the live shell now. Takes NO lock: the floor
+        can be refused from inside this executor's own locked spawn (its refresh fails there), and
+        ``SandboxedShell.close`` is thread-safe and idempotent by contract. Nothing respawns after,
+        because every call checks the refusal before it reaches the shell."""
+        shell = self._shell
+        if shell is not None:
+            try:
+                shell.close()
+            except Exception:  # noqa: BLE001 — revocation is best-effort; the refusal itself stands
+                pass
+
     def _teardown(self) -> None:
         with self._lock:
             shell, self._shell = self._shell, None
@@ -676,7 +708,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 "non-interactively instead (flags/env, a heredoc, or `yes |`).",
             )
         if self._floor.refusal is not None:
-            self._teardown()   # a live shell must not outlive a refusal set by the other hand
+            self._revoke()   # a live shell must not outlive a refusal set by the other hand
             return self._error(action, f"crown-jewels floor refused: {self._floor.refusal}")
         if action.reset:
             self._teardown()

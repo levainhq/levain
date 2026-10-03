@@ -472,6 +472,12 @@ class ConfinementError(RuntimeError):
     unconfined host shell (``structural_invariants_beat_discipline``)."""
 
 
+class FloorRefreshError(ConfinementError):
+    """The floor's evolving denies could not be re-derived (a trust file naming a store that cannot be
+    hidden, an unreadable trust path). Distinct from a shell that failed to start, so a caller can
+    record it as a refusal of the whole floor without replaying the derivation (codex L3 r5)."""
+
+
 # --- the OS-agnostic policy (the canonical object) -------------------------------------------
 
 @dataclass(frozen=True)
@@ -2409,7 +2415,10 @@ class ConfinementProvider(ABC):
         # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
         # `refresh_socket_denies` is a monotonic union — so a second resolution can only ever widen
         # what the first produced. Round 4's lost-update came from keeping the EARLIER answer.
-        refreshed = refresh_socket_denies(policy)
+        try:
+            refreshed = refresh_socket_denies(policy)
+        except Exception as exc:
+            raise FloorRefreshError(str(exc)) from exc
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not

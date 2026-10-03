@@ -560,9 +560,26 @@ def test_a_live_bash_shell_is_torn_down_by_a_refusal_from_the_editor(home):
     live = _Live()
     bash._shell = live
     floor.refuse("a trust file named an unsafe store")
+    assert live.closed            # revoked by the refusal itself, before any bash call (codex L3 r5)
     obs = bash(TerminalAction(command="echo hi"))
     assert obs.is_error and "refused" in obs.text
-    assert live.closed and bash._shell is None
+
+
+def test_a_shell_start_failure_does_not_refuse_the_floor(home, monkeypatch):
+    """A plain start failure (no bwrap, a bad host) is not a floor refusal: the editor stays usable."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            raise ConfinementError("bwrap cannot establish a namespace")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    with pytest.raises(ConfinementError):
+        bash._ensure_shell()
+    assert floor.refusal is None
 
 
 def test_a_failure_in_the_providers_own_refresh_refuses_the_floor(home, monkeypatch):
@@ -576,8 +593,8 @@ def test_a_failure_in_the_providers_own_refresh_refuses_the_floor(home, monkeypa
 
     class _Provider:
         def spawn_shell(self, policy, **kw):
-            _trust(home / ".anneal-memory" / "derive-trust.json", entity / "workspace" / "p" / "memory.db")
-            raise ConfinementError("the provider's refresh found an unsafe store")
+            from levain.firing.confinement import FloorRefreshError
+            raise FloorRefreshError("the provider's refresh found an unsafe store")
 
     monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
     with pytest.raises(ConfinementError):
@@ -608,3 +625,17 @@ def test_any_refresh_failure_refuses_the_floor(home, monkeypatch):
     with pytest.raises(ConfinementError):
         floor.refresh()
     assert floor.refusal is not None
+
+
+def test_the_providers_refresh_failure_is_typed(home, monkeypatch):
+    """The base spawn_shell reports its own refresh failing as FloorRefreshError, so the executor can
+    refuse the floor without replaying the derivation (codex L3 r5)."""
+    import levain.firing.confinement as conf
+    from levain.firing.confinement import FloorRefreshError
+
+    def boom(policy):
+        raise ConfinementError("a trust file names a store that cannot be hidden")
+
+    monkeypatch.setattr(conf, "refresh_socket_denies", boom)
+    with pytest.raises(FloorRefreshError):
+        conf.select_provider().spawn_shell(build_policy(_entity(home)))
