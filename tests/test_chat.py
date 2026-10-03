@@ -885,16 +885,359 @@ def test_a_session_being_closed_still_holds_its_slot(tmp_path):
     _opened(host, "beta")
 
 
-@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+@pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf"), threading.TIMEOUT_MAX * 2, 1e12])
 def test_a_turn_bound_that_would_never_fire_is_refused(tmp_path, bad):
     with pytest.raises(ValueError):
         _host(tmp_path, _Factory([]), turn_seconds=bad)
 
 
-@pytest.mark.parametrize("text", ["0", "-5", "nan", "inf", "soon"])
+@pytest.mark.parametrize("text", ["0", "-5", "nan", "inf", "soon", "1e12"])
 def test_serve_refuses_a_turn_seconds_that_would_never_fire(text, capsys):
     from levain.cli import main
 
     with pytest.raises(SystemExit) as e:
         main(["serve", "--turn-seconds", text])
     assert e.value.code == 2
+
+
+# -- the L2 review of the follow-ons (concurrency lens, 2026-10-03), each from its repro script ------
+
+
+def _until(pred, timeout: float = 5.0, what: str = "") -> None:
+    deadline = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < deadline, f"timed out waiting for {what or pred}"
+        time.sleep(0.005)
+
+
+class _HeldClose(_Stub):
+    """close() announces it has started, then blocks until released: a slow teardown."""
+
+    def __init__(self, on_event, script=None):
+        super().__init__(on_event, script if script is not None else [])
+        self.closing = threading.Event()
+        self.release = threading.Event()
+
+    def close(self):
+        self.closing.set()
+        assert self.release.wait(5)
+        self.closed = True
+
+
+def _deadline_watchers() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "levain-chat-deadline"]
+
+
+def test_a_fault_escaping_an_open_holds_its_slot_until_the_shell_is_released(tmp_path):
+    """L2 M1: `_guarded` published `failed` before tearing the session down, so while a slow
+    teardown ran the session no longer counted and a second open got a live shell past the cap."""
+
+    class _BadDescribe(_HeldClose):
+        @property
+        def label(self):          # read by _describe after the session exists: a fault in settling
+            raise RuntimeError("describe broke")
+
+    made: list[_Stub] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_BadDescribe(on_event) if not made else _Stub(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
+                    session_factory=factory, max_sessions=1)
+    sid = host.open("alpha")["session_id"]
+    _until(lambda: made, what="the open")
+    assert made[0].closing.wait(5)
+    assert host.session_status(sid)["state"] == "closing"
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.http_status == 429
+    made[0].release.set()
+    _until(lambda: host.session_status(sid)["state"] == "failed", what="failed")
+    _opened(host, "beta")
+
+
+def test_a_turn_ending_after_shutdown_holds_its_slot_until_the_shell_is_released(tmp_path):
+    """L2 L1: `_run_job`'s shutdown branch published `closed` before the teardown ran."""
+    hold = threading.Event()
+    made: list[_HeldClose] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_HeldClose(on_event, [_Result()]))
+        made[-1].hold = hold
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=None)
+    hold.set()
+    sid = _opened(host)
+    hold.clear()
+    job = host.turn(sid, "x")["job_id"]
+    host.shutdown()
+    hold.set()
+    assert made[0].closing.wait(5)
+    assert host.session_status(sid)["state"] == "closing"
+    assert host.job_status(job)["status"] == "done"
+    made[0].release.set()
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="closed")
+
+
+class _CountsStops(_Stub):
+    def __init__(self, on_event, script=None):
+        super().__init__(on_event, script if script is not None else [])
+        self.stops = 0
+
+    def request_stop(self):
+        self.stops += 1
+
+
+def test_a_refused_jobs_watcher_never_stops_the_session(tmp_path):
+    """L2 L2: the watcher of a job whose worker could not start keyed on the job's status, which never
+    changes for a refused job, so it went on to stop the session, and under real timing the NEXT
+    turn. The deadline here fires while the refusal still holds the host lock, which is the window
+    the old check lost."""
+    made: list[_CountsStops] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_CountsStops(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.001)
+    sid = _opened(host)
+    before = set(_deadline_watchers())
+
+    def slow_refusal(*args):
+        time.sleep(0.1)            # the watcher's deadline passes; it queues on the host lock
+        return False
+
+    host._spawn = slow_refusal
+    with pytest.raises(ChatError) as e:
+        host.turn(sid, "x")
+    assert e.value.http_status == 503
+    for t in set(_deadline_watchers()) - before:
+        t.join(5)
+    assert made[0].stops == 0
+    assert host.session_status(sid)["state"] == "idle"
+
+
+def test_a_close_whose_teardown_raises_does_not_leave_the_session_closing(tmp_path):
+    """L2 L4: a raising close left the session `closing` forever: counted toward the cap and
+    refusing every operation, including another close."""
+
+    class _RaisingClose(_Stub):
+        def close(self):
+            raise RuntimeError("teardown failed")
+
+    made: list[_Stub] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_RaisingClose(on_event, []) if not made else _Stub(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
+                    session_factory=factory, max_sessions=1)
+    sid = _opened(host)
+    with pytest.raises(RuntimeError):
+        host.close(sid)
+    assert host.session_status(sid)["state"] == "closed"
+    host.close(sid)                # idempotent once closed
+    _opened(host, "beta")          # the slot came back
+
+
+# -- the host's own guards, each made to fail when removed (L1 MED-2) -----------------------------
+
+
+class _DeafOnce(_Stub):
+    """Ignores its FIRST stop request, as the SDK's run loop undoes a pause that lands before it
+    starts, and honours the next."""
+
+    def __init__(self, on_event):
+        super().__init__(on_event, [])
+        self.stop = threading.Event()
+        self.stops = 0
+
+    def run_turn(self, message):
+        stopped = self.stop.wait(5)
+        return _Result(reply=None, error="stopped", timed_out=True) if stopped else _Result()
+
+    def request_stop(self):
+        self.stops += 1
+        if self.stops > 1:
+            self.stop.set()
+
+
+def test_the_watcher_keeps_asking_until_the_turn_stops(tmp_path):
+    """The watcher's repeat loop: a single stop request can be undone by the run loop, so the bound
+    holds only if the watcher asks again."""
+    made: list[_DeafOnce] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_DeafOnce(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.05)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "x")["job_id"], timeout=8)
+    assert made[0].stops >= 2
+    assert st["result"]["timed_out"] is True and st["deadline_hit"] is True
+
+
+class _StuckStop(_Stub):
+    """request_stop blocks (the SDK's pause waits for a step's state lock) until released; the turn
+    itself finishes normally once a stop has been asked for."""
+
+    def __init__(self, on_event):
+        super().__init__(on_event, [])
+        self.asked = threading.Event()
+        self.release = threading.Event()
+
+    def run_turn(self, message):
+        assert self.asked.wait(5)
+        return _Result()
+
+    def request_stop(self):
+        self.asked.set()
+        self.release.wait(5)
+
+
+def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
+    """The watcher-alive branch: a watcher still inside a stop request when the job ends would land
+    that stop in the session's NEXT turn, so the session is broken instead of handed back idle."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_WATCHER_JOIN_SECONDS", 0.05)
+    made: list[_StuckStop] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_StuckStop(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.05)
+    sid = _opened(host)
+    try:
+        st = _wait(host, host.turn(sid, "x")["job_id"])
+        assert st["status"] == "failed" and "watcher did not exit" in st["error"]
+        assert host.session_status(sid)["state"] == "broken" and made[0].closed
+    finally:
+        made[0].release.set()
+
+
+def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_released(tmp_path):
+    """`_run_open`'s shut path: the session it opened is torn down while the record still reads
+    `opening` (counted, job running), and only then published `closed`."""
+    gate = threading.Event()
+    made: list[_HeldClose] = []
+
+    def factory(entity_dir, *, on_event):
+        assert gate.wait(5)
+        made.append(_HeldClose(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory)
+    out = host.open("alpha")
+    host.shutdown()
+    gate.set()
+    _until(lambda: made, what="the open")
+    assert made[0].closing.wait(5)
+    assert host.session_status(out["session_id"])["state"] == "opening"
+    assert host.job_status(out["job_id"])["status"] == "running"
+    made[0].release.set()
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and host.session_status(out["session_id"])["state"] == "closed"
+
+
+def test_shutdown_publishes_closed_only_after_each_shell_is_released(tmp_path):
+    """shutdown()'s order: a session reads `closing` while its teardown runs, and one teardown that
+    raises does not strand the sessions after it."""
+
+    class _RaisingClose(_Stub):
+        def close(self):
+            raise RuntimeError("teardown failed")
+
+    made: list[_Stub] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_RaisingClose(on_event, []) if not made else _HeldClose(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
+                    session_factory=factory)
+    first, second = _opened(host, "alpha"), _opened(host, "beta")
+    stopper = threading.Thread(target=host.shutdown)
+    stopper.start()
+    assert made[1].closing.wait(5)
+    assert host.session_status(first)["state"] == "closed"
+    assert host.session_status(second)["state"] == "closing"
+    made[1].release.set()
+    stopper.join(5)
+    assert host.session_status(second)["state"] == "closed" and made[1].closed
+
+
+def test_the_longest_accepted_turn_bound_is_one_the_watcher_can_wait_for(tmp_path):
+    """L1 LOW-3: a bound past TIMEOUT_MAX passed validation and the watcher raised
+    OverflowError, leaving the turn unbounded. The boundary value itself must still work."""
+    from levain.cli import _positive_seconds
+
+    assert _positive_seconds(str(threading.TIMEOUT_MAX)) == threading.TIMEOUT_MAX
+    errors: list[str] = []
+    prior = threading.excepthook
+    threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
+    try:
+        host = _host(tmp_path, _Factory([_Result()]), turn_seconds=threading.TIMEOUT_MAX)
+        sid = _opened(host)
+        st = _wait(host, host.turn(sid, "x")["job_id"])
+    finally:
+        threading.excepthook = prior
+    assert st["status"] == "done" and host.session_status(sid)["state"] == "idle"
+    assert errors == []
+
+
+class _FinishesWhenAsked(_Stub):
+    """The turn completes normally just as the deadline's stop request arrives (LOW-1's window: a
+    stop landing after the session's last check, e.g. during capture)."""
+
+    def __init__(self, on_event, *, raise_first: bool = False):
+        super().__init__(on_event, [])
+        self.asked = threading.Event()
+        self.raise_first = raise_first
+        self.stops = 0
+
+    def run_turn(self, message):
+        assert self.asked.wait(5), "the deadline never asked the turn to stop"
+        return _Result()
+
+    def request_stop(self):
+        self.stops += 1
+        if self.raise_first and self.stops == 1:
+            raise RuntimeError("stop request failed")
+        self.asked.set()
+
+
+def test_a_turn_that_completes_as_its_deadline_arrives_is_not_marked_stopped(tmp_path):
+    """LOW-1 / L2's settle rule: a settled `deadline_hit` means the deadline stopped the turn. A turn
+    that completed (and was captured) as the stop arrived reads as an ordinary finished turn."""
+    made: list[_FinishesWhenAsked] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_FinishesWhenAsked(on_event))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.05)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "x")["job_id"])
+    assert made[0].stops >= 1
+    assert st["result"]["ok"] is True and st["deadline_hit"] is False
+    assert host.session_status(sid)["state"] == "idle"
+
+
+def test_a_stop_request_that_raises_does_not_end_the_bound(tmp_path):
+    """L2 L3: a raising request_stop killed the watcher thread, and with it the bound."""
+    made: list[_FinishesWhenAsked] = []
+
+    def factory(entity_dir, *, on_event):
+        made.append(_FinishesWhenAsked(on_event, raise_first=True))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, turn_seconds=0.05)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "x")["job_id"], timeout=8)
+    assert made[0].stops >= 2 and st["status"] == "done"

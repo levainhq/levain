@@ -132,7 +132,10 @@ DEFAULT_MAX_SESSIONS = 4
 
 DEFAULT_TURN_SECONDS = 1800.0
 """A job's wall-clock deadline (``levain serve --turn-seconds``): long enough for real multi-step
-work, short enough that a stuck turn gives its session back the same hour."""
+work. It bounds a turn that keeps taking steps, not one stuck inside a step: a model call that
+stalls holds the session past the deadline until the SDK's own HTTP timeout and retries give up
+(run against an endpoint that never answers: the deadline fired and the job kept running). Cutting
+a stalled call short needs the SDK's async run, which this host does not use."""
 
 _WATCHER_JOIN_SECONDS = 10.0
 """How long a worker waits for its deadline watcher to exit after the job returns. The watcher's
@@ -289,9 +292,13 @@ class ChatHost:
             raise ValueError("max_sessions must be at least 1")
         if max_iterations is not None and max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
-        if turn_seconds is not None and not (math.isfinite(turn_seconds) and turn_seconds > 0):
-            # `nan > 0` is False and `inf` never fires, so both read as bounded and are not.
-            raise ValueError("turn_seconds must be a finite number of seconds above 0, or None")
+        if turn_seconds is not None and not (
+                math.isfinite(turn_seconds) and 0 < turn_seconds <= threading.TIMEOUT_MAX):
+            # `nan > 0` is False and `inf` never fires, so both read as bounded and are not. Past
+            # TIMEOUT_MAX the watcher's wait raises instead of waiting, and the turn has no bound.
+            raise ValueError(
+                "turn_seconds must be a finite number of seconds above 0 and at most "
+                f"{threading.TIMEOUT_MAX:.0f}, or None")
         self._entities = {name: Path(p) for name, p in entities.items()}
         self._factory = session_factory or _default_factory(
             model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations

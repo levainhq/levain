@@ -373,7 +373,7 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
     evs = list(events)
     start = turn_start(evs)
     prefix = str(workspace).rstrip(os.sep) + os.sep
-    refused = _refused_action_ids(evs[start:])
+    refused = _refused_action_ids(evs[start:]) | _cancelled_action_ids(evs[start:])
     lines: list[str] = []
     for e in evs[start:]:
         if getattr(e, "source", None) != "agent":
@@ -399,6 +399,40 @@ def _refused_action_ids(events) -> set[str]:
     except Exception:  # noqa: BLE001 — a display filter must never break a turn
         return set()
     return {str(e.action_id) for e in events if isinstance(e, UserRejectObservation)}
+
+
+def _cancelled_action_ids(events) -> set[str]:
+    """The ids of actions the SDK skipped because the run's cancellation token was set before they
+    started (:meth:`EntitySession.request_stop` sets it): proposed, never run. The runtime emits
+    every ``ActionEvent`` of a step before executing any of them, so without this a stop landing
+    mid-step listed the skipped commands as work.
+
+    The skip is answered by a plain ``AgentErrorEvent`` that carries the action's ``tool_call_id``
+    and no action event id; only its message tells it apart from a tool that started and raised
+    (which did run, so it stays listed). The message is taken from the SDK's own constructor rather
+    than copied here, so a reworded SDK message cannot silently stop the match. Each error is paired
+    with the latest preceding action carrying its ``tool_call_id``, because some providers reuse
+    call ids across steps. Never raises: if the SDK cannot be read nothing is removed."""
+    try:
+        from types import SimpleNamespace
+
+        from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+        from openhands.sdk.event import ActionEvent, AgentErrorEvent
+
+        probe = SimpleNamespace(tool_name="", tool_call_id="")
+        cancelled_msg = ParallelToolExecutor._cancelled_error(probe)[0].error
+    except Exception:  # noqa: BLE001 — a display filter must never break a turn
+        return set()
+    latest: dict[str, str] = {}
+    ids: set[str] = set()
+    for e in events:
+        if isinstance(e, ActionEvent):
+            latest[str(e.tool_call_id)] = str(e.id)
+        elif isinstance(e, AgentErrorEvent) and e.error == cancelled_msg:
+            action_id = latest.get(str(e.tool_call_id))
+            if action_id is not None:
+                ids.add(action_id)
+    return ids
 
 
 def latest_agent_text(events) -> str | None:
@@ -993,7 +1027,9 @@ class EntitySession:
         stopped partway has no completed work to record (the same rule as the in-process bound).
         The SDK's synchronous ``run()`` cannot be cancelled inside a step, so a step in flight (a
         model call, a shell command) finishes first, and this call itself blocks until it does
-        (the SDK's pause waits for the state lock a running step holds). Calling it again is
+        (the SDK's pause waits for the state lock a running step holds). Tool calls of that step
+        that had not started yet are skipped by the SDK; they never ran, so the result's activity
+        leaves them out. Calling it again is
         harmless, and a driver should keep calling it until the turn returns: ``run()`` turns a
         pause that landed before it started back into running.
 

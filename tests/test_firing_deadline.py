@@ -775,3 +775,122 @@ def test_a_stop_requested_before_a_turn_does_not_end_the_next_one(tmp_path) -> N
     result = sess.run_turn("next")
 
     assert result.timed_out is False and sess.binding.captures == 1
+
+
+# ---------- every stop check in the drive loop, each made to fail when removed (L1 MED-2) ----------
+
+
+class _Text:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Said:
+    """A duck-typed MessageEvent: ``source`` plus an ``llm_message`` holding text."""
+
+    def __init__(self, source, text):
+        self.source = source
+        self.llm_message = type("M", (), {"content": [_Text(text)]})()
+
+
+class _ScriptedConversation:
+    """``send_message`` and ``run`` call per-test hooks, so a test can land a stop request at the exact
+    statement whose check it is pinning. Each ``run`` appends its own events, the way a real step does."""
+
+    def __init__(self, *, on_send=None, on_run=None, replies=("Done.",)) -> None:
+        self.state = type("S", (), {})()
+        self.state.events = []
+        self.state.agent_state = {}
+        self.on_send = on_send or (lambda n, m: None)
+        self.on_run = on_run or (lambda n: None)
+        self.replies = list(replies)
+        self.sends = 0
+        self.runs = 0
+
+    def send_message(self, message):
+        self.sends += 1
+        self.state.events.append(_Said("user", message if isinstance(message, str) else "go"))
+        self.on_send(self.sends, message)
+
+    def run(self):
+        self.runs += 1
+        self.on_run(self.runs)
+        self.state.events.append(_Said("agent", self.replies[min(self.runs, len(self.replies)) - 1]))
+
+    def interrupt(self):
+        pass
+
+
+def test_a_stop_landing_before_the_first_run_takes_no_step(tmp_path) -> None:
+    """The check before `run()`. The SDK's run() turns a pause that landed before it started back into
+    running, so without the check the whole turn runs past its deadline; here a stop that arrives
+    while the message is being sent must stop the turn before any step."""
+    holder = {}
+    conv = _ScriptedConversation(on_send=lambda n, m: holder["sess"].request_stop())
+    sess = holder["sess"] = _session(tmp_path, conv)
+
+    result = sess.run_turn("go")
+
+    assert result.timed_out is True and conv.runs == 0 and sess.binding.captures == 0
+
+
+def test_a_stop_landing_while_the_nudge_is_sent_takes_no_second_step(tmp_path) -> None:
+    """The check between the act-first nudge and its `run()` (L2 L6)."""
+    holder = {}
+    conv = _ScriptedConversation(
+        on_send=lambda n, m: holder["sess"].request_stop() if n == 2 else None,
+        replies=("I'll run the tests now.", "Done."))
+    sess = holder["sess"] = _session(tmp_path, conv)
+
+    result = sess.run_turn("fix it")
+
+    assert result.timed_out is True and result.nudged is True
+    assert conv.sends == 2 and conv.runs == 1 and sess.binding.captures == 0
+
+
+def test_a_stop_landing_during_the_nudged_run_is_not_captured(tmp_path) -> None:
+    """The check after the nudged `run()`. Without it the stopped turn flows on to capture, and
+    memory records a turn the deadline cut short."""
+    holder = {}
+    conv = _ScriptedConversation(
+        on_run=lambda n: holder["sess"].request_stop() if n == 2 else None,
+        replies=("I'll run the tests now.", "Done."))
+    sess = holder["sess"] = _session(tmp_path, conv)
+
+    result = sess.run_turn("fix it")
+
+    assert result.timed_out is True and result.nudged is True
+    assert conv.runs == 2 and sess.binding.captures == 0
+
+
+@pytest.mark.parametrize("call", ["resume_turn", "reject_turn"])
+def test_a_stale_stop_does_not_end_an_approval_or_a_refusal(tmp_path, call) -> None:
+    """The flag resets in resume_turn and reject_turn. A stop that arrived after the previous job
+    ended (a deadline that lost the race with the turn's end) must not end the next continuation."""
+    conv = _ScriptedConversation()
+    sess = _session(tmp_path, conv)
+    sess.request_stop()
+
+    result = getattr(sess, call)()
+
+    assert result.timed_out is False and conv.runs == 1 and sess.binding.captures == 1
+
+
+def test_a_stop_landing_during_capture_leaves_a_completed_captured_turn(tmp_path) -> None:
+    """LOW-1, rechecked: a stop that arrives after the last check (here, inside capture) cannot undo
+    a turn that completed. The result is an ordinary completed turn, captured once, so the result and
+    memory agree, and a later turn is not affected by the stale stop."""
+    conv = _ScriptedConversation()
+    sess = _session(tmp_path, conv)
+    real_capture = sess.binding.capture_turn
+
+    def capture_then_stop(conversation):
+        real_capture(conversation)
+        sess.request_stop()
+
+    sess.binding.capture_turn = capture_then_stop
+
+    result = sess.run_turn("go")
+
+    assert result.timed_out is False and result.error is None and sess.binding.captures == 1
+    assert sess.run_turn("next").timed_out is False and sess.binding.captures == 2

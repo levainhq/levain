@@ -29,14 +29,22 @@ def _positive_int(text: str) -> int:
 
 
 def _positive_seconds(text: str) -> float:
-    """An argparse type for a wall-clock bound: a finite number of seconds above 0. ``nan`` and
-    ``inf`` are refused because both read as a bound and neither ever fires."""
+    """An argparse type for a wall-clock bound: a finite number of seconds above 0 that a thread can
+    wait for. ``nan`` and ``inf`` are refused because both read as a bound and neither ever fires;
+    a value past ``threading.TIMEOUT_MAX`` because the watcher's wait raises on it instead of
+    waiting, which would leave the turn with no bound at all."""
+    import threading
+
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
     if not (math.isfinite(value) and value > 0):
         raise argparse.ArgumentTypeError(f"must be a finite number of seconds above 0, got {text!r}")
+    if value > threading.TIMEOUT_MAX:
+        raise argparse.ArgumentTypeError(
+            f"must be at most {threading.TIMEOUT_MAX:.0f} seconds (the longest a thread can wait), "
+            f"got {text!r}")
     return value
 
 

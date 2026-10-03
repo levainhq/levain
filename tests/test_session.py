@@ -942,3 +942,60 @@ def test_an_action_the_operator_refused_is_not_listed_as_work(tmp_path: Path):
               UserRejectObservation(action_id="a-refused", tool_name="terminal",
                                     tool_call_id="c1", rejection_reason="not now")]
     assert turn_tool_activity(events, ws) == ["⚙ terminal: ls"]
+
+
+def _sdk_terminal_action(command: str, call_id: str):
+    from openhands.sdk.event import ActionEvent
+    from openhands.sdk.llm import MessageToolCall, TextContent
+    from openhands.tools.terminal import TerminalAction
+
+    return ActionEvent(source="agent", thought=[TextContent(text="")],
+                       action=TerminalAction(command=command), tool_name="terminal",
+                       tool_call_id=call_id, llm_response_id="r1",
+                       tool_call=MessageToolCall(id=call_id, name="terminal", arguments="{}",
+                                                 origin="completion"))
+
+
+def test_a_tool_call_skipped_by_a_stop_is_not_listed_as_work(tmp_path: Path):
+    """request_stop cancels the run's token; the SDK's executor then SKIPS the step's remaining tool
+    calls, whose ActionEvents are already in the stream (L1 HIGH-1 repro on b3dd2b5: a stopped turn
+    listed `rm -rf build` as work though it never ran). Driven through the SDK's real executor so
+    the skip event is the one the runtime emits."""
+    pytest.importorskip("openhands.tools.terminal")
+    from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+    from openhands.sdk.conversation.cancellation import CancellationToken
+
+    first = _sdk_terminal_action("echo one", "c1")
+    skipped = _sdk_terminal_action("rm -rf build", "c2")
+    token = CancellationToken()
+    ran: list[str] = []
+
+    def runner(action):
+        ran.append(action.action.command)
+        token.cancel()  # the stop lands while the first tool runs
+        return []
+
+    results = ParallelToolExecutor(max_workers=1).execute_batch([first, skipped], runner, None, token)
+    assert ran == ["echo one"]
+    events = [_Event("user", ["go"]), first, *results[0], skipped, *results[1]]
+    assert turn_tool_activity(events, tmp_path / "workspace") == ["⚙ terminal: echo one"]
+
+
+def test_a_tool_that_started_and_raised_stays_listed_and_reused_call_ids_pair_by_order(tmp_path: Path):
+    """The CONTROL for the skip filter. A tool that raised did start (its error is not the skip
+    message), so it is still work; and a provider that reuses a call id across steps must only lose
+    the action the skip actually answered, never the earlier step's action with the same id."""
+    pytest.importorskip("openhands.tools.terminal")
+    from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+    from openhands.sdk.conversation.cancellation import CancellationToken
+    from openhands.sdk.event import AgentErrorEvent
+
+    step1 = _sdk_terminal_action("make", "call_0")
+    raised = AgentErrorEvent(error="Error executing tool 'terminal': boom", tool_name="terminal",
+                             tool_call_id="call_0")
+    step2 = _sdk_terminal_action("make install", "call_0")
+    token = CancellationToken()
+    token.cancel()
+    skip = ParallelToolExecutor(max_workers=1).execute_batch([step2], lambda a: [], None, token)[0]
+    events = [_Event("user", ["build"]), step1, raised, step2, *skip]
+    assert turn_tool_activity(events, tmp_path / "workspace") == ["⚙ terminal: make"]
