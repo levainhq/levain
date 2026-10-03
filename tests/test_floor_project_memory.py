@@ -906,6 +906,7 @@ def test_a_case_sensitive_sibling_of_a_denied_file_stays_readable(home, tmp_path
         t = str(sibling.resolve())
         assert ["--ro-bind", t, t] in binds
         assert ["--ro-bind", "/dev/null", t] not in binds
+        assert ["--ro-bind", "/dev/null", str(denied.resolve())] in binds   # the denied one stays masked
     finally:
         opt.chmod(0o755)
 
@@ -920,7 +921,10 @@ def test_a_write_only_link_to_a_hardlink_of_a_denied_file_never_self_binds_it(ho
     secret.write_text("SECRET")
     alias = tmp_path / "elsewhere" / "alias"
     alias.parent.mkdir()
-    os.link(secret, alias)
+    try:
+        os.link(secret, alias)
+    except OSError as exc:
+        pytest.skip(f"no hardlinks here ({exc})")
     opt = tmp_path / "opt"
     opt.mkdir()
     (opt / "trust.json").symlink_to(alias)
@@ -934,3 +938,35 @@ def test_a_write_only_link_to_a_hardlink_of_a_denied_file_never_self_binds_it(ho
         assert ["--ro-bind", "/dev/null", t] in binds
     finally:
         opt.chmod(0o755)
+
+
+def test_a_mask_destination_renamed_away_mid_plan_still_masks_its_hardlink(tmp_path):
+    """codex L3 (samefile r1): a denied file renamed away while the plan identified its mask
+    destination, and back before the shell started, left its hardlink self-bound. A rename keeps
+    the link count, so a target with a second link is masked whenever a destination is unidentified."""
+    from levain.firing.confinement import _MaskedFiles, _masked_both_ways
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("SECRET")
+    alias = tmp_path / "alias"
+    try:
+        os.link(secret, alias)
+    except OSError as exc:
+        pytest.skip(f"no hardlinks here ({exc})")
+    away = tmp_path / "away"
+    secret.rename(away)                     # the race: gone while the plan looks
+    masked = _MaskedFiles.collect([str(secret)])
+    away.rename(secret)                     # and back before the shell starts
+    assert masked.unidentified
+    assert _masked_both_ways(alias, masked)
+
+
+def test_an_unidentifiable_mask_destination_does_not_mask_unrelated_single_link_files(tmp_path):
+    """codex L3 (samefile r1): one destination that could not be stat'ed masked EVERY write-only
+    target, hiding readable files that cannot be it. A single-link file is no other file's alias."""
+    from levain.firing.confinement import _MaskedFiles, _masked_both_ways
+    readable = tmp_path / "config"
+    readable.write_text("READABLE")
+    masked = _MaskedFiles.collect([str(tmp_path / "never-there")])
+    assert masked.unidentified
+    assert not _masked_both_ways(readable, masked)

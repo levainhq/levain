@@ -2992,26 +2992,50 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
-def _masked_both_ways(target: Path, masked: set[str]) -> bool:
-    """True iff ``target`` is a file step (2) or (4) masked: by spelling (as given or resolved), or
-    by identity (``os.path.samefile``) with an existing masked destination, which covers a case or
-    normalization variant on a volume that folds them and a hardlink, without matching a merely
-    similar name. A target whose identity cannot be read counts as masked (fail-closed)."""
+@dataclass(frozen=True)
+class _MaskedFiles:
+    """What steps (2) and (4) masked with /dev/null: each destination as emitted and as resolved,
+    the ``(st_dev, st_ino)`` of every one that could be stat'ed when step (5) began, and whether any
+    could not be (absent, unreadable, or mid-rename)."""
+    spellings: frozenset[str]
+    identities: frozenset[tuple[int, int]]
+    unidentified: bool
+
+    @classmethod
+    def collect(cls, masked: list[str]) -> "_MaskedFiles":
+        spellings, identities, unidentified = set(masked), set(), False
+        for dest in masked:
+            try:
+                spellings.add(str(Path(dest).resolve()))
+            except (OSError, RuntimeError):
+                pass
+            try:
+                st = os.stat(dest)
+                identities.add((st.st_dev, st.st_ino))
+            except OSError:
+                unidentified = True
+        return cls(frozenset(spellings), frozenset(identities), unidentified)
+
+
+def _masked_both_ways(target: Path, masked: _MaskedFiles) -> bool:
+    """True iff the write-only ``target`` is, or may be, a file steps (2)/(4) masked.
+
+    By spelling (as given or resolved); by identity, which covers a case or normalization variant
+    on a volume that folds them and a hardlink, without matching a merely similar name (codex,
+    floor-r2 L3 r3); and, when some masked destination could not be identified, any target with a
+    second link, since it could be that file under another name (codex, samefile L3 r1: a
+    destination renamed away and back mid-plan). A target that cannot be stat'ed counts as masked.
+    An unreadable destination no longer masks unrelated single-link files (same round)."""
     try:
         resolved = str(target.resolve())
+        st = os.stat(target)
     except (OSError, RuntimeError):
         return True
-    if str(target) in masked or resolved in masked:
+    if str(target) in masked.spellings or resolved in masked.spellings:
         return True
-    for dest in masked:
-        try:
-            if os.path.samefile(target, dest):
-                return True
-        except FileNotFoundError:
-            continue   # an absent mask destination is no file the target can be
-        except OSError:
-            return True
-    return False
+    if (st.st_dev, st.st_ino) in masked.identities:
+        return True
+    return masked.unidentified and st.st_nlink > 1
 
 
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
@@ -3273,18 +3297,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
-    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
-    # plus each one's resolved spelling (codex, L3 r2: a second resolve of the policy paths can
-    # observe a symlink retargeted after step (4) mounted, so the emitted string is the authority).
-    # An alternate spelling of a masked file (case, Unicode normalization, a hardlink) is matched
-    # by filesystem identity in `_masked_both_ways`, not by folding names: a case-fold also
-    # matched a DIFFERENT file on a case-sensitive volume (codex, floor-r2 L3 r3).
-    denied_both_targets: set[str] = set(masked_both)
-    for dest in masked_both:
-        try:
-            denied_both_targets.add(str(Path(dest).resolve()))
-        except (OSError, RuntimeError):
-            pass
+    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED
+    # (codex, L3 r2: a second resolve of the policy paths can observe a symlink retargeted after
+    # step (4) mounted), matched in `_masked_both_ways` by spelling and by filesystem identity.
+    denied_both_targets = _MaskedFiles.collect(masked_both)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue

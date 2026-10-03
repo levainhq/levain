@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Linux, a write-protected file whose name differs only in letter case from a denied file in the same directory, on a case-sensitive filesystem, is readable again** (listed as a known open issue in 0.5.3). The floor now recognises another name for a denied file by the file itself, not by its spelling. That also covers a **hardlink** to a denied file, which 0.5.3 could leave readable through the link. When some denied file cannot be identified while the shell is set up (it is missing, or unreadable), a write-protected file with more than one link is hidden from the shell too, since it could be that file under another name.
+
 ## [0.5.3] — 2026-10-03
 
 A patch release of crown-jewels floor fixes. On Linux, a credential replaced by a rename while a confined shell was live could be read by that shell in every release since 0.5.0; the shell now closes when anything under its floor changes. Both platforms now deny the operator's project memory and the stores a derive-trust file names.
