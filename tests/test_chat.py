@@ -403,28 +403,6 @@ def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
     assert host.session_status(out["session_id"])["state"] == "closed" and made[0].closed
 
 
-def test_closing_a_session_that_is_still_opening_frees_its_slot_and_its_shell(tmp_path):
-    """glm-5.3 L3 r1: an open that hangs used to be unclosable and to hold a slot forever."""
-    gate = threading.Event()
-    made = []
-
-    def factory(entity_dir, *, on_event):
-        assert gate.wait(5)
-        made.append(_Stub(on_event, []))
-        return made[-1]
-
-    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, max_sessions=1)
-    out = host.open("alpha")
-    assert host.close(out["session_id"])["state"] == "closed"
-    with pytest.raises(ChatError):
-        host.turn(out["session_id"], "x")
-    gate.set()
-    st = _wait(host, out["job_id"])
-    assert st["status"] == "failed" and "closed while it opened" in st["error"]
-    assert made[0].closed and host.session_status(out["session_id"])["state"] == "closed"
-    _opened(host)   # its slot came back
-
-
 def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch):
     f = _Factory([])
     host = _host(tmp_path, f)

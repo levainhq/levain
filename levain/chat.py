@@ -173,7 +173,6 @@ class _Session:
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
     info: dict[str, Any] = field(default_factory=dict)
-    cancelled: bool = False      # closed while opening: the open job discards what it builds
 
 
 def _turn_payload(result: Any) -> dict[str, Any]:
@@ -365,17 +364,12 @@ class ChatHost:
         return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason))
 
     def close(self, session_id: Any) -> dict[str, Any]:
-        """Close a session. Refused while a turn is running (it would be torn down under itself). A
-        session still OPENING is cancelled: it reads ``closed`` at once and stops holding a slot, and
-        its open job closes whatever the open builds, so a start that hangs cannot hold a slot
-        forever (glm-5.3 L3 r1). A failed session stays ``failed``; any other ends ``closed``."""
+        """Close a session. Refused while a job is driving it (the turn would be torn down under
+        itself). A failed session stays ``failed``; any other ends ``closed``."""
         with self._lock:
             rec = self._get(session_id)
-            if rec.state == "busy":
-                raise ChatError("busy", "the session is running a turn; close it when it finishes", 409)
-            if rec.state == "opening":
-                rec.cancelled, rec.state = True, "closed"
-                return self._session_view(rec)
+            if rec.state in ("opening", "busy"):
+                raise ChatError("busy", "the session is running a job; close it when it finishes", 409)
             session, rec.session = rec.session, None
             if rec.state != "failed":
                 rec.state = "closed"
@@ -490,32 +484,29 @@ class ChatHost:
         # a client that sees "failed" must not still have the failed hands alive behind it.
         if error is not None:
             gc.collect()
-        if session is not None and (self._shut or rec.cancelled):
+        if session is not None and self._shut:
             # Shut while opening: close it BEFORE reporting, so "failed" never stands in front of a
             # live shell (codex L3 r1).
             session.close()
             session = None
-            error = ("the session was closed while it opened" if rec.cancelled
-                     else "the server shut down while the session opened")
+            error = "the server shut down while the session opened"
             closed_by_shutdown = True
         else:
             closed_by_shutdown = False
         late: Any = None
         with self._lock:
             if error is not None:
-                if rec.cancelled:
-                    pass   # close() already published `closed`
-                else:
-                    rec.state, rec.error = ("closed" if closed_by_shutdown else "failed"), (
-                        None if closed_by_shutdown else error)
+                rec.state, rec.error = ("closed" if closed_by_shutdown else "failed"), (
+                    None if closed_by_shutdown else error)
                 job.status, job.error = "failed", error
             else:
                 rec.session = session
                 rec.state = "idle"
                 rec.info = self._describe(session)
                 job.status, job.result = "done", {"session": self._session_view(rec)}
-                if self._shut or rec.cancelled:
-                    # Shut or closed after the check above: nobody else will close this session.
+                if self._shut:
+                    # Shut after the check above: shutdown() skipped this record while it was
+                    # opening, so nobody else will close it.
                     late, rec.session, rec.state = session, None, "closed"
             rec.job_id = None
         if late is not None:
