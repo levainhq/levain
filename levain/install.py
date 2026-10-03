@@ -1888,13 +1888,13 @@ def record_adapter_receipt(
     can tell an operator's edit from a file the package has since moved. Best-effort."""
     files = _adapter_local_files(adapter, install, templates_root / "adapters" / adapter,
                                  python_path, import_seed, on_demand_seed)
-    if not files:
-        return
     try:
         files = {**files, **_base_seed_files(install, templates_root,
                                              [*import_seed, *on_demand_seed])}
     except (OSError, ValueError):
         pass  # unrecorded seeds are treated as an older install's: staged, never clobbered
+    if not files:
+        return
     extra: dict[str, str] = {}
     if adapter == "codex":  # init writes codex's hooks.json + config block too (global)
         codex_root = templates_root / "adapters" / adapter
@@ -1982,7 +1982,7 @@ def refresh_adapter(
     install = install.resolve()  # every path compare below is against resolved paths
     out = AdapterRefresh()
     adapter = effective_adapter(install)
-    if adapter not in ("claude-code", "codex"):
+    if adapter not in ("claude-code", "codex", "openhands"):
         return out
     recorded, status = manifest.read_pack_locks_status(install)
     pack_dirs = [Path(p.source) for p in recorded]
@@ -1992,6 +1992,8 @@ def refresh_adapter(
              "gone, so the install cannot be re-composed faithfully. Restore it, or "
              "re-onboard (`levain init --force`).")
         return out
+    if adapter == "openhands":  # hookless: its seed files are all there is to refresh
+        return _refresh_seeds_only(install, pack_dirs, apply=apply, emit=emit, carrier=carrier)
     python_path = sys.executable
     anneal_path = manifest.resolve_anneal_bin()
     lines: list[str] = []
@@ -2069,6 +2071,44 @@ def refresh_adapter(
                                   lines=lines)
     if out.refreshed or lines:
         emit(f"\n• adapter files ({adapter}):")
+        verb = "refreshed" if apply else "would refresh"
+        for rel in out.refreshed:
+            emit(f"  {rel}: {verb} to this levain's version")
+        for ln in lines:
+            emit(ln)
+    return out
+
+
+def _refresh_seeds_only(
+    install: Path, pack_dirs: Sequence[Path], *, apply: bool, emit: Callable[[str], None],
+    carrier: bool,
+) -> AdapterRefresh:
+    """:func:`refresh_adapter` for a hookless (OpenHands) install: the base verbatim seeds,
+    by the same decision and receipt, and nothing else (it has no activation tree and no
+    adapter files). Held on the same conditions as the carrier."""
+    out = AdapterRefresh()
+    lines: list[str] = []
+    with _templates_root() as templates_root:
+        try:
+            roster = compose_roster([templates_root, *pack_dirs])
+            entries = [*import_entries(roster), *on_demand_entries(roster)]
+            files = _base_seed_files(install, templates_root, entries)
+        except (PackError, InitError, OSError, ValueError) as e:
+            out.review.append("seed")
+            emit(f"\n• seed files NOT refreshed: the package could not be composed ({e}).")
+            return out
+        missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file())
+        if not carrier:
+            lines.append("  seed files: not refreshed, because the pack reconcile above is "
+                         "holding seed changes for review.")
+        elif missing:
+            out.review.append("seed")
+            lines.append(f"  seed files: not refreshed, because seed file(s) are missing: "
+                         f"{', '.join(missing)}; re-onboard (`levain init --force`).")
+        else:
+            _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
+    if out.refreshed or lines:
+        emit("\n• seed files:")
         verb = "refreshed" if apply else "would refresh"
         for rel in out.refreshed:
             emit(f"  {rel}: {verb} to this levain's version")
@@ -2480,11 +2520,13 @@ def _refresh_adapter_files(
             # release's render, not an operator's file. Anything else is staged. The old
             # copy is still kept.
             action = "write_backup"
+        released_copy = False
         if (action == "pending" and key not in record and here is not None
                 and _sha256_text(here_text) in _RELEASED_BASE_SEED_SHA256.get(key, ())):
             # No record (an install from before seeds were recorded), and the bytes are
             # exactly what an earlier release installed: levain's copy, unedited.
             action = "write_backup"
+            released_copy = True
         if action == "keep":
             continue
         if action == "current":
@@ -2513,19 +2555,49 @@ def _refresh_adapter_files(
             if key.startswith("codex-home/"):
                 _write_codex_hooks(target, want_text, lines.append)  # backs up itself
             else:
-                if action == "write_backup" and here_text is not None:
-                    if key.startswith("seed/"):
+                # Decided from bytes read above; an editor may have saved since (codex, the
+                # seed-refresh L3 round). Re-read right before replacing: changed means the
+                # operator's, so stage instead. What is left is the gap between this read
+                # and the rename below, the host-process class named in the CHANGELOG.
+                try:
+                    raw: bytes | None = target.read_bytes()
+                except FileNotFoundError:
+                    raw = None
+                try:
+                    # Decoded as read_text decoded `here_text`, so a CRLF file compares equal.
+                    now_text = None if raw is None else raw.decode("utf-8").replace(
+                        "\r\n", "\n").replace("\r", "\n")
+                except UnicodeDecodeError:
+                    now_text = "\0changed"
+                if now_text != here_text:
+                    out.refreshed.pop()
+                    out.review.append(key)
+                    where = _put_pending(install, key, want)
+                    new_receipt[key] = _sha256_text(want_text)
+                    lines.append(f"  {key}: changed while `levain update` ran, so yours is "
+                                 f"kept and this levain's version is at {where}. Merge it "
+                                 f"in. Listed once.")
+                    continue
+                if action == "write_backup" and raw is not None:
+                    is_seed = key.startswith("seed/")
+                    if is_seed:
                         # Not beside it: seed/ is the entity's own directory.
+                        _ensure_gitignored(install / ".levain", "backups/")
                         backup = install.joinpath(
                             ".levain", "backups", "seed",
                             f"{target.name}.{time.time_ns()}")
                         backup.parent.mkdir(parents=True, exist_ok=True)
                     else:
                         backup = _timestamped_backup_path(target)
-                    shutil.copy2(target, backup)
-                    lines.append(f"  {key}: levain has no record of writing it, so the "
-                                 f"previous copy is kept at "
-                                 f"{backup.relative_to(install) if key.startswith('seed/') else backup.name}")
+                    # The bytes just checked against the decision: what is being replaced.
+                    _atomic_write_bytes(backup, raw)
+                    shown = backup.relative_to(install) if is_seed else backup.name
+                    if released_copy:
+                        lines.append(f"  {key}: an earlier release's copy, unedited; kept "
+                                     f"at {shown}")
+                    else:
+                        lines.append(f"  {key}: levain has no record of writing it, so the "
+                                     f"previous copy is kept at {shown}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_text(target, want_text)
             new_receipt[key] = _sha256_text(want_text)

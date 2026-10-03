@@ -148,16 +148,19 @@ def test_the_released_seed_table_matches_the_release_tags():
     repo = Path(__file__).resolve().parents[1]
     if shutil.which("git") is None:
         pytest.skip("git not installed")
+    import re
+
     tags = subprocess.run(["git", "-C", str(repo), "tag", "-l", "v0.*"],
                           capture_output=True, text=True).stdout.split()
-
-    def released(tag: str) -> bool:
-        major, minor, patch = (int(x) for x in tag[1:].split(".")[:3])
-        return (major, minor, patch) <= (0, 5, 4)
-
-    tags = [t for t in tags if released(t)]
-    if "v0.5.4" not in tags:
+    numbered = [tuple(int(x) for x in m.groups()) for t in tags
+                if (m := re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", t))]
+    tags = [f"v{a}.{b}.{c}" for a, b, c in sorted(numbered) if (a, b, c) <= (0, 5, 4)]
+    if not {"v0.3.0", "v0.5.4"} <= set(tags):
         pytest.skip("release tags not available in this checkout")
+    shallow = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"],
+                             capture_output=True, text=True).stdout.strip()
+    if shallow == "true":
+        pytest.skip("shallow checkout: older release tags may be missing")
     derived: dict[str, set[str]] = {}
     for key in BASE_SEEDS:
         for tag in tags:
@@ -166,3 +169,56 @@ def test_the_released_seed_table_matches_the_release_tags():
             if r.returncode == 0:
                 derived.setdefault(key, set()).add(_sha(r.stdout))
     assert {k: set(v) for k, v in install_mod._RELEASED_BASE_SEED_SHA256.items()} == derived
+
+
+def test_an_openhands_install_records_and_refreshes_its_base_seeds(make_install, monkeypatch):
+    """codex, the seed-refresh L3 round: an OpenHands entity builds its constitution from
+    seed/*.md, and refresh_adapter returned before reaching it."""
+    install = make_install("openhands", name="oh")
+    receipt = _receipt(install)
+    assert all(k in receipt for k in BASE_SEEDS)
+    monkeypatch.setitem(install_mod._RELEASED_BASE_SEED_SHA256, "seed/memory.md",
+                        frozenset({_sha(OLD)}))
+    current = _as_pre_receipt_install(install, OLD)
+    r, out = _refresh(install)
+    assert r.refreshed == ["seed/memory.md"] and not r.review, out
+    assert (install / "seed" / "memory.md").read_bytes() == current
+    assert "earlier release's copy" in out
+
+
+def test_a_seed_edited_while_update_runs_is_kept_and_staged(make_install, monkeypatch):
+    """codex, the seed-refresh L3 round: the decision is made from bytes read earlier; an
+    editor that saves before the write must not lose its edit."""
+    install = make_install()
+    memory = install / "seed" / "memory.md"
+    current = memory.read_bytes()
+    memory.write_bytes(OLD)
+    _write_receipt(install, {**_receipt(install), "seed/memory.md": _sha(OLD)})
+    real = install_mod._refresh_decision
+
+    def decide_then_edit(here, want, last, **kw):
+        action = real(here, want, last, **kw)
+        if here == OLD:
+            memory.write_bytes(b"saved by an editor mid-update\n")
+        return action
+
+    monkeypatch.setattr(install_mod, "_refresh_decision", decide_then_edit)
+    r, out = _refresh(install)
+    assert "seed/memory.md" in r.review and "seed/memory.md" not in r.refreshed
+    assert memory.read_bytes() == b"saved by an editor mid-update\n"
+    assert install.joinpath(*PENDING_REL, "seed", "memory.md").read_bytes() == current
+    assert "changed while" in out
+
+
+def test_a_crlf_copy_of_a_released_seed_is_replaced_and_its_bytes_backed_up(
+        make_install, monkeypatch):
+    install = make_install()
+    crlf = OLD.replace(b"\n", b"\r\n")
+    monkeypatch.setitem(install_mod._RELEASED_BASE_SEED_SHA256, "seed/memory.md",
+                        frozenset({_sha(OLD)}))
+    _as_pre_receipt_install(install, crlf)
+    r, _out = _refresh(install)
+    assert "seed/memory.md" in r.refreshed and not r.review
+    backups = list((install / ".levain" / "backups" / "seed").iterdir())
+    assert [b.read_bytes() for b in backups] == [crlf]
+    assert "backups/" in (install / ".levain" / ".gitignore").read_text()
