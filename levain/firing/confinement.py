@@ -2972,7 +2972,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
 
     def unverifiable(path: str, exc: OSError) -> NoReturn:
         hint = ""
-        if any(path == rd or path.startswith(rd.rstrip(os.sep) + os.sep)
+        if any(rd != os.sep and (path == rd or path.startswith(rd.rstrip(os.sep) + os.sep))
                for rd in _foreign_runtime_dirs()):
             hint = (" It is under another user's runtime directory, usually an XDG_RUNTIME_DIR "
                     "inherited through su: run `unset XDG_RUNTIME_DIR` and start again.")
@@ -3063,18 +3063,23 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     the jewel walk, so a bind alias of a single-name jewel is outside this check, as it is for bash.
     Not covered: a host process that swaps a link into place between this check and the editor's
     open (codex L3 r1; the same host-process class as a link made while a shell is live). The jewel
-    walk runs only when the target has more than one name."""
-    path = os.path.expanduser(str(path))
+    walk runs only when the target has more than one name.
+
+    The path is normalised the way the stock editor normalises it (``Path``), so the file checked
+    is the file it opens: a raw ``<link>/`` or ``<link>/.`` stats as ENOTDIR, which read as absent,
+    while the editor's ``Path`` drops the suffix and opened the link (codex, the nlink L3 round)."""
+    path = str(Path(os.path.expanduser(str(path))))
     try:
         st = os.stat(path)
-    except OSError:
-        return None   # absent (a create) or unreadable: the editor's own error stands
+    except (OSError, ValueError):
+        return None   # absent (a create), unreadable or a NUL byte: the editor's own error stands
     if stat.S_ISDIR(st.st_mode) or st.st_nlink < 2:
         return None
     try:
         jewels = _jewel_inodes(policy)
     except ConfinementError as exc:
-        return str(exc)
+        return (f"{path} has more than one name, and whether one of them is a crown jewel "
+                f"could not be checked: {exc}")
     hit = jewels.get((st.st_dev, st.st_ino))
     if hit is None:
         return None

@@ -547,3 +547,45 @@ def test_an_unresolvable_floor_path_refuses_instead_of_crashing(home) -> None:
     (home / ".ssh").symlink_to(home / ".ssh")
     with pytest.raises(ConfinementError):
         _refuse_multiply_linked_jewels(policy)
+
+
+@pytest.mark.parametrize("suffix", ["/", "/."])
+def test_the_file_editor_refuses_a_hardlink_spelled_with_a_trailing_suffix(home, suffix) -> None:
+    """codex, the nlink L3 round (RUN on /bin/test and /bin/[): a raw ``<link>/`` stats as ENOTDIR,
+    which read as absent, and the stock editor's ``Path`` then dropped the suffix and opened the link."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from openhands.tools.file_editor.definition import FileEditorAction
+    from levain.firing.openhands.tools import CrownJewelsFileEditorExecutor
+    ent = _entity(home)
+    secret = _secret(home)
+    os.link(secret, ent / "workspace" / "t")
+    ex = CrownJewelsFileEditorExecutor(policy=build_policy(ent, deny_files=(secret,)))
+    obs = ex(FileEditorAction(command="view", path=str(ent / "workspace" / "t") + suffix))
+    text = "".join(c.text for c in obs.to_llm_content if getattr(c, "text", None))
+    assert obs.is_error and "REFUSED" in text and "SECRET" not in text, text
+
+
+def test_linked_jewel_reason_returns_none_for_a_nul_byte(home) -> None:
+    from levain.firing.confinement import linked_jewel_reason
+    policy = build_policy(_entity(home))
+    assert linked_jewel_reason(policy, str(home / "a\x00b")) is None
+
+
+def test_an_unverifiable_jewel_under_a_root_runtime_dir_gets_no_xdg_hint(home, monkeypatch) -> None:
+    """complement, the nlink L3 round: a foreign runtime dir of ``/`` matched every path, so any
+    unverifiable jewel was blamed on an inherited XDG_RUNTIME_DIR."""
+    monkeypatch.setattr(confinement, "_foreign_runtime_dirs", lambda: [os.sep])
+    secret = _secret(home)
+    policy = build_policy(_entity(home), deny_files=(secret,))
+    monkeypatch.setattr(confinement.os, "stat", _raise_eacces_for(str(secret), os.stat))
+    with pytest.raises(ConfinementError) as info:
+        _refuse_multiply_linked_jewels(policy)
+    assert "could not check" in str(info.value) and "XDG_RUNTIME_DIR" not in str(info.value)
+
+
+def _raise_eacces_for(target: str, real):
+    def fake(path, *a, **kw):
+        if os.fspath(path) == target or os.path.realpath(os.fspath(path)) == os.path.realpath(target):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real(path, *a, **kw)
+    return fake
