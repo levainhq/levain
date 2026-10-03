@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **`levain serve` now sends its security headers on every response**, including the ones Python's HTTP server generates itself (an unsupported method such as OPTIONS or PUT, or a malformed request). Those used to go out with no Content-Security-Policy, `X-Content-Type-Options` or `X-Frame-Options`; `levain init --web` and `levain docs` already sent them.
+
+### Changed
+
+- **The three local web servers share one set of request guards** (`levain.http_guards.GuardedHandler`): the security headers, the DNS-rebinding Host check, the cross-site read refusal, and the write checks (origin, JSON-only body, Content-Length). Each server used to carry its own copy, and the copies had drifted (the fix above). No route or refusal changes.
+
 ## [0.5.2] — 2026-10-02
 
 ### Changed

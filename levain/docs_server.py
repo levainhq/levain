@@ -24,16 +24,15 @@ from __future__ import annotations
 
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from levain.docs import DocsError, chapters_payload
+from levain.http_guards import GuardedHandler
 from levain.web_server import (
-    _CSP,
     _LOOPBACK_HOSTS,
     _is_loopback_host,
-    host_header_allowed,
     load_web_asset,
 )
 
@@ -75,46 +74,15 @@ class _DocsServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class _DocsHandler(BaseHTTPRequestHandler):
+class _DocsHandler(GuardedHandler):
     """Serves the docs page (GET/HEAD only) behind the same DNS-rebinding Host
-    allowlist + cross-site read refusal the dashboard/init servers use. No write
-    route exists — an unsupported method falls through to the stdlib's 501, which
-    still carries the security headers via ``end_headers``."""
+    allowlist + cross-site read refusal the dashboard/init servers use (the shared
+    :class:`~levain.http_guards.GuardedHandler`). No write route exists — an
+    unsupported method falls through to the stdlib's 501, which still carries the
+    security headers via ``end_headers``."""
 
-    protocol_version = "HTTP/1.1"
     server_version = "levain-docs"
-    timeout = 30
     server: _DocsServer  # narrow the type for typed attribute access
-
-    def end_headers(self) -> None:
-        """Stamp the security headers on EVERY response — structurally, so the
-        invariant can't be skipped. ``_send`` is the normal path, but the stdlib's
-        ``send_error`` (an unsupported method, a malformed request) builds its own
-        response that never passes through ``_send``; putting the headers here
-        covers those framework-generated responses too."""
-        self.send_header("Content-Security-Policy", _CSP)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        if not head:
-            self.wfile.write(body)
-
-    def version_string(self) -> str:
-        return self.server_version
-
-    def _host_ok(self) -> bool:
-        return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     def _route(self, *, head: bool) -> None:
         if not self._host_ok():
@@ -123,7 +91,7 @@ class _DocsHandler(BaseHTTPRequestHandler):
         # Defense-in-depth: refuse a cross-site browser read (a same-origin fetch
         # sends same-origin; a top-level nav sends none; non-browser clients omit
         # it). The same cheap layer the dashboard/init read paths use.
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+        if self._cross_site_read():
             self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
             return
 
@@ -142,19 +110,6 @@ class _DocsHandler(BaseHTTPRequestHandler):
             return
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
-
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        self._route(head=False)
-
-    def do_HEAD(self) -> None:  # noqa: N802 — same routing, headers only
-        self._route(head=True)
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet by default; set ``LEVAIN_SERVE_VERBOSE`` to restore the access log."""
-        import os
-
-        if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
 
 
 def make_docs_server(

@@ -81,11 +81,17 @@ import sys
 import threading
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
+from levain.http_guards import (  # noqa: F401 — re-exported: callers import these from here
+    _CSP,
+    _WRITE_SEC_FETCH_ALLOWED,
+    GuardedHandler,
+    host_header_allowed,
+)
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
@@ -131,14 +137,6 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # 503. Static assets (cached bytes) bypass the gate.
 _MAX_INFLIGHT = 8
 
-# A write only ever legitimately originates from our own dashboard page (which sends
-# ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-
-# Site header at all (the operator's own curl/script — sovereign; absent reads as
-# Python ``None``). Any present value other than ``same-origin`` — ``cross-site``,
-# ``same-site``, or even ``none`` (a top-level navigation, which can't carry a JSON
-# POST anyway) — is an unexpected/hostile origin and is refused.
-_WRITE_SEC_FETCH_ALLOWED = "same-origin"
-
 # The OFF-BOX write governance factor (spore-129). The no-token rule above is for the
 # LOCALHOST-SOVEREIGN seat: when the surface is bound to loopback, the bind IS the auth and
 # a token there is theater (principle #6). But the MOMENT a writable surface binds an
@@ -149,61 +147,12 @@ _WRITE_SEC_FETCH_ALLOWED = "same-origin"
 # Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 
-# The page only ever loads its own same-origin scripts + stylesheet and fetches its
-# own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
-# to a served `/dashboard.css`, so `style-src` is now `'self'` — no `'unsafe-inline'`
-# (the Slice-2 tightening the prior comment flagged). `frame-ancestors 'none'` denies
-# clickjacking / hostile-iframe embedding (paired with X-Frame-Options below).
-_CSP = (
-    "default-src 'none'; script-src 'self'; style-src 'self'; "
-    "connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; "
-    "frame-ancestors 'none'"
-)
-
 # Loopback names a request's Host header may legitimately carry. A DNS-rebinding
 # page rebinds its OWN name to 127.0.0.1, so its requests still arrive with
 # ``Host: evil.com`` — rejecting any non-loopback Host closes that disclosure.
 # The actual bound address is added to this set in ``make_server``. (Lowercase —
 # the Host check normalizes case before comparing, per RFC 7230 §2.7.3.)
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
-
-def host_header_allowed(
-    raw_host: str | None, allowed_hosts: "frozenset[str] | set[str]"
-) -> bool:
-    """True iff a request's raw ``Host`` header names one of ``allowed_hosts``.
-
-    The SECURITY-CRITICAL DNS-rebinding parse, factored out so the dashboard
-    server (``_Handler._host_ok``) and the standalone init server
-    (``levain.init_server``) share ONE implementation and can never DIVERGE on it
-    — a divergence here is a rebinding read-disclosure hole, exactly the class a
-    shared structural invariant beats per-surface discipline at. Strict RFC-7230:
-    absent Host → refuse (fail-closed); a bracketed IPv6 literal must be
-    well-formed (``[host]`` optionally ``:port``); a non-bracket Host with a ``:``
-    must carry a clean numeric port; the hostname is normalized (trailing FQDN dot
-    dropped, case-folded) before the allowlist compare. So neither ``LOCALHOST``
-    false-rejects nor ``[::1]evil`` / a junk ``:`` port sneaks through."""
-    if raw_host is None:
-        return False  # HTTP/1.1 requires a Host; absent = refuse (fail-closed)
-    host = raw_host.strip()
-    if host.startswith("["):  # bracketed IPv6 literal: [::1] or [::1]:port
-        end = host.find("]")
-        if end == -1:
-            return False  # unterminated bracket
-        hostname = host[1:end]
-        rest = host[end + 1 :]
-        if rest and not (rest.startswith(":") and rest[1:].isdigit()):
-            return False  # junk after the bracket (e.g. "[::1]evil")
-    else:
-        head_part, sep, port = host.rpartition(":")
-        if sep:
-            if not port.isdigit():
-                return False  # a ":" that isn't a clean numeric port → malformed
-            hostname = head_part
-        else:
-            hostname = host  # bare host, no port
-    hostname = hostname.rstrip(".").lower()
-    return hostname in allowed_hosts
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -620,56 +569,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class _Handler(BaseHTTPRequestHandler):
-    """Serves the five read-only routes (GET + HEAD). Store paths, cached assets,
-    and the Host allowlist live on the typed server instance (``self.server``)."""
+class _Handler(GuardedHandler):
+    """Serves the read-only routes (GET + HEAD) and the write routes (POST). Store paths, cached
+    assets, and the Host allowlist live on the typed server instance (``self.server``); the shared
+    guards (security headers, Host, cross-site, the write preamble) come from
+    :class:`~levain.http_guards.GuardedHandler`."""
 
-    # A tidy, modern protocol version (enables keep-alive + proper 1.1 behavior).
-    protocol_version = "HTTP/1.1"
     server_version = "levain-serve"
-    # Socket timeout (L1 MED): without it BaseHTTPRequestHandler.timeout is None, so a
-    # client that declares a Content-Length then stalls (slowloris) holds a server
-    # thread forever — the body is read before the rate-gate, so the gate can't help.
-    # 30s lets a real localhost request finish while killing a stalled one.
-    timeout = 30
     server: _LevainHTTPServer  # narrow the type for typed attribute access
-
-    def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        # Always the length the GET body WOULD be — so a HEAD reports correct
-        # framing without a body, and GET/HEAD can never disagree on the wire.
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Security-Policy", _CSP)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        # Snapshots are per-request; never let a browser cache a stale substrate.
-        self.send_header("Cache-Control", "no-store")
-        # If we're closing the connection (the pre-read 411/413 rejections that don't
-        # drain the body), tell the client so it reads the response cleanly instead of
-        # logging a reset on the dropped keep-alive socket. [L1 LOW]
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        if not head:
-            self.wfile.write(body)
-
-    def version_string(self) -> str:
-        # Don't leak the Python version: BaseHTTPRequestHandler's default Server
-        # header appends "Python/X.Y". A localhost tool advertises nothing.
-        return self.server_version
-
-    def _host_ok(self) -> bool:
-        """True iff the request's ``Host`` names a loopback the server answers for.
-
-        Closes DNS-rebinding read-disclosure: bind-localhost stops network peers,
-        but a hostile page that rebinds its own name to 127.0.0.1 still sends its
-        own ``Host``, so a loopback-only allowlist refuses it (403). The strict
-        RFC-7230 parse lives in the shared ``host_header_allowed`` so this surface
-        and the standalone init server can't diverge on it."""
-        return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     def _write_token_required(self) -> bool:
         """True iff this surface requires the ``X-Levain-Write-Token`` — i.e. it is writable AND
@@ -710,7 +617,7 @@ class _Handler(BaseHTTPRequestHandler):
         # urllib) omit the header entirely → allowed. This stops a cross-origin
         # page from even TRIGGERING the per-request store read (it can't read the
         # response anyway, post-Host-check) — a cheap defense-in-depth layer.
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+        if self._cross_site_read():
             self._send(
                 b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head
             )
@@ -892,36 +799,6 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
 
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        self._route(head=False)
-
-    def do_HEAD(self) -> None:  # noqa: N802 — same routing, headers only (no body)
-        self._route(head=True)
-
-    def _send_json(self, payload: dict[str, object], status: int = 200) -> None:
-        self._send(
-            json.dumps(payload).encode("utf-8"),
-            "application/json; charset=utf-8",
-            status=status,
-        )
-
-    def _drain(self, n: int) -> None:
-        """Read and discard up to ``n`` bytes of the request body in bounded chunks,
-        so a rejected request's body doesn't dangle on a kept-alive connection — the
-        client can finish its send and read the error response cleanly."""
-        remaining = n
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-
-    def _reject(self, status: int, error: str, message: str) -> None:
-        """Refuse a write BEFORE its body is read: close the connection (so the unread
-        body can't desync a kept-alive socket) and send the error JSON."""
-        self.close_connection = True
-        self._send_json({"error": error, "message": message}, status)
-
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """The governed write routes — ``POST /edit`` + ``POST /action`` — behind the
         write/auth boundary. Both fork only at dispatch, AFTER the shared auth checks;
@@ -934,14 +811,10 @@ class _Handler(BaseHTTPRequestHandler):
         socket. The rate-gate is acquired BEFORE the body read, so the bounded
         read+drain+write phase is itself concurrency-bounded; a slowloris is capped by
         the gate + the 30s socket timeout. The write layer does the actual edit."""
-        # Same Host allowlist as reads — closes DNS-rebinding for the write route too.
-        if not self._host_ok():
-            return self._reject(403, "forbidden", "bad Host header")
-        # CSRF layer 1: a write must come from our own page (same-origin) or a
-        # non-browser client (no Sec-Fetch-Site at all). Anything else is refused.
-        sfs = self.headers.get("Sec-Fetch-Site")
-        if sfs is not None and sfs != _WRITE_SEC_FETCH_ALLOWED:
-            return self._reject(403, "forbidden", "cross-origin write refused")
+        # Same Host allowlist as reads (DNS rebinding), then CSRF layer 1: a write must come from
+        # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
+        if self._refuse_write_origin():
+            return
         # OFF-BOX governance factor (spore-129 writes / spore-220 reads): when this surface is bound
         # off-loopback, loopback-is-auth no longer holds, so the write MUST carry the shared device-
         # held token. SAME predicate + constant-time compare as the read gate in _route, factored
@@ -955,11 +828,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
-        ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if ctype != "application/json":
-            return self._reject(
-                415, "unsupported_media_type", "Content-Type must be application/json"
-            )
+        if self._refuse_non_json():
+            return
         # The write routes: substrate edits (/edit) + governed channel actions (/action).
         # Both ride this ONE auth gate above (Host → CSRF → off-box token → Content-Type) —
         # /action carries no second, weaker auth path. The off-box token check keys on
@@ -968,18 +838,10 @@ class _Handler(BaseHTTPRequestHandler):
         route = self.path.split("?", 1)[0]
         if route not in ("/edit", "/action"):
             return self._reject(404, "not_found", "no such route")
-        # Content-Length: required + numeric (checked before reading a byte).
-        clen_raw = self.headers.get("Content-Length")
-        # ⛔ `isascii()` IS LOAD-BEARING, NOT BELT-AND-BRACES. `str.isdigit()` is TRUE for
-        # characters `int()` REFUSES — superscripts and other Unicode digit-category
-        # characters. Measured: `"²".isdigit()` is True and `int("²")` raises ValueError, so a
-        # `Content-Length: ²` header passed this guard and blew up on the next line, turning a
-        # clean 411 into an unhandled exception. A guard that admits values the very next
-        # statement rejects is not narrowing anything. RFC 7230 makes Content-Length ASCII
-        # DIGITS, so this is also the spec-correct test.
-        if clen_raw is None or not (clen_raw.isascii() and clen_raw.isdigit()):
-            return self._reject(411, "length_required", "Content-Length required")
-        clen = int(clen_raw)
+        # Content-Length: required + ASCII digits (checked before reading a byte).
+        clen = self._declared_length()
+        if clen is None:
+            return
 
         # Acquire the rate-gate BEFORE any body read/drain so the read+write phase is
         # concurrency-bounded — a stalled body can't pile up unbounded threads. [L3 MED]
@@ -1053,15 +915,6 @@ class _Handler(BaseHTTPRequestHandler):
             self.server.request_gate.release()
         if result is not None:
             self._send_json(result, 200)
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet by default — the server prints its own startup line; per-request
-        access logging would just be noise in an interactive terminal. Set
-        ``LEVAIN_SERVE_VERBOSE`` to restore the stdlib access log on stderr."""
-        import os
-
-        if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
 
 
 def make_server(
