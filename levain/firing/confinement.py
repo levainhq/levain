@@ -3235,49 +3235,86 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
                        ".levain/confinement.json."), False
 
 
-def _file_type(p: Path) -> str:
-    """``lstat`` file type of ``p`` as a word (``"absent"`` if missing, ``"unknown"`` if unstattable)."""
+def _identity(p: Path) -> tuple[int, int, int] | None:
+    """``(st_dev, st_ino, file type)`` of ``p`` without following a link, or None if it is absent.
+    Any other ``lstat`` error propagates (the caller refuses)."""
     try:
-        mode = os.lstat(p).st_mode
+        st = os.lstat(p)
     except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
+
+
+def _describe(ident: tuple[int, int, int] | None) -> str:
+    if ident is None:
         return "absent"
-    except OSError:
-        return "unknown"
-    for test, word in ((stat.S_ISREG, "file"), (stat.S_ISDIR, "dir"), (stat.S_ISLNK, "symlink")):
-        if test(mode):
-            return word
-    return "other"
+    kind = {stat.S_IFREG: "file", stat.S_IFDIR: "dir", stat.S_IFLNK: "symlink"}.get(ident[2], "other")
+    return f"{kind} inode {ident[1]}"
 
 
-def _file_shaped_jewels(policy: CrownJewelsPolicy) -> list[Path]:
-    """The jewels the SQLite check classifies: file-shaped read+write roots and ``deny_files``."""
-    return [p for p in policy.deny_read_write if not p.is_dir()] + list(policy.deny_files)
+def _mount_manifest(argv: list[str], policy: CrownJewelsPolicy) -> dict[str, tuple[int, int, int] | None]:
+    """Every host path the bwrap plan mounts over, plus every SQLite sidecar name it leaves unmounted,
+    with its identity NOW (before bwrap runs).
+
+    A mount attaches to the file or directory that is at a path when bwrap runs, not to the path. If
+    the host later replaces what is there (an atomic rewrite, an unlink, a swap for a link) the mount
+    stays on the old object and the new one is fully exposed: RUN on argushub 2026-10-03 at 509a40e, a
+    denied credential replaced by rename was refused before and read after, in the same live shell.
+    A path strictly inside a tmpfs root is left out: the tmpfs hides the host tree there either way."""
+    dsts: list[str] = []
+    tmpfs: list[Path] = []
+    i = 0
+    while i < len(argv):
+        op = argv[i]
+        if op == "--tmpfs":
+            dsts.append(argv[i + 1])
+            tmpfs.append(Path(argv[i + 1]))
+            i += 2
+        elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
+            if argv[i + 2] != "/":
+                dsts.append(argv[i + 2])
+            i += 3
+        elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
+            i += 2
+        else:
+            i += 1
+    paths = [d for d in dsts
+             if not any(Path(d) != r and _ci_within(Path(d), r) for r in tmpfs)]
+    mounted = set(paths)
+    paths += [str(sc) for sc in policy.sqlite_sidecars if str(sc) not in mounted]
+    return {q: _identity(Path(q)) for q in dict.fromkeys(paths)}
 
 
 class _BwrapShell(SandboxedShell):
-    """A :class:`SandboxedShell` that re-runs the spawn-time SQLite jewel check before every command
-    (spore-1312, rec C, ruled by Phill 2026-10-03).
+    """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
+    mounts it was started with (spore-1312, rec C, ruled by Phill 2026-10-03, widened by its L3).
 
-    The spawn check (:func:`_refuse_plantable_sqlite_jewels`) classifies each file-shaped jewel once.
-    A jewel that was an empty file at spawn and is initialised as a WAL database afterwards was RUN on
-    Linux at 3838801: the live shell read a row out of the host's ``-wal``. So the same check runs
-    here at the point each command is issued; if a jewel has become a database (or an unreadable file
-    in a writable directory), a SQLite sidecar has appeared that was not there (so not mounted) at
-    spawn, or a jewel's file type changed (unlinked, replaced by a link), the shell is closed, which
-    kills its process group, and the command is refused. RUN on Linux before each arm was added: a
-    host that unlinked the database while its connection kept the ``-wal`` let the next command read
-    the ``-wal`` (L3 codex 2026-10-03). The next spawn is refused by the spawn check itself, so bash stays off until the condition
-    the refusal names is cleared. A filesystem error while re-checking refuses the same way.
-    NOT covered: a command already running when the jewel changes, or one backgrounded earlier, can
-    read a ``-wal``/``-journal`` or plant one that SQLite replays, for as long as it runs; so can a
-    command whose jewel changes between this check and its start; a ``setsid`` child survives the
-    group kill (the module's known slice-2 limit); a store with no recognisable header (SQLCipher)
-    is never classified as a database."""
+    Two checks, one rule each:
+      - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
+        empty jewel can be initialised as a database IN PLACE, keeping its inode (RUN on Linux at
+        3838801: the next command read a row out of the host's ``-wal``);
+      - every path in the mount manifest (:func:`_mount_manifest`) still has the identity it had when
+        the mounts were made, which covers every way the host can put something new where a mount
+        was: an atomic rewrite, an unlink while a connection keeps a ``-wal``, a swap for a link, a
+        sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
+        2026-10-03 before this replaced the per-case checks.
+    If either fires, the shell is closed (its process group killed) and the command refused; the next
+    spawn mounts what is there now, or refuses at the spawn check. A filesystem error while checking
+    refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
+    including a ``levain wrap`` rewriting the entity's own continuity, or a daemon recreating its socket:
+    that rewrite detached the mount, so the shell could no longer be trusted with it.
+    The manifest is recorded once, before bwrap runs, with mountpoints bwrap creates filled in once
+    right after it starts (:meth:`settle_created_mountpoints`); a later ``start()`` changes nothing.
+    NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
+    its access for as long as it runs; so does a command whose path changes between this check and
+    its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
+    with no recognisable header (SQLCipher) is never classified as a database."""
 
     def __init__(
         self,
         *,
         policy: CrownJewelsPolicy,
+        manifest: dict[str, tuple[int, int, int] | None],
         argv: list[str],
         cwd: Path,
         env: dict[str, str],
@@ -3285,34 +3322,31 @@ class _BwrapShell(SandboxedShell):
     ) -> None:
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
-        self._sidecars_at_spawn: set[Path] = set()
-        self._jewel_types: dict[Path, str] = {}
+        self._manifest = dict(manifest)
+        sidecars = {str(sc) for sc in policy.sqlite_sidecars}
+        # Mountpoints absent at plan time are created by bwrap (or the provider) as it mounts; their
+        # identity is recorded once, after the start. Unmounted sidecars stay absent by expectation.
+        self._to_settle = [q for q, ident in self._manifest.items()
+                           if ident is None and q not in sidecars]
+        self._settled = False
 
-    def start(self) -> "SandboxedShell":
-        # Snapshot AFTER the sandbox exists: bwrap creates an empty stub for an absent write-denied
-        # path as it mounts, so a snapshot taken before start would read that stub as a change.
-        # What is recorded is what the mounts covered: the sidecar names present (only those were
-        # mounted) and each file-shaped jewel's file type.
-        shell = super().start()
-        pol = self._jewel_policy
-        self._sidecars_at_spawn = {p for p in pol.sqlite_sidecars if os.path.lexists(p)}
-        self._jewel_types = {p: _file_type(p) for p in _file_shaped_jewels(pol)}
-        return shell
+    def settle_created_mountpoints(self) -> None:
+        """Record the identity of the mountpoints bwrap created. Called once by the provider right
+        after the start; later calls do nothing."""
+        if self._settled:
+            return
+        for q in self._to_settle:
+            self._manifest[q] = _identity(Path(q))
+        self._settled = True
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
-        for p in self._jewel_policy.sqlite_sidecars:
-            if p not in self._sidecars_at_spawn and os.path.lexists(p):
-                raise ConfinementError(
-                    f"{p} appeared after the shell started; it was not mounted, so the shell could "
-                    "read or plant it."
-                )
-        for p, was in self._jewel_types.items():
-            now = _file_type(p)
+        for q, was in self._manifest.items():
+            now = _identity(Path(q))
             if now != was:
                 raise ConfinementError(
-                    f"{p} changed type since the shell started ({was} -> {now}); its mount no longer "
-                    "describes what is on disk."
+                    f"{q} changed since the shell started ({_describe(was)} -> {_describe(now)}); "
+                    "the mount over it no longer covers what is on disk."
                 )
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
@@ -3400,6 +3434,7 @@ class BwrapProvider(ConfinementProvider):
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
         argv, create_first = _bwrap_plan(policy)
+        manifest = _mount_manifest(argv, policy)   # BEFORE anything is created or mounted
         argv = argv + ["/bin/bash", "--noprofile", "--norc"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
@@ -3416,12 +3451,19 @@ class BwrapProvider(ConfinementProvider):
         policy.workspace.mkdir(parents=True, exist_ok=True)
         shell = _BwrapShell(
             policy=policy,
+            manifest=manifest,
             argv=argv,
             cwd=policy.workspace,
             env=env if env is not None else _default_shell_env(),
             default_timeout=default_timeout,
         )
-        return shell.start()
+        try:
+            shell.start()
+            shell.settle_created_mountpoints()
+        except BaseException:
+            shell.close()   # never orphan a started shell (glm L3 r2)
+            raise
+        return shell
 
 
 def sandbox_exec_available() -> bool:
