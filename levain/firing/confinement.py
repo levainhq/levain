@@ -3248,7 +3248,17 @@ def _identity(p: Path) -> tuple[int, int, int] | None:
     except FileNotFoundError:
         return None
     except PermissionError:
-        return _UNREACHABLE
+        # Unreachable only when the directory blocking the way belongs to ANOTHER user: one this user
+        # owns, a same-uid shell can chmod open, read through and close again (complement L3 r5).
+        for a in p.parents:
+            try:
+                ast = os.lstat(a)
+            except PermissionError:
+                continue
+            if ast.st_uid == os.geteuid():
+                raise
+            return _UNREACHABLE
+        raise
     return (st.st_dev, st.st_ino, stat.S_IFMT(st.st_mode))
 
 
@@ -3287,7 +3297,7 @@ def _mount_plan_paths(
         elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
             src, dst = argv[i + 1], argv[i + 2]
             if dst != "/":
-                kind = "file" if src == "/dev/null" and not op.endswith("-try") else None
+                kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
                 mounted.setdefault(dst, kind)
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
@@ -3334,7 +3344,9 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
             continue
         # bwrap would create missing parents too; without them a jewel under an absent directory
         # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
-        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
+        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
+            a.mkdir(mode=0o700, exist_ok=True)
         if kind == "dir":
             p.mkdir(mode=0o700, exist_ok=True)
         else:
@@ -3513,22 +3525,28 @@ class BwrapProvider(ConfinementProvider):
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
                 "bash hands (fail-closed)."
             ) from exc
-        moved = [q for q in unmounted if q in before_plan and manifest.get(q) != before_plan[q]]
+        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
         if moved:
             raise ConfinementError(
                 f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
                 "— refusing to grant bash hands (fail-closed). Try again."
             )
+        shell_env = dict(env if env is not None else _default_shell_env())
+        for var in ("BASH_ENV", "ENV"):
+            # bash would source these at startup, before the first per-command check, so a jewel that
+            # appeared there could be read before anything looked (codex L3 r5).
+            shell_env.pop(var, None)
         shell = _BwrapShell(
             policy=policy,
             manifest=manifest,
             argv=argv,
             cwd=policy.workspace,
-            env=env if env is not None else _default_shell_env(),
+            env=shell_env,
             default_timeout=default_timeout,
         )
         try:
             shell.start()
+            shell._recheck()   # whatever changed during the start closes it before any command
         except BaseException:
             shell.close()   # never orphan a started shell (glm L3 r2)
             raise

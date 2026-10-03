@@ -334,6 +334,8 @@ def test_an_unreachable_path_costs_nothing_until_it_changes(tmp_path, monkeypatc
     locked.mkdir()
     sock = locked / "docker.sock"
     locked.chmod(0o000)
+    real_uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real_uid + 1)   # the locked dir is now "another user's"
     try:
         assert _identity(sock) == _UNREACHABLE
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -361,7 +363,7 @@ def test_only_tmpfs_and_dev_null_targets_are_created():
             "--bind-try", "/a/c", "/a/c", "--ro-bind-try", "/dev/null", "/a/g", "--bind", "/a/p", "/a/p"]
     mounted, _ = _mount_plan_paths(argv, _P())
     assert mounted == {"/a/t": "dir", "/a/f": "file", "/a/s": None, "/a/c": None,
-                       "/a/g": None, "/a/p": None}
+                       "/a/g": "file", "/a/p": None}
 
 
 def test_a_stub_under_an_absent_directory_is_created_with_its_parents(tmp_path):
@@ -372,6 +374,8 @@ def test_a_stub_under_an_absent_directory_is_created_with_its_parents(tmp_path):
     _prepare_mountpoints({str(f): "file", str(d): "dir", str(tmp_path / "skip"): None})
     assert f.is_file() and f.stat().st_size == 0 and d.is_dir()
     assert not (tmp_path / "skip").exists()
+    for level in (tmp_path / "config", tmp_path / "config" / "gh", tmp_path / "x", tmp_path / "x" / "y"):
+        assert level.stat().st_mode & 0o777 == 0o700, level   # every created level, not just the leaf
 
 
 def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_path, monkeypatch):
@@ -396,3 +400,53 @@ def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_p
     with pytest.raises(ConfinementError, match="changed while the floor was being planned"):
         conf.BwrapProvider()._spawn_shell_impl(build_policy(entity, extra_deny_read_write=(vault,)))
     assert not started
+
+
+def test_an_own_uid_blocking_directory_is_not_unreachable(tmp_path):
+    """complement L3 r5: a directory this user owns can be chmod'ed open by a same-uid shell, so a
+    path behind it must not be waved through as unreachable."""
+    if os.geteuid() == 0:
+        pytest.skip("root can stat anything")
+    locked = tmp_path / "mine"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError):
+            _identity(locked / "token")
+    finally:
+        locked.chmod(0o755)
+
+
+def test_the_shell_env_never_carries_bash_env(tmp_path, monkeypatch):
+    """codex L3 r5: BASH_ENV/ENV make bash source a file at startup, before the first check."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    seen = {}
+
+    def fake_start(self):
+        seen.update(self._env)
+        return self
+
+    monkeypatch.setattr(conf._BwrapShell, "start", fake_start)
+    monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
+    conf.BwrapProvider()._spawn_shell_impl(
+        build_policy(_entity(tmp_path)), env={"PATH": "/usr/bin", "BASH_ENV": "/x", "ENV": "/y"})
+    assert "BASH_ENV" not in seen and "ENV" not in seen and seen.get("PATH") == "/usr/bin"
+
+
+def test_a_change_during_the_start_closes_the_shell_before_any_command(tmp_path, monkeypatch):
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    entity = _entity(tmp_path)
+    late = tmp_path / "creds" / "late-token"
+    late.parent.mkdir()
+    closed = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: late.write_text("x") or self)
+    monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))
+    with pytest.raises(ConfinementError, match=_CHANGED):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(entity, deny_files=(late,)))
+    assert closed
