@@ -154,9 +154,18 @@ def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, heade
     """L1 2026-10-03 MED-1 (run): with either server's Content-Length guard swapped for a bare int(),
     every existing test still passed. Each refusal is now driven through BOTH write servers, live,
     and every refusal before the body is read closes the connection."""
-    with _server(kind, tmp_path) as port:
-        # No body: a refused request's unread bytes can make the kernel reset the socket before the
-        # response is read (complement L3).
-        got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers)
+    import sys
+
+    # The too-many-digits case depends on Python's int-conversion limit; pin the default so the
+    # outcome does not depend on PYTHONINTMAXSTRDIGITS in the environment (L3 r2).
+    old_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        with _server(kind, tmp_path) as port:
+            # No body: a refused request's unread bytes can make the kernel reset the socket before
+            # the response is read (complement L3).
+            got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers)
+    finally:
+        sys.set_int_max_str_digits(old_limit)
     assert got == status, f"{kind}: {headers} -> {got}"
     assert resp_headers.get("Connection") == "close"

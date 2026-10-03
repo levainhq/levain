@@ -87,7 +87,7 @@ from typing import Any
 
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import GuardedHandler
-from levain.http_guards import host_header_allowed  # noqa: F401 — its public home until 2026-10-03
+from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
     MAX_BODY_BYTES,
