@@ -24,8 +24,15 @@ choice moves the gate and nothing else. (L1 review 2026-10-03; if the chat route
 authenticated client, that is the moment to revisit it.)
 
 **An entity that may connect to localhost is refused.** With ``allow_localhost_outbound`` its shell
-could call these routes itself: list the sessions, approve its own held actions, drive the other
-entities. Every other entity's shell is denied loopback by its floor. (L2 review 2026-10-03.)
+could call these routes itself and approve its own held actions. Every other entity's shell is denied
+loopback by its floor. (L2 review 2026-10-03.) The refusal fires twice: early from the config, and
+after the session opens, from the floor its hands actually enforce, because the config can change
+between the two reads (codex L3 r1) and only the second is the floor that will run.
+
+**A session id is a capability.** ``/chat.json`` lists sessions by entity and state, never by id: the
+id is returned only to the caller that opened the session, and every operation on a session names
+it. Under no authentication this is what keeps one local caller from approving another's held
+actions without being handed the id (L3 r1, complement).
 
 **Activity is what was ISSUED; the result is what RAN.** A job's ``activity`` grows as the entity
 issues tool actions, which for a gated action is before the gate stops it, so while the turn runs a
@@ -129,7 +136,7 @@ def chat_refusal(entity_dir: Path) -> str | None:
 
     try:
         cfg = load_confinement_config(entity_dir)
-    except ConfinementError:
+    except (ConfinementError, OSError, ValueError):
         return None
     if cfg.allow_localhost_outbound:
         return (
@@ -166,6 +173,7 @@ class _Session:
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
     info: dict[str, Any] = field(default_factory=dict)
+    cancelled: bool = False      # closed while opening: the open job discards what it builds
 
 
 def _turn_payload(result: Any) -> dict[str, Any]:
@@ -190,6 +198,19 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     }
 
 
+def _hands_allow_localhost(session: Any) -> bool:
+    """True when ``session`` has a shell whose floor allows connecting to this host, read from the
+    floor the hands enforce. An unreadable floor on a session with a shell counts as allowing it
+    (fail-closed)."""
+    if not getattr(session, "bash_ok", False):
+        return False
+    try:
+        floor = session.conversation.agent.tools_map["file_editor"].executor._policy
+        return not bool(floor.deny_localhost_outbound)
+    except Exception:  # noqa: BLE001 — cannot read the floor: assume the worst
+        return True
+
+
 def _default_factory(
     *, model: str, base_url: str, api_key: str | None, max_iterations: int | None
 ) -> Callable[..., Any]:
@@ -199,7 +220,7 @@ def _default_factory(
         refusal = chat_refusal(entity_dir)
         if refusal is not None:
             raise ChatError("refused_entity", refusal, 403)
-        return EntitySession.open(
+        session = EntitySession.open(
             entity_dir,
             model=model,
             base_url=base_url,
@@ -209,6 +230,16 @@ def _default_factory(
             max_iterations=max_iterations,
             mode=CHAT_DRIVE_MODE,
         )
+        if _hands_allow_localhost(session):
+            session.close()
+            raise ChatError(
+                "refused_entity",
+                f"{entity_dir}: the opened session's shell may connect to localhost, so it could "
+                "call this server's chat routes itself. Refused (its confinement.json changed, or "
+                "allows it).",
+                403,
+            )
+        return session
 
     return _open
 
@@ -236,6 +267,8 @@ class ChatHost:
             raise ValueError("a chat host needs at least one entity")
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
+        if max_iterations is not None and max_iterations < 1:
+            raise ValueError("max_iterations must be at least 1")
         self._entities = {name: Path(p) for name, p in entities.items()}
         self._factory = session_factory or _default_factory(
             model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations
@@ -256,7 +289,11 @@ class ChatHost:
                 "model": self._model,
                 "drive_mode": CHAT_DRIVE_MODE,
                 "max_sessions": self._max_sessions,
-                "sessions": [self._session_view(s) for s in self._sessions.values()],
+                "sessions": [
+                    {k: v for k, v in self._session_view(s).items()
+                     if k not in ("session_id", "job_id")}
+                    for s in self._sessions.values()
+                ],
             }
 
     def session_status(self, session_id: Any) -> dict[str, Any]:
@@ -298,7 +335,7 @@ class ChatHost:
                     429,
                 )
             ended = [s for s in self._sessions.values() if s.state not in _LIVE_STATES]
-            for old in ended[: max(0, len(ended) - _ENDED_SESSIONS_KEPT + 1)]:
+            for old in ended[: max(0, len(ended) - _ENDED_SESSIONS_KEPT)]:
                 del self._sessions[old.session_id]
             sid = secrets.token_hex(8)
             rec = _Session(session_id=sid, entity=entity)
@@ -328,12 +365,17 @@ class ChatHost:
         return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason))
 
     def close(self, session_id: Any) -> dict[str, Any]:
-        """Close a session. Refused while a job is driving it (the turn would be torn down under
-        itself). A failed session stays ``failed``; any other ends ``closed``."""
+        """Close a session. Refused while a turn is running (it would be torn down under itself). A
+        session still OPENING is cancelled: it reads ``closed`` at once and stops holding a slot, and
+        its open job closes whatever the open builds, so a start that hangs cannot hold a slot
+        forever (glm-5.3 L3 r1). A failed session stays ``failed``; any other ends ``closed``."""
         with self._lock:
             rec = self._get(session_id)
-            if rec.state in ("opening", "busy"):
-                raise ChatError("busy", "the session is running a job; close it when it finishes", 409)
+            if rec.state == "busy":
+                raise ChatError("busy", "the session is running a turn; close it when it finishes", 409)
+            if rec.state == "opening":
+                rec.cancelled, rec.state = True, "closed"
+                return self._session_view(rec)
             session, rec.session = rec.session, None
             if rec.state != "failed":
                 rec.state = "closed"
@@ -448,22 +490,36 @@ class ChatHost:
         # a client that sees "failed" must not still have the failed hands alive behind it.
         if error is not None:
             gc.collect()
+        if session is not None and (self._shut or rec.cancelled):
+            # Shut while opening: close it BEFORE reporting, so "failed" never stands in front of a
+            # live shell (codex L3 r1).
+            session.close()
+            session = None
+            error = ("the session was closed while it opened" if rec.cancelled
+                     else "the server shut down while the session opened")
+            closed_by_shutdown = True
+        else:
+            closed_by_shutdown = False
+        late: Any = None
         with self._lock:
             if error is not None:
-                rec.state, rec.error = "failed", error
+                if rec.cancelled:
+                    pass   # close() already published `closed`
+                else:
+                    rec.state, rec.error = ("closed" if closed_by_shutdown else "failed"), (
+                        None if closed_by_shutdown else error)
                 job.status, job.error = "failed", error
-            elif self._shut:
-                rec.state = "closed"
-                job.status, job.error = "failed", "the server shut down while the session opened"
             else:
                 rec.session = session
                 rec.state = "idle"
                 rec.info = self._describe(session)
                 job.status, job.result = "done", {"session": self._session_view(rec)}
-                session = None
+                if self._shut or rec.cancelled:
+                    # Shut or closed after the check above: nobody else will close this session.
+                    late, rec.session, rec.state = session, None, "closed"
             rec.job_id = None
-        if session is not None:
-            session.close()
+        if late is not None:
+            late.close()
 
     def _route_events(self, rec: _Session) -> Callable[[str], None]:
         """The session's ``on_event`` sink. Bound once at open, it forwards each tool-activity line
@@ -491,6 +547,13 @@ class ChatHost:
             payload = _turn_payload(result)
         except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
             error = f"{type(exc).__name__}: {exc}"
+        broken = payload is None or (payload["error"] is not None
+                                     and not (payload["gated"] and payload["error"] is None))
+        if broken and rec.session is not None:
+            # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
+            # so the cap can never be exceeded by a teardown still in progress (codex L3 r1).
+            dead, rec.session = rec.session, None
+            dead.close()
         to_close: Any = None
         with self._lock:
             if payload is None:

@@ -15,6 +15,18 @@ from pathlib import Path
 from levain import __version__
 
 
+def _positive_int(text: str) -> int:
+    """An argparse type for a count that must be at least 1 (the SDK refuses 0 and below only when a
+    session opens, long after the server has bound)."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="levain",
@@ -629,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     web_p.add_argument(
         "--max-iterations",
-        type=int,
+        type=_positive_int,
         default=None,
         dest="max_iterations",
         help="With --chat: bound each turn to at most N agent steps. Default: the SDK's own limit.",

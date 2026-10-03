@@ -1094,8 +1094,11 @@ class _Handler(BaseHTTPRequestHandler):
                 # Chat acts through the ENTITY's own governed floor, not the substrate's write
                 # scope, so the read-only refusal below does not apply to it. It rode every
                 # check above (Host, CSRF, Content-Type, length, the rate gate).
-                assert self.server.chat_host is not None
-                self._send_chat(self._chat_post(route, self.server.chat_host, req))
+                host = self.server.chat_host
+                if host is None:  # is_chat required it; an explicit check survives `python -O`
+                    self._send_json({"error": "not_found", "message": "no such route"}, 404)
+                    return
+                self._send_chat(self._chat_post(route, host, req))
                 return
             scope = self.server.levain_source.write_scope
             if scope is None:
@@ -1565,6 +1568,8 @@ def _build_chat_host(
         refusal = chat_refusal(entity_dir)
         if refusal is not None:
             return None, f"--chat {raw}: {refusal}"
+        if entities.get(entity_dir.name) == entity_dir:
+            continue   # the same entity passed twice (another spelling of one path)
         if entity_dir.name in entities:
             return None, (
                 f"--chat: two entities are named {entity_dir.name!r} ({entities[entity_dir.name]} "

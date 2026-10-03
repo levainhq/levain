@@ -238,6 +238,18 @@ def test_a_turn_that_errors_breaks_the_session_and_releases_it(tmp_path, bad):
     assert e.value.http_status == 409
 
 
+def test_a_broken_sessions_shell_is_released_before_it_reads_broken(tmp_path):
+    """codex L3 r1: publishing `broken` (which frees the cap slot) before the shell closed let a new
+    open start while the old teardown was still running."""
+    f = _Factory([_Result(reply=None, error="boom")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    seen = []
+    f.made[0].close = lambda: seen.append(host.session_status(sid)["state"])
+    _wait(host, host.turn(sid, "x")["job_id"])
+    assert seen == ["busy"] and host.session_status(sid)["state"] == "broken"
+
+
 def test_a_failed_open_keeps_the_message_text_and_never_the_exception(tmp_path):
     f = _Factory(fail=RuntimeError("no such model"))
     host = _host(tmp_path, f)
@@ -301,7 +313,7 @@ def test_a_broken_session_does_not_hold_a_slot_and_ended_ones_are_pruned(tmp_pat
         sid = _opened(host)          # the broken one does not count against max_sessions=1
         host.close(sid)
         later.append(sid)
-    remaining = {s["session_id"] for s in host.listing()["sessions"]}
+    remaining = set(host._sessions)
     assert broken not in remaining and len(remaining) <= 3
     assert later[-1] in remaining
 
@@ -391,6 +403,28 @@ def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
     assert host.session_status(out["session_id"])["state"] == "closed" and made[0].closed
 
 
+def test_closing_a_session_that_is_still_opening_frees_its_slot_and_its_shell(tmp_path):
+    """glm-5.3 L3 r1: an open that hangs used to be unclosable and to hold a slot forever."""
+    gate = threading.Event()
+    made = []
+
+    def factory(entity_dir, *, on_event):
+        assert gate.wait(5)
+        made.append(_Stub(on_event, []))
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "alpha"}, session_factory=factory, max_sessions=1)
+    out = host.open("alpha")
+    assert host.close(out["session_id"])["state"] == "closed"
+    with pytest.raises(ChatError):
+        host.turn(out["session_id"], "x")
+    gate.set()
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and "closed while it opened" in st["error"]
+    assert made[0].closed and host.session_status(out["session_id"])["state"] == "closed"
+    _opened(host)   # its slot came back
+
+
 def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch):
     f = _Factory([])
     host = _host(tmp_path, f)
@@ -407,7 +441,7 @@ def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch)
         host.turn(sid, "x")
     assert e.value.http_status == 503
     assert host.session_status(sid)["state"] == "idle"
-    assert [s["session_id"] for s in host.listing()["sessions"]] == [sid]
+    assert list(host._sessions) == [sid]
 
 
 def test_a_hung_turn_does_not_keep_the_process_alive(tmp_path):
@@ -456,6 +490,59 @@ def test_activity_lines_and_result_activity_are_size_bounded(tmp_path):
     assert len(acts) == MAX_ACTIVITY_LINES and all(len(a) <= MAX_LINE_CHARS + 2 for a in acts)
 
 
+class _Floored(_Stub):
+    """A stub whose hands report a floor, as EntitySession's do."""
+
+    def __init__(self, on_event, *, deny_localhost: bool | None):
+        super().__init__(on_event, [])
+        if deny_localhost is not None:
+            policy = type("P", (), {"deny_localhost_outbound": deny_localhost})()
+            executor = type("E", (), {"_policy": policy})()
+            tool = type("T", (), {"executor": executor})()
+            agent = type("A", (), {"tools_map": {"file_editor": tool}})()
+            self.conversation = type("C", (), {"agent": agent})()
+
+
+@pytest.mark.parametrize("deny_localhost", [False, None])
+def test_a_session_whose_hands_may_reach_localhost_is_refused_after_open(
+    tmp_path, monkeypatch, deny_localhost
+):
+    """codex L3 r1 HIGH: the config is read before open and again by open, so it can change in
+    between; the floor the opened hands enforce is the one checked last. An unreadable floor on a
+    session with a shell is refused too."""
+    from levain.session import EntitySession
+
+    made = []
+    monkeypatch.setattr(EntitySession, "open", classmethod(
+        lambda cls, path, **kw: made.append(_Floored(kw["on_event"], deny_localhost=deny_localhost))
+        or made[-1]))
+    host = ChatHost({"ok": _entity(tmp_path, "ok")})
+    st = _wait(host, host.open("ok")["job_id"])
+    assert st["status"] == "failed" and "localhost" in st["error"]
+    assert made[0].closed
+
+
+def test_the_listing_never_carries_a_session_or_job_id(tmp_path):
+    host = _host(tmp_path, _Factory([]))
+    sid = _opened(host)
+    listed = host.listing()["sessions"]
+    assert listed and all("session_id" not in v and "job_id" not in v for v in listed)
+    assert sid not in json.dumps(host.listing())
+
+
+def test_max_iterations_below_one_is_refused_before_anything_starts(tmp_path):
+    from levain.cli import _positive_int
+
+    with pytest.raises(ValueError):
+        ChatHost({"a": tmp_path}, max_iterations=0)
+    import argparse
+
+    for bad in ("0", "-3", "x"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int(bad)
+    assert _positive_int("12") == 12
+
+
 def test_chat_opens_headless_and_refuses_an_entity_that_may_reach_localhost(tmp_path, monkeypatch):
     """HIGH-1 (L1): the routes authenticate nobody, so a session is not `interactive` (the design
     gives that to an authenticated human). L2: an entity allowed to reach localhost could call the
@@ -465,7 +552,7 @@ def test_chat_opens_headless_and_refuses_an_entity_that_may_reach_localhost(tmp_
 
     seen = {}
     monkeypatch.setattr(EntitySession, "open", classmethod(
-        lambda cls, path, **kw: seen.update(kw) or _Stub(kw["on_event"], [])))
+        lambda cls, path, **kw: seen.update(kw) or _Floored(kw["on_event"], deny_localhost=True)))
     ok = _entity(tmp_path, "ok")
     open_ = _entity(tmp_path, "open_", deny=None)
     (open_ / ".levain" / "confinement.json").write_text('{"allow_localhost_outbound": true}')
@@ -625,6 +712,10 @@ def test_serve_refuses_a_chat_dir_that_is_not_an_openhands_entity(tmp_path, caps
     host, err = _build_chat_host([tmp_path / "a" / "x", tmp_path / "b" / "x"], model="m",
                                  base_url="u", api_key=None, max_iterations=None)
     assert host is None and "two entities are named 'x'" in err
+    same = tmp_path / "a" / "x"
+    host, err = _build_chat_host([same, tmp_path / "a" / "." / "x"], model="m", base_url="u",
+                                 api_key=None, max_iterations=None)
+    assert host is not None and host.listing()["entities"] == ["x"]
 
 
 # -- real EntitySessions (openhands-gated) -------------------------------------------------------
