@@ -907,8 +907,9 @@ def test_a_busy_install_is_refused_before_any_write_not_reported_partial(tmp_pat
             release.set()
             t.join(5)
     assert status == 409 and body["error"] == "install_refused" and body["partial"] is False
-    assert sorted(p.name for p in install.iterdir()) == [".levain"]   # no seed, no adapter files
-    assert not (install / ".levain" / "answers.json").exists()
+    assert sorted(p.name for p in install.iterdir()) == [".levain"]
+    assert sorted(p.name for p in (install / ".levain").iterdir()) in (
+        ["install.lock"], [".gitignore", "install.lock"])
 
 
 def test_a_docs_refresh_fault_never_turns_a_good_install_into_a_failure(tmp_path: Path) -> None:

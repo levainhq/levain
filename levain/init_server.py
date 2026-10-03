@@ -582,7 +582,8 @@ class _InitHandler(BaseHTTPRequestHandler):
 
                     # Shaped INSIDE the lock (codex L3 2026-10-03): it reads the live seed/activation
                     # trees, and a CLI init/update taking the lock as soon as it is released could
-                    # swap them mid-read. The response itself is written after the lock is released.
+                    # swap them mid-read. A successful response is written after the lock is released
+                    # (a 409/500 refusal above is still sent from inside it).
                     # The install SUCCEEDED (apply_init returned). Shaping the response
                     # manifest does post-success filesystem I/O (_manifest_rows globs the
                     # seed/activation trees), so a fault HERE must not flip a good install
