@@ -880,3 +880,57 @@ def test_a_case_variant_link_to_a_read_denied_file_never_self_binds_it(home, tmp
         assert not any(s == d and s.casefold().endswith("/secrets/token") for _, s, d in binds), binds
     finally:
         opt.chmod(0o755)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_case_sensitive_sibling_of_a_denied_file_stays_readable(home, tmp_path, monkeypatch):
+    """codex L3 (floor-r2 r3): the case-fold matched `config` against a denied `CONFIG` on a
+    case-sensitive volume, where they are two files, and hid the write-only one from the shell."""
+    from levain.firing.confinement import _bwrap_argv
+    d = tmp_path / "secrets"
+    d.mkdir()
+    if _case_insensitive(d):
+        pytest.skip("needs a case-sensitive volume")
+    denied = d / "CONFIG"
+    denied.write_text("DENIED")
+    sibling = d / "config"
+    sibling.write_text("READABLE")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(sibling)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(denied,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(sibling.resolve())
+        assert ["--ro-bind", t, t] in binds
+        assert ["--ro-bind", "/dev/null", t] not in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_write_only_link_to_a_hardlink_of_a_denied_file_never_self_binds_it(home, tmp_path, monkeypatch):
+    """complement L3 (floor-r2 r3): a hardlink is the denied file under another name; a name
+    compare self-bound it, re-exposing the content. Identity catches it."""
+    from levain.firing.confinement import _bwrap_argv
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("SECRET")
+    alias = tmp_path / "elsewhere" / "alias"
+    alias.parent.mkdir()
+    os.link(secret, alias)
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(alias)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(secret,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(alias.resolve())
+        assert ["--ro-bind", t, t] not in binds
+        assert ["--ro-bind", "/dev/null", t] in binds
+    finally:
+        opt.chmod(0o755)

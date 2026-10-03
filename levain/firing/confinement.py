@@ -2993,14 +2993,25 @@ def _bwrap_file_target(f: Path) -> Path:
 
 
 def _masked_both_ways(target: Path, masked: set[str]) -> bool:
-    """True iff ``target`` names a destination step (2) or (4) masked, as spelled or as resolved,
-    compared case- and normalization-insensitively (``masked`` holds ``_canon`` strings)."""
-    if _canon(str(target)) in masked:
-        return True
+    """True iff ``target`` is a file step (2) or (4) masked: by spelling (as given or resolved), or
+    by identity (``os.path.samefile``) with an existing masked destination, which covers a case or
+    normalization variant on a volume that folds them and a hardlink, without matching a merely
+    similar name. A target whose identity cannot be read counts as masked (fail-closed)."""
     try:
-        return _canon(str(target.resolve())) in masked
+        resolved = str(target.resolve())
     except (OSError, RuntimeError):
-        return False
+        return True
+    if str(target) in masked or resolved in masked:
+        return True
+    for dest in masked:
+        try:
+            if os.path.samefile(target, dest):
+                return True
+        except FileNotFoundError:
+            continue   # an absent mask destination is no file the target can be
+        except OSError:
+            return True
+    return False
 
 
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
@@ -3263,17 +3274,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
-    # plus each one's resolved spelling, compared through `_canon`. Two corrections (codex, L3 r2):
-    # a second resolve of the policy paths can observe a symlink retargeted after step (4) mounted,
-    # so the emitted string is the authority; and `resolve()` folds neither case nor Unicode
-    # normalization, so on a casefolded Linux volume an alternate spelling of a masked dentry would
-    # miss an exact compare. Over-matching only turns a self-bind into a /dev/null mask, which
-    # denies MORE (fail-closed).
-    denied_both_targets: set[str] = set()
+    # plus each one's resolved spelling (codex, L3 r2: a second resolve of the policy paths can
+    # observe a symlink retargeted after step (4) mounted, so the emitted string is the authority).
+    # An alternate spelling of a masked file (case, Unicode normalization, a hardlink) is matched
+    # by filesystem identity in `_masked_both_ways`, not by folding names: a case-fold also
+    # matched a DIFFERENT file on a case-sensitive volume (codex, floor-r2 L3 r3).
+    denied_both_targets: set[str] = set(masked_both)
     for dest in masked_both:
-        denied_both_targets.add(_canon(dest))
         try:
-            denied_both_targets.add(_canon(str(Path(dest).resolve())))
+            denied_both_targets.add(str(Path(dest).resolve()))
         except (OSError, RuntimeError):
             pass
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
