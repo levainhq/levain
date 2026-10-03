@@ -45,7 +45,8 @@ Sovereignty boundary (load-bearing, not incidental):
   route — it IS the Slice-2a write/auth boundary it was the seed of.
 - **no-token localhost-sovereign write/auth (Slice 2a)** — there is no password/
   token (a startup token is SaaS thinking; principle #6 rejects it at the seat
-  layer). The auth for a write is the loopback bind + the Host allowlist + two
+  layer). The ``/chat`` routes are the one exception: they make an entity act, so they
+  take a per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310). The auth for a write is the loopback bind + the Host allowlist + two
   CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
   operator's own curl) or ``same-origin`` (our own dashboard page) — a hostile
   cross-site page's request carries ``cross-site`` and is refused; (2) the body
@@ -75,6 +76,7 @@ from __future__ import annotations
 
 import dataclasses
 import hmac
+import secrets
 import ipaddress
 import json
 import sys
@@ -143,6 +145,15 @@ _MAX_INFLIGHT = 8
 # it is the factor that replaces loopback when the write surface leaves the machine.
 # Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
+
+# The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). The no-token rule above rests on
+# "anything that can reach loopback can already edit the files". That holds for /edit and fails for
+# /chat, which makes an entity execute and spend the model endpoint: a container reaching host
+# loopback through host.docker.internal, a sandboxed app with a network entitlement, or another OS
+# user can reach loopback without being able to edit your files. So every /chat route requires a
+# per-launch token, generated at startup, held only in this process and printed once to the
+# terminal that started it (never written to a file an entity's floor could read).
+_CHAT_TOKEN_HEADER = "X-Levain-Chat-Token"
 
 # Loopback names a request's Host header may legitimately carry. A DNS-rebinding
 # page rebinds its OWN name to 127.0.0.1, so its requests still arrive with
@@ -609,6 +620,15 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _chat_token_valid(self) -> bool:
+        """True iff the request carries this launch's chat token (constant-time compare). A server with
+        no token, or an empty supplied one, fails closed."""
+        expected = getattr(self.server, "chat_token", None) or ""
+        supplied = self.headers.get(_CHAT_TOKEN_HEADER, "")
+        return bool(expected) and hmac.compare_digest(
+            supplied.encode("utf-8"), expected.encode("utf-8")
+        )
+
     def _route(self, *, head: bool) -> None:
         # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
         # cannot even TRIGGER the per-request store read.
@@ -708,6 +728,11 @@ class _Handler(GuardedHandler):
             return
 
         if path in _CHAT_GET_ROUTES and self.server.chat_host is not None:
+            if not self._chat_token_valid():
+                self._send_json({"error": "chat_token", "message": (
+                    f"this route needs the chat token printed when `levain serve --chat` started, "
+                    f"sent as {_CHAT_TOKEN_HEADER}")}, 403)
+                return
             self._send_chat(self._chat_get(path, self.server.chat_host), head=head)
             return
 
@@ -881,6 +906,10 @@ class _Handler(GuardedHandler):
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if route not in ("/edit", "/action") and not is_chat:
             return self._reject(404, "not_found", "no such route")
+        if is_chat and not self._chat_token_valid():   # before a byte of the body is read
+            return self._reject(403, "chat_token", (
+                f"this route needs the chat token printed when `levain serve --chat` started, "
+                f"sent as {_CHAT_TOKEN_HEADER}"))
         # Content-Length: required + ASCII digits (checked before reading a byte).
         clen = self._declared_length()
         if clen is None:
@@ -953,6 +982,7 @@ def make_server(
     write_token: str | None = None,
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
+    chat_token: str | None = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1167,6 +1197,8 @@ def make_server(
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
+    # A chat surface always has a token: the caller's, or a fresh per-launch one.
+    httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the token-free localhost-sovereign path is
@@ -1331,6 +1363,11 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
+        # Flushed: this line is the only place the token is published, and stdout is block-buffered
+        # when it is not a terminal (a supervisor, a log file), where it would otherwise not appear
+        # until the buffer filled. RUN 2026-10-03: piped to a file, the token never showed.
+        print(f"  chat token (send as {_CHAT_TOKEN_HEADER}; valid until this server stops): "
+              f"{httpd.chat_token}", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in

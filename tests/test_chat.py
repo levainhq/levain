@@ -580,7 +580,7 @@ def _source(tmp_path):
 def _serving(source, chat_host):
     from levain.web_server import make_server
 
-    httpd = make_server(source, host="127.0.0.1", port=0, chat_host=chat_host)
+    httpd = make_server(source, host="127.0.0.1", port=0, chat_host=chat_host, chat_token=_TOKEN)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
@@ -591,9 +591,14 @@ def _serving(source, chat_host):
         t.join(timeout=5)
 
 
-def _call(url, body=None, headers=None):
+_TOKEN = "test-chat-token-1310"
+
+
+def _call(url, body=None, headers=None, *, token=_TOKEN):
     data = None if body is None else json.dumps(body).encode()
     hdrs = {"Content-Type": "application/json", **(headers or {})}
+    if token is not None:
+        hdrs.setdefault("X-Levain-Chat-Token", token)
     req = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
@@ -1241,3 +1246,42 @@ def test_a_stop_request_that_raises_does_not_end_the_bound(tmp_path):
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "x")["job_id"], timeout=8)
     assert made[0].stops >= 2 and st["status"] == "done"
+
+
+# --- spore-1310 (rec B): the per-launch chat token ------------------------------------------------
+
+
+@pytest.mark.parametrize("token", [None, "wrong-token", ""])
+def test_chat_routes_refuse_a_missing_or_wrong_token(tmp_path, token):
+    """A process that reaches loopback without being you (a Docker container via host.docker.internal,
+    a sandboxed app, another OS user) must not drive an entity or read its sessions."""
+    with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
+        code, body = _call(f"{base}/chat.json", token=token)
+        assert code == 403 and body["error"] == "chat_token"
+        code, body = _call(f"{base}/chat/open", {"entity": "x"}, token=token)
+        assert code == 403 and body["error"] == "chat_token"
+
+
+def test_the_chat_token_does_not_gate_the_substrate_routes(tmp_path):
+    """/edit and the reads stay token-free on loopback (principle #6); only /chat takes the factor."""
+    with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
+        code, _ = _call(f"{base}/substrate.json", token=None)
+        assert code == 200
+
+
+def test_each_launch_gets_its_own_token(tmp_path):
+    from levain.web_server import make_server
+    tokens = []
+    for _ in range(2):
+        httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0,
+                            chat_host=_host(tmp_path, _Factory([])))
+        try:
+            tokens.append(httpd.chat_token)
+        finally:
+            httpd.server_close()
+    assert all(t and len(t) >= 32 for t in tokens) and tokens[0] != tokens[1]
+    httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0)
+    try:
+        assert httpd.chat_token is None            # no chat, no token
+    finally:
+        httpd.server_close()
