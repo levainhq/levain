@@ -1051,18 +1051,6 @@ def build_policy(
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
-    # A trust spelling whose own location (the final component unresolved) is inside a subtree
-    # assembled so far (the operator stores, sibling entity stores, caller extras) is dropped: the
-    # subtree denies it both ways, and a write-only self-bind of it on Linux would take its source
-    # from the host tree and re-expose it. NOT checked: the credential subtrees, ~/.ssh and
-    # deny_files, which are added below (L3 r2, routed), nor a spelling that is a link INTO a hidden
-    # subtree, which step (5) maps to its target (L3 r2 codex, routed).
-    trust_spellings = [
-        sp for sp in trust_spellings
-        if not any((loc := sp.parent.resolve() / sp.name) == t or loc.is_relative_to(t)
-                   for t in subtrees)
-    ]
-
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
     # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
@@ -1162,6 +1150,25 @@ def build_policy(
         deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
+    # A trust spelling whose own location (final component unresolved) is already denied both ways
+    # is dropped: inside any read+write subtree (operator stores, siblings, extras, credential
+    # subtrees), inside ~/.ssh in agent mode, or equal to a deny_files entry. Listing it again would
+    # only add a redundant write-only mount. A spelling that is a link INTO a hidden subtree stays,
+    # and bwrap step (5) binds /dev/null at its target rather than re-exposing it.
+    covered = list(subtrees) + ([ssh_dir] if ssh_dir is not None else [])
+    kept: list[Path] = []
+    for sp in trust_spellings:
+        try:
+            loc = sp.parent.resolve() / sp.name
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV} spelling {sp} cannot be resolved ({exc}) — refusing to build "
+                "the floor (fail-closed)."
+            ) from exc
+        if loc in files or any(loc == t or loc.is_relative_to(t) for t in covered):
+            continue
+        kept.append(sp)
+    trust_spellings = kept
     deny_write_files_l.extend(trust_spellings)
 
     # De-dup while preserving order (a sibling could coincide with an extra).
@@ -2985,6 +2992,17 @@ def _bwrap_file_target(f: Path) -> Path:
     return f.resolve()
 
 
+def _masked_both_ways(target: Path, masked: set[str]) -> bool:
+    """True iff ``target`` names a destination step (2) or (4) masked, as spelled or as resolved,
+    compared case- and normalization-insensitively (``masked`` holds ``_canon`` strings)."""
+    if _canon(str(target)) in masked:
+        return True
+    try:
+        return _canon(str(target.resolve())) in masked
+    except (OSError, RuntimeError):
+        return False
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
     return _bwrap_plan(policy)[0]
@@ -3112,6 +3130,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # error direction now is keeping a root, which at worst aborts bwrap (fail-closed).
     tmpfs_roots: list[Path] = []
     file_roots: list[Path] = []   # subtree roots that are files: denied both ways, like step (4)
+    # Every destination steps (2) and (4) mask with /dev/null, recorded AS EMITTED. Step (5) checks
+    # its self-bind targets against these, never against a second resolve of the policy paths.
+    masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
@@ -3139,6 +3160,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # 2026-10-01): a tmpfs cannot be mounted over it and bwrap aborts before bash starts.
             # Deny it the way step (4) denies a file, which refuses both read and write.
             argv += ["--ro-bind", "/dev/null", str(sub)]
+            masked_both.append(str(sub))
             file_roots.append(sub)
             continue
         tmpfs_roots.append(sub)
@@ -3167,6 +3189,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         for sub in nested_in_ssh:
             if sub.exists() and not sub.is_dir():
                 argv += ["--ro-bind", "/dev/null", str(sub)]
+                masked_both.append(str(sub))
                 file_roots.append(sub)
             else:
                 argv += ["--tmpfs", str(sub)]
@@ -3215,7 +3238,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        argv += ["--ro-bind", "/dev/null", str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))]
+        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        argv += ["--ro-bind", "/dev/null", dest]
+        masked_both.append(dest)
 
     # (5) WRITE-ONLY-DENIED FILES — the ssh persistence/exec vectors and the entity's OWN memory
     # store. Read stays allowed (raw-mode ~/.ssh reads work; the entity may `cat` its own memory);
@@ -3237,6 +3262,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30).
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
+    # Targets already denied both ways by steps (2) and (4): the destinations those steps EMITTED,
+    # plus each one's resolved spelling, compared through `_canon`. Two corrections (codex, L3 r2):
+    # a second resolve of the policy paths can observe a symlink retargeted after step (4) mounted,
+    # so the emitted string is the authority; and `resolve()` folds neither case nor Unicode
+    # normalization, so on a casefolded Linux volume an alternate spelling of a masked dentry would
+    # miss an exact compare. Over-matching only turns a self-bind into a /dev/null mask, which
+    # denies MORE (fail-closed).
+    denied_both_targets: set[str] = set()
+    for dest in masked_both:
+        denied_both_targets.add(_canon(dest))
+        try:
+            denied_both_targets.add(_canon(str(Path(dest).resolve())))
+        except (OSError, RuntimeError):
+            pass
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f):
             continue
@@ -3273,8 +3312,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            t = str(_bwrap_file_target(f))
-            argv += ["--ro-bind", t, t]
+            target = _bwrap_file_target(f)
+            if _shadowed_by(target, roots) or _masked_both_ways(target, denied_both_targets):
+                # The spelling is outside every hidden subtree but its TARGET is inside one, or is
+                # itself a file step (2)/(4) already masked both ways (codex + glm L3, 2026-10-03:
+                # a link to a deny_files entry was self-bound on top of its /dev/null mask). A
+                # self-bind takes its source from the host tree, so it would put the hidden file
+                # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
+                # link in a non-writable directory pointing into a sibling entity's store): the
+                # confined shell read the sibling's file. /dev/null denies both ways instead.
+                argv += ["--ro-bind", "/dev/null", str(target)]
+            else:
+                argv += ["--ro-bind", str(target), str(target)]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 

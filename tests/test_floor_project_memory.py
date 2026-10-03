@@ -690,3 +690,193 @@ def test_a_refusal_during_candidate_publication_never_lets_a_command_run(home, m
     assert obs.is_error
     assert not ran
     assert candidates and candidates[0].closed
+
+
+# --- floor L3 r2 follow-ons: a link INTO a hidden subtree; the filter's ordering ---------------
+
+
+def _link_into_sibling(home: Path, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A trust link in a directory this user cannot write, pointing at a file inside a sibling
+    entity's hidden store (codex's precondition; RUN on argushub at 509a40e: the shell read it)."""
+    me = _entity(home)
+    sib = home / "entities" / "sibling" / ".levain"
+    sib.mkdir(parents=True)
+    target = sib / "derive-trust.json"
+    target.write_text("SIBLING-SECRET-1308")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(target)
+    opt.chmod(0o555)
+    return me, target, opt
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_write_only_link_into_a_hidden_subtree_binds_dev_null_at_its_target(
+    home, tmp_path, monkeypatch
+):
+    from levain.firing.confinement import _bwrap_argv
+    me, target, opt = _link_into_sibling(home, tmp_path)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(me))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        assert ["--ro-bind", str(target.resolve()), str(target.resolve())] not in binds
+        assert ["--ro-bind", "/dev/null", str(target.resolve())] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+@pytest.mark.skipif(not _LINUX, reason="the step (5) self-bind is Linux-only")
+def test_live_a_trust_link_into_a_sibling_store_does_not_re_expose_it(home, tmp_path, monkeypatch):
+    me, target, opt = _link_into_sibling(home, tmp_path)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        with select_provider().spawn_shell(build_policy(me)) as sh:
+            r = sh.run(f"cat '{target}' 2>&1", timeout=20)
+            assert "SIBLING-SECRET-1308" not in r.output
+    finally:
+        opt.chmod(0o755)
+
+
+def test_a_trust_spelling_inside_a_credential_subtree_is_not_listed_again(home, monkeypatch):
+    gh = home / ".config" / "gh"
+    gh.mkdir(parents=True)
+    (gh / "derive-trust.json").write_text("{}")
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(gh / "derive-trust.json"))
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    assert gh.resolve() in policy.deny_read_write
+    assert policy.trust_spellings == ()
+
+
+def test_a_trust_spelling_equal_to_a_deny_file_is_not_listed_again(home, monkeypatch):
+    t = home / "secrets" / "derive-trust.json"
+    t.parent.mkdir()
+    t.write_text("{}")
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(t))
+    policy = build_policy(_entity(home), deny_files=(t,))
+    assert policy.trust_spellings == ()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_write_only_link_to_a_read_denied_file_never_self_binds_it(home, tmp_path, monkeypatch):
+    """codex + glm L3 (floor-r2 r1): a trust link in a non-writable directory pointing at a deny_files
+    entry was self-bound on top of that entry's /dev/null mask, making the secret readable."""
+    from levain.firing.confinement import _bwrap_argv
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("SECRET")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(secret)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(secret,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(secret.resolve())
+        assert ["--ro-bind", t, t] not in binds
+        assert ["--ro-bind", "/dev/null", t] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the step (5) self-bind is Linux-only")
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_live_a_trust_link_to_a_denied_file_does_not_expose_it(home, tmp_path, monkeypatch):
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    secret.write_text("DENIED-SECRET-1308")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(secret)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        with select_provider().spawn_shell(build_policy(_entity(home), deny_files=(secret,))) as sh:
+            assert "DENIED-SECRET-1308" not in sh.run(f"cat '{secret}' 2>&1", timeout=20).output
+            assert "DENIED-SECRET-1308" not in sh.run(f"cat '{opt}/trust.json' 2>&1", timeout=20).output
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_jewel_retargeted_after_its_mask_does_not_unmask_the_write_only_target(
+    home, tmp_path, monkeypatch
+):
+    """codex L3 (floor-r2 r2): step (5) re-resolved the deny_files paths instead of using what step
+    (4) emitted. A jewel path that resolves elsewhere between the two observations left the masked
+    file off the guard list, so a write-only link to it was self-bound on top of its /dev/null mask."""
+    from levain.firing import confinement
+    a = tmp_path / "secrets" / "a"
+    b = tmp_path / "secrets" / "b"
+    a.parent.mkdir()
+    a.write_text("SECRET-A")
+    b.write_text("SECRET-B")
+    jewel = a.resolve()   # build_policy stores deny_files resolved
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(a)
+    opt.chmod(0o555)
+    real_target = confinement._bwrap_file_target
+    real_resolve = Path.resolve
+    masked = []
+
+    def target(f):
+        out = real_target(f)
+        if f == jewel:
+            masked.append(out)
+        return out
+
+    def resolve(self, *args, **kwargs):
+        if masked and self == jewel:
+            return b.resolve()   # the jewel's path now leads elsewhere (swapped mid-plan)
+        return real_resolve(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        policy = build_policy(_entity(home), deny_files=(jewel,))
+        monkeypatch.setattr(confinement, "_bwrap_file_target", target)
+        monkeypatch.setattr(Path, "resolve", resolve)
+        argv = confinement._bwrap_argv(policy)
+        monkeypatch.undo()
+        assert masked == [jewel]
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        t = str(a.resolve())
+        assert ["--ro-bind", t, t] not in binds
+        assert ["--ro-bind", "/dev/null", t] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+def _case_insensitive(d: Path) -> bool:
+    probe = d / "CaseProbe"
+    probe.write_text("")
+    try:
+        return (d / "caseprobe").exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_case_variant_link_to_a_read_denied_file_never_self_binds_it(home, tmp_path, monkeypatch):
+    """codex L3 (floor-r2 r2): on a case-insensitive volume a write-only link spelled `TOKEN` names
+    the same dentry as the deny_files entry `token`; an exact compare missed it and self-bound it."""
+    from levain.firing.confinement import _bwrap_argv
+    secret = tmp_path / "secrets" / "token"
+    secret.parent.mkdir()
+    if not _case_insensitive(secret.parent):
+        pytest.skip("needs a case-insensitive volume")
+    secret.write_text("SECRET")
+    variant = secret.parent / "TOKEN"
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(variant)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(_entity(home), deny_files=(secret,)))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        assert not any(s == d and s.casefold().endswith("/secrets/token") for _, s, d in binds), binds
+    finally:
+        opt.chmod(0o755)
