@@ -698,7 +698,8 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     final component unresolved (a symlink's own location, which is what ``rm`` and ``rename`` act on),
     and the fully resolved target. Its parent directory is write-denied as a literal by the ancestor
     pin every jewel gets, so it cannot be renamed. ``build_policy`` drops a spelling whose own
-    location is inside any denied subtree. A value that cannot be resolved refuses the floor.
+    location is inside a store subtree (see the comment there for what it does not check). A value
+    that cannot be resolved refuses the floor.
     NOT covered, by design of this cut: a project home moved away from ``~/.anneal-projects`` (its
     stores are wherever the trust file's entries point); a symlink hop in the env path beyond its
     last directory (the replaceable-intermediate-symlink class this module documents for ssh); and
@@ -876,9 +877,12 @@ def build_policy(
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
-    # A trust spelling whose own location (the final component unresolved) is inside ANY denied
-    # subtree is dropped here, against the full list: the subtree denies it both ways, and a
-    # write-only self-bind of it on Linux would take its source from the host tree and re-expose it.
+    # A trust spelling whose own location (the final component unresolved) is inside a subtree
+    # assembled so far (the operator stores, sibling entity stores, caller extras) is dropped: the
+    # subtree denies it both ways, and a write-only self-bind of it on Linux would take its source
+    # from the host tree and re-expose it. NOT checked: the credential subtrees, ~/.ssh and
+    # deny_files, which are added below (L3 r2, routed), nor a spelling that is a link INTO a hidden
+    # subtree, which step (5) maps to its target (L3 r2 codex, routed).
     trust_spellings = [
         sp for sp in trust_spellings
         if not any((loc := sp.parent.resolve() / sp.name) == t or loc.is_relative_to(t)
