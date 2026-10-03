@@ -556,6 +556,8 @@ class CrownJewelsPolicy:
     # an ssh vector without calling `.resolve()` inside the predicate, where a resolution error
     # would escape the fail-closed guard. Enforcement remains `deny_sockets` (resolved, arm i)
     # plus `deny_write_files` (both spellings, arms ii/iii).
+    trust_spellings: tuple[Path, ...] = ()  # the relocated derive-trust file's spellings (spore-1308) —
+    # MESSAGE CLASSIFICATION ONLY, like `socket_spellings`. Enforcement is `deny_write_files`.
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
     # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
@@ -674,6 +676,61 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
                 continue
             out.add(anc)
     return tuple(sorted(out))
+
+
+PROJECT_MEMORY_HOME = ".anneal-projects"
+DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
+
+
+def _project_memory_jewels(
+    home: Path, entity_dir: Path, workspace: Path
+) -> tuple[list[Path], list[Path]]:
+    """The operator's PROJECT memory: subtrees to deny read+write, and trust-file spellings to deny
+    write (spore-1308, ruled by Phill 2026-10-03, option A).
+
+    ``~/.anneal-projects`` holds per-project anneal stores and, by flow's convention, the derive-trust
+    file that binds re-derive labels to repo roots. It is operator memory exactly as ``~/.anneal-memory``
+    is, and a project store's continuity may be loaded into an operator session's prompt (flow did so
+    for every levain seat when this was ruled), so a confined write there is an injection path. A run
+    on 2026-10-03 showed a confined seatbelt shell could read and write both.
+
+    ``$ANNEAL_MEMORY_DERIVE_TRUST``, read here at policy build, can move the trust file. When it is set:
+      - the file itself is write-denied at its lexical and resolved spellings (a read only reveals
+        which repo roots are trusted; a write rebinds them), except a spelling that already sits
+        inside a subtree denied here, which is denied both ways;
+      - its parent directory, which is where the moved project stores live, is denied as a subtree,
+        UNLESS that subtree would swallow the entity's own working area: the filesystem root, ``$HOME``
+        or any ancestor of it, or any directory containing the entity or its workspace. There the file
+        literal (and the ancestor pin every jewel gets) is all that applies, because denying the
+        subtree would leave the shell unable to write its own workspace.
+    An empty variable counts as unset."""
+    subtrees: list[Path] = [(home / PROJECT_MEMORY_HOME).resolve()]
+    spellings: list[Path] = []
+    raw = os.environ.get(DERIVE_TRUST_ENV, "")
+    if raw:
+        lexical = Path(raw).expanduser()
+        if not lexical.is_absolute():
+            lexical = Path.cwd() / lexical
+        resolved = lexical.resolve()
+        spellings = [lexical, resolved] if lexical != resolved else [resolved]
+        parent = resolved.parent
+        home_r = home.resolve()
+        swallows_own = (
+            str(parent) == parent.anchor
+            or home_r == parent
+            or home_r.is_relative_to(parent)
+            or entity_dir == parent
+            or entity_dir.is_relative_to(parent)
+            or workspace == parent
+            or workspace.is_relative_to(parent)
+        )
+        if not swallows_own:
+            subtrees.append(parent)
+        # A spelling inside a denied subtree is already denied both ways. Listing it again would ask
+        # bwrap for a file mount inside a read-only tmpfs.
+        spellings = [s for s in spellings
+                     if not any(s == t or s.is_relative_to(t) for t in subtrees)]
+    return subtrees, spellings
 
 
 def _sibling_entity_stores(entity_dir: Path) -> tuple[Path, ...]:
@@ -815,6 +872,8 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
+    project_subtrees, trust_spellings = _project_memory_jewels(home, ed, ws)
+    subtrees.extend(project_subtrees)
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
@@ -916,6 +975,9 @@ def build_policy(
         deny_write_files_l.append(ssh_home / n)               # RAW ``Path.home()`` — the true lexical
         deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
         deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
+    # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
+    # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
+    deny_write_files_l.extend(trust_spellings)
 
     # De-dup while preserving order (a sibling could coincide with an extra).
     # ⚠ THE SOUNDNESS PREMISE HERE USED TO READ "resolved paths compare exactly, so a simple
@@ -1095,6 +1157,7 @@ def build_policy(
         own_memory_files=own_memory_files_t,
         deny_sockets=deny_sockets_t,
         socket_spellings=socket_spellings_t,
+        trust_spellings=_dedup(list(trust_spellings)),
         socket_sources=socket_sources_t,
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
@@ -1406,6 +1469,9 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
             if wf in sockets:
                 return (f"{p} is a container/VM daemon socket — reaching an unsandboxed root "
                         f"daemon bypasses the whole floor (spore-725)")
+            if wf in policy.trust_spellings:
+                return (f"{p} is the derive-trust file — writing it would rebind which repo roots "
+                        f"the operator's project memory re-derives against (spore-1308)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
         # The file editor has no rename primitive and no legit reason to touch the entity's own store
