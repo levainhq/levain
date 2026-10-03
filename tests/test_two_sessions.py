@@ -167,10 +167,12 @@ def test_a_resumed_conversation_of_a_deleted_entity_is_refused_not_rebuilt_witho
         tmp_path, home):
     """r2-2 (codex L3, REPRODUCED on d65d63e): a resumed conversation whose entity had been deleted
     got a floor REBUILT from <workspace>/.. with no confinement.json — the operator's deny_files
-    readable. No code path rebuilds a floor from a record any more:
-      - a raw SDK resume with the persisted agent keeps the floor that was RESOLVED at creation (it
-        travels as data in the tool spec), so the deny survives the entity's deletion;
-      - Levain's resume path re-creates the binding, and creation refuses a deleted entity."""
+    readable. No code path re-derives a floor from an entity that is gone any more:
+      - the hands DESERIALIZE the floor resolved when the binding was created (it travels as data in
+        the tool spec), so a raw SDK resume with the persisted agent keeps the deny after the
+        entity's deletion. That floor is trusted on content: K1 part 2 must re-create the binding
+        from the live entity and never build hands from a persisted or client-supplied agent;
+      - re-creating the binding (what opening a session does) refuses a deleted entity."""
     import shutil
 
     from openhands.sdk import Conversation
@@ -199,33 +201,44 @@ def test_a_resumed_conversation_of_a_deleted_entity_is_refused_not_rebuilt_witho
         _open(ent, "interactive")
 
 
-def test_a_conversations_binding_cannot_change_after_creation(tmp_path, home):
-    """r2-3 (codex L3, REPRODUCED on d65d63e: a rebind raced the tool build) and r3-2 (a resumed
-    state re-bound to another entity). Both needed a write path onto a live binding. There is none:
-    the binding is a frozen value inside a frozen agent, and no bind function exists."""
+def test_a_sessions_binding_cannot_change_after_open(tmp_path, home):
+    """r2-3 (codex L3, REPRODUCED on d65d63e: a rebind raced the tool build). That needed a write path
+    onto a live binding. On the session path there is none:
+      - the binding is a frozen value and no bind function exists;
+      - the hands are built and their floor read back INSIDE open, so the spec params they were
+        built from are never read again — mutating them afterwards (L1's run against the lazy build,
+        2026-10-02) moves nothing.
+    Not claimed here: a raw-SDK resume of entity A's persisted conversation under entity B's agent
+    is accepted by the SDK (it checks tool names only; L1, run). No Levain path resumes; K1 part 2
+    must derive a conversation's persistence from its entity."""
     import dataclasses
 
     import levain.firing.openhands.tools as T
     from levain.firing.binding import ConversationBinding
 
     ent = _entity(tmp_path, "ent")
-    agent, c = _bare_conversation(ent)
+    s = _open(ent, "unattended")
     try:
-        spec = agent.tools[0]
+        spec = s.conversation.agent.tools[0]
         bound = ConversationBinding.from_params(spec.params["binding"])
         with pytest.raises(dataclasses.FrozenInstanceError):
-            bound.mode = "unattended"  # type: ignore[misc]
-        with pytest.raises(Exception, match="frozen"):
-            agent.tools = []  # type: ignore[misc]
+            bound.mode = "interactive"  # type: ignore[misc]
         assert not [n for n in dir(T) if "bind_conversation" in n or n == "conversation_binding"]
+        loose = ConversationBinding.create(ent, mode="interactive", workspace=ent / "workspace")
+        spec.params["binding"] = loose.to_params()            # the lazy-build attack, after open
+        gh = home / ".config" / "gh" / "hosts.yml"
+        assert TOKEN not in _reads(s.conversation, gh)          # the unattended floor holds
+        assert s.conversation.agent.tools_map["file_editor"].executor._policy == bound.floor
     finally:
-        c.close()
+        s.close()
 
 
 def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_own_floor(
         tmp_path, home):
-    """r2-1 + r3-1 (a GC finalizer re-entering a module lock; two module locks taken in opposite
-    orders) and the c6a6b6e test whose injected race window never ran. This is a RUN, not a window:
+    """The c6a6b6e test whose injected race window never ran, replaced by a RUN. r2-1 + r3-1 (a GC
+    finalizer re-entering a module lock; two module locks taken in opposite orders) are closed by
+    deletion — there are no module locks — and this run could not reproduce r3-1 on c6a6b6e either
+    (25 rounds, 2026-10-02), so it smoke-tests isolation under pressure, nothing more:
     threads open sessions for two entities with OPPOSITE modes and build their tools at the same
     moment, with the cyclic GC firing on nearly every allocation. Every thread must finish (a hang
     fails the timeout), and every conversation's hands must read its OWN binding's floor."""
@@ -250,9 +263,8 @@ def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_o
             tools = s.conversation.agent.tools_map
             pol = tools["file_editor"].executor._policy
             results[i] = (pol.entity_dir, crown_jewel_reason(pol, gh) is not None,
-                          tools["file_editor"].executor._floor is (
-                              tools["terminal"].executor._floor if "terminal" in tools
-                              else tools["file_editor"].executor._floor))
+                          tools["terminal"].executor._floor is tools["file_editor"].executor._floor
+                          if "terminal" in tools else None)
         except BaseException as exc:  # noqa: BLE001 — reported by the assertion below
             results[i] = exc
 
@@ -275,4 +287,28 @@ def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_o
         entity_dir, denies_gh, one_floor = got
         assert entity_dir == ent.resolve()
         assert denies_gh is (mode == "unattended")
-        assert one_floor
+        if confinement_supported():                    # bash exists here, so both hands were built
+            assert one_floor is True
+
+
+def test_a_fork_of_a_conversation_that_already_ran_keeps_its_binding(tmp_path, home):
+    """L2 2026-10-02 (run): forking an INITIALIZED Levain conversation crashed — the SDK deep-copies
+    its events, the system-prompt event holds the built hands, and their floor/shell hold locks
+    (`cannot pickle '_thread.lock'`). A real `fork()` after the tools are built must work, and the
+    fork's hands must be its own, fenced by the same binding's floor."""
+    ent = _entity(tmp_path, "ent")
+    s = _open(ent, "unattended")
+    try:
+        forked = s.conversation.fork()
+        try:
+            forked._ensure_agent_ready()
+            src = s.conversation.agent.tools_map["file_editor"].executor
+            dst = forked.agent.tools_map["file_editor"].executor
+            assert dst._floor is not src._floor               # its own floor object…
+            assert dst._policy == src._policy                 # …fenced by the same binding
+            gh = home / ".config" / "gh" / "hosts.yml"
+            assert TOKEN not in _reads(forked, gh)            # unattended floor survives the fork
+        finally:
+            forked.close()
+    finally:
+        s.close()

@@ -643,6 +643,22 @@ class EntitySession:
                 arm_efferent_gate(conversation)
             else:
                 disarm_efferent_gate(conversation)
+            # Build the hands NOW, not at the first turn, and read their floor back. The SDK builds tools
+            # lazily from the agent's spec params, and those params are a plain dict until then; once
+            # the agent is initialized they are never read again. So after this the hands' floor can
+            # only be the one this session resolved — and a hand that does not report it refuses the
+            # start (the arm_efferent_gate read-back discipline).
+            if conv_binding is not None:
+                conversation._ensure_agent_ready()
+                tools_map = conversation.agent.tools_map
+                hands = [t for n, t in tools_map.items() if n in ("file_editor", "terminal")]
+                if "file_editor" not in tools_map or any(
+                    getattr(t.executor, "_policy", None) != conv_binding.floor for t in hands
+                ):
+                    raise BindingError(
+                        "the conversation's hands did not report the floor this session resolved "
+                        "— refusing to start (fail-closed)."
+                    )
             # The banner prints the floor the hands enforce: the binding's resolved value.
             deny_standard_creds = (
                 conv_binding.deny_standard_creds

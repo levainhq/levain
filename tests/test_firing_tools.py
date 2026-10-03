@@ -7,7 +7,7 @@ The moat: BOTH hands are fenced to the shared crown-jewels FLOOR (slice 2 relaxe
   - the BASH tool drives spore-311's ``SandboxedShell`` (a real ``sandbox-exec`` sandbox on macOS),
     refuses crown jewels, keeps state across commands, and refuses interactive input;
   - both keep the LLM-FAMILIAR names (``file_editor`` / ``terminal``) while the REGISTRY keys stay
-    distinct (``levain_file_editor`` / ``levain_bash``) so the unconfined stock tools are unreachable.
+    distinct (one ``levain_hands`` spec) so the unconfined stock tools are unreachable.
 
 openhands-gated; skipped cleanly without the extra. The real-sandbox bash tests skip off macOS (no OS
 confinement floor). The pure ``tool_action_summary`` render helper is tested in ``test_run.py``.
@@ -165,6 +165,20 @@ def test_levain_hands_refuses_a_malformed_binding(tmp_path: Path):
         LevainHands.create(_FakeConvState(ws), binding=holed)
     with pytest.raises(BindingError):
         LevainHands.create(_FakeConvState(ws), binding={**params, "mode": "nonsense"})
+    # L2 2026-10-02 (run): shapes that were ACCEPTED and widened the floor, each now refused.
+    f = params["floor"]
+    for bad in (
+        {**f, "deny_read_write": ["relative/x"]},           # never matches a resolved path: a hole
+        {**f, "ssh_dir": None, "ssh_mode": "agent"},        # enforcers key on ssh_dir: ~/.ssh open
+        {**f, "ssh_mode": {"evil": 1}},
+        {**f, "entity_dir": str(tmp_path / "elsewhere")},   # a floor fencing another entity
+    ):
+        with pytest.raises(BindingError):
+            ConversationBinding.from_params({**params, "floor": bad})
+    # every policy field has a (de)serialization kind — a new field type refuses, never passes
+    from levain.firing.binding import _field_kinds
+
+    assert set(_field_kinds()) == set(f)
 
 
 def test_the_binding_serves_the_entity_it_was_created_for_and_ignores_process_env(tmp_path: Path,

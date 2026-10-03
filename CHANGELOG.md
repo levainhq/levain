@@ -12,8 +12,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - A second session's drive mode set the first session's file-editor and bash floor. The first session's banner said one thing while its tools enforced another.
   - A second session that failed to open still moved the first session's floor.
   - Once the process named a second entity, the first session's recall, re-anchor and capture all used the second entity's store.
-  The new `levain.firing.binding.ConversationBinding` holds the entity, the drive mode and the resolved floor. It reaches both hands as data in their tool spec, and the condenser carries the entity, so a fork keeps all of it and nothing is looked up by conversation. Two entities can be open in one process, and each reads and writes only its own store. A conversation's binding cannot be changed after it is created.
-- **Both hands are now one tool spec, `levain_hands`,** built by `build_entity_tools(binding, with_bash=...)`. The registry names `levain_file_editor` and `levain_bash` are gone. The tool names the model sees (`file_editor`, `terminal`) are unchanged.
+  The new `levain.firing.binding.ConversationBinding` holds the entity, the drive mode and the resolved floor. It reaches both hands as data in their tool spec, and the condenser carries the entity, so a fork keeps all of it and nothing is looked up by conversation. Two entities can be open in one process, and each reads and writes only its own store. `EntitySession.open` builds the hands and reads their floor back before it returns, so a session's floor cannot change after it opens. (A library caller that builds a conversation itself gets its hands at the first turn, from the tool spec as it stands then.)
+- **Both hands are now one tool spec, `levain_hands`,** built by `build_entity_tools(binding, with_bash=...)`. **Breaking for library callers:** `build_entity_tools` now requires the binding, and the registry names `levain_file_editor` and `levain_bash` are gone. The tool names the model sees (`file_editor`, `terminal`) are unchanged.
 - **A process that has opened an entity refuses every default-kind (`"anneal"`) store operation** (`$LEVAIN_ENTITY_PROCESS`). A stray bare `vagus_run` or `wrap_nudge` there used to be redirected to the entity; it now refuses loudly, so it can never reach the operator's `~/.anneal-memory`. Levain's own capture always names its entity and is unaffected.
 - **`confinement.json` is read once at session start.** The banner and the floor come from the same read (it was read twice; listed under 0.5.0's known open issues).
 - **Hands built for one entity cannot be put on another entity's agent**: `build_entity_agent` refuses them.
@@ -26,6 +26,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 
 - **A session that failed to start after its conversation was built left that conversation open** until the process exited. It is now closed.
+- **Forking a conversation whose hands had been built crashed** (`cannot pickle '_thread.lock' object`). A fork now gets its own hands, fenced by the same floor.
 
 ## [0.5.1] — 2026-10-02
 

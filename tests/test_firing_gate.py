@@ -42,7 +42,7 @@ ALL_FILE_EDITOR_COMMANDS = ("view", "create", "str_replace", "insert", "undo_edi
 # ---------- the tool-name tripwire (the near-miss this test exists for) ----------
 
 def test_classifier_matches_the_STOCK_tool_names_an_action_event_actually_carries():
-    """THE TRIPWIRE. The confined hands are REGISTERED as ``levain_file_editor`` / ``levain_bash``
+    """THE TRIPWIRE. The confined hands are REGISTERED under one spec, ``levain_hands``,
     but keep the STOCK ``.name`` (``file_editor`` / ``terminal``) so a weak open model sees a
     familiar function name — and an ``ActionEvent`` carries ``tool_call.name``, i.e. the STOCK
     one.

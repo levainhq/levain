@@ -235,6 +235,12 @@ class _SharedFloor:
 
     __slots__ = ("_policy", "_lock")
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
+        # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
+        # built hands. That copy is a record, never executed: the fork's agent builds its OWN hands
+        # (and floor) from its tool spec. A lock cannot be copied, so the record shares this object.
+        return self
+
     def __init__(self, policy: CrownJewelsPolicy) -> None:
         self._policy = policy
         self._lock = threading.Lock()
@@ -426,6 +432,11 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     against each other so two never race the one shell. ``reset`` closes + respawns a fresh shell;
     ``exit`` inside a command closes it and the next command respawns; ``is_input`` (interactive stdin)
     is refused — the confined shell is a non-interactive dev shell + agent-auth SSH, no PTY."""
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "SandboxedBashExecutor":
+        # Same reason as `_SharedFloor.__deepcopy__`: a fork's event record shares this executor;
+        # the fork runs bash through the executor its own agent builds.
+        return self
 
     def __init__(
         self,

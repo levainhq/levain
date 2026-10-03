@@ -31,11 +31,12 @@ import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, get_args, get_type_hints
 
 from levain.firing.confinement import (
     ConfinementConfig,
     CrownJewelsPolicy,
+    SshMode,
     build_policy,
     load_confinement_config,
 )
@@ -81,36 +82,72 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
     return out
 
 
+# How each policy field is (de)serialized, by its RESOLVED annotation — an explicit table, so a field
+# whose type is not listed here REFUSES rather than passing through unchecked (and a dropped
+# `from __future__ import annotations` in confinement.py cannot quietly move fields to "unchecked").
+_PATH, _OPT_PATH, _PATHS, _BOOL, _SSH_MODE = "path", "optional_path", "paths", "bool", "ssh_mode"
+
+
+def _field_kinds() -> dict[str, str]:
+    hints = get_type_hints(CrownJewelsPolicy)
+    table = {
+        Path: _PATH,
+        Optional[Path]: _OPT_PATH,
+        tuple[Path, ...]: _PATHS,
+        bool: _BOOL,
+        SshMode: _SSH_MODE,
+    }
+    kinds: dict[str, str] = {}
+    for f in dataclasses.fields(CrownJewelsPolicy):
+        kind = table.get(hints[f.name])
+        if kind is None:
+            raise BindingError(
+                f"crown-jewels policy field {f.name!r} has a type this binding cannot carry "
+                "(fail-closed — teach ConversationBinding about it)."
+            )
+        kinds[f.name] = kind
+    return kinds
+
+
+def _abs_path(name: str, v: Any) -> Path:
+    if not isinstance(v, str) or not Path(v).is_absolute():
+        # A relative path can never match the resolved paths enforcement compares, so it would be a
+        # silent hole in the floor rather than a deny.
+        raise BindingError(f"floor field {name!r} holds a non-absolute path (fail-closed).")
+    return Path(v)
+
+
 def _policy_from_params(data: Any) -> CrownJewelsPolicy:
     # EXACT key set. Most policy fields default to an empty tuple, so a missing key would construct
     # a floor with a silent hole; an extra key means this is not the shape this code wrote.
-    names = {f.name for f in dataclasses.fields(CrownJewelsPolicy)}
-    if not isinstance(data, dict) or set(data) != names:
+    kinds = _field_kinds()
+    if not isinstance(data, dict) or set(data) != set(kinds):
         raise BindingError(
             "the serialized floor does not carry exactly the crown-jewels policy fields — refusing "
             "to build a floor from it (fail-closed)."
         )
     kwargs: dict[str, Any] = {}
-    for f in dataclasses.fields(CrownJewelsPolicy):
-        v = data[f.name]
-        ftype = str(f.type)
-        if ftype.startswith("tuple"):
-            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
-                raise BindingError(f"floor field {f.name!r} is not a list of paths (fail-closed).")
-            kwargs[f.name] = tuple(Path(x) for x in v)
-        elif ftype.startswith("Path"):
-            if v is None and "None" in ftype:
-                kwargs[f.name] = None
-            elif isinstance(v, str):
-                kwargs[f.name] = Path(v)
-            else:
-                raise BindingError(f"floor field {f.name!r} is not a path (fail-closed).")
-        elif ftype == "bool":
+    for name, kind in kinds.items():
+        v = data[name]
+        if kind == _PATHS:
+            if not isinstance(v, list):
+                raise BindingError(f"floor field {name!r} is not a list of paths (fail-closed).")
+            kwargs[name] = tuple(_abs_path(name, x) for x in v)
+        elif kind == _PATH:
+            kwargs[name] = _abs_path(name, v)
+        elif kind == _OPT_PATH:
+            kwargs[name] = None if v is None else _abs_path(name, v)
+        elif kind == _BOOL:
             if not isinstance(v, bool):
-                raise BindingError(f"floor field {f.name!r} is not a bool (fail-closed).")
-            kwargs[f.name] = v
-        else:
-            kwargs[f.name] = v
+                raise BindingError(f"floor field {name!r} is not a bool (fail-closed).")
+            kwargs[name] = v
+        else:  # _SSH_MODE
+            if v not in get_args(SshMode):
+                raise BindingError(f"floor field {name!r} is not an ssh mode (fail-closed).")
+            kwargs[name] = v
+    # Enforcers key on ssh_dir, not ssh_mode: "agent" with no ssh_dir would drop the ~/.ssh deny.
+    if (kwargs["ssh_mode"] == "agent") != (kwargs["ssh_dir"] is not None):
+        raise BindingError("the serialized floor's ssh_mode and ssh_dir disagree (fail-closed).")
     return CrownJewelsPolicy(**kwargs)
 
 
@@ -189,7 +226,9 @@ class ConversationBinding:
         ed, mode, creds = data["entity_dir"], data["mode"], data["deny_standard_creds"]
         if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES or not isinstance(creds, bool):
             raise BindingError("a serialized conversation binding has a malformed field (fail-closed).")
-        return cls(
-            entity_dir=Path(ed), mode=mode, floor=_policy_from_params(data["floor"]),
-            deny_standard_creds=creds,
-        )
+        floor = _policy_from_params(data["floor"])
+        if floor.entity_dir != Path(ed):
+            raise BindingError(
+                "a serialized conversation binding's floor fences a different entity (fail-closed)."
+            )
+        return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds)

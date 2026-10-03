@@ -67,12 +67,12 @@ verification layer, is not this keystone, and would be exactly the kind of scope
 split exists to keep off the spine.
 
 Tool-name note, and it is a genuine tripwire: the confined hands keep the **stock** ``.name``
-(``file_editor`` / ``terminal``) while their registry SPEC names are ``levain_file_editor`` /
-``levain_bash`` — deliberately, so a weak open model sees the familiar function name. An
+(``file_editor`` / ``terminal``) while their registry SPEC name is ``levain_hands`` (one spec
+builds both) — deliberately, so a weak open model sees the familiar function name. An
 ``ActionEvent`` carries ``tool_call.name``, i.e. the STOCK name. Matching only the registry keys
 would therefore never fire, and every action would fall through to the fail-closed default: the
 gate would over-gate (``view`` included), still look correct in any test that only asserts "bash
-gates", and be wrong. Both spellings are accepted here, and a test pins the stock ones.
+gates", and be wrong. So the stock names are what this matches, and a test pins them.
 """
 from __future__ import annotations
 
@@ -134,12 +134,12 @@ world. The SDK independently exempts a lone ``FinishAction``/``ThinkAction`` fro
 naming them here too means this classifier is correct STANDALONE rather than correct only in
 combination with a behaviour of the runtime we do not own."""
 
-FILE_EDITOR_TOOL_NAMES = frozenset({"file_editor", "levain_file_editor"})
-"""The file-editor hand, by BOTH spellings — the stock ``.name`` an ``ActionEvent`` actually
-carries, and the Levain registry spec name. See the tool-name tripwire in the module docstring."""
+FILE_EDITOR_TOOL_NAMES = frozenset({"file_editor"})
+"""The file-editor hand, by the stock ``.name`` an ``ActionEvent`` actually carries. See the
+tool-name tripwire in the module docstring."""
 
-BASH_TOOL_NAMES = frozenset({"terminal", "levain_bash"})
-"""The bash hand, by both spellings. Bash is efferent by DECISION (see the module docstring), not
+BASH_TOOL_NAMES = frozenset({"terminal"})
+"""The bash hand, by its stock name. Bash is efferent by DECISION (see the module docstring), not
 by falling off the end of the lookup — the distinction is invisible in the returned class and
 very visible in :attr:`Classification.reason`, which is exactly where an operator needs it."""
 

@@ -138,7 +138,7 @@ is tabulated above :func:`_bwrap_argv`.
     its own addresses (loopback AND the LAN IP — seatbelt's ``localhost`` keyword covers every
     local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in BOTH
     ssh_modes by ``deny_localhost_outbound`` (renders ``(deny network-outbound (remote ip
-    "localhost:*"))``), DEFAULT-ON at ``policy_for_conv_state`` (Phill 2026-09-13, 0.4.6 = A+B),
+    "localhost:*"))``), DEFAULT-ON at ``ConversationBinding.create`` (Phill 2026-09-13, 0.4.6 = A+B),
     operator opt-out ``allow_localhost_outbound``. Both modes because raw mode has the same
     fresh-connection exposure (codex L3 HIGH#1, REPRODUCED): the entity reads its OWN key but the
     OTHER jewels stay floor-denied and a local sshd reads THEM as root just the same. This deny also
@@ -616,7 +616,7 @@ class CrownJewelsPolicy:
     # file the floor denies. REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD. In ``ssh_mode="agent"``
     # the carrier is the forwarded ``SSH_AUTH_SOCK`` (proven sole carrier: disable it and the attack
     # fails "Permission denied (publickey)"). This flag is mode-AGNOSTIC — it renders the deny
-    # whenever True — and its CALL SITE (`policy_for_conv_state`) sets it in BOTH ssh_modes (Phill
+    # whenever True — and its CALL SITE (`ConversationBinding.create`) sets it in BOTH ssh_modes (Phill
     # 2026-09-13, 0.4.6 = A+B). codex L3 HIGH#1 REPRODUCED a raw-mode variant (the entity reads its own
     # key, but the OTHER jewels — ~/.anneal-memory, sibling stores, deny_files — stay floor-denied and
     # a local sshd reads THEM as root just the same), so both modes get the deny.
@@ -761,7 +761,7 @@ def build_policy(
     (``~/.config/gh`` subtree, ``~/.aws/credentials``, ``~/.netrc``) into the floor. These are knowable
     locations (not the false-security guessing the module refuses), but denying their READ breaks the
     entity's own gh/aws/curl use, so it is OFF by default — the operator enables it when the entity
-    does not need those tools. Wired from ``confinement.json`` via :func:`policy_for_conv_state`.
+    does not need those tools. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
     **Operator-declared crown jewels (the caller MUST pass — this generic, operator-neutral module
     deliberately does NOT guess where an operator's app-specific secrets live):**
