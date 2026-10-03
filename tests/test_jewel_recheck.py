@@ -14,7 +14,8 @@ from levain.firing.confinement import (
     ConfinementError,
     _BwrapShell,
     _bwrap_argv,
-    _mount_manifest,
+    _identity,
+    _mount_plan_paths,
     build_policy,
     bwrap_available,
     select_provider,
@@ -47,8 +48,12 @@ def _shell(tmp_path, monkeypatch, *, deny_files=(), extra=()):
     """An unstarted _BwrapShell with the manifest the real plan would record (pure: no bwrap)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = build_policy(_entity(tmp_path), deny_files=deny_files, extra_deny_read_write=extra)
-    manifest = _mount_manifest(_bwrap_argv(policy), policy)
+    mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
+    manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
     return _BwrapShell(policy=policy, manifest=manifest, argv=["/bin/false"], cwd=tmp_path, env={})
+
+
+_CHANGED = "the floor no longer covers what is on disk"
 
 
 def _empty(tmp_path, name="store.db") -> Path:
@@ -97,7 +102,7 @@ def test_a_denied_file_replaced_atomically_refuses(tmp_path, monkeypatch):
     tmp = cred.with_name("token.new")
     tmp.write_text("NEW")
     os.replace(tmp, cred)
-    with pytest.raises(ConfinementError, match="changed since this shell started"):
+    with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
     assert sh.closed
 
@@ -107,8 +112,9 @@ def test_a_sidecar_that_appears_after_spawn_refuses(tmp_path, monkeypatch):
     store = _empty(tmp_path)
     sh = _shell(tmp_path, monkeypatch, deny_files=(store,))
     Path(f"{store}-wal").write_bytes(b"\x37\x7f\x06\x82")
-    with pytest.raises(ConfinementError, match="changed since this shell started"):
+    with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
+    assert sh.closed
 
 
 def test_a_jewel_replaced_by_a_symlink_refuses(tmp_path, monkeypatch):
@@ -117,7 +123,7 @@ def test_a_jewel_replaced_by_a_symlink_refuses(tmp_path, monkeypatch):
     other = _empty(tmp_path, "other.db")
     store.unlink()
     store.symlink_to(other)
-    with pytest.raises(ConfinementError, match="changed since this shell started"):
+    with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
     assert sh.closed
 
@@ -130,7 +136,7 @@ def test_a_hidden_directory_swapped_for_a_link_refuses(tmp_path, monkeypatch):
     sh = _shell(tmp_path, monkeypatch, extra=(secrets,))
     secrets.rename(tmp_path / "moved")
     secrets.symlink_to(tmp_path / "moved")
-    with pytest.raises(ConfinementError, match="changed since this shell started"):
+    with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
 
 
@@ -143,18 +149,73 @@ def test_a_closed_shell_reports_closed_not_a_jewel_change(tmp_path, monkeypatch)
         sh.run("echo x")
 
 
-def test_the_manifest_is_settled_once(tmp_path, monkeypatch):
-    """L3 r2 codex/complement: a second start() re-snapshotted, laundering a change made since."""
-    absent = tmp_path / "creds" / "absent-token"   # a mountpoint bwrap would create at start
+def test_nothing_is_adopted_after_the_start(tmp_path, monkeypatch):
+    """L3 r3 codex: a post-start settle could adopt a replacement as the baseline. The manifest is
+    recorded once, before the start; a path recorded absent that appears later is a change."""
+    absent = tmp_path / "creds" / "absent-token"
     absent.parent.mkdir()
     sh = _shell(tmp_path, monkeypatch, deny_files=(absent,))
-    sh.settle_created_mountpoints()
-    before = dict(sh._manifest)
-    absent.write_text("planted after the start")
-    sh.settle_created_mountpoints()                  # must not adopt it
-    assert sh._manifest == before
-    with pytest.raises(ConfinementError, match="changed since this shell started"):
+    absent.write_text("appeared after the start")
+    with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
+
+
+def test_a_jewel_the_plan_leaves_unmounted_is_watched(tmp_path, monkeypatch):
+    """L3 r3 codex/complement: an absent jewel under the read-only .levain store gets no mount (bwrap
+    cannot create one there); if the host creates it later the read-only bind shows it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    entity = _entity(tmp_path)
+    vault = entity / ".levain" / "vault" / "token"
+    policy = build_policy(entity, deny_files=(vault,))
+    mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
+    assert str(vault.resolve()) not in mounted and str(vault.resolve()) in unmounted
+    sh = _BwrapShell(policy=policy, argv=["/bin/false"], cwd=tmp_path, env={},
+                     manifest={q: _identity(Path(q)) for q in [*mounted, *unmounted]})
+    vault.parent.mkdir()
+    vault.write_text("SECRET")
+    with pytest.raises(ConfinementError, match=_CHANGED):
+        sh.run("echo x")
+
+
+def test_tmpfs_containment_is_exact_not_case_folded():
+    """L3 r3: a case-folded match dropped a distinct path on a case-sensitive filesystem."""
+    from levain.firing.confinement import build_policy as _bp  # noqa: F401 (import check only)
+
+    class _P:
+        deny_files = deny_write_files = own_memory_files = sqlite_sidecars = deny_read_write = ()
+        config_file = None
+
+    argv = ["--tmpfs", "/x/Secrets", "--ro-bind", "/dev/null", "/x/secrets/token",
+            "--ro-bind", "/dev/null", "/x/Secrets/inner"]
+    mounted, _ = _mount_plan_paths(argv, _P())
+    assert "/x/secrets/token" in mounted and "/x/Secrets/inner" not in mounted
+
+
+def test_a_sidecar_inside_a_tmpfs_root_is_not_watched():
+    class _P:
+        deny_files = deny_write_files = own_memory_files = deny_read_write = ()
+        sqlite_sidecars = (Path("/x/Secrets/store.db-wal"), Path("/y/store.db-wal"))
+        config_file = None
+
+    _, unmounted = _mount_plan_paths(["--tmpfs", "/x/Secrets"], _P())
+    assert unmounted == ["/y/store.db-wal"]
+
+
+def test_an_error_recording_the_manifest_refuses_before_any_start(tmp_path, monkeypatch):
+    """L3 r3 codex/glm: a raw OSError from the manifest escaped spawn."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+
+    def boom(p):
+        raise PermissionError(13, "Permission denied", str(p))
+
+    monkeypatch.setattr(conf, "_identity", boom)
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="could not prepare or record"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert not started
 
 
 def test_paths_inside_a_tmpfs_root_are_not_tracked(tmp_path, monkeypatch):
@@ -163,10 +224,10 @@ def test_paths_inside_a_tmpfs_root_are_not_tracked(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".ssh").mkdir()
     policy = build_policy(_entity(tmp_path))
-    manifest = _mount_manifest(_bwrap_argv(policy), policy)
+    mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
     ssh = str((tmp_path / ".ssh").resolve())
-    assert ssh in manifest
-    assert not [q for q in manifest if q.startswith(ssh + "/")]
+    assert ssh in mounted
+    assert not [q for q in [*mounted, *unmounted] if q.startswith(ssh + "/")]
 
 
 @linux_live

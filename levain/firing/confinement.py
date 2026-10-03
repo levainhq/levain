@@ -3252,37 +3252,69 @@ def _describe(ident: tuple[int, int, int] | None) -> str:
     return f"{kind} inode {ident[1]}"
 
 
-def _mount_manifest(argv: list[str], policy: CrownJewelsPolicy) -> dict[str, tuple[int, int, int] | None]:
-    """Every host path the bwrap plan mounts over, plus every SQLite sidecar name it leaves unmounted,
-    with its identity NOW (before bwrap runs).
+def _mount_plan_paths(
+    argv: list[str], policy: CrownJewelsPolicy
+) -> tuple[dict[str, str], list[str]]:
+    """What the bwrap plan covers on the host: ``(mounted, unmounted)``.
 
-    A mount attaches to the file or directory that is at a path when bwrap runs, not to the path. If
-    the host later replaces what is there (an atomic rewrite, an unlink, a swap for a link) the mount
-    stays on the old object and the new one is fully exposed: RUN on argushub 2026-10-03 at 509a40e, a
-    denied credential replaced by rename was refused before and read after, in the same live shell.
-    A path strictly inside a tmpfs root is left out: the tmpfs hides the host tree there either way."""
-    dsts: list[str] = []
+    ``mounted`` maps each host path the plan mounts over to the kind of mountpoint it needs if absent
+    (``"dir"`` for a tmpfs or a directory bind, ``"file"`` for a ``/dev/null`` bind). ``unmounted`` is
+    every jewel path the policy names that the plan does NOT mount (an absent jewel under a read-only
+    store, a SQLite sidecar absent at spawn): nothing covers those, so they are watched for appearing.
+    A path strictly inside a tmpfs root is left out of both, by EXACT containment: the tmpfs hides the
+    host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
+    (L3 2026-10-03)."""
+    mounted: dict[str, str] = {}
     tmpfs: list[Path] = []
     i = 0
     while i < len(argv):
         op = argv[i]
         if op == "--tmpfs":
-            dsts.append(argv[i + 1])
+            mounted.setdefault(argv[i + 1], "dir")
             tmpfs.append(Path(argv[i + 1]))
             i += 2
         elif op in ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try"):
-            if argv[i + 2] != "/":
-                dsts.append(argv[i + 2])
+            src, dst = argv[i + 1], argv[i + 2]
+            if dst != "/":
+                mounted.setdefault(dst, "file" if src == "/dev/null" else "dir")
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
             i += 2
         else:
             i += 1
-    paths = [d for d in dsts
-             if not any(Path(d) != r and _ci_within(Path(d), r) for r in tmpfs)]
-    mounted = set(paths)
-    paths += [str(sc) for sc in policy.sqlite_sidecars if str(sc) not in mounted]
-    return {q: _identity(Path(q)) for q in dict.fromkeys(paths)}
+
+    def hidden(q: str) -> bool:
+        pq = Path(q)
+        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+
+    mounted = {q: k for q, k in mounted.items() if not hidden(q)}
+    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
+             *policy.sqlite_sidecars, *[p for p in policy.deny_read_write if not p.is_dir()]]
+    if policy.config_file is not None:
+        named.append(policy.config_file)
+    unmounted = [q for q in dict.fromkeys(str(p) for p in named)
+                 if q not in mounted and not hidden(q)]
+    return mounted, unmounted
+
+
+def _prepare_mountpoints(mounted: dict[str, str]) -> None:
+    """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
+    the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
+    file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
+    it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
+    which is still recorded before bwrap mounts over it."""
+    for q, kind in mounted.items():
+        p = Path(q)
+        if os.path.lexists(p):
+            continue
+        if kind == "dir":
+            p.mkdir(mode=0o700, exist_ok=True)
+        else:
+            try:
+                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+            except FileExistsError:
+                pass
 
 
 class _BwrapShell(SandboxedShell):
@@ -3293,7 +3325,7 @@ class _BwrapShell(SandboxedShell):
       - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
         empty jewel can be initialised as a database IN PLACE, keeping its inode (RUN on Linux at
         3838801: the next command read a row out of the host's ``-wal``);
-      - every path in the mount manifest (:func:`_mount_manifest`) still has the identity it had when
+      - every path in the mount manifest still has the identity it had when
         the mounts were made, which covers every way the host can put something new where a mount
         was: an atomic rewrite, an unlink while a connection keeps a ``-wal``, a swap for a link, a
         sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
@@ -3303,8 +3335,9 @@ class _BwrapShell(SandboxedShell):
     refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
     including a ``levain wrap`` rewriting the entity's own continuity, or a daemon recreating its socket:
     that rewrite detached the mount, so the shell could no longer be trusted with it.
-    The manifest is recorded once, before bwrap runs, with mountpoints bwrap creates filled in once
-    right after it starts (:meth:`settle_created_mountpoints`); a later ``start()`` changes nothing.
+    The manifest is recorded once, before bwrap runs, after the provider has created every absent
+    host mountpoint itself (:func:`_prepare_mountpoints`), so nothing is adopted after the start. It
+    covers every mounted path and every jewel the plan leaves unmounted (:func:`_mount_plan_paths`).
     NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
     its access for as long as it runs; so does a command whose path changes between this check and
     its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
@@ -3322,22 +3355,7 @@ class _BwrapShell(SandboxedShell):
     ) -> None:
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
-        self._manifest = dict(manifest)
-        sidecars = {str(sc) for sc in policy.sqlite_sidecars}
-        # Mountpoints absent at plan time are created by bwrap (or the provider) as it mounts; their
-        # identity is recorded once, after the start. Unmounted sidecars stay absent by expectation.
-        self._to_settle = [q for q, ident in self._manifest.items()
-                           if ident is None and q not in sidecars]
-        self._settled = False
-
-    def settle_created_mountpoints(self) -> None:
-        """Record the identity of the mountpoints bwrap created. Called once by the provider right
-        after the start; later calls do nothing."""
-        if self._settled:
-            return
-        for q in self._to_settle:
-            self._manifest[q] = _identity(Path(q))
-        self._settled = True
+        self._manifest = dict(manifest)   # recorded before the start; never updated
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -3346,7 +3364,7 @@ class _BwrapShell(SandboxedShell):
             if now != was:
                 raise ConfinementError(
                     f"{q} changed since the shell started ({_describe(was)} -> {_describe(now)}); "
-                    "the mount over it no longer covers what is on disk."
+                    "the floor no longer covers what is on disk there."
                 )
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
@@ -3434,7 +3452,7 @@ class BwrapProvider(ConfinementProvider):
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
         argv, create_first = _bwrap_plan(policy)
-        manifest = _mount_manifest(argv, policy)   # BEFORE anything is created or mounted
+        mounted, unmounted = _mount_plan_paths(argv, policy)
         argv = argv + ["/bin/bash", "--noprofile", "--norc"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
@@ -3449,6 +3467,14 @@ class BwrapProvider(ConfinementProvider):
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            _prepare_mountpoints(mounted)
+            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
+                "bash hands (fail-closed)."
+            ) from exc
         shell = _BwrapShell(
             policy=policy,
             manifest=manifest,
@@ -3459,7 +3485,6 @@ class BwrapProvider(ConfinementProvider):
         )
         try:
             shell.start()
-            shell.settle_created_mountpoints()
         except BaseException:
             shell.close()   # never orphan a started shell (glm L3 r2)
             raise
