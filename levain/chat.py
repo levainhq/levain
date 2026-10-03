@@ -55,12 +55,15 @@ says the deadline passed while the job ran, and the result's ``timed_out`` says 
 ended the turn. A stopped turn comes back ``timed_out``, uncaptured, and the host breaks the session
 and releases its shell. The SDK's synchronous run cannot be cancelled inside a step, so a step
 already in flight finishes first: a shell command within its own timeout, a model call within the
-SDK's HTTP timeout and retries. A stop that lands while the turn's run is going ends the turn as
-stopped, even if that last step finished it. So the bound is the deadline plus at most one step, not
-the deadline, and it does NOT cover capture: a deadline that passes during ``capture_turn`` does not
-stop it, and a capture that hangs holds the job past the deadline (not bounded here). A session stays ``busy`` (and
-counted) until its worker returns. Workers are daemon threads, so stopping the server does not wait
-for one; the SDK closes every live conversation, and its shell, at interpreter exit.
+SDK's HTTP timeout and retries. If that step finishes the turn and every tool call the turn made ran
+to an outcome, the turn keeps its ordinary result and the session stays usable. Otherwise it is
+stopped: a call that was cancelled, errored or has no outcome, a status other than finished or idle,
+or an event log that cannot be read (:meth:`EntitySession.request_stop`). So the bound is the
+deadline plus at most one step, not the deadline, and it does NOT cover capture: a deadline that
+passes during ``capture_turn`` does not stop it, and a capture that hangs holds the job past the
+deadline (not bounded here). A session stays ``busy`` (and counted) until its worker returns.
+Workers are daemon threads, so stopping the server does not wait for one; the SDK closes every live
+conversation, and its shell, at interpreter exit.
 
 **A session is counted toward the cap until its shell is released.** ``close`` marks it ``closing``
 (still counted, refusing every operation), tears it down outside the lock, and only then publishes

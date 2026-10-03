@@ -471,6 +471,7 @@ def _one_turn(method: Callable[..., TurnResult]) -> Callable[..., TurnResult]:
     def _wrapped(self: "EntitySession", *args: Any, **kwargs: Any) -> TurnResult:
         with self._turn_lock:
             self._stop_requested = False
+            self._turn_start = self._event_count()
             self._turn_active = True
         try:
             return method(self, *args, **kwargs)
@@ -517,6 +518,7 @@ class EntitySession:
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
     _stop_requested: bool = field(default=False, init=False, repr=False, compare=False)
     _turn_active: bool = field(default=False, init=False, repr=False, compare=False)
+    _turn_start: int | None = field(default=None, init=False, repr=False, compare=False)
     _turn_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -976,7 +978,7 @@ class EntitySession:
             if self._stop_requested:
                 return self._stopped_result(nudged=nudged)
             self.conversation.run()
-            if self._stop_requested:
+            if self._stop_requested and self._stop_ended_run():
                 return self._stopped_result(nudged=nudged)
 
             # The gate check comes FIRST, before the act-first backstop, because a halted turn
@@ -996,7 +998,7 @@ class EntitySession:
                 if self._stop_requested:
                     return self._stopped_result(nudged=nudged)
                 self.conversation.run()
-                if self._stop_requested:
+                if self._stop_requested and self._stop_ended_run():
                     return self._stopped_result(nudged=nudged)
                 # Same three-valued treatment as the pre-nudge check — the post-nudge run() is
                 # a second chance to halt, and an unreadable status here cascades identically.
@@ -1054,7 +1056,9 @@ class EntitySession:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
 
         The turn ends at its next step boundary and returns ``timed_out=True``, NOT captured: a turn
-        stopped partway has no completed work to record (the same rule as the in-process bound).
+        stopped partway has no completed work to record (the same rule as the in-process bound). A
+        turn that plainly completed before the stop could end it keeps its ordinary result
+        (:meth:`_stop_ended_run` says what that takes).
         The SDK's synchronous ``run()`` cannot be cancelled inside a step, so a step in flight (a
         model call, a shell command) finishes first, and this call itself blocks until it does
         (the SDK's pause waits for the state lock a running step holds). Tool calls of that step
@@ -1079,6 +1083,51 @@ class EntitySession:
                 self.conversation.interrupt()
             except Exception:  # noqa: BLE001 — a stop request must never take down its caller
                 pass
+
+    def _event_count(self) -> int | None:
+        """How many events the conversation holds now, or ``None`` if they cannot be read."""
+        try:
+            return len(self.conversation.state.events)
+        except Exception:  # noqa: BLE001 — unreadable: a later stop check fails closed on None
+            return None
+
+    def _stop_ended_run(self) -> bool:
+        """After ``run()`` returned with a stop requested: did the stop end the turn? It did, unless
+        the turn plainly completed, which takes all three:
+
+        - the status reads ``finished`` or ``idle``. The SDK's pause changes only a RUNNING (or
+          IDLE) status and waits for the running step first, so a step that finished the turn
+          leaves it FINISHED;
+        - every tool action emitted since the turn began has an ``ObservationEvent`` (a real
+          execution outcome) for its id. FINISHED alone is not enough: the SDK marks a batch that
+          contains a finish call FINISHED even when the stop cancelled the batch's other calls,
+          which leave only an ``AgentErrorEvent``;
+        - no ``AgentErrorEvent`` arrived since the turn began. That also covers an approval, whose
+          held actions were emitted in an earlier turn and run in this one.
+
+        Anything else, or events or a status that cannot be read, counts as stopped (fail-closed).
+        Types are matched by class name and the status by value, so this needs no SDK import."""
+        try:
+            status = self.conversation.state.execution_status
+            if getattr(status, "value", status) not in ("finished", "idle"):
+                return True
+            start = self._turn_start
+            if start is None:
+                return True
+            events = list(self.conversation.state.events)[start:]
+            observed = {
+                str(e.action_id) for e in events
+                if type(e).__name__ == "ObservationEvent" and getattr(e, "action_id", None)
+            }
+            for e in events:
+                kind = type(e).__name__
+                if kind == "AgentErrorEvent":
+                    return True
+                if kind == "ActionEvent" and str(getattr(e, "id", "")) not in observed:
+                    return True
+        except Exception:  # noqa: BLE001 — unreadable: the stop is taken to have ended the turn
+            return True
+        return False
 
     def _stopped_result(self, *, nudged: bool) -> TurnResult:
         """A turn ended by :meth:`request_stop`: timed out, nothing captured."""

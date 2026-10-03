@@ -1077,16 +1077,173 @@ class _Binding:
         self.captured += 1
 
 
-def _sdk_like_session(tmp_path: Path, step):
+def _sdk_like_session(tmp_path: Path, step, *, with_tools: bool = False):
     from levain.session import EntitySession
 
     binding = _Binding()
     sess = EntitySession(
         entity_dir=tmp_path, binding=binding, conversation=_SdkLikeConv(step),
-        workspace=tmp_path / "workspace", model_label="m", with_tools=False, bash_ok=False,
+        workspace=tmp_path / "workspace", model_label="m", with_tools=with_tools, bash_ok=False,
         gate_mode="ungated",
     )
     return sess, binding
+
+
+# Plain stand-ins named like the SDK's event classes: the completion rule matches by class name, so
+# it runs (and is tested) without the openhands extra.
+_FakeAction = type("ActionEvent", (), {})
+_FakeObservation = type("ObservationEvent", (), {})
+_FakeAgentError = type("AgentErrorEvent", (), {})
+
+
+def _fake(cls, **attrs):
+    e = cls()
+    e.__dict__.update(attrs)
+    return e
+
+
+def _finished_step(holder, *events):
+    def step(conv):
+        conv.state.events.extend(events)
+        conv.state.events.append(_Event("agent", ["done"]))
+        conv.state.execution_status = "finished"
+        holder["sess"].request_stop()
+    return step
+
+
+def test_a_turn_that_completes_as_the_stop_lands_returns_its_result(tmp_path: Path):
+    """glm L3 r1 HIGH: the step finished the turn and every action it emitted ran, then the stop
+    landed (the SDK's pause waits for the step, then finds FINISHED and does nothing). That turn
+    completed; it keeps its result and is captured."""
+    holder = {}
+    step = _finished_step(holder, _fake(_FakeAction, id="a1", source="agent"),
+                          _fake(_FakeObservation, action_id="a1", source="environment"))
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    result = sess.run_turn("go")
+    assert sess.conversation.interrupts == 1                 # the stop did land
+    assert result.timed_out is False and result.error is None and result.reply == "done"
+    assert binding.captured == 1
+
+
+def test_a_finished_turn_whose_batch_the_stop_cancelled_is_stopped(tmp_path: Path):
+    """codex L3 r2 HIGH-1, from what the SDK records: the stop cancels the batch after its first
+    call, the executor answers the skipped call with an AgentErrorEvent and no observation, and the
+    batch's finish call still marks the run FINISHED. Built from the SDK's own executor and classes."""
+    pytest.importorskip("openhands.tools.terminal")
+    from openhands.sdk.agent.parallel_executor import ParallelToolExecutor
+    from openhands.sdk.conversation.cancellation import CancellationToken
+    from openhands.sdk.conversation.state import ConversationExecutionStatus
+    from openhands.sdk.event import ObservationEvent
+    from openhands.sdk.tool.builtins.finish import FinishObservation
+
+    ran = _sdk_terminal_action("echo one", "c1")
+    skipped = _sdk_terminal_action("rm -rf build", "c2")
+    token = CancellationToken()
+    holder = {}
+
+    def runner(action):
+        holder["sess"].request_stop()
+        token.cancel()  # what request_stop's interrupt does to the run's token, mid-batch
+        return [ObservationEvent(observation=FinishObservation.from_text(text="one"),
+                                 action_id=action.id, tool_name=action.tool_name,
+                                 tool_call_id=action.tool_call_id)]
+
+    def step(conv):
+        conv.state.events.extend([ran, skipped])
+        for out in ParallelToolExecutor(max_workers=1).execute_batch([ran, skipped], runner, None,
+                                                                     token):
+            conv.state.events.extend(out)
+        conv.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    result = sess.run_turn("go")
+    assert [type(e).__name__ for e in sess.conversation.state.events[-2:]] == [
+        "ObservationEvent", "AgentErrorEvent"]
+    assert result.timed_out is True and binding.captured == 0
+    assert result.tool_activity == ["⚙ terminal: echo one"]
+
+
+def test_an_action_with_no_outcome_is_not_a_completed_turn(tmp_path: Path):
+    """An action emitted this turn with no observation for its id has not run, whatever the status."""
+    holder = {}
+    step = _finished_step(holder, _fake(_FakeAction, id="a1", source="agent"))
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    assert sess.run_turn("go").timed_out is True and binding.captured == 0
+
+
+def test_an_approval_whose_held_action_the_stop_cancelled_is_stopped(tmp_path: Path):
+    """The held action was emitted in the earlier turn, so this turn's window holds only its
+    cancellation error. An AgentErrorEvent in the window is enough to count the turn stopped."""
+    holder = {}
+    step = _finished_step(holder, _fake(_FakeAgentError, tool_call_id="c1", source="agent"))
+    sess, binding = _sdk_like_session(tmp_path, step)
+    holder["sess"] = sess
+    sess.conversation.state.events.append(_fake(_FakeAction, id="held", source="agent"))
+    assert sess.resume_turn().timed_out is True and binding.captured == 0
+
+
+@pytest.mark.parametrize("ran", [True, False])
+def test_the_run_after_the_act_first_nudge_is_checked_the_same_way(tmp_path: Path, ran):
+    """The second post-run check. The first run only plans, so the backstop nudges and runs again;
+    the stop lands as that run finishes. Completed only if its action has an outcome."""
+    holder, runs = {}, []
+
+    def step(conv):
+        runs.append(1)
+        if len(runs) == 1:
+            conv.state.events.append(_Event("agent", ["I'll run the tests."]))
+        else:
+            conv.state.events.append(_fake(_FakeAction, id="a2", source="agent"))
+            if ran:
+                conv.state.events.append(_fake(_FakeObservation, action_id="a2", source="env"))
+            conv.state.events.append(_Event("agent", ["done"]))
+            holder["sess"].request_stop()
+        conv.state.execution_status = "finished"
+
+    sess, binding = _sdk_like_session(tmp_path, step, with_tools=True)
+    holder["sess"] = sess
+    result = sess.run_turn("test it")
+    assert len(runs) == 2 and result.nudged is True
+    assert result.timed_out is (not ran) and binding.captured == (1 if ran else 0)
+
+
+def test_an_unreadable_status_after_a_stop_reads_as_stopped(tmp_path: Path):
+    holder = {}
+    sess, binding = _sdk_like_session(tmp_path, _finished_step(holder))
+    holder["sess"] = sess
+    conv = sess.conversation
+    original = conv.run
+
+    def run():
+        original()
+        del conv.state.execution_status          # the run returned; its status cannot be read
+
+    conv.run = run
+    assert sess.run_turn("go").timed_out is True and binding.captured == 0
+
+
+def test_events_unreadable_at_turn_start_read_as_stopped(tmp_path: Path):
+    """Without the turn's starting point there is no window to check, so a stop ends the turn."""
+
+    class _NoLen(list):
+        """Unreadable once, at the turn's start; readable after (`list()` asks for a length too)."""
+        failed = False
+
+        def __len__(self):
+            if not _NoLen.failed:
+                _NoLen.failed = True
+                raise RuntimeError("event log unreadable")
+            return super().__len__()
+
+    holder = {}
+    sess, binding = _sdk_like_session(tmp_path, _finished_step(holder))
+    holder["sess"] = sess
+    sess.conversation.state.events = _NoLen()
+    assert sess.run_turn("go").timed_out is True and binding.captured == 0
+    assert _NoLen.failed and sess._turn_start is None
 
 
 def test_a_turn_the_stop_paused_is_still_stopped(tmp_path: Path):
