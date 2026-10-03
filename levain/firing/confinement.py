@@ -697,9 +697,8 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     file anneal reads. Its spellings are write-denied: the path as given, its real parent with the
     final component unresolved (a symlink's own location, which is what ``rm`` and ``rename`` act on),
     and the fully resolved target. Its parent directory is write-denied as a literal by the ancestor
-    pin every jewel gets, so it cannot be renamed. A spelling whose own location is inside a denied
-    subtree is dropped: the subtree covers it both ways, and a write-only self-bind of it on Linux
-    would take its source from the host tree and re-expose it for reading.
+    pin every jewel gets, so it cannot be renamed. ``build_policy`` drops a spelling whose own
+    location is inside any denied subtree. A value that cannot be resolved refuses the floor.
     NOT covered, by design of this cut: a project home moved away from ``~/.anneal-projects`` (its
     stores are wherever the trust file's entries point); a symlink hop in the env path beyond its
     last directory (the replaceable-intermediate-symlink class this module documents for ssh); and
@@ -718,14 +717,18 @@ def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Pat
     spellings: list[Path] = []
     raw = os.environ.get(DERIVE_TRUST_ENV, "")
     if raw:
-        lexical = Path(raw).expanduser()
-        if not lexical.is_absolute():
-            lexical = Path.cwd() / lexical
-        covered = subtrees + [(home / ".anneal-memory").resolve()]
-        for sp in (lexical, lexical.parent.resolve() / lexical.name, lexical.resolve()):
-            loc = sp.parent.resolve() / sp.name
-            if sp not in spellings and not any(loc == t or loc.is_relative_to(t) for t in covered):
-                spellings.append(sp)
+        try:
+            lexical = Path(raw).expanduser()
+            if not lexical.is_absolute():
+                lexical = Path.cwd() / lexical
+            for sp in (lexical, lexical.parent.resolve() / lexical.name, lexical.resolve()):
+                if sp not in spellings:
+                    spellings.append(sp)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV}={raw!r} cannot be resolved ({exc}) — refusing to build the "
+                "floor (fail-closed). Unset it or point it at the trust file."
+            ) from exc
     return subtrees, spellings, store_links
 
 
@@ -873,6 +876,14 @@ def build_policy(
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
+    # A trust spelling whose own location (the final component unresolved) is inside ANY denied
+    # subtree is dropped here, against the full list: the subtree denies it both ways, and a
+    # write-only self-bind of it on Linux would take its source from the host tree and re-expose it.
+    trust_spellings = [
+        sp for sp in trust_spellings
+        if not any((loc := sp.parent.resolve() / sp.name) == t or loc.is_relative_to(t)
+                   for t in subtrees)
+    ]
 
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 

@@ -31,9 +31,10 @@ live = pytest.mark.skipif(not (_MAC or _LINUX), reason="needs macOS sandbox-exec
 mac_live = pytest.mark.skipif(not _MAC, reason="needs macOS sandbox-exec")
 
 # What each OS says when the floor refuses: seatbelt EPERM; bwrap EROFS on a read-only mount,
-# EACCES on a /dev/null bind, EBUSY on a mountpoint rename or unlink, ENOENT inside a jewel tmpfs.
+# EACCES on a /dev/null bind, EBUSY on a mountpoint rename or unlink, and ENOENT inside a jewel
+# tmpfs. ENOENT counts only on Linux: on macOS it would mean the probed path was never there.
 _REFUSALS = ("Operation not permitted", "Read-only file system", "Permission denied",
-             "Device or resource busy", "No such file or directory")
+             "Device or resource busy") + (("No such file or directory",) if _LINUX else ())
 
 
 def _entity(root: Path) -> Path:
@@ -138,7 +139,7 @@ def test_env_trust_link_under_a_symlinked_directory_denies_the_links_own_locatio
     (tmp_path / "via").symlink_to(real_dir)
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(tmp_path / "via" / "derive-trust.json"))
     policy = build_policy(_entity(home))
-    assert (real_dir / "derive-trust.json") in policy.deny_write_files
+    assert (real_dir.resolve() / "derive-trust.json") in policy.deny_write_files
     assert target.resolve() in policy.deny_write_files
 
 
@@ -149,6 +150,22 @@ def test_a_symlinked_store_link_is_pinned(home: Path, tmp_path: Path, store: str
     (home / store).symlink_to(real)
     policy = build_policy(_entity(home))
     assert home.resolve() / store in policy.deny_write_dirs
+
+
+def test_env_trust_inside_a_sibling_entity_store_is_not_listed_again(home: Path, monkeypatch) -> None:
+    sibling = home / "entities" / "other" / ".levain"
+    sibling.mkdir(parents=True)
+    (sibling / "derive-trust.json").write_text("{}")
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(sibling / "derive-trust.json"))
+    policy = build_policy(_entity(home))
+    assert sibling.resolve() in policy.deny_read_write
+    assert policy.trust_spellings == ()
+
+
+def test_an_unresolvable_env_trust_refuses_the_floor(home: Path, monkeypatch) -> None:
+    monkeypatch.setenv(DERIVE_TRUST_ENV, "~no_such_user_levain_1308/derive-trust.json")
+    with pytest.raises(ConfinementError, match=DERIVE_TRUST_ENV):
+        build_policy(_entity(home))
 
 
 def test_empty_env_trust_counts_as_unset(home: Path, monkeypatch) -> None:
