@@ -262,6 +262,19 @@ def held_action_ids(conversation: Any) -> set[str]:
         return set()
 
 
+def unmatched_action_ids(conversation: Any) -> set[str] | None:
+    """The ids of proposed actions with no observation yet, which the next ``run()`` executes.
+    ``None`` when they CANNOT BE READ: unlike :func:`held_action_ids` (a display filter), this
+    answers a gate question, so "could not tell" must not read as "none"."""
+    try:
+        from openhands.sdk.conversation.state import ConversationState
+
+        pending = ConversationState.get_unmatched_actions(conversation.state.events)
+        return {str(_safe_attr(e, "id")) for e in pending}
+    except Exception:  # noqa: BLE001 — undeterminable, which is NOT "none"
+        return None
+
+
 def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
     """The actions the gate stopped, in the order the agent proposed them.
 

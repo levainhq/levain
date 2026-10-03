@@ -873,18 +873,35 @@ class EntitySession:
         # driver") applied to a SECURITY boundary, where the two goals point opposite ways. On a
         # gate, uptime loses. Same discipline as `arm_efferent_gate`: check the STATE, never the
         # call's return — `verify_the_output_not_the_run`.
-        if self._gate_halted():
+        # Fail CLOSED on anything short of a confirmed refusal (codex L3, 2026-10-03): an
+        # unreadable status, or a status that reads idle while an action still has no
+        # observation (the SDK clears the halt BEFORE it records the rejections, so a failure
+        # between the two leaves exactly that), would let `_drive()`'s `run()` execute the
+        # refused action.
+        if self.gate_mode == "gated" and not self._refusal_landed():
             return TurnResult(
                 reply=None,
                 tool_activity=[],
                 error=(
-                    "the refusal did NOT take — the actions are still held and were NOT run. "
+                    "the refusal could not be confirmed — the actions were NOT run. "
                     "Do not resume this session; restart it."
                 ),
                 gated=True,
                 pending=self._gate_report(),
             )
         return self._drive()
+
+    def _refusal_landed(self) -> bool:
+        """True only when the runtime positively reports no halt AND no action left unanswered."""
+        if self._gate_status() is not False:
+            return False
+        try:
+            from levain.firing.openhands.gate import unmatched_action_ids
+
+            remaining = unmatched_action_ids(self.conversation)
+        except Exception:  # noqa: BLE001 — undeterminable, NOT "landed"
+            return False
+        return remaining == set()
 
     def pending_efferent(self) -> tuple[PendingEfferent, ...]:
         """The actions the gate is currently holding, or ``()`` if it is not holding any.
