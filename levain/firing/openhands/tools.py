@@ -255,6 +255,7 @@ class _SharedFloor:
         """Register a bound method to call once, outside the lock, when the floor is refused. Held
         weakly, so a discarded hand is not kept alive by its floor."""
         with self._lock:
+            self._on_refuse = [r for r in self._on_refuse if r() is not None]
             self._on_refuse.append(weakref.WeakMethod(callback))
 
     @property
@@ -657,14 +658,19 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                             "not stamp it, so the socket floor it was rendered with is unknown "
                             "(fail-closed)."
                         )
-                    # MERGE, never assign: `absorb` unions under the FLOOR'S OWN lock, so a
-                    # concurrent spawner's denies cannot be lost to a wholesale overwrite.
-                    self._floor.absorb(effective)
                     # ⛔ THE COMMIT IS INSIDE THE PROTECTED BLOCK (codex L3 LOW, 2026-09-04). An
                     # asynchronous exception landing after validation but before the assignment
                     # would otherwise leave a LIVE shell that is neither cached nor closed — its
                     # reader thread keeps it, and the subprocess outlives the refusal.
+                    # ⛔ PUBLISHED BEFORE THE ABSORB (codex, reproduced, L3 r6): a refusal landing
+                    # between a successful absorb and this assignment found no shell to revoke, and
+                    # the command then ran on the live candidate. Now a refusal that lands first makes
+                    # `absorb` raise (the handler below closes the candidate), and one that lands
+                    # after finds the candidate here and closes it.
                     self._shell = candidate
+                    # MERGE, never assign: `absorb` unions under the FLOOR'S OWN lock, so a
+                    # concurrent spawner's denies cannot be lost to a wholesale overwrite.
+                    self._floor.absorb(effective)
                 except BaseException:
                     # ⛔ BaseException, NOT Exception (codex L3 MED). A KeyboardInterrupt or
                     # SystemExit raised by `close()` would otherwise REPLACE the original refusal,

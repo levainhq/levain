@@ -639,3 +639,54 @@ def test_the_providers_refresh_failure_is_typed(home, monkeypatch):
     monkeypatch.setattr(conf, "refresh_socket_denies", boom)
     with pytest.raises(FloorRefreshError):
         conf.select_provider().spawn_shell(build_policy(_entity(home)))
+
+
+@pytest.mark.parametrize("when", ["before_absorb", "after_absorb"])
+def test_a_refusal_during_candidate_publication_never_lets_a_command_run(home, monkeypatch, when):
+    """codex L3 r6 (reproduced): a refusal landing between a successful absorb and the shell's
+    publication found nothing to revoke, and the command ran on the live candidate."""
+    import levain.firing.openhands.tools as tools_mod
+    from levain.firing.openhands.tools import SandboxedBashExecutor, _SharedFloor
+    from openhands.tools.terminal.definition import TerminalAction
+    floor = _SharedFloor(build_policy(_entity(home)))
+    bash = SandboxedBashExecutor(floor=floor)
+    ran = []
+
+    class _Candidate:
+        def __init__(self, policy):
+            self.effective_policy = policy
+            self.closed = False
+        def close(self):
+            self.closed = True
+        def run(self, command, timeout=None):
+            if self.closed:
+                raise ConfinementError("shell is not running")
+            ran.append(command)
+            raise AssertionError("a command ran after the floor was refused")
+
+    candidates = []
+
+    class _Provider:
+        def spawn_shell(self, policy, **kw):
+            candidates.append(_Candidate(policy))
+            return candidates[-1]
+
+    real_absorb = _SharedFloor.absorb
+    calls = []
+
+    def absorb(self, spawned):
+        calls.append(1)
+        if len(calls) < 2:                 # the first absorb is the pre-spawn refresh; leave it be
+            return real_absorb(self, spawned)
+        if when == "before_absorb":       # the candidate's absorb: refuse just before it ...
+            self.refuse("refused by the editor mid-spawn")
+            return real_absorb(self, spawned)
+        real_absorb(self, spawned)         # ... or just after it
+        self.refuse("refused by the editor mid-spawn")
+
+    monkeypatch.setattr(tools_mod, "select_provider", lambda: _Provider())
+    monkeypatch.setattr(_SharedFloor, "absorb", absorb)
+    obs = bash(TerminalAction(command="cat ~/secret-store/memory.db"))
+    assert obs.is_error
+    assert not ran
+    assert candidates and candidates[0].closed
