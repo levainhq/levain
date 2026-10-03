@@ -843,3 +843,117 @@ class TestOversizeWithALyingContentLength:
         assert b"413" in raw.split(b"\r\n", 1)[0], (
             f"expected a 413 status line, got: {raw[:120]!r}"
         )
+
+
+def test_the_pack_docs_refresh_runs_inside_the_install_lock(tmp_path: Path) -> None:
+    """spore-1250 (2): the web handler refreshed `.levain/docs` (a wipe and copy) AFTER apply_init
+    had returned and released the per-install lock, so a CLI `init`/`update` could take the lock and
+    interleave its own wipe-and-copy. `run_init` holds the lock across both; the web path must too.
+    Run from the window itself: another thread tries the lock while the refresh is in progress."""
+    import levain.init_server as init_server_mod
+    from levain.install import InstallBusy, install_lock
+
+    install = tmp_path / "i"
+    seen: list[str] = []
+    real = init_server_mod._copy_pack_docs
+
+    def probing(target, packs):
+        def other_thread():
+            try:
+                with install_lock(target):
+                    seen.append("acquired")
+            except InstallBusy:
+                seen.append("busy")
+
+        t = threading.Thread(target=other_thread)
+        t.start()
+        t.join(5)
+        return real(target, packs)
+
+    with mock.patch.object(init_server_mod, "_copy_pack_docs", probing):
+        with _serving(install) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, _body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+    assert status == 200
+    assert seen == ["busy"], f"another writer could take the install lock mid-refresh: {seen}"
+
+
+def test_a_busy_install_is_refused_before_any_write_not_reported_partial(tmp_path: Path) -> None:
+    """spore-1250 (1), and the shape the handler's own lock must keep: another writer holds the
+    install lock, so the POST is refused with 409 and `partial: false`, and nothing is written."""
+    from levain.install import install_lock
+
+    install = tmp_path / "i"
+    install.mkdir()
+    # force: the holder's lock file makes the dir non-empty, which an unforced init refuses first.
+    with _serving(install, force=True) as (base, _port):
+        plan = json.loads(_req(base + "/init-plan.json")[2])
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with install_lock(install):
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        assert held.wait(5)
+        try:
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+        finally:
+            release.set()
+            t.join(5)
+    assert status == 409 and body["error"] == "install_refused" and body["partial"] is False
+    assert sorted(p.name for p in install.iterdir()) == [".levain"]
+    assert sorted(p.name for p in (install / ".levain").iterdir()) in (
+        ["install.lock"], [".gitignore", "install.lock"])
+
+
+def test_a_docs_refresh_fault_never_turns_a_good_install_into_a_failure(tmp_path: Path) -> None:
+    """L2 2026-10-03 (run): a refresh fault outside (OSError, InitError, PackError) fell through to the
+    outer handler, which reported the SUCCESSFUL install as a partial failure. The refresh is non-fatal."""
+    import levain.init_server as init_server_mod
+
+    def broken(target, packs):
+        raise RuntimeError("refresh exploded")
+
+    with mock.patch.object(init_server_mod, "_copy_pack_docs", broken):
+        with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+    assert status == 200 and body["ok"] is True
+    assert any("could not refresh pack docs" in m for m in body["messages"])
+
+
+def test_the_response_manifest_is_read_inside_the_install_lock(tmp_path: Path) -> None:
+    """codex L3 2026-10-03: the manifest/next-steps shaping read the live trees after the lock was
+    released, so a CLI writer could swap them mid-read. Same probe as the docs-refresh test."""
+    import levain.init_server as init_server_mod
+    from levain.install import InstallBusy, install_lock
+
+    seen: list[str] = []
+    real = init_server_mod._manifest_rows
+
+    def probing(install, *a, **k):
+        def other_thread():
+            try:
+                with install_lock(install):
+                    seen.append("acquired")
+            except InstallBusy:
+                seen.append("busy")
+
+        t = threading.Thread(target=other_thread)
+        t.start()
+        t.join(5)
+        return real(install, *a, **k)
+
+    with mock.patch.object(init_server_mod, "_manifest_rows", probing):
+        with _serving(tmp_path / "i") as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            status, _body = _post(
+                base + "/init", {"adapter": "claude-code", "answers": _all_answers(plan)})
+    assert status == 200 and seen == ["busy"], seen

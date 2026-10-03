@@ -26,6 +26,7 @@ answers}``, so a page can never redirect the install target.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import threading
@@ -35,6 +36,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from levain.install import install_lock as _install_flock
 from levain.install import (
     InitError,
     InstallLockError,
@@ -247,7 +249,8 @@ class _InitHandler(GuardedHandler):
 
     def _run_install(self, req: object) -> None:
         """Validate the submitted ``{adapter, answers}`` at the input boundary,
-        then run ``apply_init`` and report. Holds ``install_lock``."""
+        then run ``apply_init`` and report. Holds the server's ``install_lock`` (a threading lock;
+        the per-install file lock is taken inside, around ``apply_init`` and the docs refresh)."""
         if not isinstance(req, dict):
             self._send_json({"error": "bad_request", "message": "body must be a JSON object"}, 400)
             return
@@ -400,84 +403,103 @@ class _InitHandler(GuardedHandler):
                 # progress, NOT the clean "templates" shape a pre-write compose fault
                 # uses (L1 #4 / L2 Point 4: the old handler mislabeled a half-written
                 # install as a wheel-corruption "templates" error with no progress).
-                try:
-                    result = apply_init(
-                        install,
-                        chosen,
-                        answers,
-                        templates_root,
-                        self.server.python_path,
-                        self.server.anneal_path,
-                        specs,
-                        verbatim,
-                        activation_roots=activation_roots,
-                        packs=pack_pairs,
-                        emit=messages.append,
-                        require_empty=not self.server.force,
-                    )
-                except InstallLockError as exc:
-                    # Refused before any write (busy, or the target filled up meanwhile): not
-                    # a partial install, so not the 500 "partial" shape below.
-                    self._send_json(
-                        {"error": "install_refused", "message": exc.message,
-                         "partial": False, "messages": messages}, 409
-                    )
-                    return
-                except InitError as exc:
-                    self._send_json(
-                        {"error": "install_failed", "message": exc.message,
-                         "partial": True, "messages": messages}, 500
-                    )
-                    return
+                # ONE install lock across apply_init AND the pack-docs refresh, as run_init holds it:
+                # the refresh wipes and recopies .levain/docs, and outside the lock a CLI init/update
+                # could interleave its own (spore-1250, reproduced 2026-10-03). apply_init takes the
+                # same lock; it is reentrant per (install, thread), so that acquisition nests. A busy
+                # lock is refused here, before any write, with the same 409 apply_init's own refusal
+                # gets (uncaught, the outer InitError handler reports it as a 500 "templates" fault).
+                with contextlib.ExitStack() as held:
+                    try:
+                        held.enter_context(_install_flock(install))
+                    except InstallLockError as exc:
+                        self._send_json(
+                            {"error": "install_refused", "message": exc.message,
+                             "partial": False, "messages": messages}, 409
+                        )
+                        return
+                    try:
+                        result = apply_init(
+                            install,
+                            chosen,
+                            answers,
+                            templates_root,
+                            self.server.python_path,
+                            self.server.anneal_path,
+                            specs,
+                            verbatim,
+                            activation_roots=activation_roots,
+                            packs=pack_pairs,
+                            emit=messages.append,
+                            require_empty=not self.server.force,
+                        )
+                    except InstallLockError as exc:
+                        # Refused before any write, not a partial install. With the lock held above,
+                        # what reaches here is the target filling up meanwhile (InstallTargetTaken).
+                        self._send_json(
+                            {"error": "install_refused", "message": exc.message,
+                             "partial": False, "messages": messages}, 409
+                        )
+                        return
+                    except InitError as exc:
+                        self._send_json(
+                            {"error": "install_failed", "message": exc.message,
+                             "partial": True, "messages": messages}, 500
+                        )
+                        return
 
-                # Refresh the persisted pack docs so `levain docs` renders a
-                # SELF-CONTAINED composed view — ALWAYS (even base-only), so a
-                # --force reinstall that DROPS a pack CLEARS that pack's stale
-                # (possibly company-private) chapters rather than serving them
-                # forever (the IP-boundary class run_init guards, complement L3
-                # CRITICAL). Manifests are re-read LIVE here (consistent with the
-                # roster/activation read live above — no stale start-time snapshot,
-                # L1 #2 / L2 Point 3); a re-read can raise PackError if a pack.toml
-                # changed since the compose ms ago, so catch it too. A copy failure
-                # is non-fatal — the manual is a read surface, not install-critical —
-                # so it warns into the log and the install still reports success.
-                try:
-                    copied_docs = _copy_pack_docs(
-                        install, [(load_pack_manifest(p), p) for p in pack_dirs]
-                    )
-                except (OSError, InitError, PackError) as doc_exc:
-                    # HONEST message (complement L3): a failed refresh may have cleared
-                    # only PART of a prior pack's chapters, so do NOT claim "base only"
-                    # — any prior (possibly proprietary) chapters MAY remain. Tell the
-                    # operator to verify. Non-fatal: the install itself still succeeded.
-                    messages.append(
-                        f"note: could not refresh pack docs ({doc_exc}) — any prior "
-                        f"pack chapters may remain; verify with `levain docs`."
-                    )
-                    copied_docs = []
-                if copied_docs:
-                    messages.append(
-                        f"docs: {len(copied_docs)} pack chapter(s) → .levain/docs/ "
-                        f"(compose with `levain docs`)"
-                    )
+                    # Refresh the persisted pack docs so `levain docs` renders a
+                    # SELF-CONTAINED composed view — ALWAYS (even base-only), so a
+                    # --force reinstall that DROPS a pack CLEARS that pack's stale
+                    # (possibly company-private) chapters rather than serving them
+                    # forever (the IP-boundary class run_init guards, complement L3
+                    # CRITICAL). Manifests are re-read LIVE here (consistent with the
+                    # roster/activation read live above — no stale start-time snapshot,
+                    # L1 #2 / L2 Point 3); a re-read can raise PackError if a pack.toml
+                    # changed since the compose ms ago, so catch it too. A copy failure
+                    # is non-fatal — the manual is a read surface, not install-critical —
+                    # so it warns into the log and the install still reports success.
+                    try:
+                        copied_docs = _copy_pack_docs(
+                            install, [(load_pack_manifest(p), p) for p in pack_dirs]
+                        )
+                    except Exception as doc_exc:  # noqa: BLE001 — the refresh is non-fatal (below)
+                        # HONEST message (complement L3): a failed refresh may have cleared
+                        # only PART of a prior pack's chapters, so do NOT claim "base only"
+                        # — any prior (possibly proprietary) chapters MAY remain. Tell the
+                        # operator to verify. Non-fatal: the install itself still succeeded.
+                        messages.append(
+                            f"note: could not refresh pack docs ({doc_exc}) — any prior "
+                            f"pack chapters may remain; verify with `levain docs`."
+                        )
+                        copied_docs = []
+                    if copied_docs:
+                        messages.append(
+                            f"docs: {len(copied_docs)} pack chapter(s) → .levain/docs/ "
+                            f"(compose with `levain docs`)"
+                        )
 
-                # The install SUCCEEDED (apply_init returned). Shaping the response
-                # manifest does post-success filesystem I/O (_manifest_rows globs the
-                # seed/activation trees), so a fault HERE must not flip a good install
-                # to "failed" via the generic outer handler — the same misreport class
-                # the docs step guards, one function later (complement L3 MED). Degrade
-                # the manifest, keep ok/partial sourced from result.store_ok.
-                store = install / ".levain" / "memory.db"
-                try:
-                    rows = _manifest_rows(install, chosen, store, result.store_ok)
-                    next_steps = _next_steps_lines(install, chosen, result.store_ok)
-                except OSError as shape_exc:
-                    messages.append(
-                        f"note: install complete, but could not build the file "
-                        f"manifest ({shape_exc})."
-                    )
-                    rows = []
-                    next_steps = []
+                    # Shaped INSIDE the lock (codex L3 2026-10-03): it reads the live seed/activation
+                    # trees, and a CLI init/update taking the lock as soon as it is released could
+                    # swap them mid-read. A successful response is written after the lock is released
+                    # (a 409/500 refusal above is still sent from inside it).
+                    # The install SUCCEEDED (apply_init returned). Shaping the response
+                    # manifest does post-success filesystem I/O (_manifest_rows globs the
+                    # seed/activation trees), so a fault HERE must not flip a good install
+                    # to "failed" via the generic outer handler — the same misreport class
+                    # the docs step guards, one function later (complement L3 MED). Degrade
+                    # the manifest, keep ok/partial sourced from result.store_ok.
+                    store = install / ".levain" / "memory.db"
+                    try:
+                        rows = _manifest_rows(install, chosen, store, result.store_ok)
+                        next_steps = _next_steps_lines(install, chosen, result.store_ok)
+                    except OSError as shape_exc:
+                        messages.append(
+                            f"note: install complete, but could not build the file "
+                            f"manifest ({shape_exc})."
+                        )
+                        rows = []
+                        next_steps = []
         except InitError as exc:
             # PRE-write compose fault: open_init_templates raised at the `with` entry
             # (corrupt/missing base templates, or a pack that no longer composes) —

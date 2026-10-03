@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 
 - **`levain serve` now sends its security headers on every response**, including the ones Python's HTTP server generates itself (an unsupported method such as OPTIONS or PUT, or a malformed request). Those used to go out with no Content-Security-Policy, `X-Content-Type-Options` or `X-Frame-Options`; `levain init --web` and `levain docs` already sent them.
+- **`levain init --web` now holds the install lock while it refreshes the pack docs**, as `levain init` in the terminal already did. The refresh clears and recopies `.levain/docs/`; it used to run after the install had released the lock, so a `levain init` or `levain update` started at that moment could interleave its own copy. A busy install is still refused before anything is written (409, not reported as a partial install).
 
 ### Changed
 
