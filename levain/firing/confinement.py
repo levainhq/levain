@@ -2426,6 +2426,7 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
+        _refuse_multiply_linked_jewels(refreshed)
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
@@ -2932,6 +2933,66 @@ def _sqlite_state(p: Path) -> str:
         return "unreadable"
     finally:
         os.close(fd)
+
+
+def _refuse_multiply_linked_jewels(policy: CrownJewelsPolicy) -> None:
+    """Refuse bash when a crown-jewel FILE has more than one name (``st_nlink > 1``).
+
+    The floor denies PATHS. A hardlink is the same file under another path, so a link planted
+    before the shell starts, at a path the floor does not deny, bypasses it both ways. REPRODUCED
+    2026-10-03 on macOS seatbelt and Linux bwrap at e8f403d: a link to a ``deny_files`` token printed
+    it, and writing through a link to ``authorized_keys`` added a line to the host's real file, while
+    both direct paths were refused. levain cannot find the other names (they can be anywhere on the
+    volume), so it refuses and names the file instead. Checked at spawn only: a link a host process
+    makes while a shell is live is not watched (Phill's ruling, 2026-10-03).
+
+    Covered: the named jewel files (followed through symlinks, the file the floor protects) and every
+    regular file under the hidden subtrees and the ssh dir (walked without following symlinks). An
+    entry this user cannot stat is skipped: a link to it would be unreadable to the shell too."""
+    named = [*policy.deny_files, *policy.deny_write_files, *policy.own_memory_files,
+             *policy.sqlite_sidecars]
+    if policy.config_file is not None:
+        named.append(policy.config_file)
+
+    def refuse(path: str, links: int) -> None:
+        raise ConfinementError(
+            f"{path} is a crown jewel with {links} names on disk. The floor denies paths, so another "
+            "name for the same file would let the shell read or write it. Refusing to grant bash hands "
+            f"(fail-closed). Find the other names with `find <volume> -samefile {path}` and remove the "
+            "extra links."
+        )
+
+    for f in named:
+        try:
+            st = os.stat(f)
+        except OSError:
+            continue   # absent or unreachable: no file to have other names
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            refuse(str(f), st.st_nlink)
+    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
+                   key=lambda p: str(p))
+    walked: list[Path] = []
+    for root in roots:
+        if any(root == w or root.is_relative_to(w) for w in walked):
+            continue
+        walked.append(root)
+        try:
+            st = os.stat(root)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):   # a subtree root that is a file (argushub's ~/.anneal-memory)
+            if st.st_nlink > 1:
+                refuse(str(root), st.st_nlink)
+            continue
+        for dirpath, _dirs, files in os.walk(root):   # os.walk does not follow directory symlinks
+            for name in files:
+                q = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(q)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                    refuse(q, st.st_nlink)
 
 
 def _refuse_plantable_sqlite_jewels(policy: CrownJewelsPolicy) -> None:
