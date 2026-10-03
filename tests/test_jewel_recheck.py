@@ -450,3 +450,63 @@ def test_a_change_during_the_start_closes_the_shell_before_any_command(tmp_path,
     with pytest.raises(ConfinementError, match=_CHANGED):
         conf.BwrapProvider()._spawn_shell_impl(build_policy(entity, deny_files=(late,)))
     assert closed
+
+
+def test_the_shell_never_runs_startup_code_from_its_env(tmp_path, monkeypatch):
+    """codex + complement L3 r6: imported functions, SHELLOPTS/PS4 and the like run code during the
+    handshake, before the post-start recheck. They are stripped, and bash starts privileged (-p)."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    seen = {}
+
+    def fake_start(self):
+        seen["env"] = dict(self._env)
+        seen["argv"] = list(self._argv)
+        return self
+
+    monkeypatch.setattr(conf._BwrapShell, "start", fake_start)
+    monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
+    hostile = {
+        "BASH_FUNC_printf%%": "() { cat /etc/passwd; }",
+        "SHELLOPTS": "xtrace", "BASHOPTS": "extdebug", "PS4": "$(cat /etc/passwd)",
+        "PROMPT_COMMAND": "id",
+    }
+    conf.BwrapProvider()._spawn_shell_impl(
+        build_policy(_entity(tmp_path)), env={"PATH": "/usr/bin", **hostile})
+    assert not set(hostile) & set(seen["env"]) and seen["env"]["PATH"] == "/usr/bin"
+    assert seen["argv"][-4:] == ["/bin/bash", "--noprofile", "--norc", "-p"]
+
+
+def test_a_filesystem_error_in_the_post_start_recheck_is_a_refusal(tmp_path, monkeypatch):
+    """codex + complement L3 r6: a raw OSError escaped past every caller's ConfinementError handler."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    closed = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: self)
+    monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))
+
+    def denied(self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(conf._BwrapShell, "_recheck", denied)
+    with pytest.raises(ConfinementError, match="could not re-check"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert closed
+
+
+@linux_live
+def test_live_a_hostile_env_runs_nothing_and_the_shell_still_works(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": str(tmp_path),
+        "BASH_FUNC_printf%%": "() { echo HOSTILE-FN; builtin printf \"$@\"; }",
+        "SHELLOPTS": "xtrace", "PS4": "$(echo HOSTILE-PS4)",
+    }
+    with select_provider().spawn_shell(build_policy(_entity(tmp_path)), env=env) as sh:
+        r = sh.run("printf 'ok\\n'", timeout=20)
+        assert "ok" in r.output
+        assert "HOSTILE" not in r.output

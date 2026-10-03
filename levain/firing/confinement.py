@@ -3238,6 +3238,9 @@ def resolve_localhost_deny(allow_localhost_outbound: bool) -> tuple[bool, str | 
 _UNREACHABLE = (-1, -1, -1)   # lstat refused (EACCES/EPERM): watched for becoming reachable
 
 
+_STARTUP_EXEC_VARS = frozenset({"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND"})
+
+
 def _identity(p: Path) -> tuple[int, int, int] | None:
     """``(st_dev, st_ino, file type)`` of ``p`` without following a link, None if it is absent, or
     ``_UNREACHABLE`` if this user cannot even stat it (another user's runtime directory: the plan
@@ -3503,7 +3506,9 @@ class BwrapProvider(ConfinementProvider):
             ) from exc
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
-        argv = argv + ["/bin/bash", "--noprofile", "--norc"]
+        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
+        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
+        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         for d in create_first:
@@ -3531,11 +3536,13 @@ class BwrapProvider(ConfinementProvider):
                 f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
                 "— refusing to grant bash hands (fail-closed). Try again."
             )
-        shell_env = dict(env if env is not None else _default_shell_env())
-        for var in ("BASH_ENV", "ENV"):
-            # bash would source these at startup, before the first per-command check, so a jewel that
-            # appeared there could be read before anything looked (codex L3 r5).
-            shell_env.pop(var, None)
+        # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
+        # expand these before the first per-command check, so a jewel that appeared after the manifest
+        # could be read before anything looked (codex L3 r5, r6).
+        shell_env = {
+            k: v for k, v in (env if env is not None else _default_shell_env()).items()
+            if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
+        }
         shell = _BwrapShell(
             policy=policy,
             manifest=manifest,
@@ -3547,6 +3554,17 @@ class BwrapProvider(ConfinementProvider):
         try:
             shell.start()
             shell._recheck()   # whatever changed during the start closes it before any command
+        except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
+            shell.close()
+            raise
+        except (OSError, RuntimeError) as exc:
+            # A filesystem error in the recheck is a refusal like every other spawn-time inspection,
+            # not a crash past the caller's ConfinementError handler (codex + complement L3 r6).
+            shell.close()
+            raise ConfinementError(
+                f"could not re-check the floor's jewels after the shell started ({exc}) — refusing "
+                "to grant bash hands (fail-closed)."
+            ) from exc
         except BaseException:
             shell.close()   # never orphan a started shell (glm L3 r2)
             raise
