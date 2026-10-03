@@ -4,6 +4,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
 ## [0.5.4] — 2026-10-03
 
 Adds `levain serve --chat`, a chat with an entity through the local web server (K1 part 2), and fixes a refusal at the efferent gate that could still run the refused action.
