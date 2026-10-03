@@ -100,20 +100,30 @@ def _mcp_import_hint() -> str:
     major = installed.split(".", 1)[0]
     if not (major.isdigit() and int(major) >= 2):
         return _MCP_MISSING_HINT
-    try:
-        version("fastmcp")
-    except PackageNotFoundError:
-        # Measured through pip, 2026-10-02: with no fastmcp, pinning mcp alone repairs it.
-        repair = "pip install 'levain[app]' 'mcp>=1.27,<2'"
-    else:
-        # fastmcp is here (the openhands extra pulls it), and fastmcp 4 needs mcp 2: pinning mcp
-        # alone breaks the OpenHands import instead. Re-resolving both extras moves fastmcp back to
-        # 3.x (measured through pip, 2026-10-02).
-        repair = "pip install 'levain[openhands,app]'"
-    return (
-        f"The Levain MCP-App server needs MCP SDK 1.x, and this environment has mcp {installed}.\n"
-        f"Repair it with:  {repair}"
-    )
+    head = f"The Levain MCP-App server needs MCP SDK 1.x, and this environment has mcp {installed}.\n"
+
+    def _has(dist: str) -> bool:
+        try:
+            version(dist)
+        except PackageNotFoundError:
+            return False
+        return True
+
+    if _has("openhands-sdk"):
+        # The openhands extra pulled fastmcp 4, which needs mcp 2: pinning mcp alone would break the
+        # OpenHands import. Re-resolving both extras moves fastmcp back to 3.x (run through pip,
+        # 2026-10-02).
+        return head + "Repair it with:  pip install 'levain[openhands,app]'"
+    if _has("fastmcp"):
+        # A fastmcp installed for something else: Levain cannot fix that by pulling in OpenHands
+        # (L3 r2, complement + codex; reproduced 2026-10-02).
+        return head + (
+            "Something else here needs fastmcp, whose 4.x line requires mcp 2, so the two cannot "
+            "share this environment.\nInstall the app server in its own environment:  "
+            "pip install 'levain[app]'"
+        )
+    # Run through pip, 2026-10-02: with no fastmcp, pinning mcp alone repairs it.
+    return head + "Repair it with:  pip install 'levain[app]' 'mcp>=1.27,<2'"
 
 
 def _require_mcp() -> tuple[Any, Any]:

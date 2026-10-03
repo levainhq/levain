@@ -316,9 +316,16 @@ class TestOptionalDependency:
             _require_mcp()
         assert "mcp 2.3.0" in str(ei.value)
         assert "pip install 'levain[app]' 'mcp>=1.27,<2'" in str(ei.value)
-        # fastmcp 4 present (the openhands extra): pinning mcp alone would break OpenHands, so the
-        # repair re-resolves both extras (both repairs were run through pip on 2026-10-02).
+        # A standalone fastmcp 4 (no OpenHands): the hint must not pull OpenHands in (L3 r2,
+        # reproduced in a real env on 2026-10-02).
         versions["fastmcp"] = "4.0.10"
+        with pytest.raises(ImportError) as ei:
+            _require_mcp()
+        assert "openhands" not in str(ei.value)
+        assert "own environment" in str(ei.value)
+        # OpenHands present: pinning mcp alone would break it, so the repair re-resolves both
+        # extras (both repairs were run through pip on 2026-10-02).
+        versions["openhands-sdk"] = "1.26.0"
         with pytest.raises(ImportError) as ei:
             _require_mcp()
         assert "pip install 'levain[openhands,app]'" in str(ei.value)

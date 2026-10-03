@@ -306,14 +306,16 @@ def _history_finalizer(executor: Any) -> Callable[[], Any]:
 
 def _remove_if_owner(directory: str, owner_pid: int) -> None:
     # A forked child holds a copy of the executor; if the child collects it, the dir is still the
-    # parent's (complement L3, reasoned).
+    # parent's (complement L3, reasoned). Accepted residual: a host that forks and lets the PARENT
+    # exit first loses the dir under the surviving child (complement L3 r2).
     if os.getpid() == owner_pid:
         shutil.rmtree(directory, ignore_errors=True)
 
 
 def _close_quietly(executor: Any) -> None:
-    """Close an executor on a failure path. A close that raises is logged, never raised, so the
-    build failure that brought us here is the error the caller sees (complement L3, reasoned)."""
+    """Close an executor on a failure path. A close that raises an ordinary exception is logged,
+    not raised, so the build failure that brought us here is the error the caller sees (complement
+    L3, reasoned). KeyboardInterrupt and SystemExit still propagate, on purpose."""
     try:
         executor.close()
     except Exception:  # noqa: BLE001
