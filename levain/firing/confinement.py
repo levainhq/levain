@@ -1012,18 +1012,6 @@ def build_policy(
     subtrees.extend(_sibling_entity_stores(ed))
     for extra in extra_deny_read_write:
         subtrees.append(Path(extra).expanduser().resolve())
-    # A trust spelling whose own location (the final component unresolved) is inside a subtree
-    # assembled so far (the operator stores, sibling entity stores, caller extras) is dropped: the
-    # subtree denies it both ways, and a write-only self-bind of it on Linux would take its source
-    # from the host tree and re-expose it. NOT checked: the credential subtrees, ~/.ssh and
-    # deny_files, which are added below (L3 r2, routed), nor a spelling that is a link INTO a hidden
-    # subtree, which step (5) maps to its target (L3 r2 codex, routed).
-    trust_spellings = [
-        sp for sp in trust_spellings
-        if not any((loc := sp.parent.resolve() / sp.name) == t or loc.is_relative_to(t)
-                   for t in subtrees)
-    ]
-
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
     # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
@@ -1123,6 +1111,25 @@ def build_policy(
         deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
+    # A trust spelling whose own location (final component unresolved) is already denied both ways
+    # is dropped: inside any read+write subtree (operator stores, siblings, extras, credential
+    # subtrees), inside ~/.ssh in agent mode, or equal to a deny_files entry. Listing it again would
+    # only add a redundant write-only mount. A spelling that is a link INTO a hidden subtree stays,
+    # and bwrap step (5) binds /dev/null at its target rather than re-exposing it.
+    covered = list(subtrees) + ([ssh_dir] if ssh_dir is not None else [])
+    kept: list[Path] = []
+    for sp in trust_spellings:
+        try:
+            loc = sp.parent.resolve() / sp.name
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfinementError(
+                f"${DERIVE_TRUST_ENV} spelling {sp} cannot be resolved ({exc}) — refusing to build "
+                "the floor (fail-closed)."
+            ) from exc
+        if loc in files or any(loc == t or loc.is_relative_to(t) for t in covered):
+            continue
+        kept.append(sp)
+    trust_spellings = kept
     deny_write_files_l.extend(trust_spellings)
 
     # De-dup while preserving order (a sibling could coincide with an extra).
@@ -3222,8 +3229,16 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            t = str(_bwrap_file_target(f))
-            argv += ["--ro-bind", t, t]
+            target = _bwrap_file_target(f)
+            if _shadowed_by(target, roots):
+                # The spelling is outside every hidden subtree but its TARGET is inside one. A
+                # self-bind takes its source from the host tree, so it would put the hidden file
+                # back, readable, inside the tmpfs that hid it. RUN on argushub 2026-10-03 (a trust
+                # link in a non-writable directory pointing into a sibling entity's store): the
+                # confined shell read the sibling's file. /dev/null denies both ways instead.
+                argv += ["--ro-bind", "/dev/null", str(target)]
+            else:
+                argv += ["--ro-bind", str(target), str(target)]
         else:
             argv += ["--ro-bind", "/dev/null", str(f)]
 

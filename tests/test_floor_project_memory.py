@@ -437,3 +437,67 @@ def test_live_a_moved_project_home_found_through_its_trust_file_is_refused(
         _refused(sh, f"echo PLANT >> '{moved}/levain-v2/memory.continuity.md'")
         _refused(sh, f": >> '{trust}'")
     assert not (moved / "levain-v2" / "probe").exists()
+
+
+# --- floor L3 r2 follow-ons: a link INTO a hidden subtree; the filter's ordering ---------------
+
+
+def _link_into_sibling(home: Path, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A trust link in a directory this user cannot write, pointing at a file inside a sibling
+    entity's hidden store (codex's precondition; RUN on argushub at 509a40e: the shell read it)."""
+    me = _entity(home)
+    sib = home / "entities" / "sibling" / ".levain"
+    sib.mkdir(parents=True)
+    target = sib / "derive-trust.json"
+    target.write_text("SIBLING-SECRET-1308")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(target)
+    opt.chmod(0o555)
+    return me, target, opt
+
+
+def test_a_write_only_link_into_a_hidden_subtree_binds_dev_null_at_its_target(
+    home, tmp_path, monkeypatch
+):
+    from levain.firing.confinement import _bwrap_argv
+    me, target, opt = _link_into_sibling(home, tmp_path)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        argv = _bwrap_argv(build_policy(me))
+        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        assert ["--ro-bind", str(target.resolve()), str(target.resolve())] not in binds
+        assert ["--ro-bind", "/dev/null", str(target.resolve())] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(not _LINUX, reason="the step (5) self-bind is Linux-only")
+def test_live_a_trust_link_into_a_sibling_store_does_not_re_expose_it(home, tmp_path, monkeypatch):
+    me, target, opt = _link_into_sibling(home, tmp_path)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        with select_provider().spawn_shell(build_policy(me)) as sh:
+            r = sh.run(f"cat '{target}' 2>&1", timeout=20)
+            assert "SIBLING-SECRET-1308" not in r.output
+    finally:
+        opt.chmod(0o755)
+
+
+def test_a_trust_spelling_inside_a_credential_subtree_is_not_listed_again(home, monkeypatch):
+    gh = home / ".config" / "gh"
+    gh.mkdir(parents=True)
+    (gh / "derive-trust.json").write_text("{}")
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(gh / "derive-trust.json"))
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    assert gh.resolve() in policy.deny_read_write
+    assert policy.trust_spellings == ()
+
+
+def test_a_trust_spelling_equal_to_a_deny_file_is_not_listed_again(home, monkeypatch):
+    t = home / "secrets" / "derive-trust.json"
+    t.parent.mkdir()
+    t.write_text("{}")
+    monkeypatch.setenv(DERIVE_TRUST_ENV, str(t))
+    policy = build_policy(_entity(home), deny_files=(t,))
+    assert policy.trust_spellings == ()
