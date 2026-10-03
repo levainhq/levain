@@ -459,6 +459,20 @@ def test_a_failure_after_the_hands_build_leaks_no_editor_history_dir(
     assert _history_dirs(editor_tmp) == []
 
 
+def test_a_no_tools_session_also_gets_the_resolved_workspace(tmp_path, home):
+    """L3 r2 round 2 (codex): with no tools there is no binding, and the conversation got the
+    unresolved spelling of an in-tree symlinked workspace, so retargeting the link later moved it."""
+    ent = _entity(tmp_path, "ent")
+    (ent / "real-ws").mkdir()
+    (ent / "workspace").symlink_to(ent / "real-ws", target_is_directory=True)
+    s = EntitySession.open(ent, mode="interactive", with_tools=False)
+    try:
+        assert Path(s.conversation.workspace.working_dir) == (ent / "real-ws").resolve()
+        assert s.workspace == (ent / "real-ws").resolve()
+    finally:
+        s.close()
+
+
 def test_the_conversation_gets_the_workspace_the_floor_fences(tmp_path, home):
     """L3 r2 (codex) + L1 (mutation): floor and conversation must name ONE workspace. An in-tree
     symlinked workspace passes every fence, the floor resolves it, and the conversation used to get

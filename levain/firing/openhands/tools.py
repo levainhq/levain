@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import shutil
 import threading
 import weakref
@@ -300,7 +301,23 @@ def _history_finalizer(executor: Any) -> Callable[[], Any]:
         directory = executor.editor._history_manager.cache.directory
     except Exception:  # noqa: BLE001 — same tolerance as _drop_editor_history
         return lambda: None
-    return weakref.finalize(executor, shutil.rmtree, directory, ignore_errors=True)
+    return weakref.finalize(executor, _remove_if_owner, directory, os.getpid())
+
+
+def _remove_if_owner(directory: str, owner_pid: int) -> None:
+    # A forked child holds a copy of the executor; if the child collects it, the dir is still the
+    # parent's (complement L3, reasoned).
+    if os.getpid() == owner_pid:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _close_quietly(executor: Any) -> None:
+    """Close an executor on a failure path. A close that raises is logged, never raised, so the
+    build failure that brought us here is the error the caller sees (complement L3, reasoned)."""
+    try:
+        executor.close()
+    except Exception:  # noqa: BLE001
+        _log.warning("closing an executor after a failed tool build raised", exc_info=True)
 
 
 class CrownJewelsFileEditorExecutor(FileEditorExecutor):
@@ -470,7 +487,7 @@ class LevainFileEditorTool(FileEditorTool):
             ]
         except BaseException:
             # Reasoned, no test: only the pydantic validation inside `cls(...)` can raise here (L1).
-            floored.close()
+            _close_quietly(floored)
             raise
 
 
@@ -772,7 +789,7 @@ class LevainHands(ToolDefinition[Action, Observation]):
                 # the editor built above (L3 r2).
                 built = {id(t.executor): t.executor for t in tools if t.executor is not None}
                 for executor in built.values():
-                    executor.close()
+                    _close_quietly(executor)
                 raise
         return tools
 

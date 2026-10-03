@@ -97,12 +97,23 @@ def _mcp_import_hint() -> str:
         installed = version("mcp")
     except PackageNotFoundError:
         return _MCP_MISSING_HINT
-    if installed.split(".", 1)[0].isdigit() and int(installed.split(".", 1)[0]) >= 2:
-        return (
-            f"The Levain MCP-App server needs MCP SDK 1.x, and this environment has mcp {installed}.\n"
-            "Reinstall the extra so it can pin the version:  pip install 'levain[app]' 'mcp>=1.27,<2'"
-        )
-    return _MCP_MISSING_HINT
+    major = installed.split(".", 1)[0]
+    if not (major.isdigit() and int(major) >= 2):
+        return _MCP_MISSING_HINT
+    try:
+        version("fastmcp")
+    except PackageNotFoundError:
+        # Measured through pip, 2026-10-02: with no fastmcp, pinning mcp alone repairs it.
+        repair = "pip install 'levain[app]' 'mcp>=1.27,<2'"
+    else:
+        # fastmcp is here (the openhands extra pulls it), and fastmcp 4 needs mcp 2: pinning mcp
+        # alone breaks the OpenHands import instead. Re-resolving both extras moves fastmcp back to
+        # 3.x (measured through pip, 2026-10-02).
+        repair = "pip install 'levain[openhands,app]'"
+    return (
+        f"The Levain MCP-App server needs MCP SDK 1.x, and this environment has mcp {installed}.\n"
+        f"Repair it with:  {repair}"
+    )
 
 
 def _require_mcp() -> tuple[Any, Any]:

@@ -630,8 +630,10 @@ class EntitySession:
             # fenced again now that it is final, and the one the conversation is handed. A symlink
             # swapped in after the fence above used to give the floor one directory and the
             # conversation another (codex L3 r2).
-            if conv_binding is not None:
-                workspace = conv_binding.floor.workspace
+            # With no tools there is no binding, and the resolved path is used the same way.
+            workspace = (
+                conv_binding.floor.workspace if conv_binding is not None else workspace.resolve()
+            )
             assert_workspace_isolated(workspace, entity_dir=entity_dir)
             entity_tools = (
                 build_entity_tools(conv_binding, with_bash=bash_ok)

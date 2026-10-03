@@ -302,16 +302,27 @@ class TestOptionalDependency:
                 raise ModuleNotFoundError("No module named 'mcp.server.fastmcp'")
             return real_import(name, *args, **kwargs)
 
-        real_version = importlib.metadata.version
         monkeypatch.setattr(builtins, "__import__", fake_import)
-        monkeypatch.setattr(
-            importlib.metadata, "version",
-            lambda dist: "2.3.0" if dist == "mcp" else real_version(dist),
-        )
+        versions = {"mcp": "2.3.0"}
+
+        def fake_version(dist):
+            if dist in versions:
+                return versions[dist]
+            raise importlib.metadata.PackageNotFoundError(dist)
+
+        monkeypatch.setattr(importlib.metadata, "version", fake_version)
+        # No fastmcp: pinning mcp alone repairs it.
         with pytest.raises(ImportError) as ei:
             _require_mcp()
         assert "mcp 2.3.0" in str(ei.value)
-        assert "mcp>=1.27,<2" in str(ei.value)
+        assert "pip install 'levain[app]' 'mcp>=1.27,<2'" in str(ei.value)
+        # fastmcp 4 present (the openhands extra): pinning mcp alone would break OpenHands, so the
+        # repair re-resolves both extras (both repairs were run through pip on 2026-10-02).
+        versions["fastmcp"] = "4.0.10"
+        with pytest.raises(ImportError) as ei:
+            _require_mcp()
+        assert "pip install 'levain[openhands,app]'" in str(ei.value)
+        assert "'mcp>=1.27,<2'" not in str(ei.value)
 
     def test_module_imports_with_mcp_blocked(self) -> None:
         """Structural proof (not a trivially-passing reload): the module imports
