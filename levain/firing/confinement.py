@@ -3033,14 +3033,14 @@ def _masked_both_ways(target: Path, masked: _MaskedFiles) -> bool:
 
 
 def _mask_exposed_by_self_bind(argv: list[str], manifest: dict) -> tuple[str, str] | None:
-    """A ``(self-bound path, masked path)`` pair that name the SAME file in ``manifest``, or None.
+    """A ``(self-bound path, masked path)`` pair that name the SAME file, or None.
 
     A self-bind takes its source from the host, so one that is the same inode as a /dev/null mask
     puts the masked content back under another name (a hardlink, or a case variant on a folding
-    volume). Planning matches by identity already; this re-checks the finished plan against the
-    identities recorded for the shell, which every command is then rechecked against, so a file
-    swapped, unlinked or relinked while the plan was made cannot slip between the two (codex,
-    samefile L3 r1 and r2)."""
+    volume). Planning matches by identity already; this re-checks the finished plan at spawn. Each
+    self-bind's identity is the one in ``manifest``, which every command is rechecked against, so a
+    later relink of it refuses the shell. Each mask's identity is read from the host now, following
+    links, because a mask under a hidden subtree is not in the manifest (codex, samefile L3 r3)."""
     masks: dict[tuple[int, int], str] = {}
     self_binds: list[str] = []
     for i in range(len(argv) - 2):
@@ -3048,9 +3048,11 @@ def _mask_exposed_by_self_bind(argv: list[str], manifest: dict) -> tuple[str, st
             continue
         src, dst = argv[i + 1], argv[i + 2]
         if src == "/dev/null":
-            ident = manifest.get(dst)
-            if ident and ident != _UNREACHABLE:
-                masks[(ident[0], ident[1])] = dst
+            try:
+                st = os.stat(dst)
+            except OSError:
+                continue   # absent or unreadable: no file for a self-bind to be
+            masks[(st.st_dev, st.st_ino)] = dst
         elif src == dst:
             self_binds.append(dst)
     for dst in self_binds:

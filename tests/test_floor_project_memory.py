@@ -946,14 +946,26 @@ def test_the_finished_plan_never_self_binds_a_file_it_masks():
     from levain.firing.confinement import _UNREACHABLE, _mask_exposed_by_self_bind
     argv = ["--ro-bind", "/dev/null", "/s/token", "--ro-bind", "/o/alias", "/o/alias",
             "--ro-bind", "/o/other", "/o/other"]
-    manifest = {"/s/token": (1, 42, 0o100000), "/o/alias": (1, 42, 0o100000),
-                "/o/other": (1, 7, 0o100000)}
-    assert _mask_exposed_by_self_bind(argv, manifest) == ("/o/alias", "/s/token")
-    manifest["/o/alias"] = (1, 43, 0o100000)
-    assert _mask_exposed_by_self_bind(argv, manifest) is None
-    manifest["/o/alias"] = _UNREACHABLE
-    manifest["/s/token"] = _UNREACHABLE
-    assert _mask_exposed_by_self_bind(argv, manifest) is None
+    import os as _os
+    real_stat = _os.stat
+
+    def fake_stat(path, *a, **k):
+        if path == "/s/token":
+            return _os.stat_result((0o100644, 42, 1, 1, 0, 0, 0, 0, 0, 0))
+        return real_stat(path, *a, **k)
+
+    import levain.firing.confinement as conf
+    orig = conf.os.stat
+    conf.os.stat = fake_stat
+    try:
+        manifest = {"/o/alias": (1, 42, 0o100000), "/o/other": (1, 7, 0o100000)}
+        assert _mask_exposed_by_self_bind(argv, manifest) == ("/o/alias", "/s/token")
+        manifest["/o/alias"] = (1, 43, 0o100000)
+        assert _mask_exposed_by_self_bind(argv, manifest) is None
+        manifest["/o/alias"] = _UNREACHABLE
+        assert _mask_exposed_by_self_bind(argv, manifest) is None
+    finally:
+        conf.os.stat = orig
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
@@ -1010,5 +1022,42 @@ def test_an_absent_deny_file_does_not_hide_an_unrelated_hardlinked_file(home, tm
         binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
         t = str(shared.resolve())
         assert ["--ro-bind", t, t] in binds
+    finally:
+        opt.chmod(0o755)
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
+def test_a_hardlink_to_a_masked_file_under_a_hidden_subtree_is_refused_at_spawn(home, tmp_path, monkeypatch):
+    """codex L3 (samefile r3): a mask under a tmpfs-hidden subtree is not in the manifest, so the
+    guard read no identity for it. It now reads every mask's identity from the host."""
+    import levain.firing.confinement as conf
+    store = home / ".anneal-memory"
+    store.mkdir(exist_ok=True)
+    secret = store / "token"
+    secret.write_text("SECRET")
+    alias = tmp_path / "elsewhere" / "alias"
+    alias.parent.mkdir()
+    try:
+        os.link(secret, alias)
+    except OSError as exc:
+        pytest.skip(f"no hardlinks here ({exc})")
+    opt = tmp_path / "opt"
+    opt.mkdir()
+    (opt / "trust.json").symlink_to(alias)
+    opt.chmod(0o555)
+    try:
+        monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
+        monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+        monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+        monkeypatch.setattr(conf, "_masked_both_ways", lambda target, masked: False)  # fooled
+        monkeypatch.setattr(conf._BwrapShell, "start", lambda self: pytest.fail("shell started"))
+        policy = build_policy(_entity(home), deny_files=(secret,))
+        argv = conf._bwrap_argv(policy)
+        masked = [argv[i + 2] for i in range(len(argv) - 2)
+                  if argv[i] == "--ro-bind" and argv[i + 1] == "/dev/null"]
+        mounted, _ = conf._mount_plan_paths(argv, policy)
+        assert str(secret) in masked and str(secret) not in mounted, "precondition: nested mask"
+        with pytest.raises(ConfinementError, match="same file as"):
+            conf.BwrapProvider()._spawn_shell_impl(policy)
     finally:
         opt.chmod(0o755)
