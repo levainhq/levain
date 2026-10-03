@@ -859,9 +859,11 @@ def _case_insensitive(d: Path) -> bool:
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores the 0555 precondition")
-def test_a_case_variant_link_to_a_read_denied_file_never_self_binds_it(home, tmp_path, monkeypatch):
+def test_a_case_variant_link_to_a_read_denied_file_is_masked_after_its_self_bind(home, tmp_path, monkeypatch):
     """codex L3 (floor-r2 r2): on a case-insensitive volume a write-only link spelled `TOKEN` names
-    the same dentry as the deny_files entry `token`; an exact compare missed it and self-bound it."""
+    the same dentry as the deny_files entry `token`. An exact compare does not see that, so the
+    variant may be self-bound; the /dev/null mask on `token` must then come AFTER that self-bind,
+    because the later mount on a dentry wins (masks-last, RUN on argushub 2026-10-03)."""
     from levain.firing.confinement import _bwrap_argv
     secret = tmp_path / "secrets" / "token"
     secret.parent.mkdir()
@@ -876,7 +878,11 @@ def test_a_case_variant_link_to_a_read_denied_file_never_self_binds_it(home, tmp
     try:
         monkeypatch.setenv(DERIVE_TRUST_ENV, str(opt / "trust.json"))
         argv = _bwrap_argv(build_policy(_entity(home), deny_files=(secret,)))
-        binds = [argv[i:i + 3] for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
-        assert not any(s == d and s.casefold().endswith("/secrets/token") for _, s, d in binds), binds
+        binds = [(i, argv[i + 1], argv[i + 2]) for i in range(len(argv) - 2) if argv[i] == "--ro-bind"]
+        mask_at = [i for i, s, d in binds if s == "/dev/null" and d.casefold().endswith("/secrets/token")]
+        self_at = [i for i, s, d in binds if s == d and s.casefold().endswith("/secrets/token")]
+        assert mask_at, binds
+        assert self_at, binds   # the exact compare self-binds the variant; the mask must follow it
+        assert all(i < min(mask_at) for i in self_at), binds
     finally:
         opt.chmod(0o755)
