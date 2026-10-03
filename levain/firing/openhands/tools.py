@@ -344,8 +344,15 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         return self._floor.policy
 
     def close(self) -> None:
-        """Remove this executor's history tempdir (the SDK closes executors at conversation close)."""
-        _drop_editor_history(self)
+        """Remove this executor's history tempdir (the SDK closes executors at conversation close),
+        then run the parent's close, so cleanup a future SDK adds there still happens."""
+        try:
+            _drop_editor_history(self)
+        finally:
+            # Chained for whatever a later SDK puts there; no test, because there was nothing to run
+            # [judged 2026-10-02 against openhands-tools 1.26.0: FileEditorExecutor defines no close,
+            # and ToolExecutor.close is a no-op] (glm + complement L3 r2, reasoned).
+            super().close()
 
     def __call__(
         self,
@@ -418,25 +425,31 @@ class LevainFileEditorTool(FileEditorTool):
     ) -> list["LevainFileEditorTool"]:
         """Build around ``floor`` — the one :class:`LevainHands` builds for both hands. Not registered
         on its own: an entity reaches it only through ``levain_hands``."""
-        floored = CrownJewelsFileEditorExecutor(floor=floor)
         # The stock tool is built only to borrow its description/schema; its own executor (and the
-        # history tempdir that executor made) is discarded here.
+        # history tempdir that executor made) is discarded here. It is built FIRST, so that if it
+        # raises, ours (which makes its own history dir) does not exist yet (L3 r2, three seats).
         stocks = FileEditorTool.create(conv_state)
         for stock in stocks:
             _drop_editor_history(stock.executor)
-        # Build REAL LevainFileEditorTool instances (not stock via set_executor, which keeps the stock
-        # class + its raising declared_resources), reusing the stock tool's rich description/schema/
-        # annotations by copying its fields — so our declared_resources override is what runs.
-        return [
-            cls(
-                description=stock.description,
-                action_type=stock.action_type,
-                observation_type=stock.observation_type,
-                annotations=stock.annotations,
-                executor=floored,
-            )
-            for stock in stocks
-        ]
+        floored = CrownJewelsFileEditorExecutor(floor=floor)
+        try:
+            # Build REAL LevainFileEditorTool instances (not stock via set_executor, which keeps the
+            # stock class + its raising declared_resources), reusing the stock tool's rich
+            # description/schema/annotations by copying its fields — so our declared_resources
+            # override is what runs.
+            return [
+                cls(
+                    description=stock.description,
+                    action_type=stock.action_type,
+                    observation_type=stock.observation_type,
+                    annotations=stock.annotations,
+                    executor=floored,
+                )
+                for stock in stocks
+            ]
+        except BaseException:
+            floored.close()
+            raise
 
 
 # --- the bash hand (a persistent OS-sandboxed shell) -----------------------------------------
@@ -730,7 +743,15 @@ class LevainHands(ToolDefinition[Action, Observation]):
             *LevainFileEditorTool.create(conv_state, floor=floor)
         ]
         if with_bash:
-            tools.extend(LevainBashTool.create(conv_state, floor=floor))
+            try:
+                tools.extend(LevainBashTool.create(conv_state, floor=floor))
+            except BaseException:
+                # The SDK never sees a tool list that failed to build, so nothing else would close
+                # the editor built above (L3 r2).
+                built = {id(t.executor): t.executor for t in tools if t.executor is not None}
+                for executor in built.values():
+                    executor.close()
+                raise
         return tools
 
 

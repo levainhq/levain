@@ -66,8 +66,11 @@ _LATCHED = False
 def mark_entity_process() -> None:
     """Latch this process as one that hosts an entity. Idempotent; never cleared."""
     global _LATCHED
-    _LATCHED = True
+    # The env var is written first, so a child spawned by another thread between the two writes
+    # still inherits the latch; the reverse order left this process latched and that child not
+    # (codex L3 r2, reasoned: a two-statement window, so it is fixed by order, not by a test).
     os.environ[LEVAIN_ENTITY_PROCESS_ENV] = "1"
+    _LATCHED = True
 
 
 def entity_process_latched() -> bool:

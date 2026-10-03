@@ -62,6 +62,7 @@ from levain.firing.confinement import (
 )
 from levain.firing.deadline import TurnTimeout
 from levain.firing.drive import (
+    DRIVE_MODES,
     DriveMode,
     human_present,
     resolve_cred_floor,
@@ -523,6 +524,12 @@ class EntitySession:
         is gated while executing every efferent action is worse than an honestly ungated one, so
         the wiring is proven at startup rather than assumed.
         """
+        # Before anything is created: an unknown mode used to be refused only by the binding, after
+        # `<entity>/workspace` already existed (codex L3 r2).
+        if mode not in DRIVE_MODES:
+            raise SessionStartError(
+                f"unknown drive mode {mode!r}; expected one of {DRIVE_MODES}"
+            )
         entity_dir = Path(str(path)).expanduser().resolve()
 
         err = require_openhands_entity(entity_dir)
@@ -615,6 +622,13 @@ class EntitySession:
                 if cfg is not None
                 else None
             )
+            # ONE workspace from here on: the one the binding resolved (and fenced its floor around),
+            # fenced again now that it is final, and the one the conversation is handed. A symlink
+            # swapped in after the fence above used to give the floor one directory and the
+            # conversation another (codex L3 r2).
+            if conv_binding is not None:
+                workspace = conv_binding.floor.workspace
+            assert_workspace_isolated(workspace, entity_dir=entity_dir)
             entity_tools = (
                 build_entity_tools(conv_binding, with_bash=bash_ok)
                 if conv_binding is not None

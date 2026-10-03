@@ -334,15 +334,94 @@ def test_open_creates_nothing_in_an_entity_whose_store_escapes(tmp_path, home):
     assert not (ent / "workspace").exists()
 
 
-def test_a_session_leaks_no_editor_history_dir(tmp_path, home):
-    """L3 r1 (codex): the stock file editor makes a history tempdir when its executor is CONSTRUCTED
-    and never removes it; with the hands built inside open, every session would leak two (ours, and
-    the stock tool's discarded one). Open + close must leave the count unchanged."""
-    import glob
+@pytest.fixture
+def editor_tmp(tmp_path, monkeypatch):
+    """A private tempdir for the stock editor's history dirs, so a count cannot be disturbed by
+    another process using the shared one (complement L3 r2)."""
     import tempfile
 
-    pattern = os.path.join(tempfile.gettempdir(), "oh_editor_history_*")
-    before = set(glob.glob(pattern))
+    d = tmp_path / "tmp"
+    d.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(d))
+    return d
+
+
+def _history_dirs(d: Path) -> list[Path]:
+    return sorted(d.glob("oh_editor_history_*"))
+
+
+def test_a_session_leaks_no_editor_history_dir(tmp_path, home, editor_tmp):
+    """L3 r1 (codex): the stock file editor makes a history tempdir when its executor is CONSTRUCTED
+    and never removes it; with the hands built inside open, every session would leak two (ours, and
+    the stock tool's discarded one). Open + close must leave none behind."""
     s = _open(_entity(tmp_path, "ent"), "interactive")
+    assert _history_dirs(editor_tmp), "the probe must see the dir it counts (none was made)"
     s.close()
-    assert set(glob.glob(pattern)) - before == set()
+    assert _history_dirs(editor_tmp) == []
+
+
+def test_a_failed_tool_build_leaks_no_editor_history_dir(tmp_path, home, editor_tmp, monkeypatch):
+    """L3 r2 (complement, glm, codex): the floored executor was constructed before steps that can
+    raise, so a tool build that failed after it left its history dir behind. Reproduced by making the
+    stock tool's create raise; the failed open must leave no dir."""
+    from openhands.tools.file_editor import FileEditorTool
+
+    from levain.session import SessionStartError
+
+    def boom(*a, **k):
+        raise RuntimeError("stock tool build failed")
+
+    monkeypatch.setattr(FileEditorTool, "create", classmethod(boom))
+    with pytest.raises(SessionStartError):
+        _open(_entity(tmp_path, "ent"), "interactive")
+    assert _history_dirs(editor_tmp) == []
+
+
+@pytest.mark.skipif(not confinement_supported(), reason="needs an OS sandbox for the bash hand")
+def test_a_failed_bash_build_leaks_no_editor_history_dir(tmp_path, home, editor_tmp, monkeypatch):
+    """L3 r2: the editor is built first, so a bash hand that failed to build stranded the editor's
+    executor. The failed open must leave no history dir."""
+    from levain.firing.openhands.tools import LevainBashTool
+    from levain.session import SessionStartError
+
+    def boom(*a, **k):
+        raise RuntimeError("bash hand build failed")
+
+    monkeypatch.setattr(LevainBashTool, "create", classmethod(boom))
+    with pytest.raises(SessionStartError):
+        _open(_entity(tmp_path, "ent"), "interactive")
+    assert _history_dirs(editor_tmp) == []
+
+
+def test_an_unknown_mode_is_refused_before_the_workspace_is_created(tmp_path, home):
+    """L3 r2 (codex): `open(mode="typo")` created `<entity>/workspace` and only then had the binding
+    refuse the mode. A refused open must create nothing."""
+    from levain.session import SessionStartError
+
+    ent = _entity(tmp_path, "ent")
+    with pytest.raises(SessionStartError, match="drive mode"):
+        EntitySession.open(ent, mode="typo", with_tools=True)  # type: ignore[arg-type]
+    assert not (ent / "workspace").exists()
+
+
+def test_a_workspace_swapped_after_the_fence_is_refused(tmp_path, home, monkeypatch):
+    """L3 r2 (codex): the last workspace fence ran before the binding resolved the workspace, so a
+    symlink swapped in between gave the floor one directory and the conversation another. Reproduced
+    by swapping `<entity>/workspace` for a link out of the tree inside the binding's create."""
+    from levain.firing import binding as binding_mod
+    from levain.session import SessionStartError
+
+    ent = _entity(tmp_path, "ent")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    real_create = binding_mod.ConversationBinding.create.__func__
+
+    def swapping_create(cls, entity_dir, **kw):
+        ws = Path(kw["workspace"])
+        ws.rmdir()
+        ws.symlink_to(outside, target_is_directory=True)
+        return real_create(cls, entity_dir, **kw)
+
+    monkeypatch.setattr(binding_mod.ConversationBinding, "create", classmethod(swapping_create))
+    with pytest.raises(SessionStartError, match="escapes the entity dir"):
+        _open(ent, "interactive")
