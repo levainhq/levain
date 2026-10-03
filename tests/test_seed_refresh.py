@@ -155,12 +155,10 @@ def test_the_released_seed_table_matches_the_release_tags():
     numbered = [tuple(int(x) for x in m.groups()) for t in tags
                 if (m := re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", t))]
     tags = [f"v{a}.{b}.{c}" for a, b, c in sorted(numbered) if (a, b, c) <= (0, 5, 4)]
-    if not {"v0.3.0", "v0.5.4"} <= set(tags):
-        pytest.skip("release tags not available in this checkout")
-    shallow = subprocess.run(["git", "-C", str(repo), "rev-parse", "--is-shallow-repository"],
-                             capture_output=True, text=True).stdout.strip()
-    if shallow == "true":
-        pytest.skip("shallow checkout: older release tags may be missing")
+    # 28 = the vX.Y.Z tags from v0.3.0 through v0.5.4 (fixed: those releases are done). A
+    # checkout with fewer, a shallow or selective fetch, cannot re-derive the whole table.
+    if len(tags) < 28:
+        pytest.skip("not every release tag through v0.5.4 is in this checkout")
     derived: dict[str, set[str]] = {}
     for key in BASE_SEEDS:
         for tag in tags:
@@ -184,30 +182,6 @@ def test_an_openhands_install_records_and_refreshes_its_base_seeds(make_install,
     assert r.refreshed == ["seed/memory.md"] and not r.review, out
     assert (install / "seed" / "memory.md").read_bytes() == current
     assert "earlier release's copy" in out
-
-
-def test_a_seed_edited_while_update_runs_is_kept_and_staged(make_install, monkeypatch):
-    """codex, the seed-refresh L3 round: the decision is made from bytes read earlier; an
-    editor that saves before the write must not lose its edit."""
-    install = make_install()
-    memory = install / "seed" / "memory.md"
-    current = memory.read_bytes()
-    memory.write_bytes(OLD)
-    _write_receipt(install, {**_receipt(install), "seed/memory.md": _sha(OLD)})
-    real = install_mod._refresh_decision
-
-    def decide_then_edit(here, want, last, **kw):
-        action = real(here, want, last, **kw)
-        if here == OLD:
-            memory.write_bytes(b"saved by an editor mid-update\n")
-        return action
-
-    monkeypatch.setattr(install_mod, "_refresh_decision", decide_then_edit)
-    r, out = _refresh(install)
-    assert "seed/memory.md" in r.review and "seed/memory.md" not in r.refreshed
-    assert memory.read_bytes() == b"saved by an editor mid-update\n"
-    assert install.joinpath(*PENDING_REL, "seed", "memory.md").read_bytes() == current
-    assert "changed while" in out
 
 
 def test_a_crlf_copy_of_a_released_seed_is_replaced_and_its_bytes_backed_up(

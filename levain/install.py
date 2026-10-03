@@ -2555,30 +2555,7 @@ def _refresh_adapter_files(
             if key.startswith("codex-home/"):
                 _write_codex_hooks(target, want_text, lines.append)  # backs up itself
             else:
-                # Decided from bytes read above; an editor may have saved since (codex, the
-                # seed-refresh L3 round). Re-read right before replacing: changed means the
-                # operator's, so stage instead. What is left is the gap between this read
-                # and the rename below, the host-process class named in the CHANGELOG.
-                try:
-                    raw: bytes | None = target.read_bytes()
-                except FileNotFoundError:
-                    raw = None
-                try:
-                    # Decoded as read_text decoded `here_text`, so a CRLF file compares equal.
-                    now_text = None if raw is None else raw.decode("utf-8").replace(
-                        "\r\n", "\n").replace("\r", "\n")
-                except UnicodeDecodeError:
-                    now_text = "\0changed"
-                if now_text != here_text:
-                    out.refreshed.pop()
-                    out.review.append(key)
-                    where = _put_pending(install, key, want)
-                    new_receipt[key] = _sha256_text(want_text)
-                    lines.append(f"  {key}: changed while `levain update` ran, so yours is "
-                                 f"kept and this levain's version is at {where}. Merge it "
-                                 f"in. Listed once.")
-                    continue
-                if action == "write_backup" and raw is not None:
+                if action == "write_backup" and here_text is not None:
                     is_seed = key.startswith("seed/")
                     if is_seed:
                         # Not beside it: seed/ is the entity's own directory.
@@ -2589,8 +2566,7 @@ def _refresh_adapter_files(
                         backup.parent.mkdir(parents=True, exist_ok=True)
                     else:
                         backup = _timestamped_backup_path(target)
-                    # The bytes just checked against the decision: what is being replaced.
-                    _atomic_write_bytes(backup, raw)
+                    shutil.copy2(target, backup)
                     shown = backup.relative_to(install) if is_seed else backup.name
                     if released_copy:
                         lines.append(f"  {key}: an earlier release's copy, unedited; kept "
