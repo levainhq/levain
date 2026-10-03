@@ -8,7 +8,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 
-- **Rejecting a held action could still run it if the rejection was only half recorded.** `levain run`'s reject (and the chat reject) checked only that the conversation no longer read as halted. OpenHands clears the halt before it records the rejection, so a failure between the two (or a status that could not be read) left the action unanswered, and the next step executed it. The refusal now has to be confirmed: the status must read as not halted and every held action must have its rejection recorded, or the turn ends with the actions not run and the session must be restarted. Found in review; it needs an internal OpenHands failure, which an entity cannot cause.
+- **Rejecting a held action could still run it if the rejection was only half recorded.** `levain run`'s reject checked only that the conversation no longer read as halted. OpenHands clears the halt before it records the rejection, so a failure between the two (or a status that could not be read) left the action unanswered, and the next step executed it. The refusal now has to be confirmed: the status must read as not halted and every held action must have its rejection recorded, or the turn ends with the actions not run and the session refuses every further turn until it is restarted. Found in review; it needs an internal OpenHands failure, which an entity cannot cause.
 
 ## [0.5.3] — 2026-10-03
 
