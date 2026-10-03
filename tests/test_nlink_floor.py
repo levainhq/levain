@@ -231,24 +231,6 @@ def test_a_symlink_spelled_as_a_runtime_dir_is_not_foreign(home, monkeypatch, tm
     assert confinement._foreign_runtime_dirs() == []
 
 
-def test_a_parent_that_cannot_be_stated_refuses(home, monkeypatch) -> None:
-    """complement, the r1 fix-diff round: when stat(parent) failed, the per-spelling fallback key
-    let two spellings of one entry count twice."""
-    secret = _secret(home)
-    policy = build_policy(_entity(home), deny_files=(secret,))
-    real_stat = os.stat
-    parent = str(secret.parent.resolve())
-
-    def stat(q, *a, **k):
-        if str(q) == parent:
-            raise PermissionError(13, "Permission denied", str(q))
-        return real_stat(q, *a, **k)
-
-    monkeypatch.setattr(confinement.os, "stat", stat)
-    with pytest.raises(ConfinementError, match="could not check"):
-        _refuse_multiply_linked_jewels(policy)
-
-
 def _case_insensitive(d: Path) -> bool:
     (d / "CaseProbe").write_text("")
     try:
@@ -259,22 +241,27 @@ def _case_insensitive(d: Path) -> bool:
 
 def test_two_spellings_of_one_entry_do_not_hide_an_outside_link(home) -> None:
     """codex + complement L3 r1: names were counted as strings, so `token` and `TOKEN` (one entry on
-    a case-insensitive volume) counted as two and hid the outside link."""
+    a case-insensitive volume) counted as two and hid the outside link. The strict rule reads
+    st_nlink alone, so listing a jewel at two spellings cannot hide anything."""
     secret = _secret(home)
     if not _case_insensitive(secret.parent):
         pytest.skip("needs a case-insensitive volume")
     os.link(secret, home / "outside")
     policy = build_policy(_entity(home), deny_files=(secret, secret.parent / "TOKEN"))
-    with pytest.raises(ConfinementError, match="2 names on disk, and only 1"):
+    with pytest.raises(ConfinementError, match="2 names on disk"):
         _refuse_multiply_linked_jewels(policy)
 
 
-def test_two_names_both_inside_the_floor_do_not_refuse(home) -> None:
+def test_two_names_both_inside_a_hidden_subtree_refuse(home) -> None:
+    """The strict rule: four review rounds each found a way that counting names "inside the floor"
+    misjudged, so a jewel with a second name refuses wherever that name is, and says how to find it."""
     store = home / ".anneal-memory"
     store.mkdir()
     (store / "a.db").write_text("store")
     os.link(store / "a.db", store / "b.db")
-    _refuse_multiply_linked_jewels(build_policy(_entity(home)))
+    with pytest.raises(ConfinementError, match=r"\.db is a crown jewel with 2 names") as exc:
+        _refuse_multiply_linked_jewels(build_policy(_entity(home)))
+    assert "find" in str(exc.value) and "-samefile" in str(exc.value)
 
 
 def test_a_linked_daemon_socket_is_refused(home, tmp_path) -> None:
@@ -358,6 +345,8 @@ def test_linked_jewel_reason_names_the_jewel_for_a_link_and_spares_plain_files(h
     policy = build_policy(_entity(home), deny_files=(secret,))
     reason = linked_jewel_reason(policy, home / "t")
     assert reason and "token" in reason and "hardlink" in reason
+    own = linked_jewel_reason(policy, secret)   # the jewel's own name, with a second name elsewhere
+    assert own and "token" in own and "hardlink" in own
     assert linked_jewel_reason(policy, plain) is None
     assert linked_jewel_reason(policy, home / "absent") is None
 
@@ -380,22 +369,10 @@ def test_the_file_editor_refuses_a_hardlink_to_a_jewel(home) -> None:
     assert not ok.is_error
 
 
-def _alias_parent(monkeypatch, alias: Path, real: Path) -> None:
-    """Make ``alias`` stat as ``real``: the identity a bind mount of ``real`` at ``alias`` has."""
-    real_stat = os.stat
-
-    def stat(q, *a, **k):
-        if str(q) == str(alias):
-            return real_stat(real, *a, **k)
-        return real_stat(q, *a, **k)
-
-    monkeypatch.setattr(confinement.os, "stat", stat)
-
-
-def test_linked_jewel_reason_refuses_a_name_that_only_shares_the_entry_key(home, monkeypatch) -> None:
-    """codex + complement, the r1 fix-diff round (a regression in r1's own fix): the editor allowed a
-    path whose directory-entry key matched a jewel's. A bind alias of a hidden directory has its
-    parent's identity and the same file name, so it matched and the editor read the jewel."""
+def test_linked_jewel_reason_refuses_every_name_of_a_linked_jewel(home) -> None:
+    """codex + complement, the r1 fix-diff round: the editor allowed a path whose directory-entry key
+    matched a jewel's, so a bind alias of a hidden directory read the store. The strict rule has no
+    allow branch: every name of a jewel with more than one name is refused, its own included."""
     from levain.firing.confinement import linked_jewel_reason
     store = home / ".anneal-memory"
     store.mkdir()
@@ -403,16 +380,16 @@ def test_linked_jewel_reason_refuses_a_name_that_only_shares_the_entry_key(home,
     alias = (home / "alias").resolve()
     alias.mkdir()
     os.link(store / "x.db", alias / "x.db")
-    _alias_parent(monkeypatch, alias, store.resolve())
     policy = build_policy(_entity(home))
     reason = linked_jewel_reason(policy, alias / "x.db")
     assert reason and "x.db" in reason and "hardlink" in reason
-    assert linked_jewel_reason(policy, store.resolve() / "x.db") is None   # its own exact name
+    own = linked_jewel_reason(policy, store.resolve() / "x.db")
+    assert own and "x.db" in own and "hardlink" in own
 
 
 def test_linked_jewel_reason_refuses_a_same_dir_case_variant_link(home) -> None:
     """The second shape of the same finding: on a case-sensitive volume ``TOKEN`` beside ``token``
-    is a separate entry with the jewel's key."""
+    is a separate name for the jewel."""
     from levain.firing.confinement import linked_jewel_reason
     secret = _secret(home)
     if _case_insensitive(secret.parent):
@@ -458,7 +435,7 @@ def test_live_the_file_editor_check_refuses_a_real_bind_alias(home) -> None:
 
 @pytest.mark.skipif(_ROOT, reason="root searches every directory")
 @pytest.mark.parametrize("rd", [os.path.realpath("/tmp"), "/"])
-def test_a_reachable_socket_under_a_foreign_owned_runtime_dir_is_still_counted(home, monkeypatch, rd) -> None:
+def test_a_reachable_socket_under_a_foreign_owned_runtime_dir_is_still_checked(home, monkeypatch, rd) -> None:
     """L2 (RUN at 29ed753): owning the runtime dir proves nothing about reach. With
     $XDG_RUNTIME_DIR at a root-owned shared dir, or at /, a socket this user owns, with a second
     link beside it, was dropped from the check."""
@@ -506,12 +483,12 @@ def test_a_socket_blocked_by_this_users_own_dir_inside_a_foreign_runtime_dir_ref
 
 def test_a_read_denied_jewel_linked_as_the_entitys_own_memory_refuses(home) -> None:
     """L1 (RUN at 29ed753): the floor lets bash READ the entity's own memory files, so a deny_files
-    token whose second name is memory.continuity.md counted 2 of 2 names inside the floor and bash
-    was granted, with the token readable through the memory path."""
+    token whose second name is memory.continuity.md was counted as fully covered and bash was
+    granted, with the token readable through the memory path."""
     ent = _entity(home)
     secret = _secret(home)
     os.link(secret, ent / ".levain" / "memory.continuity.md")
-    with pytest.raises(ConfinementError, match="the shell may not read.*memory.continuity.md"):
+    with pytest.raises(ConfinementError, match="token is a crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(ent, deny_files=(secret,)))
 
 
@@ -521,21 +498,21 @@ def test_a_read_denied_jewel_linked_as_rebound_known_hosts_refuses(home) -> None
     ssh.mkdir()
     secret = _secret(home)
     os.link(secret, ssh / "known_hosts")
-    with pytest.raises(ConfinementError, match="known_hosts is another name"):
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent",
                                                     deny_files=(secret,)))
 
 
 def test_a_hidden_write_only_file_linked_as_own_memory_refuses(home) -> None:
-    """codex (nlink L3): agent mode hides ~/.ssh, so ~/.ssh/rc is not readable, but it is also a
-    deny_write_file, which a two-tier rule called readable; linked to the entity's memory (readable)
-    it passed, and bash read rc through the memory name."""
+    """codex (nlink L3): agent mode hides ~/.ssh, so ~/.ssh/rc is not readable; linked to the
+    entity's memory (readable) it passed an access-graded count, and bash read rc through the
+    memory name."""
     ent = _entity(home)
     ssh = home / ".ssh"
     ssh.mkdir()
     (ssh / "rc").write_text("hidden")
     os.link(ssh / "rc", ent / ".levain" / "memory.continuity.md")
-    with pytest.raises(ConfinementError, match="rc is a crown jewel the shell may not read"):
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(ent, ssh_mode="agent"))
 
 
@@ -546,17 +523,19 @@ def test_authorized_keys_linked_as_the_rebound_known_hosts_refuses(home) -> None
     ssh.mkdir()
     (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA real\n")
     os.link(ssh / "authorized_keys", ssh / "known_hosts")
-    with pytest.raises(ConfinementError, match="known_hosts is another name.*read and write"):
+    with pytest.raises(ConfinementError, match="crown jewel with 2 names"):
         _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="agent"))
 
 
-def test_two_names_with_the_same_access_do_not_refuse(home) -> None:
-    """raw mode: authorized_keys and authorized_keys2 are both read-only binds."""
+def test_two_names_with_the_same_access_refuse(home) -> None:
+    """raw mode: authorized_keys and authorized_keys2 are both read-only binds. The access-graded
+    rule let this pair through; the strict rule refuses any second name."""
     ssh = home / ".ssh"
     ssh.mkdir()
     (ssh / "authorized_keys").write_text("ssh-ed25519 AAAA real\n")
     os.link(ssh / "authorized_keys", ssh / "authorized_keys2")
-    _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="raw"))
+    with pytest.raises(ConfinementError, match="authorized_keys is a crown jewel with 2 names"):
+        _refuse_multiply_linked_jewels(build_policy(_entity(home), ssh_mode="raw"))
 
 
 def test_an_unresolvable_floor_path_refuses_instead_of_crashing(home) -> None:
