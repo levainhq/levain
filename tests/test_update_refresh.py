@@ -667,8 +667,10 @@ def test_ack_waits_for_a_run_that_changes_nothing(tmp_path, capsys, monkeypatch)
     (pack / "seed" / "zz_role.md").write_text("Operator v2: {{OPERATOR_NAME}}\n")
 
     lines: list[str] = []
-    run_update(install, no_pip=True, ack=True, emit=lines.append, confirm=lambda _p: False)
+    rc1 = run_update(install, no_pip=True, ack=True, emit=lines.append,
+                     confirm=lambda _p: False)
     out = "\n".join(lines)
+    assert rc1 == 1, out   # the proposals are still pending
     assert (install / "seed" / "zz_role.md").read_text() == "Operator v2: Chris\n"
     mid = _migrate_state(install)
     assert mid.migrate_acked == before.migrate_acked, "ack recorded on the run that changed a seed"
@@ -693,8 +695,7 @@ def test_ack_is_skipped_on_a_run_that_refreshes_the_carrier(tmp_path, capsys, mo
     before = _migrate_state(install)
     carrier = install / "CLAUDE.md"
     current = carrier.read_text()
-    older = current.replace("Edit the seed files", "Edit the old seed files")
-    assert older != current
+    older = current + "\nAn older release's line.\n"
     carrier.write_text(older)
     receipt_path = install.joinpath(*ADAPTER_RECEIPT_REL)
     receipt = json.loads(receipt_path.read_text())
