@@ -31,6 +31,9 @@ def _isolate_activation_env(monkeypatch):
     """
     monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    # Same shape for the floor: `ANNEAL_MEMORY_DERIVE_TRUST` adds write-denies to every policy
+    # build_policy assembles (spore-1308), so a shell that sets it would grade the floor tests.
+    monkeypatch.delenv("ANNEAL_MEMORY_DERIVE_TRUST", raising=False)
 
 
 @pytest.fixture(autouse=True)
