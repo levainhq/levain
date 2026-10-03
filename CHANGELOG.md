@@ -4,7 +4,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased]
+## [0.5.4] — 2026-10-03
+
+Adds `levain serve --chat`, a chat with an entity through the local web server (K1 part 2), and fixes a refusal at the efferent gate that could still run the refused action.
+
+### Known open issues
+
+Found in review, not fixed in 0.5.4:
+
+- **A pack `order` change alone can switch which pack's activation hook is installed, without review** (since 0.5.0). When two packs ship the same `activation/hooks/<file>`, changing only one pack's `order` makes `levain update` install the other pack's hook. A changed hook *file* is held for review; a changed *winner* is not.
+- **A pack source edited and then reverted while `levain update` runs can slip its edited hook in** (since 0.5.0). It needs a concurrent writer to the pack directory during the update.
+- **Codex's machine-global files are guarded by a per-install lock** (since 0.5.0). `~/.codex/hooks.json` and `config.toml` are shared by every install on the machine, so two installs updating at once can interleave on them.
+- **On Linux, the localhost block does not cover unix sockets at a file path, or AF_VSOCK** (since 0.5.0). A socket at a path the floor does not deny (an ssh ControlMaster or proxy socket in `/tmp`, X11) can still reach this host's services, and inside a VM so can AF_VSOCK. The user's systemd manager and session D-Bus are refused. The ssh ControlMaster case is the same on macOS.
+- **On Linux, the shell is checked before each command, not during one.** A command already running when a protected file changes, or one started in the background earlier, keeps its access while it runs; so does a command whose path changes between the check and its start; a `setsid` child survives the shell being closed. A host process that links a denied file to a path the shell can read while the shell is live is the same case: it is not watched between checks (a denied file under a hidden directory is not rechecked at all, by design, since the operator's own store changes constantly).
+- **An encrypted SQLite store (SQLCipher) has no recognisable header** (since 0.5.1), so the Linux SQLite checks do not see it. A planted sidecar would need the store's key to be replayed.
+- **A trust file levain cannot find is not covered**: a flow project home moved with `FLOW_PROJECT_MEMORY_HOME`, unless `$ANNEAL_MEMORY_DERIVE_TRUST` is also set for levain; and a path to the trust file through more than one symlinked directory.
+- **When a trust-file refresh refuses the floor mid-session, a command the bash hand is starting at that moment can still run** until the shell finishes closing. Every later command is refused.
+- **On a case-sensitive Linux filesystem, a write-protected file whose name differs only in letter case from a denied file in the same directory is hidden from the shell** (it should stay readable). This fails closed: the shell loses read access to that one file.
+- **`spawn_shell(env=...)` on Linux passes that environment to `bwrap` as well as to bash**, so a loader variable such as `LD_PRELOAD` in it runs before the sandbox exists. levain's own callers pass no environment; this affects only a program that calls the API with its own.
+- **The README does not mention that on Linux bash is refused when a crown jewel is a SQLite database** (since 0.5.1; the CHANGELOG entry for 0.5.1 explains it).
+- **A hardlink to a denied file, at a path the floor does not deny, reads that file** (both platforms). The floor denies paths, not files, so the content is readable through the other name. The planned fix matches by file identity; it is not in 0.5.4.
+- **An `EntitySession` takes one driver at a time.** Driving one session from two threads at once (a turn while a rejection is being confirmed, or two turns) is not supported and can run an action nobody approved. `levain run` and `levain serve --chat` each drive a session from one place at a time (chat refuses a second request while one is running).
+- **`levain serve --chat`: a tool error the model recovered from, in a turn the wall-clock stop lands on, discards that turn** (reported `timed_out`, not captured, session closed). It fails closed. A session whose open hangs keeps its slot until the server restarts.
 
 ### Added
 
