@@ -711,9 +711,10 @@ class EntitySession:
                 disarm_efferent_gate(conversation)
             # Build the hands NOW, not at the first turn, and read their floor back. The SDK builds tools
             # lazily from the agent's spec params, and those params are a plain dict until then; once
-            # the agent is initialized they are never read again. So after this the hands' floor can
-            # only be the one this session resolved — and a hand that does not report it refuses the
-            # start (the arm_efferent_gate read-back discipline).
+            # the agent is initialized THIS conversation's hands are never rebuilt from them, so their
+            # floor can only be the one this session resolved — and a hand that does not report it
+            # refuses the start (the arm_efferent_gate read-back discipline). A later fork() builds its
+            # hands from the spec as it stands then (codex L3 r1, 2f326f2).
             if conv_binding is not None:
                 conversation._ensure_agent_ready()
                 tools_map = conversation.agent.tools_map

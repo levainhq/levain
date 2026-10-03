@@ -1259,8 +1259,9 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     a receipt describing a tree that was not installed (spore-1023).
 
     REENTRANT per (install, thread): a nested ``install_lock`` inside a held one is a
-    no-op, so ``run_init`` can hold it across ``apply_init`` (which takes it too, for
-    the web POST). A second ``flock`` on a fresh fd would refuse even its own process,
+    no-op, so a caller can hold it across ``apply_init`` (which takes it too) and the
+    work after it: ``run_init`` and the web init handler both do, around the docs
+    refresh. A second ``flock`` on a fresh fd would refuse even its own process,
     because a BSD ``flock`` belongs to the open file, not the process. Without
     ``fcntl`` (Windows) there is no lock and this yields unguarded."""
     try:

@@ -26,15 +26,17 @@ answers}``, so a page can never redirect the install target.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import threading
 from collections.abc import Sequence
 from dataclasses import asdict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from levain.install import install_lock as _install_flock
 from levain.install import (
     InitError,
     InstallLockError,
@@ -49,12 +51,10 @@ from levain.install import (
 from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
+from levain.http_guards import GuardedHandler
 from levain.web_server import (
-    _CSP,
     _LOOPBACK_HOSTS,
-    _WRITE_SEC_FETCH_ALLOWED,
     _is_loopback_host,
-    host_header_allowed,
     load_web_asset,
 )
 
@@ -140,68 +140,20 @@ class _InitServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class _InitHandler(BaseHTTPRequestHandler):
+class _InitHandler(GuardedHandler):
     """Serves the init form (GET/HEAD) + the one governed write route
     (``POST /init``). Behind the same DNS-rebinding Host allowlist + CSRF +
-    application/json boundary the dashboard server uses."""
+    application/json boundary the dashboard server uses (the shared
+    :class:`~levain.http_guards.GuardedHandler`)."""
 
-    protocol_version = "HTTP/1.1"
     server_version = "levain-init"
-    timeout = 30
     server: _InitServer  # narrow the type for typed attribute access
-
-    # ---- shared response discipline (CSP + security headers, like the dashboard) ----
-
-    def end_headers(self) -> None:
-        """Stamp the security headers on EVERY response — structurally, so the
-        invariant can't be skipped. ``_send`` is the normal path, but the stdlib's
-        ``send_error`` (an unsupported method, an OPTIONS preflight, a malformed
-        request) builds its own response that never passes through ``_send``; putting
-        the headers here covers those framework-generated responses too (codex L3
-        MED). Nothing else sets these (``_send`` deliberately does not), so a plain
-        add is exactly-once per response."""
-        self.send_header("Content-Security-Policy", _CSP)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
-    ) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        if not head:
-            self.wfile.write(body)
-
-    def _send_json(self, payload: dict[str, object], status: int = 200) -> None:
-        self._send(
-            json.dumps(payload).encode("utf-8"),
-            "application/json; charset=utf-8",
-            status=status,
-        )
-
-    def version_string(self) -> str:
-        return self.server_version
-
-    def _host_ok(self) -> bool:
-        return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     # ---- reads (GET/HEAD) ----
 
     def _route(self, *, head: bool) -> None:
-        if not self._host_ok():
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
-            return
-        # Defense-in-depth: refuse a cross-site browser read (a same-origin fetch
-        # sends same-origin; a top-level nav sends none; non-browser clients omit
-        # it). Same cheap layer the dashboard read path uses.
-        if self.headers.get("Sec-Fetch-Site") == "cross-site":
-            self._send(b"forbidden\n", "text/plain; charset=utf-8", status=403, head=head)
+        # Host allowlist, then the cross-site read refusal (the shared read preamble).
+        if self._refuse_read(head=head):
             return
 
         path = self.path.split("?", 1)[0]
@@ -229,12 +181,6 @@ class _InitHandler(BaseHTTPRequestHandler):
 
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
 
-    def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        self._route(head=False)
-
-    def do_HEAD(self) -> None:  # noqa: N802 — same routing, headers only
-        self._route(head=True)
-
     def _build_plan_json(self) -> bytes:
         """The ``/init-plan.json`` body: the shared interview field plan projected
         to JSON (every field, pre-filled `current`, section grouping), plus the
@@ -259,23 +205,6 @@ class _InitHandler(BaseHTTPRequestHandler):
 
     # ---- the write route (POST /init) ----
 
-    def _reject(self, status: int, error: str, message: str) -> None:
-        """Refuse a write BEFORE its body is read: close the connection (so the
-        unread body can't desync a kept-alive socket) and send the error JSON."""
-        self.close_connection = True
-        self._send_json({"error": error, "message": message}, status)
-
-    def _drain(self, n: int) -> None:
-        """Read and discard up to ``n`` bytes of the request body in bounded chunks,
-        so a rejected oversize request's body doesn't dangle on a kept-alive
-        connection — the client can finish its send and read the error cleanly."""
-        remaining = n
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """``POST /init`` — run the install from the submitted ``{adapter,
         answers}``. The cheap fail-closed checks (Host → CSRF → Content-Type →
@@ -284,47 +213,19 @@ class _InitHandler(BaseHTTPRequestHandler):
         ``install_lock`` (one install at a time — two into one dir would race) and
         owns its try/except → HTTP + partial-install reporting (no rollback; codex
         installs touch global ~/.codex)."""
-        if not self._host_ok():
-            return self._reject(403, "forbidden", "bad Host header")
-        # CSRF layer 1: same-origin (our page) or a non-browser client only.
-        sfs = self.headers.get("Sec-Fetch-Site")
-        if sfs is not None and sfs != _WRITE_SEC_FETCH_ALLOWED:
-            return self._reject(403, "forbidden", "cross-origin write refused")
+        # Host, then CSRF layer 1 (same-origin or a non-browser client only).
+        if self._refuse_write_origin():
+            return
         # CSRF layer 2: require application/json (a cross-origin page can't send it
         # without a CORS preflight this server never answers).
-        ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if ctype != "application/json":
-            return self._reject(
-                415, "unsupported_media_type", "Content-Type must be application/json"
-            )
+        if self._refuse_non_json():
+            return
         if self.path.split("?", 1)[0] != "/init":
             return self._reject(404, "not_found", "no such route")
-        clen_raw = self.headers.get("Content-Length")
-        # ⛔ `isascii()` IS LOAD-BEARING, NOT BELT-AND-BRACES. `str.isdigit()` is TRUE for
-        # characters `int()` REFUSES — superscripts and other Unicode digit-category
-        # characters. Measured: `"²".isdigit()` is True and `int("²")` raises ValueError, so a
-        # `Content-Length: ²` header passed this guard and blew up on the next line, turning a
-        # clean 411 into an unhandled exception. A guard that admits values the very next
-        # statement rejects is not narrowing anything. RFC 7230 makes Content-Length ASCII
-        # DIGITS, so this is also the spec-correct test.
-        if clen_raw is None or not (clen_raw.isascii() and clen_raw.isdigit()):
-            return self._reject(411, "length_required", "Content-Length required")
-        clen = int(clen_raw)
-        if clen > _MAX_INIT_BODY:
-            # Refuse oversize: ALWAYS close the connection (never keep-alive after a
-            # rejected body — a truncated/lying body would otherwise desync the next
-            # request on the socket), and drain a bounded amount first so the client
-            # can read the 413 cleanly. Guard the drain so a stalled/short body can't
-            # strand the thread past the socket timeout (codex LOW / nemotron).
-            self.close_connection = True
-            if clen <= _DRAIN_CAP:
-                try:
-                    self._drain(clen)
-                except OSError:
-                    pass
-            self._send_json(
-                {"error": "too_large", "message": f"body exceeds {_MAX_INIT_BODY} bytes"}, 413
-            )
+        clen = self._declared_length()
+        if clen is None:
+            return
+        if self._refuse_oversize(clen, _MAX_INIT_BODY, _DRAIN_CAP):
             return
 
         # Serialize installs: only one runs at a time (concurrent installs into the
@@ -348,7 +249,8 @@ class _InitHandler(BaseHTTPRequestHandler):
 
     def _run_install(self, req: object) -> None:
         """Validate the submitted ``{adapter, answers}`` at the input boundary,
-        then run ``apply_init`` and report. Holds ``install_lock``."""
+        then run ``apply_init`` and report. Holds the server's ``install_lock`` (a threading lock;
+        the per-install file lock is taken inside, around ``apply_init`` and the docs refresh)."""
         if not isinstance(req, dict):
             self._send_json({"error": "bad_request", "message": "body must be a JSON object"}, 400)
             return
@@ -501,84 +403,103 @@ class _InitHandler(BaseHTTPRequestHandler):
                 # progress, NOT the clean "templates" shape a pre-write compose fault
                 # uses (L1 #4 / L2 Point 4: the old handler mislabeled a half-written
                 # install as a wheel-corruption "templates" error with no progress).
-                try:
-                    result = apply_init(
-                        install,
-                        chosen,
-                        answers,
-                        templates_root,
-                        self.server.python_path,
-                        self.server.anneal_path,
-                        specs,
-                        verbatim,
-                        activation_roots=activation_roots,
-                        packs=pack_pairs,
-                        emit=messages.append,
-                        require_empty=not self.server.force,
-                    )
-                except InstallLockError as exc:
-                    # Refused before any write (busy, or the target filled up meanwhile): not
-                    # a partial install, so not the 500 "partial" shape below.
-                    self._send_json(
-                        {"error": "install_refused", "message": exc.message,
-                         "partial": False, "messages": messages}, 409
-                    )
-                    return
-                except InitError as exc:
-                    self._send_json(
-                        {"error": "install_failed", "message": exc.message,
-                         "partial": True, "messages": messages}, 500
-                    )
-                    return
+                # ONE install lock across apply_init AND the pack-docs refresh, as run_init holds it:
+                # the refresh wipes and recopies .levain/docs, and outside the lock a CLI init/update
+                # could interleave its own (spore-1250, reproduced 2026-10-03). apply_init takes the
+                # same lock; it is reentrant per (install, thread), so that acquisition nests. A busy
+                # lock is refused here, before any write, with the same 409 apply_init's own refusal
+                # gets (uncaught, the outer InitError handler reports it as a 500 "templates" fault).
+                with contextlib.ExitStack() as held:
+                    try:
+                        held.enter_context(_install_flock(install))
+                    except InstallLockError as exc:
+                        self._send_json(
+                            {"error": "install_refused", "message": exc.message,
+                             "partial": False, "messages": messages}, 409
+                        )
+                        return
+                    try:
+                        result = apply_init(
+                            install,
+                            chosen,
+                            answers,
+                            templates_root,
+                            self.server.python_path,
+                            self.server.anneal_path,
+                            specs,
+                            verbatim,
+                            activation_roots=activation_roots,
+                            packs=pack_pairs,
+                            emit=messages.append,
+                            require_empty=not self.server.force,
+                        )
+                    except InstallLockError as exc:
+                        # Refused before any write, not a partial install. With the lock held above,
+                        # what reaches here is the target filling up meanwhile (InstallTargetTaken).
+                        self._send_json(
+                            {"error": "install_refused", "message": exc.message,
+                             "partial": False, "messages": messages}, 409
+                        )
+                        return
+                    except InitError as exc:
+                        self._send_json(
+                            {"error": "install_failed", "message": exc.message,
+                             "partial": True, "messages": messages}, 500
+                        )
+                        return
 
-                # Refresh the persisted pack docs so `levain docs` renders a
-                # SELF-CONTAINED composed view — ALWAYS (even base-only), so a
-                # --force reinstall that DROPS a pack CLEARS that pack's stale
-                # (possibly company-private) chapters rather than serving them
-                # forever (the IP-boundary class run_init guards, complement L3
-                # CRITICAL). Manifests are re-read LIVE here (consistent with the
-                # roster/activation read live above — no stale start-time snapshot,
-                # L1 #2 / L2 Point 3); a re-read can raise PackError if a pack.toml
-                # changed since the compose ms ago, so catch it too. A copy failure
-                # is non-fatal — the manual is a read surface, not install-critical —
-                # so it warns into the log and the install still reports success.
-                try:
-                    copied_docs = _copy_pack_docs(
-                        install, [(load_pack_manifest(p), p) for p in pack_dirs]
-                    )
-                except (OSError, InitError, PackError) as doc_exc:
-                    # HONEST message (complement L3): a failed refresh may have cleared
-                    # only PART of a prior pack's chapters, so do NOT claim "base only"
-                    # — any prior (possibly proprietary) chapters MAY remain. Tell the
-                    # operator to verify. Non-fatal: the install itself still succeeded.
-                    messages.append(
-                        f"note: could not refresh pack docs ({doc_exc}) — any prior "
-                        f"pack chapters may remain; verify with `levain docs`."
-                    )
-                    copied_docs = []
-                if copied_docs:
-                    messages.append(
-                        f"docs: {len(copied_docs)} pack chapter(s) → .levain/docs/ "
-                        f"(compose with `levain docs`)"
-                    )
+                    # Refresh the persisted pack docs so `levain docs` renders a
+                    # SELF-CONTAINED composed view — ALWAYS (even base-only), so a
+                    # --force reinstall that DROPS a pack CLEARS that pack's stale
+                    # (possibly company-private) chapters rather than serving them
+                    # forever (the IP-boundary class run_init guards, complement L3
+                    # CRITICAL). Manifests are re-read LIVE here (consistent with the
+                    # roster/activation read live above — no stale start-time snapshot,
+                    # L1 #2 / L2 Point 3); a re-read can raise PackError if a pack.toml
+                    # changed since the compose ms ago, so catch it too. A copy failure
+                    # is non-fatal — the manual is a read surface, not install-critical —
+                    # so it warns into the log and the install still reports success.
+                    try:
+                        copied_docs = _copy_pack_docs(
+                            install, [(load_pack_manifest(p), p) for p in pack_dirs]
+                        )
+                    except Exception as doc_exc:  # noqa: BLE001 — the refresh is non-fatal (below)
+                        # HONEST message (complement L3): a failed refresh may have cleared
+                        # only PART of a prior pack's chapters, so do NOT claim "base only"
+                        # — any prior (possibly proprietary) chapters MAY remain. Tell the
+                        # operator to verify. Non-fatal: the install itself still succeeded.
+                        messages.append(
+                            f"note: could not refresh pack docs ({doc_exc}) — any prior "
+                            f"pack chapters may remain; verify with `levain docs`."
+                        )
+                        copied_docs = []
+                    if copied_docs:
+                        messages.append(
+                            f"docs: {len(copied_docs)} pack chapter(s) → .levain/docs/ "
+                            f"(compose with `levain docs`)"
+                        )
 
-                # The install SUCCEEDED (apply_init returned). Shaping the response
-                # manifest does post-success filesystem I/O (_manifest_rows globs the
-                # seed/activation trees), so a fault HERE must not flip a good install
-                # to "failed" via the generic outer handler — the same misreport class
-                # the docs step guards, one function later (complement L3 MED). Degrade
-                # the manifest, keep ok/partial sourced from result.store_ok.
-                store = install / ".levain" / "memory.db"
-                try:
-                    rows = _manifest_rows(install, chosen, store, result.store_ok)
-                    next_steps = _next_steps_lines(install, chosen, result.store_ok)
-                except OSError as shape_exc:
-                    messages.append(
-                        f"note: install complete, but could not build the file "
-                        f"manifest ({shape_exc})."
-                    )
-                    rows = []
-                    next_steps = []
+                    # Shaped INSIDE the lock (codex L3 2026-10-03): it reads the live seed/activation
+                    # trees, and a CLI init/update taking the lock as soon as it is released could
+                    # swap them mid-read. A successful response is written after the lock is released
+                    # (a 409/500 refusal above is still sent from inside it).
+                    # The install SUCCEEDED (apply_init returned). Shaping the response
+                    # manifest does post-success filesystem I/O (_manifest_rows globs the
+                    # seed/activation trees), so a fault HERE must not flip a good install
+                    # to "failed" via the generic outer handler — the same misreport class
+                    # the docs step guards, one function later (complement L3 MED). Degrade
+                    # the manifest, keep ok/partial sourced from result.store_ok.
+                    store = install / ".levain" / "memory.db"
+                    try:
+                        rows = _manifest_rows(install, chosen, store, result.store_ok)
+                        next_steps = _next_steps_lines(install, chosen, result.store_ok)
+                    except OSError as shape_exc:
+                        messages.append(
+                            f"note: install complete, but could not build the file "
+                            f"manifest ({shape_exc})."
+                        )
+                        rows = []
+                        next_steps = []
         except InitError as exc:
             # PRE-write compose fault: open_init_templates raised at the `with` entry
             # (corrupt/missing base templates, or a pack that no longer composes) —
@@ -619,13 +540,6 @@ class _InitHandler(BaseHTTPRequestHandler):
             },
             200,
         )
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet by default; set ``LEVAIN_SERVE_VERBOSE`` to restore the access log."""
-        import os
-
-        if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
 
 
 def make_init_server(
