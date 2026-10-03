@@ -686,6 +686,8 @@ class _FakeSystemctl:
         self.calls.append(cmd)
         verb = cmd[2] if cmd[0] == "systemctl" and len(cmd) > 2 else cmd[0]
         rc = self._rc_for.get(verb, 0)
+        if isinstance(rc, list):   # per-call results for this verb, in order; the last one repeats
+            rc = rc.pop(0) if len(rc) > 1 else rc[0]
         out = ""
         if verb == "show":
             unit = cmd[3]
@@ -918,6 +920,21 @@ def test_systemd_rollback_disables_the_service_a_failed_shape_change_enabled(
     with pytest.raises(DaemonError, match="rolled back"):
         systemd.install(_resident(tmp_path))
     assert ["systemctl", "--user", "disable", "levain-cockpit.service"] in fake.calls
+
+
+@pytest.mark.parametrize("rollback_rc,said", [(0, "re-enabled levain-cockpit.timer"),
+                                              (1, "re-enabling levain-cockpit.timer FAILED")])
+def test_systemd_rollback_reports_whether_the_prior_unit_was_re_enabled(
+        systemd, tmp_path, monkeypatch, rollback_rc, said) -> None:
+    """The rollback's own enable can fail too; the error must not claim a re-enable it did not get
+    (L3 codex 2026-10-03, run: every enable failed and the message still said re-enabled)."""
+    systemd.UNIT_DIR.mkdir(parents=True)
+    (systemd.UNIT_DIR / "levain-cockpit.service").write_text("[Unit]\nDescription=PRIOR\n")
+    (systemd.UNIT_DIR / "levain-cockpit.timer").write_text("[Timer]\nOnUnitActiveSec=900\n")
+    monkeypatch.setattr(daemon, "_run", _FakeSystemctl(rc_for={"enable": [1, rollback_rc]}))
+    with pytest.raises(DaemonError) as exc:
+        systemd.install(_resident(tmp_path))
+    assert said in str(exc.value)
 
 
 # --- systemd's OWN parser is the oracle, not our string assertions ----------------------------

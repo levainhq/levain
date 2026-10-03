@@ -244,14 +244,22 @@ def test_open_refuses_hands_that_do_not_report_the_resolved_floor(tmp_path, home
     from levain.session import SessionStartError
 
     real = ConversationBinding.from_params.__func__
+    skews: list[int] = []
 
     def skewed(cls, data):
+        skews.append(1)
         b = real(cls, data)
         return dataclasses.replace(b, floor=dataclasses.replace(b.floor, deny_files=()))
 
     monkeypatch.setattr(ConversationBinding, "from_params", classmethod(skewed))
-    with pytest.raises(SessionStartError, match="did not report the floor"):
-        _open(_entity(tmp_path, "ent"), "unattended")
+    opened = None
+    try:
+        with pytest.raises(SessionStartError, match="did not report the floor"):
+            opened = _open(_entity(tmp_path, "ent"), "unattended")
+    finally:
+        if opened is not None:
+            opened.close()
+    assert skews, "the hands were not built through from_params, so nothing was skewed"
 
 
 def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_own_floor(
