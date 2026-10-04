@@ -98,7 +98,7 @@ dependencies = [
     # `>=0.9.26` (2026-10-03): the seed templates are reconciled to anneal 0.9.26's AM-HOP-RETIRED
     # (recall follows cited evidence, not Hebbian links). An older anneal still reads links in
     # recall, so the seed's guidance would be wrong for it; KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=0.9.26,<0.10",
+    "anneal-memory>=0.9.27,<0.10",
 ]
 
 [project.optional-dependencies]

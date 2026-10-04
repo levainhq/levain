@@ -356,6 +356,7 @@ _COVERAGE_SENTINELS = {
     "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
     "AM-LINKGATE": ("memory.md", "[evidence: <id1>, <id2>"),           # the honest multi-episode example
     "AM-HOP-RETIRED": ("memory.md", "recall follows the episodes a pattern's evidence cites"),
+    "AM-DURABLE-FACTS": ("memory.md", "`- fact — cues: a, b, c`"),     # the section's line + cue form
 }
 # EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
 # sentinel" is a reviewed decision rather than an omission.

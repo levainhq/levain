@@ -73,6 +73,14 @@ class TestParseSections:
         secs = _parse_sections(self.MD, ("State", "Nonexistent"))
         assert [s.heading for s in secs] == ["State"]
 
+    def test_the_default_set_shows_durable_facts(self) -> None:
+        """anneal 0.9.27's optional section, in its schema order, when the continuity has it."""
+        from levain.dashboard import _ALL_SECTIONS
+        md = "## State\ns\n\n## Durable Facts\n- tree nut allergy — cues: dinner\n\n## Patterns\np\n"
+        secs = _parse_sections(md, _ALL_SECTIONS)
+        assert [s.heading for s in secs] == ["State", "Durable Facts", "Patterns"]
+        assert "tree nut" in secs[1].body
+
     def test_order_follows_request_not_doc(self) -> None:
         secs = _parse_sections(self.MD, ("Active Threads", "State"))
         assert [s.heading for s in secs] == ["Active Threads", "State"]
