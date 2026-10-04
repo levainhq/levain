@@ -183,25 +183,31 @@ def _cancel_if_ours(store: object, wrap_token: object) -> bool:
     (``invariant_must_fire_at_the_point_of_use``): a bare ``wrap_cancelled`` clears WHATEVER wrap is in
     the store, which after a race is the winner's. No-op if idle or the token changed; never raises.
 
-    Returns False only when a wrap of ours may still be open: the cancel itself failed (a locked or
-    unreadable store). Idle, another token's wrap, and no token at all return True. Callers that
-    tell the operator the wrap was cancelled print :data:`_CANCEL_FAILED` instead when it is False."""
+    Returns True only when no wrap of ours can still be open: ours was cancelled, the store is idle,
+    or the open wrap carries another token. Anything it cannot establish returns False (fail closed):
+    no token to compare, a cancel that raised, or anneal reporting a partial lifecycle state. Callers
+    print :data:`_CANCEL_FAILED` when it is False, and a dry run exits 1."""
     # anneal compares the token and clears the wrap in one step (expect_token); reading the snapshot
     # and then calling a bare cancel let another client's new wrap be cleared in between (codex, the
     # 0.5.6 hunk look). WrapOwnershipError means the in-progress wrap is not ours: leave it.
     # Without a token there is nothing to compare, and wrap_cancelled(expect_token=None) is anneal's
     # bare cancel, which clears whatever wrap is open. A "ready" result always carries one, so this
-    # only guards a broken contract: leave the store alone rather than clear a wrap we cannot name.
+    # only guards a broken contract: leave the store alone rather than clear a wrap we cannot name,
+    # and report it unresolved, since a wrap may be open that nobody cancelled.
     if not wrap_token:
         _log.warning("cancel-if-ours: no wrap token to compare, nothing cancelled")
-        return True
+        return False
     try:
         from anneal_memory import WrapOwnershipError
 
         try:
             store.wrap_cancelled(expect_token=wrap_token)  # type: ignore[attr-defined]
-        except WrapOwnershipError:
-            pass
+        except WrapOwnershipError as exc:
+            # Idle or another token's wrap: nothing of ours is open. A partial state (lifecycle keys
+            # set, no usable token) is not that: it may be our wrap, damaged, still blocking the next.
+            if getattr(exc, "partial_state", False):
+                _log.warning("cancel-if-ours: the store's wrap state is partial; not cancelled")
+                return False
         return True
     except Exception as exc:  # noqa: BLE001 — a guard must not raise into a failure path
         _log.warning("cancel-if-ours failed (%s): %s", type(exc).__name__, exc)
@@ -273,7 +279,7 @@ def _cancel_our_wrap(store: object, wrap_token: object) -> None:
 
     Never raises: cleanup must not replace the exception it is cleaning up after."""
     try:
-        if wrap_token is not None:
+        if wrap_token:
             _cancel_if_ours(store, wrap_token)
         elif _wrap_in_progress(store):
             store.wrap_cancelled()  # type: ignore[attr-defined]
@@ -686,8 +692,11 @@ def _consolidate(
         if status != "ready":
             # No cancel: a non-ready result started no wrap of ours (anneal's "downgraded" leaves the
             # store untouched and carries no token), so a bare cancel here could only clear a wrap
-            # some other process started meanwhile (codex + complement, the 0.5.7 round).
+            # some other process started meanwhile (codex + complement, the 0.5.7 round). A status
+            # this levain does not know that still carries a token did open one: cancel that by token.
             print(f"levain wrap: prepare_wrap returned an unexpected status {status!r} — aborting.")
+            if result.get("wrap_token") and not _cancel_if_ours(store, result.get("wrap_token")):
+                print(_CANCEL_FAILED)
             return 1
 
         wrap_token = result.get("wrap_token")

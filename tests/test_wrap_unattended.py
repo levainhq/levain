@@ -609,8 +609,44 @@ def test_cancel_if_ours_without_a_token_clears_nothing(tmp_path):
     db = _with_store(ent, episodes=2)
     with Store(str(db), section_schema=None) as store:
         assert prepare_wrap(store).get("status") == "ready"
-        assert wrapmod._cancel_if_ours(store, None) is True
+        assert wrapmod._cancel_if_ours(store, None) is False
         assert store.get_wrap_started_at() is not None
+
+
+def test_cancel_if_ours_on_a_partial_state_is_unresolved():
+    """codex, the 0.5.7 fix-diff round: a partial lifecycle state may be our damaged wrap."""
+    from anneal_memory import WrapOwnershipError
+
+    class _Store:
+        def wrap_cancelled(self, **kw):
+            raise WrapOwnershipError(expected="t", actual=None, partial_state=True)
+
+    class _Idle:
+        def wrap_cancelled(self, **kw):
+            raise WrapOwnershipError(expected="t", actual=None, partial_state=False)
+
+    assert wrapmod._cancel_if_ours(_Store(), "t") is False
+    assert wrapmod._cancel_if_ours(_Idle(), "t") is True
+
+
+def test_an_unknown_status_with_a_token_cancels_that_wrap(tmp_path, monkeypatch, capsys):
+    """codex, the 0.5.7 fix-diff round: a status this levain does not know may still open a wrap."""
+    import anneal_memory.continuity as cont
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    real_prepare = cont.prepare_wrap
+
+    def opens_then_reports_a_new_status(store, **kw):
+        r = dict(real_prepare(store, **kw))
+        r["status"] = "some-future-status"
+        return r
+
+    monkeypatch.setattr(cont, "prepare_wrap", opens_then_reports_a_new_status)
+    assert wrap_entity(ent) == 1
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
 
 
 def test_a_dry_run_whose_cancel_fails_is_not_a_success(tmp_path, monkeypatch, capsys):
