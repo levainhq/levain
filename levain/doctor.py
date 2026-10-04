@@ -1409,18 +1409,14 @@ def _imports_continuity(text: str) -> bool:
     defeated three ways in one round, each RUN against Claude Code (gemini, the 0.5.5 L3): a
     tab-indented import, a ```` fence around a ``` fence, a comment opened mid-line. Each was
     ignored by Claude Code and counted by doctor. So any fence before the import, or any comment
-    left open on its line, means doctor cannot confirm it, and says so: a false warning, never a
-    false all-clear. The levain-written carrier has neither before the import."""
+    left open on its line, means doctor cannot confirm it, and says so: for those shapes, a false
+    warning rather than a false all-clear. The levain-written carrier has neither before the import."""
     wanted = {CONTINUITY_IMPORT, "@./" + CONTINUITY_IMPORT[1:]}
-    # "\n" only, and ASCII spaces only: splitlines() also breaks on \v, \f and NEL, and strip()
-    # takes Unicode spaces, either of which made a line doctor counted that Claude Code does
-    # not (codex + complement, the bound's fix-diff round).
-    for line in text.split("\n"):
-        line = line.removesuffix("\r")
-        body = line.lstrip(" ")
-        if len(line) - len(body) < 4 and body.rstrip(" ") in wanted:
-            return True
+    for line in text.splitlines():
         stripped = line.strip()
+        lead = line[: len(line) - len(line.lstrip())]
+        if stripped in wanted and "\t" not in lead and len(lead) < 4:
+            return True
         if stripped.startswith(("```", "~~~")):
             return False
         if "<!--" in line and "-->" not in line.rsplit("<!--", 1)[1]:

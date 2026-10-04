@@ -21,9 +21,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Known open issues
 
 - **A file saved while `levain update` is replacing it can be overwritten** (since 0.5.0 for hooks, `CLAUDE.md` / `AGENTS.md`, settings and `.mcp.json`; seed files join them in this release). `levain update` decides from the file as it read it and then replaces it; an editor that saves in between loses that save, and a copy replaced without a record keeps a backup taken at replace time, not decision time. Levain's install lock keeps other `levain` processes out, not editors. Close the entity's files before running `levain update`.
-
 - **`levain doctor` can report "upgrade pending" for a Claude Code install whose living memory does load.** You see it when you have put a code block, or an HTML comment left open on its line, above the `@.levain/memory.continuity.md` line in `CLAUDE.md`. Doctor only counts that import when nothing above it could hide it from Claude Code, so it cannot confirm it, and `levain update` will not change your edited file. Move the import line above the code block or comment and the warning clears.
 - **In that same layout, doctor's context-size figure leaves out the living memory**, so the total it prints is smaller than what Claude Code loads by the size of `.levain/memory.continuity.md`. Moving the import line fixes this too.
+- **`levain doctor` can count the living-memory import on a line Claude Code may not read as its own.** Doctor splits `CLAUDE.md` into lines the way Python does, which also breaks at a vertical tab, a form feed, a bare carriage return and some Unicode line and space characters; Claude Code's handling of those has not been measured. A `CLAUDE.md` that levain wrote, or that you edited in an ordinary editor, contains none of them. If doctor says the memory loads and the entity does not see it, check that line for stray control characters.
 
 ## [0.5.4] — 2026-10-03
 

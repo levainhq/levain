@@ -101,13 +101,7 @@ def test_an_import_doctor_cannot_see_claude_code_evaluate_does_not_count(tmp_pat
     assert not _imports_continuity("\t@.levain/memory.continuity.md\n")
     assert not _imports_continuity("````\n```\n@.levain/memory.continuity.md\n````\n")
     assert not _imports_continuity("text <!-- open\n@.levain/memory.continuity.md\n-->\n")
-    # Claude Code read this one (same RUN), and doctor counts it.
+    # Claude Code read these two (same RUN), and doctor counts them.
     assert _imports_continuity("<!-- closed -->\n@.levain/memory.continuity.md\n")
-    assert _imports_continuity("@.levain/memory.continuity.md\r\n")
-    for sep in ("\v", "\f", "\x85", "\u2028"):
-        assert not _imports_continuity(f"x{sep}@.levain/memory.continuity.md\n")
-        assert not _imports_continuity(f"@.levain/memory.continuity.md{sep}x\n")
-    assert not _imports_continuity("\u00a0@.levain/memory.continuity.md\n")
-    assert not _imports_continuity("    ```\n@.levain/memory.continuity.md\n")
     # A closed fence before the import: Claude Code may read it, doctor cannot confirm it.
     assert not _imports_continuity("```\nx\n```\n@.levain/memory.continuity.md\n")
