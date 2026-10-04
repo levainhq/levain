@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.8] — 2026-10-04
+
+`levain wrap` stops claiming things the store does not show: after a stop, a failed save, or a failure while showing the result, its messages now say only what was established (and name the command that settles the rest), `--reset` clears a wrap whose episode list anneal cannot read, and the symlink-loop warning fires on Python 3.13 as on 3.12.
+
 ### Fixed
 
 - **`levain wrap --reset` could not clear a wrap whose episode list anneal could not read** (new in 0.5.7). Every wrap `levain wrap` opens is token-bound, so when the snapshot is unreadable `--reset` and the unattended discard now name the store's bound token and clear the wrap by that compare-and-swap, which still leaves any wrap that replaced it alone. (A wrap another program opened with a caller-supplied token is bound too, and is cleared the same way when it passes the same lock and age check.) A wrap with no token to name is refused as before, with the commands for that entity's store.
