@@ -1819,6 +1819,47 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# The bytes every release from v0.3.0 through v0.5.4 installed for each base verbatim
+# seed file, read from `git show <tag>:levain/templates/seed/<name>` across those tags.
+# Those releases recorded no hash for seed files, so this is how `levain update` tells
+# an unedited copy from an operator's edit on such an install. Frozen: from 0.5.5 on,
+# init and update record every base seed in the adapter receipt, so no later release
+# adds a row. tests/test_seed_refresh.py re-derives it from the tags when git has them.
+_RELEASED_BASE_SEED_SHA256: dict[str, frozenset[str]] = {
+    "seed/partnership.md": frozenset({
+        "6a56af919badacf27ff43d6aff1b022f7c2fd7674f8bb3b46ad02d270a820380",
+        "c906ac694a0ff60b3b19eaba7a15a9819993f205bb0445ee8ea333cd1dbe64ec",
+    }),
+    "seed/memory.md": frozenset({
+        "0397786e79cf6a30bf2b6adbd11d0f32da2e1b66f0e567f8f5fa587456a3b58b",
+        "d0fda4b4362b6944b7be4a608dce8dc6fd002f6e941250f044d37603fa12e4cb",
+        "884c95f0d8c74e30391bba3108013d712331ed34c2e4ea54add0e73beff15537",
+        "fb09110a644e26f885a5a273cdb23545753e35e4a0174363574f6587ea416e7b",
+        "daa5913e99f21cafd4b116a291895cc52e42a685d7e056e25aa1cd5c4851be19",
+    }),
+    "seed/spore_instructions.md": frozenset({
+        "e23c7a439c852ebbc872bb0a1b14e4ca24f1a01485e34059c9b12c1baab0b670",
+        "4b66417ef61a4e7c0fc3754d944967af94d819e93883bee6f263b8199a94a162",
+        "01e246c4df5ab23c6d83e5151b72e034e340be90b4421322e5d7699350b4dd56",
+    }),
+}
+
+
+def _base_seed_files(
+    install: Path, templates_root: Path, entries: Sequence[SeedEntry],
+) -> dict[Path, str]:
+    """The base layer's verbatim seed files among ``entries``, as ``{install target: the
+    text this levain ships}``. A file a pack supplies is left out (the pack reconcile owns
+    it), and so is every rendered file (the interview owns those)."""
+    base_seed = (templates_root / "seed").resolve()
+    files: dict[Path, str] = {}
+    for e in entries:
+        if e.is_render or e.path.resolve().parent != base_seed:
+            continue
+        files[install / "seed" / e.name] = e.path.read_text(encoding="utf-8")
+    return files
+
+
 def _adapter_local_files(
     adapter: str,
     install: Path,
@@ -1847,6 +1888,11 @@ def record_adapter_receipt(
     can tell an operator's edit from a file the package has since moved. Best-effort."""
     files = _adapter_local_files(adapter, install, templates_root / "adapters" / adapter,
                                  python_path, import_seed, on_demand_seed)
+    try:
+        files = {**files, **_base_seed_files(install, templates_root,
+                                             [*import_seed, *on_demand_seed])}
+    except (OSError, ValueError):
+        pass  # unrecorded seeds are treated as an older install's: staged, never clobbered
     if not files:
         return
     extra: dict[str, str] = {}
@@ -1916,10 +1962,15 @@ def refresh_adapter(
     already calls a stale one a pending upgrade; the old copy is backed up first.
     Nothing is ever replaced whole, so a file the operator added is never moved.
 
-    The seed files and the interview are not touched: the pack reconcile owns seeds. So
-    the carrier (CLAUDE.md / AGENTS.md, whose import list IS the seed set) is refreshed
-    only when the caller says the pack layer is settled (``carrier``) and every seed it
-    would import is on disk; otherwise it would load a seed the reconcile held back. An
+    The base layer's verbatim seed files (partnership.md, memory.md, ...) are decided the
+    same way, recorded in the adapter receipt. On an install from before that record, a
+    copy whose bytes equal what some earlier release shipped (``_RELEASED_BASE_SEED_SHA256``)
+    is replaced, with the old copy kept under ``.levain/backups/seed/``; any other copy is
+    staged. Rendered seeds and a pack's seeds are not touched: the interview and the pack
+    reconcile own those. So the carrier (CLAUDE.md / AGENTS.md, whose import list IS the
+    seed set) and the base seeds are refreshed only when the caller says the pack layer is
+    settled (``carrier``) and every seed the carrier would import is on disk; otherwise it
+    would load a seed the reconcile held back. An
     activation file a drifted pack changed is never refreshed here: the pack reconcile owns
     it and lists it for review.
     Codex's machine-global hooks.json is handled only when it already names this
@@ -1931,7 +1982,7 @@ def refresh_adapter(
     install = install.resolve()  # every path compare below is against resolved paths
     out = AdapterRefresh()
     adapter = effective_adapter(install)
-    if adapter not in ("claude-code", "codex"):
+    if adapter not in ("claude-code", "codex", "openhands"):
         return out
     recorded, status = manifest.read_pack_locks_status(install)
     pack_dirs = [Path(p.source) for p in recorded]
@@ -1941,6 +1992,8 @@ def refresh_adapter(
              "gone, so the install cannot be re-composed faithfully. Restore it, or "
              "re-onboard (`levain init --force`).")
         return out
+    if adapter == "openhands":  # hookless: its seed files are all there is to refresh
+        return _refresh_seeds_only(install, pack_dirs, apply=apply, emit=emit, carrier=carrier)
     python_path = sys.executable
     anneal_path = manifest.resolve_anneal_bin()
     lines: list[str] = []
@@ -1986,6 +2039,15 @@ def refresh_adapter(
             files = {t: x for t, x in files.items() if t.name != carrier_name}
             lines.append(f"  {carrier_name}: not refreshed, because {held}; re-onboard "
                          f"(`levain init --force`) or settle that first.")
+        else:
+            try:
+                files = {**files, **_base_seed_files(
+                    install, templates_root,
+                    [*import_entries(roster), *on_demand_entries(roster)])}
+            except (OSError, ValueError) as e:
+                out.review.append("seed")
+                lines.append(f"  seed files: not refreshed, because this levain's copies "
+                             f"could not be read ({e}).")
         if adapter == "codex":
             hooks = _codex_home() / "hooks.json"
             want = _codex_hooks_json(adapter_root, python_path, install)
@@ -2009,6 +2071,44 @@ def refresh_adapter(
                                   lines=lines)
     if out.refreshed or lines:
         emit(f"\n• adapter files ({adapter}):")
+        verb = "refreshed" if apply else "would refresh"
+        for rel in out.refreshed:
+            emit(f"  {rel}: {verb} to this levain's version")
+        for ln in lines:
+            emit(ln)
+    return out
+
+
+def _refresh_seeds_only(
+    install: Path, pack_dirs: Sequence[Path], *, apply: bool, emit: Callable[[str], None],
+    carrier: bool,
+) -> AdapterRefresh:
+    """:func:`refresh_adapter` for a hookless (OpenHands) install: the base verbatim seeds,
+    by the same decision and receipt, and nothing else (it has no activation tree and no
+    adapter files). Held on the same conditions as the carrier."""
+    out = AdapterRefresh()
+    lines: list[str] = []
+    with _templates_root() as templates_root:
+        try:
+            roster = compose_roster([templates_root, *pack_dirs])
+            entries = [*import_entries(roster), *on_demand_entries(roster)]
+            files = _base_seed_files(install, templates_root, entries)
+        except (PackError, InitError, OSError, ValueError) as e:
+            out.review.append("seed")
+            emit(f"\n• seed files NOT refreshed: the package could not be composed ({e}).")
+            return out
+        missing = sorted(e.name for e in entries if not (install / "seed" / e.name).is_file())
+        if not carrier:
+            lines.append("  seed files: not refreshed, because the pack reconcile above is "
+                         "holding seed changes for review.")
+        elif missing:
+            out.review.append("seed")
+            lines.append(f"  seed files: not refreshed, because seed file(s) are missing: "
+                         f"{', '.join(missing)}; re-onboard (`levain init --force`).")
+        else:
+            _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
+    if out.refreshed or lines:
+        emit("\n• seed files:")
         verb = "refreshed" if apply else "would refresh"
         for rel in out.refreshed:
             emit(f"  {rel}: {verb} to this levain's version")
@@ -2420,6 +2520,13 @@ def _refresh_adapter_files(
             # release's render, not an operator's file. Anything else is staged. The old
             # copy is still kept.
             action = "write_backup"
+        released_copy = False
+        if (action == "pending" and key not in record and here is not None
+                and _sha256_text(here_text) in _RELEASED_BASE_SEED_SHA256.get(key, ())):
+            # No record (an install from before seeds were recorded), and the bytes are
+            # exactly what an earlier release installed: levain's copy, unedited.
+            action = "write_backup"
+            released_copy = True
         if action == "keep":
             continue
         if action == "current":
@@ -2449,10 +2556,24 @@ def _refresh_adapter_files(
                 _write_codex_hooks(target, want_text, lines.append)  # backs up itself
             else:
                 if action == "write_backup" and here_text is not None:
-                    backup = _timestamped_backup_path(target)
+                    is_seed = key.startswith("seed/")
+                    if is_seed:
+                        # Not beside it: seed/ is the entity's own directory.
+                        _ensure_gitignored(install / ".levain", "backups/")
+                        backup = install.joinpath(
+                            ".levain", "backups", "seed",
+                            f"{target.name}.{time.time_ns()}")
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        backup = _timestamped_backup_path(target)
                     shutil.copy2(target, backup)
-                    lines.append(f"  {key}: levain has no record of writing it, so the "
-                                 f"previous copy is kept at {backup.name}")
+                    shown = backup.relative_to(install) if is_seed else backup.name
+                    if released_copy:
+                        lines.append(f"  {key}: an earlier release's copy, unedited; kept "
+                                     f"at {shown}")
+                    else:
+                        lines.append(f"  {key}: levain has no record of writing it, so the "
+                                     f"previous copy is kept at {shown}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_text(target, want_text)
             new_receipt[key] = _sha256_text(want_text)

@@ -303,7 +303,7 @@ def test_doctor_carrier_freshness_passes_on_a_current_carrier(tmp_path: Path):
     install = tmp_path / "ent"
     install.mkdir()
     (install / "CLAUDE.md").write_text(
-        "# Partnership\n\n@seed/origin.md\n@seed/memory.md\n\n"
+        "# Partnership\n\n@seed/origin.md\n@seed/memory.md\n\n@.levain/memory.continuity.md\n\n"
         "## Read these when you need them\n\n"
         "- `seed/spore_instructions.md` — plant one with `spore_add`.\n",
         encoding="utf-8",

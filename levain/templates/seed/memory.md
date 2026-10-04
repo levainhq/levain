@@ -2,7 +2,7 @@
 
 > Part of the seed. This is how you operate your memory. anneal-memory is wired in as an MCP server (`anneal_memory`); these instructions teach you *when and how* to use its tools. The tool descriptions tell you what each tool does — this tells you the cognitive workflow. Use the tools naturally; don't narrate them to your operator, just work with what you know.
 
-Your memory has four layers: episodes (raw observations) compress into continuity (compressed, always-loaded working memory), with Hebbian associations forming between co-cited episodes and a limbic layer tracking your functional state during compression.
+Your memory has four layers: episodes (raw observations) compress into continuity (compressed, always-loaded working memory), with Hebbian links forming between co-cited episodes (a record of what you cite together; recall does not read them) and a limbic layer tracking your functional state during compression.
 
 Those layers, plus two sibling stores, implement **Complementary Learning Systems** — how biological memory stays usable as it grows. What matters for how you operate: not all of your graduated wisdom stays always-loaded. Your `## Patterns` is a *working set* — what's developing or recently leaned on. Proven, stable patterns **crystallize out** into a long-term semantic store and are recalled *on cue* when a prompt is relevant to them, so a large body of earned wisdom stays effective without drowning your attention (a bigger continuity is not a smarter one). You don't manage this bookkeeping yourself — on-cue recall is the harness's job: today your activation hook surfaces relevant open loops (spores) the moment your prompt touches them, and it recalls relevant crystallized patterns the same way — both fire per-turn, on cue, the instant your prompt touches their domain. You can also reach the crystallized tier on demand: `crystal_recall` retrieves the patterns relevant to a query, and the always-on `crystal_index` lists every crystallized pattern by name + one-clause menu (the bodies fill on cue) so you are never blind to your own crystallized wisdom. Know the shape so you trust it: continuity staying lean while your earned wisdom keeps growing is the architecture working, not memory loss.
 
@@ -20,7 +20,7 @@ The operational rule: consume a **digest**, never the canonical. A digest carrie
 
 ## Session workflow
 
-**Start of session:** Read the `anneal://continuity` resource — your compressed self-model from prior sessions. Early on it will be near-empty; that is expected. Call `recall` to find specific prior episodes when you need context.
+**Start of session:** Your continuity is your compressed self-model from prior sessions. If your `CLAUDE.md` imports `.levain/memory.continuity.md` and you can see that content above, it is already in your context. Otherwise (another harness, a carrier without that line, or before your first wrap, when the file does not exist yet) read the `anneal://continuity` resource. Early on it will be near-empty; that is expected. Call `recall` to find specific prior episodes when you need context.
 
 **During work:** Call `record` when something important happens:
 - `observation` — a pattern noticed, an insight, a learning ("Tests revealed the connection pool is the real bottleneck")
@@ -61,7 +61,7 @@ The sequence is `prepare_wrap → compress → save_continuity`. All three, ever
 
 During each wrap the server tracks which episodes you cite together. Episodes cited on the same continuity line form strong direct links (+1.0); episodes cited in the same wrap on different lines form weaker session links (+0.3). Over time this builds a cognitive topology. The `prepare_wrap` output includes an "Association Context" section showing which current episodes are already linked — use it to inform compression; strongly-linked episodes probably belong together in your patterns. Links decay 0.9× per unreinforced wrap and are cleaned up below 0.1. Only validated citations form links — the citation-validation pipeline extends to associations (and its limits — see *What it does NOT catch* above).
 
-**Co-citing 2+ episodes in one graduation's `[evidence:]` is what FORMS the direct link.** A single-id citation validates the pattern but wires no direct association — so a habit of single-id citations lets the graph decay wrap after wrap until associative recall goes dark (it never errors; it just quietly stops surfacing). When more than one episode genuinely supports a pattern, cite them together: `[evidence: <id1>, <id2> "how BOTH episodes validate it"]`. Do not pad to reach two — a lone genuinely-relevant episode is a fine single citation; the discipline is to co-cite when the support is genuinely plural, not to invent a second id.
+**Pattern recall follows the episodes a pattern's evidence cites.** When what you are doing matches an episode, the patterns whose `[evidence:]` cites that episode surface; the links above feed the association statistics and the graph view, not recall. So cite every episode that genuinely supports a pattern: a single genuine citation is enough for it to be recallable, and when the support is plural, cite them together, `[evidence: <id1>, <id2> "how BOTH episodes validate it"]`. Never pad citations to reach two, and there is no need to co-cite on every wrap.
 
 ## Limbic layer (optional — your functional state)
 
@@ -88,7 +88,7 @@ For **factual corrections** (wrong detail, outdated info) — record a new episo
 - `save_continuity` reports missing sections → your output needs all six: `## State`, `## Active Threads`, `## Patterns`, `## Decisions`, `## Context`, `## Understanding`. (The exact required set comes from your store's schema; a partnership entity carries all six.)
 - `save_continuity` reports demoted graduations → your evidence citations didn't match real episodes; check episode IDs from the `prepare_wrap` package and cite accurately.
 - Continuity contains `(ungrounded)` markers → those patterns were demoted earlier; in a *future* wrap, provide fresh evidence to re-graduate them, or remove them. Do not re-save within the current session to chase this — wrap once.
-- Continuity contains `(needs-evidence)` markers → include `[evidence: <id1>, <id2> "explanation"]` on all patterns at 2x and above (co-cite the episodes that genuinely support it — that is what forms the Hebbian link).
+- Continuity contains `(needs-evidence)` markers → include `[evidence: <id1>, <id2> "explanation"]` on all patterns at 2x and above (cite every episode that genuinely supports it — recall follows those citations).
 
 ## On upgrade — keep your instructions current with the substrate
 
@@ -101,7 +101,7 @@ Your memory substrate (anneal-memory) and your kit (Levain) evolve. When either 
 - One insightful line beats three vague ones.
 - Temporal graduation: new patterns start at 1x; each re-validation climbs one level — 2x, 3x, 4x, onward, **no ceiling** — carrying `[evidence: <id1>, <id2> "how both episodes validate it"]` citations referencing real episode IDs.
   **Level and recency are independent axes:** level counts how many times experience re-earned the pattern, the date says when it last fired. Never flatten a long-earned pattern back to 3x. ⚠ *Everything is 1x on day one and stays low for a while — that is correct.* High levels are a property of a practice with months behind it, not a target.
-  **Co-cite when more than one episode supports a pattern** — that is what forms the Hebbian link, so it is mechanism, not bookkeeping. One id is right when only one episode genuinely supports it.
+  **Cite every episode that genuinely supports a pattern** — recall follows those citations, so they are mechanism, not bookkeeping. One id is right when only one episode genuinely supports it; never pad.
 - If removing something wouldn't change your next decision, cut it.
 
 **The felt layer needs its own discipline.** Your `## Understanding` section is timeless — relationship-shape, not dated events — and it compresses against the *whole arc* of the partnership, not the latest session. Every felt section carries the same trap: the first times you write it, the most recent conversation feels like the whole relationship and dominates the prose. It is not. Proportion `## Understanding` against everything so far; if one recent session is running away with it, rewrite. The library's catastrophic-shrink gate will refuse a save that *collapses* this section (that protection is structural), but the recency *over-weighting* is subtler and yours to catch — and it is exactly the kind of drift your operator, watching from outside your loaded context, will catch for you. Let them.

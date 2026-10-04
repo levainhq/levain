@@ -1396,6 +1396,34 @@ def _check_openhands(install: Path) -> list[CheckResult]:
     ]
 
 
+# The Claude Code carrier's import of the live continuity, exactly as the template writes it.
+CONTINUITY_IMPORT = "@.levain/memory.continuity.md"
+
+
+def _imports_continuity(text: str) -> bool:
+    """Whether doctor can CONFIRM the carrier imports the continuity: the import on a line of its
+    own (``./`` allowed, fewer than four leading spaces and no tab), and no line before it that
+    opens a code fence or leaves an HTML comment open.
+
+    A bound, not a Markdown parser. Tracking fences and comments the way Claude Code does was
+    defeated three ways in one round, each RUN against Claude Code (gemini, the 0.5.5 L3): a
+    tab-indented import, a ```` fence around a ``` fence, a comment opened mid-line. Each was
+    ignored by Claude Code and counted by doctor. So any fence before the import, or any comment
+    left open on its line, means doctor cannot confirm it, and says so: for those shapes, a false
+    warning rather than a false all-clear. The levain-written carrier has neither before the import."""
+    wanted = {CONTINUITY_IMPORT, "@./" + CONTINUITY_IMPORT[1:]}
+    for line in text.splitlines():
+        stripped = line.strip()
+        lead = line[: len(line) - len(line.lstrip())]
+        if stripped in wanted and "\t" not in lead and len(lead) < 4:
+            return True
+        if stripped.startswith(("```", "~~~")):
+            return False
+        if "<!--" in line and "-->" not in line.rsplit("<!--", 1)[1]:
+            return False
+    return False
+
+
 def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
@@ -1431,13 +1459,22 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
         for name in ON_DEMAND_SEED
         if f"@seed/{name}" in text or f". `seed/{name}`" in text
     ]
+    # A Claude Code carrier written before 0.5.5 does not import the live continuity, so the
+    # entity starts each session without its memory unless it thinks to read it (1003+21's
+    # demo runs: memory read on 4-5 of 8 days). Same remedy: `levain update` rewrites it.
+    problems: list[str] = []
     if stale:
+        problems.append("eagerly loads seed file(s) now classified on-demand: " + ", ".join(stale))
+    if carrier.name == "CLAUDE.md" and not _imports_continuity(text):
+        problems.append(f"does not import the living memory ({CONTINUITY_IMPORT}) where "
+                        "doctor can confirm Claude Code reads it (a line of its own, above any "
+                        "code block or open HTML comment), so a session may start without it")
+    if problems:
         return [
             CheckResult(
                 f"{carrier.name} freshness",
                 False,
-                "eagerly loads seed file(s) now classified on-demand: "
-                + ", ".join(stale),
+                "; ".join(problems),
                 f"This install predates the change. Run `levain update --path "
                 f"{install}`: it rewrites {carrier.name} if it is still the copy levain "
                 f"wrote. If you edited it, or levain has no record of writing it, the "
@@ -1847,6 +1884,12 @@ def _check_context_surface(install: Path, carrier: Path) -> list[CheckResult]:
 
     by_role: dict[str, int] = {}
     total = len(text.encode("utf-8"))  # the carrier itself loads too
+    if _imports_continuity(text):
+        try:   # the living memory loads every session too; absent until the first wrap
+            by_role["living memory"] = (install / CONTINUITY_IMPORT[1:]).stat().st_size
+            total += by_role["living memory"]
+        except OSError:
+            pass
     seen: set[str] = set()
     for name in names:
         if name in seen:

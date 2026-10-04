@@ -424,9 +424,10 @@ def verbatim_names(roster: Sequence[SeedEntry]) -> list[str]:
 # the roster IS imported — a pack's new methodology file loads by DEFAULT (fail
 # toward loading: a seed file that installs to disk but never reaches context is
 # the invisible-infrastructure failure the adapter import list exists to prevent).
-#   - continuity.md is the entity's living memory; it loads through the
-#     anneal-memory server (the ``anneal://continuity`` resource), not as a static
-#     context file. Importing it as static text would fork the memory surface.
+#   - continuity.md is the seed's starting template for the living memory, not the
+#     memory itself. The live file is ``.levain/memory.continuity.md``, the one the
+#     anneal-memory server serves as ``anneal://continuity``; the claude-code carrier
+#     imports THAT file, so there is one memory surface.
 #   - README.md documents the seed directory for a human browsing it; it is not
 #     entity context.
 NON_IMPORT_SEED: tuple[str, ...] = ("continuity.md", "README.md")

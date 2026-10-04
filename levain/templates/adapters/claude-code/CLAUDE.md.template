@@ -12,9 +12,10 @@ Edit the seed files themselves, not these import lines.
 
 {{SEED_IMPORTS}}
 
-<!-- seed/continuity.md is intentionally not imported here — it is the entity's
-     living memory and loads through the anneal-memory server (the
-     anneal://continuity resource), not as a static context file. -->
+Your living memory: what you and your operator have done, decided and learned,
+recomposed by every `levain wrap`. It loads at the start of every session.
+
+@.levain/memory.continuity.md
 
 {{SEED_ON_DEMAND}}
 

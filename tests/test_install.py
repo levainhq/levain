@@ -1339,8 +1339,10 @@ def test_apply_init_generates_claude_seed_imports_byte_identical(tmp_path: Path,
     # the first half would pass for a file that vanished from the install entirely.
     assert "@seed/spore_instructions.md" not in got
     assert "`seed/spore_instructions.md`" in got
-    # the surrounding template prose survives — not just the generated block
-    assert "anneal://continuity resource" in got
+    # the surrounding template prose survives — not just the generated block — and the
+    # live continuity loads at session start as its own import line (1003+21's demo runs:
+    # without it the agent read its memory on 4-5 of 8 days)
+    assert "\n@.levain/memory.continuity.md\n" in got
 
 
 def test_apply_init_generates_codex_seed_imports_byte_identical(tmp_path: Path, monkeypatch):

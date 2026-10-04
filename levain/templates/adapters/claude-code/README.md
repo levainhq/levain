@@ -19,7 +19,7 @@ post-v1 item.)
 
 > **This README documents the adapter and a manual install path for dogfooding
 > it.** The supported end-to-end install — running an interview to fill the
-> seed templates, initializing the store, loading the continuity scaffold,
+> seed templates, initializing the store,
 > resolving the placeholder tokens below — is `levain init` (build step 4).
 > Until that ships, the manual sequence here stands up a working install.
 
@@ -103,7 +103,9 @@ only if the server is registered under exactly that name. `mcp.template.json`
 ships the correct registration; do not rename the server.
 
 The store is pinned to **`.levain/memory.db` inside the install** — see
-*Store scoping* below.
+*Store scoping* below. Its continuity, `.levain/memory.continuity.md`, is also
+imported by `CLAUDE.md`, so once the first `levain wrap` has written it, it is in context
+from the first turn of every session.
 
 ## Prerequisites
 
@@ -139,10 +141,10 @@ The store is pinned to **`.levain/memory.db` inside the install** — see
 7. **Start a Claude Code session** in the partnership directory.
 
 `levain init` (build step 4) automates steps 2–6, resolves the placeholder
-tokens, fills `world.md`/`origin.md` from an interview, and loads
-`seed/continuity.md` into the store. In this manual path the entity starts
-from an empty continuity — the expected near-empty start anyway
-(`seed/memory.md`: "early on it will be near-empty").
+tokens, fills `world.md`/`origin.md` from an interview, and initialises the
+store. Either way the entity starts with no continuity: the first `levain wrap`
+writes `.levain/memory.continuity.md`, and until then the `CLAUDE.md` import of
+it is skipped (`seed/memory.md`: "early on it will be near-empty").
 
 ## First-run approvals
 
@@ -202,9 +204,10 @@ MCP server and the hooks will read different stores.
   directives do not leak into contexts that must stay independent. A typical
   operator never needs to set it.
 - **The `CLAUDE.md` `@`-import list is curated.** It imports four seed files;
-  `seed/continuity.md` is intentionally *not* imported — it is the entity's
-  living memory and loads through the anneal-memory server, not as a static
-  context file. If you add a seed file, add it to `CLAUDE.md`. The seed files
+  `seed/continuity.md` is intentionally *not* imported — it is only the starting
+  template for the living memory. The living memory itself,
+  `.levain/memory.continuity.md`, IS imported, so after the first wrap it is in
+  context from the first turn. If you add a seed file, add it to `CLAUDE.md`. The seed files
   must not `@`-import *each other* — they cross-reference by section title,
   which is what keeps them placement-agnostic.
 

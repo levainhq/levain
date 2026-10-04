@@ -179,6 +179,12 @@ def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypat
     assert manifest.read_lock(tmp_path) is not None
 
 
+def _above(version: str) -> str:
+    """The next patch above ``version``: a marker genuinely ahead of it, derived, never a literal."""
+    a, b, c = (int(x) for x in version.split(".")[:3])
+    return f"{a}.{b}.{c + 1}"
+
+
 def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
     # A store whose marker is ALREADY ahead of the ack target must NOT be lowered.
     #
@@ -193,7 +199,7 @@ def test_record_compat_lock_ack_is_advance_only(tmp_path, monkeypatch):
     # STRICTLY AHEAD, derived: the marker is at KNOWN_GOOD (above the reconciled cap), so
     # ack_target = min(cap, installed) = cap, and acked > cap is the shape under test.
     store = _store(tmp_path)
-    ahead_of_target = manifest.KNOWN_GOOD_ANNEAL
+    ahead_of_target = _above(manifest.TEMPLATES_RECONCILED_ANNEAL)
     assert manifest._cmp(ahead_of_target, manifest.TEMPLATES_RECONCILED_ANNEAL) == 1, (
         "this test is only non-vacuous while the known-good runtime is AHEAD of the reconciled "
         "cap; if they converge, pick a genuinely higher marker rather than pinning a literal"
@@ -308,7 +314,8 @@ def test_template_ack_target_caps_and_skips():
     # Reconciled target when installed is at/above it; capped at installed when
     # older; skipped when unknown. Exercises the 0.9.6 boundary explicitly.
     assert manifest.template_ack_target("0.10.0") == manifest.TEMPLATES_RECONCILED_ANNEAL
-    assert manifest.template_ack_target("0.9.7") == manifest.TEMPLATES_RECONCILED_ANNEAL  # just above -> cap
+    cap = manifest.TEMPLATES_RECONCILED_ANNEAL
+    assert manifest.template_ack_target(_above(cap)) == cap  # just above -> cap
     assert manifest.template_ack_target(manifest.TEMPLATES_RECONCILED_ANNEAL) == \
         manifest.TEMPLATES_RECONCILED_ANNEAL                  # exactly at the cap -> the cap
     assert manifest.template_ack_target("0.9.5") == "0.9.5"   # the old known-good, now below the cap -> installed
@@ -318,8 +325,8 @@ def test_template_ack_target_caps_and_skips():
     # Pre-release / post / local label of the cap: version_tuple collapses the suffix
     # so it compares EQUAL to the cap, but the ack records the EXACT runtime, never
     # the bare final cap label (codex L3 — init must mirror update._ack_target).
-    assert manifest.template_ack_target("0.9.6rc1") == "0.9.6rc1"
-    assert manifest.template_ack_target("0.9.6.post1") == "0.9.6.post1"
+    assert manifest.template_ack_target(cap + "rc1") == cap + "rc1"
+    assert manifest.template_ack_target(cap + ".post1") == cap + ".post1"
 
 
 # Per-MANIFEST-ENTRY coverage sentinels: feature-code → a literal string that MUST
@@ -347,7 +354,8 @@ _COVERAGE_SENTINELS = {
     "AM-MIGRATE-NOTIFY": ("memory.md", "levain update"),               # the upgrade habit
     "AM-CRYSTAL": ("memory.md", "crystallization candidates"),         # crystallize-OUT routing
     "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
-    "AM-LINKGATE": ("memory.md", "Co-citing 2+ episodes"),             # co-citation, not single-id
+    "AM-LINKGATE": ("memory.md", "[evidence: <id1>, <id2>"),           # the honest multi-episode example
+    "AM-HOP-RETIRED": ("memory.md", "recall follows the episodes a pattern's evidence cites"),
 }
 # EXPLICIT allowlist of entries that genuinely require NO template edit, so "no
 # sentinel" is a reviewed decision rather than an omission.
@@ -423,9 +431,17 @@ def test_seed_templates_carry_the_reconciled_guidance():
     # in the file that OWNS it, for the same reason as every sentinel above.
     linkgate_owner = _COVERAGE_SENTINELS["AM-LINKGATE"][0]
     assert "[evidence: <id1>, <id2>" in seed_files[linkgate_owner], (
-        f"the co-citation example must live in {linkgate_owner} — a single-id example there "
-        "would teach the exact habit AM-LINKGATE exists to end"
+        f"the honest multi-episode evidence example must live in {linkgate_owner} (one genuine "
+        "citation is enough since anneal 0.9.26; the example shows how to cite plural support)"
     )
+
+    # AM-HOP-RETIRED (0.9.26), the negative half: recall no longer reads links, so the seed must
+    # not say co-citing keeps recall alive or that recall goes dark without it.
+    for retired in ("associative recall goes dark", "that is what forms the Hebbian link",
+                    "Co-citing 2+ episodes in one graduation", "allow_unlinked"):
+        for name, text in seed_files.items():
+            assert retired.lower() not in text.lower(), (
+                f"{name} still teaches the retired claim {retired!r}")
 
 
 def test_am_wrap_generated_inline_end_state_is_structurally_guarded():
