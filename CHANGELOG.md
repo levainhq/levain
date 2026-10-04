@@ -20,6 +20,8 @@ Team context: one project's decisions shared across a team of engineers, with gi
 - **`levain team export --jsonl`**: every verified entry, per file in file order, for anneal-memory's team import (`--in-force` for the current view). `tests/test_team_golden.py` pins the canonical-JSON and hash bytes.
 - **Optional anneal import.** At session start, if the installed anneal-memory ships `anneal_memory.team` and a store is configured (`--anneal-db`, or `<repo>/.levain/memory.db`), the ledger is imported once per ledger tree with `--link-authority <owner>`; otherwise it is skipped and `levain team doctor` says which. `LEVAIN_TEAM_ANNEAL_IMPORT=off` disables it.
 
+- **A forged ledger line is one reported problem, never a failed read.** Lines are parsed through one bounded entry point: nesting past 32, lines past 256K characters, stray closers, CPython's integer-digit limit and lone surrogates are each refused for that line alone, its neighbours verify exactly as if it were absent, and the PreToolUse hook therefore cannot be stopped by one forged line on the `levain-ledger` branch. (A line nested ~200,000 brackets deep otherwise raises RecursionError out of every read, and has run for minutes in `json.loads` on Windows.) The misfiled-entry filter is linear in a hostile file. Review: three lineages over three rounds, each round's pre-registration in the fan-in log.
+
 ### Known limits
 
 - Identity is the author email on each commit, mapped through `team.toml`. Anyone can set it, so levain detects and reports; it does not authenticate. A teammate who sets their git email to the owner's can act as the owner. Authentication is the git host's job (branch protection, required signed commits); levain does not check signatures.

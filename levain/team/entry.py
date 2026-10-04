@@ -276,8 +276,10 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 def _printable(text: str) -> str:
     """Hostile text made safe to carry in a problem string: no lone surrogate (it cannot be encoded to UTF-8, so
-    it would crash the canon write and the print of the very report that names the line), and bounded length."""
-    return text.encode("utf-8", "replace").decode("utf-8")[:300]
+    it would crash the canon write and the print of the very report that names the line), and bounded length. The
+    middle is elided, never the tail: a hostile id leads the string and the reason for the problem ends it."""
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    return text if len(text) <= 300 else text[:150] + "..." + text[-147:]
 
 
 def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:

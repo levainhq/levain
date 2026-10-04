@@ -478,3 +478,10 @@ def test_misfiled_entries_are_filtered_without_pairwise_comparison(monkeypatch):
     led = I.build([("ana/d.jsonl", ["{}"])], "ana")
     assert not led.entries and sum("filed under" in p for p in led.problems) == 300
     assert len(compared) == 0
+
+
+def test_a_long_hostile_id_does_not_hide_the_reason():
+    forged = {"id": "x" * 5000, "prev": "", "hash": "0" * 64}
+    _, problems, _ = E.verify_lines([json.dumps(forged)])
+    assert problems and all(len(p) <= 300 for p in problems)
+    assert any(p.endswith("edited after it was written)") or "hash mismatch" in p for p in problems)
