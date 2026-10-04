@@ -743,3 +743,16 @@ def test_a_checkout_that_fails_after_the_replay_published_keeps_the_discard_warn
     assert "were discarded" in err
     assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+
+
+def test_a_failing_commit_hook_cannot_make_the_replay_drop_an_entry(two):
+    # git 2.50 runs no commit hook on a clean cherry-pick, so this guards a git that does (it cannot fail today)
+    gl, ana = _conflicting_replay(two)
+    hooks = Path(git("rev-parse", "--git-common-dir", cwd=gl.wt).strip())
+    hooks = (hooks if hooks.is_absolute() else gl.wt / hooks) / "hooks"
+    hooks.mkdir(exist_ok=True)
+    hook = hooks / "prepare-commit-msg"
+    hook.write_text("#!/bin/sh\ngit restore --staged --source=HEAD -- . 2>/dev/null\nexit 1\n")
+    hook.chmod(0o755)
+    assert team("sync", repo=ana) == 0
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1

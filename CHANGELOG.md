@@ -14,7 +14,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - Local commits are replayed in topological order (`--topo-order`), so skewed commit clocks cannot reorder them.
   - If the replay was published but the worktree could not be moved back onto the branch, the discard warning is still printed (it used to be lost with the error), the checkout is retried forced, and only if that fails too does the error name the `git checkout -f` to run.
   - A failure while re-attaching the worktree after a failed replay no longer replaces the error that caused the replay to fail; it is reported as a warning that the worktree was left detached and that the next command re-attaches it.
-  The hardening items were reasoned from review, not reproduced end to end against a real rerere or hook setup; each is pinned by a test that injects the failing git result and fails on 0.6.0.
+  The rerere skip itself (a copied `.git` plus rerere autoupdate) was reasoned from review and not reproduced; the flags are pinned by a test that reads the git command lines. The wrong-cause, stale-marker, re-attach and post-publish cases are pinned by tests that inject the failing git result and fail on 0.6.0; the "already upstream" skip is pinned by a real git run. Known limits: if both the checkout and the forced re-attach fail, the error names the first failure only; a conflict in the replay is reported as "git could not run: <git's last line>".
 
 ## [0.6.0] — 2026-10-04
 
