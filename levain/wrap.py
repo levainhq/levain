@@ -302,7 +302,7 @@ def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
     return token, store.get_wrap_started_at()  # type: ignore[attr-defined]
 
 
-def _discard_prior_wrap(store: object, prior_token: str | None, *, reset: bool) -> None:
+def _discard_prior_wrap(store: object, prior_token: str | None) -> bool:
     """Clear the PRIOR run's wrap that this run found open (``--reset``, or the unattended self-heal).
 
     Always by the token observed with the wrap's age (:func:`_observe_prior_wrap`), never a bare
@@ -311,22 +311,22 @@ def _discard_prior_wrap(store: object, prior_token: str | None, *, reset: bool) 
     cleared. Partial wrap metadata has no token to name, so it is cleared only while still partial.
     Whether the observed wrap is an orphan is the caller's call (the lock and the age test, or the
     operator's ``--reset``); anneal's compare-and-swap lets a caller that names a token clear it.
-    A wrap whose metadata could not be read (no token) is cleared by ``--reset`` with ``force``,
-    the operator's explicit recovery, and by the unattended seat only while still partial. A wrap
-    that went idle between the observation and the cancel is already discarded."""
+    A wrap whose metadata could not be read (no token) is cleared only while anneal still calls
+    it partial: forcing here would clear whatever wrap replaced the one observed, and there is no
+    token to compare. A wrap that went idle between the observation and the cancel is already
+    discarded. Returns True when this call cleared a wrap, False when there was none left."""
     from anneal_memory import WrapOwnershipError
 
     try:
         if prior_token:
             store.wrap_cancelled(expect_token=prior_token)  # type: ignore[attr-defined]
-        elif reset:
-            store.wrap_cancelled(force=True)  # type: ignore[attr-defined]
         else:
             store.wrap_cancelled(expect_partial=True)  # type: ignore[attr-defined]
     except WrapOwnershipError as exc:
-        if exc.actual is None and not getattr(exc, "partial_state", False):
-            return   # idle: nothing left to discard
+        if exc.actual is None and not exc.partial_state:
+            return False   # idle: nothing left to discard
         raise
+    return True
 
 
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
@@ -699,12 +699,16 @@ def _consolidate(
                 )
                 return 2
             try:
-                _discard_prior_wrap(store, prior_token, reset=reset)
+                discarded = _discard_prior_wrap(store, prior_token)
             except WrapOwnershipError:
-                print("levain wrap: the prior wrap was replaced by another consolidate while it was "
-                      "being discarded; nothing of it was cleared. Re-run in a moment.")
+                print("levain wrap: the prior wrap was not cleared: another consolidate replaced it, "
+                      "or its metadata cannot be read. Nothing was changed. Re-run in a moment; if "
+                      "it persists, inspect it with `anneal-memory wrap-status` and clear a dead one "
+                      "with `anneal-memory wrap-cancel`.")
                 return 2
-            if unattended and not reset:
+            if not discarded:
+                print("levain wrap: the prior wrap was already gone; continuing.")
+            elif unattended and not reset:
                 # SAID, not silent: a seat that keeps self-healing is a seat whose consolidates keep
                 # dying, and the log is the only place an operator can notice that pattern.
                 print(

@@ -440,9 +440,9 @@ def test_a_peers_fresh_wrap_that_replaces_the_orphan_mid_discard_is_never_cancel
     else:
         real_discard = wrapmod._discard_prior_wrap
 
-        def swap_then_discard(store, token, **kw):
+        def swap_then_discard(store, token):
             peer_replaces_the_wrap()
-            return real_discard(store, token, **kw)
+            return real_discard(store, token)
 
         monkeypatch.setattr(wrapmod, "_discard_prior_wrap", swap_then_discard)
 
@@ -463,40 +463,15 @@ def test_a_prior_wrap_that_goes_idle_before_the_discard_is_already_discarded(tmp
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
     real_discard = wrapmod._discard_prior_wrap
 
-    def idle_then_discard(store, token, **kw):
+    def idle_then_discard(store, token):
         with Store(str(db), section_schema=None) as peer:
             peer.wrap_cancelled(force=True)
-        return real_discard(store, token, **kw)
+        return real_discard(store, token)
 
     monkeypatch.setattr(wrapmod, "_discard_prior_wrap", idle_then_discard)
     rc = wrap_entity(ent, unattended=True) if kind == "unattended self-heal" else wrap_entity(ent, reset=True)
     assert rc == 0
     assert (ent / ".levain" / "memory.continuity.md").exists()
-
-
-def test_reset_clears_a_prior_wrap_whose_metadata_cannot_be_read(tmp_path, monkeypatch):
-    """complement MED (0.5.7 r1): with no readable token the discard asked anneal for a partial-state
-    cancel, which refuses a wrap that is not partial, and `--reset` then looped on a message that
-    named `--reset` as the cure. `--reset` is the operator's explicit recovery: it forces."""
-    import sys
-    from anneal_memory import StoreError
-
-    ent = _openhands_entity(tmp_path)
-    db = _with_store(ent)
-    _strand_a_wrap(db, bound=True)
-    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
-    real = Store.load_wrap_snapshot
-
-    def unreadable_for_levain(self):
-        if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
-            raise StoreError("simulated unreadable wrap metadata")
-        return real(self)
-
-    monkeypatch.setattr(Store, "load_wrap_snapshot", unreadable_for_levain)
-    assert wrap_entity(ent, reset=True) == 0
-    monkeypatch.undo()
-    with Store(str(db), section_schema=None) as store:
-        assert store.get_wrap_started_at() is None
 
 
 @pytest.mark.parametrize("kind", ["unattended self-heal", "operator --reset"])
