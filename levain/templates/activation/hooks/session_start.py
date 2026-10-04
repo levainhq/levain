@@ -70,6 +70,14 @@ def main() -> int:
         if not hook.should_fire():
             return 0
 
+        # The auto-memory mirror's start sweep (catches edits made by hand). Detached, so it
+        # costs this hook one process spawn; its own guard keeps any failure out of here.
+        try:
+            import automemory_mirror
+            automemory_mirror.start_sweep_if_enabled()
+        except (Exception, SystemExit):   # its import guard exits; that must not end this hook
+            pass
+
         sections: list[str] = []
 
         # 1. Posture (Layer A) — the first `## ` block of posture.md.

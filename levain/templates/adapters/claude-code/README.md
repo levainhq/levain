@@ -46,7 +46,8 @@ post-v1 item.)
     └── hooks/
         ├── _levain_hook.py        <- shared helpers
         ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch)
-        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + Layer D nudge)
+        ├── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + Layer D nudge)
+        └── automemory_mirror.py   <- PostToolUse hook: native auto-memory -> anneal mirror
 ```
 
 ## Template placeholders
@@ -88,6 +89,8 @@ described below.
   recency position before each prompt: one directive selected at random from
   `activation/recency_directives.md`. Once episodes-since-last-wrap pass a
   threshold it also appends the **Layer D ambient nudge**.
+- **`automemory_mirror.py`** → `PostToolUse` on `Write|Edit` (since 0.5.10), plus
+  a start sweep from `session_start.py`. See "The auto-memory mirror" below.
 
 Layer D (keeping sessions wrapped) is **folded into these two hooks** — there
 is no separate `Stop`/`SessionEnd` hook. A `Stop` hook injects context only
@@ -131,7 +134,7 @@ from the first turn of every session.
 4. **Create `.claude/settings.json`** from `settings.template.json`: replace
    `{{PYTHON}}` with the Python 3 path from step 1. If the directory already
    has a `.claude/settings.json`, do not overwrite it — merge: append the
-   `SessionStart` and `UserPromptSubmit` entries into the existing `hooks`
+   `SessionStart`, `UserPromptSubmit` and `PostToolUse` entries into the existing `hooks`
    object's arrays for those events (each event's value is an *array* of
    matcher groups; appending a group is safe, replacing the array is not).
 5. **Initialize the memory store:**
@@ -198,6 +201,23 @@ MCP server and the hooks will read different stores.
   cost is process-spawn overhead, fast on a normal store. The per-prompt path
   uses a tight 2s query timeout so a hung anneal-memory cannot stall a turn;
   it is fail-open (no count → no nudge).
+- **The auto-memory mirror is ON by default (since 0.5.10).** Claude Code's own
+  auto-memory (`~/.claude/projects/<this install's folder>/memory/*.md`, or under
+  `$CLAUDE_CONFIG_DIR`, or the `autoMemoryDirectory` set in this install's
+  `.claude/settings.local.json` / `.claude/settings.json` or your user settings;
+  one passed only by `claude --settings` is invisible to hooks) is the operator-facing layer the seed hands it. Every
+  write to one of THIS install's memory files becomes a decision episode in this
+  install's store (source `automemory-mirror`, tag `operator-rule`); an edit
+  supersedes the previous episode and a deletion records a retraction that
+  supersedes it. It is one way: it never writes continuity and never writes back
+  to native memory. The first sweep only records the files that already exist,
+  so turning it on (or upgrading with `levain update`) does not import the
+  existing backlog. `MEMORY.md`, the index, is never mirrored. If its state file
+  is lost while the store already holds mirror episodes it stops and
+  `levain doctor` says so (`.levain/automemory_mirror.lost` explains recovery).
+  **To turn it off:** set `"automemory_mirror": false` in `.levain/config.json`
+  (durable), or `LEVAIN_AUTOMEMORY_MIRROR=off` in the environment (per session;
+  it wins over the config).
 - **`LEVAIN_HOOK_SUPPRESS=1`** — if you later build tooling that itself
   launches Claude Code from *inside* the install (a consultation runner, a
   batch job), set this in that tooling's environment so the activation

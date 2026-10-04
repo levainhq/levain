@@ -25,6 +25,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{PYTHON}}\" \"${CLAUDE_PROJECT_DIR}/activation/hooks/automemory_mirror.py\" hook"
+          }
+        ]
+      }
     ]
   }
 }

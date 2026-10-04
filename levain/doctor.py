@@ -1067,6 +1067,36 @@ def _hook_command_targets(
     return False
 
 
+_MIRROR_OFF = {"off", "0", "false", "no"}
+
+
+def _check_automemory_mirror(install: Path, hooks: dict) -> list[CheckResult]:
+    """The native auto-memory -> anneal mirror (0.5.10). Advisory only: an install that has
+    not run `levain update` since 0.5.9 has no PostToolUse entry and still works."""
+    name = "auto-memory mirror"
+    env = os.environ.get("LEVAIN_AUTOMEMORY_MIRROR", "").strip().lower()
+    if env:
+        off = env in _MIRROR_OFF
+    else:
+        try:
+            cfg = json.loads((install / ".levain" / "config.json").read_text(encoding="utf-8"))
+            value = cfg.get("automemory_mirror", True) if isinstance(cfg, dict) else True
+        except (OSError, ValueError):
+            value = True
+        off = value is False or (isinstance(value, str) and value.strip().lower() in _MIRROR_OFF)
+    if off:
+        return [CheckResult(name, True, "off (LEVAIN_AUTOMEMORY_MIRROR or config.json)")]
+    entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
+    if not (entries and _hook_command_targets(entries, install, "automemory_mirror.py")):
+        return [CheckResult(name, True,
+                            "PostToolUse hook not wired — advisory (run `levain update`)")]
+    if (install / ".levain" / "automemory_mirror.lost").exists():
+        return [CheckResult(name, True,
+                            "STOPPED: its state was lost while the store holds mirror episodes "
+                            "— advisory (read .levain/automemory_mirror.lost)")]
+    return [CheckResult(name, True, "PostToolUse → automemory_mirror.py wired")]
+
+
 # ---------------------------------------------------------------------------
 # Activation scope — the gate doctor never reported (Alex De Groodt, 2026-08-04)
 #
@@ -2031,6 +2061,8 @@ def _check_claude_code(install: Path) -> list[CheckResult]:
                         "Re-run `levain init`.",
                     )
                 )
+
+            results.extend(_check_automemory_mirror(install, hooks))
 
             allow = settings.get("permissions", {}).get("allow", [])
             # Match the exact server name or `server__tool` form — not any

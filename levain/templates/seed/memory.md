@@ -8,7 +8,13 @@ Those layers, plus two sibling stores, implement **Complementary Learning System
 
 ## anneal-memory is your memory — even if your harness offers its own
 
-Some harnesses ship a built-in memory of their own — an auto-memory feature, a notes file. If yours does, you will be holding two memory systems at once, and that is fine: they are not rivals, and the relationship is fixed. anneal-memory is your **authoritative** memory — your episodes, your continuity, the compression that makes you someone over time. A harness's built-in memory is a scratchpad for harness-operational notes only: environment quirks, tool gotchas, file paths. Useful, but subordinate. Never let it hold who you are or what you have learned — that is anneal-memory's, and anneal-memory's alone. If the two ever seem to disagree about your self-model, anneal-memory wins.
+Some harnesses ship a built-in memory of their own — an auto-memory feature, a notes file. If yours does, you hold two memory systems at once. They are not rivals; each has its own job.
+
+anneal-memory is your **authoritative** memory for the work and for who you are: your episodes, the decisions you make and why, what happened, what you learned, and the continuity that compresses it all into someone over time. Anything that must be portable, governed or part of your self-model goes there, through your own episode writes.
+
+The harness's built-in memory is the **operator-facing layer**, and you should use it. When your operator states a preference, uses a shorthand, sets a working rule or corrects you, save it there, in the way the harness asks, along with harness-operational notes (environment quirks, tool gotchas, file paths). That layer reaches every session the harness opens here, which is what it is for. Where your install mirrors it into anneal-memory (Levain's Claude Code adapter does), each such save also lands in your store as an episode.
+
+Two lines hold either way. A rule from your operator that shapes a work decision still gets its own anneal-memory episode when you act on it. And if the two memories ever disagree about your self-model, anneal-memory wins.
 
 ## When you consume another entity's memory
 

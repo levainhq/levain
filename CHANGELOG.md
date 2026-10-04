@@ -6,6 +6,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.10] — 2026-10-04
+
+The seed now gives Claude Code's own auto-memory a job (the operator-facing layer) instead of displacing it, and a Claude Code install mirrors every native memory write into the entity's anneal store.
+
+### Changed
+
+- **`seed/memory.md` now hands the harness's built-in memory the operator-facing layer.** It used to call that memory "a scratchpad for harness-operational notes only ... subordinate", and in measured Claude Code runs with auto-memory on, a Levain entity wrote zero native memory files on every day while plain Claude Code kept two to four. The new wording keeps anneal-memory authoritative for the work history, decisions, the self-model and anything that must be portable or governed, and tells the entity to save the operator's stated preferences, shorthand, working rules and corrections in the harness's memory, alongside the operational notes. The tie-break is unchanged: on the self-model, anneal-memory wins. An unedited `seed/memory.md` is refreshed by `levain update` on installs made by 0.5.5 or later; an edited one is kept and the new version staged under `.levain/pending/`.
+- **The trade, stated plainly:** what the entity writes to native memory lives in Claude Code's store (`~/.claude/projects/<folder>/memory/`), which is not sovereign, not portable and not under anneal-memory's immune system. The mirror below is what brings it back under anneal.
+
+### Added
+
+- **The auto-memory mirror (Claude Code adapter), ON by default.** A new `activation/hooks/automemory_mirror.py`, wired as a `PostToolUse` hook on `Write|Edit` and swept at session start, copies each write to THIS install's Claude Code auto-memory files into this install's anneal store, one way: a new file becomes a decision episode carrying its text, an edit records an episode that supersedes the previous one (anneal's own `--supersedes`, so recall hides the old one), a deletion records a retraction that supersedes it, and a file recreated after a deletion supersedes the retraction. It never writes continuity and never writes back to native memory; the wrap decides what graduates. The hook always exits 0 and does its work in a detached process, so it never blocks a Write or an Edit.
+  - **No backfill.** The first sweep records the hash of every memory file that already exists and writes no episode, on a new install and on an existing one upgraded with `levain update`, so only notes written or changed after the upgrade are mirrored.
+  - **Turn it off** with `"automemory_mirror": false` in `.levain/config.json` (durable), or `LEVAIN_AUTOMEMORY_MIRROR=off` (per session; it wins over the config).
+  - **What a mirrored episode looks like:** type `decision`, source `automemory-mirror`, tags `operator-rule`, `automemory`, `mirror` and `amem-path-<16 hex>` (one per file), content starting `OPERATOR RULE (auto-memory mirror): memory/<file>.md`, `OPERATOR RULE, REVISED (auto-memory mirror; replaces <id>)` or `RETRACTED OPERATOR RULE (auto-memory mirror)`. `anneal-memory --db .levain/memory.db episodes --source automemory-mirror` lists them.
+  - **If the state file is lost** while the store already holds mirror episodes, the mirror stops (re-baselining then would leave an edited or deleted note current forever) and writes `.levain/automemory_mirror.lost`; `levain doctor` reports it. Recovery is a person's: restore `.levain/automemory_mirror.json`, or accept the gap, then delete the marker.
+  - `MEMORY.md` (the index) is never mirrored, and only this install's own memory folder is read: Claude Code's per-project folder for the install directory (and for its git work tree when it sits inside one), plus an `autoMemoryDirectory` set in the install's `.claude/settings.local.json` or `.claude/settings.json` or in the user's `settings.json`. A directory given only by `claude --settings` on the command line cannot be seen by a hook and is not mirrored.
+- `levain doctor` reports the mirror: wired, off, not yet wired (advisory: run `levain update`), or stopped.
+
 ## [0.5.9] — 2026-10-04
 
 Levain is now tested against, and requires, anneal-memory 0.9.31, so `levain doctor` and `levain update` no longer report a fresh install's anneal as ahead of the known-good version.
