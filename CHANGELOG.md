@@ -6,6 +6,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **Team sync replay (the 0.6.0 known-open list).** When `levain team sync` has to replay local entries after a `team.toml`/`PROJECT.md` conflict:
+  - git's rerere is switched off for the replay (`rerere.enabled=false`, `rerere.autoupdate=false`), so a recorded resolution can no longer turn a local entry into an apparently empty pick that was then skipped as "already upstream".
+  - A pick is skipped as "already upstream" only when git actually stopped on it (`CHERRY_PICK_HEAD` present, nothing unmerged, nothing staged). A cherry-pick that fails for another reason (a stale `index.lock`) now stops the sync with git's own message and leaves the branch where it was, instead of failing in `cherry-pick --skip` with the wrong cause.
+  - Local commits are replayed in topological order (`--topo-order`), so skewed commit clocks cannot reorder them.
+  - If the replay succeeded but the worktree could not be moved back onto the branch, the error says so and tells you to run `levain team sync` again, rather than claiming nothing changed.
+  - A failure while re-attaching the worktree after a failed replay no longer replaces the error that caused the replay to fail.
+  The four hardening items other than the replay-order one were reasoned from review, not reproduced end to end against a real rerere or hook setup; each is pinned by a test that injects the failing git result and fails on 0.6.0.
+
 ## [0.6.0] — 2026-10-04
 
 Team context: one project's decisions shared across a team of engineers, with git as the wire and a Claude Code hook that puts a recorded decision in front of the agent at the edit it governs.
