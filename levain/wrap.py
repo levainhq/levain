@@ -1010,12 +1010,20 @@ def _consolidate(
                 # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
                 debug_path = _dump_rejected(entity_dir, wrap_token, neocortex)
                 cancelled = _cancel_if_ours(store, wrap_token)
+                # anneal 0.9.33's hard maximum raises a ContinuityValidationError carrying `bound`.
+                why = (
+                    "The composed memory is LONGER than the schema's hard maximum; the message above "
+                    "names what to cut. Levain cancelled its wrap, so there is nothing to save "
+                    "again: re-run."
+                    if isinstance(getattr(exc, "bound", None), int) else
+                    "The compose model most likely dropped a required section, mis-cited an episode, "
+                    "or (on a later wrap) produced a too-small memory that the catastrophic-shrink "
+                    "gate refused."
+                )
                 print(
                     f"levain wrap: the composed memory was REFUSED — NOT saved "
                     f"({type(exc).__name__}: {exc}).\n"
-                    "  The entity's identity is unchanged. The compose model most likely dropped a "
-                    "required section, mis-cited an episode, or (on a later wrap) produced a too-small "
-                    "memory that the catastrophic-shrink gate refused.\n"
+                    f"  The entity's identity is unchanged. {why}\n"
                     f"  The rejected draft was saved for inspection: {debug_path}\n"
                     "  Re-run to try again (a stronger --composer may help)."
                 )

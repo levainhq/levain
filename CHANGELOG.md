@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.12] — 2026-10-04
+
+Levain is now tested against, and requires, anneal-memory 0.9.33, which refuses to save a continuity above a hard maximum.
+
+### Changed
+
+- **Levain now requires anneal-memory 0.9.33 or later** (`anneal-memory>=0.9.33,<0.10`), and 0.9.33 is the version it is tested against. 0.9.33 adds a hard maximum on the saved continuity (`anneal_memory.schema.hard_max_chars`, 1.25 times the schema's target, the Durable Facts section excluded): a save above it is refused, the refusal is written to anneal's audit trail, and the wrap stays open. It adds no migration entry, so the seed guidance is unchanged.
+- **`levain wrap` names a hard-maximum refusal for what it is.** It already cancelled its own wrap and kept the rejected draft on any refused save; it used to explain every refusal as a dropped section, a mis-cited episode or a too-small memory. A refusal for size now says the memory is longer than the hard maximum, beside anneal's own message naming what to cut. In a Claude Code install the entity wraps over MCP: the refusal is the tool result it reads, and an open wrap left behind is surfaced at the next session start.
+
 ## [0.5.11] — 2026-10-04
 
 Levain is now tested against, and requires, anneal-memory 0.9.32, so `levain doctor` and `levain update` no longer report a fresh install's anneal as ahead of the known-good version.

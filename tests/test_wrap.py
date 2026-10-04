@@ -232,6 +232,22 @@ def test_wrap_success_writes_the_neocortex_into_the_entity_tree(tmp_path, capsys
         assert store.get_wrap_started_at() is None  # completed, not left hanging
 
 
+def test_wrap_names_a_hard_maximum_refusal_and_leaves_no_wrap_open(tmp_path, capsys, monkeypatch):
+    """anneal 0.9.33 refuses a continuity above `hard_max_chars(schema)` and leaves the wrap open;
+    `levain wrap` cancels its own wrap and says the memory is too long (reproduced 2026-10-04)."""
+    entity = _openhands_entity(tmp_path)
+    db = _with_store(entity, episodes=2)
+    big = _VALID_NEOCORTEX.replace(
+        "## Context\n", "## Context\n" + ("Background detail fetchable from the record. " * 900) + "\n", 1)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: big)
+    assert wrap_entity(entity) == 1
+    out = capsys.readouterr().out
+    assert "LONGER than the schema's hard maximum" in out and "hard maximum of" in out
+    assert not (entity / ".levain" / "memory.continuity.md").exists()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
+
+
 def test_wrap_fail_closed_refuses_a_malformed_compose(tmp_path, capsys, monkeypatch):
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent, episodes=2)
