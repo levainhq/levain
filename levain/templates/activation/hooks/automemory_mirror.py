@@ -397,7 +397,8 @@ def note_type(text: str) -> str:
     m = re.match(r"\A---\s*\n(.*?)\n---", text.lstrip("\ufeff"), re.S)
     if not m:
         return ""
-    t = re.search(r"^type:\s*['\"]?([A-Za-z_-]+)", m.group(1), re.M)
+    # top level, or nested (Claude Code writes `metadata:` then an indented `type:`)
+    t = re.search(r"^[ \t]*type:\s*['\"]?([A-Za-z_-]+)", m.group(1), re.M)
     return t.group(1).lower() if t else ""
 
 

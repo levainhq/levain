@@ -69,7 +69,7 @@ def test_first_sweep_baselines_then_hook_mirrors_a_new_note(inst):
     counts = sweep(root, env)
     assert counts.get("baselined") == 1 and mirrored(root, env) == []
 
-    (mem / "new.md").write_text("---\nname: arrow\ntype: feedback\n---\nOperator shorthand: '->' means next step.\n")
+    (mem / "new.md").write_text("---\nname: arrow\nmetadata:\n  type: feedback\n---\nOperator shorthand: '->' means next step.\n")
     payload = json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(mem / "new.md")}})
     r = subprocess.run([sys.executable, str(root / "activation" / "hooks" / "automemory_mirror.py"),
                         "hook"], input=payload, capture_output=True, text=True, env=env,
