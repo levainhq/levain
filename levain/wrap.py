@@ -192,8 +192,8 @@ def _cancel_if_ours(store: object, wrap_token: object) -> bool:
     # and then calling a bare cancel let another client's new wrap be cleared in between (codex, the
     # 0.5.6 hunk look). WrapOwnershipError means the in-progress wrap is not ours: leave it.
     # Without a token there is nothing to compare, and wrap_cancelled(expect_token=None) is anneal's
-    # bare cancel, which clears whatever wrap is open. A "ready" result always carries one, so this
-    # only guards a broken contract: leave the store alone rather than clear a wrap we cannot name,
+    # bare cancel, which clears whatever wrap is open. `wrap_entity` always holds one, so this only
+    # guards a caller that does not: leave the store alone rather than clear a wrap we cannot name,
     # and report it unresolved, since a wrap may be open that nobody cancelled.
     if not wrap_token:
         _log.warning("cancel-if-ours: no wrap token to compare, nothing cancelled")
@@ -282,21 +282,38 @@ def _cancel_our_wrap(store: object, wrap_token: str) -> None:
         _log.debug("out-of-band wrap cancel skipped (%s): %s", type(exc).__name__, exc)
 
 
-def _discard_prior_wrap(store: object, *, reset: bool) -> None:
+def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
+    """``(token, started_at)`` of the wrap now open, the TOKEN READ FIRST.
+
+    The age proof (:func:`_orphan_is_stale`) is about the wrap whose ``started_at`` was read, and
+    the token that gets cancelled must name a wrap no younger than that. Reading the token first
+    gives that: if the wrap is replaced in between, ``started_at`` belongs to the newer wrap while
+    the token names the old one, so the cancel by that token fails its compare-and-swap instead of
+    clearing the newcomer (L2: with the token read after the age check, a peer's fresh wrap landing
+    in the gap was the one cancelled). The token is ``None`` when the store's wrap metadata is
+    partial (no usable token)."""
+    try:
+        snap = store.load_wrap_snapshot()  # type: ignore[attr-defined]
+        token = snap["token"] if snap else None
+    except Exception as exc:  # noqa: BLE001 — partial wrap metadata raises StoreError
+        _log.debug("prior wrap snapshot unreadable (%s): %s", type(exc).__name__, exc)
+        token = None
+    return token, store.get_wrap_started_at()  # type: ignore[attr-defined]
+
+
+def _discard_prior_wrap(store: object, prior_token: str | None) -> None:
     """Clear the PRIOR run's wrap that this run found open (``--reset``, or the unattended self-heal).
 
-    A wrap Levain opened carries a caller token, and anneal refuses a tokenless cancel of a
-    token-bound wrap. ``--reset`` is the operator's explicit recovery, so it forces. The unattended
-    self-heal has only the lock and the wrap's age as proof, so it cancels by the token it observed:
-    a wrap that changed hands in between raises ``WrapOwnershipError`` instead of being cleared."""
-    if reset:
-        store.wrap_cancelled(force=True)  # type: ignore[attr-defined]
-        return
-    observed = store.wrap_bound_token()  # type: ignore[attr-defined]
-    if observed:
-        store.wrap_cancelled(expect_token=observed)  # type: ignore[attr-defined]
+    Always by the token observed with the wrap's age (:func:`_observe_prior_wrap`), never a bare
+    cancel: a wrap Levain opened is token-bound and anneal refuses a tokenless cancel of it, and a
+    wrap that changed hands since the observation raises ``WrapOwnershipError`` instead of being
+    cleared. Partial wrap metadata has no token to name, so it is cleared only while still partial.
+    Whether the observed wrap is an orphan is the caller's call (the lock and the age test, or the
+    operator's ``--reset``); anneal's compare-and-swap lets a caller that names a token clear it."""
+    if prior_token:
+        store.wrap_cancelled(expect_token=prior_token)  # type: ignore[attr-defined]
     else:
-        store.wrap_cancelled()  # type: ignore[attr-defined]
+        store.wrap_cancelled(expect_partial=True)  # type: ignore[attr-defined]
 
 
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
@@ -538,6 +555,7 @@ def _consolidate(
             CrystalStore,
             Store,
             WrapInProgressError,
+            WrapOwnershipError,
         )
         from anneal_memory.continuity import (
             format_wrap_package_text,
@@ -636,7 +654,7 @@ def _consolidate(
         # unattended seat one skipped consolidate (recoverable) instead of destroying a live wrap
         # (not). `invariant_must_fire_at_the_point_of_use`.
         holds_lock = isinstance(lock, int)
-        started = store.get_wrap_started_at()
+        prior_token, started = _observe_prior_wrap(store)
         # BOTH halves must hold before an unattended seat discards someone else's in-progress wrap:
         # the LOCK (no live Levain peer) and the AGE (no live NON-Levain writer — an anneal CLI/MCP
         # caller never takes our lock). See `_orphan_is_stale`.
@@ -667,7 +685,12 @@ def _consolidate(
                     + extra
                 )
                 return 2
-            _discard_prior_wrap(store, reset=reset)
+            try:
+                _discard_prior_wrap(store, prior_token)
+            except WrapOwnershipError:
+                print("levain wrap: the prior wrap was replaced by another consolidate while it was "
+                      "being discarded; nothing of it was cleared. Re-run in a moment.")
+                return 2
             if unattended and not reset:
                 # SAID, not silent: a seat that keeps self-healing is a seat whose consolidates keep
                 # dying, and the log is the only place an operator can notice that pattern.
@@ -703,10 +726,13 @@ def _consolidate(
             )
             return 0
         if status != "ready":
-            # A known non-ready result opened no wrap of ours (anneal's "downgraded" leaves the
-            # store untouched), and a status this levain does not know may have. The cancel is by
-            # our token either way: it clears our wrap if one was opened, and finds nothing to
-            # clear (never a peer's wrap) if not.
+            if status == "downgraded":
+                # anneal declined and left the store untouched: no wrap of ours exists, so there is
+                # nothing to cancel (and a failed cancel would claim a wrap that was never opened).
+                print(f"levain wrap: anneal declined to start a wrap — {result.get('message') or status}")
+                return 1
+            # A status this levain does not know may have opened one: cancel by our token, which
+            # clears our wrap if it exists and never a peer's.
             print(f"levain wrap: prepare_wrap returned an unexpected status {status!r} — aborting.")
             if not _cancel_if_ours(store, wrap_token):
                 print(_CANCEL_FAILED)
@@ -858,10 +884,10 @@ def _consolidate(
         )
         return 2
     except AnnealMemoryError as exc:
-        # A store/crystal failure. Before prepare_wrap returns a token (schema read, wrap-state
-        # read, prepare_wrap itself) nothing was written: anneal marks the wrap in progress LAST.
-        # AFTER it, a wrap of ours is open, and returning without cancelling stranded it (codex,
-        # the 0.5.6 hunk look), so any wrap still carrying our token is cancelled first.
+        # A store/crystal failure. Before prepare_wrap is entered (schema read, wrap-state read)
+        # no wrap of ours can exist. From the call on one may be open, even if prepare_wrap itself
+        # raised, and returning without cancelling stranded it (codex, the 0.5.6 hunk look), so any
+        # wrap carrying our token is cancelled first.
         # A wall-clock stop landing INSIDE this handler is a BaseException, which the sibling
         # clause below cannot see (a sibling does not catch what a handler raises), so the cancel
         # is guarded here as well.
@@ -888,9 +914,11 @@ def _consolidate(
         # death until the auto-discard above, and relying on that discard alone would be leaving a
         # known mess for a later run to clean rather than not making it.
         #
-        # Cancelling is safe for the same structural reason the discard is: we hold the exclusive
-        # `wrap.lock`, so any wrap in progress here is OURS. Nothing partial can have been written —
-        # the save fails closed — so the frozen episodes simply return to the next wrap.
+        # Cancelling is safe because it is a compare against the token Levain minted: it clears the
+        # wrap only if that wrap is ours, whatever other program is using the store (`wrap.lock`
+        # keeps other Levain processes out and says nothing about them). Nothing partial can have
+        # been written — the save fails closed — so the frozen episodes simply return to the next
+        # wrap.
         _cancel_our_wrap(store, wrap_token)
         raise
     finally:

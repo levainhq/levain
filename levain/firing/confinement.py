@@ -3305,11 +3305,6 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
         # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
         # (6): a path the HOST creates there after spawn is visible through the read-only bind.
-        if not _reachable(f):
-            # A path this user cannot even stat (a rootful /run/podman/podman.sock behind a 0700
-            # root directory) is out of the entity's reach too: nothing to hide, and probing it
-            # must not refuse the whole floor (the CI runner's real host, 2026-10-04).
-            return True
         if f.exists():
             return False
         anc = f.parent

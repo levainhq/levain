@@ -2451,30 +2451,6 @@ def test_bwrap_never_uses_a_try_variant(tmp_path, monkeypatch) -> None:
     assert not [a for a in argv if a.endswith("-try")]
 
 
-def test_a_daemon_socket_behind_an_untraversable_directory_does_not_refuse_the_floor(tmp_path, monkeypatch) -> None:
-    """Found by the repo's first CI run, on a stock Ubuntu runner: a rootful podman leaves
-    ``/run/podman`` mode 0700 root, so a non-root ``stat`` of ``/run/podman/podman.sock`` raises
-    EACCES. The plan probed it with a bare ``exists()``, so EVERY Linux floor build refused ("could
-    not inspect the host") and the entity got no bash at all. A path this user cannot stat is out
-    of the entity's reach too (the ``_reachable`` rule), so it is skipped, not refused."""
-    import pathlib
-
-    policy = _lin_policy(tmp_path, monkeypatch)
-    assert any(str(s) == "/run/podman/podman.sock" for s in policy.deny_sockets), "fixture must carry the podman socket"
-
-    def _deny(real):
-        def probe(self, *a, **k):
-            if str(self).startswith("/run/podman/"):   # the directory itself stats; its children do not
-                raise PermissionError(13, "Permission denied", str(self))
-            return real(self, *a, **k)
-        return probe
-
-    monkeypatch.setattr(pathlib.Path, "stat", _deny(pathlib.Path.stat))
-    monkeypatch.setattr(pathlib.Path, "lstat", _deny(pathlib.Path.lstat))
-    argv = _bwrap_argv(policy)
-    assert not [a for a in argv if str(a).startswith("/run/podman/")]
-
-
 def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
     """A BARE tmpfs hides the jewel but lets writes into it SILENTLY SUCCEED and vanish — the entity
     is told its write worked when nothing was written. ``--remount-ro`` keeps the hiding and makes

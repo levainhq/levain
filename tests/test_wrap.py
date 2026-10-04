@@ -298,7 +298,9 @@ def test_wrap_post_commit_externalization_failure_is_not_reported_as_unsaved(
     def _post_commit_fail(store, text, **kw):
         # Simulate anneal's Phase-2 commit (which clears the in-progress metadata) then a Phase-3
         # rename failure raising post-commit.
-        store.wrap_cancelled()  # observable proxy for "wrap_completed cleared the in-progress flag"
+        # observable proxy for "wrap_completed cleared the in-progress flag" (forced: the wrap is
+        # token-bound, and anneal refuses a tokenless cancel of a bound wrap)
+        store.wrap_cancelled(force=True)
         raise StoreError(
             "Failed to rename continuity tmp — the DB has committed the wrap but externalization "
             "is incomplete; preserved at /x/memory.continuity.md.tmp."

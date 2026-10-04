@@ -410,6 +410,48 @@ def test_a_wall_clock_stop_inside_the_store_error_handler_still_cancels_by_token
         assert store.get_wrap_started_at() is None
 
 
+@pytest.mark.parametrize("where", ["during the age read", "between the observation and the cancel"])
+def test_a_peers_fresh_wrap_that_replaces_the_orphan_mid_discard_is_never_cancelled(tmp_path, capsys, monkeypatch, where):
+    """L2 (0.5.7 round), RAN: the age proof was computed on orphan A, and the token that got cancelled
+    was read later, so a peer that cleared A and opened its own wrap B in that gap had B cancelled by
+    the self-heal. The token is now read on both sides of the age read, and the cancel names it."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db, bound=True)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    def peer_replaces_the_wrap():
+        with Store(str(db), section_schema=None) as peer:
+            peer.wrap_cancelled(force=True)
+            peer.wrap_started(token="b" * 32, episode_ids=[str(e.id) for e in peer.episodes_since_wrap()], token_bound=True)
+
+    if where == "during the age read":
+        real_started = Store.get_wrap_started_at
+        fired: list[int] = []
+
+        def started_then_swap(self):
+            value = real_started(self)
+            if not fired:
+                fired.append(1)
+                peer_replaces_the_wrap()
+            return value
+
+        monkeypatch.setattr(Store, "get_wrap_started_at", started_then_swap)
+    else:
+        real_discard = wrapmod._discard_prior_wrap
+
+        def swap_then_discard(store, token):
+            peer_replaces_the_wrap()
+            return real_discard(store, token)
+
+        monkeypatch.setattr(wrapmod, "_discard_prior_wrap", swap_then_discard)
+
+    assert wrap_entity(ent, unattended=True) == 2
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.load_wrap_snapshot()["token"] == "b" * 32, "the peer's wrap was cancelled"
+
+
 @pytest.mark.parametrize("kind", ["unattended self-heal", "operator --reset"])
 def test_a_token_bound_orphan_from_an_earlier_levain_wrap_is_still_discarded(tmp_path, capsys, monkeypatch, kind):
     """A wrap Levain opens carries a caller token, and anneal refuses a TOKENLESS cancel of a
@@ -668,7 +710,7 @@ def test_a_non_ready_prepare_cancels_nothing(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(cont, "prepare_wrap", a_peer_wraps_then_ours_downgrades)
     assert wrap_entity(ent) == 1
-    assert "unexpected status 'downgraded'" in capsys.readouterr().out
+    assert "anneal declined to start a wrap" in capsys.readouterr().out
     monkeypatch.undo()
     with Store(str(db), section_schema=None) as store:
         assert store.load_wrap_snapshot()["token"] == peer["token"]
