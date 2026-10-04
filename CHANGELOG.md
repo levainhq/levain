@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.11] — 2026-10-04
+
+Levain is now tested against, and requires, anneal-memory 0.9.32, so `levain doctor` and `levain update` no longer report a fresh install's anneal as ahead of the known-good version.
+
+### Changed
+
+- **Levain now requires anneal-memory 0.9.32 or later** (`anneal-memory>=0.9.32,<0.10`), and 0.9.32 is the version it is tested against. 0.9.32 was released while 0.5.10 shipped, so a fresh 0.5.10 install resolved it and `levain doctor` reported "anneal-memory 0.9.32 is AHEAD of this levain release's known-good 0.9.31 — untested together". 0.9.32 makes anneal's multi-statement reads one snapshot; it adds no migration entry, schema or API, so the seed guidance is unchanged.
+- The auto-memory mirror recognises anneal's supersession refusal by the phrase `shares too little`, a single literal in anneal's source.
+
 ## [0.5.10] — 2026-10-04
 
 The seed now gives Claude Code's own auto-memory a job (the operator-facing layer) instead of displacing it, and a Claude Code install mirrors every native memory write into the entity's anneal store.

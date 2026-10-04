@@ -95,7 +95,7 @@ ANNEAL_TIMEOUT = 60
 PAGE = 500
 _OFF = {"off", "0", "false", "no"}
 _RULE_TYPES = {"user", "feedback"}
-_GROUNDING_REFUSAL = "to ground as an update"     # anneal's supersede refusal, measured 0.9.31
+_GROUNDING_REFUSAL = "shares too little"     # anneal's supersede refusal (SupersessionError text)
 
 
 def folder_name(path: Path | str) -> str:

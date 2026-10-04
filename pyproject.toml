@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.5.10"
+version = "0.5.11.dev0"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -102,13 +102,15 @@ dependencies = [
     # section (AM-DURABLE-FACTS, first released in 0.9.28; 0.9.27 was never published).
     # `>=0.9.30`: `levain wrap` hands `prepare_wrap` its own wrap token (`wrap_token=`), which an
     # older anneal does not accept, and cancels every wrap by that token.
+    # `>=0.9.32` (2026-10-04): KNOWN_GOOD_ANNEAL moves to the anneal a fresh install resolves (0.9.32
+    # only makes multi-statement reads one snapshot; no migration-manifest entry, schema or API change).
     # `>=0.9.31`: KNOWN_GOOD_ANNEAL and this floor are one number (`pip_floor_verdict` reports drift
     # unless they are equal), and the refusal text sends an operator to `anneal-memory wrap-status`,
     # which reads one transaction from 0.9.31 (0.9.30's could show a replaced wrap with the older
     # wrap's bound token). No migration-manifest entry and no schema changed in 0.9.30 or 0.9.31;
     # their API additions (`prepare_wrap(wrap_token=)` above, `Store.wrap_status_snapshot`,
     # `Store.keyword_candidates`) are additive and the seed does not depend on them.
-    "anneal-memory>=0.9.31,<0.10",
+    "anneal-memory>=0.9.32,<0.10",
 ]
 
 [project.optional-dependencies]
