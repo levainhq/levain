@@ -343,8 +343,8 @@ def test_compose_constitution_memory_augments_a_real_seed_only(tmp_path):
 @pytest.mark.skipif(
     sys.version_info >= (3, 13),
     reason="Path.resolve() stopped raising RuntimeError on a symlink loop in 3.13, so the log line "
-           "this asserts is never written; the boot itself still completes. Unsettled, see the "
-           "levain 0.5.7 pickup.")
+           "this asserts is never written; the boot itself still completes. Unsettled: the 3.13 "
+           "behaviour of the entity-isolation guard on a loop has not been decided.")
 def test_neocortex_injection_fail_soft_on_symlink_loop(tmp_path, caplog):
     """A symlink LOOP at .levain/memory.continuity.md must NOT crash the boot — `assert_entity_isolated`
     `.resolve()`s internally and raises `RuntimeError` (not `IsolationError`) on a loop; the guard call
