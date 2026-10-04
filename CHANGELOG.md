@@ -6,7 +6,38 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.6] — 2026-10-04
+
+`levain wrap` keeps working for existing entities under anneal-memory 0.9.28, the composing model is asked for the sections the store actually has (including anneal 0.9.28's optional `## Durable Facts`), and Levain now requires anneal-memory 0.9.28.
+
 **Upgrade Levain together with anneal-memory.** Levain 0.5.5 refuses `levain wrap` for every existing entity once anneal-memory 0.9.28 is installed ("this entity's store is not on the 6-section partnership schema", exit 2). Install Levain 0.5.6 with anneal-memory 0.9.28, not anneal-memory alone. Do not run the `set-schema` command that message prints just to get past it: on a partnership store it only opts the store into the new optional section.
+
+### Known open issues
+
+Found in review, not fixed in 0.5.6:
+
+- **An interrupt during `levain wrap` before anneal returns the wrap's token can cancel another program's wrap** (since 0.4.x). On Ctrl-C or the wall-clock stop in that interval, `levain wrap` clears whatever wrap is open on the store, on the grounds that its own lock proves the wrap is its own. That lock keeps other `levain` processes out, not other programs using the same store (the `anneal-memory` CLI, an MCP client), so a wrap one of them started in that moment is the one cleared. The same applies to a wall-clock stop that lands while `levain wrap` is handling a store error: the wrap can be left open.
+- **`levain wrap` checks the store's schema before the wrap starts, not the schema the wrap freezes** (since 0.4.x). Another process that changes the store's schema in between (an `anneal-memory set-schema` run by hand, or by another tool on the same store) is not caught, and the wrap runs under the new schema. Levain's own wrap lock does not cover other programs.
+- **The dashboard matches section headings by exact case**, so a continuity written with `## durable facts` (which anneal accepts) is not shown there. Its content is unaffected.
+- **A file saved while `levain update` is replacing it can be overwritten** (since 0.5.0 for hooks, `CLAUDE.md` / `AGENTS.md`, settings and `.mcp.json`; seed files join them in this release). `levain update` decides from the file as it read it and then replaces it; an editor that saves in between loses that save, and a copy replaced without a record keeps a backup taken at replace time, not decision time. Levain's install lock keeps other `levain` processes out, not editors. Close the entity's files before running `levain update`.
+- **`levain doctor` can report "upgrade pending" for a Claude Code install whose living memory does load.** You see it when you have put a code block, or an HTML comment left open on its line, above the `@.levain/memory.continuity.md` line in `CLAUDE.md`. Doctor only counts that import when nothing above it could hide it from Claude Code, so it cannot confirm it, and `levain update` will not change your edited file. Move the import line above the code block or comment and the warning clears.
+- **In that same layout, doctor's context-size figure leaves out the living memory**, so the total it prints is smaller than what Claude Code loads by the size of `.levain/memory.continuity.md`. Moving the import line fixes this too.
+- **`levain doctor` can count the living-memory import on a line Claude Code may not read as its own.** Doctor splits `CLAUDE.md` into lines the way Python does, which also breaks at a vertical tab, a form feed, a bare carriage return and some Unicode line and space characters; Claude Code's handling of those has not been measured. A `CLAUDE.md` that levain wrote, or that you edited in an ordinary editor, contains none of them. If doctor says the memory loads and the entity does not see it, check that line for stray control characters.
+- **A hardlink made after bash starts, or between the file editor's check and its open, and a copy of a crown jewel, are not caught by the hardlink check** (both platforms). The check counts a jewel's names when a shell starts and each time the editor touches a file; a copy is a different file with one name.
+- **A pack `order` change alone can switch which pack's activation hook is installed, without review** (since 0.5.0). When two packs ship the same `activation/hooks/<file>`, changing only one pack's `order` makes `levain update` install the other pack's hook. A changed hook *file* is held for review; a changed *winner* is not.
+- **A pack source edited and then reverted while `levain update` runs can slip its edited hook in** (since 0.5.0). It needs a concurrent writer to the pack directory during the update.
+- **Codex's machine-global files are guarded by a per-install lock** (since 0.5.0). `~/.codex/hooks.json` and `config.toml` are shared by every install on the machine, so two installs updating at once can interleave on them.
+- **On Linux, the localhost block does not cover unix sockets at a file path, or AF_VSOCK** (since 0.5.0). A socket at a path the floor does not deny (an ssh ControlMaster or proxy socket in `/tmp`, X11) can still reach this host's services, and inside a VM so can AF_VSOCK. The user's systemd manager and session D-Bus are refused. The ssh ControlMaster case is the same on macOS.
+- **On Linux, the shell is checked before each command, not during one.** A command already running when a protected file changes, or one started in the background earlier, keeps its access while it runs; so does a command whose path changes between the check and its start; a `setsid` child survives the shell being closed. A host process that links a denied file to a path the shell can read while the shell is live is the same case: it is not watched between checks (a denied file under a hidden directory is not rechecked at all, by design, since the operator's own store changes constantly).
+- **An encrypted SQLite store (SQLCipher) has no recognisable header** (since 0.5.1), so the Linux SQLite checks do not see it. A planted sidecar would need the store's key to be replayed.
+- **A trust file levain cannot find is not covered**: a flow project home moved with `FLOW_PROJECT_MEMORY_HOME`, unless `$ANNEAL_MEMORY_DERIVE_TRUST` is also set for levain; and a path to the trust file through more than one symlinked directory.
+- **When a trust-file refresh refuses the floor mid-session, a command the bash hand is starting at that moment can still run** until the shell finishes closing. Every later command is refused.
+- **`spawn_shell(env=...)` on Linux passes that environment to `bwrap` as well as to bash**, so a loader variable such as `LD_PRELOAD` in it runs before the sandbox exists. levain's own callers pass no environment; this affects only a program that calls the API with its own.
+- **The README does not mention that on Linux bash is refused when a crown jewel is a SQLite database** (since 0.5.1; the CHANGELOG entry for 0.5.1 explains it).
+- **An `EntitySession` takes one driver at a time.** Driving one session from two threads at once (a turn while a rejection is being confirmed, or two turns) is not supported and can run an action nobody approved. `levain run` and `levain serve --chat` each drive a session from one place at a time (chat refuses a second request while one is running).
+- **`levain serve --chat`: a tool error the model recovered from, in a turn the wall-clock stop lands on, discards that turn** (reported `timed_out`, not captured, session closed). It fails closed. A session whose open hangs keeps its slot until the server restarts.
+
+Not run before release: a real model writing a new durable fact under `levain wrap`'s prompt (no free compose model was available; the prompt text, the guard and the save path are tested).
 
 ### Fixed
 
@@ -16,11 +47,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Changed
 
 - **Levain now requires anneal-memory 0.9.28 or later** (`anneal-memory>=0.9.28,<0.10`). anneal-memory 0.9.28 adds an optional `## Durable Facts` section for facts that would change a future answer (an allergy, a commitment, a fact a later action depends on), one line each with cue words, kept until you drop one. The seed's memory guidance names the section and its line form and leaves the rules to anneal's wrap guidance, and the dashboard shows the section. A NEW entity gets the section. An EXISTING one keeps its schema until you opt it in with `anneal-memory --db .levain/memory.db set-schema partnership`; `levain update` does not do that for you, because changing a store's schema is the operator's decision.
-
-### Known open issues
-
-- **`levain wrap` checks the store's schema before the wrap starts, not the schema the wrap freezes** (since 0.4.x). Another process that changes the store's schema in between (an `anneal-memory set-schema` run by hand, or by another tool on the same store) is not caught, and the wrap runs under the new schema. Levain's own wrap lock does not cover other programs.
-- **The dashboard matches section headings by exact case**, so a continuity written with `## durable facts` (which anneal accepts) is not shown there. Its content is unaffected.
 
 ## [0.5.5] — 2026-10-03
 
