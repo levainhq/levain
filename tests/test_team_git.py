@@ -643,15 +643,20 @@ def _conflicting_replay(two):
     return GitLedger(Repo.discover(ana)), ana
 
 
-def _spy_git(monkeypatch, fail_pick=False):
-    """Record every git argv the transport runs; optionally make a replay cherry-pick fail with no state left."""
+def _spy_git(monkeypatch, fail_pick=False, pick_rc=1, stale_pick_marker=False, fail_checkout=False):
+    """Record every git argv the transport runs; optionally make a replay cherry-pick fail, or the final checkout."""
     import levain.team.transport as T
     real, calls = T.git, []
 
     def spy(args, cwd, **kw):
         calls.append(list(args))
-        if fail_pick and "cherry-pick" in args and "--skip" not in args and "--abort" not in args:
-            return subprocess.CompletedProcess(["git", *args], 1, "", "fatal: Unable to create index.lock")
+        if fail_pick and "--allow-empty" in args and "cherry-pick" in args:
+            if stale_pick_marker:
+                marker = Path(real(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], cwd).stdout.strip())
+                (marker if marker.is_absolute() else Path(cwd) / marker).write_text("0" * 40 + "\n")
+            return subprocess.CompletedProcess(["git", *args], pick_rc, "", "fatal: Unable to create index.lock")
+        if fail_checkout and args == ["checkout", "-q", "levain-ledger"]:
+            raise T.TeamError("git checkout failed: untracked file in the way")
         return real(args, cwd, **kw)
     monkeypatch.setattr(T, "git", spy)
     return calls
@@ -680,6 +685,31 @@ def test_a_cherry_pick_that_failed_without_a_pick_in_progress_is_not_skipped_as_
     assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
 
 
+def test_a_stale_pick_marker_with_a_fatal_exit_is_not_skipped_as_upstream(two, monkeypatch, capsys):
+    gl, ana = _conflicting_replay(two)
+    tip = git("rev-parse", "levain-ledger", cwd=ana).strip()
+    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=128, stale_pick_marker=True)
+    assert team("sync", repo=ana) != 0
+    assert not any("--skip" in c for c in calls)
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip
+
+
+def test_an_empty_pick_git_stopped_on_is_still_skipped_as_upstream(two, monkeypatch):
+    gl, ana = _conflicting_replay(two)
+    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=1, stale_pick_marker=True)
+    import levain.team.transport as T
+    spy = T.git
+
+    def skip_ok(args, cwd, **kw):
+        if args[:2] == ["cherry-pick", "--skip"]:
+            calls.append(list(args))
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        return spy(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", skip_ok)
+    assert team("sync", repo=ana) == 0
+    assert any(c[:2] == ["cherry-pick", "--skip"] for c in calls)
+
+
 def test_a_failing_reattach_does_not_mask_the_error_that_sent_us_there(two, monkeypatch, capsys):
     gl, ana = _conflicting_replay(two)
     _spy_git(monkeypatch, fail_pick=True)
@@ -688,4 +718,17 @@ def test_a_failing_reattach_does_not_mask_the_error_that_sent_us_there(two, monk
     capsys.readouterr()
     assert team("sync", repo=ana) != 0
     err = capsys.readouterr().err
-    assert "index.lock" in err and "reattach exploded" not in err
+    assert "index.lock" in err                                  # the replay's own error is the one raised
+    assert "left detached (reattach exploded)" in err           # and the state it leaves behind is stated
+
+
+def test_a_checkout_that_fails_after_the_replay_published_keeps_the_discard_warning_and_reattaches(two, monkeypatch,
+                                                                                                capsys):
+    gl, ana = _conflicting_replay(two)
+    _spy_git(monkeypatch, fail_checkout=True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0                          # the forced checkout recovers, nothing is lost
+    err = capsys.readouterr().err
+    assert "were discarded" in err
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1

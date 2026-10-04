@@ -625,32 +625,41 @@ class GitLedger:
                         continue
                     unmerged = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.strip()
                     picking = (self.wt / git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], self.wt).stdout.strip()).exists()
-                    if picking and not unmerged and git(["diff", "--cached", "--quiet"], self.wt,
-                                                         check=False).returncode == 0:
+                    # git stops with exit 1 on a conflict or an empty pick; any other code (128: another pick is in
+                    # progress, a lock, a bad object) is a failure, never "already upstream"
+                    if (cp.returncode == 1 and picking and not unmerged
+                            and git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0):
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)   # already upstream: nothing to add
                         continue
+                    detail = "" if unmerged or picking else f" ({_tail(cp)})"
                     raise TeamError("an unpushed entry cannot be replayed onto the remote ledger (two clones "
-                                    "share a device id, or git could not run: "
-                                    f"{_tail(cp)}). Nothing was changed locally; if this clone's .git was "
-                                    "copied from another, see `levain team join --new-device`")
+                                    f"share a device id?){detail}. Nothing was changed locally; if this clone's "
+                                    ".git was copied from another, see `levain team join --new-device`")
                 new = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
                 git(["update-ref", "-m", "levain team: replay onto remote", REF, new, orig], self.wt)
                 published = True
+                if drop:   # the branch now carries the replay, so nothing later can rediscover what was dropped
+                    self.warnings.append(f"{len(drop)} local team.toml/PROJECT.md change(s) conflicted with the "
+                                         "remote and were discarded; the remote's version stands. Re-run the "
+                                         "change (`levain team member add` / `levain team consolidate`) if still "
+                                         "wanted.")
                 try:
                     git(["checkout", "-q", BRANCH], self.wt, timeout=60)
                 except TeamError as exc:
-                    raise TeamError(f"the replayed ledger was published to the local branch ({exc}) but the "
-                                    "worktree could not be moved onto it; run `levain team sync` again") from None
+                    try:
+                        self._reattach()    # the same checkout, forced
+                    except TeamError:
+                        raise TeamError(f"the replayed ledger was published to the local branch ({exc}) but the "
+                                        f"worktree could not be moved onto it; run `git -C {self.wt} checkout -f "
+                                        f"{BRANCH}`") from None
             finally:
                 if not published:
                     try:
                         self._reattach()
-                    except TeamError:
-                        pass   # never replace the error that sent us here; the next command's recovery re-attaches
-            if drop:
-                self.warnings.append(f"{len(drop)} local team.toml/PROJECT.md change(s) conflicted with the remote "
-                                     "and were discarded; the remote's version stands. Re-run the change "
-                                     "(`levain team member add` / `levain team consolidate`) if still wanted.")
+                    except TeamError as exc:
+                        # the replay's own error is the one to raise; say what state this leaves behind
+                        self.warnings.append(f"the ledger worktree was left detached ({exc}); the next levain team "
+                                             "command re-attaches it")
 
     def _reattach(self) -> None:
         """Abort any replay in progress and put the worktree back on the branch, wherever the branch points."""
