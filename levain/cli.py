@@ -962,6 +962,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
+    from levain.team.cli import register as _register_team
+
+    _register_team(subparsers)
+
     args = parser.parse_args(argv)
     return args.func(args)
 
