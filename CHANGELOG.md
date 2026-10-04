@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **Levain now requires anneal-memory 0.9.31 or later** (`anneal-memory>=0.9.31,<0.10`), and 0.9.31 is the version it is tested against. 0.9.31 was already what a fresh install resolved to, so `levain doctor` and `levain update` reported it as "ahead of this release's known-good, untested together"; they no longer do. What moved the floor is that the known-good version and the floor must be the same number, and that the refusal text of `levain wrap` sends you to `anneal-memory wrap-status`, which reads one transaction from 0.9.31 (0.9.30's could show a wrap that had been replaced with the older wrap's bound token). No migration entry, schema or API changed in anneal 0.9.30 or 0.9.31, so the seed needed no change.
+
+### Added
+
+- A test that fails when the pyproject floor and the known-good anneal version differ, or when the anneal under test has a migration entry newer than the version the seed is reconciled to (the next anneal that adds one).
+
 ## [0.5.8] — 2026-10-04
 
 `levain wrap` stops claiming things the store does not show: after a stop, a failed save, or a failure while showing the result, its messages now say only what was established (and name the command that settles the rest), `--reset` clears a wrap whose episode list anneal cannot read, and the symlink-loop warning fires on Python 3.13 as on 3.12.

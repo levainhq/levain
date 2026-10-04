@@ -551,3 +551,23 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
     )
     assert after.pending_count == expected_pending
     assert after.migrate_acked == manifest.TEMPLATES_RECONCILED_ANNEAL
+
+
+def test_the_anneal_floor_is_known_good_and_no_manifest_entry_is_above_the_template_cap():
+    """0.5.9: two release-gate invariants that failed silently the other way. (1) The pyproject
+    floor equals KNOWN_GOOD_ANNEAL (`doctor` reports drift otherwise), read from pyproject itself
+    so a stale install's metadata cannot satisfy it. (2) No migration-manifest entry of the anneal
+    under test is newer than TEMPLATES_RECONCILED_ANNEAL: when anneal adds an entry, the seed has
+    to be reconciled to it and the cap moved, or a fresh install would ack past guidance it does
+    not carry."""
+    import re
+    from pathlib import Path
+
+    from anneal_memory.migration import MIGRATION_MANIFEST
+
+    text = (Path(manifest.__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    floor = re.search(r'"anneal-memory>=([0-9.]+)', text).group(1)
+    assert floor == manifest.KNOWN_GOOD_ANNEAL, (floor, manifest.KNOWN_GOOD_ANNEAL)
+    newest = max(manifest.version_tuple(e["version"]) for e in MIGRATION_MANIFEST)
+    assert newest <= manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL), (
+        "anneal has a migration-manifest entry newer than the seed's reconcile cap")
