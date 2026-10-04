@@ -692,7 +692,7 @@ def _consolidate(
         if dry_run:
             # A prepared-but-unsaved wrap would strand the store, so cancel it — --dry-run changes
             # NOTHING (a plan is not a result). The episodes stay unwrapped for the real run.
-            store.wrap_cancelled()
+            _cancel_if_ours(store, wrap_token)
             print(
                 f"levain wrap: DRY RUN — {episode_count} episode(s) are ready to consolidate "
                 f"(wrap_token {wrap_token}). Nothing was composed or saved.\n"
@@ -716,11 +716,11 @@ def _consolidate(
                 instructions=_compose_instructions(wrap_schema),
             )
         except _ComposeUnavailable as exc:
-            store.wrap_cancelled()  # never composed → don't strand the wrap
+            _cancel_if_ours(store, wrap_token)  # never composed → don't strand the wrap
             print(f"levain wrap: {exc}")
             return 2
         except Exception as exc:  # noqa: BLE001 — a model/endpoint failure is a run failure, not a crash
-            store.wrap_cancelled()  # self-clean so a plain re-run works; episodes return to the pool
+            _cancel_if_ours(store, wrap_token)  # self-clean so a plain re-run works; episodes return to the pool
             print(
                 f"levain wrap: the compose model failed ({type(exc).__name__}: {exc}).\n"
                 "  Nothing was saved; the entity's memory is unchanged and its episodes are safe. "
@@ -729,7 +729,7 @@ def _consolidate(
             return 1
 
         if not neocortex.strip():
-            store.wrap_cancelled()
+            _cancel_if_ours(store, wrap_token)
             print(
                 "levain wrap: the compose model returned no usable memory text; nothing saved. "
                 "Re-run (a stronger --composer may help a weak model)."
