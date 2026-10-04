@@ -408,3 +408,21 @@ def test_a_directory_path_governs_its_tree_and_paths_are_cwd_relative(two, monke
     e = next(e for e in ledger(ana).in_force if e.get("summary") == "Decimal only")
     assert e["paths"] == ["src/"]
     assert "Decimal only" in edit(ana, "src/billing.py")["hookSpecificOutput"]["additionalContext"]
+
+
+def test_retire_forged_under_the_owners_name_is_not_enforced(two):
+    """ben writes a retire that claims to be ana's (the owner) into ana's folder and commits it as himself."""
+    tmp, ana, ben = two
+    assert record_ruling(ana) == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ben))
+    rid = next(e["id"] for e in gl.ledger().in_force if e.get("words") == "Per-line rounding stays.")
+    forged = E.seal(E.build("ana", "retire", supersedes=[rid], words="Dana: drop it"), "")
+    p = gl.wt / "ledger" / "ana" / "0000beef.jsonl"
+    p.write_text(json.dumps(forged) + "\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "as ana", cwd=gl.wt)
+    led = gl.ledger()
+    assert rid in {e["id"] for e in led.in_force}
+    assert any("committed by ben@ex.com" in p for p in led.problems)
+    assert edit(ben, "src/billing.py")["hookSpecificOutput"]["permissionDecision"] == "deny"

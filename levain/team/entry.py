@@ -5,8 +5,9 @@ An entry is one JSON object per line in an append-only file. Each file carries i
 The chain proves the history of one file was not rewritten after the fact; it does not prove who wrote it
 (git's author and the host's access control do that part).
 
-``canonical()`` is a cross-package contract: anneal-memory's team import recomputes the same bytes
-(``tests/test_team_golden.py`` pins a vector both packages check). Do not change its arguments.
+``canonical()`` is a cross-package contract, meant to be recomputed byte for byte by any importer of the
+ledger (anneal-memory's team import is the first). ``tests/test_team_golden.py`` pins the bytes; changing the
+arguments here breaks every ledger already written.
 """
 from __future__ import annotations
 

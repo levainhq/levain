@@ -6,6 +6,28 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-04
+
+Team context: one project's decisions shared across a team of engineers, with git as the wire and a Claude Code hook that puts a recorded decision in front of the agent at the edit it governs.
+
+### Added
+
+- **`levain team`** (`init`, `join`, `record`, `retire`, `sync`, `status`, `verify`, `consolidate`, `export`, `install`, `doctor`, `member add`, `pack-sync`). An orphan `levain-ledger` branch in the project's repository holds `team.toml`, one append-only SHA-256-chained JSON-lines file per author per clone (`ledger/<author>/<device>.jsonl`, so two clones never write one file), and the owner-generated `PROJECT.md`. Every read and write goes through a private, locked `git worktree` of that branch under `<git common dir>/levain-team/`. Entry schema v1: `v id ts author agent session type kind mode paths owner words summary reason recheck supersedes refs pack rule_id prev hash`; types `decision constraint finding question tension ack retire`; a ruling needs an owner and the decider's own words. Refused at write: missing fields, unknown supersede targets, text that looks like a secret, field sizes above the limits anneal-memory's import enforces.
+- **A Claude Code `PreToolUse` hook** (Edit|Write|MultiEdit|NotebookEdit) and a `SessionStart` line, wired by `levain team init/join/install` into `.claude/settings.local.json` of every working tree of the clone (git-excluded; it names your interpreter). Someone else's ruling denies the first edit per session with the full record as the reason, and the retry is allowed and recorded as an `ack`; `block` mode always denies; a `tension` on the path always denies; practices, findings, questions and your own rulings are context only. The hook never emits `allow` (that would bypass the user's own permission prompt). Every failure is fail-open with one visible `[team] ledger unavailable: ...` line. `LEVAIN_TEAM_SESSIONSTART_RULINGS=off` drops the per-ruling lines from the session-start context so enforcement rests on the edit-time hook.
+- **Authority.** Only an entry's own author, or the `team.toml` owner, may supersede or retire it; other links are reported and ignored. Only the owner consolidates the canon, seeds pack rules or changes membership. A ledger file whose git committer is not the member it is filed under (the owner, for pack files) is not enforced and is reported. `levain team verify` walks every chain and reports every problem.
+- **`judgment.toml` in a pack**: `[pack] name/version` plus `[[rule]] id paths kind owner words reason recheck mode`. `levain team pack-sync` (and `init --pack`) seeds the rules as entries authored `pack:<name>`; an upgrade supersedes changed rules and retires dropped ones; a rule the team retired is not resurrected by re-syncing unchanged text.
+- **`levain team export --jsonl`**: every verified entry, per file in file order, for anneal-memory's team import (`--in-force` for the current view). `tests/test_team_golden.py` pins the canonical-JSON and hash bytes.
+- **Optional anneal import.** At session start, if the installed anneal-memory ships `anneal_memory.team` and a store is configured (`--anneal-db`, or `<repo>/.levain/memory.db`), the ledger is imported once per ledger tree with `--link-authority <owner>`; otherwise it is skipped and `levain team doctor` says which. `LEVAIN_TEAM_ANNEAL_IMPORT=off` disables it.
+
+### Known limits
+
+- Identity is `git config user.email` mapped through `team.toml`, and the committer check trusts the email in each commit: a convention with checks, not cryptography. Someone who sets their git email to a teammate's can still write as them (signed commits are not checked). Deleting a file's last lines is visible only in git history. If a member's email changes in `team.toml`, their older files fail the committer check until it is reverted or re-recorded.
+- Bash writes are not intercepted. Two rulings that disagree are not detected; a `tension` entry is how a team marks one. A nested repository or submodule is governed only by its own ledger.
+- Freshness is a fetch at session start and at most every `fetch_interval` (default 300 s) from the hook.
+- A clone copied with its `.git` directory shares the original's device id; run `levain team join` in a fresh clone instead.
+- POSIX only (`fcntl`). Claude Code started with `--bare` loads no settings hooks, so the team layer is absent there.
+- `levain doctor` does not yet check the team layer; `levain team doctor` does.
+
 ## [0.5.12] — 2026-10-04
 
 Levain is now tested against, and requires, anneal-memory 0.9.33, which refuses to save a continuity above a hard maximum.

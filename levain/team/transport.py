@@ -202,12 +202,54 @@ class GitLedger:
     def handle(self, team: R.Team | None = None) -> str | None:
         return (team or self.team()).handle_for_email(self.email())
 
-    def ledger(self) -> I.Ledger:
+    def ledger(self, *, check_committers: bool = True) -> I.Ledger:
+        """The ledger as enforced. Entries in a file whose git committers are not the member it is filed under
+        (the owner, for pack files) are left out and reported: entry authorship is asserted text, the commit's
+        author email is what the repository host recorded. Cached per ledger tree, so a hook pays one
+        ``git log`` per change, not per edit."""
         try:
-            owner = self.team().owner
+            team = self.team()
         except R.RolesError:
-            owner = None  # no owner known: only same-author links are honoured
-        return I.load_dir(self.wt / "ledger", owner)
+            team = None  # no owner known: only same-author links are honoured, no committer check
+        led = I.load_dir(self.wt / "ledger", team.owner if team else None)
+        if team is None or not check_committers:
+            return led
+        bad = self._committer_problems(team, led)
+        if not bad:
+            return led
+        drop = {e["id"] for f in led.files if f.rel in bad for e in f.entries}
+        kept = [e for e in led.entries if e["id"] not in drop]
+        files = [f for f in led.files if f.rel not in bad]
+        return I.Ledger(kept, led.file_problems + [m for msgs in bad.values() for m in msgs], files, led.owner)
+
+    def _committer_problems(self, team: R.Team, led: I.Ledger) -> dict[str, list[str]]:
+        tree = self.ledger_tree()
+        cache = self.base / "committers.json"
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            if cached.get("tree") == tree and cached.get("team") == R.dump_team(team):
+                return {k: list(v) for k, v in cached.get("bad", {}).items()}
+        except (OSError, ValueError, AttributeError):
+            pass
+        by_safe = {E.safe_handle(h): h for h in team.members}
+        bad: dict[str, list[str]] = {}
+        for f in led.files:
+            top = f.rel.split("/", 1)[0]
+            expected = team.owner if top.startswith("pack-") else by_safe.get(top)
+            cp = git(["log", "--format=%ae", "--", f"ledger/{f.rel}"], self.wt, check=False, timeout=30)
+            for mail in sorted(set(cp.stdout.split())):
+                who = team.handle_for_email(mail)
+                if expected is None or who != expected:
+                    bad.setdefault(f.rel, []).append(
+                        f"ledger/{f.rel}: committed by {mail} ({who or 'not a member'}), but it holds {top}'s "
+                        f"entries (expected {expected or 'a member'}); not enforced")
+        try:
+            tmp = cache.with_suffix(f".tmp{os.getpid()}")
+            tmp.write_text(json.dumps({"tree": tree, "team": R.dump_team(team), "bad": bad}), encoding="utf-8")
+            os.replace(tmp, cache)
+        except OSError:
+            pass
+        return bad
 
     def file_for(self, author: str) -> Path:
         return self.wt / "ledger" / E.safe_handle(author) / f"{self.device}.jsonl"

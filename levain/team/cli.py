@@ -205,7 +205,6 @@ def cmd_verify(args) -> int:
                 problems.append(f"{e['id']}: names {s}, which is not in the ledger")
         if e.get("owner") and not team.owner_ok(e["owner"]):
             problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
-    problems += _commit_author_problems(gl, team, ledger)
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
     print(C.staleness(canon_text, ledger, tree))
@@ -213,25 +212,6 @@ def cmd_verify(args) -> int:
         print(f"PROBLEM: {p}")
     print("ledger verified: every chain intact" if not problems else f"{len(problems)} problem(s)")
     return 0 if not problems else 1
-
-
-def _commit_author_problems(gl: GitLedger, team: R.Team, ledger: I.Ledger) -> list[str]:
-    """Who actually committed each ledger file, per git. Entry authorship is asserted text; the commit's
-    author email is what the client's git host records. A file whose committers map to someone other than the
-    handle it is filed under (or, for pack files, other than the owner) is reported."""
-    out = []
-    by_safe = {E.safe_handle(h): h for h in team.members}
-    for f in ledger.files:
-        top = f.rel.split("/", 1)[0]
-        expected = team.owner if top.startswith("pack-") else by_safe.get(top)
-        cp = subprocess.run(["git", "log", "--format=%ae", "--", f"ledger/{f.rel}"], cwd=gl.wt,
-                            capture_output=True, text=True)
-        for mail in sorted(set(cp.stdout.split())):
-            who = team.handle_for_email(mail)
-            if expected is None or who != expected:
-                out.append(f"ledger/{f.rel}: committed by {mail} ({who or 'not a member'}), "
-                           f"but it holds {top}'s entries (expected {expected or 'a member'})")
-    return out
 
 
 def cmd_consolidate(args) -> int:
