@@ -124,10 +124,16 @@ def pending_path() -> Path:
 
 
 def _read_pending() -> float | None:
+    """The recorded time; a file that exists but does not parse counts from its own mtime."""
     try:
         return float(pending_path().read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
+    except (OSError, ValueError):
+        try:
+            return pending_path().stat().st_mtime
+        except OSError:
+            return None
 
 
 def mirror_enabled() -> bool:
@@ -470,7 +476,12 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
                             since.append(os.path.getmtime(trigger))
                         except OSError:
                             pass
-                    pending_path().write_text(repr(min(since)), encoding="utf-8")
+                    try:
+                        tmp = pending_path().with_name(f"{pending_path().name}.{os.getpid()}")
+                        tmp.write_text(repr(min(since)), encoding="utf-8")
+                        os.replace(tmp, pending_path())
+                    except OSError:
+                        pass
                 return counts
             if has:
                 counts["state_lost"] = 1
@@ -489,6 +500,11 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
         # A note modified at or after the cutoff (the session's start when session_start.py
         # passed it, else this sweep's own) is being written now and is never baselined.
         cutoff = min(started, _STARTED) if started else _STARTED
+        if not first and not dry_run and pending_path().exists():
+            try:
+                pending_path().unlink()            # left by a crash after the first save
+            except OSError:
+                pass
         pending = _read_pending() if first else None
         if pending is not None:
             cutoff = min(cutoff, pending)          # a first sweep that waited on the store

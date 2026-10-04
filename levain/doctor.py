@@ -1101,7 +1101,7 @@ def _check_automemory_mirror(install: Path, hooks: dict) -> list[CheckResult]:
     except (OSError, ValueError):
         pass
     problem = ""
-    if (install / ".levain" / "automemory_mirror.pending").exists():
+    if (install / ".levain" / "automemory_mirror.pending").exists() and not last:
         problem = ("its first sweep has not yet been able to read the anneal store; notes "
                    "written meanwhile are mirrored once it can")
     elif last.get("store_unreadable"):
