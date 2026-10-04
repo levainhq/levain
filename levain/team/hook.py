@@ -259,11 +259,13 @@ def sessionstart(payload: dict) -> None:
     lines.append(f"[team] {C.staleness(canon_text, ledger, tree)}. Canon: {gl.wt / 'PROJECT.md'}")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
-    for e in rulings[:15]:
+    # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
+    show = os.environ.get("LEVAIN_TEAM_SESSIONSTART_RULINGS", "").lower() not in ("0", "off", "false", "no")
+    for e in (rulings[:15] if show else []):
         where = ", ".join(e.get("paths") or ["(project-wide)"])
         words = e.get("words", "")
         lines.append(f"  - {where}: owner {e.get('owner')}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
-    if len(rulings) > 15:
+    if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
     if fetch_note:
         lines.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
