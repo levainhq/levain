@@ -175,16 +175,26 @@ def _wrap_in_progress(store: object) -> bool:
         return True
 
 
-def _cancel_if_ours(store: object, wrap_token: object) -> None:
+def _cancel_if_ours(store: object, wrap_token: object) -> bool:
     """Cancel the in-progress wrap ONLY if it is still OURS (its snapshot token equals ``wrap_token``).
 
     The point-of-use guard against cancelling a concurrent peer's live wrap in our failure path — the
     ``loser-cancels-winner`` race. Correct even if the process lock were somehow bypassed
     (``invariant_must_fire_at_the_point_of_use``): a bare ``wrap_cancelled`` clears WHATEVER wrap is in
-    the store, which after a race is the winner's. No-op if idle or the token changed; never raises."""
+    the store, which after a race is the winner's. No-op if idle or the token changed; never raises.
+
+    Returns False only when a wrap of ours may still be open: the cancel itself failed (a locked or
+    unreadable store). Idle, another token's wrap, and no token at all return True. Callers that
+    tell the operator the wrap was cancelled print :data:`_CANCEL_FAILED` instead when it is False."""
     # anneal compares the token and clears the wrap in one step (expect_token); reading the snapshot
     # and then calling a bare cancel let another client's new wrap be cleared in between (codex, the
     # 0.5.6 hunk look). WrapOwnershipError means the in-progress wrap is not ours: leave it.
+    # Without a token there is nothing to compare, and wrap_cancelled(expect_token=None) is anneal's
+    # bare cancel, which clears whatever wrap is open. A "ready" result always carries one, so this
+    # only guards a broken contract: leave the store alone rather than clear a wrap we cannot name.
+    if not wrap_token:
+        _log.warning("cancel-if-ours: no wrap token to compare, nothing cancelled")
+        return True
     try:
         from anneal_memory import WrapOwnershipError
 
@@ -192,8 +202,17 @@ def _cancel_if_ours(store: object, wrap_token: object) -> None:
             store.wrap_cancelled(expect_token=wrap_token)  # type: ignore[attr-defined]
         except WrapOwnershipError:
             pass
+        return True
     except Exception as exc:  # noqa: BLE001 — a guard must not raise into a failure path
-        _log.debug("cancel-if-ours skipped (%s): %s", type(exc).__name__, exc)
+        _log.warning("cancel-if-ours failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+_CANCEL_FAILED = (
+    "  ⚠ The prepared wrap could NOT be cancelled, so the next "
+    "`levain wrap` will find it in progress. Once nothing else is using this entity, run "
+    "`levain wrap --reset` to discard it; the episodes are safe."
+)
 
 
 def _orphan_is_stale(started: object, bound: float | None) -> bool:
@@ -665,26 +684,32 @@ def _consolidate(
             )
             return 0
         if status != "ready":
+            # No cancel: a non-ready result started no wrap of ours (anneal's "downgraded" leaves the
+            # store untouched and carries no token), so a bare cancel here could only clear a wrap
+            # some other process started meanwhile (codex + complement, the 0.5.7 round).
             print(f"levain wrap: prepare_wrap returned an unexpected status {status!r} — aborting.")
-            store.wrap_cancelled()
             return 1
 
         wrap_token = result.get("wrap_token")
         # THE AUTHORITATIVE SCHEMA CHECK, at the point of use. The check above runs before the wrap
         # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
-        # round, reproduced: the wrap saved under the ops schema). Once prepare_wrap has started the
-        # wrap, anneal refuses any schema change until the save or a cancel, so the schema read here
-        # is the one the save validates against, and the compose prompt is built from this object.
+        # round, reproduced: the wrap saved under the ops schema). The schema read here is the one
+        # anneal froze for this wrap, which the save validates against, and the compose prompt is
+        # built from this object. It does NOT close the window inside prepare_wrap itself: anneal
+        # freezes the schema prepare_wrap read before it built the package, without comparing it to
+        # the live one, so a change committed in between is frozen over (CHANGELOG, known open).
         # A store error reading it is handled by the outer AnnealMemoryError clause, which cancels
         # by token now that a wrap exists.
         wrap_schema = store.section_schema_for_wrap()
         if name_for_schema(wrap_schema) != "partnership":
-            _cancel_if_ours(store, wrap_token)
+            cancelled = _cancel_if_ours(store, wrap_token)
             print(
                 "levain wrap: this entity's store changed off the partnership schema while the "
-                "consolidate was starting, so it was cancelled; nothing was saved.\n"
+                "consolidate was starting, so it was stopped; nothing was saved.\n"
                 f"  got:      {[s['heading'] for s in wrap_schema]}\n  required: {expected}"
             )
+            if not cancelled:
+                print(_CANCEL_FAILED)
             return 2
         package_text = format_wrap_package_text(result)
         episode_count = result.get("episode_count")
@@ -692,12 +717,16 @@ def _consolidate(
         if dry_run:
             # A prepared-but-unsaved wrap would strand the store, so cancel it — --dry-run changes
             # NOTHING (a plan is not a result). The episodes stay unwrapped for the real run.
-            _cancel_if_ours(store, wrap_token)
+            # A cancel that failed left the wrap open, which is a change, so it is not a success.
+            cancelled = _cancel_if_ours(store, wrap_token)
             print(
                 f"levain wrap: DRY RUN — {episode_count} episode(s) are ready to consolidate "
                 f"(wrap_token {wrap_token}). Nothing was composed or saved.\n"
             )
             print(package_text)
+            if not cancelled:
+                print(_CANCEL_FAILED)
+                return 1
             return 0
 
         print(
@@ -716,24 +745,30 @@ def _consolidate(
                 instructions=_compose_instructions(wrap_schema),
             )
         except _ComposeUnavailable as exc:
-            _cancel_if_ours(store, wrap_token)  # never composed → don't strand the wrap
+            cancelled = _cancel_if_ours(store, wrap_token)  # never composed → don't strand the wrap
             print(f"levain wrap: {exc}")
+            if not cancelled:
+                print(_CANCEL_FAILED)
             return 2
         except Exception as exc:  # noqa: BLE001 — a model/endpoint failure is a run failure, not a crash
-            _cancel_if_ours(store, wrap_token)  # self-clean so a plain re-run works; episodes return to the pool
+            cancelled = _cancel_if_ours(store, wrap_token)  # self-clean so a plain re-run works
             print(
                 f"levain wrap: the compose model failed ({type(exc).__name__}: {exc}).\n"
                 "  Nothing was saved; the entity's memory is unchanged and its episodes are safe. "
                 "Check --composer / --base-url and re-run."
             )
+            if not cancelled:
+                print(_CANCEL_FAILED)
             return 1
 
         if not neocortex.strip():
-            _cancel_if_ours(store, wrap_token)
+            cancelled = _cancel_if_ours(store, wrap_token)
             print(
                 "levain wrap: the compose model returned no usable memory text; nothing saved. "
                 "Re-run (a stronger --composer may help a weak model)."
             )
+            if not cancelled:
+                print(_CANCEL_FAILED)
             return 1
 
         # SAVE — the gated efferent write. FAIL-CLOSED: validated_save_continuity REFUSES (raises) a
@@ -764,7 +799,7 @@ def _consolidate(
                 # Nothing committed — the identity is unchanged. Cancel OUR wrap (token-owned, so a
                 # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
                 debug_path = _dump_rejected(entity_dir, wrap_token, neocortex)
-                _cancel_if_ours(store, wrap_token)
+                cancelled = _cancel_if_ours(store, wrap_token)
                 print(
                     f"levain wrap: the composed memory was REFUSED — NOT saved "
                     f"({type(exc).__name__}: {exc}).\n"
@@ -774,6 +809,8 @@ def _consolidate(
                     f"  The rejected draft was saved for inspection: {debug_path}\n"
                     "  Re-run to try again (a stronger --composer may help)."
                 )
+                if not cancelled:
+                    print(_CANCEL_FAILED)
                 return 1
             # The DB COMMITTED but the file externalization (Phase-3 rename) failed — the wrap IS
             # recorded (recoverable from the ``.tmp`` the exception names) and the episodes are NOT
@@ -804,12 +841,13 @@ def _consolidate(
         # read, prepare_wrap itself) nothing was written: anneal marks the wrap in progress LAST.
         # AFTER it, a wrap of ours is open, and returning without cancelling stranded it (codex,
         # the 0.5.6 hunk look), so any wrap still carrying our token is cancelled first.
-        if wrap_token is not None:
-            _cancel_if_ours(store, wrap_token)
+        cancelled = _cancel_if_ours(store, wrap_token) if wrap_token is not None else True
         print(
             f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
             f"({type(exc).__name__}: {exc})."
         )
+        if not cancelled:
+            print(_CANCEL_FAILED)
         return 2
     except BaseException:
         # THE OUT-OF-BAND EXITS — and this clause exists because the two that matter are deliberately
