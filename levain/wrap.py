@@ -663,8 +663,22 @@ def _consolidate(
             store.wrap_cancelled()
             return 1
 
-        package_text = format_wrap_package_text(result)
         wrap_token = result.get("wrap_token")
+        # THE AUTHORITATIVE SCHEMA CHECK, at the point of use. The check above runs before the wrap
+        # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
+        # round). Once prepare_wrap has started the wrap, anneal refuses any schema change until the
+        # save or a cancel, so the schema read here is the one the save validates against, and the
+        # compose prompt is built from this same object.
+        wrap_schema = store.section_schema_for_wrap()
+        if name_for_schema(wrap_schema) != "partnership":
+            _cancel_if_ours(store, wrap_token)
+            print(
+                "levain wrap: this entity's store changed off the partnership schema while the "
+                "consolidate was starting, so it was cancelled; nothing was saved.\n"
+                f"  got:      {[s['heading'] for s in wrap_schema]}\n  required: {expected}"
+            )
+            return 2
+        package_text = format_wrap_package_text(result)
         episode_count = result.get("episode_count")
 
         if dry_run:
@@ -691,7 +705,7 @@ def _consolidate(
                 composer=composer,
                 base_url=base_url,
                 api_key=api_key,
-                instructions=_compose_instructions(store.section_schema),
+                instructions=_compose_instructions(wrap_schema),
             )
         except _ComposeUnavailable as exc:
             store.wrap_cancelled()  # never composed → don't strand the wrap

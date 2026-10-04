@@ -12,6 +12,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **`levain wrap` accepts a store persisted before an optional section existed.** It compared the store's sections to anneal's current list exactly, so anneal 0.9.27's optional `## Durable Facts` made every older partnership store fail the check. It now compares the required sections only; a store missing a required one is still refused.
 - **`levain wrap` asks the composing model for the sections the store actually has.** Its instructions listed six fixed headings and said all six must appear, which outranked anneal's own wrap guidance, so a store with `## Durable Facts` never had a new durable fact written to it. The list is now read from the store's schema, and an optional section is marked as optional.
+- **`levain wrap` checks the schema the wrap actually runs under.** It checked the store's schema before starting the wrap, so a schema change made by another program in between (an `anneal-memory set-schema` on the same store) let the consolidate save under the wrong schema, without the felt-layer shrink protection. The check now runs after the wrap has started, when anneal refuses any schema change until the save, and a mismatch cancels the wrap with nothing saved.
 
 ### Changed
 
@@ -19,7 +20,6 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Known open issues
 
-- **`levain wrap` checks the store's schema before the wrap starts, not the schema the wrap freezes** (since 0.4.x). Another process that changes the store's schema in between (an `anneal-memory set-schema` run by hand, or by another tool on the same store) is not caught, and the wrap runs under the new schema. Levain's own wrap lock does not cover other programs.
 - **The dashboard matches section headings by exact case**, so a continuity written with `## durable facts` (which anneal accepts) is not shown there. Its content is unaffected.
 
 ## [0.5.5] — 2026-10-03
