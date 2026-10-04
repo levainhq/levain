@@ -122,7 +122,7 @@ def test_a_full_rewrite_anneal_will_not_ground_is_retried_with_the_earlier_text(
     assert "It replaces this earlier text:" in visible[0]["content"]
 
 
-def test_lost_state_stops_the_mirror_and_doctor_reports_it(inst):
+def test_lost_state_stops_the_mirror_and_doctor_reports_it(inst, monkeypatch):
     root, mem, env = inst
     sweep(root, env)
     (mem / "d.md").write_text("A rule.\n")
@@ -135,6 +135,7 @@ def test_lost_state_stops_the_mirror_and_doctor_reports_it(inst):
     assert len(mirrored(root, env, superseded=True)) == 1
 
     from levain.doctor import _check_automemory_mirror
+    monkeypatch.delenv("LEVAIN_AUTOMEMORY_MIRROR", raising=False)
     hooks = {"PostToolUse": [{"matcher": "Write|Edit", "hooks": [{"type": "command", "command":
              f'"{sys.executable}" "${{CLAUDE_PROJECT_DIR}}/activation/hooks/automemory_mirror.py" hook'}]}]}
     (res,) = _check_automemory_mirror(root, hooks)

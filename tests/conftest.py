@@ -34,6 +34,10 @@ def _isolate_activation_env(monkeypatch):
     # Same shape for the floor: `ANNEAL_MEMORY_DERIVE_TRUST` adds write-denies to every policy
     # build_policy assembles (spore-1308), so a shell that sets it would grade the floor tests.
     monkeypatch.delenv("ANNEAL_MEMORY_DERIVE_TRUST", raising=False)
+    # A test that runs the template session_start.py in place would otherwise spawn a detached
+    # auto-memory sweep rooted at levain/templates/ (measured: it wrote .levain/ state there).
+    # tests/test_automemory_mirror.py builds its own env and sets this deliberately.
+    monkeypatch.setenv("LEVAIN_AUTOMEMORY_MIRROR", "off")
 
 
 @pytest.fixture(autouse=True)
