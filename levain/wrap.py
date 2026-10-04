@@ -707,8 +707,12 @@ def _consolidate(
                       "or its metadata cannot be read. Nothing was changed. Re-run in a moment; if "
                       "it persists, look at it with\n"
                       f"  {anneal_invocation('--db', str(episodic_path), 'wrap-status')}\n"
-                      "which prints the exact cancel command for a dead one (aimed at this entity's "
-                      "store, with the wrap's own token).")
+                      "and clear it ONLY once you have confirmed it is dead: a wrap in partial state "
+                      "with\n"
+                      f"  {anneal_invocation('--db', str(episodic_path), 'wrap-cancel', '--partial')}\n"
+                      "or a readable one with that same command and `--wrap-token <its token>` in "
+                      "place of `--partial`. Keep the `--db` shown here: without it anneal reads "
+                      "~/.anneal-memory.")
                 return 2
             if not discarded:
                 print("levain wrap: the prior wrap was already gone; continuing.")
