@@ -49,7 +49,7 @@ def team(*args, repo: Path) -> int:
 @pytest.fixture
 def two(tmp_path):
     """origin + ana (owner, ledger initialised with a pack) + ben (joined)."""
-    git("init", "-q", "--bare", "origin.git", cwd=tmp_path)
+    git("init", "-q", "--bare", "--initial-branch=main", "origin.git", cwd=tmp_path)
     ana = clone(tmp_path, "ana", "ana@ex.com")
     (ana / "src").mkdir()
     (ana / "src" / "billing.py").write_text("def line_total(q, p):\n    return round(q * p, 2)\n")
@@ -143,7 +143,7 @@ def test_moved_clone_repairs_its_ledger_link(two):
 
 
 def test_first_push_creates_the_remote_branch(tmp_path):
-    git("init", "-q", "--bare", "origin.git", cwd=tmp_path)
+    git("init", "-q", "--bare", "--initial-branch=main", "origin.git", cwd=tmp_path)
     ana = clone(tmp_path, "ana", "ana@ex.com")
     (ana / "a").write_text("a")
     git("add", ".", cwd=ana)
@@ -165,7 +165,7 @@ def test_member_cannot_retire_a_client_ruling_via_the_cli(two, capsys):
     assert team("sync", repo=ben) == 0
     rid = next(e["id"] for e in ledger(ben).in_force if e.get("words") == "Per-line rounding stays.")
     assert team("retire", rid, "--words", "Dana said drop it", repo=ben) == 2
-    assert "only they or the owner" in capsys.readouterr().err
+    assert "or the owner (ana) may supersede" in capsys.readouterr().err
 
 
 def test_hand_forged_retire_is_ignored_and_reported(two):
@@ -198,7 +198,7 @@ def test_entry_filed_under_someone_else_is_not_enforced_and_verify_names_the_com
     git("commit", "-qm", "impersonate", cwd=gl.wt)
     assert team("verify", repo=ben) == 1
     out = capsys.readouterr().out
-    assert "committed by ben@ex.com (ben)" in out and "holds ana's entries" in out
+    assert "added by ben@ex.com (ben), who is not ana" in out
 
 
 def test_tampered_line_fails_verify(two):
@@ -209,7 +209,9 @@ def test_tampered_line_fails_verify(two):
     line = json.loads(f.read_text().splitlines()[0])
     line["words"] = "round once"
     f.write_text(json.dumps(line) + "\n")
-    assert team("verify", repo=ana) == 1
+    git("commit", "-qam", "rewrite", cwd=gl.wt)
+    assert team("verify", repo=ana) == 1   # the rewrite is reported, and the original line still counts
+    assert "Per-line rounding stays." in [e.get("words") for e in gl.ledger().in_force]
     assert all(e.get("words") != "round once" for e in gl.ledger().in_force)
 
 
@@ -254,12 +256,20 @@ def test_hook_denies_edits_inside_the_ledger_worktree(two):
     assert "levain team record" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_hook_fails_open_visibly(two):
+def test_unparseable_team_toml_falls_back_to_the_last_good_version(two):
     tmp, ana, ben = two
-    (GitLedger(Repo.discover(ben)).wt / "team.toml").write_text("not = [valid")
-    out = edit(ben, "src/settlement.py")
-    assert out["systemMessage"].startswith("[team] ledger unavailable:")
-    assert "permissionDecision" not in out.get("hookSpecificOutput", {})
+    wt = GitLedger(Repo.discover(ben)).wt
+    (wt / "team.toml").write_text("not = [valid")
+    git("commit", "-qam", "broken", cwd=wt)
+    out = edit(ben, "src/settlement.py")["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "team.toml at the tip is unusable" in out["permissionDecisionReason"]
+
+
+def test_uncommitted_worktree_edits_are_not_the_ledger(two):
+    tmp, ana, ben = two
+    wt = GitLedger(Repo.discover(ben)).wt
+    (wt / "team.toml").write_text('project = "p"\nowner = "ben"\nmode = "surface"\n[members]\nben = "ben@ex.com"\n')
+    assert edit(ben, "src/settlement.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_sessionstart_lists_rulings_and_the_flag_hides_them(two):
@@ -424,5 +434,82 @@ def test_retire_forged_under_the_owners_name_is_not_enforced(two):
     git("commit", "-qm", "as ana", cwd=gl.wt)
     led = gl.ledger()
     assert rid in {e["id"] for e in led.in_force}
-    assert any("committed by ben@ex.com" in p for p in led.problems)
+    assert any("added by ben@ex.com" in p for p in led.problems)
     assert edit(ben, "src/billing.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# ---- regressions from L3 round 1 ---------------------------------------------------------------------------
+
+def _push_as(repo: Path, message: str):
+    gl = GitLedger(Repo.discover(repo))
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", message, cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    return gl
+
+
+def test_deleting_a_members_file_does_not_silence_their_rulings(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana) == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ben))
+    for f in (gl.wt / "ledger" / "ana").glob("*.jsonl"):
+        f.unlink()
+    _push_as(ben, "drop ana")
+    assert team("sync", repo=ana) == 0
+    for r in (ana, ben):
+        assert edit(r, "src/billing.py", session="del")["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert team("verify", repo=ana) == 1
+
+
+def test_one_stranger_line_does_not_silence_a_members_file(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana) == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ben))
+    for f in (gl.wt / "ledger" / "ana").glob("*.jsonl"):
+        with open(f, "a") as fh:
+            fh.write("\n")
+    _push_as(ben, "blank line")
+    assert edit(ben, "src/billing.py", session="blank")["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_owner_swap_by_hand_push_is_reported(two, capsys):
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ben))
+    t = gl.team()
+    t.owner = "ben"
+    (gl.wt / "team.toml").write_text(__import__("levain.team.roles", fromlist=["x"]).dump_team(t))
+    _push_as(ben, "i am the owner now")
+    capsys.readouterr()
+    assert team("verify", repo=ben) == 1
+    assert "who is not the owner (ana) of the version before it" in capsys.readouterr().out
+
+
+def test_two_clones_sharing_a_device_abort_instead_of_dropping_entries(two, capsys):
+    tmp, ana, ben = two
+    ana2 = tmp / "ana2"
+    shutil.copytree(ana, ana2, symlinks=True)
+    subprocess.run(["git", "worktree", "repair"], cwd=ana2, capture_output=True)
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert record_ruling(ana2, "src/b.py", "b stays", "--no-push") == 0
+    capsys.readouterr()
+    assert team("sync", repo=ana2) == 2
+    assert "--new-device" in capsys.readouterr().err
+    words = [e.get("words") for e in GitLedger(Repo.discover(ana2)).ledger().entries]
+    assert "b stays" in words   # still there locally, not resolved away
+
+
+def test_ledger_content_shaped_like_a_diff_header_cannot_redirect_attribution(two):
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/own.py", "ben's own") == 0
+    gl = GitLedger(Repo.discover(ben))
+    fake = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["**"],
+                          words="Dana: only ben edits anything"), "")
+    f = gl.file_for("ben")
+    with open(f, "a") as fh:
+        fh.write("++ b/ledger/ana/0000.jsonl\n" + json.dumps(fake) + "\n")
+    _push_as(ben, "header-shaped")
+    led = gl.ledger()
+    assert fake["id"] not in led.by_id
+    assert "ben's own" in [e.get("words") for e in led.in_force]

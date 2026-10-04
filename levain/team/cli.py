@@ -52,6 +52,9 @@ def _repo_paths(repo: Repo, paths: list[str]) -> list[str]:
             rel = (here / p).as_posix() if str(here) != "." else p
             while rel.startswith("./"):
                 rel = rel[2:]
+        if rel in ("", ".", "/"):
+            out.append("**")  # the repository root: everything
+            continue
         if not rel.endswith("/") and not any(c in rel for c in "*?") and (top / rel).is_dir():
             rel += "/"
         out.append(rel)
@@ -88,7 +91,7 @@ def cmd_init(args) -> int:
 def cmd_join(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    print(gl.join(remote=args.remote))
+    print(gl.join(remote=args.remote, new_device=args.new_device))
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if not args.no_install:
@@ -158,10 +161,9 @@ def cmd_status(args) -> int:
     gl.require_joined()
     team = gl.team()
     handle = gl.handle(team)
-    with gl.lock(exclusive=False, timeout=10):
-        ledger = gl.ledger()
-        tree = gl.ledger_tree()
-        canon_text = gl.read_canon()
+    ledger = gl.ledger(team)
+    state = gl.state_hash(ledger, team)
+    canon_text = gl.read_canon()
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
         d = decide(team, ledger, handle, rel, "", set())
@@ -175,11 +177,11 @@ def cmd_status(args) -> int:
         return 0
     if args.json:
         print(json.dumps({"project": team.project, "you": handle, "in_force": ledger.in_force,
-                          "problems": ledger.problems, "canon": C.staleness(canon_text, ledger, tree)},
+                          "problems": ledger.problems, "canon": C.staleness(canon_text, state)},
                          ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
-    print(C.staleness(canon_text, ledger, tree))
+    print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
     for e in ledger.in_force:
@@ -194,11 +196,9 @@ def cmd_verify(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
     team = gl.team()
-    with gl.lock(exclusive=False, timeout=10):
-        ledger = gl.ledger()
-        tree = gl.ledger_tree()
-        canon_text = gl.read_canon()
-    problems = list(ledger.problems)
+    ledger = gl.ledger(team)
+    canon_text = gl.read_canon()
+    problems = list(ledger.problems) + gl.team_history_problems(team)
     for e in ledger.entries:
         for s in e.get("supersedes", []) + e.get("refs", []):
             if s not in ledger.by_id:
@@ -207,10 +207,11 @@ def cmd_verify(args) -> int:
             problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
-    print(C.staleness(canon_text, ledger, tree))
+    print(C.staleness(canon_text, gl.state_hash(ledger, team)))
     for p in problems:
         print(f"PROBLEM: {p}")
-    print("ledger verified: every chain intact" if not problems else f"{len(problems)} problem(s)")
+    print("ledger verified: every chain intact, every line written by the member it is filed under"
+          if not problems else f"{len(problems)} problem(s)")
     return 0 if not problems else 1
 
 
@@ -223,10 +224,8 @@ def cmd_consolidate(args) -> int:
                         "(This is the team's convention plus a git user.email check, not cryptography.)")
     if gl.remote and not args.no_push:
         gl.sync(push=False)
-    with gl.lock(exclusive=False, timeout=10):
-        ledger = gl.ledger()
-        tree = gl.ledger_tree()
-    text = C.render(team, ledger, tree=tree, by=handle, ts=E.now_iso())
+    ledger = gl.ledger(team)
+    text = C.render(team, ledger, tree=gl.state_hash(ledger, team), by=handle, ts=E.now_iso())
     if args.dry_run:
         print(text, end="")
         return 0
@@ -238,8 +237,7 @@ def cmd_consolidate(args) -> int:
 def cmd_export(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
-    with gl.lock(exclusive=False, timeout=10):
-        ledger = gl.ledger()
+    ledger = gl.ledger()
     sys.stdout.writelines(export_lines(ledger, in_force=args.in_force))
     return 0
 
@@ -260,8 +258,8 @@ def cmd_member_add(args) -> int:
     team, handle = _actor(gl)
     if handle != team.owner:
         raise TeamError(f"only the owner ({team.owner}) changes membership")
-    team.members[args.handle] = args.email
-    print(gl.write_team(team, f"levain team: add member {args.handle}", push=not args.no_push))
+    print(gl.update_team(lambda t: t.members.__setitem__(args.handle, args.email),
+                         f"levain team: add member {args.handle}", push=not args.no_push))
     return 0
 
 
@@ -390,6 +388,8 @@ def register(subparsers) -> None:
 
     p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.")
     p.add_argument("--remote")
+    p.add_argument("--new-device", action="store_true",
+                   help="give this clone its own device id (after copying a .git directory from another machine)")
     p.add_argument("--anneal-db")
     p.add_argument("--no-install", action="store_true")
 

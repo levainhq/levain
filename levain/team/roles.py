@@ -82,6 +82,8 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")
     for h, mail in t.members.items():
+        if h.lower().startswith("pack-"):
+            raise RolesError(f"{where}: member handle {h!r} is reserved (pack-* is where pack rules are filed)")
         if not HANDLE_RE.fullmatch(h):
             raise RolesError(f"{where}: member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]*")
         if "@" not in mail:
@@ -164,6 +166,8 @@ def load_judgment(path: Path) -> Judgment:
     if not isinstance(raw_rules, list):
         raise RolesError(f"{path.name}: rules are [[rule]] tables")
     for i, r in enumerate(raw_rules, 1):
+        if not isinstance(r, dict):
+            raise RolesError(f"rule {i}: each [[rule]] must be a table")
         rid = str(r.get("id", "")).strip()
         if not re.fullmatch(r"[A-Za-z0-9._-]+", rid):
             raise RolesError(f"rule {i}: id must be [A-Za-z0-9._-]+")

@@ -62,9 +62,11 @@ def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     bad = [r.id for r in judgment.rules if not team.owner_ok(r.owner)]
     if bad:
         raise TeamError(f"rule owner(s) not allowed by team.toml (client_owners / members): {', '.join(bad)}")
-    led = gl.ledger()
-    todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
-    written = []
-    for i, e in enumerate(todo):
-        written.append(gl.append(e, push=push and i == len(todo) - 1))
+    # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
+    with gl.lock(name="pack", timeout=60):
+        led = gl.ledger(team)
+        todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
+        written = []
+        for i, e in enumerate(todo):
+            written.append(gl.append(e, push=push and i == len(todo) - 1))
     return written

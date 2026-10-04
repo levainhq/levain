@@ -15,6 +15,7 @@ the same five operations (append, sync, fetch_if_due, ledger, write_canon), not 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import fcntl
 import json
 import os
@@ -31,9 +32,11 @@ from . import index as I
 from . import roles as R
 
 BRANCH = "levain-ledger"
+REF = f"refs/heads/{BRANCH}"
 DIRNAME = "levain-team"
 CANON_FILE = "PROJECT.md"
-_SCRUB_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+_SCRUB_ENV = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+              "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
               "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
 _PUSH_RETRIES = 6
 WARNINGS: list[str] = []  # process-wide: things a person must hear that did not stop the operation
@@ -156,14 +159,19 @@ class GitLedger:
                             "run `levain team init` (first engineer) or `levain team join`")
         self._repair_if_moved()
 
+    def _wt_is_ours(self) -> bool:
+        cp = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], self.wt, check=False, timeout=10)
+        return cp.returncode == 0 and os.path.realpath(cp.stdout.strip()) == os.path.realpath(self.repo.common)
+
     def _repair_if_moved(self) -> None:
-        """A moved or renamed clone leaves the worktree's absolute gitdir link dangling; git can relink it."""
-        if git(["rev-parse", "--git-dir"], self.wt, check=False, timeout=10).returncode == 0:
+        """The worktree's .git file holds an absolute link. A moved clone leaves it dangling; a COPIED clone
+        leaves it pointing at the original repository, where every write would silently land. git relinks it."""
+        if self._wt_is_ours():
             return
         git(["worktree", "repair", str(self.wt)], self.repo.toplevel, check=False, timeout=30)
-        if git(["rev-parse", "--git-dir"], self.wt, check=False, timeout=10).returncode != 0:
-            raise TeamError(f"the ledger worktree {self.wt} is detached from this repository and "
-                            "`git worktree repair` could not relink it")
+        if not self._wt_is_ours():
+            raise TeamError(f"the ledger worktree {self.wt} does not belong to this repository and "
+                            "`git worktree repair` could not relink it; run `levain team join --new-device`")
 
     # ---- locking -----------------------------------------------------------------------------------------
 
@@ -196,60 +204,176 @@ class GitLedger:
         cp = git(["config", "user.email"], self.repo.toplevel, check=False, timeout=10)
         return cp.stdout.strip()
 
+    # ---- read path: everything is read from the branch REF, never the worktree ------------------------------
+    # The ref moves atomically when a rebase or commit completes, so readers need no lock and never see a
+    # half-rebased tree. The worktree is only where writes are prepared.
+
+    def head(self) -> str:
+        cp = git(["rev-parse", "-q", "--verify", REF], self.repo.toplevel, check=False, timeout=10)
+        if cp.returncode != 0:
+            raise TeamError(f"this clone has no {BRANCH} branch")
+        return cp.stdout.strip()
+
+    def _show(self, path: str, rev: str = REF) -> str | None:
+        cp = git(["show", f"{rev}:{path}"], self.repo.toplevel, check=False, timeout=30)
+        return cp.stdout if cp.returncode == 0 else None
+
     def team(self) -> R.Team:
-        return R.load_team(self.wt / "team.toml")
+        """team.toml at the branch tip; if that version does not parse, the newest one that does (reported)."""
+        text = self._show("team.toml")
+        try:
+            return R.parse_team(text or "", "team.toml")
+        except R.RolesError as exc:
+            first = exc
+        cp = git(["log", "--format=%H", REF, "--", "team.toml"], self.repo.toplevel, check=False, timeout=30)
+        for sha in cp.stdout.split()[1:]:
+            try:
+                t = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
+            except R.RolesError:
+                continue
+            self.warnings.append(f"team.toml at the tip is unusable ({first}); using the version from {sha[:10]}")
+            return t
+        raise first
 
     def handle(self, team: R.Team | None = None) -> str | None:
         return (team or self.team()).handle_for_email(self.email())
 
-    def ledger(self, *, check_committers: bool = True) -> I.Ledger:
-        """The ledger as enforced. Entries in a file whose git committers are not the member it is filed under
-        (the owner, for pack files) are left out and reported: entry authorship is asserted text, the commit's
-        author email is what the repository host recorded. Cached per ledger tree, so a hook pays one
-        ``git log`` per change, not per edit."""
-        try:
-            team = self.team()
-        except R.RolesError:
-            team = None  # no owner known: only same-author links are honoured, no committer check
-        led = I.load_dir(self.wt / "ledger", team.owner if team else None)
-        if team is None or not check_committers:
-            return led
-        bad = self._committer_problems(team, led)
-        if not bad:
-            return led
-        drop = {e["id"] for f in led.files if f.rel in bad for e in f.entries}
-        kept = [e for e in led.entries if e["id"] not in drop]
-        files = [f for f in led.files if f.rel not in bad]
-        return I.Ledger(kept, led.file_problems + [m for msgs in bad.values() for m in msgs], files, led.owner)
+    def ledger(self, team: R.Team | None = None) -> I.Ledger:
+        """The ledger as enforced, rebuilt from history: every line ever ADDED under ledger/, in the order it
+        was added, attributed to the author email of the commit that added it.
 
-    def _committer_problems(self, team: R.Team, led: I.Ledger) -> dict[str, list[str]]:
-        tree = self.ledger_tree()
-        cache = self.base / "committers.json"
+        Removing or rewriting a line therefore changes nothing (the ledger is append-only by construction;
+        the removal is reported). A line whose adding commit is not by the member it is filed under (the owner,
+        for pack files) is dropped on its own and reported; the rest of that file still counts. Cached per
+        branch tip.
+        """
+        if team is None:
+            try:
+                team = self.team()
+            except R.RolesError:
+                team = None
+        head = self.head()
+        key = head + "|" + (R.dump_team(team) if team else "")
+        cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
-            if cached.get("tree") == tree and cached.get("team") == R.dump_team(team):
-                return {k: list(v) for k, v in cached.get("bad", {}).items()}
-        except (OSError, ValueError, AttributeError):
+            if cached.get("key") == key:
+                return I.build([(r, l) for r, l in cached["files"]], team.owner if team else None, cached["problems"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-        by_safe = {E.safe_handle(h): h for h in team.members}
-        bad: dict[str, list[str]] = {}
-        for f in led.files:
-            top = f.rel.split("/", 1)[0]
-            expected = team.owner if top.startswith("pack-") else by_safe.get(top)
-            cp = git(["log", "--format=%ae", "--", f"ledger/{f.rel}"], self.wt, check=False, timeout=30)
-            for mail in sorted(set(cp.stdout.split())):
-                who = team.handle_for_email(mail)
-                if expected is None or who != expected:
-                    bad.setdefault(f.rel, []).append(
-                        f"ledger/{f.rel}: committed by {mail} ({who or 'not a member'}), but it holds {top}'s "
-                        f"entries (expected {expected or 'a member'}); not enforced")
+        files, problems = self._history(team)
         try:
             tmp = cache.with_suffix(f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps({"tree": tree, "team": R.dump_team(team), "bad": bad}), encoding="utf-8")
+            tmp.write_text(json.dumps({"key": key, "files": sorted(files.items()), "problems": problems}),
+                           encoding="utf-8")
             os.replace(tmp, cache)
         except OSError:
             pass
-        return bad
+        return I.build(sorted(files.items()), team.owner if team else None, problems)
+
+    def _history(self, team: R.Team | None) -> tuple[dict[str, list[str]], list[str]]:
+        cp = git(["log", "--reverse", "--no-renames", "--no-color", "-p", "--unified=0",
+                  "--format=%x00C%x09%H%x09%ae", REF, "--", "ledger/"], self.repo.toplevel, check=False, timeout=60)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the ledger history: {_tail(cp)}")
+        by_safe = {E.safe_handle(h): h for h in (team.members if team else {})}
+        files: dict[str, list[str]] = {}
+        problems: list[str] = []
+        stranger: dict[tuple[str, str], int] = {}
+        sha = mail = cur = src = ""
+        added: list[str] = []
+        removed: list[str] = []
+
+        def flush() -> None:
+            gone = [r for r in removed if r.strip() and r not in added]
+            where = cur or src
+            if where and gone:
+                problems.append(f"ledger/{where}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
+                                f"{mail}; the ledger is append-only, so the original lines still count")
+            added.clear()
+            removed.clear()
+
+        def take(text: str) -> None:
+            added.append(text)
+            if not text.strip():
+                return
+            top = cur.split("/", 1)[0]
+            expected = (team.owner if top.startswith("pack-") else by_safe.get(top)) if team else None
+            who = team.handle_for_email(mail) if team else None
+            if team is not None and (expected is None or who != expected):
+                stranger[(cur, mail)] = stranger.get((cur, mail), 0) + 1
+                return
+            files.setdefault(cur, []).append(text)
+
+        def ledger_rel(path: str, prefix: str) -> str:
+            p = path[len(prefix):] if path.startswith(prefix) else ""
+            return p if p.endswith(".jsonl") else ""
+
+        lines = cp.stdout.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
+            if line.startswith("\x00C\t"):
+                flush()
+                _, sha, mail = line.split("\t", 2)
+                cur = src = ""
+            elif line.startswith("--- "):
+                flush()
+                src = ledger_rel(line[4:], "a/ledger/")
+                cur = ""
+            elif line.startswith("+++ "):
+                cur = ledger_rel(line[4:], "b/ledger/")
+            elif line.startswith("@@ "):
+                # Consume exactly the hunk's lines (--unified=0: only removals and additions), so ledger content
+                # can never be read as a diff header however it begins.
+                m = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+                n_old = int(m.group(1)) if m and m.group(1) is not None else 1
+                n_new = int(m.group(2)) if m and m.group(2) is not None else 1
+                body = []
+                while i < len(lines) and len(body) < n_old + n_new:
+                    if not lines[i].startswith("\\ "):   # "\ No newline at end of file"
+                        body.append(lines[i])
+                    i += 1
+                for h in body:
+                    if h.startswith("-") and (cur or src):
+                        removed.append(h[1:])
+                    elif h.startswith("+") and cur:
+                        take(h[1:])
+        flush()
+        for (rel, m), n in sorted(stranger.items()):
+            problems.append(f"ledger/{rel}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
+                            f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
+        return files, problems
+
+    def team_history_problems(self, team: R.Team) -> list[str]:
+        """team.toml and PROJECT.md changes not committed by the owner of the version before them.
+
+        Reported, not enforced: identity here is the commit's author email, which anyone can set, so a check
+        would only stop honest mistakes while claiming to stop forgery. Authentication is the git host's job.
+        """
+        out: list[str] = []
+        cp = git(["log", "--reverse", "--format=%H%x09%ae", REF, "--", "team.toml"], self.repo.toplevel,
+                 check=False, timeout=30)
+        prev: R.Team | None = None
+        for row in cp.stdout.splitlines():
+            sha, mail = row.split("\t", 1)
+            try:
+                cur = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
+            except R.RolesError:
+                out.append(f"team.toml at {sha[:10]} (by {mail}) does not parse")
+                continue
+            judge = prev or cur
+            if judge.handle_for_email(mail) != judge.owner:
+                out.append(f"team.toml changed in {sha[:10]} by {mail}, who is not the owner ({judge.owner}) "
+                           "of the version before it")
+            prev = cur
+        cp = git(["log", "--format=%H%x09%ae", REF, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
+        for row in cp.stdout.splitlines():
+            sha, mail = row.split("\t", 1)
+            if team.handle_for_email(mail) != team.owner:
+                out.append(f"{CANON_FILE} changed in {sha[:10]} by {mail}, who is not the owner ({team.owner})")
+        return out
 
     def file_for(self, author: str) -> Path:
         return self.wt / "ledger" / E.safe_handle(author) / f"{self.device}.jsonl"
@@ -280,7 +404,7 @@ class GitLedger:
             self.repo.toplevel)
 
     def _new_device(self) -> str:
-        return self.device or secrets.token_hex(4)
+        return self.device or secrets.token_hex(8)
 
     def init(self, team: R.Team, *, remote: str | None = None, push: bool = True) -> str:
         """Create the ledger branch with team.toml, attach the worktree, push. Returns a status line."""
@@ -288,8 +412,9 @@ class GitLedger:
         email = self.email()
         if not email:
             raise TeamError("git config user.email is not set in this repository")
-        if team.handle_for_email(email) is None:
-            raise TeamError(f"your git user.email ({email}) is not a member in the team you are creating")
+        if team.handle_for_email(email) != team.owner:
+            raise TeamError(f"the ledger is created by its owner ({team.owner}); your git user.email ({email}) "
+                            "maps to someone else")
         remote = remote or self._default_remote()
         if self._local_branch_exists():
             raise TeamError(f"branch {BRANCH} already exists here: use `levain team join`")
@@ -307,7 +432,7 @@ class GitLedger:
             return f"ledger created and pushed to {remote}/{BRANCH}"
         return f"ledger created locally ({'no remote' if not remote else 'not pushed'})"
 
-    def join(self, *, remote: str | None = None) -> str:
+    def join(self, *, remote: str | None = None, new_device: bool = False) -> str:
         email = self.email()
         if not email:
             raise TeamError("git config user.email is not set in this repository")
@@ -318,7 +443,7 @@ class GitLedger:
             git(["fetch", "-q", remote, f"+refs/heads/{BRANCH}:refs/remotes/{remote}/{BRANCH}"],
                 self.repo.toplevel, timeout=120)
             git(["branch", BRANCH, f"refs/remotes/{remote}/{BRANCH}"], self.repo.toplevel)
-        self.save_state(device=self._new_device(), remote=remote or "")
+        self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "")
         self._attach_worktree()
         team = self.team()
         handle = team.handle_for_email(email)
@@ -384,10 +509,9 @@ class GitLedger:
             E.validate(entry, known=ledger.by_id)
             for s in entry.get("supersedes", []):
                 target = ledger.by_id[s]
-                if not I.may_link(entry["author"], target.get("author", ""), ledger.owner):
-                    raise E.EntryError(
-                        f"{s} was recorded by {target.get('author')}; only they or the owner ({ledger.owner}) may "
-                        "supersede or retire it. Record your own entry (refs it with --refs) and ask the owner.")
+                why = I.may_link(entry, target, ledger.owner)
+                if why is not None:
+                    raise E.EntryError(f"{why}. Record your own entry (refs it with --refs) and ask the owner.")
             path = self.file_for(entry["author"])
             rel = path.relative_to(self.wt / "ledger").as_posix()
             prev = next((f.last_hash for f in ledger.files if f.rel == rel), "")
@@ -437,13 +561,21 @@ class GitLedger:
     def _rebase(self, rref: str, timeout: float, lock_timeout: float) -> None:
         with self.lock(timeout=lock_timeout):
             self._recover_dirty()
-            cp = git(["rebase", "-q", "--no-verify", rref], self.wt, check=False, timeout=timeout)
+            cp = git(["rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt, check=False, timeout=timeout)
             if cp.returncode == 0:
                 return
+            conflicted = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.split()
             git(["rebase", "--abort"], self.wt, check=False)
+            if any(p.startswith("ledger/") for p in conflicted) or not conflicted:
+                # An entry file only conflicts when two clones share a device id (a copied .git). Never resolve
+                # it by picking a side: that silently drops entries.
+                raise TeamError(f"the ledger cannot be rebased onto the remote ({', '.join(conflicted) or _tail(cp)}); "
+                                "if this clone's .git was copied from another, run `levain team join --new-device`. "
+                                "Nothing was lost locally")
             # Entry files are per device and cannot conflict; team.toml and PROJECT.md can (an owner on two
             # machines). The remote's version wins those files, and the operator is told to redo the change.
-            cp = git(["rebase", "-q", "--no-verify", "-X", "ours", rref], self.wt, check=False, timeout=timeout)
+            cp = git(["rebase", "-q", "--no-verify", "--empty=drop", "-X", "ours", rref], self.wt, check=False,
+                     timeout=timeout)
             if cp.returncode != 0:
                 git(["rebase", "--abort"], self.wt, check=False)
                 raise TeamError(f"could not rebase the ledger onto the remote ({_tail(cp)}); nothing was lost locally")
@@ -478,7 +610,10 @@ class GitLedger:
                 cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:
-                    self._fetch(remote, rref, timeout)
+                    try:
+                        self._fetch(remote, rref, timeout)
+                    except TeamError:
+                        pass  # the push landed; a failed refresh of the tracking ref is not a failed push
                     return "pushed"
                 err = (cp.stderr or "").lower()
                 race = any(s in err for s in ("non-fast-forward", "fetch first", "failed to update ref",
@@ -517,14 +652,18 @@ class GitLedger:
     # ---- canon ---------------------------------------------------------------------------------------------
 
     def ledger_tree(self) -> str:
-        cp = git(["rev-parse", "-q", "--verify", "HEAD:ledger"], self.wt, check=False)
+        cp = git(["rev-parse", "-q", "--verify", f"{REF}:ledger"], self.repo.toplevel, check=False)
         return cp.stdout.strip() or "empty"
 
     def read_canon(self) -> str | None:
-        try:
-            return (self.wt / CANON_FILE).read_text(encoding="utf-8")
-        except OSError:
-            return None
+        return self._show(CANON_FILE)
+
+    @staticmethod
+    def state_hash(ledger: I.Ledger, team: R.Team) -> str:
+        """What the canon is generated from: the non-ack entries and team.toml. Acks are left out (every agent
+        retry writes one), so the canon is not called stale by work that cannot change it."""
+        ids = sorted(e["id"] for e in ledger.entries if e.get("type") != "ack")
+        return hashlib.sha256(json.dumps([ids, R.dump_team(team)]).encode("utf-8")).hexdigest()[:16]
 
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
@@ -542,9 +681,23 @@ class GitLedger:
     def write_canon(self, text: str, *, push: bool = True) -> str:
         return self._write_file(CANON_FILE, text, "levain team: consolidate PROJECT.md", push)
 
-    def write_team(self, team: R.Team, message: str, *, push: bool = True) -> str:
-        R.validate_team(team)
-        return self._write_file("team.toml", R.dump_team(team), message, push)
+    def update_team(self, change, message: str, *, push: bool = True) -> str:
+        """Reload team.toml, apply ``change(team)`` and commit, all under the worktree lock, so two concurrent
+        membership changes cannot overwrite each other."""
+        self.require_joined()
+        with self.lock():
+            self._recover_dirty()
+            team = R.parse_team((self.wt / "team.toml").read_text(encoding="utf-8"), "team.toml")
+            change(team)
+            R.validate_team(team)
+            (self.wt / "team.toml").write_text(R.dump_team(team), encoding="utf-8")
+            git(["add", "--", "team.toml"], self.wt)
+            if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
+                return "team.toml unchanged"
+            self._commit(message)
+        if push and self.remote:
+            return self._sync(push=True)
+        return "team.toml written locally"
 
     # ---- per-session hook state (local only) -----------------------------------------------------------------
 

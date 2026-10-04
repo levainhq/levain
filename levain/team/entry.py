@@ -118,6 +118,8 @@ def validate(entry: dict, known: dict[str, dict] | None = None, *, scan: bool = 
             raise EntryError(f"missing required field: {f}")
     if not ID_RE.fullmatch(entry["id"]):
         raise EntryError(f"id {entry['id']!r} is not <author>-<yyyymmddHHMMSS>-<8 hex>")
+    if not re.fullmatch(re.escape(safe_handle(entry["author"])) + r"-\d{14}-[0-9a-f]{8}", entry["id"]):
+        raise EntryError(f"id {entry['id']!r} does not begin with its author's handle ({safe_handle(entry['author'])}-)")
     if not TS_RE.fullmatch(entry["ts"]):
         raise EntryError("ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ")
     try:

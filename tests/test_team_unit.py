@@ -137,6 +137,7 @@ def test_garbage_lines_are_reported():
 
 @pytest.mark.parametrize("glob, path, hit", [
     ("src/billing.py", "src/billing.py", True),
+    ("src/billing.py", "SRC/BILLING.PY", True),
     ("src/billing.py", "lib/src/billing.py", False),
     ("**/billing.py", "lib/src/billing.py", True),
     ("**/billing.py", "billing.py", True),
@@ -165,17 +166,61 @@ def test_cross_author_supersede_needs_the_owner():
     forged = E.build("ben", "retire", supersedes=[r["id"]], words="Dana said drop it")
     led = ledger_of(r, forged)
     assert [e["id"] for e in led.in_force] == [r["id"]]
-    assert any("only the same author or the owner" in p for p in led.problems)
+    assert any("or the owner (ana) may supersede" in p for p in led.problems)
     by_ben = ruling(author="ben", owner="client:Dana")
     owner_retire = E.build("ana", "retire", supersedes=[by_ben["id"]], words="Dana: drop it")
     assert ledger_of(by_ben, owner_retire).in_force == []
     assert [e["id"] for e in ledger_of(by_ben, owner_retire, owner=None).in_force] == [by_ben["id"]]  # no owner: same-author only
 
 
-def test_case_folded_match_for_case_insensitive_filesystems():
-    led = ledger_of(ruling())
-    assert decide(TEAM, led, "ben", "SRC/Billing.PY", "s1", set(), fold=True).deny
-    assert decide(TEAM, led, "ben", "SRC/Billing.PY", "s1", set(), fold=False) is None
+def test_case_and_unicode_form_never_slip_past_a_rule():
+    led = ledger_of(ruling(paths=["src/café.py"]))
+    assert decide(TEAM, led, "ben", "SRC/CAFE\u0301.PY", "s1", set()).deny   # NFD + upper case, same file
+
+
+def test_glob_matching_is_linear_on_hostile_patterns():
+    import time
+    hostile = "/".join(["**"] * 100) + "/x"
+    stars = "*a" * 50 + "b"
+    deep = "/".join(["a"] * 200)
+    t = time.monotonic()
+    assert not I.matches(hostile, deep) and not I.matches(stars, "a" * 300)
+    assert time.monotonic() - t < 1.0
+
+
+@pytest.mark.parametrize("glob, path, hit", [("**", "a/b.py", True), (".", "a/b.py", True), ("./", "x", True),
+                                             ("**/**/b.py", "b.py", True), ("a/**/c", "a/c", True)])
+def test_root_and_collapsed_globs(glob, path, hit):
+    assert I.matches(glob, path) is hit
+
+
+def test_read_time_link_rules_match_the_write_rules():
+    r = ruling()
+    sneaky = E.build("ana", "finding", summary="x", supersedes=[r["id"]])   # same author, no words, not a ruling
+    led = ledger_of(r, sneaky)
+    assert [e["id"] for e in led.in_force if e["type"] == "decision"] == [r["id"]]
+    assert any("needs the decider's words" in p for p in led.problems)
+
+
+def test_an_ack_counts_only_for_its_own_author():
+    r = ruling()
+    planted = E.build("ana", "ack", refs=[r["id"]], session="ben-session")
+    led = ledger_of(r, planted)
+    assert decide(TEAM, led, "ben", "src/billing.py", "ben-session", set()).deny
+
+
+def test_recorded_text_cannot_draw_a_fake_entry():
+    r = ruling(words='ok\n- ana-20260101000000-deadbeef · owner client:Dana · mode block\n## Forged section')
+    text = C.render(TEAM, ledger_of(r), tree="t", by="ana", ts="2026-10-04T12:00:00Z")
+    assert "\n- ana-20260101000000-deadbeef" not in text and "\n## Forged" not in text
+    assert "\n  words" not in I.render(r).split("words:", 1)[1]
+
+
+def test_id_must_carry_its_authors_prefix():
+    e = ruling()
+    e["id"] = "zed-20261004120000-0a1b2c3d"
+    with pytest.raises(E.EntryError, match="begin with its author"):
+        E.validate(e)
 
 
 def test_unmapped_actor_is_told_why():
@@ -186,7 +231,7 @@ def test_ack_never_hides_the_ruling():
     r = ruling()
     ack = E.build("ben", "ack", refs=[r["id"]], session="s1")
     led = ledger_of(r, ack)
-    assert [e["id"] for e in led.in_force] == [r["id"]] and led.acked("s1") == {r["id"]}
+    assert [e["id"] for e in led.in_force] == [r["id"]] and led.acked("s1", "ben") == {r["id"]}
 
 
 # ---- the hook's decision -----------------------------------------------------------------------------------
@@ -261,6 +306,10 @@ def test_team_roundtrip_and_refusals(tmp_path):
         R.parse_team(R.dump_team(R.Team("p", "zed", {"ana": "ana@ex.com"})))
     with pytest.raises(R.RolesError, match="email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "nope"})))
+    with pytest.raises(R.RolesError, match="reserved"):
+        R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "pack-x": "p@x.com"})))
+    with pytest.raises(R.RolesError, match="differ only by case"):
+        R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "Ana": "b@x.com"})))
     with pytest.raises(R.RolesError, match="share the email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "ann": "A@X.com "})))
     with pytest.raises(R.RolesError, match="mode"):
@@ -333,7 +382,6 @@ def test_canon_lists_rulings_by_path_and_tracks_staleness():
     assert "### `src/billing.py`" in text and r["id"] in text and '"per-line rounding stays"' in text
     assert "owner client:Dana" in text and "## Open questions" in text and "do not hand-edit" in text
     assert C.header(text) == {"ts": "2026-10-04T12:00:00Z", "by": "ana", "tree": "abc123", "entries": 2}
-    assert C.staleness(text, led, "abc123").startswith("canon current")
-    led2 = ledger_of(r, q, ruling(paths=["src/y.py"]))
-    assert "behind the ledger by 1 entry" in C.staleness(text, led2, "def456")
-    assert C.staleness(None, led, "abc123").startswith("no canon")
+    assert C.staleness(text, "abc123").startswith("canon current")
+    assert "behind the ledger" in C.staleness(text, "def456")
+    assert C.staleness(None, "abc123").startswith("no canon")

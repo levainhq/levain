@@ -28,7 +28,7 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamBusy, TeamError
+from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -46,20 +46,17 @@ def _mode(e: dict, team: R.Team) -> str:
     return e.get("mode") or team.mode
 
 
-FOLD_CASE = sys.platform == "darwin"
-
-
 def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session: str,
-           denied_before: set[str], *, fold: bool = FOLD_CASE) -> Decision | None:
+           denied_before: set[str]) -> Decision | None:
     """What the hook does for one edit of ``rel``. Pure: no I/O. None = nothing applies."""
-    matched = ledger.applying_to(rel, fold=fold)
+    matched = ledger.applying_to(rel)
     if not matched:
         return None
     tensions = [e for e in matched if e.get("type") == "tension"]
     foreign = [e for e in matched if e.get("kind") == "ruling" and not team.owns(handle, e.get("owner", ""))]
     always = tensions + [e for e in foreign if _mode(e, team) == "block"]
     once = [e for e in foreign if _mode(e, team) == "ask-once"]
-    acked = ledger.acked(session) if session else set()
+    acked = ledger.acked(session, handle) if session else set()
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
     owners = sorted({e["owner"] for e in tensions + foreign if e.get("owner")})
@@ -131,9 +128,17 @@ def _in_ledger_machinery(path: str) -> bool:
     """Is ``path`` under some repository's ``<git dir>/levain-team/``? Purely by shape, no git needed."""
     p = Path(os.path.realpath(path))
     for parent in [p, *p.parents]:
-        if parent.name == DIRNAME and (parent.parent / "HEAD").is_file() and (parent.parent / "objects").is_dir():
+        if parent.name.casefold() == DIRNAME and (parent.parent / "HEAD").is_file() \
+                and (parent.parent / "objects").is_dir():
             return True
     return False
+
+
+def _interval(gl: GitLedger) -> float:
+    try:
+        return float(gl.team().fetch_interval)
+    except (R.RolesError, TeamError):
+        return 300.0
 
 
 def _wired_but_broken(gl: GitLedger) -> bool:
@@ -167,30 +172,25 @@ def pretooluse(payload: dict) -> None:
             _fail_open("PreToolUse", f"this clone has a {BRANCH} branch but no usable ledger worktree "
                                      "(run `levain team join`, then `levain team doctor`)")
         return
+    # Fetch first, then read team, ledger and identity together from the branch ref: one consistent snapshot,
+    # no lock (the ref only moves when a rebase or commit completes).
+    fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
     try:
         team = gl.team()
-    except R.RolesError as exc:
+        ledger = gl.ledger(team)
+    except (R.RolesError, TeamError) as exc:
         _fail_open("PreToolUse", str(exc))
         return
-    fetch_note = gl.fetch_if_due(team.fetch_interval, timeout=5.0)
-    busy_note = None
-    try:
-        with gl.lock(exclusive=False, timeout=10.0):
-            ledger = gl.ledger()
-    except TeamBusy:
-        # The worktree lock covers only local commits and rebases, so this is rare; reading unlocked can at worst
-        # see a file mid-rewrite, which verification reports. Enforcing from that beats enforcing nothing.
-        ledger = gl.ledger()
-        busy_note = "[team] read the ledger without its lock (another operation held it for 10 s)"
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
     if rel is None:
         return
-    session = str(payload.get("session_id") or "")
+    # Claude Code always sends session_id; the transcript path is a stable stand-in if a build ever does not.
+    session = str(payload.get("session_id") or payload.get("transcript_path") or "")
     handle = gl.handle(team)
     d = decide(team, ledger, handle, rel, session, gl.session_denied(session) if session else set())
     from .transport import WARNINGS
-    notes = [f"[team] {w}" for w in WARNINGS] + ([busy_note] if busy_note else [])
+    notes = [f"[team] {w}" for w in WARNINGS]
     if fetch_note:
         notes.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
@@ -203,7 +203,11 @@ def pretooluse(payload: dict) -> None:
     text = d.text + ("\n\n" + "\n".join(notes) if notes else "")
     if d.deny:
         if session and d.newly_denied:
-            gl.mark_denied(session, d.newly_denied)
+            try:
+                gl.mark_denied(session, d.newly_denied)
+            except OSError as exc:
+                # Not remembering the deny means the next attempt is denied again: never a reason to allow.
+                text += f"\n\n[team] could not record this denial ({exc}); a retry will be denied again"
         _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                      "permissionDecisionReason": text}})
         return
@@ -226,7 +230,7 @@ def _anneal_db(gl: GitLedger) -> Path | None:
     return p if p.exists() else None
 
 
-def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:
+def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:  # tree: state hash
     """Optional seam: feed every ledger entry to anneal's team import, once per ledger tree.
 
     Runs only when the installed anneal-memory ships ``anneal_memory.team`` and a store is known.
@@ -277,18 +281,13 @@ def sessionstart(payload: dict) -> None:
             _fail_open("SessionStart", f"this clone has a {BRANCH} branch but no usable ledger worktree "
                                        "(run `levain team join`, then `levain team doctor`)")
         return
-    try:
-        team = gl.team()
-    except R.RolesError as exc:
-        _fail_open("SessionStart", str(exc))
-        return
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
     try:
-        with gl.lock(exclusive=False, timeout=10.0):
-            ledger = gl.ledger()
-            tree = gl.ledger_tree()
-            canon_text = gl.read_canon()
-    except TeamError as exc:
+        team = gl.team()
+        ledger = gl.ledger(team)
+        tree = gl.state_hash(ledger, team)
+        canon_text = gl.read_canon()
+    except (R.RolesError, TeamError) as exc:
         _fail_open("SessionStart", str(exc))
         return
     live = ledger.in_force
@@ -298,7 +297,7 @@ def sessionstart(payload: dict) -> None:
     lines = [f"[team] {team.project}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
              f"{'y' if len(live) - len(rulings) == 1 else 'ies'} in force; newest entry "
              f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (git user.email unmapped)'}."]
-    lines.append(f"[team] {C.staleness(canon_text, ledger, tree)}. Canon: {gl.wt / 'PROJECT.md'}")
+    lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.

@@ -23,20 +23,20 @@ def _count(ledger: I.Ledger) -> int:
 def _entry_block(e: dict, team: R.Team) -> list[str]:
     meta = [e["id"]]
     if e.get("owner"):
-        meta.append(f"owner {e['owner']}")
+        meta.append(f"owner {I.oneline(e['owner'])}")
     if e.get("kind") == "ruling":
         meta.append(f"mode {e.get('mode') or team.mode}")
     src = f"pack {e['pack']}" if e.get("pack") else e.get("author", "?")
     meta.append(f"recorded by {src} {e.get('ts', '')[:10]}")
     out = [f"- {' · '.join(meta)}"]
     if e.get("words"):
-        out.append(f'  > "{e["words"]}"')
+        out.append(f'  > "{I.oneline(e["words"])}"')
     if e.get("summary"):
-        out.append(f"  summary by {e.get('author')}: {e['summary']}")
+        out.append(f"  summary by {e.get('author')}: {I.oneline(e['summary'])}")
     if e.get("reason"):
-        out.append(f"  why: {e['reason']}")
+        out.append(f"  why: {I.oneline(e['reason'])}")
     if e.get("recheck"):
-        out.append(f"  re-check: `{e['recheck']}`")
+        out.append(f"  re-check: `{I.oneline(e['recheck'])}`")
     return out
 
 
@@ -76,7 +76,7 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
         lines.append("An agent editing a matching path is shown the ruling (and, by mode, stopped until it asks).")
         lines.append("")
         for g in sorted(by_path):
-            lines.append(f"### `{g}`")
+            lines.append(f"### `{I.oneline(g)}`")
             for e in by_path[g]:
                 lines.extend(_entry_block(e, team))
             lines.append("")
@@ -89,7 +89,7 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
     section("Findings", [e for e in live if e.get("type") == "finding"])
     if ledger.problems:
         lines.append("## Ledger integrity problems at generation")
-        lines.extend(f"- {p}" for p in ledger.problems)
+        lines.extend(f"- {I.oneline(p)}" for p in ledger.problems)
         lines.append("")
     if not any(l.startswith("## ") for l in lines):
         lines.append("Nothing is in force yet.")
@@ -106,13 +106,11 @@ def header(text: str | None) -> dict | None:
     return {"ts": m.group(1), "by": m.group(2), "tree": m.group(3), "entries": int(m.group(4))}
 
 
-def staleness(text: str | None, ledger: I.Ledger, tree: str) -> str:
-    """One line: is the canon current with the ledger it claims to come from?"""
+def staleness(text: str | None, state: str) -> str:
+    """One line: was the canon generated from the ledger and team.toml as they are now?"""
     h = header(text)
     if h is None:
         return "no canon yet (the owner runs `levain team consolidate`)"
-    newer = _count(ledger) - h["entries"]
-    if h["tree"] == tree or newer == 0:
+    if h["tree"] == state:
         return f"canon current (generated {h['ts']} by {h['by']})"
-    return (f"canon is behind the ledger by {newer} entr{'y' if newer == 1 else 'ies'} "
-            f"(generated {h['ts']} by {h['by']})")
+    return f"canon is behind the ledger (generated {h['ts']} by {h['by']}; the owner re-runs `levain team consolidate`)"
