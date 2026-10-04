@@ -182,10 +182,16 @@ def _cancel_if_ours(store: object, wrap_token: object) -> None:
     ``loser-cancels-winner`` race. Correct even if the process lock were somehow bypassed
     (``invariant_must_fire_at_the_point_of_use``): a bare ``wrap_cancelled`` clears WHATEVER wrap is in
     the store, which after a race is the winner's. No-op if idle or the token changed; never raises."""
+    # anneal compares the token and clears the wrap in one step (expect_token); reading the snapshot
+    # and then calling a bare cancel let another client's new wrap be cleared in between (codex, the
+    # 0.5.6 hunk look). WrapOwnershipError means the in-progress wrap is not ours: leave it.
     try:
-        snapshot = store.load_wrap_snapshot()  # type: ignore[attr-defined]
-        if snapshot is not None and snapshot.get("token") == wrap_token:
-            store.wrap_cancelled()  # type: ignore[attr-defined]
+        from anneal_memory import WrapOwnershipError
+
+        try:
+            store.wrap_cancelled(expect_token=wrap_token)  # type: ignore[attr-defined]
+        except WrapOwnershipError:
+            pass
     except Exception as exc:  # noqa: BLE001 — a guard must not raise into a failure path
         _log.debug("cancel-if-ours skipped (%s): %s", type(exc).__name__, exc)
 
@@ -663,8 +669,24 @@ def _consolidate(
             store.wrap_cancelled()
             return 1
 
-        package_text = format_wrap_package_text(result)
         wrap_token = result.get("wrap_token")
+        # THE AUTHORITATIVE SCHEMA CHECK, at the point of use. The check above runs before the wrap
+        # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
+        # round, reproduced: the wrap saved under the ops schema). Once prepare_wrap has started the
+        # wrap, anneal refuses any schema change until the save or a cancel, so the schema read here
+        # is the one the save validates against, and the compose prompt is built from this object.
+        # A store error reading it is handled by the outer AnnealMemoryError clause, which cancels
+        # by token now that a wrap exists.
+        wrap_schema = store.section_schema_for_wrap()
+        if name_for_schema(wrap_schema) != "partnership":
+            _cancel_if_ours(store, wrap_token)
+            print(
+                "levain wrap: this entity's store changed off the partnership schema while the "
+                "consolidate was starting, so it was cancelled; nothing was saved.\n"
+                f"  got:      {[s['heading'] for s in wrap_schema]}\n  required: {expected}"
+            )
+            return 2
+        package_text = format_wrap_package_text(result)
         episode_count = result.get("episode_count")
 
         if dry_run:
@@ -691,7 +713,7 @@ def _consolidate(
                 composer=composer,
                 base_url=base_url,
                 api_key=api_key,
-                instructions=_compose_instructions(store.section_schema),
+                instructions=_compose_instructions(wrap_schema),
             )
         except _ComposeUnavailable as exc:
             store.wrap_cancelled()  # never composed → don't strand the wrap
@@ -778,9 +800,12 @@ def _consolidate(
         )
         return 2
     except AnnealMemoryError as exc:
-        # A read-phase store/crystal failure (schema read, wrap-state read, prepare_wrap). anneal
-        # marks the wrap in progress LAST, so nothing was written and no wrap was stranded — a clean
-        # precondition error, not a failed-mid-flight wrap.
+        # A store/crystal failure. Before prepare_wrap returns a token (schema read, wrap-state
+        # read, prepare_wrap itself) nothing was written: anneal marks the wrap in progress LAST.
+        # AFTER it, a wrap of ours is open, and returning without cancelling stranded it (codex,
+        # the 0.5.6 hunk look), so any wrap still carrying our token is cancelled first.
+        if wrap_token is not None:
+            _cancel_if_ours(store, wrap_token)
         print(
             f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
             f"({type(exc).__name__}: {exc})."
