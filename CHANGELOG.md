@@ -22,6 +22,10 @@ Team context: one project's decisions shared across a team of engineers, with gi
 
 - **A forged ledger line is one reported problem, never a failed read.** Lines are parsed through one bounded entry point: nesting past 32, lines past 256K characters, stray closers, CPython's integer-digit limit and lone surrogates are each refused for that line alone, its neighbours verify exactly as if it were absent, and the PreToolUse hook therefore cannot be stopped by one forged line on the `levain-ledger` branch. (A line nested ~200,000 brackets deep otherwise raises RecursionError out of every read, and has run for minutes in `json.loads` on Windows.) The misfiled-entry filter is linear in a hostile file. Review: three lineages over three rounds, each round's pre-registration in the fan-in log.
 
+### Changed
+
+- **Levain now requires anneal-memory 0.9.36 or later** (`anneal-memory>=0.9.36,<0.10`), and 0.9.36 is the version it is tested against: it is the first published release carrying `anneal-memory team-import`, the other end of `levain team export --jsonl`. No migration-manifest entry and no schema changed, so existing installs' seeds are unchanged.
+
 ### Known limits
 
 - Identity is the author email on each commit, mapped through `team.toml`. Anyone can set it, so levain detects and reports; it does not authenticate. A teammate who sets their git email to the owner's can act as the owner. Authentication is the git host's job (branch protection, required signed commits); levain does not check signatures.
