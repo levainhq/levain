@@ -202,19 +202,25 @@ MCP server and the hooks will read different stores.
   uses a tight 2s query timeout so a hung anneal-memory cannot stall a turn;
   it is fail-open (no count → no nudge).
 - **The auto-memory mirror is ON by default (since 0.5.10).** Claude Code's own
-  auto-memory (`~/.claude/projects/<this install's folder>/memory/*.md`, or under
-  `$CLAUDE_CONFIG_DIR`, or the `autoMemoryDirectory` set in this install's
-  `.claude/settings.local.json` / `.claude/settings.json` or your user settings;
-  one passed only by `claude --settings` is invisible to hooks) is the operator-facing layer the seed hands it. Every
-  write to one of THIS install's memory files becomes a decision episode in this
-  install's store (source `automemory-mirror`, tag `operator-rule`); an edit
-  supersedes the previous episode and a deletion records a retraction that
-  supersedes it. It is one way: it never writes continuity and never writes back
-  to native memory. The first sweep only records the files that already exist,
-  so turning it on (or upgrading with `levain update`) does not import the
-  existing backlog. `MEMORY.md`, the index, is never mirrored. If its state file
+  auto-memory is the operator-facing layer the seed hands it. Every change to one
+  of this install's memory notes becomes an episode in this install's store
+  (source `automemory-mirror`; a `user`/`feedback` note is an `operator-rule`
+  decision, any other note `context`); an edit supersedes the current episode and
+  a deletion records a retraction. Edits made by hand or through Bash are picked up
+  at the next session start or memory write. It is one way: it never writes
+  continuity and never writes back to native memory. The first sweep that sees a
+  memory folder only records the notes already in it, so turning it on (or
+  upgrading with `levain update`) does not import the backlog. Folders: Claude
+  Code's per-project folder for this install (keyed by the git repository when the
+  install sits in one, so the repository's notes are shared), and an
+  `autoMemoryDirectory` set in this install's `.claude/settings.local.json` or
+  `.claude/settings.json`. A user-scope `autoMemoryDirectory` is not mirrored
+  (it is shared by every project), and one passed by `claude --settings` or managed
+  settings is invisible to hooks. `MEMORY.md` is never mirrored. If its state file
   is lost while the store already holds mirror episodes it stops and
   `levain doctor` says so (`.levain/automemory_mirror.lost` explains recovery).
+  A native memory write landing during a wrap's save can make the save refuse a
+  citation; drop that citation and save again.
   **To turn it off:** set `"automemory_mirror": false` in `.levain/config.json`
   (durable), or `LEVAIN_AUTOMEMORY_MIRROR=off` in the environment (per session;
   it wins over the config).

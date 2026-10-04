@@ -69,7 +69,7 @@ def test_first_sweep_baselines_then_hook_mirrors_a_new_note(inst):
     counts = sweep(root, env)
     assert counts.get("baselined") == 1 and mirrored(root, env) == []
 
-    (mem / "new.md").write_text("Operator shorthand: '->' means next step.\n")
+    (mem / "new.md").write_text("---\nname: arrow\ntype: feedback\n---\nOperator shorthand: '->' means next step.\n")
     payload = json.dumps({"tool_name": "Write", "tool_input": {"file_path": str(mem / "new.md")}})
     r = subprocess.run([sys.executable, str(root / "activation" / "hooks" / "automemory_mirror.py"),
                         "hook"], input=payload, capture_output=True, text=True, env=env,
@@ -95,15 +95,16 @@ def test_edit_delete_recreate_leave_only_the_current_note_visible(inst):
     note.write_text("Never deploy on Fridays; ask first.\n")
     assert sweep(root, env)["changed"] == 1
     visible = mirrored(root, env)
-    assert len(visible) == 1 and visible[0]["content"].startswith("OPERATOR RULE, REVISED")
+    assert len(visible) == 1 and visible[0]["content"].startswith("AUTO-MEMORY NOTE, REVISED")
+    assert visible[0]["type"] == "context"
     note.unlink()
     assert sweep(root, env)["deleted"] == 1
     visible = mirrored(root, env)
-    assert len(visible) == 1 and visible[0]["content"].startswith("RETRACTED OPERATOR RULE")
+    assert len(visible) == 1 and visible[0]["content"].startswith("RETRACTED AUTO-MEMORY NOTE")
     note.write_text("Fridays are fine now.\n")
     assert sweep(root, env)["new"] == 1
     visible = mirrored(root, env)
-    assert len(visible) == 1 and visible[0]["content"].rstrip().endswith("Fridays are fine now.")
+    assert len(visible) == 1 and "\n\nFridays are fine now.\n" in visible[0]["content"]
     assert len(mirrored(root, env, superseded=True)) == 4
     (mem / "MEMORY.md").write_text("# index changed\n")
     assert sweep(root, env)["new"] == 0
@@ -122,17 +123,26 @@ def test_a_full_rewrite_anneal_will_not_ground_is_retried_with_the_earlier_text(
     assert "It replaces this earlier text:" in visible[0]["content"]
 
 
-def test_lost_state_stops_the_mirror_and_doctor_reports_it(inst, monkeypatch):
+def test_lost_state_stops_the_mirror_and_a_restored_older_state_does_not_fork(inst, monkeypatch):
     root, mem, env = inst
     sweep(root, env)
     (mem / "d.md").write_text("A rule.\n")
     assert sweep(root, env)["new"] == 1
+    sp = root / ".levain" / "automemory_mirror.json"
+    older = sp.read_text()
+    (mem / "d.md").write_text("A rule, v2.\n")
+    assert sweep(root, env)["changed"] == 1
+    sp.write_text(older)                     # the recovery the marker names, from an older copy
+    (mem / "d.md").write_text("A rule, v3.\n")
+    sweep(root, env)
+    visible = mirrored(root, env)
+    assert len(visible) == 1 and "A rule, v3." in visible[0]["content"]
     (root / ".levain" / "automemory_mirror.json").unlink()
     (mem / "d.md").write_text("A rule, edited.\n")
     assert sweep(root, env).get("state_lost") == 1
     assert (root / ".levain" / "automemory_mirror.lost").exists()
     assert sweep(root, env).get("state_lost") == 1          # stays stopped
-    assert len(mirrored(root, env, superseded=True)) == 1
+    assert len(mirrored(root, env, superseded=True)) == 3
 
     from levain.doctor import _check_automemory_mirror
     monkeypatch.delenv("LEVAIN_AUTOMEMORY_MIRROR", raising=False)

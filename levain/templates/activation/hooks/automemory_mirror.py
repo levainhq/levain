@@ -3,50 +3,60 @@
 
 Claude Code keeps a per-project auto-memory (`<config>/projects/<folder>/memory/*.md`): the
 operator-facing layer the seed hands it (stated preferences, shorthand, working rules,
-corrections). That store has no consolidation and no immune system, and it never leaves this
-machine's Claude Code. This hook copies every write to it, one way, into THIS install's anneal
-store as a decision episode, so the entity's own memory carries the operator layer too and the
-wrap decides what graduates. It never writes continuity, and it never writes back to native
-memory.
+corrections), plus project and reference notes. That store has no consolidation and no immune
+system, and it never leaves this machine's Claude Code. This hook copies every write to it, one
+way, into THIS install's anneal store as an episode, so the entity's own memory carries the
+operator layer too and the wrap decides what graduates. It never writes continuity, and it never
+writes back to native memory.
 
 There is deliberately no automatic rebuild of lost state from the store (see LOST STATE).
 
 TWO ENTRY POINTS, ONE SWEEP:
   hook    PostToolUse on Write|Edit. Reads the payload and, only when the edited file is one of
           this install's auto-memory files, spawns a detached `sweep` and returns. It writes
-          nothing itself, prints nothing and always exits 0, so it can never block a Write or an
-          Edit.
-  sweep   Spawned by the hook and by session_start.py (which catches edits made by hand). Under
-          an exclusive lock it compares each auto-memory file's sha256 with the one recorded at
-          its last mirror and records:
-            new file      -> a decision episode carrying the file's text;
-            changed file  -> a decision episode that supersedes the previous one;
-            deleted file  -> a decision episode that supersedes it as RETRACTED;
-            recreated     -> a new-rule episode that supersedes the retraction.
-          Supersession is anneal's own (`record --supersedes`), so recall hides the replaced
-          episode. anneal refuses a supersession whose text shares too little with the old
-          episode; the write is then retried once with the earlier text quoted, which grounds it.
-          A file's new hash is recorded only after its episode write succeeded, so a failed write
-          is retried at the next sweep; a write that landed unconfirmed costs a duplicate, never
-          a loss. A file that exists but cannot be read is retried, never retracted.
+          nothing itself, prints nothing and always exits 0.
+  sweep   Spawned by the hook and by session_start.py (which catches edits made by hand or
+          through Bash). Under an exclusive lock it compares each auto-memory file's sha256 with
+          the one recorded at its last mirror and records:
+            new file      -> an episode carrying the file's text;
+            changed file  -> an episode that supersedes the current one for that file;
+            deleted file  -> a RETRACTED episode that supersedes it;
+            recreated     -> a new episode that supersedes the retraction.
+          A note whose frontmatter `type` is user or feedback is an OPERATOR RULE (`decision`,
+          tag operator-rule); any other note is an AUTO-MEMORY NOTE (`context`).
+
+WHAT IS SUPERSEDED IS READ FROM THE STORE, NOT FROM THE STATE FILE: every write supersedes
+every episode the store currently shows (recall-visible) carrying that file's path tag. anneal
+accepts a second supersession of an already-superseded episode and the chain forks, so a stale
+id held locally (a write that landed unconfirmed, a restored state file) would otherwise leave
+an old rule current. The state file only remembers hashes: what was last mirrored, and what was
+baselined. anneal refuses a supersession whose text shares too little with the old episode;
+only that refusal is retried, once, with the earlier text quoted, which grounds it.
+A file's new hash is recorded only after its episode write succeeded. A file that exists but
+cannot be read is retried, never retracted.
 
 NO BACKFILL: the first sweep that sees a memory folder records every existing file's hash in it
 without writing an episode (a new install, an install upgraded by `levain update`, or an
-autoMemoryDirectory set later), so only rules written or changed after that are mirrored. The
-edit that triggered the sweep is the exception: it is the rule being written now.
+autoMemoryDirectory set later). A folder that drops out of scope keeps its entries, so it is not
+backfilled when it returns. A file modified after this sweep process started is the exception:
+it is the note being written now.
 
 LOST STATE: when the state file is missing or corrupt while the store already holds mirror
 episodes, the sweep STOPS and writes `.levain/automemory_mirror.lost` (`levain doctor` reports
-it). Re-baselining then would leave an edited or deleted rule current forever. Recovery is a
-person's: restore the state file, or accept the loss, then delete the marker.
+it). Re-baselining then would leave an edited or deleted note current until its next edit.
+Recovery is a person's: restore the state file (safe: supersession reads the store), or accept
+the gap, then delete the marker.
 
 ON BY DEFAULT. Off when `LEVAIN_AUTOMEMORY_MIRROR` is off/0/false/no (env, per session; it
-wins), or `.levain/config.json` has `"automemory_mirror": false` (or one of those strings).
+wins), or `.levain/config.json` has `"automemory_mirror"` false/0 (or one of those strings).
 
-WHICH FOLDER: Claude Code's per-project folder for the install (and for the git work tree it
-sits in), plus any `autoMemoryDirectory` set in the install's .claude/settings.local.json or
-.claude/settings.json or in the user's settings.json. NOT MIRRORED: MEMORY.md (the index); any
-other folder.
+WHICH FOLDER: Claude Code's per-project folder for the install, for the git work tree it sits
+in, and for the repository of a linked worktree (Claude Code keys auto-memory by repository),
+or `<config>/projects/$CLAUDE_CODE_PROJECT_DIR_NAME`; plus the effective `autoMemoryDirectory`
+when it comes from the install's .claude/settings.local.json or .claude/settings.json (absolute
+or `~/` only, as Claude Code requires). A user-scope `autoMemoryDirectory` is NOT mirrored: one
+folder shared by every project would pull other projects' notes into this entity. Invisible to
+any hook: `claude --settings` and managed (policy) settings. NOT MIRRORED: MEMORY.md (the index).
 
 FAIL-OPEN: every entry point catches everything and exits 0.
 
@@ -66,6 +76,8 @@ import sys
 import time
 from pathlib import Path
 
+_STARTED = time.time()
+
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import _levain_hook as hook
@@ -78,7 +90,10 @@ META_KEY = "__meta__"
 LOCK_WAIT_SECONDS = 60
 MAX_BODY_CHARS = 20_000
 ANNEAL_TIMEOUT = 60
+PAGE = 500
 _OFF = {"off", "0", "false", "no"}
+_RULE_TYPES = {"user", "feedback"}
+_GROUNDING_REFUSAL = "to ground as an update"     # anneal's supersede refusal, measured 0.9.31
 
 
 def folder_name(path: Path | str) -> str:
@@ -108,7 +123,7 @@ def mirror_enabled() -> bool:
         value = cfg.get("automemory_mirror", True) if isinstance(cfg, dict) else True
     except Exception:
         return True
-    if value is False:
+    if value is False or (type(value) is int and value == 0):
         return False
     return not (isinstance(value, str) and value.strip().lower() in _OFF)
 
@@ -122,45 +137,66 @@ def _projects_dir() -> Path:
     return _config_dir() / "projects"
 
 
-def _configured_dirs() -> list[Path]:
-    """Every `autoMemoryDirectory` set in a settings file this hook can read: the install's
-    .claude/settings.local.json and .claude/settings.json, and the user's settings.json.
-    A directory given only by `claude --settings` on the command line is invisible here."""
+def _setting_dir(f: Path) -> tuple[bool, Path | None]:
+    """(file sets the key, the directory if it is one Claude Code accepts)."""
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return False, None
+    value = data.get("autoMemoryDirectory") if isinstance(data, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return False, None
+    value = value.strip()
+    if value.startswith("~/"):
+        return True, Path.home() / value[2:]
+    return True, (Path(value) if Path(value).is_absolute() else None)
+
+
+def _configured_dir() -> Path | None:
+    """The effective `autoMemoryDirectory` (local beats project beats user), when it comes from
+    the install's own settings. A user-scope value is shared by every project: not mirrored."""
     root = hook.install_root()
-    out = []
-    for f in (root / ".claude" / "settings.local.json", root / ".claude" / "settings.json",
-              _config_dir() / "settings.json"):
-        try:
-            value = json.loads(f.read_text(encoding="utf-8")).get("autoMemoryDirectory")
-        except Exception:
-            continue
-        if isinstance(value, str) and value.strip():
-            d = Path(value.strip()).expanduser()
-            out.append(d if d.is_absolute() else root / d)
-    return out
+    for f in (root / ".claude" / "settings.local.json", root / ".claude" / "settings.json"):
+        found, d = _setting_dir(f)
+        if found:
+            return d
+    return None
+
+
+def _git(root: Path, *args: str) -> str:
+    try:
+        r = subprocess.run(["git", "-C", str(root), "rev-parse", *args],
+                           capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _project_roots() -> list[Path]:
-    """The directories Claude Code may key this install's auto-memory folder by: the install
-    itself, and the git work tree it sits in when that differs."""
+    """The directories Claude Code may key this install's auto-memory folder by: the install,
+    the git work tree it sits in, and the main repository of a linked worktree."""
     root = hook.install_root()
     roots = [root]
-    try:
-        r = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, timeout=2)
-        top = r.stdout.strip()
-        if r.returncode == 0 and top:
-            top_path = Path(top).resolve()
-            if top_path != root:
-                roots.append(top_path)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
+    top = _git(root, "--show-toplevel")
+    if top:
+        roots.append(Path(top).resolve())
+    common = _git(root, "--path-format=absolute", "--git-common-dir")
+    if common:
+        c = Path(common).resolve()
+        roots.append(c.parent if c.name == ".git" else c)
     return roots
 
 
-def memory_dirs() -> list[Path]:
+def memory_dirs(with_git: bool = True) -> list[Path]:
     proj = _projects_dir()
-    dirs = [proj / folder_name(r) / "memory" for r in _project_roots()] + _configured_dirs()
+    roots = _project_roots() if with_git else [hook.install_root()]
+    dirs = [proj / folder_name(r) / "memory" for r in roots]
+    named = os.environ.get("CLAUDE_CODE_PROJECT_DIR_NAME", "").strip()
+    if named and "/" not in named and named not in (".", ".."):
+        dirs.append(proj / named / "memory")
+    configured = _configured_dir()
+    if configured is not None:
+        dirs.append(configured)
     out: list[Path] = []
     for d in dirs:
         if d not in out:
@@ -260,73 +296,110 @@ def store_has_mirror_episodes() -> bool | None:
     return total > 0 if isinstance(total, int) else None
 
 
-def _record(body: str, tags: list[str], supersedes: str | None) -> str:
-    args = ["--json", "record", "-", "--type", "decision", "--source", SOURCE,
+def current_heads() -> dict[str, list[dict]] | None:
+    """{path tag: [visible mirror episodes carrying it]} read from the store; None when it
+    cannot be read (then nothing is written: superseding blind could fork a chain)."""
+    if not hook.store_path().exists():
+        return {}
+    heads: dict[str, list[dict]] = {}
+    offset = 0
+    while True:
+        r = _anneal(["--json", "episodes", "--source", SOURCE, "--limit", str(PAGE),
+                     "--offset", str(offset)])
+        if r is None or r[0] != 0:
+            return None
+        try:
+            data = json.loads(r[1])
+            eps = data["episodes"]
+            total = data.get("total_matching", 0)
+        except (ValueError, KeyError, TypeError):
+            return None
+        for ep in eps:
+            tags = (ep.get("metadata") or {}).get("tags") or []
+            for t in tags:
+                if isinstance(t, str) and t.startswith("amem-path-"):
+                    heads.setdefault(t, []).append(ep)
+        offset += len(eps)
+        if not eps or offset >= total:
+            return heads
+
+
+def _record(body: str, etype: str, tags: list[str], supersedes: list[str]) -> tuple[str, str]:
+    """(episode id or '', anneal's stderr)."""
+    args = ["--json", "record", "-", "--type", etype, "--source", SOURCE,
             "--tags", ",".join(tags)]
-    if supersedes:
-        args += ["--supersedes", supersedes]
+    for s in supersedes:
+        args += ["--supersedes", s]
     r = _anneal(args, stdin=body)
-    if r is None or r[0] != 0:
-        return ""
+    if r is None:
+        return "", ""
+    if r[0] != 0:
+        return "", r[2] + r[1]
     try:
         ep = json.loads(r[1]).get("id")
     except (ValueError, AttributeError):
-        return ""
-    return ep if isinstance(ep, str) and ep else ""
+        return "", ""
+    return (ep if isinstance(ep, str) and ep else ""), ""
 
 
-def _episode_text(ep_id: str) -> str | None:
-    """The content of an earlier episode, '' when anneal says it no longer exists, None when
-    it cannot be read."""
-    r = _anneal(["--json", "get", ep_id])
-    if r is None:
-        return None
-    if r[0] != 0:
-        return "" if "not found" in (r[1] + r[2]).lower() else None
-    try:
-        content = json.loads(r[1]).get("content")
-    except (ValueError, AttributeError):
-        return None
-    return content if isinstance(content, str) else None
-
-
-def write_episode(body: str, tags: list[str], prev_episode: str | None) -> str:
-    """Record one mirror episode; return its id, or '' on failure (retried next sweep)."""
-    if not prev_episode:
-        return _record(body, tags, None)
-    ep = _record(body, tags, prev_episode)
-    if ep:
+def write_episode(body: str, etype: str, tags: list[str], heads: list[dict]) -> str:
+    """Record one mirror episode superseding `heads`; its id, or '' (retried next sweep).
+    Only anneal's grounding refusal is retried here, with the earlier text quoted: a timeout or
+    any other failure may have committed, and re-recording then would fork the chain."""
+    ids = [h["id"] for h in heads if isinstance(h.get("id"), str)]
+    ep, err = _record(body, etype, tags, ids)
+    if ep or not ids or _GROUNDING_REFUSAL not in err:
         return ep
-    earlier = _episode_text(prev_episode)
-    if earlier is None:
-        return ""
-    if earlier == "":
-        return _record(body, tags, None)        # the old episode is gone: nothing to supersede
-    quoted = earlier if len(earlier) <= MAX_BODY_CHARS else earlier[:MAX_BODY_CHARS] + " […]"
-    return _record(f"{body}\n\nIt replaces this earlier text:\n\n{quoted}", tags, prev_episode)
+    earlier = "\n\n".join(h.get("content") or "" for h in heads)
+    if len(earlier) > MAX_BODY_CHARS:
+        earlier = earlier[:MAX_BODY_CHARS] + " […]"
+    ep, _ = _record(f"{body}\n\nIt replaces this earlier text:\n\n{earlier}", etype, tags, ids)
+    return ep
 
 
 def path_tag(path: str) -> str:
     return "amem-path-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
 
 
-def _tags(path: str) -> list[str]:
-    return ["operator-rule", "automemory", "mirror", path_tag(path)]
+def note_type(text: str) -> str:
+    """The `type:` field of a note's YAML frontmatter, lowercased; '' when there is none."""
+    m = re.match(r"\A---\s*\n(.*?)\n---", text, re.S)
+    if not m:
+        return ""
+    t = re.search(r"^type:\s*['\"]?([A-Za-z_-]+)", m.group(1), re.M)
+    return t.group(1).lower() if t else ""
 
 
-def episode_body(path: str, sha: str, prev: dict | None, text: str | None) -> str:
+def episode_body(path: str, sha: str, rule: bool, revised: bool, text: str | None) -> str:
     """`text` None means the file was deleted."""
     where = f"memory/{Path(path).name}"
+    label = "OPERATOR RULE" if rule else "AUTO-MEMORY NOTE"
     if text is None:
-        return (f"RETRACTED OPERATOR RULE (auto-memory mirror): {where} was deleted. The rule "
-                f"recorded in {prev.get('episode')} no longer holds; do not graduate or recall it "
-                f"as current.")
-    head = "OPERATOR RULE (auto-memory mirror)"
-    if prev:
-        head = f"OPERATOR RULE, REVISED (auto-memory mirror; replaces {prev.get('episode')})"
+        return (f"RETRACTED {label} (auto-memory mirror): {where} was deleted. What it said no "
+                f"longer holds; do not graduate or recall it as current.")
+    head = f"{label} (auto-memory mirror)"
+    if revised:
+        head = f"{label}, REVISED (auto-memory mirror)"
     if len(text) > MAX_BODY_CHARS:
         text = text[:MAX_BODY_CHARS] + f"\n[… cut at {MAX_BODY_CHARS} chars; full text in {where}]"
-    return f"{head}: {where} (sha256 {sha[:12]})\n\n{text}"
+    tail = ("\n\n(A copy of a native memory note. If you also recorded this yourself, the two are "
+            "one piece of evidence, not two.)")
+    return f"{head}: {where} (sha256 {sha[:12]})\n\n{text}{tail}"
+
+
+def _tags(path: str, rule: bool) -> list[str]:
+    return (["operator-rule"] if rule else []) + ["automemory", "mirror", path_tag(path)]
+
+
+def _finish(state: dict, counts: dict, dry_run: bool) -> dict:
+    """Record this sweep's outcome in the state for `levain doctor`, then return the counts."""
+    if not dry_run and META_KEY in state:
+        state[META_KEY] = {**state[META_KEY], "last_sweep": {"at": time.time(), **counts}}
+        try:
+            save_state(state)
+        except OSError:
+            pass
+    return counts
 
 
 def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
@@ -355,6 +428,7 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
             counts["state_unreadable"] = 1         # transient: next sweep
             return counts
         dirs = memory_dirs()
+        dir_set = {str(d) for d in dirs}
         now, unreadable = memory_files(dirs)
         first = META_KEY not in state
         if first:
@@ -368,23 +442,30 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
                     lost_marker().write_text(
                         "auto-memory mirror stopped: .levain/automemory_mirror.json is missing "
                         "or unreadable while this store already holds mirror episodes. Restore "
-                        "the state file, or accept that edits made since are not mirrored, then "
-                        "delete this marker.\n", encoding="utf-8")
+                        "the state file, or accept that notes edited since are not mirrored "
+                        "until their next edit, then delete this marker.\n", encoding="utf-8")
                 return counts
         trigger = os.path.realpath(os.path.expanduser(trigger)) if trigger else ""
-        # No backfill, per folder: a memory folder the state has not seen yet (the first sweep,
-        # or an autoMemoryDirectory set later) has its existing files baselined, not mirrored.
+
+        def written_now(path: str) -> bool:
+            if trigger and os.path.realpath(path) == trigger:
+                return True
+            try:
+                return os.path.getmtime(path) >= _STARTED
+            except OSError:
+                return False
+
+        # No backfill, per folder: a memory folder the state has not seen yet has its existing
+        # files baselined, not mirrored.
         meta = state.get(META_KEY) if isinstance(state.get(META_KEY), dict) else {}
         known = set() if first else set(meta.get("dirs", []))
-        fresh = {str(d) for d in dirs} - known
+        fresh = dir_set - known
         if fresh:
             snap = dict(state)
             for path in sorted(set(now) | unreadable):
-                if str(Path(path).parent) not in fresh or path in snap \
-                        or (trigger and os.path.realpath(path) == trigger):
+                if str(Path(path).parent) not in fresh or path in snap or written_now(path):
                     continue
-                snap[path] = {"sha": now.get(path), "episode": None, "baseline": True,
-                              "mirrored_at": time.time()}
+                snap[path] = {"sha": now.get(path), "baseline": True, "mirrored_at": time.time()}
                 counts["baselined"] = counts.get("baselined", 0) + 1
             snap[META_KEY] = {**meta, "baseline_at": meta.get("baseline_at", time.time()),
                               "dirs": sorted(known | fresh)}
@@ -392,34 +473,31 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
                 return counts
             save_state(snap)
             state = snap
-            if first and not trigger:
-                return counts
+        heads = None                               # read from the store on the first write
         for path in sorted((set(now) | set(state)) - {META_KEY}):
+            if str(Path(path).parent) not in dir_set:
+                continue                           # out of scope now: dormant, never forgotten
             prev = state.get(path)
             sha = now.get(path)
-            if sha is None and path not in unreadable and os.path.lexists(path) \
-                    and not is_memory_file(path, dirs):
-                state.pop(path, None)              # left the mirror's scope: forget it
-                save_state(state)
-                continue
             if sha is None and (path in unreadable or os.path.lexists(path)):
                 counts["failed"] += 1              # present but unreadable: retry, never retract
                 continue
-            if sha is not None and prev and prev.get("baseline") and not prev.get("episode") \
-                    and prev.get("sha") is None:
+            if sha is not None and prev and prev.get("baseline") and prev.get("sha") is None:
                 prev["sha"] = sha                  # unreadable at the baseline: baseline it now
                 save_state(state)
                 continue
             if sha is not None and prev and not prev.get("deleted") and prev.get("sha") == sha:
                 counts["unchanged"] += 1
                 continue
-            if sha is None and (not prev or prev.get("deleted") or not prev.get("episode")):
-                if prev and not prev.get("deleted") and not prev.get("episode"):
-                    state.pop(path, None)          # a baselined file deleted: nothing to retract
-                    save_state(state)
+            if sha is None and (not prev or prev.get("deleted")):
                 continue
-            live = prev if prev and not prev.get("deleted") and prev.get("episode") else None
-            kind = "deleted" if sha is None else ("changed" if live else "new")
+            if sha is None and prev.get("baseline"):
+                state.pop(path, None)              # a baselined file deleted: nothing to retract
+                save_state(state)
+                continue
+            kind = ("deleted" if sha is None else
+                    "changed" if prev and not prev.get("deleted") and not prev.get("baseline")
+                    else "new")
             if dry_run:
                 counts[kind] += 1
                 continue
@@ -434,19 +512,30 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
                     counts["failed"] += 1
                     continue
                 text = raw.decode("utf-8", errors="replace")
-            # A recreated file supersedes its retraction, so the retraction stops being current.
-            replaces = prev.get("episode") if prev and prev.get("episode") else None
-            ep = writer(episode_body(path, sha or "", live, text), _tags(path), replaces)
+            if heads is None:
+                heads = current_heads()
+                if heads is None:
+                    counts["failed"] += 1
+                    counts["store_unreadable"] = 1
+                    break
+            tag = path_tag(path)
+            current = heads.get(tag, [])
+            rule = (note_type(text) in _RULE_TYPES if text is not None
+                    else bool(prev and prev.get("rule")))
+            etype = "decision" if rule else "context"
+            ep = writer(episode_body(path, sha or "", rule, bool(current) and text is not None,
+                                     text), etype, _tags(path, rule), current)
             if not ep:
                 counts["failed"] += 1
                 continue
-            state[path] = ({"sha": sha, "episode": ep, "mirrored_at": time.time()}
+            heads[tag] = [{"id": ep}]
+            state[path] = ({"sha": sha, "episode": ep, "rule": rule, "mirrored_at": time.time()}
                            if sha is not None else
-                           {"sha": prev.get("sha"), "episode": ep, "mirrored_at": time.time(),
-                            "deleted": True})
+                           {"sha": prev.get("sha"), "episode": ep, "rule": rule,
+                            "mirrored_at": time.time(), "deleted": True})
             save_state(state)        # per file: a later failure never loses an earlier success
             counts[kind] += 1
-    return counts
+        return _finish(state, counts, dry_run)
 
 
 def spawn_sweep(trigger: str = "") -> None:
@@ -467,13 +556,23 @@ def start_sweep_if_enabled() -> None:
 
 
 def run_hook() -> int:
-    """PostToolUse entry. Always 0, never prints."""
+    """PostToolUse entry. Always 0, never prints. It asks git (2 s cap) only for a write under
+    Claude Code's projects folder that the git-free folders do not already cover."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         ti = payload.get("tool_input") if isinstance(payload, dict) else None
         path = ti.get("file_path") if isinstance(ti, dict) else None
-        if isinstance(path, str) and path.endswith(".md") and hook.should_fire() \
-                and mirror_enabled() and is_memory_file(path):
+        if not (isinstance(path, str) and path.endswith(".md") and hook.should_fire()
+                and mirror_enabled()):
+            return 0
+        if is_memory_file(path, memory_dirs(with_git=False)):
+            spawn_sweep(path)
+            return 0
+        try:
+            Path(path).resolve().relative_to(_projects_dir().resolve())
+        except (ValueError, OSError, RuntimeError):
+            return 0
+        if is_memory_file(path):
             spawn_sweep(path)
     except Exception:
         pass

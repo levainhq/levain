@@ -83,7 +83,7 @@ levain init --web                    # fill the same interview in a browser form
 
 One adapter per install. To run both Claude Code and Codex, make two installs.
 
-With Claude Code, Levain also mirrors Claude Code's own auto-memory into the entity's store: every native memory note written in the install becomes an anneal episode (an edit supersedes it, a deletion retracts it), one way, starting from when it is enabled. It is on by default; turn it off with `"automemory_mirror": false` in `.levain/config.json` or `LEVAIN_AUTOMEMORY_MIRROR=off`.
+With Claude Code, Levain also mirrors Claude Code's own auto-memory into the entity's store: each native memory note written for the install becomes an anneal episode (an edit supersedes it, a deletion retracts it), one way, for notes written after it is enabled. It is on by default; turn it off with `"automemory_mirror": false` in `.levain/config.json` or `LEVAIN_AUTOMEMORY_MIRROR=off`.
 
 ### Installing without a terminal in front of you
 

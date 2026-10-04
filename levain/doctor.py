@@ -1083,18 +1083,37 @@ def _check_automemory_mirror(install: Path, hooks: dict) -> list[CheckResult]:
             value = cfg.get("automemory_mirror", True) if isinstance(cfg, dict) else True
         except (OSError, ValueError):
             value = True
-        off = value is False or (isinstance(value, str) and value.strip().lower() in _MIRROR_OFF)
+        off = (value is False or (type(value) is int and value == 0)
+               or (isinstance(value, str) and value.strip().lower() in _MIRROR_OFF))
     if off:
         return [CheckResult(name, True, "off (LEVAIN_AUTOMEMORY_MIRROR or config.json)")]
-    entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
-    if not (entries and _hook_command_targets(entries, install, "automemory_mirror.py")):
-        return [CheckResult(name, True,
-                            "PostToolUse hook not wired — advisory (run `levain update`)")]
     if (install / ".levain" / "automemory_mirror.lost").exists():
         return [CheckResult(name, True,
                             "STOPPED: its state was lost while the store holds mirror episodes "
                             "— advisory (read .levain/automemory_mirror.lost)")]
-    return [CheckResult(name, True, "PostToolUse → automemory_mirror.py wired")]
+    last: dict = {}
+    try:
+        state = json.loads((install / ".levain" / "automemory_mirror.json").read_text(
+            encoding="utf-8"))
+        meta = state.get("__meta__") if isinstance(state, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("last_sweep"), dict):
+            last = meta["last_sweep"]
+    except (OSError, ValueError):
+        pass
+    problem = ""
+    if last.get("store_unreadable"):
+        problem = "its last sweep could not read the anneal store"
+    elif isinstance(last.get("failed"), int) and last["failed"] > 0:
+        problem = f"its last sweep left {last['failed']} note(s) unmirrored (retried next sweep)"
+    entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
+    if not (entries and _hook_command_targets(entries, install, "automemory_mirror.py")):
+        detail = ("PostToolUse hook not wired, so notes are mirrored only at session start "
+                  "— advisory (run `levain update`)")
+    else:
+        detail = "PostToolUse → automemory_mirror.py wired"
+    if problem:
+        detail += f"; {problem} — advisory"
+    return [CheckResult(name, True, detail)]
 
 
 # ---------------------------------------------------------------------------
