@@ -22,7 +22,7 @@ Team context: one project's decisions shared across a team of engineers, with gi
 
 ### Known limits
 
-- Identity is the author email on each commit, mapped through `team.toml`. Anyone can set it, so levain detects and reports; it does not authenticate. A teammate who sets their git email to the owner's can act as the owner. Authentication is the git host's job (branch protection, required signed commits); levain does not check signatures. If a member's email changes in `team.toml`, lines they added under the old email stop being enforced until the change is reverted or they are re-recorded.
+- Identity is the author email on each commit, mapped through `team.toml`. Anyone can set it, so levain detects and reports; it does not authenticate. A teammate who sets their git email to the owner's can act as the owner. Authentication is the git host's job (branch protection, required signed commits); levain does not check signatures.
 - Any member can record a `tension` on a broad path, which stops every edit there until its author or the owner retires it. That is deliberate (a stop is cheap to lift and expensive to miss) and visible in `levain team status`.
 - `levain team init` must be run by the owner named in `--owner`. A clone whose `.git` was copied from another machine relinks its ledger worktree to itself, and two clones sharing a device id refuse to rebase rather than drop an entry: run `levain team join --new-device` in the copy.
 - Bash writes are not intercepted. Two rulings that disagree are not detected; a `tension` entry is how a team marks one. A nested repository or submodule is governed only by its own ledger.

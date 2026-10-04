@@ -256,8 +256,8 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
     body = "".join(export_lines(ledger))
     try:
         # --link-authority: only the owner's supersedes cross authors, the same rule levain's in-force view applies
-        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "team-import", "--db", str(db), "-",
-                             "--link-authority", owner],
+        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
+                             "--link-authority", owner, "-"],
                             input=body, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"[team] anneal import did not run: {exc}"
