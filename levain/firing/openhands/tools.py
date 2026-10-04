@@ -52,7 +52,8 @@ must RESOLVE that setting rather than assume it. **UNATTENDED OPERATION IS NOW A
 ``levain daemon install-seat``); what is still absent is the per-domain threshold POLICY
 (``spore-417``) — nothing graduates, everything efferent gates. The full honest limits live on
 :mod:`levain.firing.confinement`, and they are NOT identical across platforms: the shared ones are
-pre-populated hardlinks, resource exhaustion, non-crown-jewel network exfil and IPC side channels,
+a hardlink a host process creates while a shell is live, resource exhaustion, non-crown-jewel
+network exfil and IPC side channels,
 while "Apple-deprecated ``sandbox-exec``" is macOS-only and Linux carries its own — chiefly that a
 denied read reports ENOENT rather than EPERM, and that a missing write-denied file's mountpoint is
 created on the host.
@@ -95,6 +96,7 @@ from levain.firing.confinement import (
     CrownJewelsPolicy,
     SandboxedShell,
     crown_jewel_reason,
+    linked_jewel_reason,
     refresh_socket_denies,
     select_provider,
 )
@@ -460,7 +462,7 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 command=action.command,
                 is_error=True,
             )
-        reason = crown_jewel_reason(policy, action.path)
+        reason = crown_jewel_reason(policy, action.path) or linked_jewel_reason(policy, action.path)
         if reason is not None:
             return FileEditorObservation.from_text(
                 text=(
