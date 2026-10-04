@@ -1401,29 +1401,26 @@ CONTINUITY_IMPORT = "@.levain/memory.continuity.md"
 
 
 def _imports_continuity(text: str) -> bool:
-    """The carrier has the continuity import as a line Claude Code evaluates: on a line of its
-    own (``./`` allowed, under four spaces of indent), and NOT inside a fenced code block or an
-    HTML comment, where Claude Code does not read imports (codex + complement, the 0.5.5 L3)."""
+    """Whether doctor can CONFIRM the carrier imports the continuity: the import on a line of its
+    own (``./`` allowed, fewer than four leading spaces and no tab), and no line before it that
+    opens a code fence or leaves an HTML comment open.
+
+    A bound, not a Markdown parser. Tracking fences and comments the way Claude Code does was
+    defeated three ways in one round, each RUN against Claude Code (gemini, the 0.5.5 L3): a
+    tab-indented import, a ```` fence around a ``` fence, a comment opened mid-line. Each was
+    ignored by Claude Code and counted by doctor. So any fence before the import, or any comment
+    left open on its line, means doctor cannot confirm it, and says so: a false warning, never a
+    false all-clear. The levain-written carrier has neither before the import."""
     wanted = {CONTINUITY_IMPORT, "@./" + CONTINUITY_IMPORT[1:]}
-    fence = None
-    in_comment = False
     for line in text.splitlines():
         stripped = line.strip()
-        if in_comment:
-            in_comment = "-->" not in stripped
-            continue
-        if fence:
-            if stripped.startswith(fence):
-                fence = None
-            continue
-        if stripped.startswith(("```", "~~~")):
-            fence = stripped[:3]
-            continue
-        if stripped.startswith("<!--"):
-            in_comment = "-->" not in stripped
-            continue
-        if stripped in wanted and len(line) - len(line.lstrip(" ")) < 4:
+        lead = line[: len(line) - len(line.lstrip())]
+        if stripped in wanted and "\t" not in lead and len(lead) < 4:
             return True
+        if stripped.startswith(("```", "~~~")):
+            return False
+        if "<!--" in line and "-->" not in line.rsplit("<!--", 1)[1]:
+            return False
     return False
 
 
@@ -1469,8 +1466,9 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     if stale:
         problems.append("eagerly loads seed file(s) now classified on-demand: " + ", ".join(stale))
     if carrier.name == "CLAUDE.md" and not _imports_continuity(text):
-        problems.append(f"does not import the living memory ({CONTINUITY_IMPORT}), so a "
-                        "session starts without it")
+        problems.append(f"does not import the living memory ({CONTINUITY_IMPORT}) where "
+                        "doctor can confirm Claude Code reads it (a line of its own, above any "
+                        "code block or open HTML comment), so a session may start without it")
     if problems:
         return [
             CheckResult(
