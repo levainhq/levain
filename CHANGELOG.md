@@ -8,9 +8,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 
-- **`levain wrap` now checks the schema the wrap freezes, not the one the store had before the wrap started** (known open since 0.4.x, listed in 0.5.6). The partnership check now runs again after anneal has started the wrap, when anneal refuses any schema change until the save or a cancel, and the composing model's instructions are built from that same schema. A store moved off the partnership schema in between is refused (exit 2) and the wrap is cancelled; nothing is saved.
+- **`levain wrap` now checks the schema the wrap froze, not only the one the store had before the wrap started** (listed as known open in 0.5.6). The partnership check runs again once anneal has started the wrap, on the schema anneal froze for it, and the composing model's instructions are built from that same schema. A store moved off the partnership schema before anneal read it for the wrap is refused (exit 2) and the wrap is cancelled; nothing is saved. This narrows the window, it does not close it: see Known open issues.
 - **A store error after the wrap had started left that wrap open** (found in review of the change above). `levain wrap` treated every store error as happening before anything was written, so an error after anneal had started the wrap returned without cancelling it, and the next wrap found one in progress. It now cancels its own wrap first.
-- **Cancelling a failed wrap could clear another program's wrap on the same store.** After a failure, `--dry-run`, or an empty compose, `levain wrap` either read the wrap's token and then cleared whatever wrap was open, or cleared it without reading the token at all, so a wrap another program started in between was the one cleared. The token is now compared and the wrap cleared in one step by anneal, and a wrap that is not ours is left alone.
+- **Cancelling a failed wrap could clear another program's wrap on the same store.** After a failure, `--dry-run`, an empty compose, or an unexpected status from anneal, `levain wrap` either read the wrap's token and then cleared whatever wrap was open, or cleared it without reading the token at all, so a wrap another program started in between was the one cleared. The token is now compared and the wrap cleared in one step by anneal, a wrap that is not ours is left alone, and an unexpected status (which starts no wrap) cancels nothing.
+- **A cancel that failed was reported as done.** When the store could not be written (for example, locked by another program), `levain wrap` still said the wrap had been cancelled, and `--dry-run` exited 0 with its wrap left open. It now says the wrap could not be cancelled and how to discard it, and `--dry-run` exits 1.
+
+### Known open issues
+
+- **A schema change committed while anneal is preparing the wrap is not caught** (since 0.4.x; anneal-side). anneal freezes the schema it read before building the wrap package without comparing it to the store's current one, so an `anneal-memory set-schema` that lands in that interval is frozen over: the wrap saves on the old schema and the store keeps the new one. Levain's own wrap lock does not cover other programs.
+- **An error raised after the memory was saved is reported as a store read failure** (since 0.4.x). If showing the result fails after the save committed, `levain wrap` says it could not read the store and exits 2, though the memory was saved; a re-run then finds nothing to consolidate.
 
 ## [0.5.6] — 2026-10-04
 
