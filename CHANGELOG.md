@@ -29,6 +29,11 @@ Team context: one project's decisions shared across a team of engineers, with gi
 - Freshness is a fetch at session start and at most every `fetch_interval` (default 300 s) from the hook.
 - POSIX only (`fcntl`). Claude Code started with `--bare` loads no settings hooks, so the team layer is absent there.
 - `levain doctor` does not yet check the team layer; `levain team doctor` does.
+- Needs git 2.31 or later (`rev-parse --path-format`).
+- The ledger branch is kept linear (levain only rebases and cherry-picks). A merge commit pushed to it by hand is reported, and lines that exist only in a merge resolution are not read.
+- If two clones that share a device id have BOTH committed entries, `levain team join --new-device` does not move the copy's already-committed entries to its new file: reset the copy's ledger to the remote (`git -C .git/levain-team/worktree reset --hard origin/levain-ledger`) and record them again.
+- Two `pack-sync` runs from two different owner clones at the same time can leave two versions of one pack rule in force until the next `pack-sync` (one run at a time per clone is enforced).
+- If a member's email changes in `team.toml`, lines they added under the old email stop being enforced until the change is reverted or the entries are recorded again.
 
 ## [0.5.12] — 2026-10-04
 

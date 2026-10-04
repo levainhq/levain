@@ -214,18 +214,20 @@ class GitLedger:
             raise TeamError(f"this clone has no {BRANCH} branch")
         return cp.stdout.strip()
 
-    def _show(self, path: str, rev: str = REF) -> str | None:
+    def _show(self, path: str, rev: str = REF) -> str | None:  # rev: a commit SHA for a consistent snapshot
         cp = git(["show", f"{rev}:{path}"], self.repo.toplevel, check=False, timeout=30)
         return cp.stdout if cp.returncode == 0 else None
 
-    def team(self) -> R.Team:
-        """team.toml at the branch tip; if that version does not parse, the newest one that does (reported)."""
-        text = self._show("team.toml")
+    def team(self, rev: str | None = None) -> R.Team:
+        """team.toml at ``rev`` (default: the branch tip); if that version does not parse, the newest one before it
+        that does (reported)."""
+        rev = rev or REF
+        text = self._show("team.toml", rev)
         try:
             return R.parse_team(text or "", "team.toml")
         except R.RolesError as exc:
             first = exc
-        cp = git(["log", "--format=%H", REF, "--", "team.toml"], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["log", "--format=%H", rev, "--", "team.toml"], self.repo.toplevel, check=False, timeout=30)
         for sha in cp.stdout.split()[1:]:
             try:
                 t = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
@@ -238,7 +240,13 @@ class GitLedger:
     def handle(self, team: R.Team | None = None) -> str | None:
         return (team or self.team()).handle_for_email(self.email())
 
-    def ledger(self, team: R.Team | None = None) -> I.Ledger:
+    def snapshot(self) -> tuple[str, R.Team, I.Ledger]:
+        """(sha, team, ledger), all read from ONE commit of the ledger branch."""
+        sha = self.head()
+        team = self.team(sha)
+        return sha, team, self.ledger(team, sha)
+
+    def ledger(self, team: R.Team | None = None, rev: str | None = None) -> I.Ledger:
         """The ledger as enforced, rebuilt from history: every line ever ADDED under ledger/, in the order it
         was added, attributed to the author email of the commit that added it.
 
@@ -247,12 +255,12 @@ class GitLedger:
         for pack files) is dropped on its own and reported; the rest of that file still counts. Cached per
         branch tip.
         """
+        head = rev or self.head()
         if team is None:
             try:
-                team = self.team()
+                team = self.team(head)
             except R.RolesError:
                 team = None
-        head = self.head()
         key = head + "|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
@@ -261,7 +269,7 @@ class GitLedger:
                 return I.build([(r, l) for r, l in cached["files"]], team.owner if team else None, cached["problems"])
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-        files, problems = self._history(team)
+        files, problems = self._history(team, head)
         try:
             tmp = cache.with_suffix(f".tmp{os.getpid()}")
             tmp.write_text(json.dumps({"key": key, "files": sorted(files.items()), "problems": problems}),
@@ -271,11 +279,17 @@ class GitLedger:
             pass
         return I.build(sorted(files.items()), team.owner if team else None, problems)
 
-    def _history(self, team: R.Team | None) -> tuple[dict[str, list[str]], list[str]]:
-        cp = git(["log", "--reverse", "--no-renames", "--no-color", "-p", "--unified=0",
-                  "--format=%x00C%x09%H%x09%ae", REF, "--", "ledger/"], self.repo.toplevel, check=False, timeout=60)
+    def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str]]:
+        # Every output-shaping option is pinned: diff.noprefix / diff.mnemonicPrefix / color / external diff
+        # tools in a user's config would otherwise change the text this parser reads.
+        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "log", "--reverse", "--no-renames",
+                  "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+                  "--diff-merges=off", "-p", "--unified=0", "--format=%x00C%x09%H%x09%ae", rev, "--", "ledger/"],
+                 self.repo.toplevel, check=False, timeout=60)
         if cp.returncode != 0:
             raise TeamError(f"could not read the ledger history: {_tail(cp)}")
+        merges = git(["rev-list", "--merges", rev, "--", "ledger/"], self.repo.toplevel, check=False,
+                     timeout=30).stdout.split()
         by_safe = {E.safe_handle(h): h for h in (team.members if team else {})}
         files: dict[str, list[str]] = {}
         problems: list[str] = []
@@ -341,6 +355,9 @@ class GitLedger:
                     elif h.startswith("+") and cur:
                         take(h[1:])
         flush()
+        for m_sha in merges:
+            problems.append(f"merge commit {m_sha[:10]} touches ledger/: levain keeps the ledger linear, so lines "
+                            "that exist only in a merge resolution are not read")
         for (rel, m), n in sorted(stranger.items()):
             problems.append(f"ledger/{rel}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
                             f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
@@ -397,6 +414,7 @@ class GitLedger:
 
     def _attach_worktree(self) -> None:
         if (self.wt / ".git").exists():
+            self._repair_if_moved()   # a copied clone's worktree may still belong to the original repository
             return
         self.base.mkdir(parents=True, exist_ok=True)
         git(["worktree", "prune"], self.repo.toplevel, check=False)
@@ -559,29 +577,53 @@ class GitLedger:
         raise TeamError(f"git fetch failed: {_tail(cp)}")
 
     def _rebase(self, rref: str, timeout: float, lock_timeout: float) -> None:
+        """Put this clone's unpushed commits on top of the remote, under the worktree lock.
+
+        Entry files are per device, so only team.toml and PROJECT.md can conflict (an owner on two machines).
+        The one rule: a local commit touching NOTHING but those two files may be discarded (the owner re-runs
+        the command; a warning says so); every commit that touches an entry file is replayed, and if one cannot
+        be replayed cleanly the sync stops with the local branch exactly as it was. No side is ever picked.
+        """
         with self.lock(timeout=lock_timeout):
             self._recover_dirty()
-            cp = git(["rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt, check=False, timeout=timeout)
+            orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+            try:
+                cp = git(["rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt, check=False, timeout=timeout)
+            except TeamError:
+                self._restore(orig)
+                raise
             if cp.returncode == 0:
                 return
-            conflicted = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.split()
-            git(["rebase", "--abort"], self.wt, check=False)
-            if any(p.startswith("ledger/") for p in conflicted) or not conflicted:
-                # An entry file only conflicts when two clones share a device id (a copied .git). Never resolve
-                # it by picking a side: that silently drops entries.
-                raise TeamError(f"the ledger cannot be rebased onto the remote ({', '.join(conflicted) or _tail(cp)}); "
-                                "if this clone's .git was copied from another, run `levain team join --new-device`. "
-                                "Nothing was lost locally")
-            # Entry files are per device and cannot conflict; team.toml and PROJECT.md can (an owner on two
-            # machines). The remote's version wins those files, and the operator is told to redo the change.
-            cp = git(["rebase", "-q", "--no-verify", "--empty=drop", "-X", "ours", rref], self.wt, check=False,
-                     timeout=timeout)
-            if cp.returncode != 0:
-                git(["rebase", "--abort"], self.wt, check=False)
-                raise TeamError(f"could not rebase the ledger onto the remote ({_tail(cp)}); nothing was lost locally")
-            self.warnings.append("a local team.toml or PROJECT.md change conflicted with the remote; the remote's "
-                                 "version was kept. Re-run the change (`levain team member add` / "
-                                 "`levain team consolidate`) if it is still wanted.")
+            self._restore(orig)
+            local = git(["rev-list", "--reverse", f"{rref}..{orig}"], self.wt).stdout.split()
+            keep, drop = [], []
+            for c in local:
+                touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
+                (drop if touched and touched <= {"team.toml", CANON_FILE} else keep).append(c)
+            replayed = False
+            try:
+                git(["reset", "-q", "--hard", rref], self.wt)
+                for c in keep:
+                    cp = git(["-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", c],
+                             self.wt, check=False, timeout=timeout)
+                    if cp.returncode != 0:
+                        raise TeamError("an unpushed entry cannot be replayed onto the remote ledger (two clones "
+                                        "share a device id?). Nothing was changed locally; if this clone's .git was "
+                                        "copied from another, see `levain team join --new-device`")
+                replayed = True
+            finally:
+                if not replayed:
+                    self._restore(orig)
+            if drop:
+                self.warnings.append(f"{len(drop)} local team.toml/PROJECT.md change(s) conflicted with the remote "
+                                     "and were discarded; the remote's version stands. Re-run the change "
+                                     "(`levain team member add` / `levain team consolidate`) if still wanted.")
+
+    def _restore(self, orig: str) -> None:
+        """Back to exactly ``orig``: abort whatever is in progress, then hard-reset. Raises if that fails."""
+        for op in (["rebase", "--abort"], ["cherry-pick", "--abort"]):
+            git(op, self.wt, check=False, timeout=60)
+        git(["reset", "-q", "--hard", orig], self.wt, timeout=60)
 
     def _sync(self, *, push: bool, timeout: float = 120, net_timeout: float = 150,
               lock_timeout: float = 30.0) -> str:
@@ -655,15 +697,16 @@ class GitLedger:
         cp = git(["rev-parse", "-q", "--verify", f"{REF}:ledger"], self.repo.toplevel, check=False)
         return cp.stdout.strip() or "empty"
 
-    def read_canon(self) -> str | None:
-        return self._show(CANON_FILE)
+    def read_canon(self, rev: str | None = None) -> str | None:
+        return self._show(CANON_FILE, rev or REF)
 
     @staticmethod
     def state_hash(ledger: I.Ledger, team: R.Team) -> str:
         """What the canon is generated from: the non-ack entries and team.toml. Acks are left out (every agent
         retry writes one), so the canon is not called stale by work that cannot change it."""
         ids = sorted(e["id"] for e in ledger.entries if e.get("type") != "ack")
-        return hashlib.sha256(json.dumps([ids, R.dump_team(team)]).encode("utf-8")).hexdigest()[:16]
+        state = ["v1", ids, R.dump_team(team), sorted(ledger.problems)]
+        return hashlib.sha256(json.dumps(state).encode("utf-8")).hexdigest()[:16]
 
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
@@ -702,7 +745,7 @@ class GitLedger:
     # ---- per-session hook state (local only) -----------------------------------------------------------------
 
     def _session_path(self, session: str) -> Path:
-        return self.base / "sessions" / (re.sub(r"[^A-Za-z0-9._-]", "_", session)[:120] or "_")
+        return self.base / "sessions" / hashlib.sha256(session.encode("utf-8")).hexdigest()[:32]
 
     def session_denied(self, session: str) -> set[str]:
         try:

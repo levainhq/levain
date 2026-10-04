@@ -513,3 +513,66 @@ def test_ledger_content_shaped_like_a_diff_header_cannot_redirect_attribution(tw
     led = gl.ledger()
     assert fake["id"] not in led.by_id
     assert "ben's own" in [e.get("words") for e in led.in_force]
+
+
+# ---- regressions from L3 round 2 ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cfg", [("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true"),
+                                 ("color.ui", "always"), ("diff.renames", "copies")])
+def test_user_diff_config_cannot_empty_the_ledger(two, cfg):
+    tmp, ana, ben = two
+    assert record_ruling(ana) == 0
+    git("config", cfg[0], cfg[1], cwd=ana)
+    (GitLedger(Repo.discover(ana)).base / "history.json").unlink()   # force a fresh parse under this config
+    assert edit(ana, "src/billing.py", session="cfg")["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_owner_config_conflict_discards_only_config_commits_and_keeps_entries(two, capsys):
+    tmp, ana, ben = two
+    ana2 = clone(tmp, "ana2", "ana@ex.com")
+    assert team("join", repo=ana2) == 0
+    assert team("member", "add", "cat", "cat@ex.com", repo=ana) == 0
+    assert team("member", "add", "dan", "dan@ex.com", "--no-push", repo=ana2) == 0
+    assert record_ruling(ana2, "src/x.py", "x stays", "--no-push") == 0
+    capsys.readouterr()
+    assert team("sync", repo=ana2) == 0
+    assert "were discarded" in capsys.readouterr().err
+    _, t, led = GitLedger(Repo.discover(ana2)).snapshot()
+    assert "cat" in t.members and "dan" not in t.members
+    assert "x stays" in [e.get("words") for e in led.in_force]
+
+
+def test_a_merge_commit_in_the_ledger_is_reported(two):
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ana))
+    git("checkout", "-q", "-b", "side", cwd=gl.wt)
+    (gl.wt / "ledger" / "x.txt").write_text("x")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "side", cwd=gl.wt)
+    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
+    (gl.wt / "ledger" / "y.txt").write_text("y")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "main", cwd=gl.wt)
+    git("merge", "-q", "--no-edit", "side", cwd=gl.wt)
+    assert any("merge commit" in p for p in gl.ledger().problems)
+
+
+def test_join_new_device_in_a_copied_clone_never_touches_the_original(two):
+    tmp, ana, ben = two
+    before = git("rev-parse", "levain-ledger", cwd=ana).strip()
+    copy = tmp / "ana_copy"
+    shutil.copytree(ana, copy, symlinks=True)
+    assert team("join", "--new-device", repo=copy) == 0
+    gl = GitLedger(Repo.discover(copy))
+    assert gl._wt_is_ours() and gl.device != GitLedger(Repo.discover(ana)).device
+    assert record_ruling(copy, "src/c.py", "from the copy") == 0
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == before   # the original was not written
+
+
+def test_a_missing_session_id_still_acks_with_a_schema_safe_token(two):
+    tmp, ana, ben = two
+    p = {"cwd": str(ben), "hook_event_name": "PreToolUse", "tool_name": "Edit",
+         "transcript_path": "/x/" + "y" * 300 + "/t.jsonl", "tool_input": {"file_path": str(ben / "src/settlement.py")}}
+    assert hook("pretooluse", p)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    second = hook("pretooluse", p)["hookSpecificOutput"]
+    assert "permissionDecision" not in second and "acknowledgement not recorded" not in second["additionalContext"]

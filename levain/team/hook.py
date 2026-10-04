@@ -17,6 +17,7 @@ extraction from shell is unreliable); that gap is documented, not hidden.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -176,8 +177,7 @@ def pretooluse(payload: dict) -> None:
     # no lock (the ref only moves when a rebase or commit completes).
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
     try:
-        team = gl.team()
-        ledger = gl.ledger(team)
+        _, team, ledger = gl.snapshot()
     except (R.RolesError, TeamError) as exc:
         _fail_open("PreToolUse", str(exc))
         return
@@ -186,7 +186,10 @@ def pretooluse(payload: dict) -> None:
     if rel is None:
         return
     # Claude Code always sends session_id; the transcript path is a stable stand-in if a build ever does not.
-    session = str(payload.get("session_id") or payload.get("transcript_path") or "")
+    session = str(payload.get("session_id") or "")
+    if not session and payload.get("transcript_path"):
+        # a schema-safe token (entries allow [A-Za-z0-9._:@-]{1,128}), unique per transcript
+        session = "t-" + hashlib.sha256(str(payload["transcript_path"]).encode("utf-8")).hexdigest()[:32]
     handle = gl.handle(team)
     d = decide(team, ledger, handle, rel, session, gl.session_denied(session) if session else set())
     from .transport import WARNINGS
@@ -283,10 +286,9 @@ def sessionstart(payload: dict) -> None:
         return
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
     try:
-        team = gl.team()
-        ledger = gl.ledger(team)
+        sha, team, ledger = gl.snapshot()
         tree = gl.state_hash(ledger, team)
-        canon_text = gl.read_canon()
+        canon_text = gl.read_canon(sha)
     except (R.RolesError, TeamError) as exc:
         _fail_open("SessionStart", str(exc))
         return

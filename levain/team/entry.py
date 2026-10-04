@@ -162,6 +162,8 @@ def validate(entry: dict, known: dict[str, dict] | None = None, *, scan: bool = 
             raise EntryError(f"{lf} has more than {_MAX_ITEMS} items")
     if any(len(p) > _MAX_PATH for p in entry.get("paths", [])):
         raise EntryError(f"a path glob is longer than {_MAX_PATH} characters")
+    if any(sum(1 for s in p.split("/") if s != "**" and "**" in s) > 6 for p in entry.get("paths", [])):
+        raise EntryError("a path glob has more than 6 segments with ** inside them")
     if t == "retire" and not entry.get("supersedes"):
         raise EntryError("a retire entry must name what it retires in 'supersedes'")
     if t == "ack":

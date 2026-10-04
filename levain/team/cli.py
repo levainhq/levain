@@ -159,11 +159,10 @@ def cmd_status(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
     gl.require_joined()
-    team = gl.team()
+    sha, team, ledger = gl.snapshot()
     handle = gl.handle(team)
-    ledger = gl.ledger(team)
     state = gl.state_hash(ledger, team)
-    canon_text = gl.read_canon()
+    canon_text = gl.read_canon(sha)
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
         d = decide(team, ledger, handle, rel, "", set())
@@ -195,9 +194,8 @@ def cmd_status(args) -> int:
 def cmd_verify(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
-    team = gl.team()
-    ledger = gl.ledger(team)
-    canon_text = gl.read_canon()
+    sha, team, ledger = gl.snapshot()
+    canon_text = gl.read_canon(sha)
     problems = list(ledger.problems) + gl.team_history_problems(team)
     for e in ledger.entries:
         for s in e.get("supersedes", []) + e.get("refs", []):

@@ -189,7 +189,9 @@ def test_glob_matching_is_linear_on_hostile_patterns():
 
 
 @pytest.mark.parametrize("glob, path, hit", [("**", "a/b.py", True), (".", "a/b.py", True), ("./", "x", True),
-                                             ("**/**/b.py", "b.py", True), ("a/**/c", "a/c", True)])
+                                             ("**/**/b.py", "b.py", True), ("a/**/c", "a/c", True),
+                                             ("src/**.py", "src/a/b.py", True), ("src/**.py", "src/x.py", True),
+                                             ("src/**.py", "lib/x.py", False), ("a**b", "a/x/b", True)])
 def test_root_and_collapsed_globs(glob, path, hit):
     assert I.matches(glob, path) is hit
 

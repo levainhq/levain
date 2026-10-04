@@ -58,10 +58,31 @@ def _seg_match(pat: str, text: str) -> bool:
     return prev[len(text)]
 
 
+_MAX_INNER = 6  # segments like "**.py" or "a**b" expand to two alternatives each; bound the product
+
+
+def _expand(segs: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """``**`` inside a segment ("src/**.py", "a**b") crosses directories, as it always has: it means the same
+    as the segment with ``*`` in its place OR ``pre*/**/*post``. Expanded to whole-segment ``**`` patterns."""
+    out: list[tuple[str, ...]] = [()]
+    inner = 0
+    for s in segs:
+        if s != "**" and "**" in s:
+            inner += 1
+            if inner > _MAX_INNER:
+                return []   # too many to expand: matches nothing (validate refuses such globs at write)
+            pre, post = s.split("**", 1)
+            post = post.replace("**", "*")
+            alts = [(pre + "*" + post,), (pre + "*", "**", "*" + post)]
+            out = [o + a for o in out for a in alts]
+        else:
+            out = [o + (s,) for o in out]
+    return out
+
+
 def matches(glob: str, relpath: str, *, fold: bool = True) -> bool:
-    pats = _segments(_norm(glob, fold))
     parts = tuple(p for p in _norm(relpath, fold).split("/") if p)
-    return _match(pats, parts)
+    return any(_match(pats, parts) for pats in _expand(_segments(_norm(glob, fold))))
 
 
 @functools.lru_cache(maxsize=4096)
