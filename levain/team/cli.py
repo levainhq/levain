@@ -240,6 +240,13 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_view(args) -> int:
+    from .view import serve
+    gl = GitLedger(_repo(args))
+    gl.require_joined()
+    return serve(gl, host=args.host, port=args.port, recheck_days=args.recheck_days, ack_flag=args.ack_flag)
+
+
 def _install_all(repo: Repo, python: str | None = None) -> None:
     for line in W.install_all(repo, python=python):
         print(line)
@@ -434,6 +441,13 @@ def register(subparsers) -> None:
     p = add("export", cmd_export, "Print the ledger as JSON lines (all entries per file in file order).")
     p.add_argument("--jsonl", action="store_true", help="JSON lines (the only format; the flag is accepted for clarity)")
     p.add_argument("--in-force", action="store_true", help="only in-force entries, time order (not chain-verifiable)")
+
+    p = add("view", cmd_view, "Serve the read-only team view (four panes) on localhost.")
+    p.add_argument("--dir", dest="repo", help="same as --repo")
+    p.add_argument("--host", default="127.0.0.1", help="loopback only (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=7450)
+    p.add_argument("--recheck-days", type=int, default=30, help="a recheck older than this is overdue (default 30)")
+    p.add_argument("--ack-flag", type=int, default=3, help="acks on one path before it is flagged for review (default 3)")
 
     p = add("install", cmd_install, "Wire the team hooks into .claude/settings.local.json (idempotent).")
     p.add_argument("--python", help="interpreter for the hook command (default: this one)")
