@@ -474,6 +474,34 @@ def test_a_prior_wrap_that_goes_idle_before_the_discard_is_already_discarded(tmp
     assert (ent / ".levain" / "memory.continuity.md").exists()
 
 
+def test_reset_with_unreadable_wrap_metadata_changes_nothing_and_names_the_entitys_store(tmp_path, capsys, monkeypatch):
+    """r2/r3 (0.5.7): forcing the cancel when no token can be read would also clear any wrap that
+    replaced the unreadable one, so `--reset` there cancels only a PARTIAL state and otherwise
+    refuses. The refusal must aim the operator at THIS entity's store: a bare `anneal-memory
+    wrap-status` reads ~/.anneal-memory (codex r3 HIGH)."""
+    import sys
+    from anneal_memory import StoreError
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db, bound=True)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+    real = Store.load_wrap_snapshot
+
+    def unreadable_for_levain(self):
+        if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
+            raise StoreError("simulated unreadable wrap metadata")
+        return real(self)
+
+    monkeypatch.setattr(Store, "load_wrap_snapshot", unreadable_for_levain)
+    assert wrap_entity(ent, reset=True) == 2
+    out = capsys.readouterr().out
+    assert "wrap-status" in out and str(db) in out and "--db" in out
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.load_wrap_snapshot()["token"] == "orphan-token", "the wrap was cleared"
+
+
 @pytest.mark.parametrize("kind", ["unattended self-heal", "operator --reset"])
 def test_a_token_bound_orphan_from_an_earlier_levain_wrap_is_still_discarded(tmp_path, capsys, monkeypatch, kind):
     """A wrap Levain opens carries a caller token, and anneal refuses a TOKENLESS cancel of a

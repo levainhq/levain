@@ -701,10 +701,14 @@ def _consolidate(
             try:
                 discarded = _discard_prior_wrap(store, prior_token)
             except WrapOwnershipError:
+                from levain.manifest import anneal_invocation
+
                 print("levain wrap: the prior wrap was not cleared: another consolidate replaced it, "
                       "or its metadata cannot be read. Nothing was changed. Re-run in a moment; if "
-                      "it persists, inspect it with `anneal-memory wrap-status` and clear a dead one "
-                      "with `anneal-memory wrap-cancel`.")
+                      "it persists, look at it with\n"
+                      f"  {anneal_invocation('--db', str(episodic_path), 'wrap-status')}\n"
+                      "which prints the exact cancel command for a dead one (aimed at this entity's "
+                      "store, with the wrap's own token).")
                 return 2
             if not discarded:
                 print("levain wrap: the prior wrap was already gone; continuing.")
