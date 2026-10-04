@@ -685,29 +685,40 @@ def test_a_cherry_pick_that_failed_without_a_pick_in_progress_is_not_skipped_as_
     assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
 
 
-def test_a_stale_pick_marker_with_a_fatal_exit_is_not_skipped_as_upstream(two, monkeypatch, capsys):
+@pytest.mark.parametrize("rc", [1, 128])
+def test_a_marker_for_another_commit_is_not_skipped_as_upstream(two, monkeypatch, rc):
     gl, ana = _conflicting_replay(two)
     tip = git("rev-parse", "levain-ledger", cwd=ana).strip()
-    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=128, stale_pick_marker=True)
+    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=rc, stale_pick_marker=True)
     assert team("sync", repo=ana) != 0
     assert not any("--skip" in c for c in calls)
-    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip    # the entry is still on the branch
 
 
-def test_an_empty_pick_git_stopped_on_is_still_skipped_as_upstream(two, monkeypatch):
-    gl, ana = _conflicting_replay(two)
-    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=1, stale_pick_marker=True)
-    import levain.team.transport as T
-    spy = T.git
-
-    def skip_ok(args, cwd, **kw):
-        if args[:2] == ["cherry-pick", "--skip"]:
-            calls.append(list(args))
-            return subprocess.CompletedProcess(["git", *args], 0, "", "")
-        return spy(args, cwd, **kw)
-    monkeypatch.setattr(T, "git", skip_ok)
+def test_an_empty_pick_git_stopped_on_is_really_skipped_and_the_entry_survives_once(two, capsys, monkeypatch):
+    tmp, ana, ben = two
+    calls = _spy_git(monkeypatch)
+    ana2 = clone(tmp, "ana2", "ana@ex.com")
+    assert team("join", repo=ana2) == 0
+    assert record_ruling(ana, "src/e.py", "e stays", "--no-push") == 0
+    gl = GitLedger(Repo.discover(ana))
+    e_sha = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    entry_file = git("diff-tree", "--no-commit-id", "--name-only", "-r", e_sha, cwd=gl.wt).split()[0]
+    assert team("member", "add", "cat", "cat@ex.com", repo=ana2) == 0          # remote moves
+    git("fetch", "-q", "origin", cwd=gl.wt)
+    git("checkout", "-q", "--detach", "origin/levain-ledger", cwd=gl.wt)
+    git("checkout", e_sha, "--", entry_file, cwd=gl.wt)                           # upstream gets E's change ...
+    (gl.wt / "side.txt").write_text("x\n")                                       # ... inside a different patch
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "E plus another file", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:refs/heads/levain-ledger", cwd=gl.wt)
+    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
+    assert team("member", "add", "dan", "dan@ex.com", "--no-push", repo=ana) == 0  # forces the replay path
+    capsys.readouterr()
     assert team("sync", repo=ana) == 0
-    assert any(c[:2] == ["cherry-pick", "--skip"] for c in calls)
+    assert any(c[:2] == ["cherry-pick", "--skip"] for c in calls)               # the real empty-pick path ran
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
 
 
 def test_a_failing_reattach_does_not_mask_the_error_that_sent_us_there(two, monkeypatch, capsys):

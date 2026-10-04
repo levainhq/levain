@@ -624,17 +624,21 @@ class GitLedger:
                     if cp.returncode == 0:
                         continue
                     unmerged = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.strip()
-                    picking = (self.wt / git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], self.wt).stdout.strip()).exists()
-                    # git stops with exit 1 on a conflict or an empty pick; any other code (128: another pick is in
-                    # progress, a lock, a bad object) is a failure, never "already upstream"
-                    if (cp.returncode == 1 and picking and not unmerged
+                    marker = self.wt / git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], self.wt).stdout.strip()
+                    try:
+                        picking = marker.read_text().strip()
+                    except OSError:
+                        picking = ""
+                    # git stops with exit 1 and CHERRY_PICK_HEAD naming THIS commit on an empty pick; any other state
+                    # (another exit code, a marker for a different commit, a conflict, staged changes) is a failure
+                    if (cp.returncode == 1 and picking == c and not unmerged
                             and git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0):
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)   # already upstream: nothing to add
                         continue
-                    detail = "" if unmerged or picking else f" ({_tail(cp)})"
                     raise TeamError("an unpushed entry cannot be replayed onto the remote ledger (two clones "
-                                    f"share a device id?){detail}. Nothing was changed locally; if this clone's "
-                                    ".git was copied from another, see `levain team join --new-device`")
+                                    "share a device id, or git could not run: "
+                                    f"{_tail(cp)}). Nothing was changed locally; if this clone's .git was "
+                                    "copied from another, see `levain team join --new-device`")
                 new = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
                 git(["update-ref", "-m", "levain team: replay onto remote", REF, new, orig], self.wt)
                 published = True
