@@ -304,7 +304,8 @@ def test_wrap_post_commit_externalization_failure_is_not_reported_as_unsaved(
         real_save(store, text, **kw)
         raise StoreError(
             "Failed to rename continuity tmp — the DB has committed the wrap but externalization "
-            "is incomplete; preserved at /x/memory.continuity.md.tmp."
+            "is incomplete; preserved at /x/memory.continuity.md.tmp.",
+            operation="save_continuity",
         )
 
     # Patch at the anneal module (wrap_entity imports it lazily at call time, so this binds).

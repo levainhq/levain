@@ -8,15 +8,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 
-- **`levain wrap --reset` could not clear a wrap Levain itself had opened when anneal could not read that wrap's episode list** (new in 0.5.7). The wrap is token-bound, so when the snapshot is unreadable `--reset` and the unattended discard now name the bound token and clear the wrap by that compare-and-swap, which still leaves any wrap that replaced it alone. A wrap with no token to name is refused as before, with the commands for that entity's store.
-- **The wall-clock stop said the wrap was "CANCELLED cleanly" even when the cancel itself had failed** (since 0.4.x). When the store is locked by another process at that moment the wrap stays open; the report now says the cancel could not be confirmed and what clears it.
-- **After a failed save with nothing left in progress, `levain wrap` said the memory COMMITTED and not to re-run, even when another program had cleared the wrap and nothing was saved** (since 0.4.x). It now compares the last completed wrap id from before the save: unchanged means nothing was recorded and the message says so and to re-run; a store it cannot read gets a message that checks with `levain wrap --dry-run` instead of a guess.
+- **`levain wrap --reset` could not clear a wrap whose episode list anneal could not read** (new in 0.5.7). Every wrap `levain wrap` opens is token-bound, so when the snapshot is unreadable `--reset` and the unattended discard now name the store's bound token and clear the wrap by that compare-and-swap, which still leaves any wrap that replaced it alone. (A wrap another program opened with a caller-supplied token is bound too, and is cleared the same way when it passes the same lock and age check.) A wrap with no token to name is refused as before, with the commands for that entity's store.
+- **The wall-clock stop report claimed things the store did not show** (since 0.4.x). It said the wrap was "CANCELLED cleanly" even when the cancel had failed (the store locked by another process, so the wrap stays open), and also after a stop that landed when no wrap of that run was open. It now follows what the cancel found: cancelled (the clean wording), failed (the wrap may still be open, and what clears it), or no open wrap of this run (neither claim, with the dry run that settles whether the memory was saved).
+- **After a failed save with nothing left in progress, `levain wrap` said the memory COMMITTED and not to re-run, even when another program had cleared the wrap and nothing was saved** (since 0.4.x). It now claims COMMITTED only with positive evidence (the last completed wrap id moved and anneal's own "preserved at" recovery text is in the error), NOT saved only when the id did not move and the episodes are still unconsolidated or the wrap is still in progress, and otherwise says the store does not show whether this memory was recorded and to check with `levain wrap --dry-run`.
 - **An error raised while showing the result after the memory was saved was reported as "could not read the store" and exit 2** (since 0.4.x). It now says the memory was saved, that there is nothing to re-run, and exits 0.
 - **On Python 3.13 a symlink loop at `.levain/memory.continuity.md` booted the entity seed-only without the warning Python 3.12 gives.** `Path.resolve()` stopped raising on a loop in 3.13, so the guard's warning never fired. The warning now fires on every version; the boot is the same seed-only boot.
 
 ### Changed
 
-- CI runs the whole suite on Python 3.13 (the symlink-loop test was skipped there in 0.5.7).
+- The symlink-loop test is no longer skipped on Python 3.13, where CI already ran the suite.
 
 ### Known open issues
 

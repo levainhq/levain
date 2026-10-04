@@ -166,11 +166,10 @@ def _unlock_wrap(handle: "int | None | object") -> None:
 
 
 def _wrap_in_progress(store: object) -> bool:
-    """Is a wrap still in progress on ``store``? The state boundary that distinguishes a save that
-    committed NOTHING (validation/pre-commit failure — wrap still in progress) from one that COMMITTED
-    the DB but failed to externalize the file (``wrap_completed`` cleared the in-progress metadata) —
-    codex's catch that exception TYPE alone is not the boundary. Fail-safe to ``True`` on a read error
-    (the safer default: "re-run", never a false "already committed, don't re-run")."""
+    """Is a wrap still in progress on ``store``? A True means a wrap is open (a refused compose leaves
+    ours open); it does NOT mean "nothing was committed", and a False does not mean "committed": with
+    no wrap in progress our save may have committed or another program may have cleared our wrap, so
+    the callers settle that with :func:`_last_wrap_id`. Fail-safe to ``True`` on a read error."""
     try:
         return bool(store.get_wrap_started_at())  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 — unreadable state → assume in-progress (safe default)
@@ -187,18 +186,35 @@ def _last_wrap_id(store: object) -> int | None:
         return None
 
 
-def _cancel_if_ours(store: object, wrap_token: object) -> bool:
-    """Cancel the in-progress wrap ONLY if it is still OURS (its snapshot token equals ``wrap_token``).
+def _unwrapped_count(store: object) -> int | None:
+    """How many episodes still await consolidation, or ``None`` when that cannot be read."""
+    try:
+        return len(store.episodes_since_wrap())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — unreadable → unknown, never a guess
+        return None
+
+
+_SAVE_UNKNOWN = (
+    "levain wrap: the save failed ({kind}: {exc}) and the store does not show whether THIS memory was "
+    "recorded.\n"
+    "  No wrap of this run is in progress, and either its episodes are already consolidated or another "
+    "wrap completed while it ran.\n"
+    "  Check with `levain wrap --dry-run`: it says there is nothing to consolidate if the episodes are "
+    "consolidated; look at the entity's .levain/memory.continuity.md before re-running."
+)
+
+
+def _cancel_outcome(store: object, wrap_token: object) -> str:
+    """Cancel the in-progress wrap ONLY if it is still OURS (its token equals ``wrap_token``), and say
+    which of three things happened: ``"cancelled"`` (ours was open and is now cleared),
+    ``"none_open"`` (the store holds no wrap of ours: idle, or another token's wrap, which is left
+    alone) or ``"failed"`` (nothing can be said: no token to compare, a cancel that raised, or
+    anneal reporting a partial lifecycle state). Never raises.
 
     The point-of-use guard against cancelling a concurrent peer's live wrap in our failure path — the
     ``loser-cancels-winner`` race. Correct even if the process lock were somehow bypassed
     (``invariant_must_fire_at_the_point_of_use``): a bare ``wrap_cancelled`` clears WHATEVER wrap is in
-    the store, which after a race is the winner's. No-op if idle or the token changed; never raises.
-
-    Returns True only when no wrap of ours can still be open: ours was cancelled, the store is idle,
-    or the open wrap carries another token. Anything it cannot establish returns False (fail closed):
-    no token to compare, a cancel that raised, or anneal reporting a partial lifecycle state. Callers
-    print :data:`_CANCEL_FAILED` when it is False, and a dry run exits 1."""
+    the store, which after a race is the winner's."""
     # anneal compares the token and clears the wrap in one step (expect_token); reading the snapshot
     # and then calling a bare cancel let another client's new wrap be cleared in between (codex, the
     # 0.5.6 hunk look). WrapOwnershipError means the in-progress wrap is not ours: leave it.
@@ -208,7 +224,7 @@ def _cancel_if_ours(store: object, wrap_token: object) -> bool:
     # and report it unresolved, since a wrap may be open that nobody cancelled.
     if not wrap_token:
         _log.warning("cancel-if-ours: no wrap token to compare, nothing cancelled")
-        return False
+        return "failed"
     try:
         from anneal_memory import WrapOwnershipError
 
@@ -219,11 +235,19 @@ def _cancel_if_ours(store: object, wrap_token: object) -> bool:
             # set, no usable token) is not that: it may be our wrap, damaged, still blocking the next.
             if getattr(exc, "partial_state", False):
                 _log.warning("cancel-if-ours: the store's wrap state is partial; not cancelled")
-                return False
-        return True
+                return "failed"
+            return "none_open"
+        return "cancelled"
     except Exception as exc:  # noqa: BLE001 — a guard must not raise into a failure path
         _log.warning("cancel-if-ours failed (%s): %s", type(exc).__name__, exc)
-        return False
+        return "failed"
+
+
+def _cancel_if_ours(store: object, wrap_token: object) -> bool:
+    """:func:`_cancel_outcome` as a yes/no: True only when no wrap of ours can still be open (ours was
+    cancelled, the store is idle, or the open wrap carries another token); False when that cannot be
+    established. Callers print :data:`_CANCEL_FAILED` when it is False, and a dry run exits 1."""
+    return _cancel_outcome(store, wrap_token) != "failed"
 
 
 _CANCEL_FAILED = (
@@ -273,7 +297,7 @@ def _orphan_is_stale(started: object, bound: float | None) -> bool:
     return age >= horizon
 
 
-def _cancel_our_wrap(store: object, wrap_token: str) -> bool:
+def _cancel_our_wrap(store: object, wrap_token: str) -> str:
     """Cancel our wrap on the OUT-OF-BAND exit path (timeout / interrupt / refusal), by TOKEN.
 
     The sibling of :func:`_cancel_if_ours` for the ``except BaseException`` clause. Levain mints the
@@ -286,14 +310,22 @@ def _cancel_our_wrap(store: object, wrap_token: str) -> bool:
     it by accident. Before ``prepare_wrap`` has opened anything the compare finds the store idle and
     does nothing.
 
-    Never raises: cleanup must not replace the exception it is cleaning up after. Returns whether
-    no wrap of ours can still be open (:func:`_cancel_if_ours`'s answer), False when the cancel
-    itself failed, so the timeout report can say so instead of claiming a clean cancel."""
+    Never raises: cleanup must not replace the exception it is cleaning up after. Returns what
+    :func:`_cancel_outcome` found (``cancelled`` / ``none_open`` / ``failed``)."""
     try:
-        return _cancel_if_ours(store, wrap_token)
+        return _cancel_outcome(store, wrap_token)
     except Exception as exc:  # noqa: BLE001 — never mask the out-of-band exit being propagated
         _log.debug("out-of-band wrap cancel skipped (%s): %s", type(exc).__name__, exc)
-        return False
+        return "failed"
+
+
+def _note_cancel_outcome(stop: BaseException, outcome: str) -> None:
+    """Record the cancel outcome on the stop being propagated, for the timeout report. Best effort: an
+    exception type that rejects the attribute must not replace the stop it was raised for."""
+    try:
+        stop.levain_wrap_cancel = outcome  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
@@ -304,21 +336,27 @@ def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
     gives that: if the wrap is replaced in between, ``started_at`` belongs to the newer wrap while
     the token names the old one, so the cancel by that token fails its compare-and-swap instead of
     clearing the newcomer (L2: with the token read after the age check, a peer's fresh wrap landing
-    in the gap was the one cancelled). When the snapshot cannot be read, the token of a wrap Levain
-    opened is still readable as the store's bound token (every wrap Levain opens is token-bound), so
-    a wrap whose episode list is unreadable is still cancelled by the compare-and-swap. The token
-    is ``None`` only for a wrap that is neither readable nor bound (partial metadata, or a wrap
-    another program opened without a token)."""
+    in the gap was the one cancelled).
+
+    The store's bound token (the token a caller handed to ``prepare_wrap``; every wrap ``levain
+    wrap`` opens carries one, and so can a wrap another program opened) is read BEFORE the snapshot,
+    so that when the snapshot cannot be read the earliest observation is the one cancelled: a wrap
+    whose episode list is unreadable is still cleared by compare-and-swap, and a replacement that
+    lands between the reads is refused, not cleared. The token is ``None`` only for a wrap that is
+    neither readable nor bound (partial metadata, or one opened without a token)."""
+    try:
+        bound = store.wrap_bound_token()  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("bound wrap token unreadable (%s): %s", type(exc).__name__, exc)
+        bound = None
     try:
         snap = store.load_wrap_snapshot()  # type: ignore[attr-defined]
         token = snap["token"] if snap else None
+        if bound is not None and token != bound:
+            token = bound   # replaced between the two reads: keep the earlier observation
     except Exception as exc:  # noqa: BLE001 — unreadable or partial wrap metadata raises StoreError
         _log.debug("prior wrap snapshot unreadable (%s): %s", type(exc).__name__, exc)
-        try:
-            token = store.wrap_bound_token()  # type: ignore[attr-defined]
-        except Exception as exc2:  # noqa: BLE001
-            _log.debug("bound wrap token unreadable (%s): %s", type(exc2).__name__, exc2)
-            token = None
+        token = bound
     return token, store.get_wrap_started_at()  # type: ignore[attr-defined]
 
 
@@ -399,7 +437,7 @@ Output ONLY the Markdown document, starting with `## {required[0] if required el
 preamble, no closing remarks, no code fences."""
 
 
-def format_wrap_timeout_report(seconds: float, *, hard: bool, cancelled: bool = True) -> str:
+def format_wrap_timeout_report(seconds: float, *, hard: bool, outcome: str = "cancelled") -> str:
     """The operator-facing explanation of a consolidate that hit its wall-clock bound.
 
     A SEPARATE wording from :func:`levain.firing.deadline.format_timeout_report`, because that one
@@ -427,18 +465,28 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool, cancelled: bool = 
             f"TIMEOUT code even though\n"
             f"     the turn succeeded — read this line, not the code, for what actually stalled."
         )
-    if not cancelled:
+    if outcome == "failed":
         return (
-            f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated, but "
-            f"the wrap could NOT be confirmed cancelled.\n"
+            f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated, and "
+            f"cancelling its wrap did NOT complete.\n"
             f"     Your memory is UNCHANGED and your episodes are safe (nothing partial is ever "
             f"written).\n"
-            f"     ⚠ THE WRAP MAY STILL BE OPEN (the store was likely busy or unreadable when the "
-            f"cancel ran): the next\n"
+            f"     ⚠ THE WRAP MAY STILL BE OPEN (for example the store was busy or unreadable when "
+            f"the cancel ran): the next\n"
             f"     consolidate may refuse until it is discarded. An UNATTENDED seat clears it "
             f"automatically on a later run\n"
             f"     once it is older than the bound; for a manual wrap, re-run, and use --reset if "
             f"it still refuses."
+        )
+    if outcome != "cancelled":
+        return (
+            f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated. No "
+            f"open wrap of this run was found to cancel\n"
+            f"     (the stop came before the wrap started or after it had finished), or the result "
+            f"of the cancel was not recorded.\n"
+            f"     Your episodes are safe. If the memory had already been saved it stays saved: "
+            f"`levain wrap --dry-run` says\n"
+            f"     there is nothing to consolidate if so, and shows what is still to do if not."
         )
     return (
         f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated and the "
@@ -529,12 +577,12 @@ def wrap_entity(
     except TurnTimeout as exc:
         # `TurnTimeout` is a BaseException, so `_consolidate`'s `except Exception` clauses never see
         # it; its own BaseException handler has already tried to cancel our in-progress wrap on the
-        # way out and recorded whether that cancel held (`levain_wrap_cancelled`). A stop that never
-        # reached that handler left no record, so it is reported as unconfirmed, not as clean.
+        # way out and recorded what that cancel found (`levain_wrap_cancel`). A stop that never reached
+        # that handler left no record, and is reported as such, not as clean and not as failed.
         print(
             format_wrap_timeout_report(
                 deadline.seconds or 0.0, hard=False,
-                cancelled=getattr(exc, "levain_wrap_cancelled", False)),
+                outcome=getattr(exc, "levain_wrap_cancel", "unknown")),
             file=sys.stderr, flush=True,
         )
         return EXIT_TIMEOUT
@@ -899,13 +947,38 @@ def _consolidate(
                 allow_shrink=False,
             )
         except Exception as exc:  # noqa: BLE001 — anneal raises ValueError (validation) / StoreError
-            # Distinguish by STORE STATE, not exception type (codex L3). anneal validates + shrink-
-            # gates BEFORE any write (a malformed compose raises here with NOTHING committed and the
-            # wrap still in progress), but a VALID compose COMMITS the DB — wrap_completed stamps the
-            # episodes and clears the in-progress metadata — in Phase 2, and only THEN renames the
-            # continuity sidecar in Phase 3. A Phase-3 failure raises POST-commit: the wrap is already
-            # saved and the episodes are no longer re-wrappable. Exception TYPE alone can't tell these
-            # apart (both can be ValueError/StoreError); the in-progress flag can.
+            # WHAT THE STORE ESTABLISHES, and nothing inferred from the absence of a flag. anneal
+            # validates + shrink-gates BEFORE any write (a malformed compose raises here with NOTHING
+            # committed and the wrap still in progress), but a VALID compose COMMITS the DB in
+            # Phase 2 and only THEN renames the continuity sidecar in Phase 3, so a Phase-3 failure
+            # raises POST-commit. Neither the exception type nor the in-progress flag says which
+            # happened: with no wrap in progress, either our save committed, or another program
+            # cleared or completed our wrap. So:
+            #  · COMMITTED needs positive evidence: the last completed wrap id moved since before
+            #    the save AND anneal's own Phase-3 text ("preserved at <tmp>") is in the error.
+            #  · NOT saved is claimed only when the id did not move AND our episodes are still
+            #    unconsolidated, or when our wrap is still in progress (a refused compose).
+            #  · anything else is said to be unknown, with the command that settles it.
+            last_wrap_after = _last_wrap_id(store)
+            if (last_wrap_before is not None and last_wrap_after is not None
+                    and last_wrap_after != last_wrap_before and "preserved at" in str(exc)):
+                # The DB COMMITTED but the file externalization (Phase-3 rename) failed — the wrap IS
+                # recorded (recoverable from the ``.tmp`` the exception names) and the episodes are
+                # NOT re-wrappable. Do NOT cancel (nothing is in progress) and do NOT say "re-run".
+                print(
+                    f"levain wrap: the memory COMMITTED but writing it to disk did not finish "
+                    f"({type(exc).__name__}: {exc}).\n"
+                    "  The consolidate IS recorded — follow the recovery hint in the message above to "
+                    "move the preserved .tmp into place. Do NOT re-run; these episodes are already "
+                    "consolidated."
+                )
+                return 1
+            if last_wrap_before is None or last_wrap_after is None:
+                cancelled = _cancel_if_ours(store, wrap_token)   # a wrap of ours, if open, is not left
+                print(_SAVE_UNKNOWN.format(kind=type(exc).__name__, exc=exc))
+                if not cancelled:
+                    print(_CANCEL_FAILED)
+                return 1
             if _wrap_in_progress(store):
                 # Nothing committed — the identity is unchanged. Cancel OUR wrap (token-owned, so a
                 # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
@@ -923,18 +996,7 @@ def _consolidate(
                 if not cancelled:
                     print(_CANCEL_FAILED)
                 return 1
-            # Nothing is in progress any more. That is true after a COMMIT and also after another
-            # program cleared our wrap while we composed, so the last completed wrap id decides.
-            last_wrap_after = _last_wrap_id(store)
-            if last_wrap_before is None or last_wrap_after is None:
-                print(
-                    f"levain wrap: the save failed ({type(exc).__name__}: {exc}) and Levain could not "
-                    "tell whether the memory was recorded.\n"
-                    "  Check with `levain wrap --dry-run`: it says there is nothing to consolidate if "
-                    "it was, and otherwise shows what is still to do."
-                )
-                return 1
-            if last_wrap_after == last_wrap_before:
+            if last_wrap_after == last_wrap_before and _unwrapped_count(store):
                 print(
                     f"levain wrap: the wrap was cleared by another program while the memory was being "
                     f"composed, so it was NOT saved ({type(exc).__name__}: {exc}).\n"
@@ -942,15 +1004,7 @@ def _consolidate(
                     "Re-run."
                 )
                 return 1
-            # The DB COMMITTED but the file externalization (Phase-3 rename) failed — the wrap IS
-            # recorded (recoverable from the ``.tmp`` the exception names) and the episodes are NOT
-            # re-wrappable. Do NOT cancel (nothing is in progress) and do NOT say "re-run".
-            print(
-                f"levain wrap: the memory COMMITTED but writing it to disk did not finish "
-                f"({type(exc).__name__}: {exc}).\n"
-                "  The consolidate IS recorded — follow the recovery hint in the message above to move "
-                "the preserved .tmp into place. Do NOT re-run; these episodes are already consolidated."
-            )
+            print(_SAVE_UNKNOWN.format(kind=type(exc).__name__, exc=exc))
             return 1
 
         try:
@@ -984,7 +1038,7 @@ def _consolidate(
         try:
             cancelled = _cancel_if_ours(store, wrap_token) if prepare_entered else True
         except BaseException as stop:
-            stop.levain_wrap_cancelled = _cancel_our_wrap(store, wrap_token)  # type: ignore[attr-defined]
+            _note_cancel_outcome(stop, _cancel_our_wrap(store, wrap_token))
             raise
         print(
             f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
@@ -1009,7 +1063,7 @@ def _consolidate(
         # keeps other Levain processes out and says nothing about them). Nothing partial can have
         # been written — the save fails closed — so the frozen episodes simply return to the next
         # wrap.
-        exc.levain_wrap_cancelled = _cancel_our_wrap(store, wrap_token)  # type: ignore[attr-defined]
+        _note_cancel_outcome(exc, _cancel_our_wrap(store, wrap_token))
         raise
     finally:
         store.close()

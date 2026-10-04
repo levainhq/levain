@@ -474,7 +474,7 @@ def test_a_prior_wrap_that_goes_idle_before_the_discard_is_already_discarded(tmp
     assert (ent / ".levain" / "memory.continuity.md").exists()
 
 
-@pytest.mark.parametrize("bound", [True, False])
+@pytest.mark.parametrize("bound", [True, False, "replaced"])
 def test_reset_with_an_unreadable_wrap_snapshot(tmp_path, capsys, monkeypatch, bound):
     """0.5.8: a wrap Levain opened is token-bound, so when its snapshot cannot be read `--reset` still
     names it by the bound token and clears it (a compare-and-swap, so a replacement is never
@@ -485,12 +485,18 @@ def test_reset_with_an_unreadable_wrap_snapshot(tmp_path, capsys, monkeypatch, b
 
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent)
-    _strand_a_wrap(db, bound=bound)
+    _strand_a_wrap(db, bound=bound is not False)
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
     real = Store.load_wrap_snapshot
 
     def unreadable_for_levain(self):
         if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
+            if bound == "replaced":
+                # a peer clears the orphan and opens its own bound wrap while the snapshot read fails
+                with Store(str(db), section_schema=None) as peer:
+                    peer.wrap_cancelled(force=True)
+                    peer.wrap_started(token="b" * 32, episode_ids=[str(e.id) for e in peer.episodes_since_wrap()],
+                                      token_bound=True)
             raise StoreError("simulated unreadable wrap metadata", operation="load_wrap_snapshot")
         return real(self)
 
@@ -498,6 +504,11 @@ def test_reset_with_an_unreadable_wrap_snapshot(tmp_path, capsys, monkeypatch, b
     rc = wrap_entity(ent, reset=True)
     out = capsys.readouterr().out
     monkeypatch.undo()
+    if bound == "replaced":
+        assert rc == 2, out
+        with Store(str(db), section_schema=None) as store:
+            assert store.load_wrap_snapshot()["token"] == "b" * 32, "the peer's wrap was cleared"
+        return
     if bound:
         assert rc == 0, out
         with Store(str(db), section_schema=None) as store:
@@ -842,50 +853,75 @@ def test_a_dry_run_whose_cancel_fails_is_not_a_success(tmp_path, monkeypatch, ca
         assert store.get_wrap_started_at() is not None
 
 
-def test_a_timeout_whose_cancel_failed_is_not_reported_as_clean(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("case", ["cancel works", "cancel fails", "stop before any wrap exists"])
+def test_the_timeout_report_says_what_the_cancel_found(tmp_path, capsys, monkeypatch, case):
     """0.5.8: the wall-clock stop report said "CANCELLED cleanly" even when the cancel itself failed
-    (the store locked by another process), leaving the wrap open. The report now says the cancel
-    could not be confirmed; the control (a cancel that works) keeps the clean wording."""
+    (the store locked by another process), leaving the wrap open, and a stop before any wrap existed
+    could only be described by the absence of a recorded result. The report now follows what the
+    cancel FOUND: cancelled (clean wording), failed (unconfirmed, the wrap may still be open) or no
+    open wrap of this run (neither claim)."""
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent)
 
     def stall(*a, **k):
         raise TurnTimeout(30.0)
 
-    monkeypatch.setattr(wrapmod, "_compose", stall)
-    real_cancel = Store.wrap_cancelled
+    if case == "stop before any wrap exists":
+        monkeypatch.setattr(wrapmod, "_lock_wrap", stall)
+    else:
+        monkeypatch.setattr(wrapmod, "_compose", stall)
+    if case == "cancel fails":
+        real_cancel = Store.wrap_cancelled
 
-    def locked(self, **kw):
-        raise OSError("database is locked")
+        def locked(self, **kw):
+            raise OSError("database is locked")
 
-    monkeypatch.setattr(Store, "wrap_cancelled", locked)
+        monkeypatch.setattr(Store, "wrap_cancelled", locked)
     assert wrap_entity(ent, max_seconds=30) == EXIT_TIMEOUT
     err = capsys.readouterr().err
-    assert "could NOT be confirmed cancelled" in err and "wrap CANCELLED cleanly" not in err
-    monkeypatch.setattr(Store, "wrap_cancelled", real_cancel)
-    with Store(str(db), section_schema=None) as store:
-        assert store.get_wrap_started_at() is not None, "fixture: the wrap really was left open"
+    if case == "cancel works":
+        assert "wrap CANCELLED cleanly" in err
+    elif case == "cancel fails":
+        assert "did NOT complete" in err and "MAY STILL BE OPEN" in err and "CANCELLED cleanly" not in err
+        monkeypatch.setattr(Store, "wrap_cancelled", real_cancel)
+        with Store(str(db), section_schema=None) as store:
+            assert store.get_wrap_started_at() is not None, "fixture: the wrap really was left open"
+    else:
+        assert "No open wrap of this run was found" in err
+        assert "CANCELLED cleanly" not in err and "MAY STILL BE OPEN" not in err
 
 
-def test_a_wrap_cleared_by_another_program_during_the_compose_is_not_reported_as_committed(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("peer", ["clears the wrap", "commits our wrap"])
+def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_shows(tmp_path, capsys, monkeypatch, peer):
     """0.5.8: with nothing in progress after a failed save, Levain said the memory COMMITTED and told
-    the operator not to re-run, even when a peer had cleared the wrap and nothing was saved. The last
-    completed wrap id decides: unchanged means nothing was recorded."""
+    the operator not to re-run, even when a peer had cleared the wrap and nothing was saved; and the
+    first fix (the last completed wrap id alone) said NOT saved when a peer had COMMITTED our wrap
+    during the compose. Now: unchanged id with episodes still unconsolidated is NOT saved; anything
+    the store cannot settle gets the dry-run check, never either claim."""
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent)
 
-    def compose_while_a_peer_clears_the_wrap(*a, **k):
-        with Store(str(db), section_schema=None) as peer:
-            peer.wrap_cancelled(force=True)
+    def compose_while_a_peer_acts(*a, **k):
+        from anneal_memory.continuity import validated_save_continuity
+        with Store(str(db), section_schema=None) as peer_store:
+            if peer == "clears the wrap":
+                peer_store.wrap_cancelled(force=True)
+            else:
+                token = peer_store.load_wrap_snapshot()["token"]
+                validated_save_continuity(peer_store, _VALID_NEOCORTEX, wrap_token=token)
         return _VALID_NEOCORTEX
 
-    monkeypatch.setattr(wrapmod, "_compose", compose_while_a_peer_clears_the_wrap)
+    monkeypatch.setattr(wrapmod, "_compose", compose_while_a_peer_acts)
     assert wrap_entity(ent) == 1
     out = capsys.readouterr().out
     assert "COMMITTED" not in out and "Do NOT re-run" not in out
-    assert "cleared by another program" in out and "Re-run." in out
-    with Store(str(db), section_schema=None) as store:
-        assert len(store.episodes_since_wrap()) == 2, "the episodes are still unconsolidated"
+    if peer == "clears the wrap":
+        assert "cleared by another program" in out and "Re-run." in out
+        with Store(str(db), section_schema=None) as store:
+            assert len(store.episodes_since_wrap()) == 2, "the episodes are still unconsolidated"
+    else:
+        assert "NOT saved" not in out and "Re-run." not in out
+        assert "does not show whether THIS memory was recorded" in out and "levain wrap --dry-run" in out
 
 
 def test_a_failure_showing_the_result_after_the_save_is_not_a_store_read_failure(tmp_path, capsys, monkeypatch):
