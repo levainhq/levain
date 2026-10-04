@@ -402,8 +402,35 @@ def test_the_compose_prompt_lists_the_stores_own_sections():
     full = _compose_instructions(seven)
     for s in seven:
         assert f"## {s['heading']}" in full
-    assert "## Durable Facts   (optional)" in full and "optional. Write it" in full
+    assert "Optional: ## Durable Facts." in full
     assert "ALL SIX" not in full
     old = _compose_instructions(six)
-    assert "## Durable Facts" not in old and "optional. Write it" not in old
+    assert "## Durable Facts" not in old and "Optional:" not in old
     assert full.index("## Active Threads") < full.index("## Durable Facts") < full.index("## Patterns")
+
+
+def test_every_generated_heading_is_one_anneal_parses():
+    """codex, the 0.5.6 round (RUN): the prompt's heading lines must be the exact headings, or a
+    composer that copies them writes a section anneal does not recognise and the fact is lost."""
+    from levain.wrap import _compose_instructions
+
+    prompt = _compose_instructions(FLOW_SCHEMA)
+    listed = [ln for ln in prompt.splitlines() if ln.startswith("## ")]
+    assert listed[: len(FLOW_SCHEMA)] == [f"## {s['heading']}" for s in FLOW_SCHEMA]
+    durable = pytest.importorskip("anneal_memory.durable")
+    if not any(s.get("optional") for s in FLOW_SCHEMA):
+        pytest.skip("this anneal has no optional section")
+    body = "\n\n".join(f"{h}\n- x" for h in listed[: len(FLOW_SCHEMA)])
+    body = body.replace("## Durable Facts\n- x", "## Durable Facts\n- tree nut allergy — cues: dinner")
+    facts = durable.parse_durable_facts(body, FLOW_SCHEMA)
+    assert [f.fact for f in facts] == ["tree nut allergy"]
+
+
+def test_a_schema_with_the_right_headings_but_a_wrong_role_is_refused(tmp_path, capsys):
+    """codex, the 0.5.6 round: Understanding without its timeless role disables the shrink gate."""
+    ent = _openhands_entity(tmp_path)
+    wrong = [dict(s, role="narrative") if s["heading"] == "Understanding" else s
+             for s in FLOW_SCHEMA]
+    _with_store(ent, schema=wrong, episodes=1)
+    assert wrap_entity(ent, dry_run=True) == 2
+    assert "not on the partnership schema" in capsys.readouterr().out

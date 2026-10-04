@@ -268,15 +268,17 @@ def _compose_instructions(section_schema: list) -> str:
     the current memory calls for it, and its rules come from the package."""
     required = [s["heading"] for s in section_schema if not s.get("optional")]
     optional = [s["heading"] for s in section_schema if s.get("optional")]
-    listing = "\n".join(
-        f"## {s['heading']}" + ("   (optional)" if s.get("optional") else "")
-        for s in section_schema)
+    # The heading lines carry nothing but the heading: anneal matches an optional heading exactly,
+    # so a decorated "## Durable Facts (optional)" parsed to no facts (codex, the 0.5.6 round, RUN
+    # through anneal's parse_durable_facts). Optionality is said in prose, below.
+    listing = "\n".join(f"## {s['heading']}" for s in section_schema)
     optional_rule = ""
     if optional:
         names = ", ".join(f"## {h}" for h in optional)
         optional_rule = (
-            f"\n- {names}: optional. Write it when your current memory already has it or the package "
-            "gives you something for it, and follow the package's rules for it exactly.")
+            f"\n- Optional: {names}. Write it when your current memory already has it or the package "
+            "gives you something for it, with the heading spelled exactly as listed, and follow the "
+            "package's rules for it exactly.")
     return f"""\
 You are consolidating your OWN memory — the periodic, deliberate act of metabolizing your recent \
 raw episodes into your lasting sense of who you are and what you are doing. This memory is yours; \
@@ -291,8 +293,8 @@ Compose your updated memory as a single Markdown document with these sections, i
 {listing}
 
 Rules that are easy to get wrong:
-- Every heading not marked optional MUST be present, spelled exactly as above — the save is \
-refused otherwise.{optional_rule}
+- Every heading above that is not named as optional below MUST be present, spelled exactly as \
+above — the save is refused otherwise.{optional_rule}
 - Ground every Pattern's evidence citation in the REAL episode IDs shown in the package. Never
   invent an ID.
 - ## Understanding is TIMELESS relationship-shape — who you and your operator are together — and it
@@ -489,6 +491,7 @@ def _consolidate(
         from anneal_memory import (
             FLOW_SCHEMA,
             AnnealMemoryError,
+            name_for_schema,
             CrystalStore,
             Store,
             WrapInProgressError,
@@ -544,16 +547,18 @@ def _consolidate(
         # REQUIRED headings: anneal 0.9.27 added an optional Durable Facts to FLOW_SCHEMA, and a store
         # persisted before it keeps six headings; an exact compare refused every such entity
         # (codex, the 0.5.6 L3, reproduced with `levain wrap --dry-run`).
-        optional = {s["heading"] for s in FLOW_SCHEMA if s.get("optional")}
+        # anneal's own name for the schema: it compares the ordered required (heading, role) pairs
+        # and ignores optional sections (codex, the 0.5.6 round: a heading-only compare passed a
+        # schema whose Understanding had lost its timeless role, which disables the shrink gate).
         headings = [s["heading"] for s in store.section_schema]
-        expected = [s["heading"] for s in FLOW_SCHEMA]
-        if [h for h in headings if h not in optional] != [h for h in expected if h not in optional]:
+        expected = [s["heading"] for s in FLOW_SCHEMA if not s.get("optional")]
+        if name_for_schema(store.section_schema) != "partnership":
             from levain.manifest import anneal_invocation
 
             print(
                 "levain wrap: this entity's store is not on the partnership schema, "
                 "so it cannot consolidate.\n"
-                f"  got:      {headings}\n  expected: {expected}\n"
+                f"  got:      {headings}\n  required: {expected}\n"
                 f"  Fix:  {anneal_invocation('--db', str(episodic_path), 'set-schema', 'partnership')}"
             )
             return 2

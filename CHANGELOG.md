@@ -17,6 +17,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **Levain now requires anneal-memory 0.9.27 or later** (`anneal-memory>=0.9.27,<0.10`). anneal-memory 0.9.27 adds an optional `## Durable Facts` section for facts that would change a future answer (an allergy, a commitment, a fact a later action depends on), one line each with cue words, kept until you drop one. The seed's memory guidance names the section and its line form and leaves the rules to anneal's wrap guidance, and the dashboard shows the section. A NEW entity gets the section. An EXISTING one keeps its schema until you opt it in with `anneal-memory --db .levain/memory.db set-schema partnership`; `levain update` does not do that for you, because changing a store's schema is the operator's decision.
 
+### Known open issues
+
+- **`levain wrap` checks the store's schema before the wrap starts, not the schema the wrap freezes** (since 0.4.x). Another process that changes the store's schema in between (an `anneal-memory set-schema` run by hand, or by another tool on the same store) is not caught, and the wrap runs under the new schema. Levain's own wrap lock does not cover other programs.
+- **The dashboard matches section headings by exact case**, so a continuity written with `## durable facts` (which anneal accepts) is not shown there. Its content is unaffected.
+
 ## [0.5.5] — 2026-10-03
 
 Claude Code installs now load the entity's living memory at the start of every session, `levain update` brings an existing install's seed files up to date, a hardlink to a crown jewel no longer gets past the floor, and Levain now requires anneal-memory 0.9.26.
