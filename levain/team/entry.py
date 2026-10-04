@@ -271,6 +271,15 @@ def parse_line(line: str) -> object:
         raise LineError(f"{type(exc).__name__}") from exc
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _printable(text: str) -> str:
+    """Hostile text made safe to carry in a problem string: no lone surrogate (it cannot be encoded to UTF-8, so
+    it would crash the canon write and the print of the very report that names the line), and bounded length."""
+    return text.encode("utf-8", "replace").decode("utf-8")[:300]
+
+
 def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
     """Walk one file's chain. Returns (entries, problems, last_hash).
 
@@ -293,21 +302,27 @@ def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
         if e.get("prev") != prev:
             problems.append(f"line {n} ({e.get('id')}): chain break, prev does not match the line before")
         try:
-            hash_ok = e.get("hash") == chain_hash(e.get("prev", "") if isinstance(e.get("prev"), str) else "", e)
+            actual = chain_hash(e.get("prev", "") if isinstance(e.get("prev"), str) else "", e)
         except Exception:  # noqa: BLE001 - a hostile line (a lone surrogate) must be one problem, never a failed read
-            hash_ok = False
-        if not hash_ok:
+            # A line that cannot even be hashed takes no part in the chain: it must not move the cursor its
+            # neighbours are checked against.
+            problems.append(f"line {n} ({e.get('id')}): cannot be hashed, the entry is not valid text")
+            continue
+        if e.get("hash") != actual:
             problems.append(f"line {n} ({e.get('id')}): hash mismatch, the entry was edited after it was written")
-            prev = e.get("hash", "") if isinstance(e.get("hash"), str) else ""
+            claimed = e.get("hash")
+            if isinstance(claimed, str) and _HEX64.fullmatch(claimed):
+                prev = claimed  # a claimed hash that is not a digest never becomes the cursor the next write seals over
             continue
         try:
             # The secret scrub is a WRITE gate. Re-running it on read would silently stop enforcing an existing
             # ruling whenever a newer levain widened the patterns.
             validate(e, scan=False)
         except Exception as exc:  # noqa: BLE001 - EntryError is the expected one; a hostile line never fails the read
-            problems.append(f"line {n} ({e.get('id')}): invalid entry ({exc})")
+            why = str(exc) if isinstance(exc, EntryError) else f"{type(exc).__name__}: {exc}"
+            problems.append(f"line {n} ({e.get('id')}): invalid entry ({why})")
             prev = e["hash"]
             continue
         prev = e["hash"]
         entries.append(e)
-    return entries, problems, prev
+    return entries, [_printable(p) for p in problems], prev

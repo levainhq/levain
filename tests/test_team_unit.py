@@ -437,3 +437,44 @@ def test_parse_line_names_the_refusal_for_length_and_stray_closers():
         E.parse_line('{"a": "' + "x" * E.MAX_LINE_CHARS + '"}')
     with pytest.raises(E.LineError, match="closes more"):
         E.parse_line("]" * 100 + "[" * (E.MAX_JSON_DEPTH + 100))
+
+
+def test_an_unhashable_line_does_not_move_the_chain_cursor_for_its_neighbours():
+    first = E.seal(ruling(words="one"), "")
+    second = E.seal(ruling(words="two"), first["hash"])
+    for junk in ('{"x": "\\ud800"}', '{"x": "\\ud800", "prev": "", "hash": "\\ud800"}'):
+        entries, problems, last = E.verify_lines([json.dumps(first), junk, json.dumps(second)])
+        assert [e["id"] for e in entries] == [first["id"], second["id"]]
+        assert last == second["hash"]
+        assert problems and all("line 2" in p for p in problems)
+
+
+def test_a_claimed_hash_that_is_not_a_digest_never_becomes_the_cursor():
+    first = E.seal(ruling(words="one"), "")
+    forged = dict(first, words="edited", hash="z" * 5000)
+    entries, problems, last = E.verify_lines([json.dumps(first), json.dumps(forged)])
+    assert last == first["hash"] and len(entries) == 1 and any("hash mismatch" in p for p in problems)
+
+
+def test_problem_strings_carry_no_lone_surrogate():
+    hostile = json.dumps({"id": "\ud800" * 10, "prev": "", "hash": "0" * 64}, ensure_ascii=True)
+    _, problems, _ = E.verify_lines([hostile])
+    assert problems and all(p.encode("utf-8") for p in problems)
+
+
+def test_misfiled_entries_are_filtered_without_pairwise_comparison(monkeypatch):
+    """List membership on dicts is dict equality: Theta(N^2) on a hostile file of misfiled entries."""
+    compared = []
+
+    class Counting(dict):
+        def __eq__(self, other):
+            compared.append(1)
+            return dict.__eq__(self, other)
+
+        __hash__ = None
+
+    entries = [Counting(E.seal(ruling(author="ben", words=f"w{i}"), "")) for i in range(300)]
+    monkeypatch.setattr(E, "verify_lines", lambda lines: (entries, [], ""))
+    led = I.build([("ana/d.jsonl", ["{}"])], "ana")
+    assert not led.entries and sum("filed under" in p for p in led.problems) == 300
+    assert len(compared) == 0

@@ -215,7 +215,8 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         owner_dir = rel.split("/", 1)[0]
         misfiled = [e for e in got if E.safe_handle(e.get("author", "")) != owner_dir]
         probs += [f"{e['id']}: author {e.get('author')!r} is filed under {owner_dir}/ (not enforced)" for e in misfiled]
-        got = [e for e in got if e not in misfiled]
+        bad = {id(e) for e in misfiled}  # identity, not dict equality: a list scan here is quadratic in a hostile file
+        got = [e for e in got if id(e) not in bad]
         raw = []
         for line in lines:
             try:
