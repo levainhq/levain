@@ -552,8 +552,9 @@ def _self_consolidate(
         # recoverable (the episodes return to the next wrap); a consolidate failing EVERY run is the
         # seat quietly ceasing to metabolize, and the only place that pattern is visible is here.
         print(
-            f"  ⚠ consolidate did not complete (exit {rc}) — the entity's memory is UNCHANGED and "
-            f"its episodes are safe; they return to the next wrap.\n"
+            f"  ⚠ consolidate did not complete (exit {rc}) — what that established about the memory "
+            f"is in its own message above; its episodes are safe and any not yet consolidated "
+            f"return to the next wrap.\n"
             f"     Recall degrades while this keeps failing, so a run of these in the log is worth "
             f"acting on even though each one is survivable.",
             file=sys.stderr, flush=True,
