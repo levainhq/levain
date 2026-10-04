@@ -186,6 +186,17 @@ def _last_wrap_id(store: object) -> int | None:
         return None
 
 
+def _say(message: str) -> None:
+    """Print ``message`` to stdout, falling back to stderr, and never raise: the one caller reports a
+    result after the memory is already saved, and a broken stream must not turn that into a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            print(message, file=stream, flush=True)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def _unwrapped_count(store: object) -> int | None:
     """How many episodes still await consolidation, or ``None`` when that cannot be read."""
     try:
@@ -193,6 +204,13 @@ def _unwrapped_count(store: object) -> int | None:
     except Exception:  # noqa: BLE001 — unreadable → unknown, never a guess
         return None
 
+
+_SAVE_UNREADABLE = (
+    "levain wrap: the save failed ({kind}: {exc}) and the store could not be read well enough to say "
+    "whether this memory was recorded.\n"
+    "  Check with `levain wrap --dry-run`: it says there is nothing to consolidate if the episodes are "
+    "consolidated; look at the entity's .levain/memory.continuity.md before re-running."
+)
 
 _SAVE_UNKNOWN = (
     "levain wrap: the save failed ({kind}: {exc}) and the store does not show whether THIS memory was "
@@ -469,8 +487,9 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool, outcome: str = "ca
         return (
             f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated, and "
             f"cancelling its wrap did NOT complete.\n"
-            f"     Your memory is UNCHANGED and your episodes are safe (nothing partial is ever "
-            f"written).\n"
+            f"     Your episodes are safe (nothing partial is ever written). Whether the memory was "
+            f"saved is not established:\n"
+            f"     `levain wrap --dry-run` says there is nothing to consolidate if it was.\n"
             f"     ⚠ THE WRAP MAY STILL BE OPEN (for example the store was busy or unreadable when "
             f"the cancel ran): the next\n"
             f"     consolidate may refuse until it is discarded. An UNATTENDED seat clears it "
@@ -828,6 +847,9 @@ def _consolidate(
             crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
         # NO session_id — that engages flow's parallel-convo consolidate-efferent gate (spore-194),
         # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
+        # The last completed wrap id BEFORE the wrap opens: nothing else can complete while ours is
+        # open, so any later change is a wrap someone else completed (ours cleared and replaced).
+        last_wrap_before = _last_wrap_id(store)
         prepare_entered = True
         result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token)
         status = result.get("status")
@@ -936,7 +958,6 @@ def _consolidate(
             if affect_tag and affect_tag.strip()
             else None
         )
-        last_wrap_before = _last_wrap_id(store)
         try:
             saved = validated_save_continuity(
                 store,
@@ -975,11 +996,11 @@ def _consolidate(
                 return 1
             if last_wrap_before is None or last_wrap_after is None:
                 cancelled = _cancel_if_ours(store, wrap_token)   # a wrap of ours, if open, is not left
-                print(_SAVE_UNKNOWN.format(kind=type(exc).__name__, exc=exc))
+                print(_SAVE_UNREADABLE.format(kind=type(exc).__name__, exc=exc))
                 if not cancelled:
                     print(_CANCEL_FAILED)
                 return 1
-            if _wrap_in_progress(store):
+            if last_wrap_after == last_wrap_before and _wrap_in_progress(store):
                 # Nothing committed — the identity is unchanged. Cancel OUR wrap (token-owned, so a
                 # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
                 debug_path = _dump_rejected(entity_dir, wrap_token, neocortex)
@@ -1010,10 +1031,10 @@ def _consolidate(
         try:
             _report(saved, entity_dir)
         except Exception as exc:  # noqa: BLE001 — the memory is already saved; showing it is not the consolidate
-            print(
+            _say(
                 f"levain wrap: consolidated: the memory was SAVED, but showing the result failed "
                 f"({type(exc).__name__}: {exc}).\n"
-                "  Nothing to re-run: a second wrap would find nothing to consolidate."
+                "  Nothing from this wrap is left to re-run."
             )
         return 0
     except WrapInProgressError as exc:

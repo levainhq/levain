@@ -295,21 +295,19 @@ def test_wrap_post_commit_externalization_failure_is_not_reported_as_unsaved(
     _with_store(ent, episodes=2)
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
 
-    real_save = cont.validated_save_continuity
+    # anneal's OWN Phase-3 failure: the save commits (the wrap completes, the last wrap id moves),
+    # then the rename of the continuity sidecar fails, so levain reads anneal's real recovery text
+    # ("preserved at <tmp>"), not a stand-in for it.
+    import pathlib
 
-    def _post_commit_fail(store, text, **kw):
-        # A REAL commit (anneal's Phase 2: the wrap completes, the last wrap id moves, the
-        # in-progress metadata clears), then a Phase-3 rename failure raised post-commit. A bare
-        # clearing of the flag is not a commit: levain tells the two apart by the last wrap id.
-        real_save(store, text, **kw)
-        raise StoreError(
-            "Failed to rename continuity tmp — the DB has committed the wrap but externalization "
-            "is incomplete; preserved at /x/memory.continuity.md.tmp.",
-            operation="save_continuity",
-        )
+    real_replace = pathlib.Path.replace
 
-    # Patch at the anneal module (wrap_entity imports it lazily at call time, so this binds).
-    monkeypatch.setattr(cont, "validated_save_continuity", _post_commit_fail)
+    def failing_rename(self, target):
+        if str(target).endswith("memory.continuity.md"):
+            raise OSError("simulated: read-only filesystem")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "replace", failing_rename)
 
     assert wrap_entity(ent) == 1
     out = capsys.readouterr().out

@@ -883,6 +883,7 @@ def test_the_timeout_report_says_what_the_cancel_found(tmp_path, capsys, monkeyp
         assert "wrap CANCELLED cleanly" in err
     elif case == "cancel fails":
         assert "did NOT complete" in err and "MAY STILL BE OPEN" in err and "CANCELLED cleanly" not in err
+        assert "UNCHANGED" not in err, "a failed cancel does not establish that the memory is unchanged"
         monkeypatch.setattr(Store, "wrap_cancelled", real_cancel)
         with Store(str(db), section_schema=None) as store:
             assert store.get_wrap_started_at() is not None, "fixture: the wrap really was left open"
@@ -891,7 +892,7 @@ def test_the_timeout_report_says_what_the_cancel_found(tmp_path, capsys, monkeyp
         assert "CANCELLED cleanly" not in err and "MAY STILL BE OPEN" not in err
 
 
-@pytest.mark.parametrize("peer", ["clears the wrap", "commits our wrap"])
+@pytest.mark.parametrize("peer", ["clears the wrap", "commits our wrap", "commits ours, opens a new wrap", "id unreadable"])
 def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_shows(tmp_path, capsys, monkeypatch, peer):
     """0.5.8: with nothing in progress after a failed save, Levain said the memory COMMITTED and told
     the operator not to re-run, even when a peer had cleared the wrap and nothing was saved; and the
@@ -904,12 +905,29 @@ def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_s
     def compose_while_a_peer_acts(*a, **k):
         from anneal_memory.continuity import validated_save_continuity
         with Store(str(db), section_schema=None) as peer_store:
-            if peer == "clears the wrap":
+            if peer in ("clears the wrap", "id unreadable"):
                 peer_store.wrap_cancelled(force=True)
             else:
                 token = peer_store.load_wrap_snapshot()["token"]
                 validated_save_continuity(peer_store, _VALID_NEOCORTEX, wrap_token=token)
+                if peer == "commits ours, opens a new wrap":
+                    peer_store.record(content="a new episode after the commit", episode_type="observation", source="peer")
+                    peer_store.wrap_started(token="c" * 32, episode_ids=[str(e.id) for e in peer_store.episodes_since_wrap()])
         return _VALID_NEOCORTEX
+
+    if peer == "id unreadable":
+        import sys
+        real_last = Store.last_wrap_id
+        reads = []
+
+        def unreadable_after_the_compose(self):
+            if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
+                reads.append(1)
+                if len(reads) > 1:   # the baseline before prepare_wrap reads fine; the read after the failed save does not
+                    raise OSError("database is locked")
+            return real_last(self)
+
+        monkeypatch.setattr(Store, "last_wrap_id", unreadable_after_the_compose)
 
     monkeypatch.setattr(wrapmod, "_compose", compose_while_a_peer_acts)
     assert wrap_entity(ent) == 1
@@ -919,12 +937,16 @@ def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_s
         assert "cleared by another program" in out and "Re-run." in out
         with Store(str(db), section_schema=None) as store:
             assert len(store.episodes_since_wrap()) == 2, "the episodes are still unconsolidated"
+    elif peer == "id unreadable":
+        assert "could not be read well enough" in out and "levain wrap --dry-run" in out
+        assert "NOT saved" not in out and "No wrap of this run is in progress" not in out
     else:
-        assert "NOT saved" not in out and "Re-run." not in out
+        assert "NOT saved" not in out and "REFUSED" not in out and "Re-run." not in out
         assert "does not show whether THIS memory was recorded" in out and "levain wrap --dry-run" in out
 
 
-def test_a_failure_showing_the_result_after_the_save_is_not_a_store_read_failure(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("stream", ["a store error", "a broken stdout"])
+def test_a_failure_showing_the_result_after_the_save_is_not_a_store_read_failure(tmp_path, capsys, monkeypatch, stream):
     """0.5.8: an error raised while printing the result, after the memory was saved, fell into the
     store-error handler: 'could not read the store', exit 2, and a re-run finds nothing to do."""
     ent = _openhands_entity(tmp_path)
@@ -932,13 +954,24 @@ def test_a_failure_showing_the_result_after_the_save_is_not_a_store_read_failure
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
 
     def broken_report(*a, **k):
+        import sys
         from anneal_memory import StoreError
+        if stream == "a broken stdout":
+            class Broken:
+                def write(self, *_):
+                    raise BrokenPipeError("simulated: stdout closed")
+
+                def flush(self):
+                    raise BrokenPipeError("simulated: stdout closed")
+
+            monkeypatch.setattr(sys, "stdout", Broken())
         raise StoreError("simulated: could not read the result", operation="record")
 
     monkeypatch.setattr(wrapmod, "_report", broken_report)
     assert wrap_entity(ent) == 0
-    out = capsys.readouterr().out
-    assert "SAVED" in out and "could not read the store" not in out
+    cap = capsys.readouterr()
+    out = cap.err if stream == "a broken stdout" else cap.out   # the fallback goes to stderr when stdout is broken
+    assert "SAVED" in out and "could not read the store" not in out and "nothing to consolidate" not in out
     assert (ent / ".levain" / "memory.continuity.md").exists()
     with Store(str(db), section_schema=None) as store:
         assert store.get_wrap_started_at() is None and not store.episodes_since_wrap()
