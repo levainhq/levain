@@ -262,7 +262,7 @@ def _cancel_our_wrap(store: object, wrap_token: object) -> None:
 def _compose_instructions(section_schema: list) -> str:
     """The compose system prompt, with the heading list read from the store's own section schema.
 
-    A fixed six-heading list contradicted anneal 0.9.27's optional ``## Durable Facts``: the prompt
+    A fixed six-heading list contradicted anneal 0.9.28's optional ``## Durable Facts``: the prompt
     outranks the package, so a durable fact the package asked for was never written (codex, the
     0.5.6 L3). Required headings must all appear; an optional one is written when the package or
     the current memory calls for it, and its rules come from the package."""
@@ -544,7 +544,7 @@ def _consolidate(
     try:
         # A partnership entity's store MUST be on the partnership schema — an ops-schema store cannot
         # hold the compose, and a clear message here beats a cryptic save-time rejection. Compared on
-        # REQUIRED headings: anneal 0.9.27 added an optional Durable Facts to FLOW_SCHEMA, and a store
+        # REQUIRED headings: anneal 0.9.28 added an optional Durable Facts to FLOW_SCHEMA, and a store
         # persisted before it keeps six headings; an exact compare refused every such entity
         # (codex, the 0.5.6 L3, reproduced with `levain wrap --dry-run`).
         # anneal's own name for the schema: it compares the ordered required (heading, role) pairs

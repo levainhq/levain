@@ -74,7 +74,7 @@ class TestParseSections:
         assert [s.heading for s in secs] == ["State"]
 
     def test_the_default_set_shows_durable_facts(self) -> None:
-        """anneal 0.9.27's optional section, in its schema order, when the continuity has it."""
+        """anneal 0.9.28's optional section, in its schema order, when the continuity has it."""
         from levain.dashboard import _ALL_SECTIONS
         md = "## State\ns\n\n## Durable Facts\n- tree nut allergy — cues: dinner\n\n## Patterns\np\n"
         secs = _parse_sections(md, _ALL_SECTIONS)

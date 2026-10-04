@@ -367,7 +367,7 @@ def test_compose_routes_via_v1_native_with_reasoning_token_headroom(monkeypatch)
 # ---------- schema compatibility across anneal's optional sections (0.5.6) ----------
 
 def test_a_store_persisted_without_the_optional_sections_still_wraps(tmp_path, capsys):
-    """codex, the 0.5.6 L3 (reproduced with `levain wrap --dry-run`): anneal 0.9.27 added the
+    """codex, the 0.5.6 L3 (reproduced with `levain wrap --dry-run`): anneal 0.9.28 added the
     optional Durable Facts to FLOW_SCHEMA, and an exact heading compare refused every store
     persisted before it."""
     ent = _openhands_entity(tmp_path)

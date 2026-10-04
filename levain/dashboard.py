@@ -1223,7 +1223,7 @@ def recall_episode_rows(
 
 
 # The neocortex sections of anneal's partnership schema (FLOW_SCHEMA), in its order, including
-# the optional Durable Facts (anneal 0.9.27). A section the continuity lacks is skipped.
+# the optional Durable Facts (anneal 0.9.28). A section the continuity lacks is skipped.
 _ALL_SECTIONS = ("State", "Active Threads", "Durable Facts", "Patterns", "Decisions", "Context",
                  "Understanding")
 
