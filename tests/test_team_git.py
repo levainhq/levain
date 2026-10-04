@@ -576,3 +576,55 @@ def test_a_missing_session_id_still_acks_with_a_schema_safe_token(two):
     assert hook("pretooluse", p)["hookSpecificOutput"]["permissionDecision"] == "deny"
     second = hook("pretooluse", p)["hookSpecificOutput"]
     assert "permissionDecision" not in second and "acknowledgement not recorded" not in second["additionalContext"]
+
+
+# ---- regressions from L3 round 3 ---------------------------------------------------------------------------
+
+def test_conflict_replay_skips_commits_already_upstream(two, capsys):
+    tmp, ana, ben = two
+    ana2 = clone(tmp, "ana2", "ana@ex.com")
+    assert team("join", repo=ana2) == 0
+    assert record_ruling(ana, "src/e.py", "e stays", "--no-push") == 0
+    gl = GitLedger(Repo.discover(ana))
+    e_sha = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    assert team("member", "add", "cat", "cat@ex.com", repo=ana2) == 0          # remote moves
+    git("fetch", "-q", "origin", cwd=gl.wt)
+    git("checkout", "-q", "--detach", "origin/levain-ledger", cwd=gl.wt)
+    git("cherry-pick", e_sha, cwd=gl.wt)                                         # E' upstream, new SHA
+    git("push", "-q", "origin", "HEAD:refs/heads/levain-ledger", cwd=gl.wt)
+    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
+    assert team("member", "add", "dan", "dan@ex.com", "--no-push", repo=ana) == 0  # conflicts with cat
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    led = gl.ledger()
+    assert [e.get("words") for e in led.in_force].count("e stays") == 1
+
+
+def test_an_interrupted_replay_is_rolled_back_without_loss(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/k.py", "k stays", "--no-push") == 0
+    gl = GitLedger(Repo.discover(ana))
+    tip = git("rev-parse", "levain-ledger", cwd=ana).strip()
+    git("checkout", "-q", "--detach", "HEAD~1", cwd=gl.wt)     # what a kill mid-replay leaves behind
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip
+    assert "k stays" in [e.get("words") for e in gl.ledger().in_force]   # readers never saw a loss
+    assert record_ruling(ana, "src/l.py", "l stays") == 0
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+    words = [e.get("words") for e in gl.ledger().in_force]
+    assert "k stays" in words and "l stays" in words
+
+
+def test_a_merge_resolved_to_its_first_parent_cannot_hide_side_lines(two):
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ana))
+    git("checkout", "-q", "-b", "side", cwd=gl.wt)
+    e = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/s.py"], words="s stays"), "")
+    gl.file_for("ana").parent.mkdir(parents=True, exist_ok=True)
+    gl.file_for("ana").write_text(json.dumps(e) + "\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "side entry", cwd=gl.wt)
+    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
+    git("merge", "-q", "-s", "ours", "--no-edit", "side", cwd=gl.wt)     # TREESAME to the first parent
+    led = gl.ledger()
+    assert "s stays" in [e.get("words") for e in led.in_force]
+    assert any("merge commit" in p for p in led.problems)
