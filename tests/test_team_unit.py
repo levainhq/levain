@@ -395,8 +395,8 @@ def test_deeply_nested_line_is_refused_before_the_parser_and_the_rest_still_coun
     that) and has run for minutes in json.loads on Windows. It is one reported problem; its neighbours count."""
     import time
     good = E.seal(ruling(), "")
-    bomb = "[" * 200_000 + "]" * 200_000
-    bomb_obj = '{"a":' * 200_000 + "1" + "}" * 200_000
+    bomb = "[" * 120_000 + "]" * 120_000   # under the line cap: the depth guard, not the length cap, refuses it
+    bomb_obj = '{"a":' * 40_000 + "1" + "}" * 40_000
     t0 = time.monotonic()
     led = I.build([("ana/d.jsonl", [bomb, json.dumps(good), bomb_obj])], "ana")
     assert time.monotonic() - t0 < 5
@@ -412,3 +412,28 @@ def test_nesting_scan_ignores_brackets_inside_strings():
         E.parse_line("[" * (E.MAX_JSON_DEPTH + 1) + "]" * (E.MAX_JSON_DEPTH + 1))
     with pytest.raises(E.LineError):
         E.parse_line("{not json")
+
+
+@pytest.mark.parametrize("hostile", [
+    '{"a": ' + "1" * 5000 + "}",                      # CPython's integer-digit limit: a plain ValueError
+    '{"x": "\\ud800"}',                                 # a lone surrogate parses, then cannot be hashed
+    '{"x": "\\udc00", "prev": "", "hash": "z"}',
+    "]" * 100 + "[" * 132,                             # closes more than it opens
+    '{"a": "' + "x" * 300_000 + '"}',                   # past the line cap
+])
+def test_no_hostile_line_fails_the_read(hostile):
+    """The invariant is the per-line boundary: one bad line is one reported problem and its neighbours still
+    count, whatever raised inside it (the hook fails OPEN on an exception)."""
+    good = E.seal(ruling(), "")
+    entries, problems, _ = E.verify_lines([hostile, json.dumps(good)])
+    assert [e["id"] for e in entries] == [good["id"]]
+    assert len(problems) >= 1
+    led = I.build([("ana/d.jsonl", [hostile, json.dumps(good)])], "ana")
+    assert any("line 1" in p for p in led.problems)
+
+
+def test_parse_line_names_the_refusal_for_length_and_stray_closers():
+    with pytest.raises(E.LineError, match="longer than"):
+        E.parse_line('{"a": "' + "x" * E.MAX_LINE_CHARS + '"}')
+    with pytest.raises(E.LineError, match="closes more"):
+        E.parse_line("]" * 100 + "[" * (E.MAX_JSON_DEPTH + 100))

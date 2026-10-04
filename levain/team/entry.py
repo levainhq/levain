@@ -225,6 +225,7 @@ def seal(entry: dict, prev: str) -> dict:
 
 
 MAX_JSON_DEPTH = 32
+MAX_LINE_CHARS = 262_144
 
 
 class LineError(ValueError):
@@ -240,6 +241,8 @@ def parse_line(line: str) -> object:
     objects, so the bound is far above anything levain writes. Raises LineError (a ValueError) for every
     refusal, JSONDecodeError included.
     """
+    if len(line) > MAX_LINE_CHARS:
+        raise LineError(f"longer than {MAX_LINE_CHARS} characters")
     depth = 0
     in_str = esc = False
     for ch in line:
@@ -258,12 +261,14 @@ def parse_line(line: str) -> object:
                 raise LineError(f"nested deeper than {MAX_JSON_DEPTH}")
         elif ch in "]}":
             depth -= 1
+            if depth < 0:
+                raise LineError("closes more than it opens")
     try:
         return json.loads(line)
     except json.JSONDecodeError as exc:
         raise LineError(exc.msg) from exc
-    except RecursionError as exc:
-        raise LineError("nested too deeply") from exc
+    except (ValueError, RecursionError) as exc:  # ValueError: CPython's integer-digit limit
+        raise LineError(f"{type(exc).__name__}") from exc
 
 
 def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
@@ -287,7 +292,11 @@ def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
             continue
         if e.get("prev") != prev:
             problems.append(f"line {n} ({e.get('id')}): chain break, prev does not match the line before")
-        if e.get("hash") != chain_hash(e.get("prev", "") if isinstance(e.get("prev"), str) else "", e):
+        try:
+            hash_ok = e.get("hash") == chain_hash(e.get("prev", "") if isinstance(e.get("prev"), str) else "", e)
+        except Exception:  # noqa: BLE001 - a hostile line (a lone surrogate) must be one problem, never a failed read
+            hash_ok = False
+        if not hash_ok:
             problems.append(f"line {n} ({e.get('id')}): hash mismatch, the entry was edited after it was written")
             prev = e.get("hash", "") if isinstance(e.get("hash"), str) else ""
             continue
@@ -295,7 +304,7 @@ def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
             # The secret scrub is a WRITE gate. Re-running it on read would silently stop enforcing an existing
             # ruling whenever a newer levain widened the patterns.
             validate(e, scan=False)
-        except EntryError as exc:
+        except Exception as exc:  # noqa: BLE001 - EntryError is the expected one; a hostile line never fails the read
             problems.append(f"line {n} ({e.get('id')}): invalid entry ({exc})")
             prev = e["hash"]
             continue
