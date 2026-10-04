@@ -1013,9 +1013,10 @@ def _consolidate(
                 # anneal 0.9.33's hard maximum raises a ContinuityValidationError carrying `bound`.
                 why = (
                     "The composed memory is LONGER than the schema's hard maximum; the message above "
-                    "names what to cut. Levain cancelled its wrap, so there is nothing to save "
-                    "again: re-run."
-                    if isinstance(getattr(exc, "bound", None), int) else
+                    "names what to cut."
+                    + (" Levain cancelled its wrap, so ignore the 'save again' line: re-run."
+                       if cancelled else "")
+                    if type(getattr(exc, "bound", None)) is int else
                     "The compose model most likely dropped a required section, mis-cited an episode, "
                     "or (on a later wrap) produced a too-small memory that the catastrophic-shrink "
                     "gate refused."
