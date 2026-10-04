@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.9] — 2026-10-04
+
+Levain is now tested against, and requires, anneal-memory 0.9.31, so `levain doctor` and `levain update` no longer report a fresh install's anneal as ahead of the known-good version.
+
 ### Changed
 
 - **Levain now requires anneal-memory 0.9.31 or later** (`anneal-memory>=0.9.31,<0.10`), and 0.9.31 is the version it is tested against. 0.9.31 was already what a fresh install resolved to, so `levain doctor` and `levain update` reported it as "ahead of this release's known-good, untested together"; they no longer do. Levain keeps its known-good anneal version and its floor as one number, so they move together; the one 0.9.31 behaviour Levain's own text leans on is `anneal-memory wrap-status`, which `levain wrap`'s refusal sends you to and which reads one transaction from 0.9.31 (0.9.30's could show a wrap that had been replaced with the older wrap's bound token; it is an advisory display). anneal 0.9.30 and 0.9.31 added no migration entry and changed no schema, and their API additions are additive and unused by the seed, so the seed needed no change.
