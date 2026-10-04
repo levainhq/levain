@@ -166,7 +166,8 @@ def test_auto_memory_directory_from_settings_is_mirrored_and_baselined_when_it_a
     sweep(root, env)                                        # baseline of the default folder
     custom = root / ".automem"
     custom.mkdir()
-    (custom / "existing.md").write_text("Written before the setting was seen.\n")
+    (custom / "existing.md").write_text("Written before the mirror was enabled.\n")
+    os.utime(custom / "existing.md", (time.time() - 86400, time.time() - 86400))
     (root / ".claude").mkdir()
     (root / ".claude" / "settings.local.json").write_text(
         json.dumps({"autoMemoryDirectory": str(custom)}))

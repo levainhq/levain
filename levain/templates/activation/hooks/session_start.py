@@ -27,7 +27,10 @@ before main() and a catch-all inside main() cannot cover it.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
+
+_T0 = time.time()   # this session's start: the auto-memory mirror never baselines a later note
 
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -74,7 +77,7 @@ def main() -> int:
         # costs this hook one process spawn; its own guard keeps any failure out of here.
         try:
             import automemory_mirror
-            automemory_mirror.start_sweep_if_enabled()
+            automemory_mirror.start_sweep_if_enabled(_T0)
         except (Exception, SystemExit):   # its import guard exits; that must not end this hook
             pass
 

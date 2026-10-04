@@ -38,14 +38,16 @@ cannot be read is retried, never retracted.
 NO BACKFILL: the first sweep that sees a memory folder records every existing file's hash in it
 without writing an episode (a new install, an install upgraded by `levain update`, or an
 autoMemoryDirectory set later). A folder that drops out of scope keeps its entries, so it is not
-backfilled when it returns. A file modified after this sweep process started is the exception:
-it is the note being written now.
+backfilled when it returns, and only a folder that could be listed becomes known. A note modified
+at or after the session's start (or, for a folder seen later, after the mirror was enabled) is the
+exception: it is being written now. A folder that is missing or cannot be listed is skipped and
+reported; nothing in it is ever retracted.
 
 LOST STATE: when the state file is missing or corrupt while the store already holds mirror
 episodes, the sweep STOPS and writes `.levain/automemory_mirror.lost` (`levain doctor` reports
 it). Re-baselining then would leave an edited or deleted note current until its next edit.
-Recovery is a person's: restore the state file (safe: supersession reads the store), or accept
-the gap, then delete the marker.
+Recovery is a person's: restore the state file (safe: supersession reads the store) and delete
+the marker, or turn the mirror off. Deleting only the marker stops it again.
 
 ON BY DEFAULT. Off when `LEVAIN_AUTOMEMORY_MIRROR` is off/0/false/no (env, per session; it
 wins), or `.levain/config.json` has `"automemory_mirror"` false/0 (or one of those strings).
@@ -61,7 +63,7 @@ any hook: `claude --settings` and managed (policy) settings. NOT MIRRORED: MEMOR
 FAIL-OPEN: every entry point catches everything and exits 0.
 
     <python> automemory_mirror.py hook < payload.json
-    <python> automemory_mirror.py sweep [--dry-run] [--trigger PATH]
+    <python> automemory_mirror.py sweep [--dry-run] [--trigger PATH] [--started EPOCH]
 """
 
 from __future__ import annotations
@@ -199,8 +201,9 @@ def memory_dirs(with_git: bool = True) -> list[Path]:
         dirs.append(configured)
     out: list[Path] = []
     for d in dirs:
-        if d not in out:
-            out.append(d)
+        c = Path(os.path.realpath(d))     # one identity per folder: aliases must not split a chain
+        if c not in out:
+            out.append(c)
     return out
 
 
@@ -216,20 +219,28 @@ def is_memory_file(path: str, dirs: list[Path] | None = None) -> bool:
         return False
 
 
-def memory_files(dirs: list[Path]) -> tuple[dict, set]:
-    """({path: sha256} readable now, {paths that exist but could not be read})."""
-    out, unreadable = {}, set()
+def memory_files(dirs: list[Path]) -> tuple[dict, set, set]:
+    """({path: sha256} readable now, {paths that exist but could not be read}, {folders that
+    were listed}). A folder that is missing or cannot be listed is absent from the third set,
+    and nothing inside it is ever taken as deleted."""
+    out, unreadable, listed = {}, set(), set()
     for d in dirs:
-        if not d.is_dir():
+        try:
+            names = sorted(e.name for e in os.scandir(d))
+        except OSError:
             continue
-        for f in sorted(d.glob("*.md")):
-            if f.name == INDEX_NAME:
+        listed.add(str(d))
+        for name in names:
+            f = d / name
+            if name == INDEX_NAME or not name.endswith(".md"):
                 continue
             try:
+                if not f.is_file():
+                    continue
                 out[str(f)] = hashlib.sha256(f.read_bytes()).hexdigest()
             except OSError:
                 unreadable.add(str(f))
-    return out, unreadable
+    return out, unreadable, listed
 
 
 class StateUnreadable(Exception):
@@ -363,7 +374,7 @@ def path_tag(path: str) -> str:
 
 def note_type(text: str) -> str:
     """The `type:` field of a note's YAML frontmatter, lowercased; '' when there is none."""
-    m = re.match(r"\A---\s*\n(.*?)\n---", text, re.S)
+    m = re.match(r"\A---\s*\n(.*?)\n---", text.lstrip("\ufeff"), re.S)
     if not m:
         return ""
     t = re.search(r"^type:\s*['\"]?([A-Za-z_-]+)", m.group(1), re.M)
@@ -402,8 +413,11 @@ def _finish(state: dict, counts: dict, dry_run: bool) -> dict:
     return counts
 
 
-def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
-    """Mirror every change since the last sweep, holding the lock throughout. Returns counts."""
+def sweep(dry_run: bool = False, trigger: str = "", writer=None,
+          started: float | None = None) -> dict:
+    """Mirror every change since the last sweep, holding the lock throughout. Returns counts.
+    `started` is when the spawning session began (session_start.py passes it): a note modified
+    at or after it is being written now and is never baselined, whichever sweep runs first."""
     writer = writer or write_episode
     counts = {"new": 0, "changed": 0, "deleted": 0, "failed": 0, "unchanged": 0}
     sp = state_path()
@@ -429,7 +443,7 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
             return counts
         dirs = memory_dirs()
         dir_set = {str(d) for d in dirs}
-        now, unreadable = memory_files(dirs)
+        now, unreadable, listed = memory_files(dirs)
         first = META_KEY not in state
         if first:
             has = store_has_mirror_episodes()
@@ -442,36 +456,42 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
                     lost_marker().write_text(
                         "auto-memory mirror stopped: .levain/automemory_mirror.json is missing "
                         "or unreadable while this store already holds mirror episodes. Restore "
-                        "the state file, or accept that notes edited since are not mirrored "
-                        "until their next edit, then delete this marker.\n", encoding="utf-8")
+                        "the state file from a backup (an older copy is safe) and then delete "
+                        "this marker; or turn the mirror off (\"automemory_mirror\": false in "
+                        ".levain/config.json). Deleting only this marker stops it again.\n",
+                        encoding="utf-8")
                 return counts
         trigger = os.path.realpath(os.path.expanduser(trigger)) if trigger else ""
+
+        meta = state.get(META_KEY) if isinstance(state.get(META_KEY), dict) else {}
+        # A note modified at or after the cutoff is being written now, never baselined: on the
+        # first sweep the cutoff is the session's start; later, when the mirror was enabled.
+        cutoff = (min(started, _STARTED) if started else _STARTED) if first \
+            else float(meta.get("baseline_at") or _STARTED)
 
         def written_now(path: str) -> bool:
             if trigger and os.path.realpath(path) == trigger:
                 return True
             try:
-                return os.path.getmtime(path) >= _STARTED
+                return os.path.getmtime(path) >= cutoff
             except OSError:
                 return False
 
-        # No backfill, per folder: a memory folder the state has not seen yet has its existing
-        # files baselined, not mirrored.
-        meta = state.get(META_KEY) if isinstance(state.get(META_KEY), dict) else {}
+        # No backfill, per folder: a folder the state has not listed before has its existing
+        # files baselined, not mirrored. Only a folder that could be listed becomes known.
         known = set() if first else set(meta.get("dirs", []))
-        fresh = dir_set - known
-        if fresh:
+        fresh = (listed & dir_set) - known
+        if fresh or first:
             snap = dict(state)
             for path in sorted(set(now) | unreadable):
                 if str(Path(path).parent) not in fresh or path in snap or written_now(path):
                     continue
                 snap[path] = {"sha": now.get(path), "baseline": True, "mirrored_at": time.time()}
                 counts["baselined"] = counts.get("baselined", 0) + 1
-            snap[META_KEY] = {**meta, "baseline_at": meta.get("baseline_at", time.time()),
+            snap[META_KEY] = {**meta, "baseline_at": meta.get("baseline_at", cutoff),
                               "dirs": sorted(known | fresh)}
-            if dry_run:
-                return counts
-            save_state(snap)
+            if not dry_run:
+                save_state(snap)
             state = snap
         heads = None                               # read from the store on the first write
         for path in sorted((set(now) | set(state)) - {META_KEY}):
@@ -479,12 +499,16 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
                 continue                           # out of scope now: dormant, never forgotten
             prev = state.get(path)
             sha = now.get(path)
+            if sha is None and str(Path(path).parent) not in listed:
+                counts["unavailable"] = counts.get("unavailable", 0) + 1
+                continue                           # its folder cannot be listed: never retract
             if sha is None and (path in unreadable or os.path.lexists(path)):
                 counts["failed"] += 1              # present but unreadable: retry, never retract
                 continue
             if sha is not None and prev and prev.get("baseline") and prev.get("sha") is None:
                 prev["sha"] = sha                  # unreadable at the baseline: baseline it now
-                save_state(state)
+                if not dry_run:
+                    save_state(state)
                 continue
             if sha is not None and prev and not prev.get("deleted") and prev.get("sha") == sha:
                 counts["unchanged"] += 1
@@ -492,8 +516,9 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
             if sha is None and (not prev or prev.get("deleted")):
                 continue
             if sha is None and prev.get("baseline"):
-                state.pop(path, None)              # a baselined file deleted: nothing to retract
-                save_state(state)
+                if not dry_run:
+                    state.pop(path, None)          # a baselined file deleted: nothing to retract
+                    save_state(state)
                 continue
             kind = ("deleted" if sha is None else
                     "changed" if prev and not prev.get("deleted") and not prev.get("baseline")
@@ -538,19 +563,20 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None) -> dict:
         return _finish(state, counts, dry_run)
 
 
-def spawn_sweep(trigger: str = "") -> None:
+def spawn_sweep(trigger: str = "", started: float | None = None) -> None:
     """Start `sweep` detached (no wait, no inherited stdio)."""
     subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "sweep"]
-                     + (["--trigger", trigger] if trigger else []),
+                     + (["--trigger", trigger] if trigger else [])
+                     + (["--started", repr(started)] if started else []),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
 
 
-def start_sweep_if_enabled() -> None:
+def start_sweep_if_enabled(started: float | None = None) -> None:
     """session_start.py's entry: a detached sweep for hand edits. Never raises."""
     try:
         if hook.should_fire() and mirror_enabled():
-            spawn_sweep()
+            spawn_sweep(started=started)
     except Exception:
         pass
 
@@ -588,7 +614,13 @@ def main(argv: list[str]) -> int:
                 print(json.dumps({"disabled": "LEVAIN_AUTOMEMORY_MIRROR or config turns it off"}))
                 return 0
             trig = argv[argv.index("--trigger") + 1] if "--trigger" in argv[:-1] else ""
-            print(json.dumps(sweep(dry_run="--dry-run" in argv, trigger=trig)))
+            started = None
+            if "--started" in argv[:-1]:
+                try:
+                    started = float(argv[argv.index("--started") + 1])
+                except ValueError:
+                    started = None
+            print(json.dumps(sweep(dry_run="--dry-run" in argv, trigger=trig, started=started)))
             return 0
     except Exception:
         pass

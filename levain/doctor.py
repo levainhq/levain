@@ -1105,8 +1105,16 @@ def _check_automemory_mirror(install: Path, hooks: dict) -> list[CheckResult]:
         problem = "its last sweep could not read the anneal store"
     elif isinstance(last.get("failed"), int) and last["failed"] > 0:
         problem = f"its last sweep left {last['failed']} note(s) unmirrored (retried next sweep)"
+    elif isinstance(last.get("unavailable"), int) and last["unavailable"] > 0:
+        problem = (f"{last['unavailable']} mirrored note(s) sit in a memory folder it could not "
+                   f"list (missing or unmounted); none was retracted")
     entries = hooks.get("PostToolUse", []) if isinstance(hooks, dict) else []
-    if not (entries and _hook_command_targets(entries, install, "automemory_mirror.py")):
+    wired = any(
+        _hook_command_targets([{"hooks": [h]}], install, "automemory_mirror.py")
+        for group in entries if isinstance(group, dict)
+        for h in group.get("hooks", []) if isinstance(h, dict)
+    )
+    if not wired:
         detail = ("PostToolUse hook not wired, so notes are mirrored only at session start "
                   "— advisory (run `levain update`)")
     else:
