@@ -33,11 +33,19 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install package with dev extras
-        # hatchling is a build dependency the packaging tests ask for directly.
+      - name: Make the runner's container-daemon socket directory readable
+        # The Linux floor refuses a crown jewel this user cannot stat (a hardlink could reach it;
+        # the refusal tells the operator to make it readable or remove it from the floor). The
+        # runner image ships a rootful podman whose /run/podman is root-only, so every floor test
+        # would refuse on a host the tests do not model. This applies the refusal's own remedy.
+        run: sudo chmod o+rx /run/podman || true
+
+      - name: Install package with dev and openhands extras
+        # hatchling is a build dependency the packaging tests ask for directly; the openhands
+        # extra is imported by the floor tests (tests/test_floor_project_memory.py).
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" hatchling
+          pip install -e ".[dev,openhands]" hatchling
 
       - name: Run pytest
         run: pytest -q
