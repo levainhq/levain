@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.7] — 2026-10-04
+
+`levain wrap` no longer cancels a wrap that is not its own: it chooses its wrap's token itself, gives it to anneal, and cancels by it on every exit. The Claude Code install no longer tells its entity that `levain wrap` recomposes its memory. Levain now requires anneal-memory 0.9.30.
+
+**Upgrade Levain together with anneal-memory.** Levain 0.5.7 needs anneal-memory 0.9.30 (`prepare_wrap(wrap_token=...)`), and the pip floor pulls it. `levain update` refreshes an install's `CLAUDE.md` and memory seed to the corrected wording (an edited copy is kept and the new one staged under `.levain/pending/`).
+
 ### Fixed
 
 - **`levain wrap` now checks the schema the wrap froze, not only the one the store had before the wrap started** (listed as known open in 0.5.6). The partnership check runs again once anneal has started the wrap, on the schema anneal froze for it, and the composing model's instructions are built from that same schema. A store moved off the partnership schema before anneal read it for the wrap is refused (exit 2) and the wrap is cancelled; nothing is saved. This narrows the window, it does not close it: see Known open issues.
