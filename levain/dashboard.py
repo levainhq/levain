@@ -9,7 +9,7 @@ seed/config surface — into a single ``SubstrateView`` that renders from outsid
 (the local sovereign web-app, a CLI, the parked in-host MCP-App).
 
 Slice 1 served State + health + graph + crystals + spores. **Slice 1.5 shows
-EVERYTHING, read-only:** all six neocortex sections, the seed/config surface
+EVERYTHING, read-only:** every neocortex section, the seed/config surface
 (origin / operator / posture / constitution), recent episodes, the wrap-history
 timeline — organized by the ``Identity · Operate · Mind`` IA. Every emitted
 surface carries its **edit-class** (A = operator config / B = lifecycle verb /
@@ -1222,13 +1222,14 @@ def recall_episode_rows(
     return rows, None
 
 
-# The six neocortex sections of the FLOW_SCHEMA, in canonical order. Slice 1
-# showed only the first two; 1.5 shows them all.
-_ALL_SECTIONS = ("State", "Active Threads", "Patterns", "Decisions", "Context", "Understanding")
+# The neocortex sections of anneal's partnership schema (FLOW_SCHEMA), in its order, including
+# the optional Durable Facts (anneal 0.9.28). A section the continuity lacks is skipped.
+_ALL_SECTIONS = ("State", "Active Threads", "Durable Facts", "Patterns", "Decisions", "Context",
+                 "Understanding")
 
 # The sections that ride the MODEL-visible render_summary (the MCP-App content
-# half) — kept to the two headlines so the all-six expansion never bloats model
-# context. The full six always ride structuredContent for the UI.
+# half) — kept to the two headlines so the full expansion never bloats model
+# context. Every section always rides structuredContent for the UI.
 _SUMMARY_SECTIONS = frozenset({"State", "Active Threads"})
 
 
@@ -1503,7 +1504,7 @@ def build_substrate_view(
     except store_faults as exc:
         view.errors["open_spores"] = f"{type(exc).__name__}: {exc}"
 
-    # --- continuity narrative sections (all six neocortex sections) ---------
+    # --- continuity narrative sections (every neocortex section) ------------
     try:
         if paths.continuity_md.exists():
             md = paths.continuity_md.read_text(encoding="utf-8")
@@ -1781,10 +1782,10 @@ def render_summary(view: SubstrateView) -> str:
     if view.config_docs:
         lines.append(f"Seed/config docs: {len(view.config_docs)}")
 
-    # Only the two headline sections ride the MODEL-visible summary — the full six
-    # ride in structuredContent for the UI. Folding all six here would bloat model
+    # Only the two headline sections ride the MODEL-visible summary — every section
+    # rides in structuredContent for the UI. Folding them all here would bloat model
     # context, the exact inversion the content/structuredContent split exists to
-    # prevent (the 1.5 expansion to all-six sections must NOT leak into this digest).
+    # prevent (the 1.5 expansion to every section must NOT leak into this digest).
     for sec in view.sections:
         if sec.heading not in _SUMMARY_SECTIONS:
             continue

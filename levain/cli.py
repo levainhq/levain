@@ -480,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Run the CONSOLIDATE for an ISOLATED entity (created with `levain init "
             "--adapter openhands`): metabolize the raw episodes it captured while you talked to it "
-            "into its lasting 6-section memory, so its identity COMPOUNDS across sessions. The "
+            "into its lasting memory, so its identity COMPOUNDS across sessions. The "
             "entity's firing captures every turn but is forbidden to consolidate on its own — this "
             "command is the invocation that does it. A scheduled seat may also run it unattended "
             "(--unattended), in which case it may metabolize but is REFUSED from crystallizing "

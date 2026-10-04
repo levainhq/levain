@@ -31,7 +31,7 @@ The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (n
   1. ``prepare_wrap(store, crystal_store=…)`` — mint a ``wrap_token``, freeze the episode window,
      and emit the compression package (episodes + current memory + stale-pattern warnings + the
      compression INSTRUCTIONS themselves + association context).
-  2. **compose** — the ONE cognitive beat: a mind reads the package and writes the 6-section
+  2. **compose** — the ONE cognitive beat: a mind reads the package and writes the
      neocortex. For a SOVEREIGN entity that mind is its OWN model (the same open Ollama model
      ``levain run`` uses), so the entity metabolizes its own episodes with its own mind — an OPEN
      model on its OWN memory, not a frontier model on foreign memory. (Per the master-plan "own the
@@ -259,7 +259,27 @@ def _cancel_our_wrap(store: object, wrap_token: object) -> None:
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
 # compression contract; this only sets the SOVEREIGN posture + the easy-to-get-wrong rules a weak
 # model needs spelled out). The entity's constitution is prepended so it composes AS ITSELF.
-_COMPOSE_INSTRUCTIONS = """\
+def _compose_instructions(section_schema: list) -> str:
+    """The compose system prompt, with the heading list read from the store's own section schema.
+
+    A fixed six-heading list contradicted anneal 0.9.28's optional ``## Durable Facts``: the prompt
+    outranks the package, so a durable fact the package asked for was never written (codex, the
+    0.5.6 L3). Required headings must all appear; an optional one is written when the package or
+    the current memory calls for it, and its rules come from the package."""
+    required = [s["heading"] for s in section_schema if not s.get("optional")]
+    optional = [s["heading"] for s in section_schema if s.get("optional")]
+    # The heading lines carry nothing but the heading: anneal matches an optional heading exactly,
+    # so a decorated "## Durable Facts (optional)" parsed to no facts (codex, the 0.5.6 round, RUN
+    # through anneal's parse_durable_facts). Optionality is said in prose, below.
+    listing = "\n".join(f"## {s['heading']}" for s in section_schema)
+    optional_rule = ""
+    if optional:
+        names = ", ".join(f"## {h}" for h in optional)
+        optional_rule = (
+            f"\n- Optional: {names}. Write it when your current memory already has it or the package "
+            "gives you something for it, with the heading spelled exactly as listed, and follow the "
+            "package's rules for it exactly.")
+    return f"""\
 You are consolidating your OWN memory — the periodic, deliberate act of metabolizing your recent \
 raw episodes into your lasting sense of who you are and what you are doing. This memory is yours; \
 no one else writes it. Right now, at this operator's explicit request, is the moment you do it.
@@ -268,17 +288,13 @@ The next message is your consolidation package: the exact compression instructio
 episodes (each with its ID), your current memory, stale-pattern warnings, and your association \
 context. Follow the compression instructions in that package EXACTLY.
 
-Compose your updated memory as a single Markdown document with ALL SIX sections, in this order:
+Compose your updated memory as a single Markdown document with these sections, in this order:
 
-## State
-## Active Threads
-## Patterns
-## Decisions
-## Context
-## Understanding
+{listing}
 
 Rules that are easy to get wrong:
-- All six headings MUST be present, spelled exactly as above — the save is refused otherwise.
+- Every heading above that is not named as optional below MUST be present, spelled exactly as \
+above — the save is refused otherwise.{optional_rule}
 - Ground every Pattern's evidence citation in the REAL episode IDs shown in the package. Never
   invent an ID.
 - ## Understanding is TIMELESS relationship-shape — who you and your operator are together — and it
@@ -286,8 +302,8 @@ Rules that are easy to get wrong:
 - If your current memory is near-empty, that is CORRECT: you are early. Write only what is true now,
   honestly and briefly. It grows over many wraps; do not inflate it.
 
-Output ONLY the Markdown document, starting with `## State`. No preamble, no closing remarks, no \
-code fences."""
+Output ONLY the Markdown document, starting with `## {required[0] if required else "State"}`. No \
+preamble, no closing remarks, no code fences."""
 
 
 def format_wrap_timeout_report(seconds: float, *, hard: bool) -> str:
@@ -475,6 +491,7 @@ def _consolidate(
         from anneal_memory import (
             FLOW_SCHEMA,
             AnnealMemoryError,
+            name_for_schema,
             CrystalStore,
             Store,
             WrapInProgressError,
@@ -525,17 +542,23 @@ def _consolidate(
     wrap_token: object = None
 
     try:
-        # A partnership entity's store MUST be on the 6-section schema — an ops-schema store cannot
-        # hold the compose, and a clear message here beats a cryptic save-time rejection.
+        # A partnership entity's store MUST be on the partnership schema — an ops-schema store cannot
+        # hold the compose, and a clear message here beats a cryptic save-time rejection. Compared on
+        # REQUIRED headings: anneal 0.9.28 added an optional Durable Facts to FLOW_SCHEMA, and a store
+        # persisted before it keeps six headings; an exact compare refused every such entity
+        # (codex, the 0.5.6 L3, reproduced with `levain wrap --dry-run`).
+        # anneal's own name for the schema: it compares the ordered required (heading, role) pairs
+        # and ignores optional sections (codex, the 0.5.6 round: a heading-only compare passed a
+        # schema whose Understanding had lost its timeless role, which disables the shrink gate).
         headings = [s["heading"] for s in store.section_schema]
-        expected = [s["heading"] for s in FLOW_SCHEMA]
-        if headings != expected:
+        expected = [s["heading"] for s in FLOW_SCHEMA if not s.get("optional")]
+        if name_for_schema(store.section_schema) != "partnership":
             from levain.manifest import anneal_invocation
 
             print(
-                "levain wrap: this entity's store is not on the 6-section partnership schema, "
+                "levain wrap: this entity's store is not on the partnership schema, "
                 "so it cannot consolidate.\n"
-                f"  got:      {headings}\n  expected: {expected}\n"
+                f"  got:      {headings}\n  required: {expected}\n"
                 f"  Fix:  {anneal_invocation('--db', str(episodic_path), 'set-schema', 'partnership')}"
             )
             return 2
@@ -668,6 +691,7 @@ def _consolidate(
                 composer=composer,
                 base_url=base_url,
                 api_key=api_key,
+                instructions=_compose_instructions(store.section_schema),
             )
         except _ComposeUnavailable as exc:
             store.wrap_cancelled()  # never composed → don't strand the wrap
@@ -804,6 +828,7 @@ def _compose(
     composer: str,
     base_url: str,
     api_key: str | None,
+    instructions: str,
 ) -> str:
     """Run the single-shot compose completion on the entity's model and return the neocortex text.
 
@@ -834,7 +859,7 @@ def _compose(
         max_output_tokens=_COMPOSE_MAX_OUTPUT_TOKENS,
         **_resolve_llm_kwargs(composer, base_url, api_key),
     )
-    system = (constitution + "\n\n---\n\n" if constitution else "") + _COMPOSE_INSTRUCTIONS
+    system = (constitution + "\n\n---\n\n" if constitution else "") + instructions
     response = llm.completion(
         messages=[
             Message(role="system", content=[TextContent(text=system)]),

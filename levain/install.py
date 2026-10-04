@@ -3985,14 +3985,14 @@ def _init_store(
         for e in errors:
             emit(f"    - {e}")
         emit("    The memory is preserved, but the schema may still be the ops")
-        emit("    default — a partnership entity needs the 6-section schema.")
+        emit("    default — a partnership entity needs the partnership schema.")
         emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
         emit(f"    Then: {anneal_invocation('--db', str(store), 'set-schema', 'partnership')}")
         return False
 
     emit(f"Initializing anneal-memory store at {store}...")
 
-    # Persist the 6-section partnership schema at creation (anneal AM-INITSCHEMA).
+    # Persist the partnership schema at creation (anneal AM-INITSCHEMA).
     # This is the only point the felt-layer proportion-gate + schema-aware budget
     # get switched on — a store left on the default silently runs the 4-section
     # ops schema. We fail loud (below) rather than fall back to a default init,
@@ -4007,7 +4007,7 @@ def _init_store(
         emit(f"    - {e}")
     emit("    Most likely cause: anneal-memory is not installed in this Python,")
     emit("    or is older than the release that supports `init --schema` /")
-    emit("    `set-schema` (the 6-section partnership schema).")
+    emit("    `set-schema` (the partnership schema).")
     emit(f"    Fix: {pip_invocation()} install -U anneal-memory")
     emit(f"    Then: {anneal_invocation('--db', str(store), 'init', '--schema', 'partnership')}")
     return False
