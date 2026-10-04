@@ -104,7 +104,7 @@ ships the correct registration; do not rename the server.
 
 The store is pinned to **`.levain/memory.db` inside the install** — see
 *Store scoping* below. Its continuity, `.levain/memory.continuity.md`, is also
-imported by `CLAUDE.md`, so once the first `levain wrap` has written it, it is in context
+imported by `CLAUDE.md`, so once the entity's first wrap has written it, it is in context
 from the first turn of every session.
 
 ## Prerequisites
@@ -142,8 +142,8 @@ from the first turn of every session.
 
 `levain init` (build step 4) automates steps 2–6, resolves the placeholder
 tokens, fills `world.md`/`origin.md` from an interview, and initialises the
-store. Either way the entity starts with no continuity: the first `levain wrap`
-writes `.levain/memory.continuity.md`, and until then the `CLAUDE.md` import of
+store. Either way the entity starts with no continuity: its first wrap
+(`prepare_wrap`, then `save_continuity`, through the MCP server) writes `.levain/memory.continuity.md`, and until then the `CLAUDE.md` import of
 it is skipped (`seed/memory.md`: "early on it will be near-empty").
 
 ## First-run approvals

@@ -13,7 +13,8 @@ Edit the seed files themselves, not these import lines.
 {{SEED_IMPORTS}}
 
 Your living memory: what you and your operator have done, decided and learned,
-recomposed by every `levain wrap`. It loads at the start of every session.
+recomposed each time you wrap (`prepare_wrap`, then `save_continuity`; the memory seed has the sequence).
+It loads at the start of every session.
 
 @.levain/memory.continuity.md
 
