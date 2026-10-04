@@ -8,11 +8,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Changed
 
-- **Levain now requires anneal-memory 0.9.31 or later** (`anneal-memory>=0.9.31,<0.10`), and 0.9.31 is the version it is tested against. 0.9.31 was already what a fresh install resolved to, so `levain doctor` and `levain update` reported it as "ahead of this release's known-good, untested together"; they no longer do. What moved the floor is that the known-good version and the floor must be the same number, and that the refusal text of `levain wrap` sends you to `anneal-memory wrap-status`, which reads one transaction from 0.9.31 (0.9.30's could show a wrap that had been replaced with the older wrap's bound token). No migration entry, schema or API changed in anneal 0.9.30 or 0.9.31, so the seed needed no change.
+- **Levain now requires anneal-memory 0.9.31 or later** (`anneal-memory>=0.9.31,<0.10`), and 0.9.31 is the version it is tested against. 0.9.31 was already what a fresh install resolved to, so `levain doctor` and `levain update` reported it as "ahead of this release's known-good, untested together"; they no longer do. Levain keeps its known-good anneal version and its floor as one number, so they move together; the one 0.9.31 behaviour Levain's own text leans on is `anneal-memory wrap-status`, which `levain wrap`'s refusal sends you to and which reads one transaction from 0.9.31 (0.9.30's could show a wrap that had been replaced with the older wrap's bound token; it is an advisory display). anneal 0.9.30 and 0.9.31 added no migration entry and changed no schema, and their API additions are additive and unused by the seed, so the seed needed no change.
 
 ### Added
 
-- A test that fails when the pyproject floor and the known-good anneal version differ, or when the anneal under test has a migration entry newer than the version the seed is reconciled to (the next anneal that adds one).
+- A test that fails when the pyproject floor and the known-good anneal version differ, when the anneal installed for the test is older than the known-good one, or when that anneal has a migration entry newer than the version the seed is reconciled to (the next anneal that adds one), so a release is not cut with an entry nobody has reviewed against the seed.
 
 ## [0.5.8] — 2026-10-04
 

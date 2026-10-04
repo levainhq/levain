@@ -554,20 +554,31 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
 
 
 def test_the_anneal_floor_is_known_good_and_no_manifest_entry_is_above_the_template_cap():
-    """0.5.9: two release-gate invariants that failed silently the other way. (1) The pyproject
-    floor equals KNOWN_GOOD_ANNEAL (`doctor` reports drift otherwise), read from pyproject itself
-    so a stale install's metadata cannot satisfy it. (2) No migration-manifest entry of the anneal
-    under test is newer than TEMPLATES_RECONCILED_ANNEAL: when anneal adds an entry, the seed has
-    to be reconciled to it and the cap moved, or a fresh install would ack past guidance it does
-    not carry."""
+    """0.5.9: release-gate invariants that failed silently. (1) The pyproject floor, read from the
+    `anneal-memory` requirement in pyproject itself (so a stale install's metadata cannot satisfy
+    it), is the same version as KNOWN_GOOD_ANNEAL (`doctor` reports drift otherwise). (2) The
+    anneal installed for this test is at least the known-good one: otherwise (3) would read an old
+    manifest and pass vacuously. (3) No migration-manifest entry of that anneal is newer than
+    TEMPLATES_RECONCILED_ANNEAL. A fresh install handles such an entry safely (the ack stops at the
+    cap, so it stays pending); this gate is the release policy that an entry nobody has reviewed
+    against the seed does not ship."""
+    import importlib.metadata
     import re
+    import tomllib
     from pathlib import Path
 
     from anneal_memory.migration import MIGRATION_MANIFEST
 
-    text = (Path(manifest.__file__).resolve().parents[1] / "pyproject.toml").read_text()
-    floor = re.search(r'"anneal-memory>=([0-9.]+)', text).group(1)
-    assert floor == manifest.KNOWN_GOOD_ANNEAL, (floor, manifest.KNOWN_GOOD_ANNEAL)
+    project = tomllib.loads((Path(manifest.__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    requirement = next(d for d in project["project"]["dependencies"] if d.startswith("anneal-memory"))
+    floor = re.search(r">=\s*([0-9][0-9.]*)", requirement).group(1)
+    assert manifest.version_tuple(floor) == manifest.version_tuple(manifest.KNOWN_GOOD_ANNEAL), (
+        floor, manifest.KNOWN_GOOD_ANNEAL)
+    installed = importlib.metadata.version("anneal-memory")
+    assert manifest.version_tuple(installed) >= manifest.version_tuple(manifest.KNOWN_GOOD_ANNEAL), (
+        f"anneal-memory {installed} is installed here, older than the known-good "
+        f"{manifest.KNOWN_GOOD_ANNEAL}: its migration manifest says nothing about the one this "
+        "release ships against")
     newest = max(manifest.version_tuple(e["version"]) for e in MIGRATION_MANIFEST)
     assert newest <= manifest.version_tuple(manifest.TEMPLATES_RECONCILED_ANNEAL), (
         "anneal has a migration-manifest entry newer than the seed's reconcile cap")
