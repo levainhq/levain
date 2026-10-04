@@ -474,33 +474,40 @@ def test_a_prior_wrap_that_goes_idle_before_the_discard_is_already_discarded(tmp
     assert (ent / ".levain" / "memory.continuity.md").exists()
 
 
-def test_reset_with_unreadable_wrap_metadata_changes_nothing_and_names_the_entitys_store(tmp_path, capsys, monkeypatch):
-    """r2/r3 (0.5.7): forcing the cancel when no token can be read would also clear any wrap that
-    replaced the unreadable one, so `--reset` there cancels only a PARTIAL state and otherwise
-    refuses. The refusal must aim the operator at THIS entity's store: a bare `anneal-memory
-    wrap-status` reads ~/.anneal-memory (codex r3 HIGH)."""
+@pytest.mark.parametrize("bound", [True, False])
+def test_reset_with_an_unreadable_wrap_snapshot(tmp_path, capsys, monkeypatch, bound):
+    """0.5.8: a wrap Levain opened is token-bound, so when its snapshot cannot be read `--reset` still
+    names it by the bound token and clears it (a compare-and-swap, so a replacement is never
+    cleared). A wrap with no token to name (not bound) is still refused, and the refusal names the
+    entity's own store: a bare `anneal-memory wrap-status` reads ~/.anneal-memory (0.5.7, codex r3)."""
     import sys
     from anneal_memory import StoreError
 
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent)
-    _strand_a_wrap(db, bound=True)
+    _strand_a_wrap(db, bound=bound)
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
     real = Store.load_wrap_snapshot
 
     def unreadable_for_levain(self):
         if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
-            raise StoreError("simulated unreadable wrap metadata")
+            raise StoreError("simulated unreadable wrap metadata", operation="load_wrap_snapshot")
         return real(self)
 
     monkeypatch.setattr(Store, "load_wrap_snapshot", unreadable_for_levain)
-    assert wrap_entity(ent, reset=True) == 2
+    rc = wrap_entity(ent, reset=True)
     out = capsys.readouterr().out
+    monkeypatch.undo()
+    if bound:
+        assert rc == 0, out
+        with Store(str(db), section_schema=None) as store:
+            assert store.get_wrap_started_at() is None
+        return
     from levain.manifest import anneal_invocation
+    assert rc == 2
     assert anneal_invocation("--db", str(db), "wrap-status") in out
     assert anneal_invocation("--db", str(db), "wrap-cancel", "--partial") in out
     assert "--wrap-token" in out and "not 32 hex" in out and "~/.anneal-memory" in out
-    monkeypatch.undo()
     with Store(str(db), section_schema=None) as store:
         assert store.load_wrap_snapshot()["token"] == "orphan-token", "the wrap was cleared"
 
@@ -833,3 +840,69 @@ def test_a_dry_run_whose_cancel_fails_is_not_a_success(tmp_path, monkeypatch, ca
     monkeypatch.undo()
     with Store(str(db), section_schema=None) as store:
         assert store.get_wrap_started_at() is not None
+
+
+def test_a_timeout_whose_cancel_failed_is_not_reported_as_clean(tmp_path, capsys, monkeypatch):
+    """0.5.8: the wall-clock stop report said "CANCELLED cleanly" even when the cancel itself failed
+    (the store locked by another process), leaving the wrap open. The report now says the cancel
+    could not be confirmed; the control (a cancel that works) keeps the clean wording."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+
+    def stall(*a, **k):
+        raise TurnTimeout(30.0)
+
+    monkeypatch.setattr(wrapmod, "_compose", stall)
+    real_cancel = Store.wrap_cancelled
+
+    def locked(self, **kw):
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(Store, "wrap_cancelled", locked)
+    assert wrap_entity(ent, max_seconds=30) == EXIT_TIMEOUT
+    err = capsys.readouterr().err
+    assert "could NOT be confirmed cancelled" in err and "wrap CANCELLED cleanly" not in err
+    monkeypatch.setattr(Store, "wrap_cancelled", real_cancel)
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is not None, "fixture: the wrap really was left open"
+
+
+def test_a_wrap_cleared_by_another_program_during_the_compose_is_not_reported_as_committed(tmp_path, capsys, monkeypatch):
+    """0.5.8: with nothing in progress after a failed save, Levain said the memory COMMITTED and told
+    the operator not to re-run, even when a peer had cleared the wrap and nothing was saved. The last
+    completed wrap id decides: unchanged means nothing was recorded."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+
+    def compose_while_a_peer_clears_the_wrap(*a, **k):
+        with Store(str(db), section_schema=None) as peer:
+            peer.wrap_cancelled(force=True)
+        return _VALID_NEOCORTEX
+
+    monkeypatch.setattr(wrapmod, "_compose", compose_while_a_peer_clears_the_wrap)
+    assert wrap_entity(ent) == 1
+    out = capsys.readouterr().out
+    assert "COMMITTED" not in out and "Do NOT re-run" not in out
+    assert "cleared by another program" in out and "Re-run." in out
+    with Store(str(db), section_schema=None) as store:
+        assert len(store.episodes_since_wrap()) == 2, "the episodes are still unconsolidated"
+
+
+def test_a_failure_showing_the_result_after_the_save_is_not_a_store_read_failure(tmp_path, capsys, monkeypatch):
+    """0.5.8: an error raised while printing the result, after the memory was saved, fell into the
+    store-error handler: 'could not read the store', exit 2, and a re-run finds nothing to do."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    def broken_report(*a, **k):
+        from anneal_memory import StoreError
+        raise StoreError("simulated: could not read the result", operation="record")
+
+    monkeypatch.setattr(wrapmod, "_report", broken_report)
+    assert wrap_entity(ent) == 0
+    out = capsys.readouterr().out
+    assert "SAVED" in out and "could not read the store" not in out
+    assert (ent / ".levain" / "memory.continuity.md").exists()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None and not store.episodes_since_wrap()

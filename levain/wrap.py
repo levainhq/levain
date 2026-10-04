@@ -177,6 +177,16 @@ def _wrap_in_progress(store: object) -> bool:
         return True
 
 
+def _last_wrap_id(store: object) -> int | None:
+    """The id of the last COMPLETED wrap, or ``None`` when it cannot be read. Read before the save so
+    that, after a failed save, "did this wrap commit" is a comparison and not an inference from the
+    in-progress flag (a peer that clears our wrap also leaves that flag clear)."""
+    try:
+        return int(store.last_wrap_id())  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — unreadable → unknown, never a guess
+        return None
+
+
 def _cancel_if_ours(store: object, wrap_token: object) -> bool:
     """Cancel the in-progress wrap ONLY if it is still OURS (its snapshot token equals ``wrap_token``).
 
@@ -263,7 +273,7 @@ def _orphan_is_stale(started: object, bound: float | None) -> bool:
     return age >= horizon
 
 
-def _cancel_our_wrap(store: object, wrap_token: str) -> None:
+def _cancel_our_wrap(store: object, wrap_token: str) -> bool:
     """Cancel our wrap on the OUT-OF-BAND exit path (timeout / interrupt / refusal), by TOKEN.
 
     The sibling of :func:`_cancel_if_ours` for the ``except BaseException`` clause. Levain mints the
@@ -276,11 +286,14 @@ def _cancel_our_wrap(store: object, wrap_token: str) -> None:
     it by accident. Before ``prepare_wrap`` has opened anything the compare finds the store idle and
     does nothing.
 
-    Never raises: cleanup must not replace the exception it is cleaning up after."""
+    Never raises: cleanup must not replace the exception it is cleaning up after. Returns whether
+    no wrap of ours can still be open (:func:`_cancel_if_ours`'s answer), False when the cancel
+    itself failed, so the timeout report can say so instead of claiming a clean cancel."""
     try:
-        _cancel_if_ours(store, wrap_token)
+        return _cancel_if_ours(store, wrap_token)
     except Exception as exc:  # noqa: BLE001 — never mask the out-of-band exit being propagated
         _log.debug("out-of-band wrap cancel skipped (%s): %s", type(exc).__name__, exc)
+        return False
 
 
 def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
@@ -291,14 +304,21 @@ def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
     gives that: if the wrap is replaced in between, ``started_at`` belongs to the newer wrap while
     the token names the old one, so the cancel by that token fails its compare-and-swap instead of
     clearing the newcomer (L2: with the token read after the age check, a peer's fresh wrap landing
-    in the gap was the one cancelled). The token is ``None`` when the store's wrap metadata is
-    partial (no usable token)."""
+    in the gap was the one cancelled). When the snapshot cannot be read, the token of a wrap Levain
+    opened is still readable as the store's bound token (every wrap Levain opens is token-bound), so
+    a wrap whose episode list is unreadable is still cancelled by the compare-and-swap. The token
+    is ``None`` only for a wrap that is neither readable nor bound (partial metadata, or a wrap
+    another program opened without a token)."""
     try:
         snap = store.load_wrap_snapshot()  # type: ignore[attr-defined]
         token = snap["token"] if snap else None
-    except Exception as exc:  # noqa: BLE001 — partial wrap metadata raises StoreError
+    except Exception as exc:  # noqa: BLE001 — unreadable or partial wrap metadata raises StoreError
         _log.debug("prior wrap snapshot unreadable (%s): %s", type(exc).__name__, exc)
-        token = None
+        try:
+            token = store.wrap_bound_token()  # type: ignore[attr-defined]
+        except Exception as exc2:  # noqa: BLE001
+            _log.debug("bound wrap token unreadable (%s): %s", type(exc2).__name__, exc2)
+            token = None
     return token, store.get_wrap_started_at()  # type: ignore[attr-defined]
 
 
@@ -379,7 +399,7 @@ Output ONLY the Markdown document, starting with `## {required[0] if required el
 preamble, no closing remarks, no code fences."""
 
 
-def format_wrap_timeout_report(seconds: float, *, hard: bool) -> str:
+def format_wrap_timeout_report(seconds: float, *, hard: bool, cancelled: bool = True) -> str:
     """The operator-facing explanation of a consolidate that hit its wall-clock bound.
 
     A SEPARATE wording from :func:`levain.firing.deadline.format_timeout_report`, because that one
@@ -406,6 +426,19 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool) -> str:
             f"     A hard exit cannot hand back the turn's exit code, so the process reports the "
             f"TIMEOUT code even though\n"
             f"     the turn succeeded — read this line, not the code, for what actually stalled."
+        )
+    if not cancelled:
+        return (
+            f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated, but "
+            f"the wrap could NOT be confirmed cancelled.\n"
+            f"     Your memory is UNCHANGED and your episodes are safe (nothing partial is ever "
+            f"written).\n"
+            f"     ⚠ THE WRAP MAY STILL BE OPEN (the store was likely busy or unreadable when the "
+            f"cancel ran): the next\n"
+            f"     consolidate may refuse until it is discarded. An UNATTENDED seat clears it "
+            f"automatically on a later run\n"
+            f"     once it is older than the bound; for a manual wrap, re-run, and use --reset if "
+            f"it still refuses."
         )
     return (
         f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated and the "
@@ -493,12 +526,15 @@ def wrap_entity(
                 unattended=unattended,
                 max_seconds=max_seconds,
             )
-    except TurnTimeout:
+    except TurnTimeout as exc:
         # `TurnTimeout` is a BaseException, so `_consolidate`'s `except Exception` clauses never see
-        # it; its own BaseException handler has already cancelled our in-progress wrap on the way
-        # out, so by here the store is clean and the next run starts fresh.
+        # it; its own BaseException handler has already tried to cancel our in-progress wrap on the
+        # way out and recorded whether that cancel held (`levain_wrap_cancelled`). A stop that never
+        # reached that handler left no record, so it is reported as unconfirmed, not as clean.
         print(
-            format_wrap_timeout_report(deadline.seconds or 0.0, hard=False),
+            format_wrap_timeout_report(
+                deadline.seconds or 0.0, hard=False,
+                cancelled=getattr(exc, "levain_wrap_cancelled", False)),
             file=sys.stderr, flush=True,
         )
         return EXIT_TIMEOUT
@@ -852,6 +888,7 @@ def _consolidate(
             if affect_tag and affect_tag.strip()
             else None
         )
+        last_wrap_before = _last_wrap_id(store)
         try:
             saved = validated_save_continuity(
                 store,
@@ -886,6 +923,25 @@ def _consolidate(
                 if not cancelled:
                     print(_CANCEL_FAILED)
                 return 1
+            # Nothing is in progress any more. That is true after a COMMIT and also after another
+            # program cleared our wrap while we composed, so the last completed wrap id decides.
+            last_wrap_after = _last_wrap_id(store)
+            if last_wrap_before is None or last_wrap_after is None:
+                print(
+                    f"levain wrap: the save failed ({type(exc).__name__}: {exc}) and Levain could not "
+                    "tell whether the memory was recorded.\n"
+                    "  Check with `levain wrap --dry-run`: it says there is nothing to consolidate if "
+                    "it was, and otherwise shows what is still to do."
+                )
+                return 1
+            if last_wrap_after == last_wrap_before:
+                print(
+                    f"levain wrap: the wrap was cleared by another program while the memory was being "
+                    f"composed, so it was NOT saved ({type(exc).__name__}: {exc}).\n"
+                    "  The entity's identity is unchanged and its episodes are still unconsolidated. "
+                    "Re-run."
+                )
+                return 1
             # The DB COMMITTED but the file externalization (Phase-3 rename) failed — the wrap IS
             # recorded (recoverable from the ``.tmp`` the exception names) and the episodes are NOT
             # re-wrappable. Do NOT cancel (nothing is in progress) and do NOT say "re-run".
@@ -897,7 +953,14 @@ def _consolidate(
             )
             return 1
 
-        _report(saved, entity_dir)
+        try:
+            _report(saved, entity_dir)
+        except Exception as exc:  # noqa: BLE001 — the memory is already saved; showing it is not the consolidate
+            print(
+                f"levain wrap: consolidated: the memory was SAVED, but showing the result failed "
+                f"({type(exc).__name__}: {exc}).\n"
+                "  Nothing to re-run: a second wrap would find nothing to consolidate."
+            )
         return 0
     except WrapInProgressError as exc:
         # A concurrent `levain wrap` on the SAME entity won the prepare race after our
@@ -920,8 +983,8 @@ def _consolidate(
         # is guarded here as well.
         try:
             cancelled = _cancel_if_ours(store, wrap_token) if prepare_entered else True
-        except BaseException:
-            _cancel_our_wrap(store, wrap_token)
+        except BaseException as stop:
+            stop.levain_wrap_cancelled = _cancel_our_wrap(store, wrap_token)  # type: ignore[attr-defined]
             raise
         print(
             f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
@@ -930,7 +993,7 @@ def _consolidate(
         if not cancelled:
             print(_CANCEL_FAILED)
         return 2
-    except BaseException:
+    except BaseException as exc:
         # THE OUT-OF-BAND EXITS — and this clause exists because the two that matter are deliberately
         # NOT `Exception` subclasses, so every handler above is blind to them by design:
         # `TurnTimeout` (the wall-clock bound), `CrystallizationRefused`, and `KeyboardInterrupt`.
@@ -946,7 +1009,7 @@ def _consolidate(
         # keeps other Levain processes out and says nothing about them). Nothing partial can have
         # been written — the save fails closed — so the frozen episodes simply return to the next
         # wrap.
-        _cancel_our_wrap(store, wrap_token)
+        exc.levain_wrap_cancelled = _cancel_our_wrap(store, wrap_token)  # type: ignore[attr-defined]
         raise
     finally:
         store.close()

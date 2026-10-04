@@ -295,12 +295,13 @@ def test_wrap_post_commit_externalization_failure_is_not_reported_as_unsaved(
     _with_store(ent, episodes=2)
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
 
+    real_save = cont.validated_save_continuity
+
     def _post_commit_fail(store, text, **kw):
-        # Simulate anneal's Phase-2 commit (which clears the in-progress metadata) then a Phase-3
-        # rename failure raising post-commit.
-        # observable proxy for "wrap_completed cleared the in-progress flag" (forced: the wrap is
-        # token-bound, and anneal refuses a tokenless cancel of a bound wrap)
-        store.wrap_cancelled(force=True)
+        # A REAL commit (anneal's Phase 2: the wrap completes, the last wrap id moves, the
+        # in-progress metadata clears), then a Phase-3 rename failure raised post-commit. A bare
+        # clearing of the flag is not a commit: levain tells the two apart by the last wrap id.
+        real_save(store, text, **kw)
         raise StoreError(
             "Failed to rename continuity tmp — the DB has committed the wrap but externalization "
             "is incomplete; preserved at /x/memory.continuity.md.tmp."

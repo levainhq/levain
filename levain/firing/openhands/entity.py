@@ -31,7 +31,9 @@ BEFORE any UX rides on it").
 """
 from __future__ import annotations
 
+import errno
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -190,7 +192,21 @@ def _entity_continuity_block(entity_dir: Path) -> str | None:
         return None
     try:
         if not neocortex.is_file():
-            return None  # never wrapped yet — expected + silent, boot on the seed alone
+            # Never wrapped yet — expected and silent, boot on the seed alone. A symlink LOOP is not
+            # that: `is_file()` answers False for it too, and since Python 3.13 the guard's
+            # `.resolve()` no longer raises on a loop, so the warning above would never fire there.
+            # Warn on every version, with the same seed-only boot.
+            try:
+                os.stat(neocortex)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    _log.warning(
+                        "entity %s: its %s could not be resolved (symlink loop or bad path) — "
+                        "booting seed-only.",
+                        entity_dir,
+                        _CONTINUITY_FILENAME,
+                    )
+            return None
         raw = neocortex.read_text(encoding="utf-8-sig").strip()
     except (OSError, ValueError):  # ValueError ⊃ UnicodeDecodeError (a bad byte must not crash build)
         return None

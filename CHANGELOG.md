@@ -6,6 +6,24 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **`levain wrap --reset` could not clear a wrap Levain itself had opened when anneal could not read that wrap's episode list** (new in 0.5.7). The wrap is token-bound, so when the snapshot is unreadable `--reset` and the unattended discard now name the bound token and clear the wrap by that compare-and-swap, which still leaves any wrap that replaced it alone. A wrap with no token to name is refused as before, with the commands for that entity's store.
+- **The wall-clock stop said the wrap was "CANCELLED cleanly" even when the cancel itself had failed** (since 0.4.x). When the store is locked by another process at that moment the wrap stays open; the report now says the cancel could not be confirmed and what clears it.
+- **After a failed save with nothing left in progress, `levain wrap` said the memory COMMITTED and not to re-run, even when another program had cleared the wrap and nothing was saved** (since 0.4.x). It now compares the last completed wrap id from before the save: unchanged means nothing was recorded and the message says so and to re-run; a store it cannot read gets a message that checks with `levain wrap --dry-run` instead of a guess.
+- **An error raised while showing the result after the memory was saved was reported as "could not read the store" and exit 2** (since 0.4.x). It now says the memory was saved, that there is nothing to re-run, and exits 0.
+- **On Python 3.13 a symlink loop at `.levain/memory.continuity.md` booted the entity seed-only without the warning Python 3.12 gives.** `Path.resolve()` stopped raising on a loop in 3.13, so the guard's warning never fired. The warning now fires on every version; the boot is the same seed-only boot.
+
+### Changed
+
+- CI runs the whole suite on Python 3.13 (the symlink-loop test was skipped there in 0.5.7).
+
+### Known open issues
+
+- **A second stop that lands while `levain wrap` is cancelling can leave the wrap open** (since 0.4.x). A Ctrl-C followed by the wall-clock stop while the cancel is running strands the wrap until the next run's discard or `--reset`.
+- **`--reset` and the unattended discard cannot tell a dead wrap from another program's live one** beyond Levain's lock and the wrap's age (since 0.4.x). They clear the wrap they read by its token; whether that wrap is dead is the operator's judgement for `--reset`.
+- **On a Linux host with a rootful container daemon whose directory only root can read (for example `/run/podman`), the floor refuses to give the entity bash.** That is the hardlink check refusing a crown jewel it cannot stat, by design; making the directory readable to the user is the stated remedy. Whether such a host should refuse by default is undecided.
+
 ## [0.5.7] — 2026-10-04
 
 `levain wrap` no longer cancels a wrap that is not its own: it chooses its wrap's token itself, gives it to anneal, and cancels by it on every exit. The Claude Code install no longer tells its entity that `levain wrap` recomposes its memory. Levain now requires anneal-memory 0.9.30.
