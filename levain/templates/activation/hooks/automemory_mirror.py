@@ -39,7 +39,7 @@ NO BACKFILL: the first sweep that sees a memory folder records every existing fi
 without writing an episode (a new install, an install upgraded by `levain update`, or an
 autoMemoryDirectory set later). A folder that drops out of scope keeps its entries, so it is not
 backfilled when it returns, and only a folder that could be listed becomes known. A note modified
-at or after the session's start (or, for a folder seen later, after the mirror was enabled) is the
+at or after the session's start (passed by session_start.py; else the sweep's own start) is the
 exception: it is being written now. A folder that is missing or cannot be listed is skipped and
 reported; nothing in it is ever retracted.
 
@@ -114,6 +114,20 @@ def state_path() -> Path:
 
 def lost_marker() -> Path:
     return _levain_dir() / "automemory_mirror.lost"
+
+
+def pending_path() -> Path:
+    """Holds the earliest time a first sweep could not read the store. Until a first sweep
+    succeeds, nothing modified after it is baselined, so a note written then is mirrored late,
+    never lost. `levain doctor` reports the file while it exists."""
+    return _levain_dir() / "automemory_mirror.pending"
+
+
+def _read_pending() -> float | None:
+    try:
+        return float(pending_path().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
 
 
 def mirror_enabled() -> bool:
@@ -448,7 +462,15 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
         if first:
             has = store_has_mirror_episodes()
             if has is None:
-                counts["store_unreadable"] = 1      # cannot tell lost from first: do nothing
+                counts["store_unreadable"] = 1      # cannot tell lost from first: wait
+                if not dry_run:
+                    since = [t for t in (started, _STARTED, _read_pending()) if t]
+                    if trigger:
+                        try:
+                            since.append(os.path.getmtime(trigger))
+                        except OSError:
+                            pass
+                    pending_path().write_text(repr(min(since)), encoding="utf-8")
                 return counts
             if has:
                 counts["state_lost"] = 1
@@ -464,10 +486,12 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
         trigger = os.path.realpath(os.path.expanduser(trigger)) if trigger else ""
 
         meta = state.get(META_KEY) if isinstance(state.get(META_KEY), dict) else {}
-        # A note modified at or after the cutoff is being written now, never baselined: on the
-        # first sweep the cutoff is the session's start; later, when the mirror was enabled.
-        cutoff = (min(started, _STARTED) if started else _STARTED) if first \
-            else float(meta.get("baseline_at") or _STARTED)
+        # A note modified at or after the cutoff (the session's start when session_start.py
+        # passed it, else this sweep's own) is being written now and is never baselined.
+        cutoff = min(started, _STARTED) if started else _STARTED
+        pending = _read_pending() if first else None
+        if pending is not None:
+            cutoff = min(cutoff, pending)          # a first sweep that waited on the store
 
         def written_now(path: str) -> bool:
             if trigger and os.path.realpath(path) == trigger:
@@ -488,10 +512,15 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
                     continue
                 snap[path] = {"sha": now.get(path), "baseline": True, "mirrored_at": time.time()}
                 counts["baselined"] = counts.get("baselined", 0) + 1
-            snap[META_KEY] = {**meta, "baseline_at": meta.get("baseline_at", cutoff),
+            snap[META_KEY] = {**meta, "baseline_at": meta.get("baseline_at", time.time()),
                               "dirs": sorted(known | fresh)}
             if not dry_run:
                 save_state(snap)
+                if first:
+                    try:
+                        pending_path().unlink()
+                    except OSError:
+                        pass
             state = snap
         heads = None                               # read from the store on the first write
         for path in sorted((set(now) | set(state)) - {META_KEY}):
@@ -500,7 +529,8 @@ def sweep(dry_run: bool = False, trigger: str = "", writer=None,
             prev = state.get(path)
             sha = now.get(path)
             if sha is None and str(Path(path).parent) not in listed:
-                counts["unavailable"] = counts.get("unavailable", 0) + 1
+                if prev and prev.get("episode") and not prev.get("deleted"):
+                    counts["unavailable"] = counts.get("unavailable", 0) + 1
                 continue                           # its folder cannot be listed: never retract
             if sha is None and (path in unreadable or os.path.lexists(path)):
                 counts["failed"] += 1              # present but unreadable: retry, never retract
