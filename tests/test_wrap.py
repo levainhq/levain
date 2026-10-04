@@ -146,7 +146,7 @@ def test_wrap_refuses_the_ops_schema(tmp_path, capsys):
     ent = _openhands_entity(tmp_path)
     _with_store(ent, schema=DEFAULT_SCHEMA, episodes=1)
     assert wrap_entity(ent) == 2
-    assert "6-section partnership schema" in capsys.readouterr().out
+    assert "not on the partnership schema" in capsys.readouterr().out
 
 
 def test_wrap_empty_store_is_a_clean_noop(tmp_path, capsys):
@@ -354,10 +354,56 @@ def test_compose_routes_via_v1_native_with_reasoning_token_headroom(monkeypatch)
 
     monkeypatch.setattr(sdk, "LLM", _FakeLLM)
     out = wrapmod._compose(
-        "pkg", None, composer="glm-5.2:cloud", base_url="http://localhost:11434", api_key=None
+        "pkg", None, composer="glm-5.2:cloud", base_url="http://localhost:11434", api_key=None,
+        instructions=wrapmod._compose_instructions(FLOW_SCHEMA),
     )
     assert captured["model"] == "openai/glm-5.2:cloud"          # /v1 OpenAI-compat route, not ollama/
     assert str(captured["base_url"]).rstrip("/").endswith("/v1")
     assert captured["native_tool_calling"] is True
     assert captured["max_output_tokens"] >= 8000                # reasoning-model headroom
     assert "## State" in out
+
+
+# ---------- schema compatibility across anneal's optional sections (0.5.6) ----------
+
+def test_a_store_persisted_without_the_optional_sections_still_wraps(tmp_path, capsys):
+    """codex, the 0.5.6 L3 (reproduced with `levain wrap --dry-run`): anneal 0.9.27 added the
+    optional Durable Facts to FLOW_SCHEMA, and an exact heading compare refused every store
+    persisted before it."""
+    ent = _openhands_entity(tmp_path)
+    required_only = [s for s in FLOW_SCHEMA if not s.get("optional")]
+    _with_store(ent, schema=required_only, episodes=1)
+    assert wrap_entity(ent, dry_run=True) == 0, capsys.readouterr().out
+
+
+def test_a_store_on_the_full_current_schema_wraps(tmp_path, capsys):
+    ent = _openhands_entity(tmp_path)
+    _with_store(ent, schema=FLOW_SCHEMA, episodes=1)
+    assert wrap_entity(ent, dry_run=True) == 0, capsys.readouterr().out
+
+
+def test_a_store_missing_a_required_section_is_refused(tmp_path, capsys):
+    ent = _openhands_entity(tmp_path)
+    without_understanding = [s for s in FLOW_SCHEMA if s["heading"] != "Understanding"]
+    _with_store(ent, schema=without_understanding, episodes=1)
+    assert wrap_entity(ent, dry_run=True) == 2
+    assert "not on the partnership schema" in capsys.readouterr().out
+
+
+def test_the_compose_prompt_lists_the_stores_own_sections():
+    """codex, the 0.5.6 L3: a fixed six-heading prompt outranks the package, so a durable fact
+    was never written. The list comes from the store's schema; optional sections say so. An
+    explicit schema, so the test does not depend on which anneal is installed."""
+    from levain.wrap import _compose_instructions
+
+    six = [{"heading": h, "role": "x"} for h in
+           ("State", "Active Threads", "Patterns", "Decisions", "Context", "Understanding")]
+    seven = six[:2] + [{"heading": "Durable Facts", "role": "durable", "optional": True}] + six[2:]
+    full = _compose_instructions(seven)
+    for s in seven:
+        assert f"## {s['heading']}" in full
+    assert "## Durable Facts   (optional)" in full and "optional. Write it" in full
+    assert "ALL SIX" not in full
+    old = _compose_instructions(six)
+    assert "## Durable Facts" not in old and "optional. Write it" not in old
+    assert full.index("## Active Threads") < full.index("## Durable Facts") < full.index("## Patterns")

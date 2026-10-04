@@ -6,6 +6,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+**Upgrade Levain together with anneal-memory.** Levain 0.5.5 refuses `levain wrap` for every existing entity once anneal-memory 0.9.27 is installed ("this entity's store is not on the 6-section partnership schema", exit 2). Install Levain 0.5.6 with anneal-memory 0.9.27, not anneal-memory alone. Do not run the `set-schema` command that message prints just to get past it: on a partnership store it only opts the store into the new optional section.
+
+### Fixed
+
+- **`levain wrap` accepts a store persisted before an optional section existed.** It compared the store's sections to anneal's current list exactly, so anneal 0.9.27's optional `## Durable Facts` made every older partnership store fail the check. It now compares the required sections only; a store missing a required one is still refused.
+- **`levain wrap` asks the composing model for the sections the store actually has.** Its instructions listed six fixed headings and said all six must appear, which outranked anneal's own wrap guidance, so a store with `## Durable Facts` never had a new durable fact written to it. The list is now read from the store's schema, and an optional section is marked as optional.
+
 ### Changed
 
 - **Levain now requires anneal-memory 0.9.27 or later** (`anneal-memory>=0.9.27,<0.10`). anneal-memory 0.9.27 adds an optional `## Durable Facts` section for facts that would change a future answer (an allergy, a commitment, a fact a later action depends on), one line each with cue words, kept until you drop one. The seed's memory guidance names the section and its line form and leaves the rules to anneal's wrap guidance, and the dashboard shows the section. A NEW entity gets the section. An EXISTING one keeps its schema until you opt it in with `anneal-memory --db .levain/memory.db set-schema partnership`; `levain update` does not do that for you, because changing a store's schema is the operator's decision.

@@ -87,7 +87,7 @@ For **factual corrections** (wrong detail, outdated info) — record a new episo
 
 ## When things go wrong
 
-- `save_continuity` reports missing sections → your output needs all six: `## State`, `## Active Threads`, `## Patterns`, `## Decisions`, `## Context`, `## Understanding`. (The exact required set comes from your store's schema; a partnership entity carries all six.)
+- `save_continuity` reports missing sections → your output needs every required section: `## State`, `## Active Threads`, `## Patterns`, `## Decisions`, `## Context`, `## Understanding`. (The exact set comes from your store's schema; `## Durable Facts`, where your store has it, is optional.)
 - `save_continuity` reports demoted graduations → your evidence citations didn't match real episodes; check episode IDs from the `prepare_wrap` package and cite accurately.
 - Continuity contains `(ungrounded)` markers → those patterns were demoted earlier; in a *future* wrap, provide fresh evidence to re-graduate them, or remove them. Do not re-save within the current session to chase this — wrap once.
 - Continuity contains `(needs-evidence)` markers → include `[evidence: <id1>, <id2> "explanation"]` on all patterns at 2x and above (cite every episode that genuinely supports it — recall follows those citations).
