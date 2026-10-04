@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **`levain wrap` now checks the schema the wrap freezes, not the one the store had before the wrap started** (known open since 0.4.x, listed in 0.5.6). The partnership check now runs again after anneal has started the wrap, when anneal refuses any schema change until the save or a cancel, and the composing model's instructions are built from that same schema. A store moved off the partnership schema in between is refused (exit 2) and the wrap is cancelled; nothing is saved.
+- **A store error after the wrap had started left that wrap open** (found in review of the change above). `levain wrap` treated every store error as happening before anything was written, so an error after anneal had started the wrap returned without cancelling it, and the next wrap found one in progress. It now cancels its own wrap first.
+- **Cancelling a failed wrap could clear another program's wrap on the same store.** `levain wrap` read the wrap's token and then cleared whatever wrap was open, so a wrap another program started in between was the one cleared. The token is now compared and the wrap cleared in one step by anneal, and a wrap that is not ours is left alone.
+
 ## [0.5.6] — 2026-10-04
 
 `levain wrap` keeps working for existing entities under anneal-memory 0.9.28, the composing model is asked for the sections the store actually has (including anneal 0.9.28's optional `## Durable Facts`), and Levain now requires anneal-memory 0.9.28.
