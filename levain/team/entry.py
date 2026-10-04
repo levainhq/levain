@@ -224,6 +224,48 @@ def seal(entry: dict, prev: str) -> dict:
     return sealed
 
 
+MAX_JSON_DEPTH = 32
+
+
+class LineError(ValueError):
+    """A ledger line that is refused before ``json.loads`` sees it."""
+
+
+def parse_line(line: str) -> object:
+    """``json.loads`` for a ledger line, with the nesting bounded BEFORE the parser runs.
+
+    A forged line nested hundreds of thousands of brackets deep makes ``json.loads`` raise RecursionError on
+    CPython (not a JSONDecodeError, so an ordinary handler misses it and one line stops every read of the whole
+    ledger) and has run for minutes on Windows. One linear, string-aware scan refuses it first; entries are flat
+    objects, so the bound is far above anything levain writes. Raises LineError (a ValueError) for every
+    refusal, JSONDecodeError included.
+    """
+    depth = 0
+    in_str = esc = False
+    for ch in line:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise LineError(f"nested deeper than {MAX_JSON_DEPTH}")
+        elif ch in "]}":
+            depth -= 1
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise LineError(exc.msg) from exc
+    except RecursionError as exc:
+        raise LineError("nested too deeply") from exc
+
+
 def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
     """Walk one file's chain. Returns (entries, problems, last_hash).
 
@@ -236,9 +278,9 @@ def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
         if not line.strip():
             continue
         try:
-            e = json.loads(line)
-        except json.JSONDecodeError as exc:
-            problems.append(f"line {n}: not JSON ({exc.msg})")
+            e = parse_line(line)
+        except LineError as exc:
+            problems.append(f"line {n}: not JSON ({exc})")
             continue
         if not isinstance(e, dict):
             problems.append(f"line {n}: not a JSON object")

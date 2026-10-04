@@ -8,7 +8,6 @@ normalisation form, so ``SRC/Billing.py`` on a case-insensitive disk cannot slip
 from __future__ import annotations
 
 import functools
-import json
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -220,8 +219,8 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         raw = []
         for line in lines:
             try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
+                obj = E.parse_line(line)
+            except E.LineError:
                 continue
             if isinstance(obj, dict):
                 raw.append(obj)

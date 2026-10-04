@@ -388,3 +388,27 @@ def test_canon_lists_rulings_by_path_and_tracks_staleness():
     assert C.staleness(text, "abc123").startswith("canon current")
     assert "behind the ledger" in C.staleness(text, "def456")
     assert C.staleness(None, "abc123").startswith("no canon")
+
+
+def test_deeply_nested_line_is_refused_before_the_parser_and_the_rest_still_counts():
+    """A forged line nested 200,000 deep raised RecursionError out of every ledger read (the hook fails OPEN on
+    that) and has run for minutes in json.loads on Windows. It is one reported problem; its neighbours count."""
+    import time
+    good = E.seal(ruling(), "")
+    bomb = "[" * 200_000 + "]" * 200_000
+    bomb_obj = '{"a":' * 200_000 + "1" + "}" * 200_000
+    t0 = time.monotonic()
+    led = I.build([("ana/d.jsonl", [bomb, json.dumps(good), bomb_obj])], "ana")
+    assert time.monotonic() - t0 < 5
+    assert [e["id"] for e in led.entries] == [good["id"]]
+    assert sum("not JSON (nested deeper" in p for p in led.problems) == 2
+
+
+def test_nesting_scan_ignores_brackets_inside_strings():
+    deep_in_string = json.dumps({"words": "[" * 5000 + '"' + "{" * 5000})
+    assert E.parse_line(deep_in_string)["words"].startswith("[[[")
+    assert E.parse_line("[" * E.MAX_JSON_DEPTH + "]" * E.MAX_JSON_DEPTH)
+    with pytest.raises(E.LineError):
+        E.parse_line("[" * (E.MAX_JSON_DEPTH + 1) + "]" * (E.MAX_JSON_DEPTH + 1))
+    with pytest.raises(E.LineError):
+        E.parse_line("{not json")
