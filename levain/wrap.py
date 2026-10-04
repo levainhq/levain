@@ -28,9 +28,10 @@ from its own invocation, under both bounds above.
 
 The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (never reinvent it):
 
-  1. ``prepare_wrap(store, crystal_store=…, wrap_token=…)`` — anneal opens the wrap under Levain's token,
-     freeze the episode window, and emit the compression package (episodes + current memory + stale-pattern warnings + the
-     compression INSTRUCTIONS themselves + association context).
+  1. ``prepare_wrap(store, crystal_store=…, wrap_token=…)`` — anneal opens the wrap under Levain's
+     token, freezes the episode window, and emits the compression package (episodes + current
+     memory + stale-pattern warnings + the compression INSTRUCTIONS themselves + association
+     context).
   2. **compose** — the ONE cognitive beat: a mind reads the package and writes the
      neocortex. For a SOVEREIGN entity that mind is its OWN model (the same open Ollama model
      ``levain run`` uses), so the entity metabolizes its own episodes with its own mind — an OPEN
@@ -301,7 +302,7 @@ def _observe_prior_wrap(store: object) -> tuple[str | None, str | None]:
     return token, store.get_wrap_started_at()  # type: ignore[attr-defined]
 
 
-def _discard_prior_wrap(store: object, prior_token: str | None) -> None:
+def _discard_prior_wrap(store: object, prior_token: str | None, *, reset: bool) -> None:
     """Clear the PRIOR run's wrap that this run found open (``--reset``, or the unattended self-heal).
 
     Always by the token observed with the wrap's age (:func:`_observe_prior_wrap`), never a bare
@@ -309,11 +310,23 @@ def _discard_prior_wrap(store: object, prior_token: str | None) -> None:
     wrap that changed hands since the observation raises ``WrapOwnershipError`` instead of being
     cleared. Partial wrap metadata has no token to name, so it is cleared only while still partial.
     Whether the observed wrap is an orphan is the caller's call (the lock and the age test, or the
-    operator's ``--reset``); anneal's compare-and-swap lets a caller that names a token clear it."""
-    if prior_token:
-        store.wrap_cancelled(expect_token=prior_token)  # type: ignore[attr-defined]
-    else:
-        store.wrap_cancelled(expect_partial=True)  # type: ignore[attr-defined]
+    operator's ``--reset``); anneal's compare-and-swap lets a caller that names a token clear it.
+    A wrap whose metadata could not be read (no token) is cleared by ``--reset`` with ``force``,
+    the operator's explicit recovery, and by the unattended seat only while still partial. A wrap
+    that went idle between the observation and the cancel is already discarded."""
+    from anneal_memory import WrapOwnershipError
+
+    try:
+        if prior_token:
+            store.wrap_cancelled(expect_token=prior_token)  # type: ignore[attr-defined]
+        elif reset:
+            store.wrap_cancelled(force=True)  # type: ignore[attr-defined]
+        else:
+            store.wrap_cancelled(expect_partial=True)  # type: ignore[attr-defined]
+    except WrapOwnershipError as exc:
+        if exc.actual is None and not getattr(exc, "partial_state", False):
+            return   # idle: nothing left to discard
+        raise
 
 
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
@@ -686,7 +699,7 @@ def _consolidate(
                 )
                 return 2
             try:
-                _discard_prior_wrap(store, prior_token)
+                _discard_prior_wrap(store, prior_token, reset=reset)
             except WrapOwnershipError:
                 print("levain wrap: the prior wrap was replaced by another consolidate while it was "
                       "being discarded; nothing of it was cleared. Re-run in a moment.")
@@ -742,11 +755,10 @@ def _consolidate(
         # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
         # round, reproduced: the wrap saved under the ops schema). The schema read here is the one
         # anneal froze for this wrap, which the save validates against, and the compose prompt is
-        # built from this object. It does NOT close the window inside prepare_wrap itself: anneal
-        # freezes the schema prepare_wrap read before it built the package, without comparing it to
-        # the live one, so a change committed in between is frozen over (CHANGELOG, known open).
-        # A store error reading it is handled by the outer AnnealMemoryError clause, which cancels
-        # by token now that a wrap exists.
+        # built from this object. anneal itself refuses a schema that moved while it built the
+        # package (a "downgraded" result), so this check is the guard for a schema that was never
+        # partnership. A store error reading it is handled by the outer AnnealMemoryError clause,
+        # which cancels by token now that a wrap exists.
         wrap_schema = store.section_schema_for_wrap()
         if name_for_schema(wrap_schema) != "partnership":
             cancelled = _cancel_if_ours(store, wrap_token)
