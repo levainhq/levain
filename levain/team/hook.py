@@ -28,7 +28,7 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import GitLedger, Repo, TeamError
+from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamBusy, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -46,10 +46,13 @@ def _mode(e: dict, team: R.Team) -> str:
     return e.get("mode") or team.mode
 
 
+FOLD_CASE = sys.platform == "darwin"
+
+
 def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session: str,
-           denied_before: set[str]) -> Decision | None:
+           denied_before: set[str], *, fold: bool = FOLD_CASE) -> Decision | None:
     """What the hook does for one edit of ``rel``. Pure: no I/O. None = nothing applies."""
-    matched = ledger.applying_to(rel)
+    matched = ledger.applying_to(rel, fold=fold)
     if not matched:
         return None
     tensions = [e for e in matched if e.get("type") == "tension"]
@@ -66,18 +69,23 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     if always or pending:
         how = []
         if pending:
-            how.append("If your change stays within the ruling(s) above, retry the same edit: the retry is "
-                       "allowed and recorded as your acknowledgement. If your change would contradict a ruling, "
-                       f"STOP and ask the owner of the call ({', '.join(owners) or 'the owner'}) before changing "
-                       "anything; do not route around this check (no Bash, sed, heredoc or copy edits of this "
-                       "path). A changed decision is recorded with `levain team record` carrying the owner's own "
-                       "words and `--supersedes` the old id.")
+            retry = ("If your change stays within the ruling(s) above, retry the same edit: the retry is allowed and "
+                     "recorded as your acknowledgement. " if not always else "")
+            how.append(f"{retry}If your change would contradict a ruling, STOP and ask the owner of the call "
+                       f"({', '.join(owners) or 'the owner'}) before changing anything; do not route around this "
+                       "check (no Bash, sed, heredoc or copy edits of this path). If the owner changes the call, "
+                       "record their words as a new ruling (`levain team record decision --kind ruling --owner ... "
+                       f"--words ... --refs <old id>`); the team owner ({team.owner}) or the ruling's author then "
+                       "supersedes the old one.")
         if [e for e in foreign if _mode(e, team) == "block" and e in always]:
             how.append("A ruling above is in BLOCK mode: no edit to this path until a superseding ruling is "
                        "recorded with the owner's words.")
         if tensions:
             how.append(f"CONFLICT: an open tension is recorded on this path. Ask {', '.join(owners)}; edits stay "
                        "blocked until the tension is superseded by a decision.")
+        if handle is None:
+            how.append("(This clone's git user.email maps to no member of the team, so every ruling here counts "
+                       "as someone else's: `levain team doctor` shows the mapping.)")
         text = f"{head} Read it before changing this file.\n\n{blocks}\n\nWhat to do: " + " ".join(how)
         return Decision(deny=True, text=text, newly_denied={e["id"] for e in pending})
     acks = [e["id"] for e in once if e["id"] in denied_before and e["id"] not in acked]
@@ -119,25 +127,45 @@ def _within(path: str, root: Path) -> bool:
         return False
 
 
+def _in_ledger_machinery(path: str) -> bool:
+    """Is ``path`` under some repository's ``<git dir>/levain-team/``? Purely by shape, no git needed."""
+    p = Path(os.path.realpath(path))
+    for parent in [p, *p.parents]:
+        if parent.name == DIRNAME and (parent.parent / "HEAD").is_file() and (parent.parent / "objects").is_dir():
+            return True
+    return False
+
+
+def _wired_but_broken(gl: GitLedger) -> bool:
+    try:
+        return bool(gl._local_branch_exists())
+    except TeamError:
+        return False
+
+
 def pretooluse(payload: dict) -> None:
     if payload.get("tool_name") not in EDIT_TOOLS:
         return
     target = _target(payload)
     if not target:
         return
-    repo = Repo.discover(Path(target))
-    if repo is None:
-        return
-    # A path inside the ledger machinery is refused whether or not this clone has joined.
-    if _within(target, repo.base):
+    # A path inside the ledger machinery is refused whether or not this clone has joined. It is checked BEFORE
+    # repository discovery, which finds no working tree from inside .git (state.json, locks, sessions).
+    if _in_ledger_machinery(target):
         _out({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": (f"{TAG} {target} is inside the team ledger's private worktree. The "
+            "permissionDecisionReason": (f"{TAG} {target} is inside the team ledger's private machinery. The "
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
+    repo = Repo.discover(Path(target))
+    if repo is None:
+        return
     gl = GitLedger(repo)
     if not gl.joined():
+        if _wired_but_broken(gl):
+            _fail_open("PreToolUse", f"this clone has a {BRANCH} branch but no usable ledger worktree "
+                                     "(run `levain team join`, then `levain team doctor`)")
         return
     try:
         team = gl.team()
@@ -145,12 +173,15 @@ def pretooluse(payload: dict) -> None:
         _fail_open("PreToolUse", str(exc))
         return
     fetch_note = gl.fetch_if_due(team.fetch_interval, timeout=5.0)
+    busy_note = None
     try:
-        with gl.lock(exclusive=False, timeout=3.0):
+        with gl.lock(exclusive=False, timeout=10.0):
             ledger = gl.ledger()
-    except TeamError as exc:
-        _fail_open("PreToolUse", str(exc))
-        return
+    except TeamBusy:
+        # The worktree lock covers only local commits and rebases, so this is rare; reading unlocked can at worst
+        # see a file mid-rewrite, which verification reports. Enforcing from that beats enforcing nothing.
+        ledger = gl.ledger()
+        busy_note = "[team] read the ledger without its lock (another operation held it for 10 s)"
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
     if rel is None:
@@ -158,7 +189,8 @@ def pretooluse(payload: dict) -> None:
     session = str(payload.get("session_id") or "")
     handle = gl.handle(team)
     d = decide(team, ledger, handle, rel, session, gl.session_denied(session) if session else set())
-    notes = []
+    from .transport import WARNINGS
+    notes = [f"[team] {w}" for w in WARNINGS] + ([busy_note] if busy_note else [])
     if fetch_note:
         notes.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
@@ -194,7 +226,7 @@ def _anneal_db(gl: GitLedger) -> Path | None:
     return p if p.exists() else None
 
 
-def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str) -> str | None:
+def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:
     """Optional seam: feed every ledger entry to anneal's team import, once per ledger tree.
 
     Runs only when the installed anneal-memory ships ``anneal_memory.team`` and a store is known.
@@ -216,14 +248,21 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str) -> str | None:
 
     body = "".join(export_lines(ledger))
     try:
-        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "team-import", "--db", str(db), "-"],
+        # --link-authority: only the owner's supersedes cross authors, the same rule levain's in-force view applies
+        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "team-import", "--db", str(db), "-",
+                             "--link-authority", owner],
                             input=body, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"[team] anneal import did not run: {exc}"
+    tail = ((cp.stderr or cp.stdout).strip().splitlines() or ["exit " + str(cp.returncode)])[-1]
+    if cp.returncode == 3:
+        # anneal imported what verified and refused the rest; not a crash, but a person should see it
+        gl.save_state(anneal_imported_tree=tree, anneal_last=f"partial: {tail}")
+        return f"[team] anneal import refused some entries: {tail}"
     if cp.returncode != 0:
-        tail = (cp.stderr or cp.stdout).strip().splitlines()[-1:] or ["exit " + str(cp.returncode)]
-        return f"[team] anneal import failed: {tail[0]}"
-    gl.save_state(anneal_imported_tree=tree)
+        gl.save_state(anneal_last=f"failed: {tail}")
+        return f"[team] anneal import failed: {tail}"
+    gl.save_state(anneal_imported_tree=tree, anneal_last="ok")
     return f"[team] ledger imported into your memory store ({db.name})"
 
 
@@ -234,6 +273,9 @@ def sessionstart(payload: dict) -> None:
         return
     gl = GitLedger(repo)
     if not gl.joined():
+        if _wired_but_broken(gl):
+            _fail_open("SessionStart", f"this clone has a {BRANCH} branch but no usable ledger worktree "
+                                       "(run `levain team join`, then `levain team doctor`)")
         return
     try:
         team = gl.team()
@@ -242,7 +284,7 @@ def sessionstart(payload: dict) -> None:
         return
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
     try:
-        with gl.lock(exclusive=False, timeout=5.0):
+        with gl.lock(exclusive=False, timeout=10.0):
             ledger = gl.ledger()
             tree = gl.ledger_tree()
             canon_text = gl.read_canon()
@@ -271,7 +313,7 @@ def sessionstart(payload: dict) -> None:
         lines.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
         lines.append(f"[team] ledger integrity: {len(ledger.problems)} problem(s); run `levain team verify`")
-    note = anneal_import(gl, ledger, tree)
+    note = anneal_import(gl, ledger, tree, team.owner)
     if note:
         lines.append(note)
     text = "\n".join(lines)

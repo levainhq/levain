@@ -15,6 +15,11 @@ from . import roles as R
 _HEADER_RE = re.compile(r"generated (\S+) by (\S+) from ledger (\S+) \((\d+) entries\)")
 
 
+def _count(ledger: I.Ledger) -> int:
+    """Entries that can change the canon. Acknowledgements are excluded: every agent's retry writes one."""
+    return sum(1 for e in ledger.entries if e.get("type") != "ack")
+
+
 def _entry_block(e: dict, team: R.Team) -> list[str]:
     meta = [e["id"]]
     if e.get("owner"):
@@ -49,7 +54,7 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
     lines = [
         f"# {team.project}: project canon",
         "",
-        f"generated {ts} by {by} from ledger {tree} ({len(ledger.entries)} entries); do not hand-edit.",
+        f"generated {ts} by {by} from ledger {tree} ({_count(ledger)} entries); do not hand-edit.",
         f"The ledger (branch `levain-ledger`, `ledger/`) is the source of truth; this file is derived from it.",
         f"Owner: {team.owner} · members: {', '.join(team.members)} · default mode: {team.mode}",
         "",
@@ -106,8 +111,8 @@ def staleness(text: str | None, ledger: I.Ledger, tree: str) -> str:
     h = header(text)
     if h is None:
         return "no canon yet (the owner runs `levain team consolidate`)"
-    if h["tree"] == tree:
+    newer = _count(ledger) - h["entries"]
+    if h["tree"] == tree or newer == 0:
         return f"canon current (generated {h['ts']} by {h['by']})"
-    newer = len(ledger.entries) - h["entries"]
     return (f"canon is behind the ledger by {newer} entr{'y' if newer == 1 else 'ies'} "
             f"(generated {h['ts']} by {h['by']})")

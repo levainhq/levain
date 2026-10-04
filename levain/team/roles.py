@@ -68,7 +68,7 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
     try:
         t = Team(project=str(raw["project"]), owner=str(raw["owner"]),
                  members={str(k): str(v) for k, v in dict(raw.get("members", {})).items()},
-                 client_owners=[str(c) for c in raw.get("client_owners", [])],
+                 client_owners=raw.get("client_owners", []),
                  mode=str(raw.get("mode", "ask-once")), fetch_interval=int(raw.get("fetch_interval", 300)))
     except (KeyError, TypeError, ValueError) as exc:
         raise RolesError(f"{where} is missing or has a bad field: {exc}") from None
@@ -86,6 +86,21 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
             raise RolesError(f"{where}: member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]*")
         if "@" not in mail:
             raise RolesError(f"{where}: member {h!r} needs an email (it maps git's user.email to the handle)")
+    if not isinstance(t.client_owners, list) or not all(isinstance(c, str) for c in t.client_owners):
+        raise RolesError(f"{where}: client_owners must be a list of names")
+    folded: dict[str, str] = {}
+    for h in t.members:
+        if h.lower() in folded:
+            raise RolesError(f"{where}: handles {folded[h.lower()]!r} and {h!r} differ only by case "
+                             "(their ledger folders would collide on a case-insensitive disk)")
+        folded[h.lower()] = h
+    seen: dict[str, str] = {}
+    for h, mail in t.members.items():
+        key = mail.strip().lower()
+        if key in seen:
+            raise RolesError(f"{where}: members {seen[key]!r} and {h!r} share the email {mail!r}; "
+                             "the email is how a git identity maps to a handle, so it must be unique")
+        seen[key] = h
     if t.owner not in t.members:
         raise RolesError(f"{where}: owner {t.owner!r} is not in [members]")
 

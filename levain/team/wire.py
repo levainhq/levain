@@ -56,10 +56,11 @@ def install(repo: Repo, python: str | None = None) -> list[str]:
         raise ValueError(f"{path}: 'hooks' is not an object")
     before = json.dumps(data, sort_keys=True)
     pre = _strip_ours(list(hooks.get("PreToolUse", [])))
-    pre.append({"matcher": PRE_MATCHER, "hooks": [{"type": "command", "command": command(python, "pretooluse")}]})
+    pre.append({"matcher": PRE_MATCHER,
+                "hooks": [{"type": "command", "command": command(python, "pretooluse"), "timeout": 30}]})
     start = _strip_ours(list(hooks.get("SessionStart", [])))
     start.append({"matcher": START_MATCHER,
-                  "hooks": [{"type": "command", "command": command(python, "sessionstart")}]})
+                  "hooks": [{"type": "command", "command": command(python, "sessionstart"), "timeout": 60}]})
     hooks["PreToolUse"] = pre
     hooks["SessionStart"] = start
     if json.dumps(data, sort_keys=True) != before or not path.exists():
@@ -79,6 +80,27 @@ def install(repo: Repo, python: str | None = None) -> list[str]:
             with open(exclude, "a", encoding="utf-8") as fh:
                 fh.write(("" if existing.endswith("\n") or not existing else "\n") + f"/{rel}\n")
             notes.append(f"added /{rel} to {exclude} (it holds your interpreter path; never commit it)")
+    return notes
+
+
+def worktrees(repo: Repo) -> list[Path]:
+    """Every working tree of the project (main clone + `git worktree add` ones), never the ledger's own."""
+    cp = git(["worktree", "list", "--porcelain"], repo.toplevel, check=False)
+    out = []
+    for line in cp.stdout.splitlines():
+        if line.startswith("worktree "):
+            p = Path(line[len("worktree "):])
+            if p.is_dir() and not str(os.path.realpath(p)).startswith(os.path.realpath(repo.base)):
+                out.append(p)
+    return out or [repo.toplevel]
+
+
+def install_all(repo: Repo, python: str | None = None) -> list[str]:
+    """Wire every working tree: a Claude session started in any of them must be governed."""
+    notes = []
+    for wt in worktrees(repo):
+        notes += install(Repo(wt, repo.common), python)
+    notes.append("after a new `git worktree add`, run `levain team install` again to wire it")
     return notes
 
 

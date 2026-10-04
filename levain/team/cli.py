@@ -34,19 +34,27 @@ def _split(values: list[str] | None) -> list[str]:
 
 
 def _repo_paths(repo: Repo, paths: list[str]) -> list[str]:
-    """Absolute paths and cwd-relative existing paths become repo-relative; globs stay as written."""
+    """Paths and globs are taken relative to the current directory, like a git pathspec, and stored
+    repo-relative. An existing directory governs its whole tree (stored with a trailing "/")."""
     out = []
     top = Path(os.path.realpath(repo.toplevel))
+    try:
+        here = Path(os.path.realpath(os.getcwd())).relative_to(top)
+    except ValueError:
+        here = Path(".")  # running outside the repo with --repo: paths are repo-relative as written
     for p in paths:
-        cand = Path(p) if os.path.isabs(p) else Path(os.getcwd()) / p
-        if (os.path.isabs(p) or (not any(c in p for c in "*?[") and cand.exists())):
+        if os.path.isabs(p):
             try:
-                rel = Path(os.path.realpath(cand)).relative_to(top).as_posix()
+                rel = Path(os.path.realpath(p)).relative_to(top).as_posix()
             except ValueError:
                 raise TeamError(f"{p} is outside the repository {top}") from None
-            out.append(rel + ("/" if p.endswith("/") else ""))
         else:
-            out.append(p)
+            rel = (here / p).as_posix() if str(here) != "." else p
+            while rel.startswith("./"):
+                rel = rel[2:]
+        if not rel.endswith("/") and not any(c in rel for c in "*?") and (top / rel).is_dir():
+            rel += "/"
+        out.append(rel)
     return out
 
 
@@ -73,8 +81,7 @@ def cmd_init(args) -> int:
         written = P.seed(gl, Path(args.pack), push=not args.no_push)
         print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
     if not args.no_install:
-        for line in W.install(repo):
-            print(line)
+        _install_all(repo)
     return 0
 
 
@@ -85,8 +92,7 @@ def cmd_join(args) -> int:
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if not args.no_install:
-        for line in W.install(repo):
-            print(line)
+        _install_all(repo)
     return 0
 
 
@@ -107,12 +113,9 @@ def cmd_record(args) -> int:
     words = args.words
     if args.words_file:
         words = Path(args.words_file).read_text(encoding="utf-8").strip()
-    if args.kind == "ruling":
-        owner = args.owner
-        if not owner:
-            raise TeamError("a ruling needs --owner (client:<name>, lead, or a member handle)")
-    else:
-        owner = args.owner
+    owner = args.owner
+    if args.kind == "ruling" and not owner:
+        raise TeamError("a ruling needs --owner (client:<name>, lead, or a member handle)")
     if owner and not team.owner_ok(owner):
         raise TeamError(f"owner {owner!r} is not allowed by team.toml (members, lead, client:<client_owners>)")
     e = E.build(handle, args.type, kind=args.kind, mode=args.mode, paths=_repo_paths(repo, _split(args.paths)),
@@ -134,6 +137,8 @@ def cmd_retire(args) -> int:
     gl = GitLedger(repo)
     gl.require_joined()
     team, handle = _actor(gl)
+    if args.owner and not team.owner_ok(args.owner):
+        raise TeamError(f"owner {args.owner!r} is not allowed by team.toml (members, lead, client:<client_owners>)")
     e = E.build(handle, "retire", supersedes=_split(args.ids), words=args.words, reason=args.reason,
                 owner=args.owner, agent=args.agent or "human")
     sealed = gl.append(e, push=not args.no_push)
@@ -200,6 +205,7 @@ def cmd_verify(args) -> int:
                 problems.append(f"{e['id']}: names {s}, which is not in the ledger")
         if e.get("owner") and not team.owner_ok(e["owner"]):
             problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
+    problems += _commit_author_problems(gl, team, ledger)
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
     print(C.staleness(canon_text, ledger, tree))
@@ -207,6 +213,25 @@ def cmd_verify(args) -> int:
         print(f"PROBLEM: {p}")
     print("ledger verified: every chain intact" if not problems else f"{len(problems)} problem(s)")
     return 0 if not problems else 1
+
+
+def _commit_author_problems(gl: GitLedger, team: R.Team, ledger: I.Ledger) -> list[str]:
+    """Who actually committed each ledger file, per git. Entry authorship is asserted text; the commit's
+    author email is what the client's git host records. A file whose committers map to someone other than the
+    handle it is filed under (or, for pack files, other than the owner) is reported."""
+    out = []
+    by_safe = {E.safe_handle(h): h for h in team.members}
+    for f in ledger.files:
+        top = f.rel.split("/", 1)[0]
+        expected = team.owner if top.startswith("pack-") else by_safe.get(top)
+        cp = subprocess.run(["git", "log", "--format=%ae", "--", f"ledger/{f.rel}"], cwd=gl.wt,
+                            capture_output=True, text=True)
+        for mail in sorted(set(cp.stdout.split())):
+            who = team.handle_for_email(mail)
+            if expected is None or who != expected:
+                out.append(f"ledger/{f.rel}: committed by {mail} ({who or 'not a member'}), "
+                           f"but it holds {top}'s entries (expected {expected or 'a member'})")
+    return out
 
 
 def cmd_consolidate(args) -> int:
@@ -239,9 +264,13 @@ def cmd_export(args) -> int:
     return 0
 
 
-def cmd_install(args) -> int:
-    for line in W.install(_repo(args), python=args.python):
+def _install_all(repo: Repo, python: str | None = None) -> None:
+    for line in W.install_all(repo, python=python):
         print(line)
+
+
+def cmd_install(args) -> int:
+    _install_all(_repo(args), python=args.python)
     return 0
 
 
@@ -346,7 +375,8 @@ def _anneal_row(gl: GitLedger) -> tuple[bool, str]:
         return True, "anneal import: not available in this anneal-memory (ledger reaches agents via hooks + PROJECT.md only)"
     if db is None:
         return True, "anneal import: available, but no store configured (`levain team join --anneal-db PATH`)"
-    return True, f"anneal import: ON into {db}"
+    last = gl.state().get("anneal_last")
+    return True, f"anneal import: ON into {db}" + (f" (last run: {last})" if last else " (not run yet)")
 
 
 def register(subparsers) -> None:
@@ -398,7 +428,8 @@ def register(subparsers) -> None:
     p.add_argument("--refs", action="append", metavar="ID")
     p.add_argument("--agent", help="what drafted it (default $LEVAIN_TEAM_AGENT or 'human')")
     p.add_argument("--session")
-    p.add_argument("--no-push", action="store_true")
+    p.add_argument("--no-push", action="store_true",
+                   help="keep it local for now (by default the entry is pushed so the team sees it immediately)")
     p.add_argument("--json", action="store_true")
 
     p = add("retire", cmd_retire, "Retire entries without replacing them (a ruling needs the decider's words).")
@@ -423,7 +454,7 @@ def register(subparsers) -> None:
     p.add_argument("--no-push", action="store_true")
 
     p = add("export", cmd_export, "Print the ledger as JSON lines (all entries per file in file order).")
-    p.add_argument("--jsonl", action="store_true", help="accepted for clarity; JSON lines is the only format")
+    p.add_argument("--jsonl", action="store_true", help="JSON lines (the only format; the flag is accepted for clarity)")
     p.add_argument("--in-force", action="store_true", help="only in-force entries, time order (not chain-verifiable)")
 
     p = add("install", cmd_install, "Wire the team hooks into .claude/settings.local.json (idempotent).")
@@ -447,9 +478,13 @@ def register(subparsers) -> None:
 
 def _guarded(func):
     def call(args) -> int:
+        from .transport import WARNINGS
         try:
             return func(args)
         except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
             print(f"levain team: {exc}", file=sys.stderr)
             return 2
+        finally:
+            for w in dict.fromkeys(WARNINGS):
+                print(f"levain team: WARNING: {w}", file=sys.stderr)
     return call

@@ -20,12 +20,21 @@ def _fingerprint_entry(e: dict) -> str:
                   recheck=e.get("recheck", ""), mode=e.get("mode", "")).fingerprint()
 
 
-def plan(judgment: R.Judgment, existing: dict[str, dict]) -> list[dict]:
-    """The entries a seed would append (unsealed), given the in-force entries this pack seeded before."""
+def plan(judgment: R.Judgment, existing: dict[str, dict],
+         retired: dict[str, dict] | None = None) -> list[dict]:
+    """The entries a seed would append (unsealed), given the in-force entries this pack seeded before.
+
+    ``retired``: rules the team (not the pack) retired or replaced. Re-seeding the SAME rule text does not
+    bring one back; only a pack version that changes the rule offers it again.
+    """
     author = judgment.author
     tag = f"{judgment.pack}@{judgment.version}"
+    retired = retired or {}
     out = []
     for rule in judgment.rules:
+        gone = retired.get(rule.id)
+        if rule.id not in existing and gone is not None and _fingerprint_entry(gone) == rule.fingerprint():
+            continue
         old = existing.get(rule.id)
         if old is not None and _fingerprint_entry(old) == rule.fingerprint():
             continue
@@ -53,7 +62,8 @@ def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     bad = [r.id for r in judgment.rules if not team.owner_ok(r.owner)]
     if bad:
         raise TeamError(f"rule owner(s) not allowed by team.toml (client_owners / members): {', '.join(bad)}")
-    todo = plan(judgment, gl.ledger().pack_rules(judgment.pack))
+    led = gl.ledger()
+    todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
     written = []
     for i, e in enumerate(todo):
         written.append(gl.append(e, push=push and i == len(todo) - 1))

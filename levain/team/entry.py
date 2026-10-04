@@ -38,10 +38,23 @@ _SECRET_PATTERNS = [
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),               # GitHub tokens
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{30,}\b"),             # GitHub fine-grained tokens
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),                    # OpenAI/Anthropic-style secret keys
+    re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{16,}\b"),     # Stripe keys
     re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b"),            # Slack tokens
-    re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*\S{8,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."),  # JWTs
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}"),        # Authorization: Bearer ...
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@"),    # credentials in a URL
+    # KEY=value / "key": "value" for password/secret/api key/token names, including DB_PASSWORD= and
+    # client_secret=; the value must contain a digit so prose like "token: authentication" passes.
+    re.compile(r"(?i)(?<![A-Za-z])[A-Za-z0-9_]*(?:password|passwd|secret|api[_-]?key|token)[A-Za-z0-9_-]*[\"']?\s*[:=]\s*"
+               r"[\"']?(?=[^\s\"']*\d)[^\s\"']{8,}"),
 ]
 _SCANNED = ("words", "summary", "reason", "recheck")
+# Limits shared with anneal-memory's team import, so a levain-written entry never fails that import.
+_MAX_LEN = {"owner": 200, "words": 4000, "reason": 4000, "summary": 2000, "recheck": 1000}
+_MAX_ITEMS = 100
+_MAX_PATH = 300
+PLAIN_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}")
+_FUTURE_SLACK_S = 86400
 
 
 class EntryError(ValueError):
@@ -85,7 +98,7 @@ def scan_secrets(entry: dict) -> list[str]:
     return hits
 
 
-def validate(entry: dict, known: dict[str, dict] | None = None) -> None:
+def validate(entry: dict, known: dict[str, dict] | None = None, *, scan: bool = True) -> None:
     """Raise EntryError if the entry may not be written.
 
     ``known`` (id -> entry, every entry already in the ledger) enables the cross-entry checks: a
@@ -106,6 +119,20 @@ def validate(entry: dict, known: dict[str, dict] | None = None) -> None:
         raise EntryError(f"id {entry['id']!r} is not <author>-<yyyymmddHHMMSS>-<8 hex>")
     if not TS_RE.fullmatch(entry["ts"]):
         raise EntryError("ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ")
+    try:
+        when = datetime.strptime(entry["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise EntryError("ts is not a real date") from None
+    if (when - datetime.now(timezone.utc)).total_seconds() > _FUTURE_SLACK_S:
+        raise EntryError("ts is more than a day in the future")
+    for f in ("agent", "session"):
+        if f in entry and not PLAIN_RE.fullmatch(entry[f]):
+            raise EntryError(f"{f} must be a plain handle ([A-Za-z0-9._:@-], at most 128 chars)")
+    for f, n in _MAX_LEN.items():
+        if len(entry.get(f) or "") > n:
+            raise EntryError(f"{f} is longer than {n} characters")
+    if entry.get("owner") and not entry["owner"].isprintable():
+        raise EntryError("owner must be printable text")
     t = entry["type"]
     if t not in TYPES:
         raise EntryError(f"type must be one of {', '.join(TYPES)}")
@@ -127,6 +154,11 @@ def validate(entry: dict, known: dict[str, dict] | None = None) -> None:
         val = entry.get(lf, [])
         if not isinstance(val, list) or not all(isinstance(x, str) and x.strip() for x in val):
             raise EntryError(f"{lf} must be a list of non-empty strings")
+    for lf in ("paths", "supersedes", "refs"):
+        if len(entry.get(lf, [])) > _MAX_ITEMS:
+            raise EntryError(f"{lf} has more than {_MAX_ITEMS} items")
+    if any(len(p) > _MAX_PATH for p in entry.get("paths", [])):
+        raise EntryError(f"a path glob is longer than {_MAX_PATH} characters")
     if t == "retire" and not entry.get("supersedes"):
         raise EntryError("a retire entry must name what it retires in 'supersedes'")
     if t == "ack":
@@ -149,12 +181,14 @@ def validate(entry: dict, known: dict[str, dict] | None = None) -> None:
             old = known[s]
             if old.get("type") == "ack":
                 raise EntryError(f"{s} is an ack; acks are not superseded")
+            if old.get("type") == "retire":
+                raise EntryError(f"{s} is a retire; to bring back what it retired, record that entry again")
             if old.get("kind") == "ruling" and not (entry.get("words") or "").strip():
                 raise EntryError(
                     f"{s} is a ruling: replacing or retiring it needs the decider's own words in 'words'")
             if old.get("kind") == "ruling" and t != "retire" and entry.get("kind") != "ruling":
                 raise EntryError(f"{s} is a ruling: only another ruling (or a retire) may supersede it")
-    hits = scan_secrets(entry)
+    hits = scan_secrets(entry) if scan else []
     if hits:
         raise EntryError(f"refused: text in {', '.join(hits)} looks like a secret (key/token/password)")
 
@@ -209,7 +243,9 @@ def verify_lines(lines: list[str]) -> tuple[list[dict], list[str], str]:
             prev = e.get("hash", "") if isinstance(e.get("hash"), str) else ""
             continue
         try:
-            validate(e)
+            # The secret scrub is a WRITE gate. Re-running it on read would silently stop enforcing an existing
+            # ruling whenever a newer levain widened the patterns.
+            validate(e, scan=False)
         except EntryError as exc:
             problems.append(f"line {n} ({e.get('id')}): invalid entry ({exc})")
             prev = e["hash"]
