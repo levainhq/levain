@@ -472,3 +472,107 @@ def test_no_timestamp_at_all_is_never_stale():
 
     assert _orphan_is_stale(None, 900.0) is False
     assert _orphan_is_stale("", 900.0) is False
+
+
+# ======================================================================================
+# The partnership check at the point of use (0.5.6): a set-schema between levain's check and
+# the save cannot change the schema the wrap saves under. RUN against the real store.
+# ======================================================================================
+def test_a_schema_change_before_the_wrap_starts_cancels_it(tmp_path, monkeypatch, capsys):
+    """codex, the 0.5.6 fix-diff round: another process sets the ops schema after levain's early
+    check and before prepare_wrap. The check after prepare_wrap sees it, cancels by token, saves
+    nothing."""
+    import anneal_memory.continuity as cont
+    from anneal_memory import DEFAULT_SCHEMA
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    real_prepare = cont.prepare_wrap
+
+    def prepare_after_a_concurrent_set_schema(store, **kw):
+        with Store(str(db), section_schema=None) as other:
+            other.set_section_schema(DEFAULT_SCHEMA)
+        return real_prepare(store, **kw)
+
+    monkeypatch.setattr(cont, "prepare_wrap", prepare_after_a_concurrent_set_schema)
+    composed = []
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: composed.append(k) or _VALID_NEOCORTEX)
+
+    assert wrap_entity(ent) == 2
+    assert "cancelled; nothing was saved" in capsys.readouterr().out
+    assert composed == []
+    assert not (ent / ".levain" / "memory.continuity.md").exists()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
+
+
+def test_a_schema_change_after_the_wrap_starts_is_refused_and_the_save_stays_partnership(
+        tmp_path, monkeypatch):
+    """Once prepare_wrap has started the wrap, anneal refuses a schema change, so the compose
+    prompt and the save both see the partnership schema."""
+    from anneal_memory import DEFAULT_SCHEMA
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    refused, seen = [], {}
+
+    def compose_while_another_process_tries_set_schema(*a, **k):
+        seen.update(k)
+        with Store(str(db), section_schema=None) as other:
+            try:
+                other.set_section_schema(DEFAULT_SCHEMA)
+            except ValueError:
+                refused.append(True)
+        return _VALID_NEOCORTEX
+
+    monkeypatch.setattr(wrapmod, "_compose", compose_while_another_process_tries_set_schema)
+    assert wrap_entity(ent) == 0
+    assert refused == [True]
+    assert "## Understanding" in seen["instructions"]
+    with Store(str(db), section_schema=None) as store:
+        assert [s["heading"] for s in store.section_schema] == [s["heading"] for s in FLOW_SCHEMA]
+    assert "## Understanding" in (ent / ".levain" / "memory.continuity.md").read_text()
+
+
+def test_a_store_error_after_the_wrap_starts_cancels_it(tmp_path, monkeypatch, capsys):
+    """codex, the 0.5.6 hunk look: a store error after prepare_wrap returned a token fell into a
+    handler that assumed nothing was written, and left the wrap in progress."""
+    from anneal_memory import AnnealMemoryError
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+
+    import sys
+
+    real_read = Store.section_schema_for_wrap
+
+    def failing_read_from_levain(self):
+        # anneal's prepare_wrap reads the schema too; fail only levain's read AFTER it, so the
+        # wrap is really open when the error lands.
+        if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
+            assert self.get_wrap_started_at() is not None, "precondition: the wrap is open"
+            raise AnnealMemoryError("simulated schema read failure")
+        return real_read(self)
+
+    monkeypatch.setattr(Store, "section_schema_for_wrap", failing_read_from_levain)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+    assert wrap_entity(ent) == 2
+    assert "could not read" in capsys.readouterr().out
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
+
+
+def test_cancel_if_ours_leaves_another_tokens_wrap_alone(tmp_path):
+    """The token compare and the clear are one anneal call (expect_token)."""
+    from anneal_memory.continuity import prepare_wrap
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    with Store(str(db), section_schema=None) as store:
+        result = prepare_wrap(store)
+        assert result.get("status") == "ready"
+        wrapmod._cancel_if_ours(store, "not-our-token")
+        assert store.get_wrap_started_at() is not None
+        wrapmod._cancel_if_ours(store, result["wrap_token"])
+        assert store.get_wrap_started_at() is None
