@@ -59,6 +59,7 @@ def test_valid_ruling_passes():
     (lambda e: e.update(ts="yesterday"), "ts must be"),
     (lambda e: e.update(words=["x"]), "must be a string"),
     (lambda e: e.update(mode="loud"), "mode must be"),
+    (lambda e: e.update(paths=["a**b**c"]), "at most once"),
     (lambda e: e.update(supersedes=[e["id"]]), "itself"),
 ])
 def test_refusals(mutate, msg):

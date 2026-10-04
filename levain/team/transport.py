@@ -261,7 +261,7 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = head + "|" + (R.dump_team(team) if team else "")
+        key = f"parser-v2|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -283,7 +283,7 @@ class GitLedger:
         # Every output-shaping option is pinned: diff.noprefix / diff.mnemonicPrefix / color / external diff
         # tools in a user's config would otherwise change the text this parser reads.
         cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "log", "--reverse", "--no-renames",
-                  "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+                  "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
                   "--diff-merges=off", "-p", "--unified=0", "--format=%x00C%x09%H%x09%ae", rev, "--", "ledger/"],
                  self.repo.toplevel, check=False, timeout=60)
         if cp.returncode != 0:
@@ -363,14 +363,15 @@ class GitLedger:
                             f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
         return files, problems
 
-    def team_history_problems(self, team: R.Team) -> list[str]:
+    def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:
         """team.toml and PROJECT.md changes not committed by the owner of the version before them.
 
         Reported, not enforced: identity here is the commit's author email, which anyone can set, so a check
         would only stop honest mistakes while claiming to stop forgery. Authentication is the git host's job.
         """
         out: list[str] = []
-        cp = git(["log", "--reverse", "--format=%H%x09%ae", REF, "--", "team.toml"], self.repo.toplevel,
+        rev = rev or REF
+        cp = git(["log", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
                  check=False, timeout=30)
         prev: R.Team | None = None
         for row in cp.stdout.splitlines():
@@ -385,7 +386,7 @@ class GitLedger:
                 out.append(f"team.toml changed in {sha[:10]} by {mail}, who is not the owner ({judge.owner}) "
                            "of the version before it")
             prev = cur
-        cp = git(["log", "--format=%H%x09%ae", REF, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["log", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
         for row in cp.stdout.splitlines():
             sha, mail = row.split("\t", 1)
             if team.handle_for_email(mail) != team.owner:

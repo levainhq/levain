@@ -196,7 +196,7 @@ def cmd_verify(args) -> int:
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
     canon_text = gl.read_canon(sha)
-    problems = list(ledger.problems) + gl.team_history_problems(team)
+    problems = list(ledger.problems) + gl.team_history_problems(team, sha)
     for e in ledger.entries:
         for s in e.get("supersedes", []) + e.get("refs", []):
             if s not in ledger.by_id:
