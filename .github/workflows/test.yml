@@ -24,10 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13 is supported (requires-python is >=3.12) but one test, tests/test_firing_entity.py::
-        # test_neocortex_injection_fail_soft_on_symlink_loop, expects the RuntimeError that
-        # Path.resolve() raised on a symlink loop before 3.13; add "3.13" once that is settled.
-        python-version: ["3.12"]
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v6
 
