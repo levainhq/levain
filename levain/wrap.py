@@ -215,8 +215,8 @@ _SAVE_UNREADABLE = (
 _SAVE_UNKNOWN = (
     "levain wrap: the save failed ({kind}: {exc}) and the store does not show whether THIS memory was "
     "recorded.\n"
-    "  No wrap of this run is in progress, and either its episodes are already consolidated or another "
-    "wrap completed while it ran.\n"
+    "  No wrap of this run is in progress: its episodes may already be consolidated, or another program "
+    "may have cleared or replaced its wrap.\n"
     "  Check with `levain wrap --dry-run`: it says there is nothing to consolidate if the episodes are "
     "consolidated; look at the entity's .levain/memory.continuity.md before re-running."
 )
@@ -487,9 +487,11 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool, outcome: str = "ca
         return (
             f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated, and "
             f"cancelling its wrap did NOT complete.\n"
-            f"     Your episodes are safe (nothing partial is ever written). Whether the memory was "
-            f"saved is not established:\n"
-            f"     `levain wrap --dry-run` says there is nothing to consolidate if it was.\n"
+            f"     Your episodes are safe. Whether the memory was saved is not established: "
+            f"`levain wrap --dry-run` (once no wrap is open)\n"
+            f"     says there is nothing to consolidate if the episodes were consolidated, and the "
+            f"memory itself is the entity's\n"
+            f"     .levain/memory.continuity.md (an unfinished write is kept beside it as a .tmp file).\n"
             f"     ⚠ THE WRAP MAY STILL BE OPEN (for example the store was busy or unreadable when "
             f"the cancel ran): the next\n"
             f"     consolidate may refuse until it is discarded. An UNATTENDED seat clears it "
@@ -503,9 +505,11 @@ def format_wrap_timeout_report(seconds: float, *, hard: bool, outcome: str = "ca
             f"open wrap of this run was found to cancel\n"
             f"     (the stop came before the wrap started or after it had finished), or the result "
             f"of the cancel was not recorded.\n"
-            f"     Your episodes are safe. If the memory had already been saved it stays saved: "
-            f"`levain wrap --dry-run` says\n"
-            f"     there is nothing to consolidate if so, and shows what is still to do if not."
+            f"     Your episodes are safe. If the episodes were consolidated, `levain wrap --dry-run` "
+            f"says there is nothing to\n"
+            f"     consolidate; the memory itself is the entity's .levain/memory.continuity.md (an "
+            f"unfinished write is kept\n"
+            f"     beside it as a .tmp file)."
         )
     return (
         f"  ⏱ CONSOLIDATE BOUND EXCEEDED ({seconds:g}s) — the consolidate was terminated and the "
@@ -847,9 +851,6 @@ def _consolidate(
             crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
         # NO session_id — that engages flow's parallel-convo consolidate-efferent gate (spore-194),
         # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
-        # The last completed wrap id BEFORE the wrap opens: nothing else can complete while ours is
-        # open, so any later change is a wrap someone else completed (ours cleared and replaced).
-        last_wrap_before = _last_wrap_id(store)
         prepare_entered = True
         result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token)
         status = result.get("status")
@@ -958,6 +959,10 @@ def _consolidate(
             if affect_tag and affect_tag.strip()
             else None
         )
+        # Read while OUR wrap is open (nothing else can complete a wrap now except by clearing ours
+        # first), immediately before the save. Read before `prepare_wrap` it raced an ordinary peer
+        # wrap completing in the gap, and a plain refused compose then looked like a peer's commit.
+        last_wrap_before = _last_wrap_id(store)
         try:
             saved = validated_save_continuity(
                 store,
@@ -1000,7 +1005,7 @@ def _consolidate(
                 if not cancelled:
                     print(_CANCEL_FAILED)
                 return 1
-            if last_wrap_after == last_wrap_before and _wrap_in_progress(store):
+            if _wrap_in_progress(store):
                 # Nothing committed — the identity is unchanged. Cancel OUR wrap (token-owned, so a
                 # concurrent peer's live wrap is never collateral-cancelled) and let the operator re-run.
                 debug_path = _dump_rejected(entity_dir, wrap_token, neocortex)

@@ -892,7 +892,7 @@ def test_the_timeout_report_says_what_the_cancel_found(tmp_path, capsys, monkeyp
         assert "CANCELLED cleanly" not in err and "MAY STILL BE OPEN" not in err
 
 
-@pytest.mark.parametrize("peer", ["clears the wrap", "commits our wrap", "commits ours, opens a new wrap", "id unreadable"])
+@pytest.mark.parametrize("peer", ["clears the wrap", "commits our wrap", "id unreadable", "completes a wrap before ours opens"])
 def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_shows(tmp_path, capsys, monkeypatch, peer):
     """0.5.8: with nothing in progress after a failed save, Levain said the memory COMMITTED and told
     the operator not to re-run, even when a peer had cleared the wrap and nothing was saved; and the
@@ -904,16 +904,32 @@ def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_s
 
     def compose_while_a_peer_acts(*a, **k):
         from anneal_memory.continuity import validated_save_continuity
+        if peer == "completes a wrap before ours opens":
+            return "## State\nnot the six sections"     # an ordinary refused compose
         with Store(str(db), section_schema=None) as peer_store:
             if peer in ("clears the wrap", "id unreadable"):
                 peer_store.wrap_cancelled(force=True)
             else:
                 token = peer_store.load_wrap_snapshot()["token"]
                 validated_save_continuity(peer_store, _VALID_NEOCORTEX, wrap_token=token)
-                if peer == "commits ours, opens a new wrap":
-                    peer_store.record(content="a new episode after the commit", episode_type="observation", source="peer")
-                    peer_store.wrap_started(token="c" * 32, episode_ids=[str(e.id) for e in peer_store.episodes_since_wrap()])
         return _VALID_NEOCORTEX
+
+    if peer == "completes a wrap before ours opens":
+        # An ordinary peer wrap completes in the gap before this one opens. Levain's own wrap is
+        # then the open one, and a refused compose must still cancel it (a baseline id read before
+        # prepare_wrap made this look like a peer's commit and left the wrap open).
+        from anneal_memory import continuity as cont
+        real_prepare = cont.prepare_wrap
+
+        def peer_wraps_then_ours_opens(store_, **kw):
+            with Store(str(db), section_schema=None) as peer_store:
+                other = real_prepare(peer_store)
+                validated_save_continuity_(peer_store, _VALID_NEOCORTEX, wrap_token=other["wrap_token"])
+                peer_store.record(content="an episode after the peer's wrap", episode_type="observation", source="peer")
+            return real_prepare(store_, **kw)
+
+        from anneal_memory.continuity import validated_save_continuity as validated_save_continuity_
+        monkeypatch.setattr(cont, "prepare_wrap", peer_wraps_then_ours_opens)
 
     if peer == "id unreadable":
         import sys
@@ -940,6 +956,10 @@ def test_a_save_that_fails_with_no_wrap_in_progress_claims_only_what_the_store_s
     elif peer == "id unreadable":
         assert "could not be read well enough" in out and "levain wrap --dry-run" in out
         assert "NOT saved" not in out and "No wrap of this run is in progress" not in out
+    elif peer == "completes a wrap before ours opens":
+        assert "REFUSED" in out and "Re-run to try again" in out
+        with Store(str(db), section_schema=None) as store:
+            assert store.get_wrap_started_at() is None, "our wrap was left open"
     else:
         assert "NOT saved" not in out and "REFUSED" not in out and "Re-run." not in out
         assert "does not show whether THIS memory was recorded" in out and "levain wrap --dry-run" in out
