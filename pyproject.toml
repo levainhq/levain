@@ -100,7 +100,7 @@ dependencies = [
     # recall, so the seed's guidance would be wrong for it; KNOWN_GOOD_ANNEAL moves with this floor.
     # `>=0.9.28` (2026-10-03): the seed and `levain wrap` know the optional `## Durable Facts`
     # section (AM-DURABLE-FACTS, first released in 0.9.28; 0.9.27 was never published).
-    "anneal-memory>=0.9.28,<0.10",
+    "anneal-memory>=0.9.30,<0.10",
 ]
 
 [project.optional-dependencies]

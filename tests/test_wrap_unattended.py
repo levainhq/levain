@@ -163,7 +163,7 @@ def test_unattended_wrap_leaves_the_crystal_store_byte_unchanged(tmp_path, monke
 # 2. THE ORPHANED WRAP — falsified against the human-present control
 # ======================================================================================
 
-def _strand_a_wrap(db: Path, *, age_seconds: float = 24 * 3600) -> None:
+def _strand_a_wrap(db: Path, *, age_seconds: float = 24 * 3600, bound: bool = False) -> None:
     """Leave a wrap in progress, exactly as a hard-exited consolidate would.
 
     Built from the store's REAL episode ids rather than invented ones: `wrap_started` records which
@@ -174,13 +174,14 @@ def _strand_a_wrap(db: Path, *, age_seconds: float = 24 * 3600) -> None:
     ``age_seconds`` matters because the self-heal requires the orphan to be provably DEAD, not merely
     present: an orphan is by construction older than the bound that killed its process, so a RECENT
     in-progress wrap is far more likely to be a live non-Levain writer. Default is a day old — an
-    unambiguous corpse.
+    unambiguous corpse. ``bound=True`` leaves the wrap token-bound, as a consolidate that handed
+    anneal its own token (``prepare_wrap(wrap_token=...)``) leaves it.
     """
     from datetime import datetime, timedelta, timezone
 
     with Store(str(db), section_schema=None) as store:
         ids = [str(e.id) for e in store.episodes_since_wrap()]
-        store.wrap_started(token="orphan-token", episode_ids=ids)
+        store.wrap_started(token="orphan-token", episode_ids=ids, token_bound=bound)
         # Backdate it directly, because the age is what the guard reads and a test that could only
         # produce "now" would silently exercise the recent-wrap branch while claiming to test decay.
         when = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat().replace(
@@ -331,31 +332,103 @@ def test_timeout_during_compose_cancels_the_wrap_and_exits_5(tmp_path, capsys, m
         assert store.get_wrap_started_at() is None
 
 
-def test_a_timeout_BEFORE_the_token_exists_still_cancels(tmp_path, monkeypatch):
-    """THE NARROW WINDOW `_cancel_our_wrap` exists for, and the reason it is not just
-    `_cancel_if_ours`.
+def test_a_timeout_inside_prepare_cancels_by_the_token_levain_minted(tmp_path, monkeypatch):
+    """THE NARROW WINDOW the token is minted early for.
 
     anneal marks a wrap started inside `prepare_wrap`, so an out-of-band exit can land after the
-    store says "in progress" but before a token has been returned to us. Deferring to the
-    token-MATCHING guard there would compare `None` against a real token, decline to cancel, and
-    strand the wrap — the exact outcome the handler is trying to prevent. We hold the exclusive
-    lock, so cancelling whatever is in progress is provably cancelling our own work.
+    store says "in progress" but before `prepare_wrap` has returned. Levain hands anneal its own
+    token (`wrap_token=`) before the call, so the exit handler holds the token that names the open
+    wrap and cancels by it. The wrap.lock proves nothing about a non-Levain client (an
+    `anneal-memory` CLI or MCP call never takes it), so a tokenless cancel here could clear that
+    client's wrap; the compare-and-swap cannot.
     """
     ent = _openhands_entity(tmp_path)
     db = _with_store(ent)
 
     from anneal_memory import continuity as cont
     real_prepare = cont.prepare_wrap
+    given: list[str] = []
 
     def _prepare_then_stall(store, **kw):
+        given.append(kw.get("wrap_token"))
         real_prepare(store, **kw)          # the store now records a wrap in progress …
-        raise TurnTimeout(30.0)            # … and we never receive its token
+        raise TurnTimeout(30.0)            # … and prepare_wrap never returns
+
+    cancels: list[dict] = []
+    real_cancel = Store.wrap_cancelled
+
+    def _spy(self, **kw):
+        cancels.append(kw)
+        return real_cancel(self, **kw)
 
     monkeypatch.setattr(cont, "prepare_wrap", _prepare_then_stall)
+    monkeypatch.setattr(Store, "wrap_cancelled", _spy)
 
     assert wrap_entity(ent, max_seconds=30) == EXIT_TIMEOUT
+    assert len(given) == 1 and isinstance(given[0], str) and len(given[0]) == 32
+    assert cancels and all(c.get("expect_token") == given[0] for c in cancels), cancels
+    monkeypatch.undo()
     with Store(str(db), section_schema=None) as store:
-        assert store.get_wrap_started_at() is None, "a tokenless timeout stranded the wrap"
+        assert store.get_wrap_started_at() is None, "a timeout inside prepare stranded the wrap"
+
+
+def test_a_wall_clock_stop_inside_the_store_error_handler_still_cancels_by_token(tmp_path, monkeypatch, capsys):
+    """codex MED (0.5.7 rounds): a TurnTimeout raised while the `except AnnealMemoryError` handler was
+    cancelling escaped the sibling `except BaseException` clause (a sibling does not catch what a
+    handler raises), so the wrap stayed open. The first cancel here is the one that gets cut short."""
+    from anneal_memory import AnnealMemoryError
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+
+    real_read = Store.section_schema_for_wrap
+
+    def failing_read_from_levain(self):
+        import sys
+        if sys._getframe(1).f_globals.get("__name__") == "levain.wrap":
+            raise AnnealMemoryError("simulated schema read failure")
+        return real_read(self)
+
+    cancels: list[dict] = []
+    real_cancel = Store.wrap_cancelled
+
+    def _stop_the_first_cancel(self, **kw):
+        cancels.append(kw)
+        if len(cancels) == 1:
+            raise TurnTimeout(30.0)
+        return real_cancel(self, **kw)
+
+    monkeypatch.setattr(Store, "section_schema_for_wrap", failing_read_from_levain)
+    monkeypatch.setattr(Store, "wrap_cancelled", _stop_the_first_cancel)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    assert wrap_entity(ent, max_seconds=30) == EXIT_TIMEOUT
+    assert len(cancels) == 2 and all(c.get("expect_token") for c in cancels)
+    assert cancels[0]["expect_token"] == cancels[1]["expect_token"]
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
+
+
+@pytest.mark.parametrize("kind", ["unattended self-heal", "operator --reset"])
+def test_a_token_bound_orphan_from_an_earlier_levain_wrap_is_still_discarded(tmp_path, capsys, monkeypatch, kind):
+    """A wrap Levain opens carries a caller token, and anneal refuses a TOKENLESS cancel of a
+    token-bound wrap. The orphan-discard and `--reset` paths used to call a bare cancel, which would
+    now raise and leave every later consolidate refusing: the stranded-seat failure the self-heal
+    exists to prevent. The self-heal cancels by the token it observed; `--reset` is the operator's
+    explicit recovery and forces."""
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent)
+    _strand_a_wrap(db, bound=True)
+    monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: _VALID_NEOCORTEX)
+
+    if kind == "unattended self-heal":
+        assert wrap_entity(ent, unattended=True) == 0
+    else:
+        assert wrap_entity(ent, reset=True) == 0
+    assert (ent / ".levain" / "memory.continuity.md").exists()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is None
 
 
 def test_keyboard_interrupt_also_cancels_rather_than_stranding(tmp_path, monkeypatch):

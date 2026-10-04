@@ -28,8 +28,8 @@ from its own invocation, under both bounds above.
 
 The consolidate is anneal's three-beat move, and we COMPOSE with anneal's API (never reinvent it):
 
-  1. ``prepare_wrap(store, crystal_store=…)`` — mint a ``wrap_token``, freeze the episode window,
-     and emit the compression package (episodes + current memory + stale-pattern warnings + the
+  1. ``prepare_wrap(store, crystal_store=…, wrap_token=…)`` — anneal opens the wrap under Levain's token,
+     freeze the episode window, and emit the compression package (episodes + current memory + stale-pattern warnings + the
      compression INSTRUCTIONS themselves + association context).
   2. **compose** — the ONE cognitive beat: a mind reads the package and writes the
      neocortex. For a SOVEREIGN entity that mind is its OWN model (the same open Ollama model
@@ -63,6 +63,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -261,30 +262,41 @@ def _orphan_is_stale(started: object, bound: float | None) -> bool:
     return age >= horizon
 
 
-def _cancel_our_wrap(store: object, wrap_token: object) -> None:
-    """Cancel an in-progress wrap on the OUT-OF-BAND exit path (timeout / interrupt / refusal).
+def _cancel_our_wrap(store: object, wrap_token: str) -> None:
+    """Cancel our wrap on the OUT-OF-BAND exit path (timeout / interrupt / refusal), by TOKEN.
 
-    The sibling of :func:`_cancel_if_ours`, and the difference is exactly the ``wrap_token is None``
-    case. That function is a *race* guard: it compares tokens because, without the process lock, the
-    in-progress wrap might be a peer's. This one runs only from the ``except BaseException`` clause,
-    where we are still holding the exclusive ``wrap.lock`` — so a peer's wrap CANNOT be what is in
-    progress, and the token comparison is not the thing standing between us and someone else's work.
-
-    Why that distinction earns its own function rather than a flag: an out-of-band exit can land
-    BEFORE ``prepare_wrap`` returns a token, in the narrow window where anneal has already marked the
-    wrap started. Deferring to the token-matching guard there would compare ``None`` against a real
-    token, decline to cancel, and strand the wrap — the precise outcome the caller is trying to
-    prevent. So with no token in hand we cancel whatever we ourselves started, which the lock proves
-    is ours.
+    The sibling of :func:`_cancel_if_ours` for the ``except BaseException`` clause. Levain mints the
+    token BEFORE ``prepare_wrap`` and hands it to anneal (``wrap_token=``), so an exit that lands
+    inside ``prepare_wrap``, after anneal has marked the wrap started and before it returned,
+    still holds the token that names that wrap. The cancel is anneal's compare-and-swap: it clears
+    the wrap only if it carries this token, so it cannot clear a wrap some other program started
+    (``wrap.lock`` is Levain's own lock; an ``anneal-memory`` CLI or MCP client never takes it). A
+    wrap opened with a caller token is also token-bound in anneal, so no tokenless cancel can clear
+    it by accident. Before ``prepare_wrap`` has opened anything the compare finds the store idle and
+    does nothing.
 
     Never raises: cleanup must not replace the exception it is cleaning up after."""
     try:
-        if wrap_token:
-            _cancel_if_ours(store, wrap_token)
-        elif _wrap_in_progress(store):
-            store.wrap_cancelled()  # type: ignore[attr-defined]
+        _cancel_if_ours(store, wrap_token)
     except Exception as exc:  # noqa: BLE001 — never mask the out-of-band exit being propagated
         _log.debug("out-of-band wrap cancel skipped (%s): %s", type(exc).__name__, exc)
+
+
+def _discard_prior_wrap(store: object, *, reset: bool) -> None:
+    """Clear the PRIOR run's wrap that this run found open (``--reset``, or the unattended self-heal).
+
+    A wrap Levain opened carries a caller token, and anneal refuses a tokenless cancel of a
+    token-bound wrap. ``--reset`` is the operator's explicit recovery, so it forces. The unattended
+    self-heal has only the lock and the wrap's age as proof, so it cancels by the token it observed:
+    a wrap that changed hands in between raises ``WrapOwnershipError`` instead of being cleared."""
+    if reset:
+        store.wrap_cancelled(force=True)  # type: ignore[attr-defined]
+        return
+    observed = store.wrap_bound_token()  # type: ignore[attr-defined]
+    if observed:
+        store.wrap_cancelled(expect_token=observed)  # type: ignore[attr-defined]
+    else:
+        store.wrap_cancelled()  # type: ignore[attr-defined]
 
 
 # The compose instructions — the framing around anneal's own package (which carries the authoritative
@@ -566,11 +578,11 @@ def _consolidate(
         )
         return 2
 
-    # Bound BEFORE the try so the `except BaseException` cleanup can read it no matter how early an
-    # out-of-band exit lands. `None` is the honest "we never got a token"; `_cancel_our_wrap` knows
-    # how to handle that case, and a `NameError` inside a cleanup path would replace a recoverable
-    # stranded wrap with an unrecoverable traceback.
-    wrap_token: object = None
+    # Minted BEFORE the try and handed to anneal, so every cleanup path holds the token that will
+    # name our wrap even if an out-of-band exit lands inside `prepare_wrap`, and every cancel is a
+    # token compare. `prepare_entered` says whether anneal could have opened a wrap yet.
+    wrap_token = uuid.uuid4().hex
+    prepare_entered = False
 
     try:
         # A partnership entity's store MUST be on the partnership schema — an ops-schema store cannot
@@ -655,7 +667,7 @@ def _consolidate(
                     + extra
                 )
                 return 2
-            store.wrap_cancelled()
+            _discard_prior_wrap(store, reset=reset)
             if unattended and not reset:
                 # SAID, not silent: a seat that keeps self-healing is a seat whose consolidates keep
                 # dying, and the log is the only place an operator can notice that pattern.
@@ -681,7 +693,8 @@ def _consolidate(
             crystal = refuse_crystallization(crystal)  # type: ignore[assignment]
         # NO session_id — that engages flow's parallel-convo consolidate-efferent gate (spore-194),
         # which is meaningless for a single sovereign entity: one entity, one wrap, no baton.
-        result = prepare_wrap(store, crystal_store=crystal)
+        prepare_entered = True
+        result = prepare_wrap(store, crystal_store=crystal, wrap_token=wrap_token)
         status = result.get("status")
         if status == "empty":
             print(
@@ -690,16 +703,15 @@ def _consolidate(
             )
             return 0
         if status != "ready":
-            # No cancel: a non-ready result started no wrap of ours (anneal's "downgraded" leaves the
-            # store untouched and carries no token), so a bare cancel here could only clear a wrap
-            # some other process started meanwhile (codex + complement, the 0.5.7 round). A status
-            # this levain does not know that still carries a token did open one: cancel that by token.
+            # A known non-ready result opened no wrap of ours (anneal's "downgraded" leaves the
+            # store untouched), and a status this levain does not know may have. The cancel is by
+            # our token either way: it clears our wrap if one was opened, and finds nothing to
+            # clear (never a peer's wrap) if not.
             print(f"levain wrap: prepare_wrap returned an unexpected status {status!r} — aborting.")
-            if result.get("wrap_token") and not _cancel_if_ours(store, result.get("wrap_token")):
+            if not _cancel_if_ours(store, wrap_token):
                 print(_CANCEL_FAILED)
             return 1
 
-        wrap_token = result.get("wrap_token")
         # THE AUTHORITATIVE SCHEMA CHECK, at the point of use. The check above runs before the wrap
         # exists, so another process could change the schema in between (codex, the 0.5.6 fix-diff
         # round, reproduced: the wrap saved under the ops schema). The schema read here is the one
@@ -850,7 +862,14 @@ def _consolidate(
         # read, prepare_wrap itself) nothing was written: anneal marks the wrap in progress LAST.
         # AFTER it, a wrap of ours is open, and returning without cancelling stranded it (codex,
         # the 0.5.6 hunk look), so any wrap still carrying our token is cancelled first.
-        cancelled = _cancel_if_ours(store, wrap_token) if wrap_token is not None else True
+        # A wall-clock stop landing INSIDE this handler is a BaseException, which the sibling
+        # clause below cannot see (a sibling does not catch what a handler raises), so the cancel
+        # is guarded here as well.
+        try:
+            cancelled = _cancel_if_ours(store, wrap_token) if prepare_entered else True
+        except BaseException:
+            _cancel_our_wrap(store, wrap_token)
+            raise
         print(
             f"levain wrap: the consolidate could not read {entity_dir.name}'s store "
             f"({type(exc).__name__}: {exc})."
