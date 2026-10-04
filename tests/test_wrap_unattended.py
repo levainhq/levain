@@ -499,7 +499,7 @@ def test_reset_with_unreadable_wrap_metadata_changes_nothing_and_names_the_entit
     from levain.manifest import anneal_invocation
     assert anneal_invocation("--db", str(db), "wrap-status") in out
     assert anneal_invocation("--db", str(db), "wrap-cancel", "--partial") in out
-    assert "--wrap-token" in out and "~/.anneal-memory" in out
+    assert "--wrap-token" in out and "not 32 hex" in out and "~/.anneal-memory" in out
     monkeypatch.undo()
     with Store(str(db), section_schema=None) as store:
         assert store.load_wrap_snapshot()["token"] == "orphan-token", "the wrap was cleared"

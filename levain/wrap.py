@@ -711,8 +711,11 @@ def _consolidate(
                       "with\n"
                       f"  {anneal_invocation('--db', str(episodic_path), 'wrap-cancel', '--partial')}\n"
                       "or a readable one with that same command and `--wrap-token <its token>` in "
-                      "place of `--partial`. Keep the `--db` shown here: without it anneal reads "
-                      "~/.anneal-memory.")
+                      "place of `--partial`. If the status shows a token that is not 32 hex "
+                      "characters, anneal will not take it as `--wrap-token`: the same command with "
+                      "no flag then clears whatever wrap is current, so run it straight after "
+                      "wrap-status and only if that wrap is the dead one. Keep the `--db` shown "
+                      "here: without it anneal reads ~/.anneal-memory.")
                 return 2
             if not discarded:
                 print("levain wrap: the prior wrap was already gone; continuing.")
