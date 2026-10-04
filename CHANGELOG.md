@@ -34,6 +34,9 @@ Team context: one project's decisions shared across a team of engineers, with gi
 - If two clones that share a device id have BOTH committed entries, `levain team join --new-device` does not move the copy's already-committed entries to its new file: reset the copy's ledger to the remote (`git -C .git/levain-team/worktree reset --hard origin/levain-ledger`) and record them again.
 - Two `pack-sync` runs from two different owner clones at the same time can leave two versions of one pack rule in force until the next `pack-sync` (one run at a time per clone is enforced).
 - If a member's email changes in `team.toml`, lines they added under the old email stop being enforced until the change is reverted or the entries are recorded again.
+- When a sync must replay local commits after a `team.toml`/`PROJECT.md` conflict: in a clone whose `.git` was copied from another (shared device id) AND that has `rerere.enabled` with `rerere.autoupdate`, a local entry can be skipped as "already upstream". Run `levain team join --new-device` in a copied clone, and do not enable rerere autoupdate for the ledger worktree.
+- In that same replay, commits whose clocks were skewed can replay out of order, and a cherry-pick that fails for an unrelated reason (a stale `index.lock`) is reported with the wrong cause. The sync stops and nothing is lost; `levain team doctor` and the worktree at `.git/levain-team/worktree` show the state.
+- A member with push access who recommits another member's line under their own name makes that line count as theirs, so it is not enforced, and reports it. Part of the trust boundary above.
 
 ## [0.5.12] — 2026-10-04
 
