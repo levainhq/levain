@@ -499,7 +499,7 @@ def test_a_schema_change_before_the_wrap_starts_cancels_it(tmp_path, monkeypatch
     monkeypatch.setattr(wrapmod, "_compose", lambda *a, **k: composed.append(k) or _VALID_NEOCORTEX)
 
     assert wrap_entity(ent) == 2
-    assert "cancelled; nothing was saved" in capsys.readouterr().out
+    assert "stopped; nothing was saved" in capsys.readouterr().out
     assert composed == []
     assert not (ent / ".levain" / "memory.continuity.md").exists()
     with Store(str(db), section_schema=None) as store:
@@ -576,3 +576,57 @@ def test_cancel_if_ours_leaves_another_tokens_wrap_alone(tmp_path):
         assert store.get_wrap_started_at() is not None
         wrapmod._cancel_if_ours(store, result["wrap_token"])
         assert store.get_wrap_started_at() is None
+
+
+def test_a_non_ready_prepare_cancels_nothing(tmp_path, monkeypatch, capsys):
+    """codex + complement, the 0.5.7 round: a non-ready prepare_wrap started no wrap of ours, so the
+    bare cancel that followed could only clear a wrap another process opened meanwhile."""
+    import anneal_memory.continuity as cont
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    real_prepare = cont.prepare_wrap
+    peer = {}
+
+    def a_peer_wraps_then_ours_downgrades(store, **kw):
+        with Store(str(db), section_schema=None) as other:
+            peer["token"] = real_prepare(other)["wrap_token"]
+        return {"status": "downgraded", "wrap_token": None, "message": "simulated"}
+
+    monkeypatch.setattr(cont, "prepare_wrap", a_peer_wraps_then_ours_downgrades)
+    assert wrap_entity(ent) == 1
+    assert "unexpected status 'downgraded'" in capsys.readouterr().out
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.load_wrap_snapshot()["token"] == peer["token"]
+
+
+def test_cancel_if_ours_without_a_token_clears_nothing(tmp_path):
+    """complement, the 0.5.7 round: expect_token=None is anneal's bare cancel."""
+    from anneal_memory.continuity import prepare_wrap
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+    with Store(str(db), section_schema=None) as store:
+        assert prepare_wrap(store).get("status") == "ready"
+        assert wrapmod._cancel_if_ours(store, None) is True
+        assert store.get_wrap_started_at() is not None
+
+
+def test_a_dry_run_whose_cancel_fails_is_not_a_success(tmp_path, monkeypatch, capsys):
+    """codex, the 0.5.7 round: a failed cancel was swallowed and the dry run reported success
+    while its wrap stayed open."""
+    from anneal_memory import StoreError
+
+    ent = _openhands_entity(tmp_path)
+    db = _with_store(ent, episodes=2)
+
+    def locked(self, **kw):
+        raise StoreError("simulated: database is locked")
+
+    monkeypatch.setattr(Store, "wrap_cancelled", locked)
+    assert wrap_entity(ent, dry_run=True) == 1
+    assert "could NOT be cancelled" in capsys.readouterr().out
+    monkeypatch.undo()
+    with Store(str(db), section_schema=None) as store:
+        assert store.get_wrap_started_at() is not None
