@@ -37,7 +37,7 @@ def _entry_block(e: dict, team: R.Team) -> list[str]:
         out.append(f"  why: {I.oneline(e['reason'])}")
     if e.get("recheck"):
         out.append(f"  re-check: `{I.oneline(e['recheck'])}`")
-    return out
+    return [I.oneline(x) for x in out]   # every line, whatever field fed it (see index.render)
 
 
 def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> str:

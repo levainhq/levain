@@ -66,8 +66,11 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
     except tomllib.TOMLDecodeError as exc:
         raise RolesError(f"{where} is not valid TOML: {exc}") from None
     try:
-        t = Team(project=str(raw["project"]), owner=str(raw["owner"]),
-                 members={str(k): str(v) for k, v in dict(raw.get("members", {})).items()},
+        # Folded on read, so a team.toml written before the printable rule still loads (refusing it would roll the
+        # roster back or drop the whole team); writers go through validate_team with the folded name.
+        project = " ".join("".join(c if c.isprintable() else " " for c in str(raw["project"])).split())
+        t = Team(project=project, owner=str(raw["owner"]),
+                 members={str(k): str(v).strip() for k, v in dict(raw.get("members", {})).items()},
                  client_owners=raw.get("client_owners", []),
                  mode=str(raw.get("mode", "ask-once")), fetch_interval=int(raw.get("fetch_interval", 300)))
     except (KeyError, TypeError, ValueError) as exc:
@@ -88,10 +91,15 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
     for h, mail in t.members.items():
         if h.lower().startswith("pack-"):
             raise RolesError(f"{where}: member handle {h!r} is reserved (pack-* is where pack rules are filed)")
-        if not HANDLE_RE.fullmatch(h):
-            raise RolesError(f"{where}: member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]*")
-        if "@" not in mail:
-            raise RolesError(f"{where}: member {h!r} needs an email (it maps git's user.email to the handle)")
+        if not HANDLE_RE.fullmatch(h) or safe_handle(h) != h:
+            # A handle IS its ledger folder name: one ending in '-' or '.' would share a folder with its trimmed
+            # twin across a rename (L3 codex), so it is refused rather than mapped.
+            raise RolesError(f"{where}: member handle {h!r} must match [A-Za-z0-9][A-Za-z0-9._-]* and must not "
+                             "end with '-' or '.'")
+        if not re.fullmatch(r"[^\s<>]+@[^\s<>]+", mail):
+            # git records the bare address (it drops <> and surrounding space), and uniqueness must be checked on
+            # what git records, or two members share one identity in history (L3 codex).
+            raise RolesError(f"{where}: member {h!r} needs a bare email address (no spaces, < or >): {mail!r}")
     if not isinstance(t.client_owners, list) or not all(isinstance(c, str) for c in t.client_owners):
         raise RolesError(f"{where}: client_owners must be a list of names")
     # Two handles that reach the same ledger folder (safe_handle strips a trailing '-' or '.', and a

@@ -296,4 +296,6 @@ def render(e: dict) -> str:
         bits.append(f"  governs: {oneline(', '.join(e['paths']))}")
     if e.get("recheck"):
         bits.append(f"  re-check: {oneline(e['recheck'])}")
-    return "\n".join(bits)
+    # One fold over every line this emits, whatever field fed it: per-field folding missed a new field each review
+    # round (spore-813), and a line break in any of them draws a forged line in an agent's context.
+    return "\n".join(oneline(b) for b in bits)

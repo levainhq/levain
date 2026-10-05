@@ -84,11 +84,12 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
         if handle is None:
             how.append("(This clone's git user.email maps to no member of the team, so every ruling here counts "
                        "as someone else's: `levain team doctor` shows the mapping.)")
-        text = f"{head} Read it before changing this file.\n\n{blocks}\n\nWhat to do: " + " ".join(how)
+        text = (f"{I.oneline(head)} Read it before changing this file.\n\n{blocks}\n\nWhat to do: "
+                + " ".join(I.oneline(h) for h in how))
         return Decision(deny=True, text=text, newly_denied={e["id"] for e in pending})
     acks = [e["id"] for e in once if e["id"] in denied_before and e["id"] not in acked]
     lead = "Proceeding is allowed; stay within these." if foreign else "For your information:"
-    return Decision(deny=False, text=f"{head} {lead}\n\n{blocks}", ack=acks)
+    return Decision(deny=False, text=f"{I.oneline(head)} {lead}\n\n{blocks}", ack=acks)
 
 
 # ---- I/O -----------------------------------------------------------------------------------------------------
@@ -99,7 +100,7 @@ def _out(obj: dict) -> None:
 
 
 def _fail_open(event: str, reason: str) -> None:
-    line = f"[team] ledger unavailable: {reason}"
+    line = f"[team] ledger unavailable: {I.oneline(reason)}"
     _out({"systemMessage": line,
           "hookSpecificOutput": {"hookEventName": event, "additionalContext": line}})
 
@@ -198,6 +199,7 @@ def pretooluse(payload: dict) -> None:
         notes.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
         notes.append(f"[team] ledger integrity: {len(ledger.problems)} problem(s); run `levain team verify`")
+    notes = [I.oneline(n) for n in notes]   # a warning or a fetch error can carry git or ledger text
     if d is None:
         if notes:
             _out({"systemMessage": notes[0],
@@ -210,7 +212,7 @@ def pretooluse(payload: dict) -> None:
                 gl.mark_denied(session, d.newly_denied)
             except OSError as exc:
                 # Not remembering the deny means the next attempt is denied again: never a reason to allow.
-                text += f"\n\n[team] could not record this denial ({exc}); a retry will be denied again"
+                text += f"\n\n[team] could not record this denial ({I.oneline(str(exc))}); a retry will be denied again"
         _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                      "permissionDecisionReason": text}})
         return
@@ -320,7 +322,7 @@ def sessionstart(payload: dict) -> None:
     note = anneal_import(gl, ledger, tree, team.owner)
     if note:
         lines.append(note)
-    text = "\n".join(lines)
+    text = "\n".join(I.oneline(line) for line in lines)   # every assembled line, whatever fed it
     _out({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}})
 
 
