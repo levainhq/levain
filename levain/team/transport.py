@@ -19,6 +19,7 @@ import hashlib
 import fcntl
 import json
 import os
+import stat
 import random
 import re
 import secrets
@@ -73,7 +74,7 @@ def _added_removed(old: list[bytes], new: list[bytes]) -> tuple[list[bytes], lis
     """Lines added and removed between two versions of a file, in linear time (a hook runs this).
 
     Append-only is the shape levain writes, so it is the fast path; anything else is a set difference with order
-    kept, which is also what the retired quadratic diff reduced to for the question asked here."""
+    kept. Duplicate lines are not counted (a hash-chained file holds none), so this is not a multiset diff."""
     if new[:len(old)] == old:
         return new[len(old):], []
     sold, snew = set(old), set(new)
@@ -95,7 +96,8 @@ _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false",
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
-    env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
+    env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
+               GIT_NO_REPLACE_OBJECTS="1")   # a replace ref must not change what levain reads
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     # Bytes in, bytes out: text=True would decode with the parent's locale and turn a CR into a line break. The
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
@@ -352,7 +354,8 @@ class GitLedger:
         grammar, or is not a regular file (a gitlink, a symlink), is tamper, however it got there (a merge
         resolution included), and deleting it clears the refusal. Paths are compared as BYTES; a tamper path or
         gitlink is never read. History only attributes the lines of canonical paths: a non-canonical path in history
-        was refused while it existed and is skipped silently. No human display format of git is parsed: commits
+        was refused while it existed and is skipped silently, and so is a symlink or gitlink AT a canonical path in
+        history (the tip check still refuses it if it is still there). No human display format of git is parsed: commits
         from ``log -z``, paths from ``diff-tree -z --raw`` / ``ls-tree -z``, contents from ``cat-file --batch``.
         """
         top = self.repo.toplevel
@@ -360,6 +363,23 @@ class GitLedger:
         if cp.returncode != 0:
             raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
+        # An entry named exactly `ledger` that is not a directory is invisible to the pathspec above (and levain's
+        # own write would follow it out of the worktree), so it is read non-recursively and refused as tamper.
+        root = git(["ls-tree", "-z", "--full-tree", rev, "--", "ledger"], top, check=False, timeout=30)
+        if root.returncode != 0:
+            raise TeamError(f"could not read the ledger tree: {_tail(root)}")
+        root_attr = ""
+        for rec in root.stdout_bytes.split(b"\0"):
+            if not rec:
+                continue
+            meta, tab, path = rec.partition(b"\t")
+            fields = meta.split(b" ")
+            if not tab or len(fields) != 3:
+                raise TeamError("git ls-tree gave a record levain cannot read")
+            if path == b"ledger" and not (fields[0] == b"040000" and fields[1] == b"tree"):
+                bad_paths.append(path)
+                root_attr = git(["log", "-1", "--no-show-signature", "--format=%ae in commit %h", rev, "--", "ledger"],
+                                top, check=False, timeout=30).stdout.strip()
         for rec in cp.stdout_bytes.split(b"\0"):
             if not rec:
                 continue
@@ -370,7 +390,8 @@ class GitLedger:
             if not (_LEDGER_PATH_RE.fullmatch(path) and fields[0] in _REGULAR_MODES and fields[1] == b"blob"):
                 bad_paths.append(path)
 
-        cp = git(["log", "-z", "--reverse", "--topo-order", "--full-history", "--no-merges", "--format=%H%x1f%ae",
+        cp = git(["log", "-z", "--reverse", "--topo-order", "--full-history", "--no-merges", "--no-show-signature",
+                  "--format=%H%x1f%ae",
                   rev, "--", "ledger/"], top, check=False, timeout=60)
         if cp.returncode != 0:
             raise TeamError(f"could not read the ledger history: {_tail(cp)}")
@@ -397,7 +418,7 @@ class GitLedger:
             if cp.returncode != 0:
                 raise TeamError(f"could not read commit {sha[:10]}: {_tail(cp)}")
             if merge:
-                mail = git(["log", "-1", "--format=%ae", sha], top, timeout=30).stdout.strip()
+                mail = git(["log", "-1", "--no-show-signature", "--format=%ae", sha], top, timeout=30).stdout.strip()
             parts = cp.stdout_bytes.split(b"\0")
             i = 0
             while i + 1 < len(parts) and parts[i].startswith(b":"):
@@ -407,7 +428,11 @@ class GitLedger:
                 if len(meta) != 5:
                     raise TeamError(f"git diff-tree gave a record levain cannot read in {sha[:10]}")
                 if meta[4][:1] != b"D":
-                    last_by[path] = f"{mail} in commit {sha[:10]}"
+                    # a merge names the merger, not the writer: it only attributes a path no plain commit wrote
+                    if merge:
+                        last_by.setdefault(path, f"{mail} in commit {sha[:10]}")
+                    else:
+                        last_by[path] = f"{mail} in commit {sha[:10]}"
                 if merge or not _LEDGER_PATH_RE.fullmatch(path):
                     continue
                 old_mode, new_mode = meta[0], meta[1]
@@ -419,7 +444,8 @@ class GitLedger:
         tamper: list[str] = []
         for path in bad_paths:
             shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
-            who = E._printable(" ⏎ ".join(last_by.get(path, "an author git does not attribute").splitlines()))
+            who = last_by.get(path) or (root_attr if path == b"ledger" else "") or "an author git does not attribute"
+            who = E._printable(" ⏎ ".join(who.splitlines()))
             tamper.append(f"{shown!r} (written by {who}) is not a file levain writes")
 
         # Only regular files of canonical paths are ever read: never a tamper path, never a gitlink.
@@ -663,6 +689,17 @@ class GitLedger:
     def _commit(self, message: str) -> None:
         git(["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message], self.wt)
 
+    def _refuse_symlinked_dirs(self, path: Path) -> None:
+        """Never write through a link: ``<wt>/ledger`` and ``<wt>/ledger/<handle>`` must not be symlinks (lstat,
+        never followed), and neither the file itself."""
+        for p in (self.wt / "ledger", path.parent, path):
+            try:
+                if stat.S_ISLNK(os.lstat(p).st_mode):
+                    raise TeamError(f"{p.relative_to(self.wt).as_posix()} in the ledger worktree is a symlink; "
+                                    "refusing to write through it")
+            except FileNotFoundError:
+                continue
+
     def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
         """Validate, seal and append one entry to this author's file for this clone; commit; push.
 
@@ -673,6 +710,9 @@ class GitLedger:
         with self.lock(timeout=lock_timeout):
             self._recover_dirty()
             ledger = self.ledger()
+            if ledger.tamper:
+                raise TeamError("the team ledger is refused as tampered (" + "; ".join(ledger.tamper[:3]) +
+                                "); nothing was written. The owner removes those files from the ledger branch.")
             E.validate(entry, known=ledger.by_id)
             for s in entry.get("supersedes", []):
                 target = ledger.by_id[s]
@@ -683,6 +723,7 @@ class GitLedger:
             rel = path.relative_to(self.wt / "ledger").as_posix()
             prev = next((f.last_hash for f in ledger.files if f.rel == rel), "")
             sealed = E.seal(entry, prev)
+            self._refuse_symlinked_dirs(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
             with open(path, "a+b") as fh:

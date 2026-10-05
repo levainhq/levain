@@ -404,6 +404,35 @@ def test_the_tamper_refusal_clears_when_the_bad_file_is_deleted(two):
     assert "REFUSED as tampered" not in json.dumps(after)
 
 
+@pytest.mark.parametrize("kind", ["symlink", "blob"])
+def test_a_ledger_entry_that_is_not_a_directory_is_tamper_and_nothing_is_written_through_it(two, kind):
+    # `ledger` itself as a symlink or a plain file is invisible to a `ledger/` pathspec; it must still be refused,
+    # and levain's own write must never follow it out of the worktree.
+    tmp, ana, ben = two
+    outside = tmp / "outside"
+    outside.mkdir()
+    gl = GitLedger(Repo.discover(ana))
+    git("rm", "-rq", "ledger", cwd=gl.wt)
+    shutil.rmtree(gl.wt / "ledger", ignore_errors=True)
+    if kind == "symlink":
+        (gl.wt / "ledger").symlink_to(outside)
+    else:
+        (gl.wt / "ledger").write_text("not a directory\n")
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "ledger is not a directory", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 0
+    reason = edit(ben, "src/unrelated.py", session="n1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "'ledger'" in reason and "ana@ex.com" in reason
+    assert team("status", "--path", "src/a.py", repo=ben) == 3
+    try:
+        rc = record_ruling(ben, "src/a.py", "must not land")
+    except Exception:
+        rc = 1
+    assert rc != 0
+    assert list(outside.iterdir()) == []                               # nothing was written through the link
+
+
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
     from levain.team.export import _label
     rels = ["ana/a.jsonl", "ana/device!.jsonl", "ana/other!.jsonl", "unnamed-0-" + "0" * 64, "ana/" + "x" * 300 + ".jsonl"]
