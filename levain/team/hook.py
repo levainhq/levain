@@ -60,10 +60,10 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     acked = ledger.acked(session, handle) if session else set()
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
-    owners = sorted({e["owner"] for e in tensions + foreign if e.get("owner")})
+    owners = sorted({I.oneline(e["owner"]) for e in tensions + foreign if e.get("owner")})
     blocks = "\n\n".join(I.render(e) for e in matched)
     head = (f"{TAG} {rel} is governed by {len(matched)} recorded entr{'y' if len(matched) == 1 else 'ies'} in "
-            f"the {team.project} team ledger.")
+            f"the {I.oneline(team.project)} team ledger.")
     if always or pending:
         how = []
         if pending:
@@ -296,7 +296,7 @@ def sessionstart(payload: dict) -> None:
     rulings = [e for e in live if e.get("kind") == "ruling"]
     newest = max((e.get("ts", "") for e in ledger.entries), default="")
     handle = gl.handle(team)
-    lines = [f"[team] {team.project}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
+    lines = [f"[team] {I.oneline(team.project)}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
              f"{'y' if len(live) - len(rulings) == 1 else 'ies'} in force; newest entry "
              f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (git user.email unmapped)'}."]
     lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
@@ -305,9 +305,12 @@ def sessionstart(payload: dict) -> None:
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
     show = os.environ.get("LEVAIN_TEAM_SESSIONSTART_RULINGS", "").lower() not in ("0", "off", "false", "no")
     for e in (rulings[:15] if show else []):
-        where = ", ".join(e.get("paths") or ["(project-wide)"])
-        words = e.get("words", "")
-        lines.append(f"  - {where}: owner {e.get('owner')}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
+        # Every ledger-supplied string goes through oneline: a member writes these, and a line break in
+        # them would draw a forged "[team]" line into every teammate's session context.
+        where = I.oneline(", ".join(e.get("paths") or ["(project-wide)"]))
+        words = I.oneline(e.get("words", ""))
+        owner = I.oneline(str(e.get("owner")))
+        lines.append(f"  - {where}: owner {owner}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
     if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
     if fetch_note:
