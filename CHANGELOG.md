@@ -4,6 +4,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [0.6.7] — 2026-10-05
+
+Chat panel polish from the first click-through.
+
+### Changed
+
+- **Enter sends a chat message; Shift+Enter starts a new line.** Only in the message box, and not while an input method is composing a character. No key approves or rejects a held action: the decision buttons are clicks, and Enter in the reject reason only starts a new line.
+- **The reject reason is a one-line field that grows as you type.** It rendered as a tall box with the placeholder centred vertically.
+
 ## [0.6.6] — 2026-10-05
 
 The cockpit chat panel, with a consent box that asks you to approve the tool call itself and binds the approval to it. BREAKING for chat API clients: approve needs the current decision id.
