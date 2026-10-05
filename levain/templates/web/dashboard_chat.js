@@ -230,6 +230,7 @@
     poll(jobId, myRun, (j) => {
       live.textContent = "";
       const res = j.result;
+      if (j.status === "lost") { failure(j.error); resync(myRun); return; }
       if (j.status !== "done" || !res) {   // failed, lost, unknown: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
@@ -255,12 +256,37 @@
   function endOfTurn(stuck) { setComposeEnabled(!stuck); if (!stuck && area) area.focus(); }
 
   // ---- the consent surface ------------------------------------------------------------------------------------
-  // Control and format characters (bidi overrides, zero-width, ESC, other C0/C1) can make one string read as
-  // another, so inside the consent box they are shown as \u{XXXX}; newline and tab stay as they are.
+  // Nothing in the consent box may hide or alias what it shows, so the mapping is injective: a backslash is
+  // escaped FIRST (a typed "\\u{200B}" cannot pass for the escape of a zero-width space), then every control
+  // (Cc) and format (Cf) character, bidi overrides, ESC, tab and CR included, is shown as \u{XXXX}. Only the
+  // newline stays, because a multi-line action is shown line by line. Python's levain.firing.gate.visible is
+  // the same rule.
   function visible(text) {
-    return String(text).replace(/[\p{Cc}\p{Cf}]/gu, (c) => {
-      if (c === "\n" || c === "\t") return c;
+    return String(text).replace(/[\\\p{Cc}\p{Cf}]/gu, (c) => {
+      if (c === "\\") return "\\\\";
+      if (c === "\n") return c;
       return "\\u{" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "}";
+    });
+  }
+  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that:
+  // used when a decision was not accepted or contact with a job was lost, where this page can no longer say
+  // what is held. A gated session comes back with its CURRENT decision id and held set, so it can be decided
+  // again; the id is only ever taken from the server's answer. Reads only: it never POSTs.
+  function resync(myRun) {
+    if (!session) return;
+    live.textContent = "reading the session…";
+    api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
+      if (myRun !== run) return;
+      live.textContent = "";
+      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      const s = r.json || {};
+      if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
+        showConsent(s.pending, s.decision_id, myRun); return;
+      }
+      if (r.status === 200 && s.state === "busy" && s.job_id) { followJob(s.job_id, myRun); return; }
+      if (r.status === 200 && s.state === "idle") { endOfTurn(false); return; }
+      failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
+      endOfTurn(true);
     });
   }
   function showConsent(pending, decisionId, myRun) {
@@ -301,6 +327,7 @@
     function decided(j) {
       deciding = false; box.remove();
       const res = j.result;
+      if (j.status === "lost") { failure(j.error); resync(myRun); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -321,10 +348,12 @@
         endOfTurn(true); return;
       }
       if (r.status !== 202 || !r.json.job_id) {
-        // Not retried: the operator may look at the session and decide again with a fresh click. A re-armed
-        // click is bound to this box's decision id, so it cannot approve anything the box does not show.
-        deciding = false; failure("The decision was not accepted: " + why(r));
-        approve.disabled = false; reject.disabled = false; reasonIn.disabled = false; return;
+        // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If
+        // the halt is still undecided it comes back with its decision id and the set to show, and a fresh
+        // box is built from that, never from this one.
+        deciding = false; box.remove();
+        failure("The decision was not accepted: " + why(r));
+        resync(myRun); return;
       }
       live.textContent = "working…";
       poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });

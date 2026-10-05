@@ -76,6 +76,7 @@ gates", and be wrong. So the stock names are what this matches, and a test pins 
 """
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -94,6 +95,7 @@ __all__ = [
     "PendingEfferent",
     "classify_action",
     "resolve_gate_mode",
+    "visible",
 ]
 
 
@@ -216,6 +218,24 @@ def classify_action(
     )
 
 
+def visible(text: str) -> str:
+    """``text`` with nothing hidden, for a surface where the operator decides on what they read. The
+    mapping is INJECTIVE: a backslash is escaped FIRST (so a literal ``\\u{200B}`` typed into a command
+    cannot read as the escape for a zero-width space), then every control (Cc) and format (Cf)
+    character, bidi overrides, ESC, tab and CR included, becomes ``\\u{XXXX}``. Only the newline is
+    left, because a multi-line action is shown line by line. The cockpit panel's ``visible()`` is the
+    same rule."""
+    out = []
+    for ch in str(text):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch != "\n" and unicodedata.category(ch) in ("Cc", "Cf"):
+            out.append("\\u{%04X}" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 @dataclass(frozen=True)
 class PendingEfferent:
     """One action the gate stopped, rendered for a human decision.
@@ -244,7 +264,9 @@ class PendingEfferent:
         mark = "" if self.recognized else "⚠ "
         out = f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
         if self.full and self.full != self.detail:
-            body = "\n".join("        " + ln for ln in self.full.splitlines() or [""])
+            # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
+            # those inert, and the newline it kept is the only line break.
+            body = "\n".join("        " + ln for ln in visible(self.full).split("\n"))
             out += f"\n      the whole action (what approving runs):\n{body}"
         return out
 

@@ -855,3 +855,43 @@ def test_a_held_action_that_RAN_instead_of_being_refused_is_not_a_landed_refusal
 
     assert conv.runs == runs_before
     assert result.error is not None and result.gated is True
+
+
+# ---------- the report lists everything approving runs; `full` is decided by identity ----------
+
+def test_the_report_lists_the_inert_members_of_a_held_batch_because_approve_runs_them():
+    """codex MED r2: a `finish` in a held batch was dropped from the report but executed on approve."""
+    from openhands.sdk.tool.builtins import FinishAction
+
+    conv = _FakeConversation()
+    conv.state.events = [
+        _event("terminal", TerminalAction(command="rm -rf build")),
+        _event("finish", FinishAction(message="all done, nothing to see")),
+    ]
+    report = pending_gate_report(conv)
+    assert [r.tool_name for r in report] == ["terminal", "finish"]
+    assert "all done, nothing to see" in report[1].full and report[1].recognized
+
+
+def test_full_is_decided_by_tool_identity_never_by_a_command_field():
+    """codex MED r2: any action with a `command` field was treated as a terminal, hiding its other fields."""
+    from levain.firing.openhands.gate import _full_for
+
+    terminal_shaped = {"command": "ls", "is_input": False, "timeout": None, "reset": False, "kind": "TerminalAction"}
+    assert _full_for("terminal", terminal_shaped) == "ls"
+    for name in ("some_future_tool", "file_editor", ""):
+        out = _full_for(name, terminal_shaped)
+        assert out != "ls" and '"command": "ls"' in out and '"kind": "TerminalAction"' in out
+    unknown = {"command": "ls", "destination": "evil.example"}      # an unknown tool's extra field
+    assert "evil.example" in _full_for("mcp_tool", unknown)
+
+
+def test_a_value_json_cannot_carry_exactly_gives_an_empty_full_not_a_lossy_rendering():
+    """The old `default=str` printed a datetime/set/bytes as text and presented it as the whole action."""
+    import datetime
+
+    from levain.firing.openhands.gate import _full_for
+
+    for bad in (datetime.datetime(2026, 10, 5), {1, 2}, b"x", float("nan")):
+        assert _full_for("file_editor", {"command": "create", "path": "/x", "extra": bad}) == ""
+    assert _full_for("file_editor", {1: "a", "1": "b"}) == ""        # JSON would merge these two keys

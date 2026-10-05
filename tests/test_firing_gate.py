@@ -292,3 +292,20 @@ def test_an_unrecognized_pending_action_is_marked_for_the_operator():
         tool_name="mystery", detail="?", reason="unrecognized", recognized=False
     ).line()
     assert "⚠" in line, "an unrecognized tool must be visibly flagged in the decision"
+
+
+# ---------- the operator-facing text is injective (visible) ----------
+
+def test_visible_is_injective_over_backslash_tab_cr_and_every_control_or_format_char():
+    from levain.firing.gate import PendingEfferent, visible
+
+    # a typed escape sequence cannot read as the escape of a hidden character
+    assert visible("​") == "\\u{200B}" and visible("\\u{200B}") == "\\\\u{200B}"
+    assert visible("\t") == "\\u{0009}" and visible("\r") == "\\u{000D}" and visible("\x1b") == "\\u{001B}"
+    assert visible("a\nb") == "a\nb"                                  # the one line break kept
+    cases = ["a\\b", "a\tb", "a\\tb", "a\rb", "a\\rb", "‮", "\\u{202E}", "\x1b[2J", "\\x1b[2J"]
+    assert len({visible(c) for c in cases}) == len(cases)
+    # the REPL line shows the whole action through it, and \r no longer splits a line
+    full = "echo a\r\\u{200B}\x1b[2Jrm -rf ~"
+    line = PendingEfferent("terminal", "echo a", "bash fans in", full=full).line()
+    assert "\r" not in line and "\x1b" not in line and "echo a\\u{000D}\\\\u{200B}\\u{001B}[2Jrm -rf ~" in line

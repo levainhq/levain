@@ -1470,3 +1470,68 @@ def test_a_decision_id_is_single_use_even_when_two_holds_are_textually_identical
     assert _wait(host, host.approve(sid, expect=second["decision_id"])["job_id"])["result"]["reply"] == "pushed"
     with pytest.raises(ChatError):
         host.approve(sid, expect=second["decision_id"])                          # spent
+
+
+def _gated_host(tmp_path, extra=()):
+    held = PendingEfferent("terminal", "git push", "network egress", full="git push")
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,)), *extra])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    return host, sid, res, f
+
+
+def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp_path):
+    """Phill 2026-10-05: no approve-by-session-id-alone path. A missing id is refused (400) and does not
+    spend the halt; reject without one stays allowed (it runs nothing); a wrong id is still 409."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    for missing in (None,):
+        with pytest.raises(ChatError) as e:
+            host.approve(sid, missing)
+    assert e.value.code == "decision_id_required" and e.value.http_status == 400
+    assert "expect" in str(e.value) and "/chat/session.json" in str(e.value)
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]        # not spent
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, "0" * 32)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_reject_without_a_decision_id_is_allowed(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="ok, not pushing")])
+    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not pushing"
+
+
+def test_the_approve_route_refuses_a_missing_id_and_session_json_hands_it_out(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    with _serving(_source(tmp_path), host) as base:
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid})
+        assert code == 400 and out["error"] == "decision_id_required" and "expect" in out["message"]
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert code == 200 and view["state"] == "gated"
+        assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid, "expect": view["decision_id"]})
+        assert code == 202 and _poll(base, out["job_id"])["result"]["reply"] == "pushed"
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert view["state"] == "idle" and "decision_id" not in view and "pending" not in view
+        assert "decision_id" not in json.dumps(_call(f"{base}/chat.json")[1])
+
+
+def test_session_status_of_a_gated_session_carries_the_decision_and_the_held_set(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    view = host.session_status(sid)
+    assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+    assert "decision_id" not in json.dumps(host.listing())              # the listing never carries it
+
+
+def test_a_worker_that_cannot_start_restores_the_decision_id(tmp_path, monkeypatch):
+    """codex MED + complement MED r2: a 503 from a failed worker start left the hold undecidable."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    monkeypatch.setattr(host, "_spawn", lambda *a, **k: False)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.http_status == 503
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]
+    monkeypatch.undo()
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"

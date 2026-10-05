@@ -46,7 +46,7 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.security.risk import SecurityRisk
 
 from levain.firing.gate import (
-    ActionClass,
+    BASH_TOOL_NAMES,
     Classification,
     PendingEfferent,
     classify_action,
@@ -177,19 +177,29 @@ _TERMINAL_FIELDS = frozenset({"command", "is_input", "timeout", "reset", "kind"}
 _TERMINAL_DEFAULTS = {"is_input": False, "timeout": None, "reset": False}
 
 
-def _full_for(fields: dict[str, Any]) -> str:
+def _full_for(tool_name: str, fields: dict[str, Any]) -> str:
     """Everything the proposed action would execute with, unbounded and unflattened (see
-    :attr:`levain.firing.gate.PendingEfferent.full`). A plain shell command is its text exactly; any
-    other action (a file edit's ``file_text``/``old_str``/``new_str``, a tool this module has never
-    seen) is every field, so no argument that changes what runs can be left out. No fields at all
-    (an unreadable action) gives ``""``: the caller must then treat the action as undecidable here."""
+    :attr:`levain.firing.gate.PendingEfferent.full`). A plain shell command is its text exactly, and
+    "a shell command" is decided by the TOOL's identity (the terminal hand), never by the action
+    having a ``command`` field: the file editor and any tool this module has never seen carry one
+    too. Every other action is every field, as JSON that loses nothing, so no argument that changes
+    what runs can be left out. ``""`` means this cannot be shown whole: no fields at all (an
+    unreadable action), or a value or key JSON cannot carry exactly (the old ``default=str`` printed
+    such a value as text and presented it as the whole action). The caller must then treat the
+    action as undecidable here."""
     if not fields:
         return ""
     command = fields.get("command")
-    if (isinstance(command, str) and command and set(fields) <= _TERMINAL_FIELDS
+    if (tool_name in BASH_TOOL_NAMES and isinstance(command, str) and command
+            and set(fields) <= _TERMINAL_FIELDS
             and all(fields.get(k, d) == d for k, d in _TERMINAL_DEFAULTS.items())):
         return command
-    return json.dumps(fields, indent=2, sort_keys=True, ensure_ascii=False, default=str)
+    if not all(isinstance(k, str) for k in fields):
+        return ""   # JSON would coerce a non-string key, and two keys can then collide
+    try:
+        return json.dumps(fields, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return ""
 
 
 def _elide(text: str) -> str:
@@ -314,8 +324,9 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
     """The actions the gate stopped, in the order the agent proposed them.
 
     Reports EVERY pending action, not only the efferent ones. A batch halts as a unit, so the
-    afferent members of that batch are also un-executed and also waiting on the human — listing
-    only the efferent ones would under-report what approving actually authorises.
+    afferent AND inert members of that batch (a ``finish`` among them) are also un-executed and
+    also run on approve — listing only the efferent ones would under-report what approving
+    actually authorises.
     """
     try:
         from openhands.sdk.conversation.state import ConversationState
@@ -331,15 +342,13 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
             raw_name = _safe_attr(event, "tool_name")
             tool_name = str(raw_name or "<unnamed>")
             classification = classify_action(raw_name, fields)
-            if classification.action_class is ActionClass.INERT:
-                continue
             report.append(
                 PendingEfferent(
                     tool_name=tool_name,
                     detail=_detail_for(tool_name, fields, _safe_attr(event, "action")),
                     reason=classification.reason,
                     recognized=classification.recognized,
-                    full=_full_for(fields),
+                    full=_full_for(raw_name if isinstance(raw_name, str) else "", fields),
                 )
             )
         except Exception:  # noqa: BLE001 — one undescribable action must not blank the whole
