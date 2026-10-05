@@ -111,7 +111,7 @@ def _req(port, method, path="/", headers=None):
 def test_get_routes_serve_and_every_other_method_is_405(server):
     r, body = _req(server, "GET")
     assert r.status == 200 and b"Waiting on you" in body and b"carl" in body
-    assert _req(server, "GET", "/view.css")[0].status == 200
+    assert _req(server, "GET", "/team_view.css")[0].status == 200
     assert json.loads(_req(server, "GET", "/view.json")[1])["project"] == "ledgerline"
     for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "FOO"):
         r, _ = _req(server, method)
