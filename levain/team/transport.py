@@ -163,24 +163,22 @@ class Repo:
         def one(flag: str) -> bytes | None:
             # One path per call, exactly one trailing LF removed: a path may itself hold a line break, so
             # splitting a two-path answer into lines cannot be trusted (L3 r5, codex + complement, RUN).
-            try:
-                cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
-            except TeamError:
-                return None
+            # A git that is missing or times out raises TeamError to the caller: in a joined clone that must be a
+            # visible "ledger unavailable", never a quiet "no repository" (L3 r6, codex).
+            cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
             if cp.returncode != 0:
                 return None
             if not cp.stdout_bytes.endswith(b"\n") or len(cp.stdout_bytes) < 2:
                 raise TeamError(f"git rev-parse {flag} gave an answer levain cannot read")
             return cp.stdout_bytes[:-1]
 
-        top, common = one("--show-toplevel"), one("--git-common-dir")
+        top = one("--show-toplevel")
+        common = one("--git-common-dir") if top is not None else None
         if top is None or common is None:
             return None
         try:
             return cls(Path(top.decode("utf-8")), Path(common.decode("utf-8")))
         except UnicodeDecodeError:
-            if not os.path.isdir(os.path.join(common, DIRNAME.encode())):
-                return None   # no team in this clone: nothing to enforce, nothing to warn about
             # Every later git call runs in these directories, and a replaced byte names none of them; saying so
             # beats a hook that finds "no ledger" and goes quiet.
             raise TeamError("this repository's path is not valid UTF-8, which levain team does not support "
@@ -460,11 +458,17 @@ class GitLedger:
         """
         out: list[str] = []
         rev = rev or REF
-        cp = git(["log", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
+        # -z: records end in NUL, which no author field can hold (an LF can, through a hand-built commit: L3 r6)
+        cp = git(["log", "-z", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
                  check=False, timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the team.toml history: {_tail(cp)}")
         prev: R.Team | None = None
-        for row in cp.stdout.split("\n"):   # LF only: an author email may hold another line separator
+        for row in cp.stdout.split("\0"):
+            if not row:
+                continue
             if "\t" not in row:
+                out.append(f"team.toml history: an unreadable commit record ({E._printable(row[:80])!r})")
                 continue
             sha, raw_mail = row.split("\t", 1)
             mail = E._printable(" ⏎ ".join(raw_mail.splitlines()))   # shown, never matched
@@ -478,9 +482,15 @@ class GitLedger:
                 out.append(f"team.toml changed in {sha[:10]} by {mail}, who is not the owner ({judge.owner}) "
                            "of the version before it")
             prev = cur
-        cp = git(["log", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
-        for row in cp.stdout.split("\n"):
+        cp = git(["log", "-z", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False,
+                 timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the {CANON_FILE} history: {_tail(cp)}")
+        for row in cp.stdout.split("\0"):
+            if not row:
+                continue
             if "\t" not in row:
+                out.append(f"{CANON_FILE} history: an unreadable commit record ({E._printable(row[:80])!r})")
                 continue
             sha, mail = row.split("\t", 1)
             if team.handle_for_email(mail) != team.owner:

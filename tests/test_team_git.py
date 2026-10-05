@@ -1040,8 +1040,6 @@ def test_a_repository_path_that_is_not_utf8_is_refused_out_loud(tmp_path):
     except OSError:
         pytest.skip("this filesystem refuses a non-UTF-8 directory name")
     git("init", "-q", cwd=d)
-    assert Repo.discover(d) is None                 # no team in this clone: nothing to warn about
-    (d / ".git" / "levain-team").mkdir()            # a clone that has joined a team
     with pytest.raises(TeamError, match="not valid UTF-8"):
         Repo.discover(d)
     out = hook("sessionstart", {"cwd": str(d), "hook_event_name": "SessionStart"})
@@ -1071,3 +1069,12 @@ def test_an_author_email_holding_a_line_separator_neither_breaks_verify_nor_draw
     team("verify", repo=ben)
     out = capsys.readouterr().out
     assert "FORGED" in out and not any(l.startswith("[team] FORGED") for l in out.splitlines()), out
+
+
+def test_a_joined_clone_without_git_on_path_says_so_instead_of_going_silent(two):
+    # L3 r6 (codex HIGH): discover turned "git is not on PATH" (or a rev-parse timeout) into "no repository",
+    # so both hooks returned with no output in a joined clone.
+    tmp, ana, ben = two
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    out = hook("sessionstart", payload, env={"PATH": str(tmp / "no-git-here")})
+    assert "ledger unavailable" in out.get("systemMessage", "") and "git" in out["systemMessage"], out
