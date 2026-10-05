@@ -224,22 +224,16 @@ def test_only_a_publisher_ever_takes_the_exclusive_lock(pub, monkeypatch):
     assert ops and set(ops) == {fcntl.LOCK_SH | fcntl.LOCK_NB}
 
 
-def test_prune_sweeps_an_abandoned_temp_only_if_nobody_holds_it(pub):
-    import fcntl
+def test_prune_never_sweeps_a_temp_file(pub):
+    # A publisher creates its temp, then locks it: a sweep in between unregistered a starting view (lane run,
+    # 2026-10-05), so temps are left alone whatever their lock state.
     d = R.registry_dir()
     d.mkdir(parents=True)
-    abandoned = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
-    for n in abandoned:
+    temps = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
+    for n in temps:
         (d / n).write_text("{half")
-    paused = f".lock1-{'c' * 32}.tmp"                        # a publisher paused mid-publish still holds LOCK_EX
-    (d / paused).write_text("{}")
-    fd = os.open(d / paused, os.O_RDWR)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        R.prune_dead()
-        assert _names() == [paused]
-    finally:
-        os.close(fd)
+    R.prune_dead()
+    assert sorted(_names()) == sorted(temps)
 
 
 def test_prune_leaves_other_grammars_alone(pub):

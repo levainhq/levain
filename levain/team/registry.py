@@ -66,7 +66,6 @@ PRUNE_MAX_NAMES = 1024
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
-_TMP_RE = re.compile(r"\.(?:lock1-[0-9a-f]{32}|selftest-[0-9a-f]{16})\.tmp")
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -283,9 +282,10 @@ def prune_dead() -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        # Filter, then bound: junk names must not use up the examination budget. Entries and abandoned temp files
-        # go by the same rule: removed only if a shared try-lock succeeds, i.e. no publisher holds them.
-        cand = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n) or _TMP_RE.fullmatch(n)]
+        # Filter, then bound: junk names must not use up the examination budget. Temp files are never swept: a
+        # publisher creates its temp and only then locks it, so a sweep in that window unregistered a starting view
+        # (seen in the lane's run). One left by a killed view is harmless and listed by nothing.
+        cand = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)]
         for name in cand[:PRUNE_MAX_NAMES]:
             opened = _open_entry(dir_fd, name)
             if opened is None:
