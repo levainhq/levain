@@ -1109,6 +1109,10 @@
 .chat-msg.err { border-left: 2px solid var(--hot); }
 .chat-who { font: 700 10px/1 var(--label); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
 .chat-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 var(--mono); color: var(--ink); }
+.chat-unreadable { color: var(--hot); }
+.chat-raw { margin-top: 6px; color: var(--dim); }
+.chat-raw summary { cursor: pointer; font: 11px/1.5 var(--mono); }
+.chat-raw pre { margin: 6px 0 0; color: var(--dim); }
 .chat-acts { margin: 8px 0 0; padding-left: 18px; color: var(--dim); font: 11px/1.5 var(--mono); overflow-wrap: anywhere; }
 .chat-live { min-height: 1em; color: var(--dim); font: 11px/1.4 var(--mono); overflow-wrap: anywhere; }
 .chat-compose { display: flex; gap: 8px; align-items: flex-end; margin: 0; }

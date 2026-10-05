@@ -263,6 +263,21 @@
     });
   }
 
+  // A reply the server marked `unreadable_call` is the model's raw tool-call syntax, not an answer: its call failed to
+  // parse and nothing ran. It is shown as the notice, with the text collapsed beneath it and escaped by the consent
+  // surface's allowlist (visible), never as the entity's message. levain.firing.agent_reply.UNREADABLE_CALL_NOTICE is
+  // the same sentence; the two must change together.
+  const UNREADABLE_CALL_NOTICE = "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models.";
+  function replyText(b, res) {
+    if (res.unreadable_call !== true) { b.appendChild(el("div", "chat-text", res.reply)); return; }
+    b.appendChild(el("div", "chat-text chat-unreadable", UNREADABLE_CALL_NOTICE));
+    const d = el("details", "chat-raw");
+    d.appendChild(el("summary", null, "What the model sent"));
+    d.appendChild(el("pre", "chat-text", visible(res.reply, true)));
+    b.appendChild(d);
+  }
+  function replyBubble(res) { const b = bubble("them", session.entity); replyText(b, res); addLines(b, res.tool_activity); }
+
   function failure(text) { const b = bubble("err", "error"); b.appendChild(el("div", "chat-text", text)); }
 
   // Shows a job's progress, then its outcome. Reads only: a gated outcome renders the consent surface and stops.
@@ -280,15 +295,13 @@
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
-        if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
+        if (res.reply) replyBubble(res);
         showConsent(res.pending, res.decision_id, myRun);
         return;
       }
       if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
       if (res.reply) {
-        const b = bubble("them", session.entity);
-        b.appendChild(el("div", "chat-text", res.reply));
-        addLines(b, res.tool_activity);
+        replyBubble(res);
       } else if (!res.error && !res.timed_out && !res.gated) {
         failure("The entity returned no reply.");
       }
@@ -377,7 +390,7 @@
     const b = bubble("them", session.entity + " · what the last " + what + " did");
     b.appendChild(el("div", "chat-text", ran.length ? "These actions ran:" : "No action ran."));
     addLines(b, ran);
-    if (res.reply) b.appendChild(el("div", "chat-text", res.reply));
+    if (res.reply) replyText(b, res);
     if (res.error) b.appendChild(el("div", "chat-text", "error: " + res.error));
     return true;
   }
@@ -496,10 +509,10 @@
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
-        if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
+        if (res.reply) replyBubble(res);
         showConsent(res.pending, res.decision_id, myRun); return;
       }
-      if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
+      if (res.reply) replyBubble(res);
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
       endOfTurn(!!res.gated);
     }

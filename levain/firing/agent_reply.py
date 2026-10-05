@@ -19,6 +19,7 @@ Two SDK realities it encodes (verified against OpenHands 1.26.0, 2026-07-08):
 from __future__ import annotations
 
 import json
+import re
 
 # The discriminator of the built-in ``finish`` tool's action (a stable pydantic ``.kind``).
 FINISH_ACTION_KIND = "FinishAction"
@@ -172,6 +173,76 @@ def humanize_finish_json(text: str) -> str:
             if isinstance(message, str) and message.strip():
                 return message.strip()
     return text  # no finish message found → don't fabricate a reply from the scratchpad
+
+
+# What the panel and the REPL show instead of a reply that is a model's unreadable tool call (Phill, 2026-10-05).
+UNREADABLE_CALL_NOTICE = (
+    "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models."
+)
+
+# GLM's argument markup: a key tag next to a value tag. A parse failure upstream can cut the reply anywhere, so
+# either order and either tag half counts ("</arg_key><arg_value>", "</arg_value><arg_key>").
+_GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
+# The <tool_call> wrapper opening an actual call: a JSON object, or a tool name followed by GLM argument markup.
+# The bare tag in a sentence ("a <tool_call> tag") is not a call.
+_TOOL_CALL_OPEN = re.compile(r"<tool_call>\s*(?:\{|[A-Za-z_][\w.-]*\s*<arg_key>)")
+# Markdown code (a fenced block, or an inline `span`): a reply quoting the markup is explaining it, not calling.
+_CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.DOTALL)
+_WHOLE_FENCE = re.compile(r"\A```[\w-]*\n(.*)\n```\Z", re.DOTALL)
+
+
+def _json_call_names(text: str) -> list[str] | None:
+    """The tool names of ``text`` when ALL of it is one or more function-call JSON values, else ``None``.
+    A call is an object with a string ``name`` and an ``arguments`` or ``parameters`` key, or an OpenAI
+    ``{"type": "function", "function": {...}}`` wrapper of one; a JSON array of calls counts too."""
+    decoder = json.JSONDecoder()
+    names: list[str] = []
+    idx, n = 0, len(text)
+
+    def calls(obj: object) -> bool:
+        if isinstance(obj, list):
+            return bool(obj) and all(calls(x) for x in obj)
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
+            obj = obj["function"]
+        name = obj.get("name")
+        if isinstance(name, str) and ("arguments" in obj or "parameters" in obj):
+            names.append(name)
+            return True
+        return False
+
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, idx = decoder.raw_decode(text, idx)
+        except ValueError:
+            return None
+        if not calls(obj):
+            return None
+    return names or None
+
+
+def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]) -> bool:
+    """Whether ``text``, an agent's reply, is a model's raw tool-call syntax rather than an answer.
+
+    An open model's call that fails to parse upstream reaches levain as reply TEXT, and no tool ran. Three
+    shapes are recognised, each only outside Markdown code, so a reply that quotes the markup to explain it is
+    an answer: GLM argument markup (a key tag beside a value tag), a ``<tool_call>`` wrapper that opens a call,
+    and a reply that is entirely function-call JSON naming one of ``tool_names`` (the entity's own tools; with
+    none known, that shape is not flagged). It reads the shape only: the call is never repaired or run."""
+    if not text:
+        return False
+    stripped = text.strip()
+    fenced = _WHOLE_FENCE.match(stripped)
+    names = _json_call_names(fenced.group(1).strip() if fenced else stripped)
+    if names and all(n in tool_names for n in names):
+        return True
+    prose = _CODE.sub(" ", text)
+    return bool(_GLM_ARG_PAIR.search(prose) or _TOOL_CALL_OPEN.search(prose))
 
 
 def is_corrective_nudge(event) -> bool:

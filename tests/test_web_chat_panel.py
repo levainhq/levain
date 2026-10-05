@@ -91,6 +91,7 @@ let sessionReads = 0, jobReads = 0;
 const TOKEN = "tok-123";
 const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09];
 const hex = (c) => "\\u{" + c.toString(16).toUpperCase().padStart(4, "0") + "}";
+const LEAK = "_editor<arg_key>command</arg_key><arg_value>create</arg_value><arg_key>path</arg_key><arg_value>t\u00e9st.txt";
 const calls = [];
 const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
@@ -107,6 +108,8 @@ function fetch(path, init) {
   if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "chat_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
+  if (path.startsWith("/chat/job.json?id=J-turn") && (process.argv[3] === "leak" || process.argv[3] === "prose"))
+    return reply(200, { status: "done", result: { reply: LEAK, unreadable_call: process.argv[3] === "leak", gated: false, error: null, timed_out: false, tool_activity: [], pending: [] } });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
               { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true },
@@ -207,6 +210,21 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     console.log("PASS"); return;
   }
   byText(panel, "Send").fire("click", { isTrusted: true }); await sleep(80);
+  if (process.argv[3] === "leak") {
+    // 0.6.8: a reply the server marks unreadable_call is never shown as the entity's message
+    const notice = "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models.";
+    ok(panel.textContent.includes(notice), "the notice is shown");
+    ok(!find(panel, (n) => n.className === "chat-text" && n._text === LEAK), "the raw text is not rendered as the reply");
+    const d = find(panel, (n) => n.tagName === "details");
+    ok(d && !d.attrs.open && !d.open && d.children[0].tagName === "summary", "the raw text sits in a collapsed details element");
+    ok(d.textContent.includes("<arg_key>command</arg_key>") && d.textContent.includes("t\\u{00E9}st.txt") && !d.textContent.includes("\u00e9"), "escaped by the allowlist display");
+    ok(!calls.some((c) => c.path === "/chat/approve") && !area.disabled, "nothing is decided and compose is usable again");
+    console.log("PASS"); return;
+  }
+  if (process.argv[3] === "prose") {
+    ok(find(panel, (n) => n.className === "chat-text" && n._text === LEAK) && !find(panel, (n) => n.tagName === "details"), "an unflagged reply renders as itself");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "turn403json") {
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
     console.log("PASS"); return;
@@ -354,7 +372,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
-                                  "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run"])
+                                  "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
