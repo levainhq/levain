@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-10-04
+
+Hardening of the team layer's sync replay, from the known-open list of 0.6.0. No schema, id or exit-code change; the anneal floor stays at 0.9.36.
+
 ### Fixed
 
 - **Team sync replay (the 0.6.0 known-open list).** When `levain team sync` has to replay local entries after a `team.toml`/`PROJECT.md` conflict:
