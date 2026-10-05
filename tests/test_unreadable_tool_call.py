@@ -69,9 +69,6 @@ def test_a_bare_json_call_naming_a_known_tool_is_flagged(reply):
     "GLM models wrap a call in a <tool_call> tag, and when it fails to parse you see the raw text.",
     "The model emitted <tool_call> and </tool_call> around its call.",
     "Its format pairs each `<arg_key>command</arg_key><arg_value>create</arg_value>` inside backticks.",
-    # L1 r1: prose mentioning the markup WITHOUT backticks is an answer too
-    "Its markup pairs tags like </arg_key><arg_value> around each argument.",
-    'The format is <tool_call>{"name": ...}</tool_call>, see docs.',
     "Here is the format:\n```\n<tool_call>{\"name\": \"terminal\"}</tool_call>\n```\nThat is what a call looks like.",
     # JSON that is the answer: no known tool named, or not the call shape
     '{"name": "Ada", "arguments": ["one", "two"]}',
@@ -313,10 +310,10 @@ def test_a_real_leak_is_not_hidden_by_a_backtick_another_construct_owns(reply):
     assert unreadable_tool_call(reply, TOOLS)
 
 
-def test_a_code_span_cannot_pad_a_line_into_a_leak():
-    # r4 LOW: a span blanked to spaces left the markup within three columns of the line start
-    assert not unreadable_tool_call("`x`" + CALL, TOOLS)
-    assert not unreadable_tool_call("a`\nb`" + CALL, TOOLS)
+def test_markup_after_a_code_span_is_outside_it():
+    # A' (Phill 2026-10-05): only what the span holds is code; markup right after it is a leak
+    assert unreadable_tool_call("`x`" + CALL, TOOLS)
+    assert not unreadable_tool_call("`x" + CALL + "`", TOOLS)
 
 
 def test_an_entity_or_escape_is_quoted_markup():
@@ -328,7 +325,7 @@ def test_many_blank_lines_are_cheap():
     import time
 
     t = time.perf_counter()
-    assert unreadable_tool_call("\n" * 200_000 + GLM_REAL[1], TOOLS)
+    assert unreadable_tool_call("\n" * 150_000 + GLM_REAL[1], TOOLS)
     assert unreadable_tool_call("`" * 2000 + " " + "``` " * 2000 + "\n" + CALL, TOOLS)
     assert time.perf_counter() - t < 5
 
@@ -345,8 +342,10 @@ def test_many_blank_lines_are_cheap():
     "1. " + GLM_REAL[1],
     "Intro.\n\n> quoted:\n> " + CALL,
 ])
-def test_markup_in_a_heading_emphasis_link_quote_or_list_is_an_answer(reply):
-    assert not unreadable_tool_call(reply, TOOLS)
+def test_markup_in_a_heading_emphasis_link_quote_or_list_is_a_leak(reply):
+    # A' (Phill 2026-10-05): tool-call markup outside a code region is a leak wherever it is, by design. (r5 had
+    # these as answers; the block-context exclusions that did that hid real leaks in r6.)
+    assert unreadable_tool_call(reply, TOOLS)
 
 
 def test_the_hermes_form_with_the_json_on_the_next_line_is_caught():
@@ -379,3 +378,46 @@ def test_the_dependency_floor_is_four():
 
     deps = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]["dependencies"]
     assert "markdown-it-py>=4,<5" in deps
+
+
+
+# ---------- L3 r6 (Phill's A'): outside code is a leak; a size bound ----------
+
+def test_markup_mentioned_in_prose_is_a_leak_by_design():
+    assert unreadable_tool_call("Its markup pairs tags like </arg_key><arg_value> around each argument.", TOOLS)
+    assert unreadable_tool_call('The format is <tool_call>{"name": ...}</tool_call>, see docs.', TOOLS)
+    # the bare tag with no call after it is not the wrapper shape
+    assert not unreadable_tool_call("GLM wraps a call in a <tool_call> tag.", TOOLS)
+
+
+@pytest.mark.parametrize("reply", [
+    # r6: each was missed by the block-context rule
+    "file_editor<arg_key>command</arg_key><arg_value>create</arg_value><arg_key>file_text</arg_key><arg_value>Title\n---\nbody</arg_value>",
+    "1. do\n" + CALL,
+    "Steps:\n- one\nfile_editor<arg_key>command</arg_key><arg_value>x",
+    '<tool_call>\n\n{"name": "file_editor", "arguments": {}}\n</tool_call>',
+    '<tool_call>\r\n \r\n{"name": "file_editor", "arguments": {}}',
+    "x</arg_key>\n\n<arg_value>y",
+])
+def test_leaks_next_to_headings_lists_or_blank_lines_are_caught(reply):
+    assert unreadable_tool_call(reply, TOOLS)
+
+
+def test_a_reply_over_the_bound_is_not_classified():
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
+
+    pad = "a" * MAX_CLASSIFIED_BYTES
+    assert not unreadable_tool_call(GLM_REAL[1] + pad, TOOLS)
+    assert unreadable_tool_call(GLM_REAL[1] + pad[: MAX_CLASSIFIED_BYTES - len(GLM_REAL[1])], TOOLS)
+    # the bound counts bytes, so a multi-byte reply reaches it sooner
+    assert not unreadable_tool_call(GLM_REAL[1] + "\u00e9" * (MAX_CLASSIFIED_BYTES // 2), TOOLS)
+
+
+def test_the_pair_is_searched_once_per_reply():
+    # r6 (codex MED): one pair search per line start was quadratic (50,000 lines took 10.6 s)
+    import time
+
+    t = time.perf_counter()
+    unreadable_tool_call("<arg_key>x\n" * 18_000, TOOLS)
+    unreadable_tool_call("<tool_call> \n" * 15_000, TOOLS)
+    assert time.perf_counter() - t < 5
