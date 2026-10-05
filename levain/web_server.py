@@ -250,6 +250,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
+    "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -265,11 +266,25 @@ _CHAT_POST_ROUTES = ("/chat/open", "/chat/turn", "/chat/approve", "/chat/reject"
 # chat routes. make_server refuses a collision loudly (a packaging-class bug, not runtime).
 _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/substrate.json",
+    "/team_views.json",
     "/recall.json",
     "/job.json",
     "/edit",
     "/action",
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
+
+
+_TEAM_VIEWS_GATE = threading.BoundedSemaphore(2)
+
+
+def _peer_is_loopback(addr: str) -> bool:
+    """True iff the connecting peer is this machine (127.0.0.0/8, ::1, or an IPv4-mapped loopback)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
 
 
 def load_web_asset(filename: str) -> str:
@@ -594,6 +609,9 @@ class _Handler(GuardedHandler):
     server_version = "levain-serve"
     server: _LevainHTTPServer  # narrow the type for typed attribute access
 
+    def _team_views_allowed(self) -> bool:
+        return bool(self.server.is_loopback_bind) and _peer_is_loopback(self.client_address[0])
+
     def _write_token_required(self) -> bool:
         """True iff this surface requires the ``X-Levain-Write-Token`` — i.e. it is writable AND
         bound off-loopback. The off-box governance factor that replaces loopback-is-auth once the
@@ -699,6 +717,32 @@ class _Handler(GuardedHandler):
                 }).encode("utf-8")
             finally:
                 self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", head=head)
+            return
+
+        if path == "/team_views.json" and self._team_views_allowed():
+            # The running `levain team view` servers registered on this machine (levain/team/registry.py): project,
+            # repo and loopback URL, each confirmed by a pid check and a nonce probe. Served ONLY to a loopback peer
+            # on a loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
+            # That one rule is why this needs no write token (dashboard_team.js carries no token logic), why repo
+            # paths and project names never reach an off-box client, and why a remote browser is never handed a
+            # 127.0.0.1 link to the wrong machine. The registry probe is slow-ish, so it is NOT run under
+            # request_gate (that is for substrate reads); it has its own small cap.
+            if not _TEAM_VIEWS_GATE.acquire(blocking=False):
+                self._send(
+                    b"busy\n", "text/plain; charset=utf-8", status=503, head=head
+                )
+                return
+            try:
+                from levain.team.registry import live_views
+
+                body = json.dumps({"views": [
+                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in live_views()
+                ]}).encode("utf-8")
+            except Exception:  # noqa: BLE001 - a registry fault means "no team views", never a 500
+                body = b'{"views": []}'
+            finally:
+                _TEAM_VIEWS_GATE.release()
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
