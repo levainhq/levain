@@ -521,10 +521,10 @@
     }
 
     // APPROVE OPENS A CONFIRM ROW (Phill 2026-10-05, the W3C alertdialog pattern): "Run the N held actions?
-    // [Cancel] [Run them]". Cancel takes Approve's exact place and gets the focus; reaching Run them takes a deliberate
+    // [Cancel] [Run them]". Cancel takes Approve's place in the row and the focus; reaching Run them takes a deliberate
     // move (Tab or an arrow key), then Enter, Space or a click. Tab and the arrows stay inside the row while it is open;
     // Esc and Cancel close it and return focus to Approve. The two presses are separated by STRUCTURE, not by time, so
-    // whatever repeats on the spot where Approve was (a held key, the second click of a double click) lands on Cancel
+    // a held key's repeats land on the focused Cancel, and the second click of a double click lands on Cancel or the gap
     // and the failure direction is "nothing ran". Reject stays one step: rejecting runs nothing.
     const ask = el("div", "chat-reason chat-ask", "Run the " + pending.length + " held action" +
       (pending.length === 1 ? "" : "s") + "?");
@@ -533,7 +533,7 @@
     cancelBtn.type = "button"; runBtn.type = "button";
     function openConfirm() {
       if (approve.offsetWidth) cancelBtn.style.minWidth = approve.offsetWidth + "px";   // covers Approve's spot
-      reject.style.visibility = "hidden"; reject.disabled = true;   // keeps its space, so Cancel sits where Approve was
+      reject.style.visibility = "hidden"; reject.disabled = true;   // keeps its space, so Cancel takes Approve's slot
       box.insertBefore(ask, row);
       row.replaceChild(cancelBtn, approve);
       row.appendChild(runBtn);
