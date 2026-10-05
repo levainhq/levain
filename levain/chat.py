@@ -89,8 +89,6 @@ a failed start also runs one cyclic collection.
 from __future__ import annotations
 
 import gc
-import hashlib
-import json
 import logging
 import math
 import secrets
@@ -216,7 +214,7 @@ class _Session:
     session_id: str
     entity: str
     state: SessionState = "opening"
-    pending_digest: str | None = None   # what a gated session is holding, as shown to the operator
+    decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
     session: Any = None          # the EntitySession once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
@@ -241,10 +239,6 @@ def _turn_payload(result: Any) -> dict[str, Any]:
         "gated": result.gated,
         "timed_out": result.timed_out,
         "pending": pending,
-        # A decision names the held set it was made on: approve and reject accept it as ``expect`` and
-        # refuse a mismatch, so a stale or re-armed screen cannot approve an action it never showed.
-        "pending_digest": hashlib.sha256(
-            json.dumps(pending, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
         "ok": result.ok,
         "exit_code": result.exit_code,
     }
@@ -556,13 +550,17 @@ class ChatHost:
                     f"the session is {rec.state}; {kind} needs it {' or '.join(accepts)}",
                     409,
                 )
-            # Optional for API callers (a token holder is trusted); the cockpit panel always sends it.
-            if expect is not None and expect != rec.pending_digest:
+            # ``expect`` is the decision id the operator's screen was shown. It is OPTIONAL here on purpose:
+            # a token holder is trusted and the released API has callers that never send it. The cockpit
+            # panel fails closed instead (no decision id in the result, no Approve button). The id is
+            # per halt, never per content, so two textually identical holds cannot share one.
+            if expect is not None and (not isinstance(expect, str) or expect != rec.decision_id):
                 raise ChatError(
                     "stale_decision",
                     f"the held action is not the one this {kind} was made on; read the session again",
                     409,
                 )
+            rec.decision_id = None   # spent: whatever this decision does, no screen can decide this halt again
             before = rec.state
             rec.state = "busy"
             job = self._new_job(rec, kind)
@@ -709,10 +707,11 @@ class ChatHost:
                 # The result's tool_activity leaves out held and stop-skipped actions; it replaces
                 # what was streamed on every finish (module docstring).
                 job.activity, job.dropped = list(payload["tool_activity"]), cut
-                rec.pending_digest = None
+                rec.decision_id = None
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
-                    rec.pending_digest = payload["pending_digest"]
+                    rec.decision_id = secrets.token_hex(16)
+                    payload["decision_id"] = rec.decision_id
                 elif payload["error"] is not None:
                     # A turn that raised or could not read its own gate leaves the conversation in a
                     # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a

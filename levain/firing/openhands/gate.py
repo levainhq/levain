@@ -38,6 +38,7 @@ continue if either did not take. ``Conversation.__init__`` swallowing unknown kw
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -172,14 +173,23 @@ def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
     return str(kind)
 
 
+_TERMINAL_FIELDS = frozenset({"command", "is_input", "timeout", "reset", "kind"})
+_TERMINAL_DEFAULTS = {"is_input": False, "timeout": None, "reset": False}
+
+
 def _full_for(fields: dict[str, Any]) -> str:
-    """The proposed action's text exactly as it would run, unbounded and unflattened (see
-    :attr:`levain.firing.gate.PendingEfferent.full`)."""
+    """Everything the proposed action would execute with, unbounded and unflattened (see
+    :attr:`levain.firing.gate.PendingEfferent.full`). A plain shell command is its text exactly; any
+    other action (a file edit's ``file_text``/``old_str``/``new_str``, a tool this module has never
+    seen) is every field, so no argument that changes what runs can be left out. No fields at all
+    (an unreadable action) gives ``""``: the caller must then treat the action as undecidable here."""
+    if not fields:
+        return ""
     command = fields.get("command")
-    path = fields.get("path")
-    if isinstance(command, str) and isinstance(path, str) and path:
-        return f"{command} {path}"
-    return command if isinstance(command, str) else ""
+    if (isinstance(command, str) and command and set(fields) <= _TERMINAL_FIELDS
+            and all(fields.get(k, d) == d for k, d in _TERMINAL_DEFAULTS.items())):
+        return command
+    return json.dumps(fields, indent=2, sort_keys=True, ensure_ascii=False, default=str)
 
 
 def _elide(text: str) -> str:

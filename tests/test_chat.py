@@ -201,7 +201,7 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     assert e.value.code == "stale_decision" and e.value.http_status == 409
     assert host.session_status(sid)["state"] == "gated"
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
-    expect = st["result"]["pending_digest"]
+    expect = st["result"]["decision_id"]
     with pytest.raises(ChatError) as e:
         host.turn(sid, "wait, don't")   # a new message here would be read as approval
     assert e.value.http_status == 409
@@ -1448,3 +1448,25 @@ def test_each_launch_gets_its_own_token(tmp_path):
         assert httpd.chat_token is None            # no chat, no token
     finally:
         httpd.server_close()
+
+
+def test_a_decision_id_is_single_use_even_when_two_holds_are_textually_identical(tmp_path):
+    """codex L3: a content digest let a stale box approve a SECOND hold that read the same. The id names
+    the halt, not its text."""
+    pend = PendingEfferent("terminal", "git push", "network egress")
+    f = _Factory([_Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply="pushed")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    first = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    second = _wait(host, host.approve(sid, expect=first["decision_id"])["job_id"])["result"]
+    assert second["gated"] and second["pending"] == first["pending"]            # the same text again ...
+    assert second["decision_id"] and second["decision_id"] != first["decision_id"]   # ... a different halt
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=first["decision_id"])                           # the first screen's id
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert _wait(host, host.approve(sid, expect=second["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+    with pytest.raises(ChatError):
+        host.approve(sid, expect=second["decision_id"])                          # spent

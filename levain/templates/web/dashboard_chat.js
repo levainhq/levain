@@ -238,7 +238,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
-        showConsent(res.pending, res.pending_digest, myRun);
+        showConsent(res.pending, res.decision_id, myRun);
         return;
       }
       if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
@@ -255,22 +255,34 @@
   function endOfTurn(stuck) { setComposeEnabled(!stuck); if (!stuck && area) area.focus(); }
 
   // ---- the consent surface ------------------------------------------------------------------------------------
-  function showConsent(pending, digest, myRun) {
+  // Control and format characters (bidi overrides, zero-width, ESC, other C0/C1) can make one string read as
+  // another, so inside the consent box they are shown as \u{XXXX}; newline and tab stay as they are.
+  function visible(text) {
+    return String(text).replace(/[\p{Cc}\p{Cf}]/gu, (c) => {
+      if (c === "\n" || c === "\t") return c;
+      return "\\u{" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "}";
+    });
+  }
+  function showConsent(pending, decisionId, myRun) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
+    // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
+    // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
+    const decidable = typeof decisionId === "string" && decisionId !== "" &&
+      pending.every((p) => typeof p.full === "string" && p.full !== "");
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
-      item.appendChild(el("div", "chat-tool", String(p.tool)));
-      // The whole action, never the bounded one-line detail: approving runs all of it (L2: a tail past the
-      // display limit, or a newline shown as a space, hid what a command did).
+      item.appendChild(el("div", "chat-tool", visible(p.tool)));
+      // The whole action, never the bounded one-line detail: approving runs all of it.
       const whole = (typeof p.full === "string" && p.full) ? p.full : p.detail;
-      if (whole) item.appendChild(el("pre", "chat-detail", String(whole)));
-      if (p.reason) item.appendChild(el("div", "chat-reason", String(p.reason)));
+      if (whole) item.appendChild(el("pre", "chat-detail", visible(whole)));
+      if (p.reason) item.appendChild(el("div", "chat-reason", visible(p.reason)));
       if (p.recognized === false) item.appendChild(el("div", "chat-reason", "This action was not recognised by the entity's policy."));
       box.appendChild(item);
     });
+    if (!decidable) box.appendChild(el("div", "chat-reason", "Approve is not offered: this halt cannot be shown in full or carries no decision id, so only Reject (or Close session) is safe."));
     const reasonIn = el("input", "chat-input");
     reasonIn.type = "text"; reasonIn.placeholder = "reason for rejecting (optional)";
     reasonIn.setAttribute("aria-label", "reason for rejecting");
@@ -280,7 +292,8 @@
     const reject = el("button", "chat-btn reject", "Reject");
     approve.type = "button"; reject.type = "button";
     const row = el("div", "chat-row");
-    row.appendChild(approve); row.appendChild(reject);
+    if (decidable) row.appendChild(approve);
+    row.appendChild(reject);
     box.appendChild(reasonIn); box.appendChild(row);
     log.appendChild(box);
 
@@ -293,7 +306,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
-        showConsent(res.pending, res.pending_digest, myRun); return;
+        showConsent(res.pending, res.decision_id, myRun); return;
       }
       if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
@@ -309,7 +322,7 @@
       }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried: the operator may look at the session and decide again with a fresh click. A re-armed
-        // click is bound to this box's digest, so it cannot approve anything the box does not show.
+        // click is bound to this box's decision id, so it cannot approve anything the box does not show.
         deciding = false; failure("The decision was not accepted: " + why(r));
         approve.disabled = false; reject.disabled = false; reasonIn.disabled = false; return;
       }
@@ -321,13 +334,13 @@
     approve.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
       lock();
-      api("POST", "/chat/approve", { session_id: session.id, expect: digest }).then(after);
+      api("POST", "/chat/approve", { session_id: session.id, expect: decisionId }).then(after);
     });
     reject.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
       lock();
       const reason = reasonIn.value.trim();
-      api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason, expect: digest } : { session_id: session.id, expect: digest }).then(after);
+      api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason, expect: decisionId } : { session_id: session.id, expect: decisionId }).then(after);
     });
   }
 
