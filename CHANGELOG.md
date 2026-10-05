@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.6.5] — 2026-10-05
+
+A security fix for the team layer (a member could make the owner's consolidate write outside the ledger worktree; 0.6.0 to 0.6.4 are affected) and three team fixes from the nightly review.
+
 ### Security
 
 - **A team member could make the owner's `levain team consolidate` write outside the ledger worktree (0.6.0 to 0.6.4; upgrade to fix).** The ledger branch is written by every member, and the owner's consolidate wrote `PROJECT.md` to its path in the worktree, following a symlink. A member who pushed `PROJECT.md` as a symlink therefore had the canon written over any file the owner can write (reproduced on the 0.6.4 wheel: a file outside the worktree was overwritten). The canon carries members' ruling words, so a target such as a shell startup file could turn a ruling into a command. `PROJECT.md` and `team.toml` are now written as a new regular file renamed into place, so a link there is replaced, never followed, and `team.toml` is never read through a link. Run record: flow `projects/levain/reference/team_canon_symlink_run_1005/`.
