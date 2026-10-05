@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -1723,6 +1724,8 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
 
 
 def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallback_chain(monkeypatch):
+    # (CPython defines webbrowser.MacOSXOSAScript only on macOS; elsewhere a stand-in class plays it, so this runs
+    # on CI's Linux too.)
     # L1+L2 r1 and L3 r1 (codex + gemini): every controller but macOS's osascript one puts the URL in argv, readable
     # by other OS users. webbrowser.open walks every registered controller on a failure, so the token URL goes to the
     # osascript controller directly or nowhere.
@@ -1732,10 +1735,12 @@ def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallba
 
     chain = []
     monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: chain.append(u) or True)
+    if not hasattr(webbrowser, "MacOSXOSAScript"):
+        monkeypatch.setattr(webbrowser, "MacOSXOSAScript", type("MacOSXOSAScript", (webbrowser.BaseBrowser,), {}), raising=False)
 
     class _Osa(webbrowser.MacOSXOSAScript):
         def __init__(self, ok):
-            super().__init__("default")
+            webbrowser.BaseBrowser.__init__(self, "default")
             self.ok, self.got = ok, []
 
         def open(self, url, new=0, autoraise=True):
@@ -1758,6 +1763,7 @@ def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallba
     assert chain == ["http://h/"]
 
 
+@pytest.mark.skipif(not hasattr(__import__("webbrowser"), "MacOSXOSAScript"), reason="macOS's controller only")
 def test_the_osascript_controller_still_hands_the_url_over_on_stdin():
     # The guarantee _open_browser relies on is CPython's: MacOSXOSAScript pipes its script to osascript's stdin. If a
     # future CPython puts the URL on a command line instead, this fails rather than the token reaching argv.
@@ -1765,4 +1771,6 @@ def test_the_osascript_controller_still_hands_the_url_over_on_stdin():
     import webbrowser
 
     src = inspect.getsource(webbrowser.MacOSXOSAScript.open)
-    assert 'os.popen("/usr/bin/osascript", "w")' in src and "subprocess" not in src
+    # the property, not one spelling of it: a write pipe to osascript, and no process given the URL as an argument
+    assert re.search(r'os\.popen\(\s*"[^"]*osascript"\s*,\s*"w"\s*\)', src)
+    assert "subprocess" not in src and "Popen" not in src and "os.system" not in src

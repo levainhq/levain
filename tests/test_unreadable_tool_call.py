@@ -240,3 +240,22 @@ def test_a_classifier_failure_never_fails_the_turn(tmp_path, monkeypatch):
     monkeypatch.setattr(session_mod, "unreadable_tool_call", boom)
     result = _leaking_session(tmp_path, GLM_REAL[0]).run_turn("x")
     assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is False
+
+
+# ---------- L3 r2: fences by CommonMark 0.31.2 s4.5 ----------
+
+def test_a_longer_closing_fence_closes_and_a_leak_after_it_is_caught():
+    quoted = "Example:\n```\nquoted\n````\n"
+    assert unreadable_tool_call(quoted + '<tool_call>{"name": "terminal", "arguments": {}}', TOOLS)
+    assert unreadable_tool_call(quoted + GLM_REAL[1], TOOLS)
+    assert unreadable_tool_call('~~~json\n{"name": "terminal", "arguments": {}}\n~~~~', TOOLS)
+
+
+def test_crlf_fences_close():
+    assert unreadable_tool_call("Example:\r\n```\r\nquoted\r\n```\r\n" + GLM_REAL[1], TOOLS)
+    assert not unreadable_tool_call("Example:\r\n```\r\n<tool_call>{\"name\": 1}\r\n```\r\nok", TOOLS)
+
+
+def test_a_closer_of_the_other_character_or_shorter_does_not_close():
+    # inside a ``` fence, ~~~ and `` are content, so the markup after them is still quoted
+    assert not unreadable_tool_call("```\n~~~\n``\n<tool_call>{\"name\": \"terminal\"}\n```", TOOLS)

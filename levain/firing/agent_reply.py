@@ -200,11 +200,55 @@ _GLM_LINE = re.compile(r"(?m)^ {0,3}[^\s<]*</?arg_(?:key|value)>")
 # The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
 # argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
 _TOOL_CALL_OPEN = re.compile(r"(?m)^ {0,3}<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# Markdown code: a fenced block (backticks or tildes, three or more, closed by the same run or left open to the end),
-# or an inline `span` of any backtick run. A reply quoting the markup is explaining it, not calling. An indented
-# (4-space) code block is excluded by the shapes themselves: they must begin within the first three columns.
-_CODE = re.compile(r"(?ms)^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}\1[ \t]*$|\Z)|(`+)[^\n]*?\2")
-_WHOLE_FENCE = re.compile(r"\A(`{3,}|~{3,})[\w-]*\n(.*)\n\1\Z", re.DOTALL)
+# Markdown code, by CommonMark 0.31.2: a reply quoting the markup is explaining it, not calling. A fenced block (s4.5)
+# opens on 3+ backticks or 3+ tildes after at most three spaces (a backtick fence's info string has no backtick) and
+# closes on a run of the SAME character at least as long, after at most three spaces and followed only by spaces or
+# tabs; unclosed, it runs to the end. A code span (s6.1) closes on a backtick string of exactly its opener's length;
+# spans are taken within a line. An indented (4-space) code block is excluded by the shapes themselves: they must
+# begin within the first three columns.
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+_CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
+
+
+def _fence_open(line: str) -> str | None:
+    m = _FENCE_OPEN.match(line)
+    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
+        return None
+    return m.group(1)
+
+
+def _fence_closes(line: str, fence: str) -> bool:
+    m = _FENCE_CLOSE.match(line)
+    return bool(m) and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+
+
+def _without_code(text: str) -> str:
+    """``text`` with every fenced block and code span blanked, line structure kept."""
+    out: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        if fence is not None:
+            if _fence_closes(line, fence):
+                fence = None
+            out.append("")
+            continue
+        fence = _fence_open(line)
+        out.append("" if fence is not None else _CODE_SPAN.sub(" ", line))
+    return "\n".join(out)
+
+
+def _whole_fence_body(text: str) -> str | None:
+    """The inside of ``text`` when ALL of it is one closed fenced block, else ``None``."""
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return None
+    fence = _fence_open(lines[0])
+    if fence is None or not _fence_closes(lines[-1], fence):
+        return None
+    if any(_fence_closes(line, fence) for line in lines[1:-1]):
+        return None
+    return "\n".join(lines[1:-1])
 
 
 def _json_call_names(text: str) -> list[str] | None:
@@ -254,11 +298,11 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     if not text:
         return False
     stripped = text.strip()
-    fenced = _WHOLE_FENCE.match(stripped)
-    names = _json_call_names(fenced.group(2).strip() if fenced else stripped)
+    body = _whole_fence_body(stripped)
+    names = _json_call_names((body if body is not None else stripped).strip())
     if names and all(n in tool_names for n in names):
         return True
-    prose = _CODE.sub(" ", text)
+    prose = _without_code(text)
     if _TOOL_CALL_OPEN.search(prose):
         return True
     return bool(_GLM_LINE.search(prose) and _GLM_ARG_PAIR.search(prose))
