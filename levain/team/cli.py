@@ -240,6 +240,16 @@ def cmd_export(args) -> int:
     return 0
 
 
+def _port(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        n = -1
+    if not 0 <= n <= 65535:
+        raise argparse.ArgumentTypeError(f"port must be a number from 0 to 65535, got {text!r}")
+    return n
+
+
 def cmd_view(args) -> int:
     from .view import serve
     gl = GitLedger(_repo(args))
@@ -446,7 +456,7 @@ def register(subparsers) -> None:
     p = add("view", cmd_view, "Serve the read-only team view (four panes) on localhost.")
     p.add_argument("--dir", dest="repo", help="same as --repo")
     p.add_argument("--host", default="127.0.0.1", help="loopback only (default 127.0.0.1)")
-    p.add_argument("--port", type=int, default=7450)
+    p.add_argument("--port", type=_port, default=7450, help="1..65535 (default 7450)")
     p.add_argument("--recheck-days", type=int, default=30, help="a recheck older than this is overdue (default 30)")
     p.add_argument("--cockpit-url", default="http://127.0.0.1:7420/", help="where the nav's Cockpit link points")
     p.add_argument("--ack-flag", type=int, default=3, help="acks on one path before it is flagged for review (default 3)")

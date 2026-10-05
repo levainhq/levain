@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import html
 import json
+import ipaddress
 import sys
+import threading
 from urllib.parse import parse_qs
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -51,7 +53,7 @@ def _card(e: dict, now: datetime) -> dict:
     return {"id": e["id"], "type": e.get("type"), "kind": e.get("kind"), "owner": e.get("owner") or "",
             "words": I.oneline(e.get("words") or ""), "summary": I.oneline(e.get("summary") or ""),
             "reason": I.oneline(e.get("reason") or ""), "recheck": I.oneline(e.get("recheck") or ""),
-            "paths": list(e.get("paths") or []), "recorded_by": e.get("author", "?"),
+            "paths": list(dict.fromkeys(e.get("paths") or [])), "recorded_by": e.get("author", "?"),
             "age": I.age(e.get("ts", ""), now), "age_days": _days(e.get("ts", ""), now),
             "pack": e.get("pack") or ""}
 
@@ -76,34 +78,45 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
 
     live = [e for e in ledger.in_force if keep(e)]
 
-    # 1. waiting on the viewer: open questions and tensions they own, and replacements of their rulings that lack words
+    # 1. waiting on the viewer: open questions and tensions they own, and proposed replacements of their rulings
     waiting = [_card(e, now) for e in live
                if e.get("type") in ("question", "tension") and team.owns(handle, e.get("owner", ""))]
     awaiting_words = []
     for e in ledger.entries:
-        if e.get("type") == "ack":
+        # A replacement awaiting the owner is a RULING that itself stands (a superseded one awaits nothing) and
+        # whose link to a ruling the viewer owns was refused at read (the proposer is neither the ruling's author
+        # nor the canon owner): it changes nothing until the owner records their own words.
+        if e.get("kind") != "ruling" or e["id"] in ledger.superseded:
             continue
         for sid in e.get("supersedes", []):
             t = ledger.by_id.get(sid)
             if (t and keep(t) and t.get("kind") == "ruling" and sid not in ledger.superseded
-                    and team.owns(handle, t.get("owner", "")) and not (e.get("words") or "").strip()):
+                    and team.owns(handle, t.get("owner", "")) and I.may_link(e, t, ledger.owner) is not None):
                 awaiting_words.append({"replacement": _card(e, now), "ruling": _card(t, now)})
 
-    # 2. where agents were stopped: acks by path of the ruling they acknowledge; never by who acked
+    # 2. where agents were stopped: acks by path of the ruling they acknowledge; never by who acked.
+    # One ack ENTRY adds at most 1 to a path, however many refs or duplicate globs reach it; only a ref that resolves
+    # to a ruling counts. ack_flag is compared PER PATH. ack_total (the pane's header number) is the count of
+    # distinct ack entries that counted on at least one path shown, so it is never a sum of rows.
     by_path: dict[str, dict] = defaultdict(lambda: {"acks": 0, "rulings": {}})
+    ack_total = 0
     for e in ledger.entries:
         if e.get("type") != "ack":
             continue
-        for rid in e.get("refs", []):
+        seen: set[str] = set()
+        for rid in dict.fromkeys(e.get("refs", [])):
             r = ledger.by_id.get(rid)
-            if r is None:
+            if r is None or r.get("kind") != "ruling":
                 continue
-            for g in (r.get("paths") or ["(project-wide)"]):
+            for g in dict.fromkeys(r.get("paths") or ["(project-wide)"]):
                 if pf and not hit(g):
                     continue
                 slot = by_path[g]
-                slot["acks"] += 1
+                if g not in seen:
+                    seen.add(g)
+                    slot["acks"] += 1
                 slot["rulings"][rid] = I.oneline(r.get("words") or r.get("summary") or "")
+        ack_total += bool(seen)
     stopped = [{"path": g, "acks": s["acks"], "ruling_ids": sorted(s["rulings"]),
                 "ruling_words": [s["rulings"][k] for k in sorted(s["rulings"])],
                 "review": s["acks"] >= ack_flag, "in_force": any(k not in ledger.superseded for k in s["rulings"])}
@@ -115,17 +128,21 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
         if not owner:
             return True
         return not team.owner_ok(owner)
-    orphaned = [dict(_card(e, now), why=("no owner" if not e.get("owner") else
-                                          f"owner {I.oneline(e['owner'])} is not on team.toml"))
-                for e in live if e.get("kind") == "ruling" or e.get("type") in ("question", "tension")
-                if holder_gone(e.get("owner") or "")]
-    overdue = [dict(_card(e, now), why=f"recheck is {_days(e.get('ts', ''), now)} days old")
-               for e in live if e.get("recheck") and (_days(e.get("ts", ""), now) or 0) > recheck_days]
+    held_by: dict[str, dict] = {}
+    for e in live:
+        why = []
+        if (e.get("kind") == "ruling" or e.get("type") in ("question", "tension")) and holder_gone(e.get("owner") or ""):
+            why.append("no owner" if not e.get("owner") else f"owner {I.oneline(e['owner'])} is not on team.toml")
+        if e.get("recheck") and (_days(e.get("ts", ""), now) or 0) > recheck_days:
+            why.append(f"recheck is {_days(e.get('ts', ''), now)} days old")
+        if why:
+            held_by[e["id"]] = dict(_card(e, now), why="; ".join(why))
+    held = list(held_by.values())
 
     # 4. in force: the canon by path
     paths: dict[str, list[dict]] = defaultdict(list)
     for e in live:
-        for g in (e.get("paths") or ["(project-wide)"]):
+        for g in dict.fromkeys(e.get("paths") or ["(project-wide)"]):
             if not pf or hit(g):
                 paths[g].append(_card(e, now))
     canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
@@ -134,7 +151,8 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
             "waiting": waiting, "awaiting_words": awaiting_words, "stopped": stopped,
-            "orphaned": orphaned, "overdue": overdue, "in_force": canon, "path_filter": pf,
+            "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
+            "in_force_count": len(live), "path_filter": pf,
             "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
 
 
@@ -194,10 +212,10 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
     pf = m.get("path_filter") or ""
 
     p1 = "".join(_row(c) for c in m["waiting"])
-    p1 += "".join(_row(a["replacement"], "replaces the ruling below without the decider's words; ignored until it "
-                       "carries them") + _row(a["ruling"]) for a in m["awaiting_words"])
+    p1 += "".join(_row(a["replacement"], "proposes to replace the ruling below; it changes nothing until the "
+                       "owner records their words") + _row(a["ruling"]) for a in m["awaiting_words"])
     pane1 = _panel(1, "operate", "Waiting on you",
-                   "Questions and tensions you own; replacements of your rulings that await your words.",
+                   "Questions and tensions you own; proposed replacements of your rulings, not in force until you give your words.",
                    len(m["waiting"]) + len(m["awaiting_words"]),
                    p1 or _empty("Nothing is waiting on you."))
 
@@ -214,19 +232,19 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
     pane2 = _panel(2, "identity", "Where agents were stopped",
                    "Acknowledgements by path: where recorded knowledge is doing work. Counted per path, never per "
                    "person. Denies live in each clone's hook state, not in the ledger, so they are not here.",
-                   sum(r["acks"] for r in m["stopped"]),
+                   m["ack_total"],
                    "".join(rows) or _empty("No agent has acknowledged a ruling yet."))
 
-    p3 = "".join(_row(c, c["why"]) for c in m["orphaned"] + m["overdue"])
+    p3 = "".join(_row(c, c["why"]) for c in m["held"])
     pane3 = _panel(3, "held", "Held by nobody",
                    f"Rulings whose owner left team.toml, entries with no owner, rechecks older than "
                    f"{m['recheck_days']} days.",
-                   len(m["orphaned"]) + len(m["overdue"]),
+                   m["held_count"],
                    p3 or _empty("Everything in force has a holder and a fresh recheck."))
 
     groups = "".join(f'<div class="group" data-g="{_e(g["path"].lower())}"><h3>{_e(g["path"])}</h3>'
                      f'{"".join(_row(c, paths=False) for c in g["entries"])}</div>' for g in m["in_force"])
-    total = sum(len(g["entries"]) for g in m["in_force"])
+    total = m["in_force_count"]
     pane4 = _panel(4, "mind", "In force", "The canon, by path: every entry no one has superseded.", total,
                    f'<div class="sp-results" id="inforce-results">'
                    f'{groups or _empty("Nothing is in force yet.")}</div>',
@@ -361,6 +379,7 @@ class _ViewServer(ThreadingHTTPServer):
     ack_flag: int
     cockpit_url: str
     assets: dict
+    model_lock: threading.Lock
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -376,10 +395,13 @@ class _ViewHandler(GuardedHandler):
 
     def _model(self, path_filter: str = "") -> dict:
         gl: GitLedger = self.server.ledger_reader
-        sha, team, ledger = gl.snapshot()
-        return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
-                           recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
-                           path_filter=path_filter)
+        # One reader at a time: the transport's history cache and git worktree are not written for concurrent
+        # readers. Static assets never come through here, so they are never queued behind a ledger read.
+        with self.server.model_lock:
+            sha, team, ledger = gl.snapshot()
+            return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+                               recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
+                               path_filter=path_filter)
 
     def do_GET(self) -> None:
         if self._refuse_read(head=False):
@@ -392,8 +414,10 @@ class _ViewHandler(GuardedHandler):
             pf = (parse_qs(query).get("path") or [""])[0][:300]
             try:
                 model = self._model(pf)
-            except Exception as exc:  # a broken ledger must say so, not draw an empty page
-                return self._send(f"ledger unavailable: {exc}\n".encode("utf-8"), "text/plain; charset=utf-8", status=503)
+            except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
+                print(f"levain team view: ledger unavailable: {exc}", file=sys.stderr, flush=True)
+                return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
+                                  "text/plain; charset=utf-8", status=503)
             if path == "/view.json":
                 return self._send(json.dumps(model, ensure_ascii=False).encode("utf-8"),
                                   "application/json; charset=utf-8")
@@ -421,20 +445,35 @@ class _ViewHandler(GuardedHandler):
     do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _not_allowed
 
 
+def _ipv4_loopback(host: str) -> bool:
+    """127.0.0.1, any 127.x.y.z, or ``localhost``. IPv6 is refused: the server is AF_INET and would die in bind."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.version == 4 and ip.is_loopback
+
+
 def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
                      recheck_days: int = DEFAULT_RECHECK_DAYS, ack_flag: int = DEFAULT_ACK_FLAG,
                      cockpit_url: str = DEFAULT_COCKPIT_URL) -> _ViewServer:
     """A bound, not-yet-serving server. Loopback only: refused before binding, and the bound address is checked again."""
-    if host.lower() not in _LOOPBACK and not host.startswith("127."):
-        raise ValueError(f"refusing to bind {host!r}: `levain team view` is loopback-only")
+    if not _ipv4_loopback(host):
+        raise ValueError(f"refusing to bind {host!r}: `levain team view` serves IPv4 loopback only "
+                         "(127.0.0.1 or localhost)")
+    if not isinstance(port, int) or not 0 <= port <= 65535:
+        raise ValueError(f"port must be 0..65535, got {port!r}")
     gl.snapshot()  # fail now, with the ledger's own message, if this clone has no ledger
     httpd = _ViewServer((host, port), _ViewHandler)
     bound = str(httpd.server_address[0])
-    if bound.lower() not in _LOOPBACK and not bound.startswith("127."):
+    if not _ipv4_loopback(bound):
         httpd.server_close()
         raise ValueError(f"refusing to serve: {host!r} bound a non-loopback address ({bound})")
     httpd.allowed_hosts = _LOOPBACK | {bound.lower()}
     httpd.ledger_reader = gl
+    httpd.model_lock = threading.Lock()
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag
     httpd.cockpit_url = cockpit_url if cockpit_url.startswith(("http://", "https://")) else DEFAULT_COCKPIT_URL

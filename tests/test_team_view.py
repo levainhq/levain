@@ -48,23 +48,44 @@ def test_panes_from_a_seeded_ledger():
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
     assert [c["type"] for c in m["waiting"]] == ["question"]            # ben's tension is not ana's to answer
     assert [(r["path"], r["acks"], r["review"]) for r in m["stopped"]] == [("billing.py", 3, True)]
-    assert {c["owner"] for c in m["orphaned"]} == {"carl"}              # carl is not in team.toml
-    assert [c["summary"] for c in m["overdue"]] == ["no callers"]       # 60 days > 30
+    assert {c["owner"] for c in m["held"] if "not on team.toml" in c["why"]} == {"carl"}   # carl left team.toml
+    assert [c["summary"] for c in m["held"] if "recheck" in c["why"]] == ["no callers"]   # 60 days > 30
     assert {g["path"] for g in m["in_force"]} == {"billing.py", "tax/**", "infra/**", "legacy/**"}
     assert m["you"] == "ana"
     mb = V.build_model(TEAM, ledger, "ben", None, "x", now=NOW)
     assert [c["type"] for c in mb["waiting"]] == ["tension"]
 
 
+def _walk(o):
+    """Every key and every string value in a JSON-like structure."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            yield k
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
+    elif isinstance(o, str):
+        yield o
+
+
 def test_no_count_is_keyed_by_a_person():
-    ledger, _ = _ledger()
-    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
-    blob = json.dumps(m["stopped"])
-    assert "ben" not in blob and "author" not in blob and "session" not in blob
+    # the acker's handle cannot appear as a word anywhere, so a substring hit means the person leaked
+    chains: dict = {}
+    ts = (NOW - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    team = R.Team(project="p", owner="ana", members={"ana": "a@x.io", "zq9wv": "z@x.io"})
+    r = _seal(chains, "ana", ts, "decision", kind="ruling", owner="ana", paths=["a.py"], words="Keep it.")
+    acks = [_seal(chains, "zq9wv", ts, "ack", refs=[r["id"]], session=f"sess{i}") for i in range(3)]
+    ledger = I.build([("ana/a.jsonl", [json.dumps(r, sort_keys=True)]),
+                      ("zq9wv/b.jsonl", [json.dumps(e, sort_keys=True) for e in acks])], owner="ana")
+    m = V.build_model(team, ledger, "ana", None, "x", now=NOW)
+    assert m["stopped"] and m["stopped"][0]["acks"] == 3
+    for token in _walk(m["stopped"]):
+        assert "zq9wv" not in token and not token.startswith("sess")
+    assert not ({"author", "session", "by", "who"} & {t for t in _walk(m["stopped"])})
     page = V.render_html(m)
-    # the acker never appears in pane 2
     pane2 = page.split('id="pane2"')[1].split('id="pane3"')[0]
-    assert "ben" not in pane2
+    assert "zq9wv" not in pane2 and "sess" not in pane2
 
 
 def test_page_escapes_recorded_text():
@@ -146,12 +167,12 @@ def test_path_filter_narrows_every_pane():
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="billing.py")
     assert [c["type"] for c in m["waiting"]] == ["question"]
     assert [r["path"] for r in m["stopped"]] == ["billing.py"]
-    assert m["orphaned"] == [] and m["overdue"] == []
+    assert m["held"] == []
     assert [g["path"] for g in m["in_force"]] == ["billing.py"]
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="tax/handler.py")
     assert [g["path"] for g in m["in_force"]] == ["tax/**"]                       # a glob governs the file
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="infra")
-    assert [c["owner"] for c in m["orphaned"]] == ["carl"]                        # substring of the glob
+    assert [c["owner"] for c in m["held"]] == ["carl"]                        # substring of the glob
 
 
 def test_path_filter_over_http(server):
@@ -168,3 +189,199 @@ def test_host_guard_and_unknown_route(server):
 def test_refuses_a_non_loopback_bind():
     with pytest.raises(ValueError):
         V.make_view_server(_Stub(), host="0.0.0.0", port=0)
+
+
+# ---- L3 round 1 fixes: each test was run against the code before the fix and failed -----------------------------
+
+def _build(specs, *, team=TEAM, extra_members=()):
+    """specs: [(author, type, ts_offset_hours, kwargs)] in order; returns (ledger, [sealed entries])."""
+    chains: dict = {}
+    files: dict = {}
+    out = []
+    for author, type_, hours, kw in specs:
+        ts = (NOW - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e = E.build(author, type_, **{k: v for k, v in kw.items() if k not in ("force_paths",)})
+        if "force_paths" in kw:
+            e["paths"] = kw["force_paths"]
+        e["ts"] = ts
+        e = E.seal(e, chains.get(author, ""))
+        chains[author] = e["hash"]
+        files.setdefault(author, []).append(json.dumps(e, sort_keys=True))
+        out.append(e)
+    ledger = I.build([(f"{a}/f.jsonl", l) for a, l in files.items()], owner=team.owner)
+    return ledger, out
+
+
+def test_an_ack_counts_once_per_distinct_path_and_only_for_rulings():
+    # ack_flag is PER PATH. One ack entry adds at most 1 to a path however many refs or duplicate globs reach it;
+    # an ack of a non-ruling adds nothing; the header total is the number of distinct ack entries that counted.
+    specs = [
+        ("ana", "decision", 9, dict(kind="ruling", owner="ana", paths=["a.py"], words="A.", force_paths=["a.py", "a.py"])),
+        ("ana", "decision", 8, dict(kind="ruling", owner="ana", paths=["a.py", "b.py"], words="AB.")),
+        ("ana", "question", 7, dict(owner="ana", paths=["a.py"], summary="q?")),
+    ]
+    ledger, ents = _build(specs)
+    r1, r2, q = (e["id"] for e in ents)
+    chains: dict = {}
+    more = []
+    for i, refs in enumerate(([r1, r1, r2], [r2], [q])):
+        e = E.build("ben", "ack", refs=refs, session=f"s{i}")
+        e["ts"] = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e = E.seal(e, chains.get("ben", ""))
+        chains["ben"] = e["hash"]
+        more.append(json.dumps(e, sort_keys=True))
+    files = [(f.rel, [json.dumps(x, sort_keys=True) for x in f.entries]) for f in ledger.files] + [("ben/f.jsonl", more)]
+    ledger = I.build(files, owner="ana")
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
+    rows = {r["path"]: r["acks"] for r in m["stopped"]}
+    assert rows == {"a.py": 2, "b.py": 2}        # ack0 (refs r1,r1,r2) once on a.py and once on b.py; ack1 likewise
+    assert m["ack_total"] == 2                    # ack2 acknowledged a question: not counted anywhere
+    assert [r["review"] for r in m["stopped"]] == [False, False]
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, ack_flag=2)
+    assert all(r["review"] for r in m["stopped"])  # the threshold is compared per path
+    assert "<span class=\"src\">2</span>" in V.render_html(m).split('id="pane2"')[1].split('id="pane3"')[0]
+
+
+def test_ipv6_and_non_ipv4_loopback_are_refused_cleanly():
+    for host in ("::1", "[::1]", "0.0.0.0", "evil.example"):
+        with pytest.raises(ValueError, match="127.0.0.1"):
+            V.make_view_server(_Stub(), host=host, port=0)
+    V.make_view_server(_Stub(), host="localhost", port=0).server_close()
+
+
+def test_a_bad_port_is_a_clean_error():
+    for port in (-1, 65536, 99999):
+        with pytest.raises(ValueError, match="port"):
+            V.make_view_server(_Stub(), port=port)
+
+
+def test_cli_reports_bad_host_and_port_without_a_traceback(capsys, tmp_path):
+    from levain.cli import main
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    with pytest.raises(SystemExit) as ei:
+        main(["team", "view", "--repo", str(tmp_path), "--port", "99999"])
+    assert ei.value.code == 2 and "port" in capsys.readouterr().err
+
+
+class _SlowStub(_Stub):
+    def __init__(self):
+        self.active = 0
+        self.peak = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+
+    def snapshot(self):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        self.entered.set()
+        self.release.wait(5)
+        with self.lock:
+            self.active -= 1
+        return super().snapshot()
+
+
+def test_model_generation_is_serialized_and_assets_are_not_gated():
+    stub = _SlowStub()
+    stub.snapshot_called = False
+    httpd = V.make_view_server(_Stub(), port=0)
+    httpd.ledger_reader = stub
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(_req(port, "GET")[0].status)) for _ in range(2)]
+        ts[0].start()
+        assert stub.entered.wait(5)
+        ts[1].start()
+        assert _req(port, "GET", "/team_view.css")[0].status == 200   # an asset is not queued behind the ledger read
+        stub.release.set()
+        for t in ts:
+            t.join(10)
+        assert results == [200, 200]
+        assert stub.peak == 1                                          # never two snapshots at once
+    finally:
+        stub.release.set()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_ledger_failure_does_not_echo_the_error_to_the_client(capfd):
+    class Boom(_Stub):
+        def snapshot(self):
+            if getattr(self, "armed", False):
+                raise RuntimeError("fatal: not a git repository: /Users/secret/path/.git")
+            return super().snapshot()
+    stub = Boom()
+    httpd = V.make_view_server(stub, port=0)
+    stub.armed = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 503 and b"secret" not in body and b"fatal" not in body
+        assert b"ledger unavailable" in body
+        assert "/Users/secret/path" in capfd.readouterr().err          # the detail goes to the operator's stderr
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _plus(ledger, author, items):
+    """The ledger with extra sealed entries appended to one author's file. items: [(type, kwargs, mutate)]; returns
+    (new ledger, [sealed ids])."""
+    chains = {author: ""}
+    lines, ids = [], []
+    for typ, kw, mutate in items:
+        e = E.build(author, typ, **kw)
+        e["ts"] = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if mutate:
+            mutate(e)
+        e = E.seal(e, chains[author])
+        chains[author] = e["hash"]
+        lines.append(json.dumps(e, sort_keys=True))
+        ids.append(e["id"])
+    files = [(f.rel, [json.dumps(x, sort_keys=True) for x in f.entries]) for f in ledger.files]
+    return I.build(files + [(f"{author}/g.jsonl", lines)], owner=ledger.owner), ids
+
+
+def test_awaiting_words_needs_a_ruling_replacement_that_still_stands():
+    ledger, ents = _build([("ana", "decision", 9, dict(kind="ruling", owner="ana", paths=["a.py"], words="Original."))])
+    rid = ents[0]["id"]
+    # a question that supersedes the ruling is not a replacement awaiting words
+    led, _ = _plus(ledger, "ben", [("question", dict(owner="ana", paths=["a.py"], summary="why?", supersedes=[rid]), None)])
+    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
+    # a standing ruling by someone who is neither the ruling's author nor the canon owner is refused at read, so it
+    # awaits the owner (Ana owns the call and the canon here, so ben's proposal waits on her)
+    mk = dict(kind="ruling", owner="ana", paths=["a.py"], words="Use banker's rounding.", supersedes=[rid])
+    led, (rep,) = _plus(ledger, "ben", [("decision", mk, None)])
+    assert [a["replacement"]["id"] for a in V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"]] == [rep]
+    assert V.build_model(TEAM, led, "ben", None, "x", now=NOW)["awaiting_words"] == []      # not ben's call to answer
+    # the path filter applies to the ruling the owner sees
+    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW, path_filter="zzz.py")["awaiting_words"] == []
+    assert len(V.build_model(TEAM, led, "ana", None, "x", now=NOW, path_filter="a.py")["awaiting_words"]) == 1
+    # a practice (not a ruling) proposing the replacement is not shown either
+    led, _ = _plus(ledger, "ben", [("decision", dict(kind="practice", owner="ana", paths=["a.py"], supersedes=[rid]), None)])
+    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
+    # once the replacement is itself superseded (the owner replaced it) it awaits nothing
+    led, _ = _plus(ledger, "ben", [("decision", mk, None)])
+    led, _ = _plus(led, "ana", [("decision", dict(kind="ruling", owner="ana", paths=["a.py"], words="Final.",
+                                                   supersedes=[[e for e in led.entries if e.get("supersedes")][0]["id"]]),
+                                 None)])
+    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
+
+
+def test_a_held_entry_appears_once_with_both_reasons_and_paths_are_deduped():
+    old = 90 * 24
+    ledger, ents = _build([
+        ("ana", "decision", old, dict(kind="ruling", owner="carl", paths=["x/**"], words="Carl's.", recheck="grep x",
+                                       force_paths=["x/**", "x/**"])),
+    ])
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
+    assert len(m["held"]) == 1 and m["held_count"] == 1
+    why = m["held"][0]["why"]
+    assert "carl is not on team.toml" in why and "recheck is" in why
+    assert [(g["path"], len(g["entries"])) for g in m["in_force"]] == [("x/**", 1)]
+    assert m["in_force"][0]["entries"][0]["paths"] == ["x/**"]
+    assert m["in_force_count"] == 1
