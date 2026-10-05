@@ -234,11 +234,19 @@ class PendingEfferent:
     detail: str
     reason: str
     recognized: bool = True
+    # The action's whole text when ``detail`` is a bounded one-line rendering of it. An approval runs the
+    # whole text, so every surface that asks for one must be able to show it: a tail cut at the display
+    # limit, or a newline flattened into a space, is exactly where a command can hide what it does.
+    full: str = ""
 
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
-        return f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
+        out = f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
+        if self.full and self.full != self.detail:
+            body = "\n".join("        " + ln for ln in self.full.splitlines() or [""])
+            out += f"\n      the whole action (what approving runs):\n{body}"
+        return out
 
 
 def resolve_gate_mode(setting: GateSetting | str, *, human_present: bool) -> GateMode:

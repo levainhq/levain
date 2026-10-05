@@ -172,6 +172,16 @@ def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
     return str(kind)
 
 
+def _full_for(fields: dict[str, Any]) -> str:
+    """The proposed action's text exactly as it would run, unbounded and unflattened (see
+    :attr:`levain.firing.gate.PendingEfferent.full`)."""
+    command = fields.get("command")
+    path = fields.get("path")
+    if isinstance(command, str) and isinstance(path, str) and path:
+        return f"{command} {path}"
+    return command if isinstance(command, str) else ""
+
+
 def _elide(text: str) -> str:
     """One line, bounded. A multi-line command is collapsed so one proposal stays one entry."""
     flat = " ".join(text.split())
@@ -319,6 +329,7 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
                     detail=_detail_for(tool_name, fields, _safe_attr(event, "action")),
                     reason=classification.reason,
                     recognized=classification.recognized,
+                    full=_full_for(fields),
                 )
             )
         except Exception:  # noqa: BLE001 — one undescribable action must not blank the whole
