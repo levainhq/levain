@@ -16,7 +16,7 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import GitLedger, Repo, TeamError
+from .transport import GitLedger, Repo, TeamError, require_untampered
 
 
 def _repo(args) -> Repo:
@@ -161,19 +161,19 @@ def cmd_status(args) -> int:
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
     handle = gl.handle(team)
+    if ledger.tamper:
+        # Plain and --path alike: the refusal and no entries, rc 3 (never a half-trusted listing).
+        text = "the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper)
+        if args.json:
+            print(json.dumps({"deny": True, "text": text, "tamper": ledger.tamper, "entries": []}, ensure_ascii=False))
+        else:
+            print(text)
+            print("\n(every edit in this clone is DENIED until the file is removed from the ledger branch)")
+        return 3
     state = gl.state_hash(ledger, team)
     canon_text = gl.read_canon(sha)
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
-        if ledger.tamper:
-            text = "the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper)
-            if args.json:
-                print(json.dumps({"path": rel, "deny": True, "text": text, "tamper": ledger.tamper, "entries": []},
-                                 ensure_ascii=False))
-            else:
-                print(text)
-                print("\n(every edit in this clone is DENIED until the file is removed from the ledger branch)")
-            return 3
         d = decide(team, ledger, handle, rel, "", set())
         if args.json:
             print(json.dumps({"path": rel, "deny": bool(d and d.deny), "text": d.text if d else "",
@@ -232,6 +232,7 @@ def cmd_consolidate(args) -> int:
     if gl.remote and not args.no_push:
         gl.sync(push=False)
     ledger = gl.ledger(team)
+    require_untampered(ledger)        # before rendering, --dry-run included: nothing is committed or pushed
     text = C.render(team, ledger, tree=gl.state_hash(ledger, team), by=handle, ts=E.now_iso())
     if args.dry_run:
         print(text, end="")

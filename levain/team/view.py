@@ -32,7 +32,7 @@ from levain.web_server import load_web_asset
 from . import canon as C
 from . import index as I
 from . import roles as R
-from .transport import GitLedger
+from .transport import GitLedger, require_untampered
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
@@ -396,6 +396,7 @@ class _ViewHandler(GuardedHandler):
             raise _Busy()
         try:
             sha, team, ledger = gl.snapshot()
+            require_untampered(ledger)   # the refusal is served (503, no entries), never a model
             return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
                                path_filter=path_filter)

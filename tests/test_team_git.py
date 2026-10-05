@@ -433,6 +433,136 @@ def test_a_ledger_entry_that_is_not_a_directory_is_tamper_and_nothing_is_written
     assert list(outside.iterdir()) == []                               # nothing was written through the link
 
 
+def _push_wt(gl, msg, *, add="-A"):
+    git("add", add, ".", cwd=gl.wt)
+    git("commit", "-qm", msg, cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+
+
+def _own_file(gl):
+    return next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+
+
+def test_a_reorder_of_an_append_only_file_is_a_rewrite_problem_and_not_accepted(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    before = len(ledger(ben).entries)
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    lines = f.read_text().splitlines()
+    assert len(lines) >= 2
+    f.write_text("\n".join(reversed(lines)) + "\n")
+    _push_wt(gl, "reorder")
+    assert team("sync", repo=ben) == 0
+    led = ledger(ben)
+    assert any("append-only" in p and "not accepted" in p for p in led.problems), led.problems
+    assert len(led.entries) == before
+
+
+def _plumb(gl, parts, entry):
+    """Commit on top of HEAD with `entry` (mode, type, sha) at the nested path `parts`, built with mktree only."""
+    def tree_of(prefix, rest):
+        listing = git("ls-tree", "-z", f"HEAD:{prefix}" if prefix else "HEAD", cwd=gl.wt)
+        ents = [e for e in listing.split("\0") if e]
+        head = rest[0]
+        ents = [e for e in ents if e.split("\t", 1)[1] != head]
+        if len(rest) == 1:
+            ents.append(f"{entry[0]} {entry[1]} {entry[2]}\t{head}")
+        else:
+            sub = tree_of(f"{prefix}/{head}" if prefix else head, rest[1:])
+            ents.append(f"040000 tree {sub}\t{head}")
+        out = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(ents) + "\0", check=True,
+                             capture_output=True, text=True).stdout.strip()
+        return out
+    root = tree_of("", parts)
+    c = git("commit-tree", root, "-p", "HEAD", "-m", "plumbed", cwd=gl.wt).strip()
+    git("update-ref", "refs/heads/levain-ledger", c, cwd=gl.wt)
+    git("reset", "-q", "--hard", c, cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+
+
+def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    empty = subprocess.run(["git", "mktree"], cwd=gl.wt, input="", check=True, capture_output=True, text=True).stdout.strip()
+    _plumb(gl, ["ledger", "ana", "0123456789abcdef.jsonl"], ("040000", "tree", empty))
+    assert team("sync", repo=ben) == 0
+    assert any("0123456789abcdef.jsonl" in t for t in ledger(ben).tamper)
+
+
+def test_regular_to_symlink_to_regular_with_a_dropped_line_is_a_problem(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    full = f.read_text()
+    kept = full.splitlines()[0] + "\n"
+    f.unlink()
+    f.symlink_to(tmp)
+    _push_wt(gl, "symlink")
+    f.unlink()
+    f.write_text(kept)
+    _push_wt(gl, "regular again, a line dropped")
+    assert team("sync", repo=ben) == 0
+    led = ledger(ben)
+    assert sum("append-only" in p for p in led.problems) >= 2, led.problems
+    assert not led.tamper
+
+
+def test_consolidate_on_a_tampered_ledger_refuses_and_commits_nothing(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    head = git("rev-parse", "HEAD", cwd=gl.wt)
+    capsys.readouterr()
+    assert team("consolidate", "--dry-run", repo=ana) != 0
+    assert capsys.readouterr().out == ""
+    assert team("consolidate", repo=ana) != 0
+    assert git("rev-parse", "HEAD", cwd=gl.wt) == head
+    assert git("ls-tree", "--name-only", "HEAD", cwd=gl.wt).split().count("PROJECT.md") == 0
+
+
+def test_plain_status_on_a_tampered_ledger_is_refused_with_no_entries(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays visible") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    capsys.readouterr()
+    assert team("status", repo=ana) == 3
+    out = capsys.readouterr().out
+    assert "REFUSED as tampered" in out and "a stays visible" not in out
+    assert team("status", "--json", repo=ana) == 3
+    assert json.loads(capsys.readouterr().out)["entries"] == []
+
+
+def test_a_device_id_that_is_not_16_hex_is_refused(two):
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ben))
+    gl.save_state(device="../x")
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/a.py",
+                "--words", "must not land", repo=ben) != 0
+    assert not (gl.wt / "ledger" / "x.jsonl").exists()
+
+
+def test_an_append_onto_a_hard_linked_ledger_file_is_refused(two):
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ben))
+    mine = next((gl.wt / "ledger" / "ben").glob("*.jsonl"))
+    outside = tmp / "outside.jsonl"
+    os.link(mine, outside)
+    before = outside.read_bytes()
+    assert record_ruling(ben, "src/b.py", "second") != 0
+    assert outside.read_bytes() == before
+
+
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
     from levain.team.export import _label
     rels = ["ana/a.jsonl", "ana/device!.jsonl", "ana/other!.jsonl", "unnamed-0-" + "0" * 64, "ana/" + "x" * 300 + ".jsonl"]

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import entry as E
 from . import roles as R
-from .transport import GitLedger, TeamError
+from .transport import GitLedger, TeamError, require_untampered
 
 
 def _fingerprint_entry(e: dict) -> str:
@@ -65,6 +65,7 @@ def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
     with gl.lock(name="pack", timeout=60):
         led = gl.ledger(team)
+        require_untampered(led)
         todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
         written = []
         for i, e in enumerate(todo):
