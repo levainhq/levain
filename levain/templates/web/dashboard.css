@@ -1101,7 +1101,7 @@
 .chat-btn.approve:hover:not(:disabled) { color: #06120c; background: var(--mind); }
 .chat-btn.reject { color: var(--hot); border-color: color-mix(in srgb, var(--hot) 45%, var(--line)); }
 .chat-btn.reject:hover:not(:disabled) { color: #1a0804; background: var(--hot); }
-.chat-btn.approve.armed { color: #06120c; background: var(--mind); text-transform: none; letter-spacing: .02em; }
+.chat-ask { color: var(--ink); margin: 0; }
 .chat-log { display: flex; flex-direction: column; gap: 8px; max-height: 55vh; overflow-y: auto; }
 .chat-msg { border: 1px solid var(--line); border-radius: 5px; padding: 8px 10px; background: rgba(8,11,11,.55); min-width: 0; }
 .chat-msg.me { border-left: 2px solid var(--identity); }
