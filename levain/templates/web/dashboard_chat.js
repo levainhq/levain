@@ -218,8 +218,8 @@
       if (myRun !== run) return;
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
       if (r.status !== 202 || !r.json.job_id) {
-        // Only the chat server's own refusal is definite (nothing started); anything else may have started the turn.
-        if (definiteRefusal(r)) { failure("The turn was not accepted: " + why(r)); setComposeEnabled(true); return; }
+        // No response from this page can prove who wrote it (a proxy can answer a JSON 4xx/503 after forwarding the
+        // request), so anything but a 202 with a job may have started the turn.
         failure("The turn was not confirmed: " + why(r));
         ambiguousStop(myRun, "turn"); return;
       }
@@ -283,12 +283,6 @@
     }
     return out;
   }
-  // Whether a refused POST is the chat server's own refusal, so nothing started: a 4xx or 503 carrying its JSON
-  // error code. Anything else (no response, another 5xx, a proxy's bare status, a 202 without a job) is ambiguous.
-  function definiteRefusal(r) {
-    return ((r.status >= 400 && r.status < 500) || r.status === 503) &&
-      !!(r.json && typeof r.json.error === "string" && r.json.error);
-  }
   // AMBIGUOUS OUTCOME: the page cannot tell whether its last turn or decision ran. It NEVER builds a consent box on
   // its own here: it says the outcome is unknown, blocks compose, and offers one button. Only a trusted click on it
   // reads the session again, and whatever that read shows carries this warning.
@@ -309,9 +303,9 @@
     row.appendChild(btn); log.appendChild(row);
   }
   // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that. Called
-  // after a DEFINITE refusal (nothing ran; `warning` null) or from the re-read button after an ambiguous one
-  // (`warning` set, and attached to whatever is shown). A gated session comes back with its held set and, while it
-  // is still approvable, its CURRENT decision id (the id only ever comes from the server's answer). Reads only.
+  // only from the re-read button after an ambiguous outcome; `warning` is attached to whatever is shown. A gated
+  // session comes back with its held set and, while it is still approvable, its CURRENT decision id (the id only
+  // ever comes from the server's answer). Reads only.
   function resync(myRun, warning) {
     if (!session) return;
     live.textContent = "reading the session…";
@@ -386,23 +380,14 @@
     }
     function after(r) {
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
-      if (r.status === 409 && r.json && r.json.error === "stale_decision") {
-        // The server holds something other than what this box shows: the box is withdrawn, never re-armed, and
-        // a fresh one is built from what the server holds now.
-        deciding = false; box.remove();
-        failure("The held action changed since it was shown, or could not be read; nothing ran; re-reading the session.");
-        resync(myRun, null); return;
-      }
       if (r.status !== 202 || !r.json.job_id) {
-        // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If
-        // the halt is still undecided it comes back with its decision id and the set to show, and a fresh
-        // box is built from that, never from this one. Only the chat server's own refusal (a 4xx or 503 that
-        // carries its JSON error code) is definite: nothing ran. Anything else (no response, another 5xx, a
-        // proxy's bare status, a 202 without a job) may have started the decision.
+        // Not retried and not re-armed: this box is withdrawn. No response this page receives can prove who wrote
+        // it (a proxy can answer a JSON 4xx/503 after forwarding the request), so anything but a 202 with a job,
+        // the server's own 409 stale_decision included, may have started the decision: the outcome is reported
+        // unknown and the session is read only on a trusted click, never rebuilt here.
         deciding = false; box.remove();
-        failure("The decision was not accepted: " + why(r));
-        if (definiteRefusal(r)) resync(myRun, null); else ambiguousStop(myRun, "decision");
-        return;
+        failure("The decision was not confirmed: " + why(r));
+        ambiguousStop(myRun, "decision"); return;
       }
       live.textContent = "working…";
       poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });

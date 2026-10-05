@@ -111,8 +111,9 @@ function fetch(path, init) {
   const M = process.argv[3];
   if ((M === "post500" || M === "ambiguousgated") && path === "/chat/approve") return reply(500, {});
   if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
+  if (M === "proxy503json" && path === "/chat/approve") return reply(503, { error: "upstream_timeout" });
   if (M === "evicted" && path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "unknown" });
-  if (["post500", "proxy503", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+  if (["post500", "proxy503", "proxy503json", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null });
   if (M && M.startsWith("lost") && path.startsWith("/chat/session.json?id=S")) {
     sessionReads++;
@@ -152,10 +153,6 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   if (process.argv[3] === "turn500" || process.argv[3] === "turn409") {
     ok(!panel.textContent.includes("Held for your approval"), "no consent box from a turn POST without a clear answer");
     ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
-    if (process.argv[3] === "turn409") {
-      ok(panel.textContent.includes("not accepted") && !area.disabled, "a definite refusal: compose is usable again");
-      console.log("PASS"); return;
-    }
     ok(panel.textContent.includes("outcome of the last turn is unknown; the previous request may already have run"), "an ambiguous turn is reported unknown");
     ok(area.disabled, "compose is blocked");
     const rr = byText(panel, "Re-read the session"); ok(rr, "a re-read button is offered");
@@ -183,7 +180,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (["post500", "proxy503", "evicted", "ambiguousgated", "lost", "lostok", "lostloop"].includes(process.argv[3])) {
+  if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
     // No clear answer to the approve (a bare 5xx, a proxy's status, an evicted job, lost polls): the decision may
     // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
     // the session only on a trusted click of "Re-read the session", carrying the warning into what it shows.
@@ -200,7 +197,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
     rr.fire("click", { isTrusted: true }); await sleep(120);
     ok(calls.filter((c) => c.path === "/chat/session.json").length === 1, "a trusted click reads the session once");
-    if (m === "ambiguousgated") {
+    if (m === "ambiguousgated" || m === "resync" || m === "stale") {
       const box = find(panel, (n) => n.className === "chat-consent");
       ok(box && box.textContent.includes("may already have run") && box.textContent.includes("y-after-reload"), "the re-read box carries the warning");
       const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
@@ -211,18 +208,6 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     } else {
       ok(panel.textContent.includes("The session is idle now.") && !area.disabled, "an idle session is usable again, warning shown");
     }
-    console.log("PASS"); return;
-  }
-  if (process.argv[3] === "resync" || process.argv[3] === "stale") {
-    // a decision the server did not take: the box is withdrawn and rebuilt from GET /chat/session.json
-    approve.fire("click", { isTrusted: true }); await sleep(80);
-    ok(approvals() === 1, "one approve was sent");
-    ok(calls.some((c) => c.path === "/chat/session.json"), "the session was read again");
-    ok(panel.textContent.includes("y-after-reload"), "the held set the server reports is shown");
-    const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
-    again.fire("click", { isTrusted: true }); await sleep(80);
-    ok(approvals() === 2, "the fresh box approves once");
-    ok(JSON.parse(calls.filter((c) => c.path === "/chat/approve")[1].body).expect === "D2", "and carries the id the server reported");
     console.log("PASS"); return;
   }
   approve.fire("click", { isTrusted: true }); approve.fire("click", { isTrusted: true });
@@ -238,13 +223,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
     # reported unknown with compose blocked, and the session is read only on a trusted re-read click (chat r7)
-    # mode "stale": a 409 stale_decision is re-read the same way, never a dead end
-    # mode "resync": a decision the server refused is re-read (GET /chat/session.json), never re-armed
+    # modes "stale", "resync", "turn409", "proxy503json" (chat r7 L3, codex/gemini/complement): a JSON 4xx/503 proves
+    # nothing about who wrote it, so it is ambiguous like any other non-202; the session is read only on a re-read click
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)
     p = subprocess.run(["node", str(h), str(JS), mode], capture_output=True, text=True, timeout=60)
