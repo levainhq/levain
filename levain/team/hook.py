@@ -29,7 +29,7 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
+from .transport import BRANCH, DIRNAME, GitLedger, LedgerReadError, Repo, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -190,6 +190,13 @@ def pretooluse(payload: dict) -> None:
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
     try:
         _, team, ledger = gl.snapshot()
+    except LedgerReadError as exc:
+        # git's answer about the ledger could not be read, so the ledger cannot be judged: fail CLOSED, naming why.
+        _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                     "permissionDecisionReason": I.oneline(
+                                         f"{TAG} the team ledger could not be read ({exc}); every edit is denied until "
+                                         "`levain team doctor` is clean.")}})
+        return
     except (R.RolesError, TeamError) as exc:
         _fail_open("PreToolUse", str(exc))
         return

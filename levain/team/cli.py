@@ -215,6 +215,9 @@ def cmd_verify(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
+    if ledger.tamper:                 # the refusal and no counts, like status
+        print("the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper))
+        return 3
     canon_text = gl.read_canon(sha)
     problems = list(ledger.problems) + gl.team_history_problems(team, sha)
     for e in ledger.entries:
@@ -331,8 +334,11 @@ def cmd_doctor(args) -> int:
     except R.RolesError as exc:
         rows.append((False, str(exc)))
     ledger = gl.ledger()
-    rows.append((not ledger.problems, f"{len(ledger.entries)} entries, chains intact" if not ledger.problems
-                 else f"{len(ledger.problems)} integrity problem(s): run `levain team verify`"))
+    if ledger.tamper:
+        rows.append((False, "the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper[:3])))
+    else:
+        rows.append((not ledger.problems, f"{len(ledger.entries)} entries, chains intact" if not ledger.problems
+                     else f"{len(ledger.problems)} integrity problem(s): run `levain team verify`"))
     st = gl.state()
     if gl.remote:
         err = st.get("last_fetch_error")

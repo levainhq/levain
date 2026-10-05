@@ -49,6 +49,11 @@ class TeamError(RuntimeError):
     """A team operation could not complete. The message is meant for a person to read."""
 
 
+class LedgerReadError(TeamError):
+    """git's answer about the ledger's tree or blobs could not be read (an unparseable record, a framing error). The
+    ledger cannot be judged, so the edit hook fails CLOSED on this one."""
+
+
 class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
@@ -368,6 +373,39 @@ class GitLedger:
             pass
         return I.build(sorted(files.items()), team.owner if team else None, problems, tamper=tamper)
 
+    def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]]]:
+        """(bad_paths, leaves) of the ledger at ``rev``: one ``ls-tree -r -t -z``, judged as bytes. No blob is read."""
+        top = self.repo.toplevel
+        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger"], top, check=False, timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
+        bad_paths: list[bytes] = []
+        leaves: list[tuple[bytes, str]] = []
+        seen_paths: set[bytes] = set()
+        for rec in cp.stdout_bytes.split(b"\0"):
+            if not rec:
+                continue
+            meta, tab, path = rec.partition(b"\t")
+            fields = meta.split(b" ")
+            if not tab or len(fields) != 3:
+                raise LedgerReadError("git ls-tree gave a record levain cannot read")
+            mode, kind = fields[0], fields[1]
+            if path in seen_paths:                                        # two entries, one path: never valid
+                bad_paths.append(path)
+                continue
+            seen_paths.add(path)
+            is_tree = mode == b"040000" and kind == b"tree"
+            if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
+                ok = is_tree
+            elif mode in _REGULAR_MODES and kind == b"blob" and _LEDGER_PATH_RE.fullmatch(path):
+                ok = True
+                leaves.append((path, fields[2].decode("ascii", "replace")))
+            else:
+                ok = False
+            if not ok:
+                bad_paths.append(path)
+        return bad_paths, leaves
+
     def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
         """(files, problems, tamper) from the TIP TREE of the ledger branch. Nothing here reads history except to
         name a tamper path's author.
@@ -384,34 +422,7 @@ class GitLedger:
         and a tip file that does not extend them is a rewrite problem whose new content is not accepted.
         """
         top = self.repo.toplevel
-        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger"], top, check=False, timeout=30)
-        if cp.returncode != 0:
-            raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
-        bad_paths: list[bytes] = []
-        leaves: list[tuple[bytes, str]] = []
-        seen_paths: set[bytes] = set()
-        for rec in cp.stdout_bytes.split(b"\0"):
-            if not rec:
-                continue
-            meta, tab, path = rec.partition(b"\t")
-            fields = meta.split(b" ")
-            if not tab or len(fields) != 3:
-                raise TeamError("git ls-tree gave a record levain cannot read")
-            mode, kind = fields[0], fields[1]
-            if path in seen_paths:                                        # two entries, one path: never valid
-                bad_paths.append(path)
-                continue
-            seen_paths.add(path)
-            is_tree = mode == b"040000" and kind == b"tree"
-            if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
-                ok = is_tree
-            elif mode in _REGULAR_MODES and kind == b"blob" and _LEDGER_PATH_RE.fullmatch(path):
-                ok = True
-                leaves.append((path, fields[2].decode("ascii", "replace")))
-            else:
-                ok = False
-            if not ok:
-                bad_paths.append(path)
+        bad_paths, leaves = self._structure(rev)
 
         tamper: list[str] = []
         for n, path in enumerate(bad_paths):
@@ -426,6 +437,8 @@ class GitLedger:
             shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
             tamper.append(f"{shown!r} (written by {who}) is not a file levain writes")
 
+        if tamper:                                      # nothing of a structurally refused ledger is read or cached
+            return {}, [], tamper
         blobs = self._blobs({sha for _p, sha in leaves if set(sha) - {"0"}})
         by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
         pins, pin_problem = self._pins()
@@ -470,7 +483,9 @@ class GitLedger:
             problems.append(f"ledger/{rel}: a file this clone had accepted is gone; the ledger is append-only, so "
                             "its accepted lines still count")
             files[rel] = [_text(p_.encode("latin-1")) for p_ in pins[rel]]
-        if not tamper and (new_pins != pins or pin_problem):      # a tampered read never advances the pins
+        if tamper:                                      # a duplicate id: refused, and no entries are cached
+            return {}, problems, tamper
+        if new_pins != pins or pin_problem:      # a tampered read never advances the pins
             self._save_pins(new_pins)
         return files, problems, tamper
 
@@ -541,22 +556,22 @@ class GitLedger:
         cp = git(["cat-file", "--batch"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
                  check=False, timeout=60)
         if cp.returncode != 0:
-            raise TeamError(f"could not read ledger contents: {_tail(cp)}")
+            raise LedgerReadError(f"could not read ledger contents: {_tail(cp)}")
         out: dict[str, bytes] = {}
         buf, pos = cp.stdout_bytes, 0
         for want in order:
             nl = buf.find(b"\n", pos)
             head = buf[pos:nl].split(b" ") if nl >= 0 else []
             if len(head) != 3 or head[0] != want.encode("ascii") or head[1] != b"blob" or not head[2].isdigit():
-                raise TeamError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
+                raise LedgerReadError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
             size = int(head[2])
             end = nl + 1 + size
             if end >= len(buf) or buf[end:end + 1] != b"\n":
-                raise TeamError(f"git cat-file gave a frame levain cannot read for {want[:10]}")
+                raise LedgerReadError(f"git cat-file gave a frame levain cannot read for {want[:10]}")
             out[want] = buf[nl + 1:end]
             pos = end + 1
         if pos != len(buf):
-            raise TeamError("git cat-file gave output levain cannot read after the last frame")
+            raise LedgerReadError("git cat-file gave output levain cannot read after the last frame")
         return out
 
     def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:
@@ -764,7 +779,11 @@ class GitLedger:
             self._refuse_symlinked_dirs(path)
             path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
-            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o666)
+            except OSError as exc:
+                raise TeamError(f"{path.relative_to(self.wt).as_posix()} in the ledger worktree cannot be opened for "
+                                f"writing ({exc.strerror}); a symlink there is refused") from None
             try:
                 st = os.fstat(fd)
                 if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
@@ -807,6 +826,28 @@ class GitLedger:
         if "couldn't find remote ref" in (cp.stderr or ""):
             return False
         raise TeamError(f"git fetch failed: {_tail(cp)}")
+
+    def _refuse_tampered_remote(self, rref: str, lock_timeout: float) -> None:
+        """A tampered remote tip is never replayed onto and never pushed over. With nothing unpushed the ordinary
+        fast-forward installs it (the hooks then deny). With unpushed local commits it is installed locally, those
+        commits are kept under refs/levain-team/unpushed/, and the sync fails loudly instead of replaying them."""
+        sha = git(["rev-parse", "-q", "--verify", rref], self.repo.toplevel).stdout.strip()
+        bad, _leaves = self._structure(sha)
+        if not bad:
+            return
+        with self.lock(timeout=lock_timeout):
+            self._recover_dirty()
+            orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
+            ahead = git(["rev-list", "--count", f"{sha}..{orig}"], self.wt).stdout.strip()
+            if ahead == "0":
+                return
+            kept = f"refs/levain-team/unpushed/{orig[:12]}"
+            git(["update-ref", kept, orig], self.wt)
+            git(["reset", "-q", "--hard", sha], self.wt, timeout=60)
+        raise TeamError(
+            "the REMOTE team ledger is tampered with (files levain never writes), so your unpushed commit(s) were "
+            "not replayed onto it and nothing was pushed; the remote tip is installed locally and every edit here "
+            f"is denied until the team owner removes those files. Your {ahead} unpushed commit(s) are kept at {kept}.")
 
     def _rebase(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's unpushed commits on top of the remote, under the worktree lock.
@@ -917,6 +958,7 @@ class GitLedger:
                     if not push:
                         return f"{remote} has no {BRANCH} branch yet"
                 else:
+                    self._refuse_tampered_remote(rref, lock_timeout)
                     self._rebase(rref, timeout, lock_timeout)
                     if not push:
                         return "fetched"
@@ -982,6 +1024,7 @@ class GitLedger:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
+            require_untampered(self.ledger())           # judged INSIDE the lock, against the current tip
             (self.wt / name).write_text(text, encoding="utf-8")
             git(["add", "--", name], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
@@ -1000,6 +1043,7 @@ class GitLedger:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
+            require_untampered(self.ledger())           # judged INSIDE the lock, against the current tip
             team = R.parse_team((self.wt / "team.toml").read_text(encoding="utf-8"), "team.toml")
             change(team)
             R.validate_team(team)

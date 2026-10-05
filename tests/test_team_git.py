@@ -363,7 +363,7 @@ def test_a_ledger_file_levain_never_writes_is_refused_as_tamper_not_read(two, ca
     assert team("export", "--jsonl", repo=ben) == 3            # export refuses
     assert "my file.jsonl" in capsys.readouterr().err
     team("doctor", repo=ben)                                   # doctor flags it
-    assert "integrity problem" in capsys.readouterr().out
+    assert "FAIL  the team ledger is REFUSED as tampered" in capsys.readouterr().out
     payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
     ctx = hook("sessionstart", payload)["hookSpecificOutput"]["additionalContext"]
     assert "REFUSED as tampered" in ctx and "odd name stays" not in ctx
@@ -627,6 +627,81 @@ def test_two_tree_entries_with_one_path_are_tamper(two):
     c = git("commit-tree", root, "-p", "HEAD", "-m", "dup path", cwd=gl.wt).strip()
     git("update-ref", "refs/heads/levain-ledger", c, cwd=gl.wt)
     assert any(f.name in t for t in ledger(ana).tamper), ledger(ana).tamper
+
+
+def _plant(gl):
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+
+
+def test_verify_on_a_tampered_ledger_is_refused_with_no_counts(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    _plant(GitLedger(Repo.discover(ana)))
+    capsys.readouterr()
+    assert team("verify", repo=ana) == 3
+    out = capsys.readouterr().out
+    assert "REFUSED as tampered" in out and "entries in" not in out
+    team("doctor", repo=ana)
+    out = capsys.readouterr().out
+    assert "FAIL  the team ledger is REFUSED as tampered" in out and "chains intact" not in out
+
+
+def test_sync_never_replays_onto_or_pushes_over_a_tampered_remote(two):
+    tmp, ana, ben = two
+    assert team("sync", repo=ben) == 0
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/b.py",
+                "--words", "ben unpushed", "--no-push", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    _plant(gl)
+    remote_tip = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
+    assert team("sync", repo=ben) != 0
+    assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == remote_tip     # nothing was pushed
+    assert "ben unpushed" not in git("log", "--format=%s%n%b", "levain-ledger", cwd=tmp / "origin.git")
+    reason = edit(ben, "src/unrelated.py", session="r1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason                                                    # installed locally
+    gb = GitLedger(Repo.discover(ben))
+    assert git("for-each-ref", "refs/levain-team/unpushed", cwd=gb.wt).strip()                # the local commit is kept
+
+
+def test_update_team_and_write_canon_refuse_on_a_tampered_tip(two):
+    from levain.team.transport import TeamError
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    _plant(gl)
+    with pytest.raises(TeamError, match="tampered"):
+        gl.update_team(lambda t: None, "no", push=False)
+    with pytest.raises(TeamError, match="tampered"):
+        gl.write_canon("x\n", push=False)
+
+
+def test_a_structurally_tampered_tip_caches_no_entry_content(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "secret words in an entry") == 0
+    gl = GitLedger(Repo.discover(ana))
+    _plant(gl)
+    assert ledger(ana).tamper
+    assert "secret words" not in (gl.base / "history.json").read_text()
+
+
+def test_an_unreadable_tree_record_denies_in_the_hook(two, monkeypatch, capsys):
+    from levain.team import hook as H, transport as T
+    tmp, ana, ben = two
+    real = T.git
+
+    def fake(args, cwd, **kw):
+        if args and args[0] == "ls-tree":
+            cp = subprocess.CompletedProcess(args, 0, "", "")
+            cp.stdout_bytes = b"a record with no tab\0"
+            return cp
+        return real(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", fake)
+    H.pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+                  "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "a.py")}, "tool_use_id": "t"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "could not be read" in out["permissionDecisionReason"]
 
 
 def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
