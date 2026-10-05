@@ -335,10 +335,51 @@ def test_a_member_cannot_make_the_owner_write_outside_the_worktree_through_a_lin
     git("commit", "-qm", "link", cwd=wt)
     git("push", "-q", "origin", "HEAD:levain-ledger", cwd=wt)
     team("sync", repo=ana)
+    out = GitLedger(Repo.discover(ana)).wt / name
+    assert out.is_symlink()                                    # the attack reached the owner's worktree
     team("consolidate", repo=ana)
     assert victim.read_text() == "ORIGINAL\n"
-    out = GitLedger(Repo.discover(ana)).wt / name
+    assert git("status", "--porcelain", "--untracked-files=all", cwd=out.parent) == ""   # no temp left behind
     assert not out.is_symlink() and "project canon" in out.read_text()
+
+
+def _push_from_ben(ben, build, msg):
+    wt = GitLedger(Repo.discover(ben)).wt
+    build(wt)
+    git("add", "-A", ".", cwd=wt)
+    git("commit", "-qm", msg, cwd=wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=wt)
+
+
+def test_a_directory_at_project_md_is_a_team_error_not_a_crash(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana) == 0
+    assert team("sync", repo=ben) == 0
+
+    def build(wt):
+        (wt / "PROJECT.md").unlink(missing_ok=True)
+        (wt / "PROJECT.md").mkdir()
+        (wt / "PROJECT.md" / "x").write_text("x\n")
+    _push_from_ben(ben, build, "dir canon")
+    team("sync", repo=ana)
+    capsys.readouterr()
+    assert team("consolidate", repo=ana) == 2
+    assert "is a directory" in capsys.readouterr().err
+
+
+def test_a_dangling_team_toml_link_is_refused_by_name_not_reported_as_not_joined(two, capsys):
+    tmp, ana, ben = two
+    assert team("sync", repo=ben) == 0
+
+    def build(wt):
+        (wt / "team.toml").unlink()
+        (wt / "team.toml").symlink_to(tmp / "nowhere.toml")
+    _push_from_ben(ben, build, "dangling team")
+    team("sync", repo=ana)
+    capsys.readouterr()
+    assert team("member", "add", "cy", "cy@ex.com", repo=ana) == 2
+    err = capsys.readouterr().err
+    assert "team.toml" in err and "has not joined" not in err
 
 
 def _framed(text: str):
