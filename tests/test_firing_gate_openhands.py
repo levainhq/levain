@@ -926,3 +926,76 @@ def test_a_hold_whose_full_cannot_be_rendered_cannot_be_approved_at_the_repl(mon
     run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=(held,), error=None))
     assert s.approved == 0 and s.rejected == 1
     assert "cannot be shown in full" in capsys.readouterr().out
+
+
+def test_an_action_that_cannot_be_dumped_is_reject_only_at_the_repl_and_the_server(monkeypatch, capsys, tmp_path):
+    """codex HIGH r4: the vars() fallback (good enough to classify) was labelled the whole action."""
+    from types import SimpleNamespace
+
+    from levain import run as run_mod
+    from levain.chat import ChatError, ChatHost, _turn_payload
+    from levain.firing.openhands.gate import _full_for
+
+    def broken(self, *a, **k):
+        raise RuntimeError("cannot dump")
+
+    monkeypatch.setattr(TerminalAction, "model_dump", broken)
+    conv = _FakeConversation()
+    conv.state.events = [_event("terminal", TerminalAction(command="git push --force"))]
+    report = pending_gate_report(conv)
+    assert report[0].tool_name == "terminal" and report[0].full == "" and not report[0].decidable
+    assert "NOT SHOWN IN FULL" in report[0].line()
+
+    class Session:
+        approved = rejected = 0
+
+        def resume_turn(self):
+            self.approved += 1
+            return SimpleNamespace(gated=False, error=None)
+
+        def reject_turn(self, reason):
+            self.rejected += 1
+            return SimpleNamespace(gated=False, error=None)
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    s = Session()
+    run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=tuple(report), error=None))
+    assert s.approved == 0 and s.rejected == 1
+
+    class Stub:
+        label = model_label = "s"
+        gate_mode, bash_ok, deny_standard_creds, workspace = "gated", True, False, tmp_path
+
+        def __init__(self, on_event):
+            pass
+
+        def run_turn(self, message):
+            return SimpleNamespace(reply=None, tool_activity=[], error=None, nudged=False, gated=True,
+                                   timed_out=False, pending=tuple(report), ok=False, exit_code=4)
+
+        def close(self):
+            pass
+
+    host = ChatHost({"a": tmp_path}, session_factory=lambda d, on_event: Stub(on_event))
+    out = host.open("a")
+    import time
+    while host.job_status(out["job_id"])["status"] == "running":
+        time.sleep(0.01)
+    t = host.turn(out["session_id"], "go")
+    while host.job_status(t["job_id"])["status"] == "running":
+        time.sleep(0.01)
+    res = host.job_status(t["job_id"])["result"]
+    assert res["pending"][0]["full"] == ""
+    with pytest.raises(ChatError) as e:
+        host.approve(out["session_id"], res["decision_id"])
+    assert e.value.code == "undecidable"
+
+
+def test_full_is_non_empty_only_for_an_exact_json_native_dump():
+    from levain.firing.openhands.gate import _full_for
+
+    ok = {"command": "create", "path": "/x", "file_text": "a", "view_range": [1, 2], "kind": "FileEditorAction"}
+    assert _full_for("file_editor", ok) != ""
+    for bad in ((1, 2), {1}, b"x", float("inf"), {"k": (1,)}, [(1,)]):
+        assert _full_for("file_editor", {"command": "create", "extra": bad}) == "", repr(bad)
+    assert _full_for("terminal", None) == ""

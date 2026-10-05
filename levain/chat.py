@@ -568,6 +568,8 @@ class ChatHost:
             # what any screen showed. A REJECT may omit it (rejecting runs nothing and only tells the entity
             # no); one that names an id still has to match. The id is per halt, never per content, so two
             # textually identical holds cannot share one.
+            if not expect:
+                expect = None   # "", 0, [] and the like are a missing id, not a wrong one
             if require_expect and expect is None:
                 raise ChatError(
                     "decision_id_required",
@@ -582,7 +584,7 @@ class ChatHost:
                     f"the held action is not the one this {kind} was made on; read the session again",
                     409,
                 )
-            if kind == "approve" and (not rec.pending or any(not p.get("full") for p in rec.pending)):
+            if kind == "approve" and (not rec.pending or any(not str(p.get("full") or "").strip() for p in rec.pending)):
                 raise ChatError(
                     "undecidable",
                     "this hold cannot be shown in full, so it can only be rejected",

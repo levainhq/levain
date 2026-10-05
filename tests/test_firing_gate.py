@@ -321,15 +321,46 @@ def test_line_shows_every_printed_field_through_visible():
 
 
 _TABLE = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378,
-          0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800]
+          0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09]
 
 
-def test_visible_escapes_blank_invisible_and_overlaying_characters_table():
-    """Same table as the node harness in test_web_chat_panel: NBSP and other Zs, Zl/Zp, a lone surrogate, Mn/Me,
-    Co, Cn and the blank-rendering letters. A plain space stays."""
+def test_visible_is_an_allowlist_so_every_non_ascii_code_point_is_escaped():
+    """Same table as the node harness in test_web_chat_panel: blank, overlaying, composing and look-alike
+    characters, an emoji and tab. Only printable ASCII renders as itself."""
     from levain.firing.gate import visible
 
     for cp in _TABLE:
         assert visible(chr(cp)) == "\\u{%04X}" % cp, hex(cp)
-    assert visible(" ") == " " and visible("a b") == "a b"
+    assert visible(" ~az09") == " ~az09"
+    assert visible("\x7f") == "\\u{007F}"
     assert len({visible(chr(cp)) for cp in _TABLE}) == len(_TABLE)
+
+
+def test_visible_never_renders_two_different_inputs_alike():
+    from levain.firing.gate import visible
+
+    assert visible("\\u{41}") != visible("A") and visible("\\u{41}") == "\\\\u{41}"
+    assert visible("\u0430") != visible("a")                       # Cyrillic a vs Latin a
+    assert visible("\u09cb") != visible("\u09c7\u09be")           # composed vs decomposed Bengali
+    mix = ["a", "A", "\\", "\\\\", "\\u{41}", "\u0430", "\u00e9", "e\u0301", "\t", "\\t", "\r", "\U0001f600", "\ud800"]
+    outs = [visible(x) for x in mix]
+    assert len(set(outs)) == len(mix)
+    # a decoder of the output recovers the input: the mapping is injective
+    import re
+    def decode(o):
+        return re.sub(r"\\\\|\\u\{([0-9A-F]+)\}", lambda m: "\\" if m.group(1) is None else chr(int(m.group(1), 16)), o)
+    assert [decode(o) for o in outs] == mix
+
+
+def test_a_spacing_combining_mark_cannot_alias_its_decomposition():
+    from levain.firing.gate import visible
+
+    assert visible("\u09cb") != visible("\u09c7\u09be")
+    assert visible("\u09cb") == "\\u{09CB}" and visible("\u09c7\u09be") == "\\u{09C7}\\u{09BE}"
+
+
+def test_a_whitespace_only_full_is_undecidable():
+    from levain.firing.gate import PendingEfferent
+
+    p = PendingEfferent("terminal", "x", "r", full="  \n ")
+    assert not p.decidable and "NOT SHOWN IN FULL" in p.line()

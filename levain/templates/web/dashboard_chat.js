@@ -23,6 +23,7 @@
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
   let deciding = false;      // an approve/reject POST or its job is in flight
+  let lostJobs = new Set();  // job ids this session already lost contact with: never followed into a second loss
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -36,7 +37,7 @@
   function api(method, path, payload) {
     const headers = { Accept: "application/json" };
     if (token) headers["X-Levain-Chat-Token"] = token;
-    const init = { method: method, headers: headers };
+    const init = { method: method, headers: headers, cache: "no-store" };
     if (payload !== undefined) { headers["Content-Type"] = "application/json"; init.body = JSON.stringify(payload); }
     return fetch(path, init)
       .then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j || {} })))
@@ -64,7 +65,7 @@
 
   // ---- token prompt ----------------------------------------------------------------------------------------
   function showTokenPrompt(message) {
-    session = null; run++; deciding = false;
+    session = null; run++; deciding = false; lostJobs = new Set();
     ensurePanel(); clear(body);
     note("chat-note", "This cockpit serves chat. Enter the token the server printed when it started.");
     if (message) note("chat-err", message);
@@ -105,7 +106,7 @@
   }
 
   function showPicker(listing) {
-    session = null; run++; deciding = false;
+    session = null; run++; deciding = false; lostJobs = new Set();
     ensurePanel(); clear(body);
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
     const row = el("div", "chat-row");
@@ -230,7 +231,7 @@
     poll(jobId, myRun, (j) => {
       live.textContent = "";
       const res = j.result;
-      if (j.status === "lost") { failure(j.error); resync(myRun); return; }
+      if (j.status === "lost") { onLost(jobId, j.error, myRun); return; }
       if (j.status !== "done" || !res) {   // failed, lost, unknown: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
@@ -256,26 +257,37 @@
   function endOfTurn(stuck) { setComposeEnabled(!stuck); if (!stuck && area) area.focus(); }
 
   // ---- the consent surface ------------------------------------------------------------------------------------
-  // The mapping is injective: a backslash is escaped FIRST (a typed "\\u{200B}" cannot pass for the escape of a
-  // zero-width space), then every character that is blank, invisible or overlays its neighbour is shown as
-  // \u{XXXX}: categories Cc, Cf, Cs, Co, Cn, Zl, Zp, Mn, Me, every Zs except the plain space, and the letters
-  // that render blank (U+115F, U+1160, U+3164, U+FFA0, U+2800). keepNewline leaves LF literal, for the one
-  // multi-line field (the whole action); anywhere else a newline would forge the layout. NOT detected:
-  // homoglyphs (a Cyrillic "a" reads as a Latin one). levain.firing.gate.visible is the same rule; the two
-  // must change together.
-  const HIDE = /[\\\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Mn}\p{Me}\p{Zs}\u115F\u1160\u3164\uFFA0\u2800]/gu;
+  // An ALLOWLIST: printable ASCII (U+0020 to U+007E) renders as itself, a backslash as \\, and EVERY other code
+  // point (tab, CR, all non-ASCII: letters, emoji and look-alikes such as a Cyrillic "a" included, and lone
+  // surrogates) as \u{XXXX}. keepNewline leaves LF literal, for the one multi-line field (the whole action);
+  // anywhere else a newline would forge the layout. Injective by construction: a backslash in the output only
+  // starts "\\" or "\u{...}", so a typed "\u{41}" shows as "\\u{41}" and never reads as the escape for "A".
+  // levain.firing.gate.visible is the same rule; the two must change together.
   function visible(text, keepNewline) {
-    return String(text).replace(HIDE, (c) => {
-      if (c === "\\") return "\\\\";
-      if (c === " " || (c === "\n" && keepNewline)) return c;
-      return "\\u{" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "}";
-    });
+    let out = "";
+    for (const ch of String(text)) {   // by code point, so a lone surrogate is one unit
+      const cp = ch.codePointAt(0);
+      if (ch === "\\") out += "\\\\";
+      else if (ch === "\n" && keepNewline) out += ch;
+      else if (cp >= 0x20 && cp <= 0x7E) out += ch;
+      else out += "\\u{" + cp.toString(16).toUpperCase().padStart(4, "0") + "}";
+    }
+    return out;
   }
   // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that:
   // used when a decision was not accepted or contact with a job was lost, where this page can no longer say
   // what is held. A gated session comes back with its CURRENT decision id and held set, so it can be decided
   // again; the id is only ever taken from the server's answer. Reads only: it never POSTs.
-  function resync(myRun) {
+  // Contact with a job was lost. The session is re-read ONCE per job: a job already lost is never followed
+  // again, so lost -> re-read -> follow -> lost cannot loop; the second loss stops with the outcome unknown.
+  const UNKNOWN = "The outcome of the last decision is unknown; check the session's activity before retrying.";
+  function onLost(jobId, error, myRun) {
+    failure(error);
+    if (!jobId || lostJobs.has(jobId) || lostJobs.size >= 2) { failure(UNKNOWN); endOfTurn(true); return; }
+    lostJobs.add(jobId);
+    resync(myRun, jobId);
+  }
+  function resync(myRun, lostJobId) {
     if (!session) return;
     live.textContent = "reading the session…";
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
@@ -286,8 +298,21 @@
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun); return;
       }
-      if (r.status === 200 && s.state === "busy" && s.job_id) { followJob(s.job_id, myRun); return; }
-      if (r.status === 200 && s.state === "idle") { endOfTurn(false); return; }
+      if (r.status === 200 && s.state === "busy" && s.job_id) {
+        if (lostJobs.has(s.job_id)) { failure(UNKNOWN); endOfTurn(true); return; }
+        followJob(s.job_id, myRun); return;
+      }
+      if (r.status === 200 && s.state === "idle") {
+        if (!lostJobId) { endOfTurn(false); return; }
+        // Idle after a lost poll: the work finished while this page could not see it. Its RESULT is in the
+        // original job; it is shown, or the outcome is reported unknown and compose stays blocked.
+        api("GET", "/chat/job.json?id=" + encodeURIComponent(lostJobId)).then((jr) => {
+          if (myRun !== run) return;
+          if (jr.status === 200 && jr.json && jr.json.status === "done" && jr.json.result) { followJob(lostJobId, myRun); return; }
+          failure(UNKNOWN); endOfTurn(true);
+        });
+        return;
+      }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
       endOfTurn(true);
     });
@@ -300,7 +325,7 @@
     // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
     // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
     const decidable = typeof decisionId === "string" && decisionId !== "" &&
-      pending.every((p) => typeof p.full === "string" && p.full !== "");
+      pending.every((p) => typeof p.full === "string" && p.full.trim() !== "");
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
@@ -327,10 +352,10 @@
     log.appendChild(box);
 
     function lock() { deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
-    function decided(j) {
+    function decided(j, jobId) {
       deciding = false; box.remove();
       const res = j.result;
-      if (j.status === "lost") { failure(j.error); resync(myRun); return; }
+      if (j.status === "lost") { onLost(jobId, j.error, myRun); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -360,7 +385,7 @@
         resync(myRun); return;
       }
       live.textContent = "working…";
-      poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });
+      poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j, r.json.job_id); });
     }
 
     // THE ONLY /chat/approve POST in this file: a trusted click on this button, once, with both buttons locked.

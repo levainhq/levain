@@ -1485,11 +1485,11 @@ def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp
     """Phill 2026-10-05: no approve-by-session-id-alone path. A missing id is refused (400) and does not
     spend the halt; reject without one stays allowed (it runs nothing); a wrong id is still 409."""
     host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
-    for missing in (None,):
+    for missing in (None, "", 0, []):
         with pytest.raises(ChatError) as e:
             host.approve(sid, missing)
-    assert e.value.code == "decision_id_required" and e.value.http_status == 400
-    assert "expect" in str(e.value) and "/chat/session.json" in str(e.value)
+        assert e.value.code == "decision_id_required" and e.value.http_status == 400, repr(missing)
+        assert "expect" in str(e.value) and "/chat/session.json" in str(e.value)
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
     assert host.session_status(sid)["decision_id"] == res["decision_id"]        # not spent
     with pytest.raises(ChatError) as e:
@@ -1556,3 +1556,14 @@ def test_decision_id_required_message_says_where_a_turn_result_carries_it(tmp_pa
     with pytest.raises(ChatError) as e:
         host.approve(sid)
     assert "decision_id" in str(e.value) and "result" in str(e.value)
+
+
+def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
+    blank = PendingEfferent("terminal", "x", "bash fans in", full="   \n ")
+    f = _Factory([_Result(reply=None, gated=True, pending=(blank,))])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.code == "undecidable"

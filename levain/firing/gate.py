@@ -76,7 +76,6 @@ gates", and be wrong. So the stock names are what this matches, and a test pins 
 """
 from __future__ import annotations
 
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -218,30 +217,25 @@ def classify_action(
     )
 
 
-_ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp", "Mn", "Me"})
-_ESCAPED_BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
-
-
 def visible(text: str, *, keep_newline: bool = False) -> str:
-    """``text`` for a surface where the operator decides on what they read. The MAPPING is injective: a
-    backslash is escaped FIRST (so a typed ``\\u{200B}`` cannot read as the escape for a zero-width space),
-    then every character that is blank, invisible or overlays its neighbour is shown as ``\\u{XXXX}``:
-    general categories Cc, Cf, Cs, Co, Cn, Zl, Zp, Mn, Me, every Zs except the plain space, and the
-    letters that render blank (U+115F, U+1160, U+3164, U+FFA0, U+2800). ``keep_newline`` leaves LF
-    literal, for the one multi-line field (``full``); anywhere else a newline would forge the layout.
-    NOT detected: homoglyphs (a Cyrillic ``\u0430`` reads as a Latin ``a``). The cockpit panel's
-    ``visible()`` is the same rule; the two must change together."""
+    """``text`` for a surface where the operator decides on what they read: an ALLOWLIST. Printable ASCII
+    (U+0020 to U+007E) renders as itself, a backslash renders as ``\\\\``, and EVERY other code point (tab,
+    CR, every non-ASCII character, letters, emoji and look-alikes such as a Cyrillic ``\u0430`` included)
+    renders as ``\\u{XXXX}``. ``keep_newline`` leaves LF literal, for the one multi-line field (``full``);
+    anywhere else a newline would forge the layout. The mapping is injective by construction: the output
+    contains a backslash only as the start of ``\\\\`` or ``\\u{...}``, so a typed ``\\u{41}`` (shown
+    ``\\\\u{41}``) can never read as the escape for ``A``. The cockpit panel's ``visible()`` is the same
+    rule; the two must change together."""
     out = []
     for ch in str(text):
         if ch == "\\":
             out.append("\\\\")
         elif ch == "\n" and keep_newline:
             out.append(ch)
-        elif ch != " " and (unicodedata.category(ch) in _ESCAPED_CATEGORIES
-                            or (unicodedata.category(ch) == "Zs") or ch in _ESCAPED_BLANK_LETTERS):
-            out.append("\\u{%04X}" % ord(ch))
-        else:
+        elif " " <= ch <= "~":
             out.append(ch)
+        else:
+            out.append("\\u{%04X}" % ord(ch))
     return "".join(out)
 
 
@@ -270,14 +264,14 @@ class PendingEfferent:
 
     @property
     def decidable(self) -> bool:
-        """``False`` when the whole action could not be shown (``full`` empty): it can only be rejected."""
-        return bool(self.full)
+        """``False`` when the whole action could not be shown (``full`` empty or blank): it can only be rejected."""
+        return bool(self.full.strip())
 
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
         out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
-        if not self.full:
+        if not self.decidable:
             out += "\n      NOT SHOWN IN FULL: this cannot be approved (only rejected)"
         elif self.full != self.detail:
             # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made

@@ -86,8 +86,9 @@ const body = new N("body"), bar = new N("nav"), board = new N("div");
 body.appendChild(bar); body.appendChild(board);
 const document = { createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
   getElementById: (i) => (i === "board" ? board : null) };
+let sessionReads = 0, jobReads = 0;
 const TOKEN = "tok-123";
-const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800];
+const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09];
 const hex = (c) => "\\u{" + c.toString(16).toUpperCase().padStart(4, "0") + "}";
 const calls = [];
 const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
@@ -103,8 +104,18 @@ function fetch(path, init) {
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
               { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true },
-              { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "q", reason: "r", recognized: true }],
+              { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "qA\\u{41}", reason: "r", recognized: true }],
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
+  const M = process.argv[3];
+  if (M && M.startsWith("lost") && path.startsWith("/chat/session.json?id=S")) {
+    sessionReads++;
+    return M === "lostloop" ? reply(200, { state: "busy", job_id: "J-appr" }) : reply(200, { state: "idle", job_id: null });
+  }
+  if (M && M.startsWith("lost") && path.startsWith("/chat/job.json?id=J-appr")) {
+    jobReads++;
+    if (M === "lostok" && jobReads > 5) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
+    return reply(500, {});
+  }
   if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2",
     pending: [{ tool: "bash", detail: "rm -rf y", full: "rm -rf y-after-reload", reason: "destructive", recognized: true }] });
   if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
@@ -133,7 +144,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
   ok(panel.textContent.includes("Held for your approval") && panel.textContent.includes("rm\\u{200B} -rf x"), "pending is shown, with the hidden character made visible");
   ok(panel.textContent.includes("x\\\\u{200B}\\u{0009}y\\u{000D}"), "a backslash is escaped and tab/CR are shown, so no two inputs read alike");
-  ok(panel.textContent.includes("q" + TBL.map(hex).join("") + "q"), "every blank/invisible/overlaying character in the table is shown as \\u{XXXX}");
+  ok(panel.textContent.includes("q" + TBL.map(hex).join("") + "qA\\\\u{41}"), "every non-ASCII code point, tab included, is shown as \\u{XXXX}; a typed \\u{41} differs from A");
+  ok(hex(0x430) !== hex(0x61) && !panel.textContent.includes("\u0430") && !panel.textContent.includes("\u09CB"), "a Cyrillic look-alike and composed Bengali are never rendered raw");
   ok(panel.textContent.includes("t\\u{000A}x"), "a newline outside the whole action is escaped");
   await sleep(100);
   if (process.argv[3] === "nodecision") {
@@ -147,6 +159,20 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
+  if (["lost", "lostok", "lostloop"].includes(process.argv[3])) {
+    approve.fire("click", { isTrusted: true }); await sleep(300);
+    const m = process.argv[3];
+    if (m === "lostok") {
+      ok(panel.textContent.includes("done it"), "the ORIGINAL job's result is rendered after the re-read");
+      ok(!area.disabled, "a completed turn unblocks compose");
+    } else {
+      ok(panel.textContent.includes("outcome of the last decision is unknown"), "an unavailable result is reported unknown");
+      ok(area.disabled, "compose stays blocked");
+      ok(!panel.textContent.includes("done it"), "never shown as a completed turn");
+    }
+    ok(sessionReads <= 2, "the session is not re-read in a loop (reads: " + sessionReads + ")");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "resync" || process.argv[3] === "stale") {
     // a decision the server did not take: the box is withdrawn and rebuilt from GET /chat/session.json
     approve.fire("click", { isTrusted: true }); await sleep(80);
@@ -171,9 +197,11 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
+    # modes "lost*": polls fail after an approve; the session is re-read once, the original job's result is
+    # shown or the outcome reported unknown, never a loop
     # mode "stale": a 409 stale_decision is re-read the same way, never a dead end
     # mode "resync": a decision the server refused is re-read (GET /chat/session.json), never re-armed
     h = tmp_path / "harness.js"
