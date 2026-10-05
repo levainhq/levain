@@ -43,6 +43,12 @@
       .catch(() => ({ status: 0, json: {} }));
   }
   function isTokenRefusal(r) { return r.status === 403 && r.json && r.json.error === "chat_token"; }
+  // A token refusal is a JSON body like any other: it cannot prove the request it answered did not run (a proxy can
+  // send it after forwarding). So after the page has sent a request that changes something (open, turn, decision,
+  // close), or while it follows one, the refusal never reads as "refused": the page drops the session (nothing more
+  // can be decided from it) and says the outcome is unknown.
+  const TOKEN_LOST_MID_REQUEST = "The token was not accepted, so this page has let go of the session. The outcome " +
+    "of the last request is unknown; it may already have run. Enter the token again.";
   function why(r) {
     if (r.status === 0) return "could not reach the server";
     return (r.json && (r.json.message || r.json.error)) || ("status " + r.status);
@@ -127,7 +133,7 @@
       if (myRun !== run) return;
       api("GET", "/chat/job.json?id=" + encodeURIComponent(jobId)).then((r) => {
         if (myRun !== run) return;
-        if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+        if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
         if (r.status !== 200) {
           fails += 1;
           if (fails >= POLL_FAILS_MAX) { onEnd({ status: "lost", error: "lost contact with the server: " + why(r) }); return; }
@@ -150,7 +156,7 @@
   // ---- open ---------------------------------------------------------------------------------------------------
   function openSession(entity) {
     api("POST", "/chat/open", { entity: entity }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
       if (r.status !== 202 || !r.json.session_id) {
         clear(body); note("chat-err", "Could not open a session: " + why(r));
         const back = el("button", "chat-btn", "Back"); back.type = "button";
@@ -216,7 +222,7 @@
     const myRun = run;
     api("POST", "/chat/turn", { session_id: session.id, message: text }).then((r) => {
       if (myRun !== run) return;
-      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // No response from this page can prove who wrote it (a proxy can answer a JSON 4xx/503 after forwarding the
         // request), so anything but a 202 with a job may have started the turn.
@@ -312,7 +318,7 @@
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
       if (myRun !== run) return;
       live.textContent = "";
-      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
       const s = r.json || {};
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning); return;
@@ -379,7 +385,7 @@
       endOfTurn(!!res.gated);
     }
     function after(r) {
-      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn. No response this page receives can prove who wrote
         // it (a proxy can answer a JSON 4xx/503 after forwarding the request), so anything but a 202 with a job,
@@ -412,7 +418,7 @@
     if (!session) return;
     closeBtn.disabled = true;
     api("POST", "/chat/close", { session_id: session.id }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
       if (r.status !== 200) {   // e.g. 409 while a turn is still running: say so, keep the session
         closeBtn.disabled = false;
         live.textContent = "Could not close yet: " + why(r);
