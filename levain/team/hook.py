@@ -161,7 +161,7 @@ def pretooluse(payload: dict) -> None:
     if _in_ledger_machinery(target):
         _out({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": (f"{TAG} {target} is inside the team ledger's private machinery. The "
+            "permissionDecisionReason": (f"{TAG} {I.oneline(target)} is inside the team ledger's private machinery. The "
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
@@ -222,7 +222,7 @@ def pretooluse(payload: dict) -> None:
                               summary=f"proceeded with an edit of {rel} after the ruling was shown"),
                       push=False, lock_timeout=3.0)
         except (TeamError, E.EntryError) as exc:
-            text += f"\n\n[team] acknowledgement not recorded: {exc}"
+            text += f"\n\n[team] acknowledgement not recorded: {I.oneline(str(exc))}"
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})
 
 
@@ -302,6 +302,9 @@ def sessionstart(payload: dict) -> None:
              f"{'y' if len(live) - len(rulings) == 1 else 'ies'} in force; newest entry "
              f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (git user.email unmapped)'}."]
     lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
+    from .transport import WARNINGS
+    # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
+    lines += [f"[team] {w}" for w in WARNINGS]
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.

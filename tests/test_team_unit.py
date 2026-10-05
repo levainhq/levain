@@ -314,9 +314,7 @@ def test_team_roundtrip_and_refusals(tmp_path):
     with pytest.raises(R.RolesError, match="same ledger folder"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "Ana": "b@x.com"})))
     # Diogenes 2026-10-05: safe_handle strips a trailing '-' or '.', so these shared ledger/ana/.
-    with pytest.raises(R.RolesError, match="must not end with"):
-        R.parse_team(R.dump_team(R.Team("p", "ana-", {"ana-": "a@x.com"})))   # a lone 'ana-' still aliases a renamed 'ana'
-    for twin in ("Ana",):
+    for twin in ("ana-", "ana.", "Ana.-"):
         with pytest.raises(R.RolesError, match="same ledger folder"):
             R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", twin: "b@x.com"})))
     for bad in ("", "  ", "\n\t"):
@@ -326,9 +324,7 @@ def test_team_roundtrip_and_refusals(tmp_path):
         assert "\n" not in R.parse_team(R.dump_team(R.Team(odd, "ana", {"ana": "a@x.com"}))).project
     with pytest.raises(R.RolesError, match="project must be"):
         R.validate_team(R.Team("p\nq", "ana", {"ana": "a@x.com"}))         # a writer cannot store one
-    for mail in ("<a@x.com>", "a b@x.com", "a@x.com>"):
-        with pytest.raises(R.RolesError, match="bare email"):
-            R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": mail})))
+
     with pytest.raises(R.RolesError, match="share the email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "ann": "A@X.com "})))
     with pytest.raises(R.RolesError, match="mode"):

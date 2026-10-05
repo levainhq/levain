@@ -94,7 +94,8 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
     if not any(l.startswith("## ") for l in lines):
         lines.append("Nothing is in force yet.")
         lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    # Every line folded, whatever fed it: the canon is read by agents, and its header lines interpolate team.toml.
+    return "\n".join(I.oneline(line) for line in lines).rstrip() + "\n"
 
 
 def header(text: str | None) -> dict | None:
