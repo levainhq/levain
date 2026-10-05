@@ -160,6 +160,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
   byText(panel, "Open session").fire("click", { isTrusted: true }); await sleep(60);
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
+  if (process.argv[3] === "sendkey") {
+    // Phill 2026-10-05 (a): keyboard access to Send is kept. Enter/Space on the focused button reaches the page as a
+    // TRUSTED click with detail 0, and it sends, once.
+    byText(panel, "Send").fire("click", { isTrusted: true, detail: 0 }); await sleep(80);
+    ok(calls.filter((c) => c.path === "/chat/turn").length === 1, "keyboard activation of Send sends the turn once");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "enter") {
     // 0.6.7: Enter sends from the compose box; Shift+Enter and an IME-composing Enter do not
     area.fire("keydown", { key: "Enter", shiftKey: true, isTrusted: true }); await sleep(30);
@@ -177,6 +184,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(reason && reason.rows === 1, "the reject reason is a one-line growing textarea");
     reason.fire("keydown", { key: "Enter", isTrusted: true }); reason.fire("keydown", { key: "Enter", shiftKey: true, isTrusted: true }); await sleep(60);
     ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "Enter in the reason field decides nothing");
+    // a key on a decision button does nothing by itself: only the button's own activation (a click) decides
+    for (const label of ["Approve", "Reject"]) {
+      const b = byText(panel, label);
+      b.fire("keydown", { key: "Enter", isTrusted: true }); b.fire("keydown", { key: " ", isTrusted: true }); b.fire("keyup", { key: "Enter", isTrusted: true });
+    }
+    await sleep(60);
+    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "a key on Approve or Reject decides nothing beyond the button's own activation");
     // compose is disabled while the hold waits: a trusted Enter on it (or held-down repeats) sends nothing
     area.value = "again"; area.fire("keydown", { key: "Enter", isTrusted: true }); area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(60);
     ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
@@ -237,7 +251,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     if (m === "notstarted") {
       ok(panel.textContent.includes("No job has started on the server since your last confirmed request, so your last decision has not run"), "a lost request that never started is said as such");
       ok(!panel.textContent.includes("These actions ran") && !panel.textContent.includes("the earlier turn"), "the earlier job is never shown as what happened");
-      ok(byText(panel, "Check what happened"), "and it can be checked again");
+      ok(!byText(panel, "Check what happened"), "and no check is re-offered (a stale one could read a later request as this one)");
     } else if (m === "restart404") {
       ok(panel.textContent.includes("The server no longer has that session (it restarted, or the session ended and was cleaned up). Your last request may or may not have run"), "a session the server no longer knows: gone, outcome unknown");
       ok(panel.textContent.includes("/ws/ent"), "it says where to look");
@@ -283,7 +297,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
@@ -333,3 +347,14 @@ def test_the_only_key_listener_is_the_compose_box():
     assert 'sendBtn.type = "button"' in src and 'sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });' in src
     assert 'area.addEventListener("keydown"' in src
     assert not re.search(r'addEventListener\("key(up|press)"|onkey(up|down|press)', src)
+
+
+def test_a_check_row_is_retired_whenever_a_new_request_is_sent():
+    # 0.6.7 final round (complement + glm, class R): a "Check what happened" row answers for ONE lost request; it is
+    # removed the moment the page sends a turn or a decision, and the "has not run" verdict offers no new one.
+    src = JS.read_text()
+    send = src[src.index("function sendTurn()"):]
+    assert "retireChecks();" in send[: send.index('api("POST", "/chat/turn"')]
+    assert "function lock() { retireChecks();" in src
+    judge = src[src.index("function judgeLastJob("):src.index("function resync(")]
+    assert "rereadButton(" not in judge
