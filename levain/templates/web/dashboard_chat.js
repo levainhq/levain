@@ -5,7 +5,8 @@
 // printed at start. `levain serve --chat` opens the page with the token in the URL FRAGMENT (#chat_token=..., which
 // a browser never sends to a server, so it reaches no log and no Referer); the page reads it, keeps it in this tab's
 // sessionStorage, and strips it from the address bar at once. The printed token typed into the password field is
-// the fallback (a headless box, a second browser). It is never put in a cookie, storage that outlives the tab, or a request URL.
+// the fallback (a headless box, a second browser, a platform where it is not opened for you). It is never put in a cookie,
+// storage that outlives the browser session, or a request URL; a duplicated or restored tab keeps its sessionStorage, as browsers do.
 //
 // ⛔ CONSENT SURFACE. A turn that halts on a gated action reports it as `pending`; nothing here may approve
 // it on the operator's behalf. The one POST to /chat/approve lives inside the Approve button's click handler
@@ -291,20 +292,26 @@
     });
   }
 
-  // A reply the server marked `unreadable_call` is the model's raw tool-call syntax, not an answer: its call failed to
-  // parse and nothing ran. It is shown as the notice, with the text collapsed beneath it and escaped by the consent
-  // surface's allowlist (visible), never as the entity's message. levain.firing.agent_reply.UNREADABLE_CALL_NOTICE is
-  // the same sentence; the two must change together.
+  // A reply the server marked `unreadable_call` is the model's raw tool-call syntax, not an answer: that call failed to
+  // parse and did not run. It is shown as the notice, with the text collapsed beneath it and escaped by the consent
+  // surface's allowlist (visible), never as the entity's message: the bubble is levain's, not the entity's. When the
+  // same turn ran other actions the notice says so, never "nothing ran". The sentences are
+  // levain.firing.agent_reply's (a test holds them equal).
   const UNREADABLE_CALL_NOTICE = "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models.";
-  function replyText(b, res) {
+  const UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = "The model tried to call a tool, but its last call couldn't be read, so that call did not run. The actions listed with this message did run. Ask again, or switch models.";
+  function replyText(b, res, ran) {
     if (res.unreadable_call !== true) { b.appendChild(el("div", "chat-text", res.reply)); return; }
-    b.appendChild(el("div", "chat-text chat-unreadable", UNREADABLE_CALL_NOTICE));
+    const acted = ran || (Array.isArray(res.tool_activity) && res.tool_activity.length > 0);
+    b.appendChild(el("div", "chat-text chat-unreadable", acted ? UNREADABLE_CALL_AFTER_ACTIONS_NOTICE : UNREADABLE_CALL_NOTICE));
     const d = el("details", "chat-raw");
     d.appendChild(el("summary", null, "What the model sent"));
     d.appendChild(el("pre", "chat-text", visible(res.reply, true)));
     b.appendChild(d);
   }
-  function replyBubble(res) { const b = bubble("them", session.entity); replyText(b, res); addLines(b, res.tool_activity); }
+  function replyBubble(res) {
+    const b = bubble("them", res.unreadable_call === true ? "levain" : session.entity);
+    replyText(b, res); addLines(b, res.tool_activity);
+  }
 
   function failure(text) { const b = bubble("err", "error"); b.appendChild(el("div", "chat-text", text)); }
 
@@ -418,7 +425,7 @@
     const b = bubble("them", session.entity + " · what the last " + what + " did");
     b.appendChild(el("div", "chat-text", ran.length ? "These actions ran:" : "No action ran."));
     addLines(b, ran);
-    if (res.reply) replyText(b, res);
+    if (res.reply) replyText(b, res, ran.length > 0);
     if (res.error) b.appendChild(el("div", "chat-text", "error: " + res.error));
     return true;
   }

@@ -179,13 +179,27 @@ def humanize_finish_json(text: str) -> str:
 UNREADABLE_CALL_NOTICE = (
     "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models."
 )
+# The same, for a turn in which other actions DID run (listed with it): "nothing ran" would be false there, and an
+# operator who believed it could ask again and run an approved action twice.
+UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = (
+    "The model tried to call a tool, but its last call couldn't be read, so that call did not run. The actions "
+    "listed with this message did run. Ask again, or switch models."
+)
+
+
+def unreadable_call_notice(tool_activity) -> str:
+    """The notice for a turn whose reply is an unreadable tool call, given the actions that turn ran."""
+    return UNREADABLE_CALL_AFTER_ACTIONS_NOTICE if tool_activity else UNREADABLE_CALL_NOTICE
 
 # GLM's argument markup: a key tag next to a value tag. A parse failure upstream can cut the reply anywhere, so
 # either order and either tag half counts ("</arg_key><arg_value>", "</arg_value><arg_key>").
 _GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
-# The <tool_call> wrapper opening an actual call: a JSON object, or a tool name followed by GLM argument markup.
-# The bare tag in a sentence ("a <tool_call> tag") is not a call.
-_TOOL_CALL_OPEN = re.compile(r"<tool_call>\s*(?:\{|[A-Za-z_][\w.-]*\s*<arg_key>)")
+# A leaked call begins its line: markup, or one cut-off word run straight into it ("_editor<arg_key>",
+# "create</arg_value>", as captured). A sentence that mentions the markup has a space before it, so it is an answer.
+_GLM_LINE = re.compile(r"(?m)^[ \t]*[^\s<]*</?arg_(?:key|value)>")
+# The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
+# argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
+_TOOL_CALL_OPEN = re.compile(r"(?m)^[ \t]*<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
 # Markdown code (a fenced block, or an inline `span`): a reply quoting the markup is explaining it, not calling.
 _CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.DOTALL)
 _WHOLE_FENCE = re.compile(r"\A```[\w-]*\n(.*)\n```\Z", re.DOTALL)
@@ -229,11 +243,12 @@ def _json_call_names(text: str) -> list[str] | None:
 def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]) -> bool:
     """Whether ``text``, an agent's reply, is a model's raw tool-call syntax rather than an answer.
 
-    An open model's call that fails to parse upstream reaches levain as reply TEXT, and no tool ran. Three
-    shapes are recognised, each only outside Markdown code, so a reply that quotes the markup to explain it is
-    an answer: GLM argument markup (a key tag beside a value tag), a ``<tool_call>`` wrapper that opens a call,
-    and a reply that is entirely function-call JSON naming one of ``tool_names`` (the entity's own tools; with
-    none known, that shape is not flagged). It reads the shape only: the call is never repaired or run."""
+    An open model's call that fails to parse upstream reaches levain as reply TEXT, and that call did not run.
+    Three shapes are recognised. Two are markup that begins a line outside Markdown code, so a reply that quotes
+    or mentions the markup to explain it is an answer: GLM argument markup (a key tag beside a value tag), and a
+    ``<tool_call>`` wrapper that opens a call. The third is a reply that is entirely function-call JSON (bare, or
+    as the whole of one fenced block) naming only ``tool_names``, the entity's own tools; with none known, that
+    shape is not flagged. It reads the shape only: the call is never repaired or run."""
     if not text:
         return False
     stripped = text.strip()
@@ -242,7 +257,9 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     if names and all(n in tool_names for n in names):
         return True
     prose = _CODE.sub(" ", text)
-    return bool(_GLM_ARG_PAIR.search(prose) or _TOOL_CALL_OPEN.search(prose))
+    if _TOOL_CALL_OPEN.search(prose):
+        return True
+    return bool(_GLM_LINE.search(prose) and _GLM_ARG_PAIR.search(prose))
 
 
 def is_corrective_nudge(event) -> bool:

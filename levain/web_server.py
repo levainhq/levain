@@ -1318,6 +1318,19 @@ def make_server(
     return httpd
 
 
+def _browser_takes_url_off_argv() -> bool:
+    """Whether ``webbrowser.open`` hands the URL to the browser without putting it on a command line. Only macOS's
+    osascript handler does (the URL goes through osascript's stdin, then an Apple Event). Every other handler
+    (xdg-open, a browser binary, ``$BROWSER``) puts it in argv, which other OS users can read from the process table:
+    the very callers the chat token exists to keep out. There, the plain URL opens and the token field asks."""
+    import webbrowser
+
+    try:
+        return isinstance(webbrowser.get(), webbrowser.MacOSXOSAScript)
+    except Exception:  # noqa: BLE001 — no usable browser, or no MacOSXOSAScript on this platform
+        return False
+
+
 def run_web_server(
     path: Path,
     *,
@@ -1412,15 +1425,17 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-        # Flushed: this terminal is the only place the token is published, and stdout is block-buffered
+        # Flushed: this terminal is where the token is published (and, on macOS, the browser it opens), and stdout is block-buffered
         # when it is not a terminal (a supervisor, a log file), where it would otherwise not appear
         # until the buffer filled. RUN 2026-10-03: piped to a file, the token never showed.
         print(f"  chat token (send as {_CHAT_TOKEN_HEADER}; valid until this server stops): "
               f"{httpd.chat_token}", flush=True)
         # The link carries the token in the URL FRAGMENT, which a browser keeps to itself: it is never sent to a
         # server, so it reaches no access log and no Referer. The panel reads it and strips it from the address bar.
-        url = f"{url}#chat_token={httpd.chat_token}"
-        print(f"  open the cockpit, unlocked: {url}", flush=True)
+        unlocked = f"{url}#chat_token={httpd.chat_token}"
+        print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
+    else:
+        unlocked = url
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
@@ -1429,7 +1444,7 @@ def run_web_server(
         import webbrowser
 
         try:
-            webbrowser.open(url)
+            webbrowser.open(unlocked if _browser_takes_url_off_argv() else url)
         except Exception:  # noqa: BLE001 — a headless box without a browser is fine
             pass
 

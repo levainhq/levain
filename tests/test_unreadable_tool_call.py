@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from levain.firing.agent_reply import UNREADABLE_CALL_NOTICE, unreadable_tool_call
+from levain.firing.agent_reply import (
+    UNREADABLE_CALL_AFTER_ACTIONS_NOTICE,
+    UNREADABLE_CALL_NOTICE,
+    unreadable_call_notice,
+    unreadable_tool_call,
+)
 
 TOOLS = frozenset({"terminal", "file_editor", "task_tracker", "finish", "think"})
 
@@ -37,6 +42,15 @@ def test_tool_call_wrapper_is_flagged():
     reply = '<tool_call>\n{"name": "file_editor", "arguments": {"command": "create", "path": "test.txt"}}\n</tool_call>'
     assert unreadable_tool_call(reply, TOOLS)
     assert unreadable_tool_call("<tool_call>file_editor<arg_key>command</arg_key><arg_value>create</arg_value>", TOOLS)
+    # Qwen3-Coder's XML form (its model card's format)
+    assert unreadable_tool_call("<tool_call>\n<function=terminal>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>", TOOLS)
+
+
+def test_a_leak_after_earlier_text_in_the_same_turn_is_flagged():
+    # L1 r1: the reply joins every agent message since the human's; the leak can follow real prose (an approved
+    # action ran, then the next call leaked). It begins its own line.
+    assert unreadable_tool_call("Done with the push. Now the file:\n" + GLM_REAL[1], TOOLS)
+    assert unreadable_tool_call("I'll create the file.\n<tool_call>file_editor<arg_key>path</arg_key><arg_value>x", TOOLS)
 
 
 @pytest.mark.parametrize("reply", [
@@ -55,6 +69,9 @@ def test_a_bare_json_call_naming_a_known_tool_is_flagged(reply):
     "GLM models wrap a call in a <tool_call> tag, and when it fails to parse you see the raw text.",
     "The model emitted <tool_call> and </tool_call> around its call.",
     "Its format pairs each `<arg_key>command</arg_key><arg_value>create</arg_value>` inside backticks.",
+    # L1 r1: prose mentioning the markup WITHOUT backticks is an answer too
+    "Its markup pairs tags like </arg_key><arg_value> around each argument.",
+    'The format is <tool_call>{"name": ...}</tool_call>, see docs.',
     "Here is the format:\n```\n<tool_call>{\"name\": \"terminal\"}</tool_call>\n```\nThat is what a call looks like.",
     # JSON that is the answer: no known tool named, or not the call shape
     '{"name": "Ada", "arguments": ["one", "two"]}',
@@ -71,6 +88,12 @@ def test_none_and_no_tool_names():
     # the markup shapes do not need the tool names; only the bare-JSON shape does
     assert unreadable_tool_call(GLM_REAL[0], frozenset())
     assert not unreadable_tool_call('{"name": "terminal", "arguments": {}}', frozenset())
+
+
+def test_the_notice_never_says_nothing_ran_when_actions_did():
+    assert unreadable_call_notice([]) == UNREADABLE_CALL_NOTICE
+    assert unreadable_call_notice(["⚙ terminal: git push"]) == UNREADABLE_CALL_AFTER_ACTIONS_NOTICE
+    assert "nothing ran" not in UNREADABLE_CALL_AFTER_ACTIONS_NOTICE
 
 
 def test_the_notice_says_nothing_ran():
@@ -170,3 +193,16 @@ def test_the_panel_shows_the_same_sentence():
 
     js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_chat.js").read_text()
     assert f'const UNREADABLE_CALL_NOTICE = "{UNREADABLE_CALL_NOTICE}";' in js
+    assert f'const UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = "{UNREADABLE_CALL_AFTER_ACTIONS_NOTICE}";' in js
+
+
+def test_the_repl_notice_after_actions_ran_does_not_say_nothing_ran(capsys):
+    from types import SimpleNamespace
+
+    from levain.run import _render_turn
+    from levain.session import TurnResult
+
+    _render_turn(SimpleNamespace(label="ent"), TurnResult(
+        reply="Done with the push.\n" + GLM_REAL[1], tool_activity=["⚙ terminal: git push"], unreadable_call=True))
+    out = capsys.readouterr().out
+    assert "terminal: git push" in out and UNREADABLE_CALL_AFTER_ACTIONS_NOTICE in out and "nothing ran" not in out

@@ -132,6 +132,10 @@ function fetch(path, init) {
   if (M === "notstarted" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-turn", kind: "turn", status: "done",
       result: { reply: "the earlier turn", tool_activity: ["\u2699 earlier"], gated: true, error: null } } });
+  if (M === "leaklastjob" && path === "/chat/approve") return reply(500, {});
+  if (M === "leaklastjob" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-other", kind: "approve", status: "done",
+      result: { reply: LEAK, unreadable_call: true, tool_activity: ["\u2699 terminal: rm -rf x"], gated: false, error: null } } });
   if (["post500", "proxy503", "proxy503json", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: M === "evicted" ? "J-appr" : "J-other", kind: "approve", status: "done",
       result: { reply: "ran it", tool_activity: ["\u2699 terminal: rm -rf x"], gated: false, error: null } } });
@@ -152,6 +156,8 @@ function fetch(path, init) {
   if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
   if (path === "/chat/approve" && process.argv[3] === "stale" && approvals() === 1) return reply(409, { error: "stale_decision", message: "not the one shown" });
   if (path === "/chat/approve") return reply(202, { job_id: "J-appr" });
+  if (path.startsWith("/chat/job.json?id=J-appr") && M === "leakafterapprove")
+    return reply(200, { status: "done", result: { reply: "pushed.\n" + LEAK, unreadable_call: true, gated: false, error: null, timed_out: false, tool_activity: ["\u2699 terminal: git push"], pending: [] } });
   if (path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
   return reply(404, {});
 }
@@ -256,6 +262,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     // 0.6.8: a reply the server marks unreadable_call is never shown as the entity's message
     const notice = "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models.";
     ok(panel.textContent.includes(notice), "the notice is shown");
+    ok(find(panel, (n) => n.className === "chat-who" && n._text === "levain"), "under levain's name, not the entity's");
     ok(!find(panel, (n) => n.className === "chat-text" && n._text === LEAK), "the raw text is not rendered as the reply");
     const d = find(panel, (n) => n.tagName === "details");
     ok(d && !d.attrs.open && !d.open && d.children[0].tagName === "summary", "the raw text sits in a collapsed details element");
@@ -301,6 +308,19 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
+  if (process.argv[3] === "leakafterapprove") {
+    await approveTwice(approve); await sleep(150);
+    ok(panel.textContent.includes("so that call did not run. The actions listed with this message did run") && !panel.textContent.includes("so nothing ran"), "after actions ran, the notice never says nothing ran");
+    ok(panel.textContent.includes("terminal: git push") && !find(panel, (n) => n.tagName === "div" && n.className === "chat-text" && n._text.includes("<arg_key>")), "the activity is listed and the markup is not rendered as the reply");
+    console.log("PASS"); return;
+  }
+  if (process.argv[3] === "leaklastjob") {
+    await approveTwice(approve); await sleep(300);
+    byText(panel, "Check what happened").fire("click", { isTrusted: true }); await sleep(150);
+    ok(panel.textContent.includes("These actions ran:") && panel.textContent.includes("so that call did not run"), "the check's record of a leak says which call did not run");
+    ok(!find(panel, (n) => n.className === "chat-text" && n._text === LEAK) && find(panel, (n) => n.tagName === "details"), "and shows the markup only collapsed");
+    console.log("PASS"); return;
+  }
   if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "restart404", "notstarted", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
     // No clear answer to the approve (a bare 5xx, a proxy's status, an evicted job, lost polls): the decision may
     // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
@@ -415,7 +435,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
-                                  "fragment", "stored", "storagethrows", "badfragment", "twoentities"])
+                                  "fragment", "stored", "storagethrows", "badfragment", "twoentities",
+                                  "leakafterapprove", "leaklastjob"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is

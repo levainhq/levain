@@ -1688,6 +1688,7 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
     monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
     opened = []
     monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(ws, "_browser_takes_url_off_argv", lambda: True)
     assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
     out = capsys.readouterr().out
     assert opened == ["http://127.0.0.1:7462/#chat_token=tok_-AZ09"]
@@ -1718,3 +1719,38 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(webbrowser, "open", opened.append)
     assert ws.run_web_server(tmp_path) == 0
     assert opened == ["http://127.0.0.1:7463/"] and "chat_token" not in capsys.readouterr().out
+
+
+
+def test_serve_chat_never_hands_the_token_to_a_browser_launched_by_command_line(tmp_path, monkeypatch, capsys):
+    # L1+L2 r1: xdg-open, a browser binary or $BROWSER get the URL in argv, readable by other OS users (the callers
+    # the token keeps out). There the plain URL opens and the printed link is the way in.
+    import webbrowser
+    from types import SimpleNamespace
+
+    import levain.web_server as ws
+
+    (tmp_path / "memory.db").write_bytes(b"")
+    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+    monkeypatch.setattr(ws, "_build_chat_host", lambda *a, **k: (SimpleNamespace(listing=lambda: {"entities": ["e"]}, shutdown=lambda: None), None))
+
+    class _Httpd:
+        server_address = ("127.0.0.1", 7462)
+        chat_token = "tok"
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.GenericBrowser("xdg-open"))
+    assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
+    assert opened == ["http://127.0.0.1:7462/"]
+    assert "unlocked: http://127.0.0.1:7462/#chat_token=tok" in capsys.readouterr().out
+    if hasattr(webbrowser, "MacOSXOSAScript"):
+        monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.MacOSXOSAScript("default"))
+        assert ws._browser_takes_url_off_argv() is True
