@@ -204,7 +204,7 @@ def test_t2b_a_pruner_in_flight_never_reads_as_a_live_view(pub, monkeypatch):
     try:
         opened = R._open_entry(d_fd, live.name)
         live.unpublish()
-        monkeypatch.setattr(R, "_open_entry", lambda *_: opened)
+        monkeypatch.setattr(R, "_open_entry", lambda *_, **__: opened)
         assert R._read_live(d_fd, live.name) is None
     finally:
         os.close(d_fd)
@@ -371,7 +371,20 @@ def test_a_directory_read_error_part_way_reports_truncated(pub, monkeypatch):
     assert truncated is True and len(views) <= 1
 
 
-def test_a_registry_fault_in_the_handler_is_reported_as_incomplete(tmp_path, monkeypatch):
+def test_an_entry_that_cannot_be_judged_makes_the_list_incomplete(pub, monkeypatch):
+    """A transient open failure (fd pressure, EIO, EACCES) says nothing about the view: it is not judged dead."""
+    pub("ledgerline")
+    real = R.os.open
+
+    def emfile(path, flags, *a, **k):
+        if isinstance(path, str) and path.startswith("lock1-"):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(path, flags, *a, **k)
+    monkeypatch.setattr(R.os, "open", emfile)
+    assert R.live_views_scan(budget=5) == ([], True)
+
+
+def test_a_registry_fault_in_the_handler_is_an_error_not_an_empty_list(tmp_path, monkeypatch):
     import levain.team.registry as reg
 
     def boom(*a, **k):
@@ -379,8 +392,8 @@ def test_a_registry_fault_in_the_handler_is_reported_as_incomplete(tmp_path, mon
     monkeypatch.setattr(reg, "live_views_scan", boom)
     httpd = _cockpit(tmp_path)
     try:
-        body = _get(httpd.server_address[1], "/team_views.json")[1]
-        assert json.loads(body) == {"views": [], "truncated": True}
+        r, body = _get(httpd.server_address[1], "/team_views.json")
+        assert r.status == 500 and b"views" not in body             # the page keeps its last list (a failed fetch)
     finally:
         httpd.shutdown()
         httpd.server_close()

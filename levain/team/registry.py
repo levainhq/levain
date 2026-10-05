@@ -42,6 +42,7 @@ Stdlib only; imports nothing from the rest of levain.
 """
 from __future__ import annotations
 
+import errno
 import ipaddress
 import json
 import os
@@ -61,7 +62,7 @@ except ImportError:                                  # not POSIX: nothing here c
 VERSION = 2
 PREFIX = "lock1-"
 MAX_VIEWS = 8
-LIST_BUDGET = 1.0                # seconds, the whole listing; checked between files
+LIST_BUDGET = 1.0                # seconds, the whole listing; checked before each directory entry and each name
 PRUNE_MAX_NAMES = 1024
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
@@ -255,11 +256,19 @@ def register(repo: str, url: str, project: str) -> Registration:
 
 # ---- the pruner (a starting view, before it publishes) --------------------------------------------------------------
 
-def _open_entry(dir_fd: int, name: str) -> tuple[int, os.stat_result] | None:
-    """An fd on a regular file of ours, opened so that a FIFO or a symlink cannot block or redirect the open."""
+class _Unjudged(Exception):
+    """An entry the reader could not judge (an open, lock or read failed for a reason that says nothing about the
+    entry): the listing is then incomplete, never complete without it."""
+
+
+def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, os.stat_result] | None:
+    """An fd on a regular file of ours, opened so that a FIFO or a symlink cannot block or redirect the open. None
+    for a name that is gone or is a symlink; with ``strict``, any other failed open raises _Unjudged."""
     try:
         fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
-    except OSError:
+    except OSError as exc:
+        if strict and exc.errno not in (errno.ENOENT, errno.ELOOP):
+            raise _Unjudged(name) from exc
         return None
     try:
         st = os.fstat(fd)
@@ -317,8 +326,9 @@ def _validated(raw: object) -> dict | None:
 
 
 def _read_live(dir_fd: int, name: str) -> dict | None:
-    """The entry if a publisher holds its lock, else None. Acquiring the lock means nobody holds it: dead."""
-    opened = _open_entry(dir_fd, name)
+    """The entry if a publisher holds its lock, else None. Acquiring the lock means nobody holds it: dead. Raises
+    _Unjudged when the open, the lock attempt or the read fails for another reason."""
+    opened = _open_entry(dir_fd, name, strict=True)
     if opened is None:
         return None
     fd, st = opened
@@ -334,8 +344,10 @@ def _read_live(dir_fd: int, name: str) -> dict | None:
         if len(raw) > MAX_ENTRY_BYTES:
             return None
         return _validated(json.loads(raw.decode("utf-8")))
-    except (OSError, ValueError):
-        return None
+    except ValueError:
+        return None                                  # not JSON we wrote
+    except OSError as exc:
+        raise _Unjudged(name) from exc
     finally:
         os.close(fd)
 
@@ -346,7 +358,8 @@ def live_views_scan(budget: float = LIST_BUDGET) -> tuple[list[dict], bool]:
     The directory is read in full first (the budget is checked before every name, junk included), the entry names
     are sorted, and entries are judged in that order, so which views show never depends on directory order. The scan
     stops at MAX_VIEWS live views, at the end of the names, or when ``budget`` seconds are spent. ``truncated`` is
-    True whenever the result may be incomplete: names were left unexamined (the cap or the budget), or reading the
+    True whenever the result may be incomplete: names were left unexamined (the cap or the budget), an entry could not
+    be judged (its open, lock or read failed for a reason other than being gone or a symlink), or reading the
     directory failed part way. One ``open`` hung on a dead hard mount cannot be interrupted here; the caller's gate
     bounds how many requests that can trap."""
     if fcntl is None:
@@ -372,14 +385,15 @@ def live_views_scan(budget: float = LIST_BUDGET) -> tuple[list[dict], bool]:
                         names.append(ent.name)
         except OSError:
             truncated = True
-        names.sort()
+        names = sorted(set(names))                    # a readdir racing a rename may repeat a name
         for i, name in enumerate(names):
             if len(out) >= MAX_VIEWS or time.monotonic() >= end:
                 truncated = True                      # names[i:] were never judged
                 break
             try:   # one poisoned file must never abort the loop or hide the real views after it
                 e = _read_live(dir_fd, name)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 - _Unjudged or anything else: this name was not judged
+                truncated = True
                 continue
             if e:
                 out.append(e)

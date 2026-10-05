@@ -740,10 +740,13 @@ class _Handler(GuardedHandler):
                 body = json.dumps({"views": [
                     {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in found
                 ], "truncated": truncated}).encode("utf-8")
-            except Exception:  # noqa: BLE001 - a registry fault is never a 500, and never a complete empty list
-                body = b'{"views": [], "truncated": true}'
+            except Exception:  # noqa: BLE001 - a registry fault is not "no views": a non-200 keeps the page's last list
+                body = None
             finally:
                 _TEAM_VIEWS_GATE.release()
+            if body is None:
+                self._send(b"team view registry error\n", "text/plain; charset=utf-8", status=500, head=head)
+                return
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
