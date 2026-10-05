@@ -102,6 +102,8 @@ dependencies = [
     # section (AM-DURABLE-FACTS, first released in 0.9.28; 0.9.27 was never published).
     # `>=0.9.30`: `levain wrap` hands `prepare_wrap` its own wrap token (`wrap_token=`), which an
     # older anneal does not accept, and cancels every wrap by that token.
+    # `>=0.9.39` (2026-10-04): 0.9.38 added FRAMED `team-import` and carried a library-only regression (an endless
+    # blank-line iterable looped in `import_ledger`); 0.9.39 fixes it, and KNOWN_GOOD_ANNEAL and this floor are one number.
     # `>=0.9.38` (2026-10-04): `team-import` reads FRAMED input (contract v2: one root and one author per ledger file),
     # which `levain team export --jsonl` now emits; an older anneal reads that stream as unframed lines and refuses it.
     # KNOWN_GOOD_ANNEAL moves with it. No migration-manifest entry, so the seed guidance is unchanged.
@@ -119,7 +121,7 @@ dependencies = [
     # wrap's bound token). No migration-manifest entry and no schema changed in 0.9.30 or 0.9.31;
     # their API additions (`prepare_wrap(wrap_token=)` above, `Store.wrap_status_snapshot`,
     # `Store.keyword_candidates`) are additive and the seed does not depend on them.
-    "anneal-memory>=0.9.38,<0.10",
+    "anneal-memory>=0.9.39,<0.10",
 ]
 
 [project.optional-dependencies]
