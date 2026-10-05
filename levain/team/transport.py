@@ -159,24 +159,32 @@ class Repo:
     def discover(cls, start: Path) -> "Repo | None":
         """The repository containing ``start`` (a file or a directory, existing or not), or None."""
         d = _existing_dir(start)
-        try:
-            cp = git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], d,
-                     timeout=10, check=False)
-        except TeamError:
+
+        def one(flag: str) -> bytes | None:
+            # One path per call, exactly one trailing LF removed: a path may itself hold a line break, so
+            # splitting a two-path answer into lines cannot be trusted (L3 r5, codex + complement, RUN).
+            try:
+                cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
+            except TeamError:
+                return None
+            if cp.returncode != 0:
+                return None
+            if not cp.stdout_bytes.endswith(b"\n") or len(cp.stdout_bytes) < 2:
+                raise TeamError(f"git rev-parse {flag} gave an answer levain cannot read")
+            return cp.stdout_bytes[:-1]
+
+        top, common = one("--show-toplevel"), one("--git-common-dir")
+        if top is None or common is None:
             return None
-        if cp.returncode != 0:
-            return None
         try:
-            cp.stdout_bytes.decode("utf-8")
+            return cls(Path(top.decode("utf-8")), Path(common.decode("utf-8")))
         except UnicodeDecodeError:
+            if not os.path.isdir(os.path.join(common, DIRNAME.encode())):
+                return None   # no team in this clone: nothing to enforce, nothing to warn about
             # Every later git call runs in these directories, and a replaced byte names none of them; saying so
             # beats a hook that finds "no ledger" and goes quiet.
             raise TeamError("this repository's path is not valid UTF-8, which levain team does not support "
                             "(rename the directory)") from None
-        lines = cp.stdout.strip().splitlines()
-        if len(lines) != 2:
-            return None
-        return cls(Path(lines[0]), Path(lines[1]))
 
     @property
     def base(self) -> Path:

@@ -1040,7 +1040,21 @@ def test_a_repository_path_that_is_not_utf8_is_refused_out_loud(tmp_path):
     except OSError:
         pytest.skip("this filesystem refuses a non-UTF-8 directory name")
     git("init", "-q", cwd=d)
+    assert Repo.discover(d) is None                 # no team in this clone: nothing to warn about
+    (d / ".git" / "levain-team").mkdir()            # a clone that has joined a team
     with pytest.raises(TeamError, match="not valid UTF-8"):
         Repo.discover(d)
     out = hook("sessionstart", {"cwd": str(d), "hook_event_name": "SessionStart"})
     assert "ledger unavailable" in out["systemMessage"] and "not valid UTF-8" in out["systemMessage"]
+
+
+def test_a_repository_path_holding_a_line_break_is_still_discovered(tmp_path):
+    # L3 r5 (codex HIGH, complement MED, RUN): rev-parse printed two paths and the reader split them into lines,
+    # so a clone at "proj<LF>x" read as no repository and both hooks went silent.
+    for name in ("proj\nx", "proj\u2028x", "proj\rx"):
+        d = tmp_path / name
+        d.mkdir()
+        git("init", "-q", cwd=d)
+        repo = Repo.discover(d / "sub" / "file.py")
+        assert repo is not None and os.path.realpath(repo.toplevel) == os.path.realpath(d), name
+        assert os.path.realpath(repo.common) == os.path.realpath(d / ".git"), name
