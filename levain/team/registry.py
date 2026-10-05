@@ -194,6 +194,7 @@ def register(repo: str, url: str, project: str) -> Registration:
         raise RegistryUnavailable("this platform has no flock; the registry is POSIX only")
     dir_fd = _open_dir(create=True)
     lock_fd = None
+    published = None
     tmp = f".{PREFIX}{secrets.token_hex(16)}.tmp"
     try:
         if not _flock_is_real(dir_fd):
@@ -209,8 +210,14 @@ def register(repo: str, url: str, project: str) -> Registration:
         while view:
             view = view[os.write(lock_fd, view):]
         os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        published = name
         return Registration(name, dir_fd, lock_fd)
     except BaseException:
+        if published is not None:   # interrupted after the rename: withdraw the entry while still holding its lock
+            try:
+                os.unlink(published, dir_fd=dir_fd)
+            except OSError:
+                pass
         if lock_fd is not None:
             try:
                 os.close(lock_fd)
@@ -254,9 +261,8 @@ def prune_dead() -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        for name in os.listdir(dir_fd)[:PRUNE_MAX_NAMES]:
-            if not _NAME_RE.fullmatch(name):
-                continue
+        # Filter, then bound: junk names must not use up the examination budget (L2 2026-10-05, RUN).
+        for name in [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]:
             opened = _open_entry(dir_fd, name)
             if opened is None:
                 continue
