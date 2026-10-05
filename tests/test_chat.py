@@ -37,6 +37,11 @@ class _Result:
     gated: bool = False
     timed_out: bool = False
     pending: tuple = ()
+    held_digest: str | None = None   # defaults to a stand-in digest of `pending` when gated
+
+    def __post_init__(self):
+        if self.gated and self.held_digest is None:
+            self.held_digest = "digest:" + repr(self.pending)
 
     @property
     def ok(self) -> bool:
@@ -64,13 +69,19 @@ class _Stub:
         self.hold = hold
         self.calls: list[tuple[str, Any]] = []
         self.closed = False
+        self.live: str | None = None   # what held_digest() reads now; a test may change it under a hold
 
     def _next(self, name: str, arg: Any = None) -> _Result:
         self.calls.append((name, arg))
         self.on_event(f"⚙ terminal: {name}")
         if self.hold is not None:
             assert self.hold.wait(5)
-        return self.script.pop(0)
+        r = self.script.pop(0)
+        self.live = getattr(r, "held_digest", None) if getattr(r, "gated", False) else None
+        return r
+
+    def held_digest(self):
+        return self.live
 
     def run_turn(self, message):
         return self._next("run_turn", message)
@@ -1582,3 +1593,57 @@ def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
     with pytest.raises(ChatError) as e:
         host.approve(sid, res["decision_id"])
     assert e.value.code == "undecidable"
+
+
+# ---------- chat r7: approve binds to the held calls' bytes (Phill 2026-10-05, raw tool-call frame) ----------
+
+def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown(tmp_path):
+    """The decision id names the halt; the digest names its bytes. If what the next run() would execute differs
+    from what was recorded with the shown set, approve runs NOTHING, the id is spent, and the hold stays
+    rejectable (session.json still reports it, without an id)."""
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,)), _Result(reply="ok, not running it")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "list it")["job_id"])
+    expect = st["result"]["decision_id"]
+    f.made[0].live = "digest:something-else"
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    view = host.session_status(sid)
+    assert view["state"] == "gated" and "decision_id" not in view and view["pending"][0]["full"] == '{"command": "ls"}'
+    f.made[0].live = st["result"].get("held_digest") or "digest:" + repr((held,))   # even back to equal: spent
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision"
+    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not running it"
+
+
+@pytest.mark.parametrize("recorded,live", [(None, "d"), ("d", None), (None, None)])
+def test_an_approve_with_no_readable_digest_is_refused(tmp_path, recorded, live):
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    r = _Result(reply=None, gated=True, pending=(held,))
+    r.held_digest = recorded
+    f = _Factory([r])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    expect = _wait(host, host.turn(sid, "list it")["job_id"])["result"]["decision_id"]
+    f.made[0].live = live
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+
+
+def test_the_digest_recorded_is_the_one_read_with_the_shown_set(tmp_path):
+    """A matching live digest approves; the digest itself never reaches a client (it is not a credential, but
+    nothing needs it)."""
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,), held_digest="abc"), _Result(reply="listed")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "list it")["job_id"])
+    assert "held_digest" not in st["result"] and "held_digest" not in host.session_status(sid)
+    assert _wait(host, host.approve(sid, expect=st["result"]["decision_id"])["job_id"])["result"]["reply"] == "listed"

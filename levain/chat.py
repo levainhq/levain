@@ -218,6 +218,7 @@ class _Session:
     state: SessionState = "opening"
     decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
     pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
+    held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
     session: Any = None          # the EntitySession once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
@@ -364,13 +365,16 @@ class ChatHost:
     def session_status(self, session_id: Any) -> dict[str, Any]:
         """One session's state. For a ``gated`` session it also carries the CURRENT ``decision_id`` and the
         ``pending`` set that id names, so a caller that lost the turn's result (a reloaded page, a lost
-        poll) can decide again. Only here, never in :meth:`listing`: the id is addressed by a session id."""
+        poll) can decide again. Only here, never in :meth:`listing`: the id is addressed by a session id. A
+        gated session with no current id (an approve found the held calls changed) still reports its
+        ``pending`` set, so it can be shown and rejected; without an id it cannot be approved."""
         with self._lock:
             rec = self._get(session_id)
             out = self._session_view(rec)
-            if rec.state == "gated" and rec.decision_id is not None:
-                out["decision_id"] = rec.decision_id
+            if rec.state == "gated":
                 out["pending"] = [dict(p) for p in rec.pending]
+                if rec.decision_id is not None:
+                    out["decision_id"] = rec.decision_id
             return out
 
     def job_status(self, job_id: str) -> dict[str, Any]:
@@ -592,6 +596,20 @@ class ChatHost:
                     "this hold cannot be shown in full, so it can only be rejected",
                     409,
                 )
+            if kind == "approve":
+                # The approval binds to the held calls' bytes, not only to the halt: the digest recorded with
+                # the screen's set must equal the digest of what the next run() would execute, read now. The
+                # session is gated (no job drives it), so nothing can change between this read and the run.
+                live = rec.session.held_digest() if rec.session is not None else None
+                if rec.held_digest is None or live is None or live != rec.held_digest:
+                    # Spent, never re-armed: no screen holds a set that matches, so this halt is reject-only.
+                    rec.decision_id = None
+                    raise ChatError(
+                        "stale_decision",
+                        "what the gate holds is not what was shown, or cannot be read; nothing ran; this hold "
+                        "can now only be rejected",
+                        409,
+                    )
             spent = rec.decision_id
             rec.decision_id = None   # spent: whatever this decision does, no screen can decide this halt again
             before = rec.state
@@ -709,11 +727,13 @@ class ChatHost:
     ) -> None:
         payload: dict[str, Any] | None = None
         error: str | None = None
+        digest: str | None = None
         cut = 0
         try:
             try:
                 result = call(rec.session)
                 payload = _turn_payload(result)
+                digest = getattr(result, "held_digest", None)
                 cut = max(0, len(result.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
                 error = f"{type(exc).__name__}: {exc}"
@@ -741,11 +761,12 @@ class ChatHost:
                 # The result's tool_activity leaves out held and stop-skipped actions; it replaces
                 # what was streamed on every finish (module docstring).
                 job.activity, job.dropped = list(payload["tool_activity"]), cut
-                rec.decision_id, rec.pending = None, []
+                rec.decision_id, rec.pending, rec.held_digest = None, [], None
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
                     rec.decision_id = secrets.token_hex(16)
                     rec.pending = [dict(p) for p in payload["pending"]]
+                    rec.held_digest = digest if isinstance(digest, str) else None
                     payload["decision_id"] = rec.decision_id
                 elif payload["error"] is not None:
                     # A turn that raised or could not read its own gate leaves the conversation in a
