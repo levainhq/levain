@@ -116,8 +116,12 @@ function fetch(path, init) {
   if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
   if (M === "proxy503json" && path === "/chat/approve") return reply(503, { error: "upstream_timeout" });
   if (M === "evicted" && path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "unknown" });
+  if (M === "notstarted" && path === "/chat/approve") return reply(500, {});
+  if (M === "notstarted" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-turn", kind: "turn", status: "done",
+      result: { reply: "the earlier turn", tool_activity: ["\u2699 earlier"], gated: true, error: null } } });
   if (["post500", "proxy503", "proxy503json", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
-    return reply(200, { state: "idle", job_id: null, last_job: { kind: "approve", status: "done",
+    return reply(200, { state: "idle", job_id: null, last_job: { job_id: M === "evicted" ? "J-appr" : "J-other", kind: "approve", status: "done",
       result: { reply: "ran it", tool_activity: ["\u2699 terminal: rm -rf x"], gated: false, error: null } } });
   if (M === "restart404" && path === "/chat/approve") return reply(500, {});
   if (M === "restart404" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
@@ -163,7 +167,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     area.fire("compositionstart", {}); area.fire("keydown", { key: "Enter", keyCode: 13, isTrusted: true }); await sleep(30);
     area.fire("compositionend", {}); await sleep(30);
     area.fire("keydown", { key: "Enter", isTrusted: false }); await sleep(30);
-    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter, a composing Enter (by flag or by composition events) and a synthetic Enter send nothing");
+    find(panel, (n) => n.tagName === "form" && n.className === "chat-compose").fire("submit", { isTrusted: false }); await sleep(30);
+    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter, a composing Enter (by flag or by composition events), a synthetic Enter and a scripted submit send nothing");
     area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(80);
     ok(calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter sends the turn once");
     const reason = find(panel, (n) => n.tagName === "textarea" && n.attrs["aria-label"] === "reason for rejecting");
@@ -175,7 +180,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
     console.log("PASS"); return;
   }
-  find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
+  find(panel, (n) => n.tagName === "form").fire("submit", { isTrusted: true }); await sleep(80);
   if (process.argv[3] === "turn403json") {
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
     console.log("PASS"); return;
@@ -210,7 +215,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "restart404", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
+  if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "restart404", "notstarted", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
     // No clear answer to the approve (a bare 5xx, a proxy's status, an evicted job, lost polls): the decision may
     // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
     // the session only on a trusted click of "Check what happened", carrying the warning into what it shows.
@@ -227,8 +232,11 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
     rr.fire("click", { isTrusted: true }); await sleep(120);
     ok(calls.filter((c) => c.path === "/chat/session.json").length === 1, "a trusted click reads the session once");
-    if (m === "restart404") {
-      ok(panel.textContent.includes("The server restarted, so that session has ended. Your last request may or may not have run"), "a session the server no longer knows is reported as a restart, outcome unknown");
+    if (m === "notstarted") {
+      ok(panel.textContent.includes("No job has started on the server since your last confirmed request, so your last decision has not run"), "a lost request that never started is said as such");
+      ok(!panel.textContent.includes("These actions ran") && !panel.textContent.includes("the earlier turn"), "the earlier job is never shown as what happened");
+    } else if (m === "restart404") {
+      ok(panel.textContent.includes("The server no longer has that session (it restarted, or the session ended and was cleaned up). Your last request may or may not have run"), "a session the server no longer knows: gone, outcome unknown");
       ok(panel.textContent.includes("/ws/ent"), "it says where to look");
       ok(byText(panel, "Start a new session") && !byText(panel, "Approve"), "a way forward, and no box");
     } else if (m === "ambiguousgated" || m === "resync" || m === "stale") {
@@ -244,7 +252,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
       if (["post500", "proxy503", "proxy503json", "evicted"].includes(m)) {
         ok(panel.textContent.includes("These actions ran:") && panel.textContent.includes("terminal: rm -rf x"), "the check shows what the lost decision ran");
         ok(panel.textContent.includes("above is what the server recorded"), "and says the record is the answer");
-      } else ok(panel.textContent.includes("The session is idle now. The outcome"), "with no record, the outcome stays unknown");
+      } else {
+        ok(panel.textContent.includes("The session is idle now. The outcome"), "with no matching record, the outcome stays unknown");
+        ok(!panel.textContent.includes("These actions ran"), "and nothing is shown as what happened");
+      }
     }
     console.log("PASS"); return;
   }
@@ -269,7 +280,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
