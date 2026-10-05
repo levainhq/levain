@@ -217,6 +217,13 @@ def classify_action(
     )
 
 
+def shown_in_full(full: object) -> bool:
+    """Whether a held action's text can stand as "the whole action": a ``str`` holding something other than
+    spaces and line feeds. One rule for the server, the REPL and the cockpit panel (``shownInFull`` there);
+    anything else (not a string, empty, blank) can only be rejected."""
+    return isinstance(full, str) and any(ch not in " \n" for ch in full)
+
+
 def visible(text: str, *, keep_newline: bool = False) -> str:
     """``text`` for a surface where the operator decides on what they read: an ALLOWLIST. Printable ASCII
     (U+0020 to U+007E) renders as itself, a backslash renders as ``\\\\``, and EVERY other code point (tab,
@@ -265,7 +272,7 @@ class PendingEfferent:
     @property
     def decidable(self) -> bool:
         """``False`` when the whole action could not be shown (``full`` empty or blank): it can only be rejected."""
-        return bool(self.full.strip())
+        return shown_in_full(self.full)
 
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""

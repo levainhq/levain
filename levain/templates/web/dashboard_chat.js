@@ -23,7 +23,6 @@
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
   let deciding = false;      // an approve/reject POST or its job is in flight
-  let lostJobs = new Set();  // job ids this session already lost contact with: never followed into a second loss
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -65,7 +64,7 @@
 
   // ---- token prompt ----------------------------------------------------------------------------------------
   function showTokenPrompt(message) {
-    session = null; run++; deciding = false; lostJobs = new Set();
+    session = null; run++; deciding = false;
     ensurePanel(); clear(body);
     note("chat-note", "This cockpit serves chat. Enter the token the server printed when it started.");
     if (message) note("chat-err", message);
@@ -106,7 +105,7 @@
   }
 
   function showPicker(listing) {
-    session = null; run++; deciding = false; lostJobs = new Set();
+    session = null; run++; deciding = false;
     ensurePanel(); clear(body);
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
     const row = el("div", "chat-row");
@@ -231,7 +230,7 @@
     poll(jobId, myRun, (j) => {
       live.textContent = "";
       const res = j.result;
-      if (j.status === "lost") { onLost(jobId, j.error, myRun); return; }
+      if (j.status === "lost") { failure(j.error); resync(myRun, true); return; }
       if (j.status !== "done" || !res) {   // failed, lost, unknown: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
@@ -263,6 +262,10 @@
   // anywhere else a newline would forge the layout. Injective by construction: a backslash in the output only
   // starts "\\" or "\u{...}", so a typed "\u{41}" shows as "\\u{41}" and never reads as the escape for "A".
   // levain.firing.gate.visible is the same rule; the two must change together.
+  // Whether a held action's text can stand as "the whole action": a string with something in it other than spaces
+  // and line feeds. levain.firing.gate.shown_in_full is the same rule (the server and the REPL); the two must
+  // change together.
+  function shownInFull(full) { return typeof full === "string" && /[^ \n]/.test(full); }
   function visible(text, keepNewline) {
     let out = "";
     for (const ch of String(text)) {   // by code point, so a lone surrogate is one unit
@@ -274,20 +277,14 @@
     }
     return out;
   }
-  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that:
-  // used when a decision was not accepted or contact with a job was lost, where this page can no longer say
-  // what is held. A gated session comes back with its CURRENT decision id and held set, so it can be decided
-  // again; the id is only ever taken from the server's answer. Reads only: it never POSTs.
-  // Contact with a job was lost. The session is re-read ONCE per job: a job already lost is never followed
-  // again, so lost -> re-read -> follow -> lost cannot loop; the second loss stops with the outcome unknown.
+  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that, after
+  // a decision was not accepted or contact with a job was lost. It never follows a job and never reports an
+  // outcome it did not see: a GATED session comes back with its CURRENT decision id and held set and gets a fresh
+  // box (the id only ever comes from the server's answer); after an AMBIGUOUS loss (the page cannot tell whether
+  // its decision or turn ran) anything else is reported as unknown with compose blocked; after a definite refusal
+  // an idle session is ready again. Reads only: it never POSTs.
   const UNKNOWN = "The outcome of the last decision is unknown; check the session's activity before retrying.";
-  function onLost(jobId, error, myRun) {
-    failure(error);
-    if (!jobId || lostJobs.has(jobId) || lostJobs.size >= 2) { failure(UNKNOWN); endOfTurn(true); return; }
-    lostJobs.add(jobId);
-    resync(myRun, jobId);
-  }
-  function resync(myRun, lostJobId) {
+  function resync(myRun, ambiguous) {
     if (!session) return;
     live.textContent = "reading the session…";
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
@@ -298,21 +295,8 @@
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun); return;
       }
-      if (r.status === 200 && s.state === "busy" && s.job_id) {
-        if (lostJobs.has(s.job_id)) { failure(UNKNOWN); endOfTurn(true); return; }
-        followJob(s.job_id, myRun); return;
-      }
-      if (r.status === 200 && s.state === "idle") {
-        if (!lostJobId) { endOfTurn(false); return; }
-        // Idle after a lost poll: the work finished while this page could not see it. Its RESULT is in the
-        // original job; it is shown, or the outcome is reported unknown and compose stays blocked.
-        api("GET", "/chat/job.json?id=" + encodeURIComponent(lostJobId)).then((jr) => {
-          if (myRun !== run) return;
-          if (jr.status === 200 && jr.json && jr.json.status === "done" && jr.json.result) { followJob(lostJobId, myRun); return; }
-          failure(UNKNOWN); endOfTurn(true);
-        });
-        return;
-      }
+      if (ambiguous) { failure(UNKNOWN); endOfTurn(true); return; }
+      if (r.status === 200 && s.state === "idle") { endOfTurn(false); return; }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
       endOfTurn(true);
     });
@@ -324,8 +308,7 @@
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
     // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
     // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
-    const decidable = typeof decisionId === "string" && decisionId !== "" &&
-      pending.every((p) => typeof p.full === "string" && p.full.trim() !== "");
+    const decidable = typeof decisionId === "string" && decisionId !== "" && pending.every((p) => shownInFull(p.full));
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
@@ -352,10 +335,10 @@
     log.appendChild(box);
 
     function lock() { deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
-    function decided(j, jobId) {
+    function decided(j) {
       deciding = false; box.remove();
       const res = j.result;
-      if (j.status === "lost") { onLost(jobId, j.error, myRun); return; }
+      if (j.status === "lost") { failure(j.error); resync(myRun, true); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -374,18 +357,20 @@
         // a fresh one is built from what the server holds now.
         deciding = false; box.remove();
         failure("The held action changed since it was shown; nothing was decided; re-reading the session.");
-        resync(myRun); return;
+        resync(myRun, false); return;
       }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If
         // the halt is still undecided it comes back with its decision id and the set to show, and a fresh
-        // box is built from that, never from this one.
+        // box is built from that, never from this one. A 4xx or a 503 is a definite refusal (nothing ran);
+        // anything else (no response, another 5xx, a 202 without a job) may have started the decision.
         deciding = false; box.remove();
+        const definite = (r.status >= 400 && r.status < 500) || r.status === 503;
         failure("The decision was not accepted: " + why(r));
-        resync(myRun); return;
+        resync(myRun, !definite); return;
       }
       live.textContent = "working…";
-      poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j, r.json.job_id); });
+      poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });
     }
 
     // THE ONLY /chat/approve POST in this file: a trusted click on this button, once, with both buttons locked.

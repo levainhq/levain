@@ -999,3 +999,25 @@ def test_full_is_non_empty_only_for_an_exact_json_native_dump():
     for bad in ((1, 2), {1}, b"x", float("inf"), {"k": (1,)}, [(1,)]):
         assert _full_for("file_editor", {"command": "create", "extra": bad}) == "", repr(bad)
     assert _full_for("terminal", None) == ""
+
+
+def test_a_model_dump_that_leaves_out_a_declared_field_is_not_the_whole_action():
+    """L3 r4 (complement): model_dump() omits Field(exclude=True), so a dump can be exact and still not the whole
+    action. A dump missing any declared field gives no `full` (reject only)."""
+    from types import SimpleNamespace
+
+    from levain.firing.openhands.gate import _dump_fields
+
+    class Action:
+        model_fields = {"command": None, "secret_target": None}
+
+        def model_dump(self):
+            return {"command": "deploy"}
+
+    assert _dump_fields(SimpleNamespace(action=Action())) is None
+
+    class Whole(Action):
+        def model_dump(self):
+            return {"command": "deploy", "secret_target": "prod"}
+
+    assert _dump_fields(SimpleNamespace(action=Whole())) == {"command": "deploy", "secret_target": "prod"}
