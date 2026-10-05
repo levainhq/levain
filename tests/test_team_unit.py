@@ -317,6 +317,9 @@ def test_team_roundtrip_and_refusals(tmp_path):
     for twin in ("ana-", "ana.", "Ana.-"):
         with pytest.raises(R.RolesError, match="same ledger folder"):
             R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", twin: "b@x.com"})))
+    for bad in ("p\n# forged heading", "p\u2028x", "", "  "):
+        with pytest.raises(R.RolesError, match="project must be"):
+            R.parse_team(R.dump_team(R.Team(bad, "ana", {"ana": "a@x.com"})))
     with pytest.raises(R.RolesError, match="share the email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "ann": "A@X.com "})))
     with pytest.raises(R.RolesError, match="mode"):

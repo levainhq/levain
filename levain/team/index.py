@@ -267,7 +267,8 @@ def age(ts: str, now: datetime | None = None) -> str:
     return f"{h}h ago" if h else f"{max(1, d.seconds // 60)}m ago"
 
 
-_BREAKS = ("\r\n", "\n", "\r", " ", " ", "\x85", "\x0b", "\x0c")
+_BREAKS = ("\r\n", "\n", "\r", " ", " ", "\x85", "\x0b", "\x0c",
+           "\x1c", "\x1d", "\x1e")  # FS/GS/RS: str.splitlines() breaks on these too
 
 
 def oneline(text: str) -> str:

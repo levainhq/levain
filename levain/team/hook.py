@@ -73,7 +73,7 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
                        f"({', '.join(owners) or 'the owner'}) before changing anything; do not route around this "
                        "check (no Bash, sed, heredoc or copy edits of this path). If the owner changes the call, "
                        "record their words as a new ruling (`levain team record decision --kind ruling --owner ... "
-                       f"--words ... --refs <old id>`); the team owner ({team.owner}) or the ruling's author then "
+                       f"--words ... --refs <old id>`); the team owner ({I.oneline(team.owner)}) or the ruling's author then "
                        "supersedes the old one.")
         if [e for e in foreign if _mode(e, team) == "block" and e in always]:
             how.append("A ruling above is in BLOCK mode: no edit to this path until a superseding ruling is "
