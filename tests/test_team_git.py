@@ -931,7 +931,8 @@ def test_diff_path_undoes_gits_quoting_and_leaves_what_it_cannot_read_unmatched(
     assert _diff_path("b/ledger/ana/my file.jsonl\t") == "b/ledger/ana/my file.jsonl"
     assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/q"u\\o\tté.jsonl'
     assert _diff_path('"b/ledger/ana/\\q.jsonl"') == '"b/ledger/ana/\\q.jsonl"'          # unknown escape: left quoted
-    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\u00ff.jsonl"        # not UTF-8: one char per byte
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\udcff.jsonl"        # not UTF-8: a surrogate escape
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') != _diff_path('"b/ledger/ana/\\303\\277.jsonl"')   # \xff vs U+00FF never alias
     assert _diff_path('"b/ledger/ana/my \\"f.jsonl"\t') == 'b/ledger/ana/my "f.jsonl'     # a space makes git add the tab to a quoted name too
 
 
@@ -968,3 +969,30 @@ def test_a_cache_written_by_the_old_parser_is_not_trusted(two):
     c["files"] = [[r, l] for r, l in c["files"] if "my file" not in r]
     cache.write_text(json.dumps(c))
     assert list(planted.values())[0] in [e["words"] for e in ledger(ana).in_force]
+
+
+def test_the_git_helper_decodes_bytes_itself_never_through_the_locale_or_newline_translation(tmp_path):
+    from levain.team.transport import git as tgit
+    git("init", "-q", cwd=tmp_path)
+    data = b'{"w":"caf\xc3\xa9"}\r+++ b/ledger/x.jsonl\r\xff\n'
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=tmp_path, input=data, check=True,
+                         capture_output=True).stdout.decode().strip()
+    out = tgit(["cat-file", "-p", sha], tmp_path).stdout
+    assert out == '{"w":"caf\u00e9"}\r+++ b/ledger/x.jsonl\r\ufffd\n'     # CR kept (no line split), bad byte replaced
+    # the same read under a parent process whose locale is ASCII (text=True would decode with that)
+    code = ("import sys; from pathlib import Path; from levain.team.transport import git; "
+            "sys.stdout.buffer.write(git(['cat-file','-p',sys.argv[1]], Path(sys.argv[2])).stdout.encode('utf-8'))")
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    cp = subprocess.run([PY, "-P", "-c", code, sha, str(tmp_path)], env=env, capture_output=True, check=True)
+    assert cp.stdout.decode("utf-8") == out
+
+
+def test_a_ledger_file_git_would_call_binary_is_still_read(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/nul.py"], words="nul file"), "")
+    (gl.wt / "ledger" / "ana" / "nul.jsonl").write_bytes(json.dumps(root, sort_keys=True).encode() + b"\n\x00\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "a NUL in the file", cwd=gl.wt)
+    assert "nul file" in [e["words"] for e in ledger(ana).in_force]

@@ -64,15 +64,19 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
+    # Bytes in, bytes out, decoded here: text=True would use the parent's locale (not the child's LC_ALL) and would
+    # translate a raw CR in a pushed ledger line into a line break, which shifts the hunk counter _history relies on.
     try:
-        cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
-                            errors="replace",   # bytes that are not UTF-8 (a pushed file's content) must not raise
-                            timeout=timeout, input=input_text,
-                            stdin=None if input_text is not None else subprocess.DEVNULL)
+        raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, timeout=timeout,
+                             input=None if input_text is None else input_text.encode("utf-8"),
+                             stdin=None if input_text is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
         raise TeamError("git is not on PATH") from None
+    # replace, not raise: bytes that are not UTF-8 (a pushed file's content) fail their hash like any bad line
+    cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"),
+                                     raw.stderr.decode("utf-8", "replace"))
     if check and cp.returncode != 0:
         msg = (cp.stderr or cp.stdout).strip().splitlines()
         raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
@@ -87,7 +91,8 @@ def _diff_path(raw: str) -> str:
 
     git wraps a name holding a non-ASCII byte, quote, backslash or control character in double quotes with C
     escapes (octal for other bytes), and ends any name holding a space, quoted or not, with a tab. A name that is
-    not valid UTF-8 is decoded one byte per character (injective), so it is still read, never dropped. A header
+    not valid UTF-8 keeps its bad bytes as surrogate escapes (injective: valid text never decodes to a lone
+    surrogate), so it is still read and never merged with another name; see _printable for showing one. A header
     this cannot parse is returned as written, which no ledger prefix matches.
     """
     if raw.endswith("\t"):
@@ -113,7 +118,12 @@ def _diff_path(raw: str) -> str:
     try:
         return out.decode("utf-8")
     except UnicodeDecodeError:
-        return out.decode("latin-1")
+        return out.decode("utf-8", "surrogateescape")
+
+
+def _printable(text: str) -> str:
+    """A path safe to put in a message: surrogate escapes become U+FFFD (the key itself is never altered)."""
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def _tail(cp: subprocess.CompletedProcess) -> str:
@@ -336,7 +346,7 @@ class GitLedger:
         cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "core.quotepath=true",
                   "log", "--reverse", "--no-renames",
                   "--full-history", "--topo-order",
-                  "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
+                  "--no-color", "--text", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
                   "--diff-merges=off", "-p", "--unified=0", "--format=%x00C%x09%H%x09%ae", rev, "--", "ledger/"],
                  self.repo.toplevel, check=False, timeout=60)
         if cp.returncode != 0:
@@ -355,7 +365,7 @@ class GitLedger:
             gone = [r for r in removed if r.strip() and r not in added]
             where = cur or src
             if where and gone:
-                problems.append(f"ledger/{where}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
+                problems.append(f"ledger/{_printable(where)}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
                                 f"{mail}; the ledger is append-only, so the original lines still count")
             added.clear()
             removed.clear()
@@ -413,7 +423,7 @@ class GitLedger:
             problems.append(f"merge commit {m_sha[:10]} touches ledger/: levain keeps the ledger linear, so lines "
                             "that exist only in a merge resolution are not read")
         for (rel, m), n in sorted(stranger.items()):
-            problems.append(f"ledger/{rel}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
+            problems.append(f"ledger/{_printable(rel)}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
                             f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
         return files, problems
 
