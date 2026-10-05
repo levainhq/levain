@@ -28,13 +28,19 @@ def _line(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n"
 
 
-def _label(rel: str) -> str:
-    """The frame label for a ledger file: its path when that fits anneal's rule, else an opaque digest of it. A path
-    can be anything a member pushed under ``ledger/`` (a space, a non-ASCII name, 300 characters), and the label is only
-    for grouping and report text, so a file that cannot be named is still exported, never a reason to withhold the rest."""
-    if _FRAME_LABEL.fullmatch(rel):
+_OPAQUE = "unnamed-"
+
+
+def _label(index: int, rel: str) -> str:
+    """The frame label for the ``index``-th ledger file: its path when that fits anneal's rule, else
+    ``unnamed-<index>-<sha256 of the path>``. Labels are unique BY CONSTRUCTION, with nothing to detect: a path that
+    itself starts with ``unnamed-`` is treated as unframeable, so a literal label can never sit in the opaque namespace,
+    and the file's index makes every opaque label differ even if two digests were ever equal. A path can be anything a
+    member pushed under ``ledger/``, the label is only for grouping and report text, so a file that cannot be named is
+    still exported, never a reason to withhold the rest."""
+    if _FRAME_LABEL.fullmatch(rel) and not rel.startswith(_OPAQUE):
         return rel
-    return "unnamed-" + hashlib.sha256(rel.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{_OPAQUE}{index}-" + hashlib.sha256(rel.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _envelope(label: str, n: int, line: str) -> str:
@@ -46,7 +52,7 @@ def export_stream(ledger: I.Ledger, *, in_force: bool = False) -> list[str]:
     if in_force:
         return [_line(e) for e in ledger.in_force]
     out = [json.dumps(STREAM_HEADER, separators=(",", ":")) + "\n"]
-    for f in sorted(ledger.files, key=lambda f: f.rel):
-        label = _label(f.rel)
+    for index, f in enumerate(sorted(ledger.files, key=lambda f: f.rel)):
+        label = _label(index, f.rel)
         out.extend(_envelope(label, n, _line(obj).rstrip("\n")) for n, obj in enumerate(f.entries, 1))
     return out

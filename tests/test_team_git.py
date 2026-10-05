@@ -371,6 +371,18 @@ def test_a_ledger_file_with_an_unframeable_path_is_still_exported(two, capsys):
     assert any(e["frame"].startswith("unnamed-") for e in envs)
 
 
+def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
+    from levain.team.export import _label
+    rels = ["ana/a.jsonl", "ana/device!.jsonl", "ana/other!.jsonl", "unnamed-0-" + "0" * 64, "ana/" + "x" * 300 + ".jsonl"]
+    labels = [_label(i, r) for i, r in enumerate(rels)]
+    assert len(set(labels)) == len(rels)
+    assert labels[0] == "ana/a.jsonl"
+    assert all(l.startswith("unnamed-") for l in labels[1:]) and labels[3] != rels[3]
+    # even if two different paths had the same digest, the index keeps the labels apart
+    assert _label(1, "x!") != _label(2, "x!")
+    assert all(__import__("re").fullmatch(r"[A-Za-z0-9._@:+/=-]{1,200}", l) for l in labels)
+
+
 def _anneal_team_import(stdin: str, db: Path, extra=()):
     return subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
                            "--link-authority", "ana", *extra, "-"], input=stdin, capture_output=True, text=True, timeout=60)
