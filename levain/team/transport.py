@@ -22,6 +22,7 @@ import os
 import random
 import re
 import secrets
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -765,11 +766,42 @@ class GitLedger:
         state = ["v1", ids, R.dump_team(team), sorted(ledger.problems)]
         return hashlib.sha256(json.dumps(state).encode("utf-8")).hexdigest()[:16]
 
+    def _replace_plain(self, name: str, text: str) -> None:
+        """Write a top-level worktree file as a NEW regular file renamed into place. The ledger branch is written by
+        every member, so ``name`` may arrive as a symlink (or a hard link): writing to the path would follow it
+        out of the worktree. A rename replaces the directory entry itself, so a link there is replaced, never
+        followed."""
+        tmp = self.wt / f".{name}.levain-{os.getpid()}.tmp"
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, self.wt / name)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _read_plain(self, name: str) -> str:
+        """A top-level worktree file, refused unless it is a regular file (never read through a link)."""
+        path = self.wt / name
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise TeamError(f"{name} in the team worktree is not a regular file (a link or other entry was "
+                            f"committed to the ledger branch); levain will not read or write through it")
+        return path.read_text(encoding="utf-8")
+
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
-            (self.wt / name).write_text(text, encoding="utf-8")
+            self._replace_plain(name, text)
             git(["add", "--", name], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return f"{name} unchanged"
@@ -787,10 +819,10 @@ class GitLedger:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
-            team = R.parse_team((self.wt / "team.toml").read_text(encoding="utf-8"), "team.toml")
+            team = R.parse_team(self._read_plain("team.toml"), "team.toml")
             change(team)
             R.validate_team(team)
-            (self.wt / "team.toml").write_text(R.dump_team(team), encoding="utf-8")
+            self._replace_plain("team.toml", R.dump_team(team))
             git(["add", "--", "team.toml"], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return "team.toml unchanged"

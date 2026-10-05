@@ -319,6 +319,28 @@ def test_owner_consolidates_and_others_cannot(two, capsys):
     assert "canon current" in capsys.readouterr().out
 
 
+def test_a_member_cannot_make_the_owner_write_outside_the_worktree_through_a_link(two):
+    """0.6.0-0.6.4, RUN on the 0.6.4 wheel: a member pushed PROJECT.md as a symlink and the owner's consolidate wrote
+    the canon through it (any file the owner can write, e.g. ~/.bashrc). Now a link is replaced, never followed."""
+    tmp, ana, ben = two
+    name = "PROJECT.md"
+    assert record_ruling(ana) == 0
+    victim = tmp / "victim.txt"
+    victim.write_text("ORIGINAL\n")
+    assert team("sync", repo=ben) == 0
+    wt = GitLedger(Repo.discover(ben)).wt
+    (wt / name).unlink(missing_ok=True)
+    (wt / name).symlink_to(victim)
+    git("add", name, cwd=wt)
+    git("commit", "-qm", "link", cwd=wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=wt)
+    team("sync", repo=ana)
+    team("consolidate", repo=ana)
+    assert victim.read_text() == "ORIGINAL\n"
+    out = GitLedger(Repo.discover(ana)).wt / name
+    assert not out.is_symlink() and "project canon" in out.read_text()
+
+
 def _framed(text: str):
     """Parse a framed export: (header line, [(frame, n, line)])."""
     rows = text.splitlines()

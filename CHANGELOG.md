@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Security
+
+- **A team member could make the owner's `levain team consolidate` write outside the ledger worktree (0.6.0 to 0.6.4; upgrade to fix).** The ledger branch is written by every member, and the owner's consolidate wrote `PROJECT.md` to its path in the worktree, following a symlink. A member who pushed `PROJECT.md` as a symlink therefore had the canon written over any file the owner can write (reproduced on the 0.6.4 wheel: a file outside the worktree was overwritten). The canon carries members' ruling words, so a target such as a shell startup file could turn a ruling into a command. `PROJECT.md` and `team.toml` are now written as a new regular file renamed into place, so a link there is replaced, never followed, and `team.toml` is never read through a link. Run record: flow `projects/levain/reference/team_canon_symlink_run_1005/`.
+
 ### Fixed
 
 - **A teammate's ruling can no longer draw fake `[team]` lines into your session.** The `SessionStart` context printed each ruling's words, paths and owner exactly as recorded, so a line break in a member's ruling started a new line that read as the hook's own (`[team] ...`) in every teammate's agent context. Every line the hooks, `levain team status` and `PROJECT.md` assemble is now folded onto one line as a whole, whatever field or file name fed it (words, paths, owner, pack, author, the edited file's own name, warnings and git errors), so a line break in any of them stays inside its line. Found by the nightly review, reproduced, and pinned by a test that fails on 0.6.3.
