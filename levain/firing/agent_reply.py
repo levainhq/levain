@@ -196,62 +196,73 @@ def unreadable_call_notice(tool_activity) -> str:
 # GLM's argument markup: a key tag next to a value tag. A parse failure upstream can cut the reply anywhere, so
 # either order and either tag half counts ("</arg_key><arg_value>", "</arg_value><arg_key>").
 _GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
-# A leaked call begins its line: markup, or one cut-off word run straight into it ("_editor<arg_key>",
-# "create</arg_value>", as captured). A sentence that mentions the markup has a space before it, so it is an answer.
-_GLM_LINE = re.compile(r"(?m)^ {0,3}[^\s<]*</?arg_(?:key|value)>")
-# The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
-# argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
-_TOOL_CALL_OPEN = re.compile(r"(?m)^ {0,3}<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# Markdown code, as a CommonMark parser reads it (markdown-it-py, "commonmark" preset): a reply quoting the markup
-# is explaining it, not calling. Fenced and indented code blocks and code spans are code; every other line keeps its
-# text as written (an entity or a backslash escape keeps its source, so "&lt;tool_call>" is not "<tool_call>"), on the
-# source line it came from. A code span becomes a placeholder that is neither a space nor markup, so it cannot pad a
-# line's indent. Block quote and list markers are dropped, so markup quoted in one begins its line (a known limit).
+# A leaked GLM call opens with its markup, or with one cut-off word run straight into it ("_editor<arg_key>",
+# "create</arg_value>", as captured).
+_GLM_START = re.compile(r"[^\s<]*</?arg_(?:key|value)>")
+# The <tool_call> wrapper opening an actual call: a JSON object, a tool name followed by GLM argument markup, or
+# Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
+_TOOL_CALL_START = re.compile(r"<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
+
+# Where a leak can be, as a CommonMark parser (markdown-it-py, "commonmark" preset) reads the reply: the start of a
+# line of a TOP-LEVEL PARAGRAPH, carried by plain text. The parser decides everything structural: code (fenced and
+# indented blocks, code spans) is never a paragraph's text; a heading, a block quote or a list item is not a
+# top-level paragraph, so markup quoted in one is an answer; a line that opens with emphasis, a link or a code span
+# does not open with text; an entity or a backslash escape keeps its source ("&lt;tool_call>" is not
+# "<tool_call>"). Leading indentation is already gone, so no column rule is needed. A shape may run across the
+# paragraph's line breaks ("<tool_call>" on one line, its JSON on the next).
 _MD = MarkdownIt("commonmark").disable("text_join")
-_CODE_PLACEHOLDER = "\x00"
-_LINE_END = re.compile(r"\r\n?")
+# markdown-it-py compiles each rule chain on first use and publishes the empty cache before filling it, so two
+# threads parsing their first reply at once could run without rules (codex L3 r5). Parse once here, single-threaded.
+_MD.parse("warm *a* `b` [c](d)\n\n> e\n\n- f\n\n# g\n\n```\nh\n```\n")
+_MARK = "\x00"   # stands for anything that is not plain text: never a space, never markup
 
 
-def _inline_text(token) -> str:
-    parts: list[str] = []
-    for c in token.children or ():
-        if c.type in ("softbreak", "hardbreak"):
-            parts.append("\n")
-        elif c.type == "code_inline":
-            parts.append(_CODE_PLACEHOLDER)
-        elif c.type == "text_special":
-            parts.append(c.markup or c.content)
-        elif c.type in ("text", "html_inline"):
-            parts.append(c.content)
-        elif c.type == "image":
-            parts.append(_inline_text(c))
-    return "".join(parts)
-
-
-def _markdown(text: str):
-    """(``text`` outside Markdown code, line for line; the body of ``text`` when its only block is one fence, else
-    ``None``). If the parser fails, all of ``text`` is read as prose and there is no fence."""
-    source = _LINE_END.sub("\n", text)
+def _paragraphs(text: str):
+    """For each top-level paragraph of ``text``: (its text, line breaks kept; the offsets where a line opens
+    with plain text). ``[]`` when the parser fails (a display aid never fails the turn)."""
     try:
-        tokens = _MD.parse(source)
-    except Exception:  # noqa: BLE001 — a display aid: read everything rather than fail the turn
-        return source, None
-    out = [""] * (source.count("\n") + 1)
-
-    def put(start: int, end: int, body: str) -> None:
-        for k, line in enumerate(body.split("\n")[: end - start]):
-            out[start + k] = line
-
-    for t in tokens:
-        if t.map is None:
+        tokens = _MD.parse(text)
+    except Exception:  # noqa: BLE001
+        return []
+    found = []
+    for i, t in enumerate(tokens):
+        if t.type != "inline" or i == 0 or tokens[i - 1].type != "paragraph_open" or tokens[i - 1].level != 0:
             continue
-        if t.type == "inline":
-            put(t.map[0], t.map[1], _inline_text(t))
-        elif t.type == "html_block":
-            put(t.map[0], t.map[1], t.content)
+        parts: list[str] = []
+        starts: list[int] = []
+        at_line_start = True
+        size = 0
+        for c in t.children or ():
+            if c.type in ("softbreak", "hardbreak"):
+                piece, at_line_start = "\n", True
+                parts.append(piece)
+                size += 1
+                continue
+            if c.type == "text":
+                piece = c.content
+            elif c.type == "text_special":
+                piece = c.markup or c.content
+            else:
+                piece = _MARK
+            if not piece:
+                continue
+            if at_line_start and c.type == "text":
+                starts.append(size)
+            at_line_start = False
+            parts.append(piece)
+            size += len(piece)
+        found.append(("".join(parts), starts))
+    return found
+
+
+def _whole_fence_body(text: str) -> str | None:
+    """The inside of ``text`` when its only top-level block is one fenced code block, else ``None``."""
+    try:
+        tokens = _MD.parse(text)
+    except Exception:  # noqa: BLE001
+        return None
     blocks = [t for t in tokens if t.level == 0 and not t.type.endswith("_close")]
-    body = blocks[0].content if len(blocks) == 1 and blocks[0].type == "fence" else None
-    return "\n".join(out), body
+    return blocks[0].content if len(blocks) == 1 and blocks[0].type == "fence" else None
 
 
 def _json_call_names(text: str) -> list[str] | None:
@@ -293,20 +304,24 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     """Whether ``text``, an agent's reply, is a model's raw tool-call syntax rather than an answer.
 
     An open model's call that fails to parse upstream reaches levain as reply TEXT, and that call did not run.
-    Three shapes are recognised. Two are markup that begins a line outside Markdown code, so a reply that quotes
-    or mentions the markup to explain it is an answer: GLM argument markup (a key tag beside a value tag), and a
-    ``<tool_call>`` wrapper that opens a call. The third is a reply that is entirely function-call JSON (bare, or
+    Three shapes are recognised. Two are markup that opens a line of a top-level Markdown paragraph (see
+    :func:`_paragraphs`), so a reply that quotes or mentions the markup to explain it is an answer: GLM argument
+    markup (a key tag beside a value tag), and a ``<tool_call>`` wrapper that opens a call. The third is a reply that is entirely function-call JSON (bare, or
     as the whole of one fenced block) naming only ``tool_names``, the entity's own tools; with none known, that
     shape is not flagged. It reads the shape only: the call is never repaired or run."""
     if not text:
         return False
-    prose, body = _markdown(text)
+    body = _whole_fence_body(text)
     names = _json_call_names((body if body is not None else text).strip())
     if names and all(n in tool_names for n in names):
         return True
-    if _TOOL_CALL_OPEN.search(prose):
-        return True
-    return bool(_GLM_LINE.search(prose) and _GLM_ARG_PAIR.search(prose))
+    for para, starts in _paragraphs(text):
+        for at in starts:
+            if _TOOL_CALL_START.match(para, at):
+                return True
+            if _GLM_START.match(para, at) and _GLM_ARG_PAIR.search(para):
+                return True
+    return False
 
 
 def is_corrective_nudge(event) -> bool:

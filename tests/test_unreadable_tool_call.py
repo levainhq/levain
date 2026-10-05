@@ -331,3 +331,51 @@ def test_many_blank_lines_are_cheap():
     assert unreadable_tool_call("\n" * 200_000 + GLM_REAL[1], TOOLS)
     assert unreadable_tool_call("`" * 2000 + " " + "``` " * 2000 + "\n" + CALL, TOOLS)
     assert time.perf_counter() - t < 5
+
+
+# ---------- L3 r5 (Phill's A): block context and line starts come from the parser's tokens ----------
+
+@pytest.mark.parametrize("reply", [
+    "# " + CALL,
+    "**" + CALL + "**",
+    "*" + CALL + "*",
+    "[" + CALL + "](https://example.com)",
+    "> " + CALL,
+    "- " + CALL,
+    "1. " + GLM_REAL[1],
+    "Intro.\n\n> quoted:\n> " + CALL,
+])
+def test_markup_in_a_heading_emphasis_link_quote_or_list_is_an_answer(reply):
+    assert not unreadable_tool_call(reply, TOOLS)
+
+
+def test_the_hermes_form_with_the_json_on_the_next_line_is_caught():
+    assert unreadable_tool_call('<tool_call>\n{"name": "file_editor", "arguments": {"command": "create"}}\n</tool_call>', TOOLS)
+    assert unreadable_tool_call("Done.\n# Next\n" + CALL, TOOLS)
+
+
+def test_the_parser_is_compiled_before_any_turn_uses_it():
+    # codex L3 r5: the rule caches are built on first use, publishing an empty cache first; two sessions' first
+    # replies could race. Import parses once, so every chain is already compiled.
+    from levain.firing import agent_reply
+
+    for ruler in (agent_reply._MD.core.ruler, agent_reply._MD.block.ruler, agent_reply._MD.inline.ruler,
+                  agent_reply._MD.inline.ruler2):
+        assert getattr(ruler, "__cache__") is not None
+
+
+def test_reference_definitions_are_cheap():
+    # codex L3 r5: markdown-it-py 3.0.0 took 23 s here (quadratic); the floor is 4.0
+    import time
+
+    t = time.perf_counter()
+    unreadable_tool_call("".join(f"[r{i}]: /{i}\n" for i in range(5000)), TOOLS)
+    assert time.perf_counter() - t < 5
+
+
+def test_the_dependency_floor_is_four():
+    import tomllib
+    from pathlib import Path
+
+    deps = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())["project"]["dependencies"]
+    assert "markdown-it-py>=4,<5" in deps
