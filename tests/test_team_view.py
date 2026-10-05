@@ -120,11 +120,44 @@ def test_get_routes_serve_and_every_other_method_is_405(server):
         assert "frame-ancestors" in (r.getheader("Content-Security-Policy") or "")
 
 
-def test_page_has_no_form_and_no_external_request(server):
-    _, body = _req(server, "GET")
-    text = body.decode()
-    assert "<form" not in text and "<input" not in text and "<button" not in text
-    assert "http://" not in text.replace("http-equiv", "") and "https://" not in text
+def test_page_has_no_form_no_write_control_and_loads_only_own_assets(server):
+    import re
+    text = _req(server, "GET")[1].decode()
+    assert "<form" not in text and "<textarea" not in text and 'method="' not in text.lower()
+    assert set(re.findall(r'<input[^>]*type="(\w+)"', text)) == {"search"}      # filters only
+    assert "<script>" not in text and " style=" not in text                       # CSP: no inline script or style
+    srcs = re.findall(r'(?:src|href)="([^"]+)"', text)
+    external = [u for u in srcs if u.startswith("http") and u != V.DEFAULT_COCKPIT_URL]
+    assert external == []                                                         # only the cockpit nav link leaves
+    assert {"/dashboard.css", "/team_view.css", "/team_view.js"} <= set(srcs)
+    assert "data-clamp" in text and 'id="inforce-q"' in text
+
+
+def test_cockpit_stylesheet_and_assets_are_served(server):
+    for path, ctype in (("/dashboard.css", "text/css"), ("/team_view.css", "text/css"),
+                        ("/team_view.js", "text/javascript")):
+        r, body = _req(server, "GET", path)
+        assert r.status == 200 and r.getheader("Content-Type").startswith(ctype) and body
+    assert b".pbody.clamped" in _req(server, "GET", "/dashboard.css")[1]
+
+
+def test_path_filter_narrows_every_pane():
+    ledger, _ = _ledger()
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="billing.py")
+    assert [c["type"] for c in m["waiting"]] == ["question"]
+    assert [r["path"] for r in m["stopped"]] == ["billing.py"]
+    assert m["orphaned"] == [] and m["overdue"] == []
+    assert [g["path"] for g in m["in_force"]] == ["billing.py"]
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="tax/handler.py")
+    assert [g["path"] for g in m["in_force"]] == ["tax/**"]                       # a glob governs the file
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter="infra")
+    assert [c["owner"] for c in m["orphaned"]] == ["carl"]                        # substring of the glob
+
+
+def test_path_filter_over_http(server):
+    r, body = _req(server, "GET", "/view.json?path=legacy")
+    assert [g["path"] for g in json.loads(body)["in_force"]] == ["legacy/**"]
+    assert b"narrowed to what governs" in _req(server, "GET", "/?path=legacy")[1]
 
 
 def test_host_guard_and_unknown_route(server):

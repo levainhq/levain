@@ -244,7 +244,8 @@ def cmd_view(args) -> int:
     from .view import serve
     gl = GitLedger(_repo(args))
     gl.require_joined()
-    return serve(gl, host=args.host, port=args.port, recheck_days=args.recheck_days, ack_flag=args.ack_flag)
+    return serve(gl, host=args.host, port=args.port, recheck_days=args.recheck_days, ack_flag=args.ack_flag,
+                 cockpit_url=args.cockpit_url)
 
 
 def _install_all(repo: Repo, python: str | None = None) -> None:
@@ -447,6 +448,7 @@ def register(subparsers) -> None:
     p.add_argument("--host", default="127.0.0.1", help="loopback only (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=7450)
     p.add_argument("--recheck-days", type=int, default=30, help="a recheck older than this is overdue (default 30)")
+    p.add_argument("--cockpit-url", default="http://127.0.0.1:7420/", help="where the nav's Cockpit link points")
     p.add_argument("--ack-flag", type=int, default=3, help="acks on one path before it is flagged for review (default 3)")
 
     p = add("install", cmd_install, "Wire the team hooks into .claude/settings.local.json (idempotent).")
