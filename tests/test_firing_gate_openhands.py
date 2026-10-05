@@ -855,3 +855,147 @@ def test_a_held_action_that_RAN_instead_of_being_refused_is_not_a_landed_refusal
 
     assert conv.runs == runs_before
     assert result.error is not None and result.gated is True
+
+
+# ---------- the report lists everything approving runs; `full` is decided by identity ----------
+
+def test_the_report_lists_the_inert_members_of_a_held_batch_because_approve_runs_them():
+    """codex MED r2: a `finish` in a held batch was dropped from the report but executed on approve."""
+    from openhands.sdk.tool.builtins import FinishAction
+
+    conv = _FakeConversation()
+    conv.state.events = [
+        _event("terminal", TerminalAction(command="rm -rf build")),
+        _event("finish", FinishAction(message="all done, nothing to see")),
+    ]
+    report = pending_gate_report(conv)
+    assert [r.tool_name for r in report] == ["terminal", "finish"]
+    assert "all done, nothing to see" in report[1].full and report[1].recognized
+
+
+def test_full_is_decided_by_tool_identity_never_by_a_command_field():
+    """codex MED r2: any action with a `command` field was treated as a terminal, hiding its other fields."""
+    from levain.firing.openhands.gate import _full_for
+
+    terminal_shaped = {"command": "ls", "is_input": False, "timeout": None, "reset": False, "kind": "TerminalAction"}
+    assert _full_for("terminal", terminal_shaped) == "ls"
+    for name in ("some_future_tool", "file_editor", ""):
+        out = _full_for(name, terminal_shaped)
+        assert out != "ls" and '"command": "ls"' in out and '"kind": "TerminalAction"' in out
+    unknown = {"command": "ls", "destination": "evil.example"}      # an unknown tool's extra field
+    assert "evil.example" in _full_for("mcp_tool", unknown)
+
+
+def test_a_value_json_cannot_carry_exactly_gives_an_empty_full_not_a_lossy_rendering():
+    """The old `default=str` printed a datetime/set/bytes as text and presented it as the whole action."""
+    import datetime
+
+    from levain.firing.openhands.gate import _full_for
+
+    for bad in (datetime.datetime(2026, 10, 5), {1, 2}, b"x", float("nan")):
+        assert _full_for("file_editor", {"command": "create", "path": "/x", "extra": bad}) == ""
+    assert _full_for("file_editor", {1: "a", "1": "b"}) == ""        # JSON would merge these two keys
+
+
+def test_a_hold_whose_full_cannot_be_rendered_cannot_be_approved_at_the_repl(monkeypatch, capsys):
+    """L1 r3: a NaN in an action made `full` "", and the REPL then showed only the elided detail and took `y`."""
+    from types import SimpleNamespace
+
+    from levain import run as run_mod
+    from levain.firing.gate import PendingEfferent
+    from levain.firing.openhands.gate import _detail_for, _full_for
+
+    fields = {"command": "x" * 500, "timeout": float("nan")}
+    assert _full_for("terminal", fields) == ""
+    held = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full="")
+    assert "NOT SHOWN IN FULL" in held.line()
+
+    class Session:
+        approved = rejected = 0
+
+        def resume_turn(self):
+            self.approved += 1
+            return SimpleNamespace(gated=False, error=None)
+
+        def reject_turn(self, reason):
+            self.rejected += 1
+            return SimpleNamespace(gated=False, error=None)
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    s = Session()
+    run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=(held,), error=None))
+    assert s.approved == 0 and s.rejected == 1
+    assert "cannot be shown in full" in capsys.readouterr().out
+
+
+def test_an_action_that_cannot_be_dumped_is_reject_only_at_the_repl_and_the_server(monkeypatch, capsys, tmp_path):
+    """codex HIGH r4: the vars() fallback (good enough to classify) was labelled the whole action."""
+    from types import SimpleNamespace
+
+    from levain import run as run_mod
+    from levain.chat import ChatError, ChatHost, _turn_payload
+    from levain.firing.openhands.gate import _full_for
+
+    def broken(self, *a, **k):
+        raise RuntimeError("cannot dump")
+
+    monkeypatch.setattr(TerminalAction, "model_dump", broken)
+    conv = _FakeConversation()
+    conv.state.events = [_event("terminal", TerminalAction(command="git push --force"))]
+    report = pending_gate_report(conv)
+    assert report[0].tool_name == "terminal" and report[0].full == "" and not report[0].decidable
+    assert "NOT SHOWN IN FULL" in report[0].line()
+
+    class Session:
+        approved = rejected = 0
+
+        def resume_turn(self):
+            self.approved += 1
+            return SimpleNamespace(gated=False, error=None)
+
+        def reject_turn(self, reason):
+            self.rejected += 1
+            return SimpleNamespace(gated=False, error=None)
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    s = Session()
+    run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=tuple(report), error=None))
+    assert s.approved == 0 and s.rejected == 1
+
+    class Stub:
+        label = model_label = "s"
+        gate_mode, bash_ok, deny_standard_creds, workspace = "gated", True, False, tmp_path
+
+        def __init__(self, on_event):
+            pass
+
+        def run_turn(self, message):
+            return SimpleNamespace(reply=None, tool_activity=[], error=None, nudged=False, gated=True,
+                                   timed_out=False, pending=tuple(report), ok=False, exit_code=4)
+
+        def close(self):
+            pass
+
+    host = ChatHost({"a": tmp_path}, session_factory=lambda d, on_event: Stub(on_event))
+    out = host.open("a")
+    import time
+    while host.job_status(out["job_id"])["status"] == "running":
+        time.sleep(0.01)
+    t = host.turn(out["session_id"], "go")
+    while host.job_status(t["job_id"])["status"] == "running":
+        time.sleep(0.01)
+    res = host.job_status(t["job_id"])["result"]
+    assert res["pending"][0]["full"] == ""
+    with pytest.raises(ChatError) as e:
+        host.approve(out["session_id"], res["decision_id"])
+    assert e.value.code == "undecidable"
+
+
+def test_full_is_non_empty_only_for_an_exact_json_native_dump():
+    from levain.firing.openhands.gate import _full_for
+
+    ok = {"command": "create", "path": "/x", "file_text": "a", "view_range": [1, 2], "kind": "FileEditorAction"}
+    assert _full_for("file_editor", ok) != ""
+    for bad in ((1, 2), {1}, b"x", float("inf"), {"k": (1,)}, [(1,)]):
+        assert _full_for("file_editor", {"command": "create", "extra": bad}) == "", repr(bad)
+    assert _full_for("terminal", None) == ""

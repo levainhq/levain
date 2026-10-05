@@ -251,6 +251,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
+    "/dashboard_chat.js": ("dashboard_chat.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -899,9 +900,9 @@ class _Handler(GuardedHandler):
             if route == "/chat/turn":
                 return host.turn(sid, req.get("message")), 202
             if route == "/chat/approve":
-                return host.approve(sid), 202
+                return host.approve(sid, req.get("expect")), 202
             if route == "/chat/reject":
-                return host.reject(sid, req.get("reason")), 202
+                return host.reject(sid, req.get("reason"), req.get("expect")), 202
             return host.close(sid), 200
         except ChatError as exc:
             return {"error": exc.code, "message": str(exc)}, exc.http_status

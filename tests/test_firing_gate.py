@@ -292,3 +292,75 @@ def test_an_unrecognized_pending_action_is_marked_for_the_operator():
         tool_name="mystery", detail="?", reason="unrecognized", recognized=False
     ).line()
     assert "⚠" in line, "an unrecognized tool must be visibly flagged in the decision"
+
+
+# ---------- the operator-facing text is injective (visible) ----------
+
+def test_visible_is_injective_over_backslash_tab_cr_and_every_control_or_format_char():
+    from levain.firing.gate import PendingEfferent, visible
+
+    # a typed escape sequence cannot read as the escape of a hidden character
+    assert visible("​") == "\\u{200B}" and visible("\\u{200B}") == "\\\\u{200B}"
+    assert visible("\t") == "\\u{0009}" and visible("\r") == "\\u{000D}" and visible("\x1b") == "\\u{001B}"
+    assert visible("a\nb", keep_newline=True) == "a\nb"                 # the one line break kept, only in `full`
+    assert visible("a\nb") == "a\\u{000A}b"
+    cases = ["a\\b", "a\tb", "a\\tb", "a\rb", "a\\rb", "‮", "\\u{202E}", "\x1b[2J", "\\x1b[2J"]
+    assert len({visible(c) for c in cases}) == len(cases)
+    # the REPL line shows the whole action through it, and \r no longer splits a line
+    full = "echo a\r\\u{200B}\x1b[2Jrm -rf ~"
+    line = PendingEfferent("terminal", "echo a", "bash fans in", full=full).line()
+    assert "\r" not in line and "\x1b" not in line and "echo a\\u{000D}\\\\u{200B}\\u{001B}[2Jrm -rf ~" in line
+
+
+def test_line_shows_every_printed_field_through_visible():
+    from levain.firing.gate import PendingEfferent
+
+    line = PendingEfferent("ter\x1bminal", "echo \x1b[2J‮gnirts", "why ‮\x1b").line()
+    assert "\x1b" not in line and "‮" not in line
+    assert "ter\\u{001B}minal" in line and "echo \\u{001B}[2J\\u{202E}gnirts" in line and "why \\u{202E}\\u{001B}" in line
+
+
+_TABLE = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378,
+          0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09]
+
+
+def test_visible_is_an_allowlist_so_every_non_ascii_code_point_is_escaped():
+    """Same table as the node harness in test_web_chat_panel: blank, overlaying, composing and look-alike
+    characters, an emoji and tab. Only printable ASCII renders as itself."""
+    from levain.firing.gate import visible
+
+    for cp in _TABLE:
+        assert visible(chr(cp)) == "\\u{%04X}" % cp, hex(cp)
+    assert visible(" ~az09") == " ~az09"
+    assert visible("\x7f") == "\\u{007F}"
+    assert len({visible(chr(cp)) for cp in _TABLE}) == len(_TABLE)
+
+
+def test_visible_never_renders_two_different_inputs_alike():
+    from levain.firing.gate import visible
+
+    assert visible("\\u{41}") != visible("A") and visible("\\u{41}") == "\\\\u{41}"
+    assert visible("\u0430") != visible("a")                       # Cyrillic a vs Latin a
+    assert visible("\u09cb") != visible("\u09c7\u09be")           # composed vs decomposed Bengali
+    mix = ["a", "A", "\\", "\\\\", "\\u{41}", "\u0430", "\u00e9", "e\u0301", "\t", "\\t", "\r", "\U0001f600", "\ud800"]
+    outs = [visible(x) for x in mix]
+    assert len(set(outs)) == len(mix)
+    # a decoder of the output recovers the input: the mapping is injective
+    import re
+    def decode(o):
+        return re.sub(r"\\\\|\\u\{([0-9A-F]+)\}", lambda m: "\\" if m.group(1) is None else chr(int(m.group(1), 16)), o)
+    assert [decode(o) for o in outs] == mix
+
+
+def test_a_spacing_combining_mark_cannot_alias_its_decomposition():
+    from levain.firing.gate import visible
+
+    assert visible("\u09cb") != visible("\u09c7\u09be")
+    assert visible("\u09cb") == "\\u{09CB}" and visible("\u09c7\u09be") == "\\u{09C7}\\u{09BE}"
+
+
+def test_a_whitespace_only_full_is_undecidable():
+    from levain.firing.gate import PendingEfferent
+
+    p = PendingEfferent("terminal", "x", "r", full="  \n ")
+    assert not p.decidable and "NOT SHOWN IN FULL" in p.line()

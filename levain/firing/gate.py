@@ -94,6 +94,7 @@ __all__ = [
     "PendingEfferent",
     "classify_action",
     "resolve_gate_mode",
+    "visible",
 ]
 
 
@@ -216,6 +217,28 @@ def classify_action(
     )
 
 
+def visible(text: str, *, keep_newline: bool = False) -> str:
+    """``text`` for a surface where the operator decides on what they read: an ALLOWLIST. Printable ASCII
+    (U+0020 to U+007E) renders as itself, a backslash renders as ``\\\\``, and EVERY other code point (tab,
+    CR, every non-ASCII character, letters, emoji and look-alikes such as a Cyrillic ``\u0430`` included)
+    renders as ``\\u{XXXX}``. ``keep_newline`` leaves LF literal, for the one multi-line field (``full``);
+    anywhere else a newline would forge the layout. The mapping is injective by construction: the output
+    contains a backslash only as the start of ``\\\\`` or ``\\u{...}``, so a typed ``\\u{41}`` (shown
+    ``\\\\u{41}``) can never read as the escape for ``A``. The cockpit panel's ``visible()`` is the same
+    rule; the two must change together."""
+    out = []
+    for ch in str(text):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n" and keep_newline:
+            out.append(ch)
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append("\\u{%04X}" % ord(ch))
+    return "".join(out)
+
+
 @dataclass(frozen=True)
 class PendingEfferent:
     """One action the gate stopped, rendered for a human decision.
@@ -234,11 +257,28 @@ class PendingEfferent:
     detail: str
     reason: str
     recognized: bool = True
+    # The action's whole text when ``detail`` is a bounded one-line rendering of it. An approval runs the
+    # whole text, so every surface that asks for one must be able to show it: a tail cut at the display
+    # limit, or a newline flattened into a space, is exactly where a command can hide what it does.
+    full: str = ""
+
+    @property
+    def decidable(self) -> bool:
+        """``False`` when the whole action could not be shown (``full`` empty or blank): it can only be rejected."""
+        return bool(self.full.strip())
 
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
-        return f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
+        out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
+        if not self.decidable:
+            out += "\n      NOT SHOWN IN FULL: this cannot be approved (only rejected)"
+        elif self.full != self.detail:
+            # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
+            # those inert, and the newline it kept is the only line break.
+            body = "\n".join("        " + ln for ln in visible(self.full, keep_newline=True).split("\n"))
+            out += f"\n      the whole action (what approving runs):\n{body}"
+        return out
 
 
 def resolve_gate_mode(setting: GateSetting | str, *, human_present: bool) -> GateMode:

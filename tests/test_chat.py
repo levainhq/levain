@@ -181,7 +181,7 @@ def test_a_busy_session_refuses_a_second_turn_until_the_first_finishes(tmp_path)
 
 
 def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path):
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([
         _Result(reply=None, gated=True, pending=(held,)),
         _Result(reply="pushed"),
@@ -192,14 +192,21 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "push it")["job_id"])
     assert st["result"]["gated"] is True and st["result"]["exit_code"] == 4
-    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push",
+    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push", "full": "git push",
                                         "reason": "network egress", "recognized": True}]
     assert host.session_status(sid)["state"] == "gated"
+    # a decision made on another held set (a stale or re-armed screen) is refused and changes nothing
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect="0" * 64)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    expect = st["result"]["decision_id"]
     with pytest.raises(ChatError) as e:
         host.turn(sid, "wait, don't")   # a new message here would be read as approval
     assert e.value.http_status == 409
 
-    assert _wait(host, host.approve(sid)["job_id"])["result"]["reply"] == "pushed"
+    assert _wait(host, host.approve(sid, expect=expect)["job_id"])["result"]["reply"] == "pushed"   # the shown set
     assert host.session_status(sid)["state"] == "idle"
     with pytest.raises(ChatError):
         host.approve(sid)               # nothing is held now
@@ -214,7 +221,7 @@ def test_a_held_action_streamed_mid_turn_does_not_stay_in_the_jobs_activity(tmp_
     """The stream fires when an action is ISSUED, before the gate holds it. At a gated finish the
     job's activity becomes the result's tool_activity (held actions removed), so a held push never
     reads as work that ran."""
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([_Result(reply=None, gated=True, pending=(held,),
                           tool_activity=["⚙ file_editor: view README.md"])])
     host = _host(tmp_path, f)
@@ -1441,3 +1448,122 @@ def test_each_launch_gets_its_own_token(tmp_path):
         assert httpd.chat_token is None            # no chat, no token
     finally:
         httpd.server_close()
+
+
+def test_a_decision_id_is_single_use_even_when_two_holds_are_textually_identical(tmp_path):
+    """codex L3: a content digest let a stale box approve a SECOND hold that read the same. The id names
+    the halt, not its text."""
+    pend = PendingEfferent("terminal", "git push", "network egress", full="git push")
+    f = _Factory([_Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply="pushed")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    first = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    second = _wait(host, host.approve(sid, expect=first["decision_id"])["job_id"])["result"]
+    assert second["gated"] and second["pending"] == first["pending"]            # the same text again ...
+    assert second["decision_id"] and second["decision_id"] != first["decision_id"]   # ... a different halt
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=first["decision_id"])                           # the first screen's id
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert _wait(host, host.approve(sid, expect=second["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+    with pytest.raises(ChatError):
+        host.approve(sid, expect=second["decision_id"])                          # spent
+
+
+def _gated_host(tmp_path, extra=()):
+    held = PendingEfferent("terminal", "git push", "network egress", full="git push")
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,)), *extra])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    return host, sid, res, f
+
+
+def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp_path):
+    """Phill 2026-10-05: no approve-by-session-id-alone path. A missing id is refused (400) and does not
+    spend the halt; reject without one stays allowed (it runs nothing); a wrong id is still 409."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    for missing in (None, "", 0, []):
+        with pytest.raises(ChatError) as e:
+            host.approve(sid, missing)
+        assert e.value.code == "decision_id_required" and e.value.http_status == 400, repr(missing)
+        assert "expect" in str(e.value) and "/chat/session.json" in str(e.value)
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]        # not spent
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, "0" * 32)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_reject_without_a_decision_id_is_allowed(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="ok, not pushing")])
+    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not pushing"
+
+
+def test_the_approve_route_refuses_a_missing_id_and_session_json_hands_it_out(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    with _serving(_source(tmp_path), host) as base:
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid})
+        assert code == 400 and out["error"] == "decision_id_required" and "expect" in out["message"]
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert code == 200 and view["state"] == "gated"
+        assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid, "expect": view["decision_id"]})
+        assert code == 202 and _poll(base, out["job_id"])["result"]["reply"] == "pushed"
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert view["state"] == "idle" and "decision_id" not in view and "pending" not in view
+        assert "decision_id" not in json.dumps(_call(f"{base}/chat.json")[1])
+
+
+def test_session_status_of_a_gated_session_carries_the_decision_and_the_held_set(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    view = host.session_status(sid)
+    assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+    assert "decision_id" not in json.dumps(host.listing())              # the listing never carries it
+
+
+def test_a_worker_that_cannot_start_restores_the_decision_id(tmp_path, monkeypatch):
+    """codex MED + complement MED r2: a 503 from a failed worker start left the hold undecidable."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    monkeypatch.setattr(host, "_spawn", lambda *a, **k: False)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.http_status == 503
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]
+    monkeypatch.undo()
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_an_approve_on_a_hold_that_cannot_be_shown_in_full_is_refused_and_the_hold_stays(tmp_path):
+    undecidable = PendingEfferent("terminal", "echo xxx", "bash fans in", full="")
+    f = _Factory([_Result(reply=None, gated=True, pending=(undecidable,)), _Result(reply="declined")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])                       # the RIGHT id
+    assert e.value.code == "undecidable" and e.value.http_status == 409
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]      # not spent
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert _wait(host, host.reject(sid, "no", res["decision_id"])["job_id"])["result"]["reply"] == "declined"
+
+
+def test_decision_id_required_message_says_where_a_turn_result_carries_it(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid)
+    assert "decision_id" in str(e.value) and "result" in str(e.value)
+
+
+def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
+    blank = PendingEfferent("terminal", "x", "bash fans in", full="   \n ")
+    f = _Factory([_Result(reply=None, gated=True, pending=(blank,))])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.code == "undecidable"

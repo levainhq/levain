@@ -38,6 +38,7 @@ continue if either did not take. ``Conversation.__init__`` swallowing unknown kw
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from openhands.sdk.security.analyzer import SecurityAnalyzerBase
@@ -45,7 +46,7 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.security.risk import SecurityRisk
 
 from levain.firing.gate import (
-    ActionClass,
+    BASH_TOOL_NAMES,
     Classification,
     PendingEfferent,
     classify_action,
@@ -154,6 +155,35 @@ def _action_fields(action_event: Any) -> dict[str, Any]:
         return {}
 
 
+def _dump_fields(action_event: Any) -> dict[str, Any] | None:
+    """The action's arguments from ``model_dump()`` ONLY, or ``None``. The ``vars()`` fallback of
+    :func:`_action_fields` is good enough to CLASSIFY an action (an unreadable one gates) but may be a
+    partial view, so it must never stand as "the whole action" for an approval."""
+    action = _safe_attr(action_event, "action")
+    if action is None:
+        return None
+    try:
+        return dict(action.model_dump())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _exact(value: Any) -> bool:
+    """``True`` when ``value`` is JSON-native and survives the round trip unchanged: str, int, bool, None,
+    a finite float, a list or a dict with str keys, recursively. A tuple, set, bytes, an enum or any other
+    type (including a subclass of these) is not."""
+    t = type(value)
+    if t in (str, int, bool) or value is None:
+        return True
+    if t is float:
+        return value == value and value not in (float("inf"), float("-inf"))
+    if t is list:
+        return all(_exact(v) for v in value)
+    if t is dict:
+        return all(type(k) is str and _exact(v) for k, v in value.items())
+    return False
+
+
 def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
     """The judgeable content of a proposed action.
 
@@ -170,6 +200,29 @@ def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
         return "(empty command)"
     kind = fields.get("kind") or getattr(action, "kind", "") or tool_name
     return str(kind)
+
+
+_TERMINAL_FIELDS = frozenset({"command", "is_input", "timeout", "reset", "kind"})
+_TERMINAL_DEFAULTS = {"is_input": False, "timeout": None, "reset": False}
+
+
+def _full_for(tool_name: str, fields: dict[str, Any] | None) -> str:
+    """Everything the proposed action would execute with, unbounded and unflattened (see
+    :attr:`levain.firing.gate.PendingEfferent.full`). ``fields`` must be the action's ``model_dump()``
+    (:func:`_dump_fields`); ``None`` (it could not be dumped) gives ``""``. A plain shell command is its
+    text exactly, and "a shell command" is decided by the TOOL's identity (the terminal hand), never by
+    the action having a ``command`` field: the file editor and any tool this module has never seen carry
+    one too. Every other action is every field, as JSON that loses nothing. ``""`` means this cannot be
+    shown whole, and the caller must then treat the action as undecidable: no fields at all, or any value
+    that is not recursively JSON-native and exact (a tuple, set, bytes, an enum, NaN, a non-string key)."""
+    if not fields or not _exact(fields):
+        return ""
+    command = fields.get("command")
+    if (tool_name in BASH_TOOL_NAMES and isinstance(command, str) and command
+            and set(fields) <= _TERMINAL_FIELDS
+            and all(fields.get(k, d) == d for k, d in _TERMINAL_DEFAULTS.items())):
+        return command
+    return json.dumps(fields, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
 def _elide(text: str) -> str:
@@ -294,8 +347,9 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
     """The actions the gate stopped, in the order the agent proposed them.
 
     Reports EVERY pending action, not only the efferent ones. A batch halts as a unit, so the
-    afferent members of that batch are also un-executed and also waiting on the human — listing
-    only the efferent ones would under-report what approving actually authorises.
+    afferent AND inert members of that batch (a ``finish`` among them) are also un-executed and
+    also run on approve — listing only the efferent ones would under-report what approving
+    actually authorises.
     """
     try:
         from openhands.sdk.conversation.state import ConversationState
@@ -311,14 +365,13 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
             raw_name = _safe_attr(event, "tool_name")
             tool_name = str(raw_name or "<unnamed>")
             classification = classify_action(raw_name, fields)
-            if classification.action_class is ActionClass.INERT:
-                continue
             report.append(
                 PendingEfferent(
                     tool_name=tool_name,
                     detail=_detail_for(tool_name, fields, _safe_attr(event, "action")),
                     reason=classification.reason,
                     recognized=classification.recognized,
+                    full=_full_for(raw_name if isinstance(raw_name, str) else "", _dump_fields(event)),
                 )
             )
         except Exception:  # noqa: BLE001 — one undescribable action must not blank the whole
