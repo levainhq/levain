@@ -887,3 +887,48 @@ def test_levains_hook_isolation_does_not_reach_the_remotes_own_server_hooks(two)
     before = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
     assert record_ruling(ana, "src/z.py", "z stays") != 0                      # the push is refused ...
     assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == before   # ... and the remote is unchanged
+
+
+def _plant_named_ledger_files(ana, names, *, hooks_control=False):
+    """Commit one valid root ledger entry per odd file name under ana's ledger dir; return {name: words}."""
+    gl = GitLedger(Repo.discover(ana))
+    planted = {}
+    for i, name in enumerate(names):
+        words = f"planted-{i}"
+        root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=[f"src/q{i}.py"],
+                              words=words), "")
+        (gl.wt / "ledger" / "ana" / name).write_text(json.dumps(root, ensure_ascii=False, sort_keys=True) + "\n")
+        planted[name] = words
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "odd names", cwd=gl.wt)
+    return planted
+
+
+ODD_NAMES = ["my file.jsonl", "café.jsonl", 'q"uote.jsonl', "tab\tname.jsonl"]
+
+
+def test_a_ledger_file_whose_name_git_quotes_is_still_read_enforced_and_exported(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0     # makes ledger/ana exist
+    planted = _plant_named_ledger_files(ana, ODD_NAMES)
+    gl = GitLedger(Repo.discover(ana))
+    # control: git really does quote these names by default, so the test would be inert if it did not
+    raw = git("-c", "core.quotepath=true", "show", "--name-only", "--format=", "HEAD", cwd=gl.wt)
+    assert '"' in raw and "\\303\\251" in raw
+    in_force = [e["words"] for e in ledger(ana).in_force]
+    for name, words in planted.items():
+        assert words in in_force, f"{name!r} was not read"
+    capsys.readouterr()
+    assert team("export", "--jsonl", repo=ana) == 0
+    exported = capsys.readouterr().out
+    for name, words in planted.items():
+        assert words in exported, f"{name!r} was not exported"
+
+
+def test_diff_path_undoes_gits_quoting_and_leaves_what_it_cannot_read_unmatched():
+    from levain.team.transport import _diff_path
+    assert _diff_path("b/ledger/ana/x.jsonl") == "b/ledger/ana/x.jsonl"
+    assert _diff_path("b/ledger/ana/my file.jsonl\t") == "b/ledger/ana/my file.jsonl"
+    assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/q"u\\o\tté.jsonl'
+    assert _diff_path('"b/ledger/ana/\\q.jsonl"') == '"b/ledger/ana/\\q.jsonl"'          # unknown escape: left quoted
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == '"b/ledger/ana/\\377.jsonl"'      # not UTF-8: left quoted

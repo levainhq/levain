@@ -78,6 +78,40 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     return cp
 
 
+_C_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 34, "\\": 92}
+
+
+def _diff_path(raw: str) -> str:
+    """A path as it appears after ``--- `` / ``+++ `` in a git diff header, with git's quoting undone.
+
+    git wraps a name holding a quote, backslash or control character in double quotes with C escapes (octal for
+    other bytes), and ends an unquoted name that holds a space with a tab. A name this cannot read is returned
+    as written, which no ledger prefix matches, so it stays unframeable rather than being misread.
+    """
+    if not raw.startswith('"'):
+        return raw[:-1] if raw.endswith("\t") else raw
+    if not raw.endswith('"') or len(raw) < 2:
+        return raw
+    body, out, i = raw[1:-1], bytearray(), 0
+    while i < len(body):
+        c = body[i]
+        if c != "\\":
+            out += c.encode("utf-8")
+            i += 1
+        elif body[i + 1:i + 2] in _C_ESCAPES:
+            out.append(_C_ESCAPES[body[i + 1]])
+            i += 2
+        elif re.fullmatch(r"[0-7]{3}", body[i + 1:i + 4]):
+            out.append(int(body[i + 1:i + 4], 8) & 0xFF)
+            i += 4
+        else:
+            return raw
+    try:
+        return out.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+
+
 def _tail(cp: subprocess.CompletedProcess) -> str:
     lines = (cp.stderr or cp.stdout or "").strip().splitlines()
     return lines[-1] if lines else f"exit {cp.returncode}"
@@ -291,7 +325,11 @@ class GitLedger:
     def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str]]:
         # Every output-shaping option is pinned: diff.noprefix / diff.mnemonicPrefix / color / external diff
         # tools in a user's config would otherwise change the text this parser reads.
-        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "log", "--reverse", "--no-renames",
+        # core.quotepath=false keeps non-ASCII names literal; names holding a quote, backslash, tab or newline are
+        # still C-quoted by git whatever the setting, and a name holding a space carries a trailing tab: _diff_path
+        # reads all three, so no ledger file name can hide its entries from the parser.
+        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "core.quotepath=false",
+                  "log", "--reverse", "--no-renames",
                   "--full-history", "--topo-order",
                   "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
                   "--diff-merges=off", "-p", "--unified=0", "--format=%x00C%x09%H%x09%ae", rev, "--", "ledger/"],
@@ -330,6 +368,7 @@ class GitLedger:
             files.setdefault(cur, []).append(text)
 
         def ledger_rel(path: str, prefix: str) -> str:
+            path = _diff_path(path)
             p = path[len(prefix):] if path.startswith(prefix) else ""
             return p if p.endswith(".jsonl") else ""
 

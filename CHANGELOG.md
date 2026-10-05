@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **Team ledger: a ledger file whose name git must quote is now read, enforced and exported.** The ledger is rebuilt from `git log -p`, and a file whose name holds a space, a non-ASCII character, a quote, a backslash or a tab was not read at all, so its entries were neither enforced by the PreToolUse hook nor exported (the 0.6.3 "Known limit"). A member can push any `*.jsonl` name under `ledger/`, so this was an enforcement bypass. The read now sets `core.quotepath=false` and undoes git's C-quoting and its trailing-tab marker in the diff headers; a header it cannot read is left unmatched, as before. The test fails on 0.6.3 (planted files with a space, `é`, a quote and a tab) and carries a control that git really quotes those names.
+
 ## [0.6.3] — 2026-10-04
 
 The framed team export, the other half of anneal-memory's `team-import` contract v2 (0.9.38, with the 0.9.39 fix).
