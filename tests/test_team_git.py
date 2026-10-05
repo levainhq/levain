@@ -14,7 +14,7 @@ import pytest
 
 from levain.cli import main as levain_main
 from levain.team import entry as E
-from levain.team.transport import GitLedger, Repo
+from levain.team.transport import GitLedger, Repo, TeamError
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None or os.name != "posix", reason="needs git + POSIX")
 
@@ -929,11 +929,15 @@ def test_diff_path_undoes_gits_quoting_and_leaves_what_it_cannot_read_unmatched(
     from levain.team.transport import _diff_path
     assert _diff_path("b/ledger/ana/x.jsonl") == "b/ledger/ana/x.jsonl"
     assert _diff_path("b/ledger/ana/my file.jsonl\t") == "b/ledger/ana/my file.jsonl"
-    assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/\u2400q"u\\\\o\\x09t\u00e9.jsonl'
+    assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == "b/ledger/ana/\u2400" + 'q"u\\o\tt\u00e9'.encode().hex() + ".jsonl"
     assert _diff_path('"b/ledger/ana/\\q.jsonl"') == '"b/ledger/ana/\\q.jsonl"'          # unknown escape: left quoted
-    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\u2400\\xff.jsonl"        # not UTF-8: that component is an ASCII-escaped key behind U+2400
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\u2400ff.jsonl"        # not UTF-8: U+2400 + hex of the stem
     assert _diff_path('"b/ledger/ana/\\377.jsonl"') != _diff_path('"b/ledger/ana/\\303\\277.jsonl"')   # \xff vs U+00FF never alias
     assert _diff_path('"b/ledger/ana/my \\"f.jsonl"\t') == 'b/ledger/ana/my "f.jsonl'     # a space makes git add the tab to a quoted name too
+    # L3 r5: injective by construction. A real name that spells an escape is itself escaped; C1 controls are odd.
+    real = "\u2400ff.jsonl".encode()
+    assert _diff_path('"b/ledger/ana/' + "".join(f"\\{b:03o}" for b in real) + '"') == "b/ledger/ana/\u2400" + "\u2400ff".encode().hex() + ".jsonl"
+    assert _diff_path('"b/ledger/ana/\\302\\233x.jsonl"') == "b/ledger/ana/\u2400" + "\u009bx".encode().hex() + ".jsonl"
 
 
 def test_a_non_utf8_ledger_file_name_or_content_cannot_crash_or_blind_the_read(two, capsys):
@@ -970,9 +974,9 @@ def test_a_cache_written_by_the_old_parser_is_not_trusted(two):
     ledger(ana)
     cache = gl.base / "history.json"
     c = json.loads(cache.read_text())
-    assert c["key"].startswith("parser-v4|") and any("my file" in r for r, _ in c["files"])
+    assert c["key"].startswith("parser-v5|") and any("my file" in r for r, _ in c["files"])
     # what 0.6.3 would have left behind: the same head, the old key, the odd file missing
-    c["key"] = c["key"].replace("parser-v4|", "parser-v3|", 1)
+    c["key"] = c["key"].replace("parser-v5|", "parser-v4|", 1)   # what an r4 build would have left behind
     c["files"] = [[r, l] for r, l in c["files"] if "my file" not in r]
     cache.write_text(json.dumps(c))
     assert list(planted.values())[0] in [e["words"] for e in ledger(ana).in_force]
@@ -1003,3 +1007,40 @@ def test_a_ledger_file_git_would_call_binary_is_still_read(two):
     git("add", ".", cwd=gl.wt)
     git("commit", "-qm", "a NUL in the file", cwd=gl.wt)
     assert "nul file" in [e["words"] for e in ledger(ana).in_force]
+
+
+def test_a_real_name_that_spells_an_escape_cannot_stitch_two_files_into_one_chain(two, capsys):
+    # L3 r5 (codex, gemini, complement): under the r4 escape, a raw \xff.jsonl and a real file literally named
+    # with its escaped key shared one key, so a root in one and its child in the other verified as ONE chain.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/r.py"], words="root"), "")
+    child = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/c.py"], words="child"),
+                   root["hash"])
+    for name, e in ((b"ledger/ana/\xff.jsonl", root), ("ledger/ana/␀\\xff.jsonl".encode(), child),
+                    ("ledger/ana/␀ff.jsonl".encode(), child)):
+        sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=gl.wt, check=True, capture_output=True,
+                             input=json.dumps(e, sort_keys=True).encode() + b"\n").stdout.decode().strip()
+        subprocess.run(["git", "update-index", "--add", "--cacheinfo", b"100644," + sha.encode() + b"," + name],
+                       cwd=gl.wt, check=True, capture_output=True)
+    git("commit", "-qm", "stitch attempt", cwd=gl.wt)
+    led = ledger(ana)
+    assert "root" in [e["words"] for e in led.in_force]
+    # each file is its own chain: the child's file starts with a non-root line, which is reported (r4 verified clean)
+    assert sum("chain break" in p for p in led.problems) == 2, led.problems
+
+
+def test_a_repository_path_that_is_not_utf8_is_refused_out_loud(tmp_path):
+    # L3 r5 (codex HIGH): decoding rev-parse with replacement made a non-UTF-8 clone path name nothing, so the
+    # hook found "no ledger" and returned silently. Linux only: APFS refuses the name.
+    d = tmp_path / os.fsdecode(b"proj\xff")
+    try:
+        d.mkdir()
+    except OSError:
+        pytest.skip("this filesystem refuses a non-UTF-8 directory name")
+    git("init", "-q", cwd=d)
+    with pytest.raises(TeamError, match="not valid UTF-8"):
+        Repo.discover(d)
+    out = hook("sessionstart", {"cwd": str(d), "hook_event_name": "SessionStart"})
+    assert "ledger unavailable" in out["systemMessage"] and "not valid UTF-8" in out["systemMessage"]

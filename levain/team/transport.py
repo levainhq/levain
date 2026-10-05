@@ -78,6 +78,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     # puts in a message may carry one. A line that is not UTF-8 then fails its hash like any bad line.
     cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"),
                                      raw.stderr.decode("utf-8", "replace"))
+    cp.stdout_bytes = raw.stdout   # for the one caller that must tell a replaced byte from a real U+FFFD
     if check and cp.returncode != 0:
         msg = (cp.stderr or cp.stdout).strip().splitlines()
         raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
@@ -92,11 +93,10 @@ def _diff_path(raw: str) -> str:
 
     git wraps a name holding a non-ASCII byte, quote, backslash or control character in double quotes with C
     escapes (octal for other bytes), and ends any name holding a space, quoted or not, with a tab. A name that is
-    not valid UTF-8, or that holds a control character, has that path component returned as an ASCII-escaped key behind U+2400 (printable, so a report
-    or PROJECT.md never holds a NUL or a control character; backslashes are doubled so the escape is injective, and only a
-    deliberately crafted name in the same member directory can alias one, which surfaces as a chain problem). It is
-    still read, it never merges with another name, and it holds nothing a report or a terminal could choke on. A
-    header this cannot parse is returned as written, which no ledger prefix matches.
+    not valid UTF-8, or that holds a C0/C1 control character or U+2400, has that path component returned as U+2400
+    followed by the hex of its raw bytes (see _component). It is still read, it never merges with another name, and
+    it holds nothing a report or a terminal could choke on. A header this cannot parse is returned as written, which
+    no ledger prefix matches.
     """
     if raw.endswith("\t"):
         raw = raw[:-1]
@@ -122,14 +122,18 @@ def _diff_path(raw: str) -> str:
 
 
 def _component(part: bytes) -> str:
+    """A path component as a key that is injective by construction: a plain name is itself, and any other name
+    is U+2400 plus the hex of its bytes, with a trailing ".jsonl" kept outside the hex so the reader still sees a
+    ledger file. A plain name never contains U+2400, so the two sets cannot meet, and hex holds no "." so the
+    suffix cannot alias (an earlier escape scheme let a real name spell another name's escape: L3, three lineages)."""
     try:
         name = part.decode("utf-8")
-        if not any(ord(c) < 32 or ord(c) == 127 for c in name):
+        if "\u2400" not in name and not any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name):
             return name
     except UnicodeDecodeError:
         pass
-    escaped = part.replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
-    return "\u2400" + re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", escaped)
+    stem, suffix = (part[:-6], ".jsonl") if part.endswith(b".jsonl") else (part, "")
+    return "\u2400" + stem.hex() + suffix
 
 
 def _tail(cp: subprocess.CompletedProcess) -> str:
@@ -162,6 +166,13 @@ class Repo:
             return None
         if cp.returncode != 0:
             return None
+        try:
+            cp.stdout_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            # Every later git call runs in these directories, and a replaced byte names none of them; saying so
+            # beats a hook that finds "no ledger" and goes quiet.
+            raise TeamError("this repository's path is not valid UTF-8, which levain team does not support "
+                            "(rename the directory)") from None
         lines = cp.stdout.strip().splitlines()
         if len(lines) != 2:
             return None
@@ -324,7 +335,7 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v4|{head}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v5|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))

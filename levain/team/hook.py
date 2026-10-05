@@ -164,7 +164,11 @@ def pretooluse(payload: dict) -> None:
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
-    repo = Repo.discover(Path(target))
+    try:
+        repo = Repo.discover(Path(target))
+    except TeamError as exc:
+        _fail_open("PreToolUse", str(exc))
+        return
     if repo is None:
         return
     gl = GitLedger(repo)
@@ -275,7 +279,11 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
 
 def sessionstart(payload: dict) -> None:
     cwd = payload.get("cwd") or os.getcwd()
-    repo = Repo.discover(Path(cwd))
+    try:
+        repo = Repo.discover(Path(cwd))
+    except TeamError as exc:
+        _fail_open("SessionStart", str(exc))
+        return
     if repo is None:
         return
     gl = GitLedger(repo)
