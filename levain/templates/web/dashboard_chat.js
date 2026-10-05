@@ -196,9 +196,23 @@
     sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "submit";
     form.appendChild(area); form.appendChild(sendBtn);
     form.addEventListener("submit", (ev) => { ev.preventDefault(); sendTurn(); });
+    // Enter sends and Shift+Enter starts a new line, in THIS box only. Not while an input method is composing a
+    // character (that Enter belongs to the IME). Nothing in the consent box listens for Enter: deciding is a click.
+    area.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return;
+      ev.preventDefault();
+      sendTurn();
+    });
     body.appendChild(form);
   }
 
+  // A textarea that starts one line tall and grows with what is typed.
+  function autoGrow(t) {
+    t.rows = 1;
+    const fit = () => { t.style.height = "auto"; t.style.height = t.scrollHeight + "px"; };
+    t.addEventListener("input", fit);
+    return fit;
+  }
   function setComposeEnabled(on) { if (area) area.disabled = !on; if (sendBtn) sendBtn.disabled = !on; }
   function bubble(kind, who) {
     const b = el("div", "chat-msg " + kind);
@@ -354,11 +368,13 @@
       box.appendChild(item);
     });
     if (!decidable) box.appendChild(el("div", "chat-reason", "Approve is not offered: this halt cannot be shown in full or carries no decision id, so only Reject (or Close session) is safe."));
-    const reasonIn = el("input", "chat-input");
-    reasonIn.type = "text"; reasonIn.placeholder = "reason for rejecting (optional)";
+    const reasonIn = el("textarea", "chat-input chat-grow");
+    reasonIn.placeholder = "reason for rejecting (optional)";
     reasonIn.setAttribute("aria-label", "reason for rejecting");
     reasonIn.maxLength = 500;
-    // Enter in this field must not submit anything: it is a plain input outside any form.
+    autoGrow(reasonIn);
+    // Enter in this field only starts a new line: it sits outside any form and nothing here listens for Enter, so
+    // no key approves or rejects; the decision buttons are clicks.
     const approve = el("button", "chat-btn approve", "Approve");
     const reject = el("button", "chat-btn reject", "Reject");
     approve.type = "button"; reject.type = "button";

@@ -152,6 +152,19 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
   byText(panel, "Open session").fire("click", { isTrusted: true }); await sleep(60);
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
+  if (process.argv[3] === "enter") {
+    // 0.6.7: Enter sends from the compose box; Shift+Enter and an IME-composing Enter do not
+    area.fire("keydown", { key: "Enter", shiftKey: true }); await sleep(30);
+    area.fire("keydown", { key: "Enter", isComposing: true }); await sleep(30);
+    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter and a composing Enter send nothing");
+    area.fire("keydown", { key: "Enter" }); await sleep(80);
+    ok(calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter sends the turn once");
+    const reason = find(panel, (n) => n.tagName === "textarea" && n.attrs["aria-label"] === "reason for rejecting");
+    ok(reason && reason.rows === 1, "the reject reason is a one-line growing textarea");
+    reason.fire("keydown", { key: "Enter" }); reason.fire("keydown", { key: "Enter", shiftKey: true }); await sleep(60);
+    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "Enter in the reason field decides nothing");
+    console.log("PASS"); return;
+  }
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
   if (process.argv[3] === "turn403json") {
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
@@ -238,7 +251,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
@@ -275,3 +288,12 @@ def test_the_consent_shows_the_held_calls_bytes_with_the_short_form_beside_them(
     assert 'if (shownInFull(p.full)) item.appendChild(el("pre", "chat-detail", visible(p.full, true)));' in js
     assert '"in short: " + visible(p.detail)' in js                     # the short form, beside and labelled
     assert "p.full : p.detail" not in js                                # never in place of the bytes
+
+
+def test_the_only_key_listener_is_the_compose_box():
+    # 0.6.7: Enter-to-send is wired to the compose textarea alone; nothing in the consent box reacts to a key, so no
+    # keystroke can approve or reject (the decision buttons are trusted clicks).
+    src = JS.read_text()
+    assert src.count('addEventListener("keydown"') == 1
+    assert 'area.addEventListener("keydown"' in src
+    assert "keyup" not in src and "keypress" not in src
