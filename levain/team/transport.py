@@ -74,9 +74,9 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
         raise TeamError("git is not on PATH") from None
-    # stdout keeps bytes that are not UTF-8 as surrogate escapes, so a path it names (rev-parse) round-trips to the
-    # same file; stderr only ever becomes a message
-    cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "surrogateescape"),
+    # replace, not raise and not surrogateescape: a lone surrogate cannot be printed or written, so nothing a caller
+    # puts in a message may carry one. A line that is not UTF-8 then fails its hash like any bad line.
+    cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"),
                                      raw.stderr.decode("utf-8", "replace"))
     if check and cp.returncode != 0:
         msg = (cp.stderr or cp.stdout).strip().splitlines()
@@ -92,8 +92,9 @@ def _diff_path(raw: str) -> str:
 
     git wraps a name holding a non-ASCII byte, quote, backslash or control character in double quotes with C
     escapes (octal for other bytes), and ends any name holding a space, quoted or not, with a tab. A name that is
-    not valid UTF-8, or that holds a control character, has that path component returned as an ASCII-escaped key behind a NUL (which no
-    file name can hold, so it never aliases a real name; backslashes are doubled so the escape is injective). It is
+    not valid UTF-8, or that holds a control character, has that path component returned as an ASCII-escaped key behind U+2400 (printable, so a report
+    or PROJECT.md never holds a NUL or a control character; backslashes are doubled so the escape is injective, and only a
+    deliberately crafted name in the same member directory can alias one, which surfaces as a chain problem). It is
     still read, it never merges with another name, and it holds nothing a report or a terminal could choke on. A
     header this cannot parse is returned as written, which no ledger prefix matches.
     """
@@ -128,7 +129,7 @@ def _component(part: bytes) -> str:
     except UnicodeDecodeError:
         pass
     escaped = part.replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
-    return "\x00" + re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", escaped)
+    return "\u2400" + re.sub(r"[\x00-\x1f\x7f]", lambda m: f"\\x{ord(m.group()):02x}", escaped)
 
 
 def _tail(cp: subprocess.CompletedProcess) -> str:
@@ -392,9 +393,7 @@ class GitLedger:
             p = path[len(prefix):] if path.startswith(prefix) else ""
             return p if p.endswith(".jsonl") else ""
 
-        # history text becomes replacement characters where it is not UTF-8: such a line then fails its hash like any
-        # bad line, where a surrogate would raise at the first re-encode
-        lines = cp.stdout.encode("utf-8", "surrogateescape").decode("utf-8", "replace").split("\n")
+        lines = cp.stdout.split("\n")
         i = 0
         while i < len(lines):
             line = lines[i]
