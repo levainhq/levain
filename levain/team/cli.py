@@ -236,6 +236,11 @@ def cmd_export(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
     ledger = gl.ledger()
+    if ledger.tamper:
+        print("levain team export: the ledger is refused as tampered (files levain never writes):", file=sys.stderr)
+        for t in ledger.tamper:
+            print(f"  {t}", file=sys.stderr)
+        return 3
     sys.stdout.writelines(export_stream(ledger, in_force=args.in_force))
     return 0
 

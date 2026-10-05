@@ -98,6 +98,14 @@ def _out(obj: dict) -> None:
     sys.stdout.flush()
 
 
+def _tamper_text(ledger: I.Ledger, team: R.Team) -> str:
+    shown = "; ".join(ledger.tamper[:3]) + (f"; and {len(ledger.tamper) - 3} more" if len(ledger.tamper) > 3 else "")
+    return (f"{TAG} the team ledger is REFUSED as tampered: {shown}. Levain only writes "
+            "ledger/<member>/<device>.jsonl, so nothing in this ledger is trusted until the team owner "
+            f"({team.owner}) removes those files and pushes; `levain team verify` lists them. Do not work around "
+            "this check.")
+
+
 def _fail_open(event: str, reason: str) -> None:
     line = f"[team] ledger unavailable: {reason}"
     _out({"systemMessage": line,
@@ -164,7 +172,11 @@ def pretooluse(payload: dict) -> None:
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
-    repo = Repo.discover(Path(target))
+    try:
+        repo = Repo.discover(Path(target))
+    except TeamError as exc:
+        _fail_open("PreToolUse", str(exc))
+        return
     if repo is None:
         return
     gl = GitLedger(repo)
@@ -184,6 +196,12 @@ def pretooluse(payload: dict) -> None:
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
     if rel is None:
+        return
+    if ledger.tamper:
+        # Fail closed: a file levain never writes sits in the ledger, so nothing it holds can be trusted to be
+        # the whole record. Every edit in this clone is denied until the team owner removes it.
+        _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                     "permissionDecisionReason": I.oneline(_tamper_text(ledger, team))}})
         return
     # Claude Code always sends session_id; the transcript path is a stable stand-in if a build ever does not.
     session = str(payload.get("session_id") or "")
@@ -275,7 +293,11 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
 
 def sessionstart(payload: dict) -> None:
     cwd = payload.get("cwd") or os.getcwd()
-    repo = Repo.discover(Path(cwd))
+    try:
+        repo = Repo.discover(Path(cwd))
+    except TeamError as exc:
+        _fail_open("SessionStart", str(exc))
+        return
     if repo is None:
         return
     gl = GitLedger(repo)
@@ -314,7 +336,12 @@ def sessionstart(payload: dict) -> None:
         lines.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
         lines.append(f"[team] ledger integrity: {len(ledger.problems)} problem(s); run `levain team verify`")
-    note = anneal_import(gl, ledger, tree, team.owner)
+    if ledger.tamper:
+        # Said first and plainly, and nothing of a tampered ledger is imported into the member's memory.
+        lines.insert(0, I.oneline(_tamper_text(ledger, team)) + " Every edit in this clone is denied until then.")
+        note = None
+    else:
+        note = anneal_import(gl, ledger, tree, team.owner)
     if note:
         lines.append(note)
     text = "\n".join(lines)

@@ -135,6 +135,8 @@ class Ledger:
     file_problems: list[str]       # chain breaks, bad lines, misfiled or stranger-written entries
     files: list[LedgerFile] = field(default_factory=list)
     owner: str | None = None       # team.toml owner: the one author whose links cross authors
+    # Paths under ledger/ levain never writes. Non-empty means the ledger is refused as a whole by every reader.
+    tamper: list[str] = field(default_factory=list)
 
     @functools.cached_property
     def by_id(self) -> dict[str, dict]:
@@ -165,7 +167,7 @@ class Ledger:
 
     @property
     def problems(self) -> list[str]:
-        return self.file_problems + self._links[1]
+        return [f"TAMPER: {t}" for t in self.tamper] + self.file_problems + self._links[1]
 
     @functools.cached_property
     def in_force(self) -> list[dict]:
@@ -203,7 +205,7 @@ class Ledger:
 
 
 def build(files: list[tuple[str, list[str]]], owner: str | None = None,
-          problems: list[str] | None = None) -> Ledger:
+          problems: list[str] | None = None, *, tamper: list[str] | None = None) -> Ledger:
     """A ledger from (rel path under ledger/, lines) pairs. Callers split on "\\n" only:
     ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which JSON written with ensure_ascii=False
     carries unescaped inside a string."""
@@ -237,7 +239,7 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         seen.add(e["id"])
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
-    return Ledger(uniq, problems, out_files, owner)
+    return Ledger(uniq, problems, out_files, owner, list(tamper or []))
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:

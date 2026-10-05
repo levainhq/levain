@@ -15,6 +15,7 @@ the same five operations (append, sync, fetch_if_due, ledger, write_canon), not 
 from __future__ import annotations
 
 import contextlib
+import difflib
 import hashlib
 import fcntl
 import json
@@ -54,6 +55,16 @@ class TeamBusy(TeamError):
 # Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
 # fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
 _NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+# The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
+_LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
+_SHA_RE = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def _blob_lines(data: bytes) -> list[str]:
+    """A ledger file's lines. Split on LF only (a CR stays inside its line); bytes that are not UTF-8 become
+    replacement characters, so such a line fails its hash like any other bad line."""
+    lines = data.decode("utf-8", "replace").split("\n")
+    return lines[:-1] if lines and lines[-1] == "" else lines
 # rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; signing needs a
 # prompt a replay cannot answer
 _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "commit.gpgsign=false"]
@@ -64,14 +75,20 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
+    # Bytes in, bytes out: text=True would decode with the parent's locale and turn a CR into a line break. The
+    # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
+    # that is a path or ledger content is read from stdout_bytes.
     try:
-        cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
-                            timeout=timeout, input=input_text,
-                            stdin=None if input_text is not None else subprocess.DEVNULL)
+        raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True,
+                             timeout=timeout, input=None if input_text is None else input_text.encode("utf-8"),
+                             stdin=None if input_text is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
         raise TeamError("git is not on PATH") from None
+    cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"),
+                                     raw.stderr.decode("utf-8", "replace"))
+    cp.stdout_bytes = raw.stdout
     if check and cp.returncode != 0:
         msg = (cp.stderr or cp.stdout).strip().splitlines()
         raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
@@ -101,17 +118,32 @@ class Repo:
     def discover(cls, start: Path) -> "Repo | None":
         """The repository containing ``start`` (a file or a directory, existing or not), or None."""
         d = _existing_dir(start)
+
+        def one(flag: str) -> bytes | None:
+            # One path per call, as bytes, exactly one trailing LF removed: a path may hold any character but NUL,
+            # so a two-path answer split into lines cannot be trusted. Only "not a work tree" means None; any other
+            # failure (git missing, a timeout, safe.directory, a broken config) raises, so a hook in a joined clone
+            # reports it instead of reading "no repository" and going quiet.
+            cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
+            if cp.returncode != 0:
+                err = cp.stderr.lower()
+                if "not a git repository" in err or "must be run in a work tree" in err:
+                    return None
+                raise TeamError(f"git rev-parse {flag} failed: {_tail(cp)}")
+            if not cp.stdout_bytes.endswith(b"\n") or len(cp.stdout_bytes) < 2:
+                raise TeamError(f"git rev-parse {flag} gave an answer levain cannot read")
+            return cp.stdout_bytes[:-1]
+
+        top = one("--show-toplevel")
+        common = one("--git-common-dir") if top is not None else None
+        if top is None or common is None:
+            return None
         try:
-            cp = git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], d,
-                     timeout=10, check=False)
-        except TeamError:
-            return None
-        if cp.returncode != 0:
-            return None
-        lines = cp.stdout.strip().splitlines()
-        if len(lines) != 2:
-            return None
-        return cls(Path(lines[0]), Path(lines[1]))
+            return cls(Path(top.decode("utf-8")), Path(common.decode("utf-8")))
+        except UnicodeDecodeError:
+            # The hooks run only in clones that installed them (joined clones), so this is said, never swallowed.
+            raise TeamError("this repository's path is not valid UTF-8, which levain team does not support "
+                            "(rename the directory)") from None
 
     @property
     def base(self) -> Path:
@@ -270,108 +302,137 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v3|{head}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v4|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
             if cached.get("key") == key:
-                return I.build([(r, l) for r, l in cached["files"]], team.owner if team else None, cached["problems"])
+                return I.build([(r, l) for r, l in cached["files"]], team.owner if team else None, cached["problems"],
+                               tamper=cached["tamper"])
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass
-        files, problems = self._history(team, head)
+        files, problems, tamper = self._history(team, head)
         try:
             tmp = cache.with_suffix(f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps({"key": key, "files": sorted(files.items()), "problems": problems}),
+            tmp.write_text(json.dumps({"key": key, "files": sorted(files.items()), "problems": problems,
+                                       "tamper": tamper}),
                            encoding="utf-8")
             os.replace(tmp, cache)
         except OSError:
             pass
-        return I.build(sorted(files.items()), team.owner if team else None, problems)
+        return I.build(sorted(files.items()), team.owner if team else None, problems, tamper=tamper)
 
-    def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str]]:
-        # Every output-shaping option is pinned: diff.noprefix / diff.mnemonicPrefix / color / external diff
-        # tools in a user's config would otherwise change the text this parser reads.
-        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "log", "--reverse", "--no-renames",
-                  "--full-history", "--topo-order",
-                  "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
-                  "--diff-merges=off", "-p", "--unified=0", "--format=%x00C%x09%H%x09%ae", rev, "--", "ledger/"],
-                 self.repo.toplevel, check=False, timeout=60)
+    def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
+        """(files, problems, tamper) from the ledger branch's history, read through git plumbing only.
+
+        Levain owns the ledger namespace: it only ever writes ``ledger/<handle>/<16 hex>.jsonl`` as a regular file.
+        Every path git reports under ``ledger/`` is compared as BYTES against that grammar; anything else is not
+        decoded or read. It is tamper, and every reader refuses a tampered ledger as a whole. No human display
+        format of git (diff headers, quoted names) is parsed: commits come from ``log -z``, paths from
+        ``diff-tree -z --raw``, contents from ``cat-file --batch``, and added and removed lines are computed here.
+        """
+        top = self.repo.toplevel
+        cp = git(["log", "-z", "--reverse", "--topo-order", "--full-history", "--no-merges", "--format=%H%x1f%ae",
+                  rev, "--", "ledger/"], top, check=False, timeout=60)
         if cp.returncode != 0:
             raise TeamError(f"could not read the ledger history: {_tail(cp)}")
-        merges = git(["rev-list", "--merges", "--full-history", rev, "--", "ledger/"], self.repo.toplevel, check=False,
-                     timeout=30).stdout.split()
+        commits: list[tuple[str, str]] = []
+        for rec in cp.stdout_bytes.split(b"\0"):
+            rec = rec.strip(b"\n")
+            if not rec:
+                continue
+            sha, sep, mail = rec.partition(b"\x1f")
+            if not sep or not _SHA_RE.fullmatch(sha):
+                raise TeamError("git log gave a record levain cannot read")
+            commits.append((sha.decode("ascii"), mail.decode("utf-8", "replace")))
+        cp = git(["rev-list", "--merges", "--full-history", rev, "--", "ledger/"], top, check=False, timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not list the ledger's merge commits: {_tail(cp)}")
+        merges = cp.stdout.split()
+
+        changes: list[tuple[str, str, bytes, str, str, str, str]] = []   # sha, mail, path, status, mode, old, new
+        for sha, mail in commits:
+            cp = git(["diff-tree", "-z", "-r", "--raw", "--root", "--no-renames", "--no-commit-id", sha, "--",
+                      "ledger/"], top, check=False, timeout=30)
+            if cp.returncode != 0:
+                raise TeamError(f"could not read commit {sha[:10]}: {_tail(cp)}")
+            parts = cp.stdout_bytes.split(b"\0")
+            i = 0
+            while i + 1 < len(parts) and parts[i].startswith(b":"):
+                meta = parts[i][1:].split(b" ")
+                path = parts[i + 1]
+                i += 2
+                if len(meta) != 5:
+                    raise TeamError(f"git diff-tree gave a record levain cannot read in {sha[:10]}")
+                _old_mode, new_mode, old_blob, new_blob, status = (m.decode("ascii", "replace") for m in meta)
+                changes.append((sha, mail, path, status, new_mode, old_blob, new_blob))
+            if any(parts[i:]) and i < len(parts):
+                raise TeamError(f"git diff-tree gave output levain cannot read in {sha[:10]}")
+
+        blobs = self._blobs({b for c in changes for b in (c[5], c[6]) if set(b) - {"0"}})
         by_safe = {E.safe_handle(h): h for h in (team.members if team else {})}
         files: dict[str, list[str]] = {}
         problems: list[str] = []
+        tamper: list[str] = []
         stranger: dict[tuple[str, str], int] = {}
-        sha = mail = cur = src = ""
-        added: list[str] = []
-        removed: list[str] = []
-
-        def flush() -> None:
+        for sha, mail, path, status, new_mode, old_blob, new_blob in changes:
+            if not _LEDGER_PATH_RE.fullmatch(path) or (status != "D" and new_mode not in ("100644", "100755")):
+                shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
+                tamper.append(f"{shown!r} ({'deleted' if status == 'D' else 'written'} in commit {sha[:10]} by "
+                              f"{E._printable(' ⏎ '.join(mail.splitlines()))}) is not a file levain writes")
+                continue
+            rel = path[len(b"ledger/"):].decode("ascii")
+            old = _blob_lines(blobs.get(old_blob, b"")) if status != "A" else []
+            new = _blob_lines(blobs.get(new_blob, b"")) if status != "D" else []
+            added: list[str] = []
+            removed: list[str] = []
+            for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+                if op in ("delete", "replace"):
+                    removed += old[i1:i2]
+                if op in ("insert", "replace"):
+                    added += new[j1:j2]
             gone = [r for r in removed if r.strip() and r not in added]
-            where = cur or src
-            if where and gone:
-                problems.append(f"ledger/{where}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
+            if gone:
+                problems.append(f"ledger/{rel}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
                                 f"{mail}; the ledger is append-only, so the original lines still count")
-            added.clear()
-            removed.clear()
-
-        def take(text: str) -> None:
-            added.append(text)
-            if not text.strip():
-                return
-            top = cur.split("/", 1)[0]
-            expected = (team.owner if top.startswith("pack-") else by_safe.get(top)) if team else None
+            owner_dir = rel.split("/", 1)[0]
+            expected = (team.owner if owner_dir.startswith("pack-") else by_safe.get(owner_dir)) if team else None
             who = team.handle_for_email(mail) if team else None
-            if team is not None and (expected is None or who != expected):
-                stranger[(cur, mail)] = stranger.get((cur, mail), 0) + 1
-                return
-            files.setdefault(cur, []).append(text)
-
-        def ledger_rel(path: str, prefix: str) -> str:
-            p = path[len(prefix):] if path.startswith(prefix) else ""
-            return p if p.endswith(".jsonl") else ""
-
-        lines = cp.stdout.split("\n")
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            i += 1
-            if line.startswith("\x00C\t"):
-                flush()
-                _, sha, mail = line.split("\t", 2)
-                cur = src = ""
-            elif line.startswith("--- "):
-                flush()
-                src = ledger_rel(line[4:], "a/ledger/")
-                cur = ""
-            elif line.startswith("+++ "):
-                cur = ledger_rel(line[4:], "b/ledger/")
-            elif line.startswith("@@ "):
-                # Consume exactly the hunk's lines (--unified=0: only removals and additions), so ledger content
-                # can never be read as a diff header however it begins.
-                m = re.match(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
-                n_old = int(m.group(1)) if m and m.group(1) is not None else 1
-                n_new = int(m.group(2)) if m and m.group(2) is not None else 1
-                body = []
-                while i < len(lines) and len(body) < n_old + n_new:
-                    if not lines[i].startswith("\\ "):   # "\ No newline at end of file"
-                        body.append(lines[i])
-                    i += 1
-                for h in body:
-                    if h.startswith("-") and (cur or src):
-                        removed.append(h[1:])
-                    elif h.startswith("+") and cur:
-                        take(h[1:])
-        flush()
+            for text in added:
+                if not text.strip():
+                    continue
+                if team is not None and (expected is None or who != expected):
+                    stranger[(rel, mail)] = stranger.get((rel, mail), 0) + 1
+                    continue
+                files.setdefault(rel, []).append(text)
         for m_sha in merges:
             problems.append(f"merge commit {m_sha[:10]} touches ledger/: levain keeps the ledger linear, so lines "
                             "that exist only in a merge resolution are not read")
         for (rel, m), n in sorted(stranger.items()):
             problems.append(f"ledger/{rel}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
                             f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
-        return files, problems
+        return files, problems, tamper
+
+    def _blobs(self, shas: set[str]) -> dict[str, bytes]:
+        """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing."""
+        if not shas:
+            return {}
+        order = sorted(shas)
+        cp = git(["cat-file", "--batch"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
+                 check=False, timeout=60)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read ledger contents: {_tail(cp)}")
+        out: dict[str, bytes] = {}
+        buf, pos = cp.stdout_bytes, 0
+        for want in order:
+            nl = buf.find(b"\n", pos)
+            head = buf[pos:nl].split(b" ") if nl >= 0 else []
+            if len(head) != 3 or head[0] != want.encode("ascii") or head[1] != b"blob" or not head[2].isdigit():
+                raise TeamError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
+            size = int(head[2])
+            out[want] = buf[nl + 1:nl + 1 + size]
+            pos = nl + 1 + size + 1
+        return out
 
     def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:
         """team.toml and PROJECT.md changes not committed by the owner of the version before them.
@@ -381,25 +442,39 @@ class GitLedger:
         """
         out: list[str] = []
         rev = rev or REF
-        cp = git(["log", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
+        # -z: NUL-separated records, never split on a line separator an author field may hold (L3, RUN)
+        cp = git(["log", "-z", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
                  check=False, timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the team.toml history: {_tail(cp)}")
         prev: R.Team | None = None
-        for row in cp.stdout.splitlines():
-            sha, mail = row.split("\t", 1)
+        for row in cp.stdout.split("\0"):
+            row = row.strip("\n")
+            if not row:
+                continue
+            sha, _, raw_mail = row.partition("\t")
+            mail = E._printable(" ⏎ ".join(raw_mail.splitlines()))   # shown; matching uses raw_mail
             try:
                 cur = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
             except R.RolesError:
                 out.append(f"team.toml at {sha[:10]} (by {mail}) does not parse")
                 continue
             judge = prev or cur
-            if judge.handle_for_email(mail) != judge.owner:
+            if judge.handle_for_email(raw_mail) != judge.owner:
                 out.append(f"team.toml changed in {sha[:10]} by {mail}, who is not the owner ({judge.owner}) "
                            "of the version before it")
             prev = cur
-        cp = git(["log", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
-        for row in cp.stdout.splitlines():
-            sha, mail = row.split("\t", 1)
-            if team.handle_for_email(mail) != team.owner:
+        cp = git(["log", "-z", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False,
+                 timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the {CANON_FILE} history: {_tail(cp)}")
+        for row in cp.stdout.split("\0"):
+            row = row.strip("\n")
+            if not row:
+                continue
+            sha, _, raw_mail = row.partition("\t")
+            mail = E._printable(" ⏎ ".join(raw_mail.splitlines()))
+            if team.handle_for_email(raw_mail) != team.owner:
                 out.append(f"{CANON_FILE} changed in {sha[:10]} by {mail}, who is not the owner ({team.owner})")
         return out
 

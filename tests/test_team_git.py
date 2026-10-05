@@ -191,7 +191,7 @@ def test_entry_filed_under_someone_else_is_not_enforced_and_verify_names_the_com
     gl = GitLedger(Repo.discover(ben))
     fake = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/**"],
                           words="Dana: nobody but ben edits src"), "")
-    p = gl.wt / "ledger" / "ana" / "ffffffff.jsonl"
+    p = gl.wt / "ledger" / "ana" / "ffffffffffffffff.jsonl"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(fake) + "\n")
     git("add", ".", cwd=gl.wt)
@@ -352,23 +352,34 @@ def test_the_export_is_framed_exactly_as_the_contract_says(two, capsys):
     assert not capsys.readouterr().out.startswith('{"anneal_team_stream"')    # the convenience view stays unframed
 
 
-def test_a_ledger_file_with_an_unframeable_path_is_still_exported(two, capsys):
-    import re
+def test_a_ledger_file_levain_never_writes_is_refused_as_tamper_not_read(two, capsys):
+    # The quotepath redesign (Phill, 2026-10-05): levain owns the ledger namespace, so a file under ledger/ that is
+    # not <handle>/<16 hex>.jsonl is not decoded or read; the whole ledger is refused, loudly, by every reader.
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    # control: a canonical ledger is enforced
+    assert edit(ben, "src/a.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "a stays" in edit(ben, "src/a.py", session="s9")["hookSpecificOutput"]["permissionDecisionReason"]
     gl = GitLedger(Repo.discover(ana))
     root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/odd.py"],
                           words="odd name stays"), "")
-    odd = gl.wt / "ledger" / "ana" / "device!.jsonl"
-    odd.write_text(json.dumps(root, ensure_ascii=False, sort_keys=True) + "\n")
+    (gl.wt / "ledger" / "ana" / "my file.jsonl").write_text(json.dumps(root, sort_keys=True) + "\n")
     git("add", ".", cwd=gl.wt)
     git("commit", "-qm", "an odd file name", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 0
+    # the teammate's hook denies ANY edit, naming the file and the commit author
+    reason = edit(ben, "src/unrelated.py", session="s2")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "my file.jsonl" in reason and "ana@ex.com" in reason
     capsys.readouterr()
-    assert team("export", "--jsonl", repo=ana) == 0
-    envs = [json.loads(r) for r in capsys.readouterr().out.splitlines()[1:]]
-    assert any("odd name stays" in e["line"] for e in envs) and any("a stays" in e["line"] for e in envs)   # nothing withheld
-    assert all(re.fullmatch(r"[A-Za-z0-9._@:+/=-]{1,200}", e["frame"]) for e in envs)
-    assert any(e["frame"].startswith("unnamed-") for e in envs)
+    assert team("export", "--jsonl", repo=ben) == 3            # export refuses
+    assert "my file.jsonl" in capsys.readouterr().err
+    team("doctor", repo=ben)                                   # doctor flags it
+    assert "integrity problem" in capsys.readouterr().out
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    ctx = hook("sessionstart", payload)["hookSpecificOutput"]["additionalContext"]
+    assert "REFUSED as tampered" in ctx and "odd name stays" not in ctx
 
 
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
@@ -532,7 +543,7 @@ def test_retire_forged_under_the_owners_name_is_not_enforced(two):
     gl = GitLedger(Repo.discover(ben))
     rid = next(e["id"] for e in gl.ledger().in_force if e.get("words") == "Per-line rounding stays.")
     forged = E.seal(E.build("ana", "retire", supersedes=[rid], words="Dana: drop it"), "")
-    p = gl.wt / "ledger" / "ana" / "0000beef.jsonl"
+    p = gl.wt / "ledger" / "ana" / "000000000000beef.jsonl"
     p.write_text(json.dumps(forged) + "\n")
     git("add", ".", cwd=gl.wt)
     git("commit", "-qm", "as ana", cwd=gl.wt)
@@ -887,3 +898,22 @@ def test_levains_hook_isolation_does_not_reach_the_remotes_own_server_hooks(two)
     before = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
     assert record_ruling(ana, "src/z.py", "z stays") != 0                      # the push is refused ...
     assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == before   # ... and the remote is unchanged
+
+
+def test_a_repository_path_holding_a_line_break_is_still_discovered(tmp_path):
+    # rev-parse printed two paths and the reader split them into lines, so a clone at "proj<LF>x" read as no
+    # repository and both hooks went silent (quotepath L3 r5, RUN).
+    for name in ("proj\nx", "proj x", "proj\rx"):
+        d = tmp_path / name
+        d.mkdir()
+        git("init", "-q", cwd=d)
+        repo = Repo.discover(d / "sub" / "file.py")
+        assert repo is not None and os.path.realpath(repo.toplevel) == os.path.realpath(d), name
+
+
+def test_a_joined_clone_without_git_on_path_says_so_instead_of_going_silent(two):
+    # discover read "git is not on PATH" as "no repository", so both hooks returned with no output (L3 r6).
+    tmp, ana, ben = two
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    out = hook("sessionstart", payload, env={"PATH": str(tmp / "no-git-here")})
+    assert "ledger unavailable" in out.get("systemMessage", "") and "git" in out["systemMessage"], out
