@@ -197,9 +197,9 @@ def test_tampered_line_fails_verify(two):
     line["words"] = "round once"
     f.write_text(json.dumps(line) + "\n")
     git("commit", "-qam", "rewrite", cwd=gl.wt)
-    assert team("verify", repo=ana) == 1   # the rewrite is reported, and the original line still counts
-    assert "Per-line rounding stays." in [e.get("words") for e in gl.ledger().in_force]
-    assert all(e.get("words") != "round once" for e in gl.ledger().in_force)
+    assert team("verify", repo=ana) == 3   # the rewrite of a pinned file refuses the ledger
+    assert any("rewritten or removed" in t for t in gl.ledger().tamper)
+    assert not gl.ledger().in_force
 
 
 # ---- the hook ---------------------------------------------------------------------------------------------
@@ -444,8 +444,8 @@ def test_a_reorder_of_an_append_only_file_is_a_rewrite_problem_and_not_accepted(
     _push_wt(gl, "reorder")
     assert team("sync", repo=ben) == 0
     led = ledger(ben)
-    assert any("removed or rewritten" in p for p in led.problems), led.problems
-    assert len(led.entries) == before
+    assert any("rewritten or removed" in t for t in led.tamper), led.tamper
+    assert before and not led.entries
 
 
 def _plumb(gl, parts, entry):
@@ -492,8 +492,8 @@ def test_a_force_push_that_rewrites_a_pinned_file_is_a_rewrite_problem(two):
     git("fetch", "-q", "origin", "+levain-ledger:refs/remotes/origin/levain-ledger", cwd=gb.wt)
     git("reset", "-q", "--hard", "refs/remotes/origin/levain-ledger", cwd=gb.wt)
     led = ledger(ben)
-    assert any("removed or rewritten" in p for p in led.problems), led.problems
-    assert {e["id"] for e in led.entries} == before   # the lines ben accepted stay, the rewritten tail is not accepted
+    assert before and any("rewritten or removed" in t for t in led.tamper), led.tamper
+    assert not led.entries                           # refused as a whole until the owner restores it or ben repins
 
 
 def _pins_file(repo):
@@ -530,28 +530,19 @@ def test_a_tampered_read_does_not_advance_the_pins(two):
     assert pins.read_bytes() == before
 
 
-def test_a_line_that_does_not_verify_is_not_pinned(two):
-    tmp, ana, ben = two
-    assert record_ruling(ana, "src/a.py", "first") == 0
-    gl = GitLedger(Repo.discover(ana))
-    f = _own_file(gl)
-    good = len(f.read_text().splitlines())
-    with open(f, "a") as fh:
-        fh.write("this line is not a ledger entry\n")
-    _push_wt(gl, "a bad line")
-    assert team("sync", repo=ben) == 0
-    ledger(ben)
-    assert len(json.loads(_pins_file(ben).read_text())[f"ana/{f.name}"]) == good
 
 
-def test_a_corrupt_pins_file_is_reported_not_silently_rebuilt(two):
+def test_a_corrupt_pins_file_refuses_until_repin(two):
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     ledger(ben)
-    _pins_file(ben).write_text("{not json")
-    assert any("pins are unreadable" in p for p in ledger(ben).problems)
-    assert not any("pins are unreadable" in p for p in ledger(ben).problems)   # restarted from that read
+    for bad in ("{not json", "[]", json.dumps({"ana/x.jsonl": {"sha256": "zz", "length": 1}}),
+                json.dumps({"ana/x.jsonl": {"sha256": "0" * 64, "length": -1}})):
+        _pins_file(ben).write_text(bad)
+        assert any("pins.json" in t and "repin" in t for t in ledger(ben).tamper), bad
+    assert team("repin", repo=ben) == 0
+    assert not ledger(ben).tamper and _pins_file(ben).exists()      # a missing file is the start; the read re-pins
 
 
 def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
@@ -564,6 +555,7 @@ def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
     assert team("repin", "--file", key, repo=ben) == 0
     assert "dropped 1 pin" in capsys.readouterr().out
     assert key not in json.loads(_pins_file(ben).read_text())
+    assert not ledger(ben).tamper
     ledger(ben)                                                      # the next read trusts what it sees and pins again
     assert key in json.loads(_pins_file(ben).read_text())
     assert team("repin", repo=ben) == 0
@@ -584,20 +576,6 @@ def test_session_start_on_a_tampered_ledger_emits_only_the_refusal(two):
     assert "a stays visible" not in ctx and "ruling(s)" not in ctx
 
 
-def test_an_older_shorter_pin_never_shrinks_a_longer_stored_one(two):
-    tmp, ana, ben = two
-    assert record_ruling(ana, "src/a.py", "first") == 0
-    assert record_ruling(ana, "src/b.py", "second") == 0
-    assert team("sync", repo=ben) == 0
-    ledger(ben)
-    gb = GitLedger(Repo.discover(ben))
-    stored = json.loads(_pins_file(ben).read_text())
-    key = next(k for k in stored if k.startswith("ana/"))
-    assert len(stored[key]) >= 2
-    gb._save_pins({key: stored[key][:1]})                            # a reader that saw an older tip
-    assert json.loads(_pins_file(ben).read_text())[key] == stored[key]
-    gb._save_pins({key: ["a different first line"]})                 # a conflict: the stored pin is kept
-    assert json.loads(_pins_file(ben).read_text())[key] == stored[key]
 
 
 def test_two_tree_entries_with_one_path_are_tamper(two):
@@ -943,7 +921,8 @@ def test_deleting_a_members_file_does_not_silence_their_rulings(two):
     assert team("sync", repo=ana) == 0
     for r in (ana, ben):
         assert edit(r, "src/billing.py", session="del")["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert team("verify", repo=ana) == 1
+    assert any("rewritten or removed" in t for t in ledger(ben).tamper)     # a removed pinned file refuses
+    assert team("verify", repo=ana) == 3
 
 
 def test_one_stranger_line_does_not_silence_a_members_file(two):

@@ -67,7 +67,8 @@ _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
-_PINS_UNREADABLE = "this clone's ledger pins are unreadable; rewrite protection restarts from this read"
+_PINS_UNREADABLE = ("pins.json (this clone's local rewrite-protection record) cannot be read or validated; run "
+                    "`levain team repin` to start it again")
 _NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so it is a reported problem, never an entry
 _REGULAR_MODES = (b"100644", b"100755")
 
@@ -356,7 +357,7 @@ class GitLedger:
             pin_state = f"{st.st_mtime_ns}:{st.st_size}"
         except OSError:
             pin_state = "none"
-        key = f"parser-v8|{head}|{pin_state}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v9|{head}|{pin_state}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -442,58 +443,41 @@ class GitLedger:
         blobs = self._blobs({sha for _p, sha in leaves if set(sha) - {"0"}})
         by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
         pins, pin_problem = self._pins()
-        new_pins = dict(pins)
+        datas = {path[len(b"ledger/"):].decode("ascii"): blobs.get(sha, b"") for path, sha in leaves}
+        tamper += [pin_problem] if pin_problem else self._pin_violations(pins, datas)
         files: dict[str, list[str]] = {}
-        problems: list[str] = [pin_problem] if pin_problem else []
+        problems: list[str] = []
+        clean = True                                     # pins advance only on a fully clean read
         seen_ids: dict[str, str] = {}
-        for path, sha in sorted(leaves):
-            rel = path[len(b"ledger/"):].decode("ascii")
+        for rel, data in sorted(datas.items()):
             folder = rel.split("/", 1)[0]
             if team is not None and folder not in by_safe and not folder.startswith("pack-"):
                 problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
+                clean = False
                 continue
-            raw_lines = _blob_lines(blobs.get(sha, b""))
-            lines = [_text(l) for l in raw_lines]
-            raw = [l.decode("latin-1") for l in raw_lines]               # pins compare RAW bytes, not decoded text
+            lines = [_text(l) for l in _blob_lines(data)]
             got, probs, _last = E.verify_lines(lines)
+            if probs or any(E.safe_handle(e.get("author", "")) != folder for e in got):
+                clean = False
             for e in got:
                 other = seen_ids.setdefault(str(e.get("id")), rel)
                 if other != rel:
                     tamper.append(f"ledger/{rel} and ledger/{other} both hold entry id {e.get('id')}; levain never "
                                   "writes an id twice (the owner removes the copy)")
-            pin = pins.get(rel)
-            if pin and raw[:len(pin)] != pin:
-                problems.append(f"ledger/{rel}: lines this clone had accepted were removed or rewritten; the ledger "
-                                "is append-only, so the lines already accepted still count and the rest of the "
-                                "file is not accepted")
-                files[rel] = [_text(p_.encode("latin-1")) for p_ in pin]
-                continue
             files[rel] = lines
-            # Pin only what verified: the lines before the first one that did not, and only in a file filed under
-            # the folder its entries' author names.
-            firsts = [re.match(r"line (\d+)", p_) for p_ in probs]
-            if any(m is None for m in firsts):
-                continue
-            good = min((int(m.group(1)) - 1 for m in firsts if m), default=len(lines))
-            if any(E.safe_handle(e.get("author", "")) != folder for e in got):
-                continue
-            if good > len(pin or []):
-                new_pins[rel] = raw[:good]
-        for rel in sorted(set(pins) - {p[len(b"ledger/"):].decode("ascii") for p, _s in leaves}):
-            problems.append(f"ledger/{rel}: a file this clone had accepted is gone; the ledger is append-only, so "
-                            "its accepted lines still count")
-            files[rel] = [_text(p_.encode("latin-1")) for p_ in pins[rel]]
-        if tamper:                                      # a duplicate id: refused, and no entries are cached
+        if tamper:                                       # refused: no entries are returned or cached, no pin moves
             return {}, problems, tamper
-        if new_pins != pins or pin_problem:      # a tampered read never advances the pins
-            self._save_pins(new_pins)
+        if clean:
+            self._advance_pins(datas, pins)
         return files, problems, tamper
 
-    def _pins(self) -> tuple[dict[str, list[str]], str]:
-        """(pins, problem). This clone's record, per ledger file, of the lines it has accepted (trust on first
-        use). Local only: it lives beside state.json and is never in the ledger branch. A MISSING file is the
-        documented start; one that exists but cannot be read is reported, and protection restarts from this read.
-        A clone that first sees an already rewritten file cannot tell."""
+    # ---- rewrite protection: this clone's pins (trust on first use) ---------------------------------------------
+    # A pin is the sha256 and length of the exact bytes of a whole ledger file this clone accepted. It lives beside
+    # state.json, never in the ledger branch. A clone that first sees an already-rewritten file cannot tell.
+
+    def _pins(self) -> tuple[dict[str, dict], str]:
+        """(pins, problem). A MISSING pins.json is the TOFU start; one that exists and cannot be read or validated is
+        a refusal naming the file and `levain team repin`."""
         path = self.base / "pins.json"
         try:
             text = path.read_text(encoding="utf-8")
@@ -503,49 +487,71 @@ class GitLedger:
             return {}, _PINS_UNREADABLE
         try:
             data = json.loads(text)
-            if not isinstance(data, dict) or not all(
-                    isinstance(k, str) and isinstance(v, list) and all(isinstance(x, str) for x in v)
-                    for k, v in data.items()):
-                raise ValueError("wrong shape")
+            ok = isinstance(data, dict) and all(
+                isinstance(k, str) and isinstance(v, dict) and set(v) == {"sha256", "length"}
+                and isinstance(v["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
+                and isinstance(v["length"], int) and not isinstance(v["length"], bool) and v["length"] >= 0
+                for k, v in data.items())
         except ValueError:
-            return {}, _PINS_UNREADABLE
-        return data, ""
+            ok = False
+        return (data, "") if ok else ({}, _PINS_UNREADABLE)
 
-    def _save_pins(self, pins: dict[str, list[str]], *, merge: bool = True) -> None:
-        """Save under a small flock. Lock-free readers each load, compute and save, so a reader at an older tip must
-        not shrink a newer pin: the stored pins are re-read under the lock and merged monotonically per file (the
-        longer pin wins when one extends the other; on a CONFLICT the stored one is kept and the reader reports the
-        rewrite as usual)."""
+    @staticmethod
+    def _pin_violations(pins: dict[str, dict], datas: dict[str, bytes]) -> list[str]:
+        out = []
+        for rel, pin in sorted(pins.items()):
+            data = datas.get(rel)
+            if data is None or len(data) < pin["length"] or \
+                    hashlib.sha256(data[:pin["length"]]).hexdigest() != pin["sha256"]:
+                out.append(f"ledger/{rel} was rewritten or removed since this clone accepted it; the owner restores "
+                           "it, or run `levain team repin` to trust the current ledger")
+        return out
+
+    def _advance_pins(self, datas: dict[str, bytes], seen: dict[str, dict]) -> None:
+        """Set each file's pin to its current whole bytes, under the pins lock. The stored pins are re-read there and
+        THIS read's tip is re-checked against them: if they no longer match, nothing is saved (the next read
+        refuses or advances)."""
+        new = {rel: {"sha256": hashlib.sha256(d).hexdigest(), "length": len(d)} for rel, d in datas.items()}
+        if new == seen:
+            return
         try:
             with self.lock(name="pins.lock", timeout=5.0):
-                if merge:
-                    stored, _bad = self._pins()
-                    merged = dict(stored)
-                    for rel, new in pins.items():
-                        cur = stored.get(rel)
-                        if cur is None or new[:len(cur)] == cur:
-                            merged[rel] = new
-                    pins = merged
-                _atomic_write(self.base / "pins.json", json.dumps(pins))
+                stored, bad = self._pins()
+                if bad or self._pin_violations(stored, datas):
+                    return
+                self.base.mkdir(parents=True, exist_ok=True)
+                _atomic_write(self.base / "pins.json", json.dumps(new))
         except (OSError, TeamError):
             pass
 
     def repin(self, rel: str | None = None) -> list[str]:
-        """Drop this clone's pins (all, or one file) and return what was dropped. Local only: rewrite protection for
-        those files restarts at the next read."""
-        pins, bad = self._pins()
+        """Drop this clone's pins (all, or one file) under the pins lock and return what was dropped; rewrite
+        protection for those files restarts at the next read. A failure to persist is an error."""
         path = self.base / "pins.json"
-        if rel is None:
-            dropped = sorted(pins) or (["(an unreadable pins file)"] if bad else [])
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-            return dropped
-        rel = rel[len("ledger/"):] if rel.startswith("ledger/") else rel
-        if rel not in pins:
-            return []
-        del pins[rel]
-        self._save_pins(pins, merge=False)
-        return [rel]
+        self.base.mkdir(parents=True, exist_ok=True)
+        with self.lock(name="pins.lock", timeout=10.0):
+            pins, bad = self._pins()
+            if rel is None:
+                dropped = sorted(pins) or (["pins.json (it was unreadable)"] if bad else [])
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise TeamError(f"could not drop the pins: {exc.strerror}") from None
+                return dropped
+            if bad:
+                raise TeamError("pins.json is unreadable, so one file cannot be picked out of it; "
+                                "run `levain team repin` to drop them all")
+            rel = rel[len("ledger/"):] if rel.startswith("ledger/") else rel
+            if rel not in pins:
+                return []
+            del pins[rel]
+            try:
+                _atomic_write(path, json.dumps(pins))
+            except OSError as exc:
+                raise TeamError(f"could not save the pins: {exc.strerror}") from None
+            return [rel]
 
     def _blobs(self, shas: set[str]) -> dict[str, bytes]:
         """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing.
