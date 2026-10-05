@@ -384,6 +384,28 @@ def test_an_entry_that_cannot_be_judged_makes_the_list_incomplete(pub, monkeypat
     assert R.live_views_scan(budget=5) == ([], True)
 
 
+def test_a_long_project_or_repo_is_published_at_the_shown_length_and_listed(pub):
+    """An entry over MAX_ENTRY_BYTES was published, then skipped by every reader: a live view read as absent."""
+    pub("x" * 5000, repo="/w/" + "r" * 5000)
+    views, truncated = R.live_views_scan(budget=5)
+    assert [len(v["project"]) for v in views] == [120] and truncated is False
+
+
+def test_a_dropped_registration_is_still_closed_in_a_forked_child(pub):
+    import gc
+    r = R.register("/w", "http://127.0.0.1:43999/", "dropped")   # not through `pub`, which keeps a reference
+    name = r.name
+    del r
+    gc.collect()
+    kept = [x for x in R._LIVE if x.name == name]
+    try:
+        assert kept                                                # the at-fork hook can still find its fds
+    finally:
+        for x in kept:
+            x.unpublish()
+            x.close()
+
+
 def test_a_registry_fault_in_the_handler_is_an_error_not_an_empty_list(tmp_path, monkeypatch):
     import levain.team.registry as reg
 

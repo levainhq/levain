@@ -50,7 +50,6 @@ import re
 import secrets
 import stat
 import time
-import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -155,7 +154,7 @@ def _flock_is_real(dir_fd: int) -> bool:
 
 # ---- the publisher ------------------------------------------------------------------------------------------------
 
-_LIVE: "weakref.WeakSet[Registration]" = weakref.WeakSet()
+_LIVE: "set[Registration]" = set()      # strong: a dropped, unclosed Registration still has its fds closed at fork
 
 
 def _forget_in_child() -> None:
@@ -172,7 +171,8 @@ if hasattr(os, "register_at_fork"):
 class Registration:
     """One published entry and the lock fd that makes it live. Owns the fd for the life of the view: keep this
     object referenced (the view hangs it on its server). There is no finalizer: dropping it without ``close`` leaves
-    the fds open, so the entry reads live until ``close`` or process exit.
+    the fds open (the module keeps a strong reference so a fork still closes the child's copies), so the entry reads
+    live until ``close`` or process exit.
     ``unpublish`` removes the entry, ``close`` releases the lock; both are idempotent and neither raises on a
     resource that is already gone."""
 
@@ -197,6 +197,7 @@ class Registration:
         self._drop_fds()
 
     def _drop_fds(self) -> None:
+        _LIVE.discard(self)
         lock_fd, dir_fd = self._lock_fd, self._dir_fd
         self._lock_fd = self._dir_fd = None
         for fd in (lock_fd, dir_fd):
@@ -223,9 +224,11 @@ def register(repo: str, url: str, project: str) -> Registration:
         if not _flock_is_real(dir_fd):
             raise RegistryUnavailable("this filesystem does not support the registry's locks")
         name = f"{PREFIX}{secrets.token_hex(16)}.json"
-        entry = {"v": VERSION, "repo": str(repo), "url": norm, "project": str(project),
-                 "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        entry = {"v": VERSION, "repo": str(repo)[:500], "url": norm, "project": str(project)[:120],
+                 "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}   # the lengths _validated shows
         data = json.dumps(entry, sort_keys=True).encode("utf-8")
+        if len(data) > MAX_ENTRY_BYTES:      # a reader skips an oversized file, so it must never be published
+            raise ValueError(f"registry entry is {len(data)} bytes, over {MAX_ENTRY_BYTES}")
         lock_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600,
                           dir_fd=dir_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -267,7 +270,7 @@ def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, o
     try:
         fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
     except OSError as exc:
-        if strict and exc.errno not in (errno.ENOENT, errno.ELOOP):
+        if strict and exc.errno not in (errno.ENOENT, errno.ELOOP, errno.EMLINK):   # EMLINK: FreeBSD's O_NOFOLLOW
             raise _Unjudged(name) from exc
         return None
     try:
@@ -344,7 +347,7 @@ def _read_live(dir_fd: int, name: str) -> dict | None:
         if len(raw) > MAX_ENTRY_BYTES:
             return None
         return _validated(json.loads(raw.decode("utf-8")))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None                                  # not JSON we wrote
     except OSError as exc:
         raise _Unjudged(name) from exc
