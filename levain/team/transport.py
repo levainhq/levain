@@ -58,7 +58,6 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 # The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_SHA_RE = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 _NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so it is a reported problem, never an entry
@@ -322,21 +321,15 @@ class GitLedger:
         return sha, team, self.ledger(team, sha)
 
     def ledger(self, team: R.Team | None = None, rev: str | None = None) -> I.Ledger:
-        """The ledger as enforced, rebuilt from history: every line ever ADDED under ledger/, in the order it
-        was added, attributed to the author email of the commit that added it.
-
-        Removing or rewriting a line therefore changes nothing (the ledger is append-only by construction;
-        the removal is reported). A line whose adding commit is not by the member it is filed under (the owner,
-        for pack files) is dropped on its own and reported; the rest of that file still counts. Cached per
-        branch tip.
-        """
+        """The ledger as enforced, read from the tip tree of the ledger branch (see ``_history``). Cached per
+        branch tip."""
         head = rev or self.head()
         if team is None:
             try:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v6|{head}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v7|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -357,28 +350,26 @@ class GitLedger:
         return I.build(sorted(files.items()), team.owner if team else None, problems, tamper=tamper)
 
     def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
-        """(files, problems, tamper) from the ledger branch, read through git plumbing only.
+        """(files, problems, tamper) from the TIP TREE of the ledger branch. Nothing here reads history except to
+        name a tamper path's author.
 
-        Levain owns the ledger namespace. Tamper is judged from the TIP TREE alone, in one
-        ``ls-tree -r -t -z`` call that lists trees too: the valid entries are exactly ``ledger`` (a tree),
-        ``ledger/<handle>`` (a tree), ``ledger/<handle>/<16 hex>.jsonl`` (a regular blob), and team.toml and
-        PROJECT.md as regular blobs. Anything else (a symlink, a gitlink, an empty tree at a leaf, a file named
-        ``ledger``) is tamper however it got there, and deleting it clears the refusal. Paths are compared as
-        BYTES and a tamper path is never read.
+        One ``ls-tree -r -t -z`` lists trees too. The valid entries are exactly ``ledger`` (a tree),
+        ``ledger/<handle>`` (a tree) and ``ledger/<handle>/<16 hex>.jsonl`` (a regular blob); anything else (a
+        symlink, a gitlink, an empty tree at a leaf, a file named ``ledger``) is tamper, however it got there, and
+        deleting it clears the refusal. Paths are compared as BYTES, and a tamper path is never read. Only the
+        canonical blobs are read (``cat-file --batch``, length-framed), each line decoded strictly. A line belongs to
+        the folder it is filed under; an entry whose ``author`` is not that folder is the misfiled problem in
+        ``index.build``. (A commit's email is not identity, so it is not consulted.)
 
-        History only attributes the lines of canonical paths. A ledger file is append-only by contract, so the one
-        valid transition is "the lines accepted so far, then more": any other commit touching the file (a
-        reorder, a removal, a duplicate insert, a rewrite, a deletion, a typechange away from a regular file) is a
-        reported problem and that commit's content for the file is not accepted. No human display format of git is
-        parsed: commits from ``log -z``, paths from ``diff-tree -z`` / ``ls-tree -z``, contents from
-        ``cat-file --batch``.
+        Rewrites are caught by a local pin (see ``_pins``): this clone remembers, per file, the lines it accepted,
+        and a tip file that does not extend them is a rewrite problem whose new content is not accepted.
         """
         top = self.repo.toplevel
-        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger", "team.toml", CANON_FILE], top,
-                 check=False, timeout=30)
+        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger"], top, check=False, timeout=30)
         if cp.returncode != 0:
             raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
+        leaves: list[tuple[bytes, str]] = []
         for rec in cp.stdout_bytes.split(b"\0"):
             if not rec:
                 continue
@@ -388,118 +379,78 @@ class GitLedger:
                 raise TeamError("git ls-tree gave a record levain cannot read")
             mode, kind = fields[0], fields[1]
             is_tree = mode == b"040000" and kind == b"tree"
-            is_file = mode in _REGULAR_MODES and kind == b"blob"
-            if path in (b"team.toml", CANON_FILE.encode("ascii")):
-                ok = is_file
-            elif path == b"ledger":
+            if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
                 ok = is_tree
-            elif _LEDGER_DIR_RE.fullmatch(path):
-                ok = is_tree
+            elif mode in _REGULAR_MODES and kind == b"blob" and _LEDGER_PATH_RE.fullmatch(path):
+                ok = True
+                leaves.append((path, fields[2].decode("ascii", "replace")))
             else:
-                ok = is_file and bool(_LEDGER_PATH_RE.fullmatch(path))
+                ok = False
             if not ok:
                 bad_paths.append(path)
 
-        cp = git(["log", "-z", "--reverse", "--topo-order", "--full-history", "--no-merges", "--no-show-signature",
-                  "--format=%H%x1f%ae", rev, "--", "ledger/"], top, check=False, timeout=60)
-        if cp.returncode != 0:
-            raise TeamError(f"could not read the ledger history: {_tail(cp)}")
-        commits: list[tuple[str, str]] = []
-        for rec in cp.stdout_bytes.split(b"\0"):
-            rec = rec.strip(b"\n")
-            if not rec:
-                continue
-            sha, sep, mail = rec.partition(b"\x1f")
-            if not sep or not _SHA_RE.fullmatch(sha):
-                raise TeamError("git log gave a record levain cannot read")
-            commits.append((sha.decode("ascii"), mail.decode("utf-8", "replace")))
-        cp = git(["rev-list", "--merges", "--full-history", rev, "--", "ledger/"], top, check=False, timeout=30)
-        if cp.returncode != 0:
-            raise TeamError(f"could not list the ledger's merge commits: {_tail(cp)}")
-        merges = cp.stdout.split()
-
-        changes: list[tuple[str, str, bytes, str, bytes, str]] = []       # sha, mail, path, status, new mode, new blob
-        last_by: dict[bytes, str] = {}                                    # latest writer of a path, for tamper naming
-        for sha, mail, merge in [(s_, m_, False) for s_, m_ in commits] + [(m, "", True) for m in merges]:
-            args = ["diff-tree", "-z", "-r", "--raw", "--root", "--no-renames", "--no-commit-id"]
-            cp = git(args + (["-m"] if merge else []) + [sha, "--", "ledger/"], top, check=False, timeout=30)
-            if cp.returncode != 0:
-                raise TeamError(f"could not read commit {sha[:10]}: {_tail(cp)}")
-            if merge:
-                mail = git(["log", "-1", "--no-show-signature", "--format=%ae", sha], top, timeout=30).stdout.strip()
-            parts = cp.stdout_bytes.split(b"\0")
-            i = 0
-            while i + 1 < len(parts) and parts[i].startswith(b":"):
-                meta = parts[i][1:].split(b" ")
-                path = parts[i + 1]
-                i += 2
-                if len(meta) != 5:
-                    raise TeamError(f"git diff-tree gave a record levain cannot read in {sha[:10]}")
-                if meta[4][:1] != b"D":
-                    # a merge names the merger, not the writer: it only attributes a path no plain commit wrote
-                    if merge:
-                        last_by.setdefault(path, f"{mail} in commit {sha[:10]}")
-                    else:
-                        last_by[path] = f"{mail} in commit {sha[:10]}"
-                if merge or not _LEDGER_PATH_RE.fullmatch(path):
-                    continue
-                changes.append((sha, mail, path, meta[4].decode("ascii", "replace"), meta[1],
-                                meta[3].decode("ascii", "replace")))
-            if any(parts[i:]) and i < len(parts):
-                raise TeamError(f"git diff-tree gave output levain cannot read in {sha[:10]}")
-
         tamper: list[str] = []
-        for path in bad_paths:
-            who = last_by.get(path)
-            if not who and len(tamper) < 20:
+        for n, path in enumerate(bad_paths):
+            who = ""
+            if n < 20:                                                    # best effort: names a commit author only
                 try:
                     who = git(["log", "-1", "--no-show-signature", "--format=%ae in commit %h", rev, "--",
                                ":(literal)" + path.decode("utf-8")], top, check=False, timeout=30).stdout.strip()
                 except UnicodeDecodeError:
-                    who = ""
+                    pass
             who = E._printable(" ⏎ ".join((who or "an author git does not attribute").splitlines()))
             shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
             tamper.append(f"{shown!r} (written by {who}) is not a file levain writes")
 
-        # Only the new content of a regular file at a canonical path is ever read, never a tamper path or a gitlink.
-        blobs = self._blobs({c[5] for c in changes if c[3] != "D" and c[4] in _REGULAR_MODES and set(c[5]) - {"0"}})
-        by_safe = {E.safe_handle(h): h for h in (team.members if team else {})}
+        blobs = self._blobs({sha for _p, sha in leaves if set(sha) - {"0"}})
+        by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
+        pins = self._pins()
+        new_pins = dict(pins)
         files: dict[str, list[str]] = {}
-        accepted: dict[str, list[bytes]] = {}                             # per file: the lines accepted so far
         problems: list[str] = []
-        stranger: dict[tuple[str, str], int] = {}
-        for sha, mail, path, status, new_mode, new_blob in changes:
+        for path, sha in sorted(leaves):
             rel = path[len(b"ledger/"):].decode("ascii")
-            have = accepted.get(rel, [])
-            if status == "D" or new_mode not in _REGULAR_MODES:
-                if have:
-                    problems.append(f"ledger/{rel}: removed or replaced by a non-file in commit {sha[:10]} by {mail}; "
-                                    "the ledger is append-only, so the original lines still count")
+            folder = rel.split("/", 1)[0]
+            if team is not None and folder not in by_safe and not folder.startswith("pack-"):
+                problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
                 continue
-            new = _blob_lines(blobs.get(new_blob, b""))
-            if new[:len(have)] != have:
-                problems.append(f"ledger/{rel}: lines removed or rewritten in commit {sha[:10]} by {mail}; the "
-                                "ledger is append-only, so that commit's content for the file is not accepted")
+            lines = [_text(l) for l in _blob_lines(blobs.get(sha, b""))]
+            pin = pins.get(rel)
+            if pin and lines[:len(pin)] != pin:
+                problems.append(f"ledger/{rel}: lines this clone had accepted were removed or rewritten; the ledger "
+                                "is append-only, so the lines already accepted still count and the rest of the "
+                                "file is not accepted")
+                files[rel] = list(pin)
                 continue
-            added = new[len(have):]
-            accepted[rel] = new
-            owner_dir = rel.split("/", 1)[0]
-            expected = (team.owner if owner_dir.startswith("pack-") else by_safe.get(owner_dir)) if team else None
-            who = team.handle_for_email(mail) if team else None
-            for raw in added:
-                if not raw.strip():
-                    continue
-                if team is not None and (expected is None or who != expected):
-                    stranger[(rel, mail)] = stranger.get((rel, mail), 0) + 1
-                    continue
-                files.setdefault(rel, []).append(_text(raw))
-        for m_sha in merges:
-            problems.append(f"merge commit {m_sha[:10]} touches ledger/: levain keeps the ledger linear, so lines "
-                            "that exist only in a merge resolution are not read")
-        for (rel, m), n in sorted(stranger.items()):
-            problems.append(f"ledger/{rel}: {n} line(s) added by {m} ({team.handle_for_email(m) or 'not a member'}), "
-                            f"who is not {rel.split('/', 1)[0]}; those lines are not enforced")
+            files[rel] = lines
+            new_pins[rel] = lines
+        for rel in sorted(set(pins) - {p[len(b"ledger/"):].decode("ascii") for p, _s in leaves}):
+            problems.append(f"ledger/{rel}: a file this clone had accepted is gone; the ledger is append-only, so "
+                            "its accepted lines still count")
+            files[rel] = list(pins[rel])
+        if new_pins != pins:
+            self._save_pins(new_pins)
         return files, problems, tamper
+
+    def _pins(self) -> dict[str, list[str]]:
+        """This clone's record, per ledger file, of the lines it has accepted (trust on first use). Local only:
+        it lives beside state.json and is never in the ledger branch. A clone that first sees an already rewritten
+        file cannot tell."""
+        try:
+            data = json.loads((self.base / "pins.json").read_text(encoding="utf-8"))
+            return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, list)
+                    and all(isinstance(x, str) for x in v)}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def _save_pins(self, pins: dict[str, list[str]]) -> None:
+        try:
+            self.base.mkdir(parents=True, exist_ok=True)
+            tmp = self.base / f"pins.tmp{os.getpid()}"
+            tmp.write_text(json.dumps(pins), encoding="utf-8")
+            os.replace(tmp, self.base / "pins.json")
+        except OSError:
+            pass
 
     def _blobs(self, shas: set[str]) -> dict[str, bytes]:
         """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing.
@@ -951,28 +902,11 @@ class GitLedger:
         state = ["v1", ids, R.dump_team(team), sorted(ledger.problems)]
         return hashlib.sha256(json.dumps(state).encode("utf-8")).hexdigest()[:16]
 
-    def _safe_write(self, path: Path, text: str) -> None:
-        """Write a worktree file without following a link: a symlink at the target is refused (lstat) and the open
-        itself carries O_NOFOLLOW."""
-        try:
-            if stat.S_ISLNK(os.lstat(path).st_mode):
-                raise TeamError(f"{path.name} in the ledger worktree is a symlink; refusing to write through it")
-        except FileNotFoundError:
-            pass
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o666)
-        except OSError as exc:
-            raise TeamError(f"could not write {path.name} in the ledger worktree: {exc.strerror}") from None
-        try:
-            _write_all(fd, text.encode("utf-8"))
-        finally:
-            os.close(fd)
-
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
-            self._safe_write(self.wt / name, text)
+            (self.wt / name).write_text(text, encoding="utf-8")
             git(["add", "--", name], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return f"{name} unchanged"
@@ -993,7 +927,7 @@ class GitLedger:
             team = R.parse_team((self.wt / "team.toml").read_text(encoding="utf-8"), "team.toml")
             change(team)
             R.validate_team(team)
-            self._safe_write(self.wt / "team.toml", R.dump_team(team))
+            (self.wt / "team.toml").write_text(R.dump_team(team), encoding="utf-8")
             git(["add", "--", "team.toml"], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return "team.toml unchanged"

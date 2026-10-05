@@ -186,19 +186,6 @@ def test_hand_forged_retire_is_ignored_and_reported(two):
     assert team("verify", repo=ben) == 1
 
 
-def test_entry_filed_under_someone_else_is_not_enforced_and_verify_names_the_committer(two, capsys):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ben))
-    fake = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/**"],
-                          words="Dana: nobody but ben edits src"), "")
-    p = gl.wt / "ledger" / "ana" / "ffffffffffffffff.jsonl"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(fake) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "impersonate", cwd=gl.wt)
-    assert team("verify", repo=ben) == 1
-    out = capsys.readouterr().out
-    assert "added by ben@ex.com (ben), who is not ana" in out
 
 
 def test_tampered_line_fails_verify(two):
@@ -448,7 +435,7 @@ def test_a_reorder_of_an_append_only_file_is_a_rewrite_problem_and_not_accepted(
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert record_ruling(ana, "src/b.py", "second") == 0
     assert team("sync", repo=ben) == 0
-    before = len(ledger(ben).entries)
+    before = len(ledger(ben).entries)                # ben reads, and so pins, ana's file
     gl = GitLedger(Repo.discover(ana))
     f = _own_file(gl)
     lines = f.read_text().splitlines()
@@ -457,7 +444,7 @@ def test_a_reorder_of_an_append_only_file_is_a_rewrite_problem_and_not_accepted(
     _push_wt(gl, "reorder")
     assert team("sync", repo=ben) == 0
     led = ledger(ben)
-    assert any("append-only" in p and "not accepted" in p for p in led.problems), led.problems
+    assert any("removed or rewritten" in p for p in led.problems), led.problems
     assert len(led.entries) == before
 
 
@@ -483,6 +470,32 @@ def _plumb(gl, parts, entry):
     git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
 
 
+def test_a_force_push_that_rewrites_a_pinned_file_is_a_rewrite_problem(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    before = {e["id"] for e in ledger(ben).entries}  # ben reads, and so pins, ana's file
+    gl = GitLedger(Repo.discover(ana))
+    git("reset", "-q", "--hard", "HEAD~1", cwd=gl.wt)
+    f = _own_file(gl)
+    root = json.loads(f.read_text().splitlines()[-1])
+    forged = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/z.py"],
+                            words="forged"), root["hash"])
+    with open(f, "a") as fh:
+        fh.write(json.dumps(forged, sort_keys=True) + "\n")
+    git("commit", "-qam", "rewritten history", cwd=gl.wt)
+    git("push", "-qf", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    # `levain team sync` cannot replay ben's old tip onto a force-pushed remote (it errors and keeps the old tip), so
+    # the clone is moved onto the rewritten tip the way an operator would: fetch, then reset the ledger worktree.
+    gb = GitLedger(Repo.discover(ben))
+    git("fetch", "-q", "origin", "+levain-ledger:refs/remotes/origin/levain-ledger", cwd=gb.wt)
+    git("reset", "-q", "--hard", "refs/remotes/origin/levain-ledger", cwd=gb.wt)
+    led = ledger(ben)
+    assert any("removed or rewritten" in p for p in led.problems), led.problems
+    assert {e["id"] for e in led.entries} == before   # the lines ben accepted stay, the rewritten tail is not accepted
+
+
 def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
@@ -493,24 +506,6 @@ def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
     assert any("0123456789abcdef.jsonl" in t for t in ledger(ben).tamper)
 
 
-def test_regular_to_symlink_to_regular_with_a_dropped_line_is_a_problem(two):
-    tmp, ana, ben = two
-    assert record_ruling(ana, "src/a.py", "first") == 0
-    assert record_ruling(ana, "src/b.py", "second") == 0
-    gl = GitLedger(Repo.discover(ana))
-    f = _own_file(gl)
-    full = f.read_text()
-    kept = full.splitlines()[0] + "\n"
-    f.unlink()
-    f.symlink_to(tmp)
-    _push_wt(gl, "symlink")
-    f.unlink()
-    f.write_text(kept)
-    _push_wt(gl, "regular again, a line dropped")
-    assert team("sync", repo=ben) == 0
-    led = ledger(ben)
-    assert sum("append-only" in p for p in led.problems) >= 2, led.problems
-    assert not led.tamper
 
 
 def test_consolidate_on_a_tampered_ledger_refuses_and_commits_nothing(two, capsys):
@@ -716,22 +711,6 @@ def test_a_directory_path_governs_its_tree_and_paths_are_cwd_relative(two, monke
     assert "Decimal only" in edit(ana, "src/billing.py")["hookSpecificOutput"]["additionalContext"]
 
 
-def test_retire_forged_under_the_owners_name_is_not_enforced(two):
-    """ben writes a retire that claims to be ana's (the owner) into ana's folder and commits it as himself."""
-    tmp, ana, ben = two
-    assert record_ruling(ana) == 0
-    assert team("sync", repo=ben) == 0
-    gl = GitLedger(Repo.discover(ben))
-    rid = next(e["id"] for e in gl.ledger().in_force if e.get("words") == "Per-line rounding stays.")
-    forged = E.seal(E.build("ana", "retire", supersedes=[rid], words="Dana: drop it"), "")
-    p = gl.wt / "ledger" / "ana" / "000000000000beef.jsonl"
-    p.write_text(json.dumps(forged) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "as ana", cwd=gl.wt)
-    led = gl.ledger()
-    assert rid in {e["id"] for e in led.in_force}
-    assert any("added by ben@ex.com" in p for p in led.problems)
-    assert edit(ben, "src/billing.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 # ---- regressions from L3 round 1 ---------------------------------------------------------------------------
@@ -748,6 +727,7 @@ def test_deleting_a_members_file_does_not_silence_their_rulings(two):
     tmp, ana, ben = two
     assert record_ruling(ana) == 0
     assert team("sync", repo=ben) == 0
+    assert ledger(ben).in_force                      # ben has read (and so pinned) ana's file before it is dropped
     gl = GitLedger(Repo.discover(ben))
     for f in (gl.wt / "ledger" / "ana").glob("*.jsonl"):
         f.unlink()
@@ -838,19 +818,6 @@ def test_owner_config_conflict_discards_only_config_commits_and_keeps_entries(tw
     assert "x stays" in [e.get("words") for e in led.in_force]
 
 
-def test_a_merge_commit_in_the_ledger_is_reported(two):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ana))
-    git("checkout", "-q", "-b", "side", cwd=gl.wt)
-    (gl.wt / "ledger" / "x.txt").write_text("x")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "side", cwd=gl.wt)
-    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
-    (gl.wt / "ledger" / "y.txt").write_text("y")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "main", cwd=gl.wt)
-    git("merge", "-q", "--no-edit", "side", cwd=gl.wt)
-    assert any("merge commit" in p for p in gl.ledger().problems)
 
 
 def test_join_new_device_in_a_copied_clone_never_touches_the_original(two):
@@ -910,20 +877,6 @@ def test_an_interrupted_replay_is_rolled_back_without_loss(two):
     assert "k stays" in words and "l stays" in words
 
 
-def test_a_merge_resolved_to_its_first_parent_cannot_hide_side_lines(two):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ana))
-    git("checkout", "-q", "-b", "side", cwd=gl.wt)
-    e = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/s.py"], words="s stays"), "")
-    gl.file_for("ana").parent.mkdir(parents=True, exist_ok=True)
-    gl.file_for("ana").write_text(json.dumps(e) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "side entry", cwd=gl.wt)
-    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
-    git("merge", "-q", "-s", "ours", "--no-edit", "side", cwd=gl.wt)     # TREESAME to the first parent
-    led = gl.ledger()
-    assert "s stays" in [e.get("words") for e in led.in_force]
-    assert any("merge commit" in p for p in led.problems)
 
 
 # ---- 0.6.1 replay hardening ------------------------------------------------------------------------------------
