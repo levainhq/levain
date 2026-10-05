@@ -931,4 +931,40 @@ def test_diff_path_undoes_gits_quoting_and_leaves_what_it_cannot_read_unmatched(
     assert _diff_path("b/ledger/ana/my file.jsonl\t") == "b/ledger/ana/my file.jsonl"
     assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/q"u\\o\tté.jsonl'
     assert _diff_path('"b/ledger/ana/\\q.jsonl"') == '"b/ledger/ana/\\q.jsonl"'          # unknown escape: left quoted
-    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == '"b/ledger/ana/\\377.jsonl"'      # not UTF-8: left quoted
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\u00ff.jsonl"        # not UTF-8: one char per byte
+    assert _diff_path('"b/ledger/ana/my \\"f.jsonl"\t') == 'b/ledger/ana/my "f.jsonl'     # a space makes git add the tab to a quoted name too
+
+
+def test_a_non_utf8_ledger_file_name_or_content_cannot_crash_or_blind_the_read(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/bad.py"], words="bad name"), "")
+    # APFS refuses a non-UTF-8 file name, so both files go in through git plumbing, as a hostile member's push would
+    for name, data in ((b"ledger/ana/\xff.jsonl", json.dumps(root, sort_keys=True).encode() + b"\n"),   # a name that is not UTF-8
+                       (b"ledger/ana/junk.jsonl", b"\xff\xfe not json\n")):                            # content that is not UTF-8
+        sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=gl.wt, input=data, check=True,
+                             capture_output=True).stdout.decode().strip()
+        subprocess.run(["git", "update-index", "--add", "--cacheinfo", b"100644," + sha.encode() + b"," + name],
+                       cwd=gl.wt, check=True, capture_output=True)
+    git("commit", "-qm", "non-utf8", cwd=gl.wt)
+    assert "bad name" in [e["words"] for e in ledger(ana).in_force]
+    capsys.readouterr()
+    assert team("export", "--jsonl", repo=ana) == 0
+    assert "bad name" in capsys.readouterr().out
+
+
+def test_a_cache_written_by_the_old_parser_is_not_trusted(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    planted = _plant_named_ledger_files(ana, ["my file.jsonl"])
+    gl = GitLedger(Repo.discover(ana))
+    ledger(ana)
+    cache = gl.base / "history.json"
+    c = json.loads(cache.read_text())
+    assert c["key"].startswith("parser-v4|") and any("my file" in r for r, _ in c["files"])
+    # what 0.6.3 would have left behind: the same head, the old key, the odd file missing
+    c["key"] = c["key"].replace("parser-v4|", "parser-v3|", 1)
+    c["files"] = [[r, l] for r, l in c["files"] if "my file" not in r]
+    cache.write_text(json.dumps(c))
+    assert list(planted.values())[0] in [e["words"] for e in ledger(ana).in_force]

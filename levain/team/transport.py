@@ -66,6 +66,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     try:
         cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
+                            errors="replace",   # bytes that are not UTF-8 (a pushed file's content) must not raise
                             timeout=timeout, input=input_text,
                             stdin=None if input_text is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -84,12 +85,15 @@ _C_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, '"': 3
 def _diff_path(raw: str) -> str:
     """A path as it appears after ``--- `` / ``+++ `` in a git diff header, with git's quoting undone.
 
-    git wraps a name holding a quote, backslash or control character in double quotes with C escapes (octal for
-    other bytes), and ends an unquoted name that holds a space with a tab. A name this cannot read is returned
-    as written, which no ledger prefix matches, so it stays unframeable rather than being misread.
+    git wraps a name holding a non-ASCII byte, quote, backslash or control character in double quotes with C
+    escapes (octal for other bytes), and ends any name holding a space, quoted or not, with a tab. A name that is
+    not valid UTF-8 is decoded one byte per character (injective), so it is still read, never dropped. A header
+    this cannot parse is returned as written, which no ledger prefix matches.
     """
+    if raw.endswith("\t"):
+        raw = raw[:-1]
     if not raw.startswith('"'):
-        return raw[:-1] if raw.endswith("\t") else raw
+        return raw
     if not raw.endswith('"') or len(raw) < 2:
         return raw
     body, out, i = raw[1:-1], bytearray(), 0
@@ -109,7 +113,7 @@ def _diff_path(raw: str) -> str:
     try:
         return out.decode("utf-8")
     except UnicodeDecodeError:
-        return raw
+        return out.decode("latin-1")
 
 
 def _tail(cp: subprocess.CompletedProcess) -> str:
@@ -304,7 +308,7 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v3|{head}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v4|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -325,10 +329,11 @@ class GitLedger:
     def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str]]:
         # Every output-shaping option is pinned: diff.noprefix / diff.mnemonicPrefix / color / external diff
         # tools in a user's config would otherwise change the text this parser reads.
-        # core.quotepath=false keeps non-ASCII names literal; names holding a quote, backslash, tab or newline are
-        # still C-quoted by git whatever the setting, and a name holding a space carries a trailing tab: _diff_path
-        # reads all three, so no ledger file name can hide its entries from the parser.
-        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "core.quotepath=false",
+        # core.quotepath=true is pinned (a user's config could turn it off, which makes git print raw non-UTF-8 name
+        # bytes): git then C-quotes every name holding a non-ASCII byte, quote, backslash or control character, and
+        # ends any name holding a space with a tab. _diff_path reads all of that, so no ledger file name can hide
+        # its entries from the parser.
+        cp = git(["-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "core.quotepath=true",
                   "log", "--reverse", "--no-renames",
                   "--full-history", "--topo-order",
                   "--no-color", "--no-ext-diff", "--no-textconv", "--no-show-signature", "--src-prefix=a/", "--dst-prefix=b/",
