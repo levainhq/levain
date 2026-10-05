@@ -217,7 +217,12 @@
     api("POST", "/chat/turn", { session_id: session.id, message: text }).then((r) => {
       if (myRun !== run) return;
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
-      if (r.status !== 202 || !r.json.job_id) { failure("The turn was not accepted: " + why(r)); setComposeEnabled(true); return; }
+      if (r.status !== 202 || !r.json.job_id) {
+        // Only the chat server's own refusal is definite (nothing started); anything else may have started the turn.
+        if (definiteRefusal(r)) { failure("The turn was not accepted: " + why(r)); setComposeEnabled(true); return; }
+        failure("The turn was not confirmed: " + why(r));
+        ambiguousStop(myRun, "turn"); return;
+      }
       followJob(r.json.job_id, myRun);
     });
   }
@@ -231,7 +236,7 @@
       live.textContent = "";
       const res = j.result;
       // "lost" (contact lost) and "unknown" (the server no longer holds the job) say nothing about what ran.
-      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the turn."); resync(myRun, "turn"); return; }
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the turn."); ambiguousStop(myRun, "turn"); return; }
       if (j.status !== "done" || !res) {   // failed: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
@@ -278,17 +283,36 @@
     }
     return out;
   }
-  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that, after
-  // a decision was not accepted or contact with a job was lost. It never follows a job and never reports an
-  // outcome it did not see: a GATED session comes back with its CURRENT decision id and held set and gets a fresh
-  // box (the id only ever comes from the server's answer); after an AMBIGUOUS loss (the page cannot tell whether
-  // its decision or turn ran) anything else is reported as unknown with compose blocked; after a definite refusal
-  // an idle session is ready again. Reads only: it never POSTs.
-  function unknownOutcome(what) {
-    return "The outcome of the last " + what + " is unknown; check the session's activity before retrying.";
+  // Whether a refused POST is the chat server's own refusal, so nothing started: a 4xx or 503 carrying its JSON
+  // error code. Anything else (no response, another 5xx, a proxy's bare status, a 202 without a job) is ambiguous.
+  function definiteRefusal(r) {
+    return ((r.status >= 400 && r.status < 500) || r.status === 503) &&
+      !!(r.json && typeof r.json.error === "string" && r.json.error);
   }
-  // `ambiguous` is false after a definite refusal, else "turn" or "decision": what may have run unseen.
-  function resync(myRun, ambiguous) {
+  // AMBIGUOUS OUTCOME: the page cannot tell whether its last turn or decision ran. It NEVER builds a consent box on
+  // its own here: it says the outcome is unknown, blocks compose, and offers one button. Only a trusted click on it
+  // reads the session again, and whatever that read shows carries this warning.
+  function ambiguousStop(myRun, what) {
+    const warning = "The outcome of the last " + what + " is unknown; the previous request may already have run.";
+    failure(warning);
+    setComposeEnabled(false);
+    rereadButton(myRun, warning);
+  }
+  function rereadButton(myRun, warning) {
+    const row = el("div", "chat-row");
+    const btn = el("button", "chat-btn", "Re-read the session"); btn.type = "button";
+    btn.addEventListener("click", (ev) => {
+      if (!ev.isTrusted || myRun !== run || !session) return;
+      row.remove();
+      resync(myRun, warning);
+    });
+    row.appendChild(btn); log.appendChild(row);
+  }
+  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that. Called
+  // after a DEFINITE refusal (nothing ran; `warning` null) or from the re-read button after an ambiguous one
+  // (`warning` set, and attached to whatever is shown). A gated session comes back with its held set and, while it
+  // is still approvable, its CURRENT decision id (the id only ever comes from the server's answer). Reads only.
+  function resync(myRun, warning) {
     if (!session) return;
     live.textContent = "reading the session…";
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
@@ -297,28 +321,34 @@
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
       const s = r.json || {};
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
-        showConsent(s.pending, s.decision_id, myRun); return;
+        showConsent(s.pending, s.decision_id, myRun, warning); return;
       }
-      if (ambiguous) { failure(unknownOutcome(ambiguous)); endOfTurn(true); return; }
-      if (r.status === 200 && s.state === "idle") { endOfTurn(false); return; }
+      if (r.status === 200 && s.state === "idle") {
+        if (warning) failure("The session is idle now. " + warning);
+        endOfTurn(false); return;
+      }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
       endOfTurn(true);
+      if (warning) rereadButton(myRun, warning);
     });
   }
-  function showConsent(pending, decisionId, myRun) {
+  function showConsent(pending, decisionId, myRun, warning) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
+    if (warning) box.appendChild(el("div", "chat-reason", "⚠ " + warning));
     // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
     // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
     const decidable = typeof decisionId === "string" && decisionId !== "" && pending.every((p) => shownInFull(p.full));
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
-      // The whole action, never the bounded one-line detail: approving runs all of it.
-      const whole = (typeof p.full === "string" && p.full) ? p.full : p.detail;
-      if (whole) item.appendChild(el("pre", "chat-detail", visible(whole, whole === p.full)));
+      // The held call's arguments exactly as stored: approving runs what was built from them, and the approval
+      // binds to them. The one-line detail is a convenience parsed from the same bytes, shown beside them only.
+      if (p.detail) item.appendChild(el("div", "chat-reason", "in short: " + visible(p.detail)));
+      if (shownInFull(p.full)) item.appendChild(el("pre", "chat-detail", visible(p.full, true)));
+      else item.appendChild(el("div", "chat-reason", "The held call could not be read; it can only be rejected."));
       if (p.reason) item.appendChild(el("div", "chat-reason", visible(p.reason)));
       if (p.recognized === false) item.appendChild(el("div", "chat-reason", "This action was not recognised by the entity's policy."));
       box.appendChild(item);
@@ -342,7 +372,7 @@
     function decided(j) {
       deciding = false; box.remove();
       const res = j.result;
-      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the decision."); resync(myRun, "decision"); return; }
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the decision."); ambiguousStop(myRun, "decision"); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -360,8 +390,8 @@
         // The server holds something other than what this box shows: the box is withdrawn, never re-armed, and
         // a fresh one is built from what the server holds now.
         deciding = false; box.remove();
-        failure("The held action changed since it was shown; nothing was decided; re-reading the session.");
-        resync(myRun, false); return;
+        failure("The held action changed since it was shown, or could not be read; nothing ran; re-reading the session.");
+        resync(myRun, null); return;
       }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If
@@ -370,10 +400,9 @@
         // carries its JSON error code) is definite: nothing ran. Anything else (no response, another 5xx, a
         // proxy's bare status, a 202 without a job) may have started the decision.
         deciding = false; box.remove();
-        const definite = ((r.status >= 400 && r.status < 500) || r.status === 503) &&
-          !!(r.json && typeof r.json.error === "string" && r.json.error);
         failure("The decision was not accepted: " + why(r));
-        resync(myRun, definite ? false : "decision"); return;
+        if (definiteRefusal(r)) resync(myRun, null); else ambiguousStop(myRun, "decision");
+        return;
       }
       live.textContent = "working…";
       poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });

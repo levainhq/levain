@@ -264,9 +264,10 @@ class PendingEfferent:
     detail: str
     reason: str
     recognized: bool = True
-    # The action's whole text when ``detail`` is a bounded one-line rendering of it. An approval runs the
-    # whole text, so every surface that asks for one must be able to show it: a tail cut at the display
-    # limit, or a newline flattened into a space, is exactly where a command can hide what it does.
+    # The held tool call's arguments as the runtime stored them (the action is built from them), less only the
+    # model's narration of itself (its own risk rating and summary, which the runtime drops before building).
+    # ``detail`` is a one-line convenience parsed from the same text and is never shown instead of it. ``""``
+    # means the call could not be read: reject only.
     full: str = ""
 
     @property
@@ -280,11 +281,11 @@ class PendingEfferent:
         out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
         if not self.decidable:
             out += "\n      NOT SHOWN IN FULL: this cannot be approved (only rejected)"
-        elif self.full != self.detail:
+        else:
             # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
             # those inert, and the newline it kept is the only line break.
             body = "\n".join("        " + ln for ln in visible(self.full, keep_newline=True).split("\n"))
-            out += f"\n      the whole action (what approving runs):\n{body}"
+            out += f"\n      the call's arguments, exactly (what approving runs):\n{body}"
         return out
 
 

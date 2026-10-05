@@ -38,6 +38,7 @@ continue if either did not take. ``Conversation.__init__`` swallowing unknown kw
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -46,7 +47,6 @@ from openhands.sdk.security.confirmation_policy import ConfirmationPolicyBase
 from openhands.sdk.security.risk import SecurityRisk
 
 from levain.firing.gate import (
-    BASH_TOOL_NAMES,
     Classification,
     PendingEfferent,
     classify_action,
@@ -61,6 +61,7 @@ __all__ = [
     "arm_efferent_gate",
     "awaiting_confirmation",
     "disarm_efferent_gate",
+    "held_digest",
     "pending_gate_report",
     "reject_pending",
 ]
@@ -141,7 +142,8 @@ def _action_fields(action_event: Any) -> dict[str, Any]:
     """The action's arguments as a plain mapping, fail-soft to ``{}``.
 
     ``{}`` is the SAFE degradation: the classifier reads only the file editor's ``command``, and
-    an absent command classifies as a write. Unreadable fields therefore gate."""
+    an absent command classifies as a write. Unreadable fields therefore gate. This view CLASSIFIES
+    an action; it is never what an operator approves (that is :func:`_held_call`)."""
     action = _safe_attr(action_event, "action")
     if action is None:
         return {}
@@ -153,42 +155,6 @@ def _action_fields(action_event: Any) -> dict[str, Any]:
         return dict(vars(action))
     except Exception:  # noqa: BLE001
         return {}
-
-
-def _dump_fields(action_event: Any) -> dict[str, Any] | None:
-    """The action's arguments as shown for approval, or ``None`` when they cannot stand as the whole action.
-
-    ONE test, upstream of every way a dump can leave something out (a ``vars()`` fallback, ``Field(exclude=True)``
-    at any depth, a custom serializer): the dump is the whole action only if the action REBUILT from it equals
-    the action (``model_validate(dump) == action``; pydantic compares every field, excluded and nested ones
-    included). Anything that cannot be rebuilt, or rebuilds differently, is reject-only. The ``vars()`` view of
-    :func:`_action_fields` stays good enough to CLASSIFY an action, never to approve one."""
-    action = _safe_attr(action_event, "action")
-    if action is None:
-        return None
-    try:
-        dump = dict(action.model_dump())
-        if type(action).model_validate(dump) != action:
-            return None
-    except Exception:  # noqa: BLE001 - no model_dump/model_validate, or the dump does not rebuild: not the whole action
-        return None
-    return dump
-
-
-def _exact(value: Any) -> bool:
-    """``True`` when ``value`` is JSON-native and survives the round trip unchanged: str, int, bool, None,
-    a finite float, a list or a dict with str keys, recursively. A tuple, set, bytes, an enum or any other
-    type (including a subclass of these) is not."""
-    t = type(value)
-    if t in (str, int, bool) or value is None:
-        return True
-    if t is float:
-        return value == value and value not in (float("inf"), float("-inf"))
-    if t is list:
-        return all(_exact(v) for v in value)
-    if t is dict:
-        return all(type(k) is str and _exact(v) for k, v in value.items())
-    return False
 
 
 def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
@@ -209,27 +175,92 @@ def _detail_for(tool_name: str, fields: dict[str, Any], action: Any) -> str:
     return str(kind)
 
 
-_TERMINAL_FIELDS = frozenset({"command", "is_input", "timeout", "reset", "kind"})
-_TERMINAL_DEFAULTS = {"is_input": False, "timeout": None, "reset": False}
+def _held_call(action_event: Any) -> tuple[str, str] | None:
+    """The held event's tool call exactly as the runtime stored it: ``(name, arguments)``, or ``None``
+    when either is not a non-empty ``str``.
+
+    THIS is the consent payload, and it is what every surface shows and what an approval binds to. The
+    runtime parses the model's arguments, normalises them, stores ``tool_call.arguments`` as the JSON of
+    that normalised mapping, and builds the action from the same mapping (OpenHands
+    ``Agent._get_action_event``), so the approved bytes are the action's input rather than a view derived
+    from the built object. A derived view is what four review rounds of the earlier construct kept
+    beating (a ``model_dump`` can leave a field out, or a serializer can show one thing and its validator
+    rebuild another); those shapes live in TOOL code, which this box does not defend against and could
+    not (an installed tool runs arbitrary code). What it defends against is the model, and the model's
+    whole say is these bytes. They are BOUND whole (:func:`held_digest`) and SHOWN minus the model's own
+    narration (:func:`_shown_arguments`). Stated limit: an action deserialized from a persisted event file
+    is trusted to match its stored call (the operator's disk is the boundary)."""
+    call = _safe_attr(action_event, "tool_call")
+    name = _safe_attr(call, "name")
+    arguments = _safe_attr(call, "arguments")
+    if type(name) is str and name and type(arguments) is str:
+        return name, arguments
+    return None
 
 
-def _full_for(tool_name: str, fields: dict[str, Any] | None) -> str:
-    """Everything the proposed action would execute with, unbounded and unflattened (see
-    :attr:`levain.firing.gate.PendingEfferent.full`). ``fields`` must be the action's ``model_dump()``
-    (:func:`_dump_fields`); ``None`` (it could not be dumped) gives ``""``. A plain shell command is its
-    text exactly, and "a shell command" is decided by the TOOL's identity (the terminal hand), never by
-    the action having a ``command`` field: the file editor and any tool this module has never seen carry
-    one too. Every other action is every field, as JSON that loses nothing. ``""`` means this cannot be
-    shown whole, and the caller must then treat the action as undecidable: no fields at all, or any value
-    that is not recursively JSON-native and exact (a tuple, set, bytes, an enum, NaN, a non-string key)."""
-    if not fields or not _exact(fields):
-        return ""
-    command = fields.get("command")
-    if (tool_name in BASH_TOOL_NAMES and isinstance(command, str) and command
-            and set(fields) <= _TERMINAL_FIELDS
-            and all(fields.get(k, d) == d for k, d in _TERMINAL_DEFAULTS.items())):
-        return command
-    return json.dumps(fields, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False)
+_NARRATION_KEYS = ("security_risk", "summary")
+"""Keys the model may add to any call that the runtime POPS before it builds the action: its own risk rating and
+its own summary of what the call does. They never run, and they are the model's account of itself, which the
+decision surface never shows (the gate reads the tool, not the model's opinion of it)."""
+
+
+def _shown_arguments(action_event: Any, arguments: str) -> tuple[str, dict[str, Any]] | None:
+    """What the operator reads for a held call: the stored arguments without :data:`_NARRATION_KEYS`, re-encoded
+    with the runtime's own ``json.dumps`` defaults, so a call that carries neither key is shown byte for byte as
+    stored. ``summary`` is hidden only when the action POSITIVELY does not take it: neither a declared field
+    nor a key of an MCP action's ``data`` (an MCP tool whose schema has ``summary`` keeps it as an input, and the
+    runtime then does not pop it). An action that cannot be read keeps it shown. ``None`` when the stored text
+    is not a JSON object: nothing to show, reject only. The approval still binds to the whole stored text."""
+    fields = _call_fields(arguments)
+    if fields is None:
+        return None
+    action = _safe_attr(action_event, "action")
+    declared = getattr(type(action), "model_fields", None)
+    data = _safe_attr(action, "data")
+    keep_summary = (not isinstance(declared, dict) or "summary" in declared
+                    or (isinstance(data, dict) and "summary" in data))
+    shown = {k: v for k, v in fields.items()
+             if not (k == "security_risk" or (k == "summary" and not keep_summary))}
+    if shown == fields:
+        return arguments, fields
+    try:
+        return json.dumps(shown), shown
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_fields(arguments: str) -> dict[str, Any] | None:
+    """The held arguments parsed as a JSON object, or ``None``. Used ONLY to derive the one-line
+    convenience ``detail`` from the same bytes the operator approves; never a substitute for them."""
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def held_digest(conversation: Any) -> str | None:
+    """What an approval binds to: SHA-256 over the ordered ``[event id, tool name, arguments]`` of EVERY
+    action the next ``run()`` would execute (inert ones such as ``finish`` included), as compact ASCII JSON
+    (a list of strings, so the encoding is injective). ``None`` when nothing is held or any held action's
+    id or call cannot be read: such a hold can only be rejected. Never raises."""
+    try:
+        from openhands.sdk.conversation.state import ConversationState
+
+        pending = ConversationState.get_unmatched_actions(conversation.state.events)
+        items: list[list[str]] = []
+        for event in pending:
+            event_id = _safe_attr(event, "id")
+            call = _held_call(event)
+            if type(event_id) is not str or call is None:
+                return None
+            items.append([event_id, call[0], call[1]])
+    except Exception:  # noqa: BLE001 - undeterminable, which is NOT "nothing changed"
+        return None
+    if not items:
+        return None
+    encoded = json.dumps(items, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
 def _elide(text: str) -> str:
@@ -368,17 +399,30 @@ def pending_gate_report(conversation: Any) -> list[PendingEfferent]:
     report: list[PendingEfferent] = []
     for event in pending:
         try:
-            fields = _action_fields(event)
             raw_name = _safe_attr(event, "tool_name")
-            tool_name = str(raw_name or "<unnamed>")
-            classification = classify_action(raw_name, fields)
+            classification = classify_action(raw_name, _action_fields(event))
+            call = _held_call(event)
+            shown = _shown_arguments(event, call[1]) if call is not None else None
+            if call is None or shown is None:
+                # No stored call to show: the operator cannot see what approving would run.
+                report.append(
+                    PendingEfferent(
+                        tool_name=str(raw_name or "<unnamed>"),
+                        detail="the held tool call could not be read",
+                        reason=classification.reason,
+                        recognized=classification.recognized,
+                    )
+                )
+                continue
+            name = call[0]
+            text, fields = shown
             report.append(
                 PendingEfferent(
-                    tool_name=tool_name,
-                    detail=_detail_for(tool_name, fields, _safe_attr(event, "action")),
+                    tool_name=name,
+                    detail=_detail_for(name, fields, _safe_attr(event, "action")),
                     reason=classification.reason,
                     recognized=classification.recognized,
-                    full=_full_for(raw_name if isinstance(raw_name, str) else "", _dump_fields(event)),
+                    full=text,
                 )
             )
         except Exception:  # noqa: BLE001 — one undescribable action must not blank the whole

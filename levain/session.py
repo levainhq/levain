@@ -248,6 +248,11 @@ class TurnResult:
     classification fanned in, because an operator deciding on ``git push --force`` needs the
     command, not the tool's name."""
 
+    held_digest: str | None = None
+    """What an approval of THIS halt binds to (:func:`levain.firing.openhands.gate.held_digest`), read at the
+    same quiescent moment as :attr:`pending`. ``None`` when not gated or the held calls could not be read: a
+    driver that binds approvals (the chat server) then offers reject only."""
+
     @property
     def ok(self) -> bool:
         """The turn completed AND produced a reply. Not 'the task succeeded'.
@@ -1231,7 +1236,20 @@ class EntitySession:
             nudged=nudged,
             gated=True,
             pending=self._gate_report(),
+            held_digest=self.held_digest(),
         )
+
+    def held_digest(self) -> str | None:
+        """The digest of what the gate is holding NOW (:func:`levain.firing.openhands.gate.held_digest`), or
+        ``None`` (not gated, nothing held, or unreadable). Never raises."""
+        if self.gate_mode != "gated" or self._closed:
+            return None
+        try:
+            from levain.firing.openhands.gate import held_digest
+
+            return held_digest(self.conversation)
+        except Exception:  # noqa: BLE001 - undeterminable: an approval bound to it is refused
+            return None
 
     def _executed_activity(self) -> list[str]:
         """Activity for the actions that actually RAN this turn, with the held ones removed."""

