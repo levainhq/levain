@@ -230,8 +230,9 @@
     poll(jobId, myRun, (j) => {
       live.textContent = "";
       const res = j.result;
-      if (j.status === "lost") { failure(j.error); resync(myRun, true); return; }
-      if (j.status !== "done" || !res) {   // failed, lost, unknown: never rendered as success
+      // "lost" (contact lost) and "unknown" (the server no longer holds the job) say nothing about what ran.
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the turn."); resync(myRun, "turn"); return; }
+      if (j.status !== "done" || !res) {   // failed: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
       }
@@ -283,7 +284,10 @@
   // box (the id only ever comes from the server's answer); after an AMBIGUOUS loss (the page cannot tell whether
   // its decision or turn ran) anything else is reported as unknown with compose blocked; after a definite refusal
   // an idle session is ready again. Reads only: it never POSTs.
-  const UNKNOWN = "The outcome of the last decision is unknown; check the session's activity before retrying.";
+  function unknownOutcome(what) {
+    return "The outcome of the last " + what + " is unknown; check the session's activity before retrying.";
+  }
+  // `ambiguous` is false after a definite refusal, else "turn" or "decision": what may have run unseen.
   function resync(myRun, ambiguous) {
     if (!session) return;
     live.textContent = "reading the session…";
@@ -295,7 +299,7 @@
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun); return;
       }
-      if (ambiguous) { failure(UNKNOWN); endOfTurn(true); return; }
+      if (ambiguous) { failure(unknownOutcome(ambiguous)); endOfTurn(true); return; }
       if (r.status === 200 && s.state === "idle") { endOfTurn(false); return; }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
       endOfTurn(true);
@@ -338,7 +342,7 @@
     function decided(j) {
       deciding = false; box.remove();
       const res = j.result;
-      if (j.status === "lost") { failure(j.error); resync(myRun, true); return; }
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the decision."); resync(myRun, "decision"); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -362,12 +366,14 @@
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If
         // the halt is still undecided it comes back with its decision id and the set to show, and a fresh
-        // box is built from that, never from this one. A 4xx or a 503 is a definite refusal (nothing ran);
-        // anything else (no response, another 5xx, a 202 without a job) may have started the decision.
+        // box is built from that, never from this one. Only the chat server's own refusal (a 4xx or 503 that
+        // carries its JSON error code) is definite: nothing ran. Anything else (no response, another 5xx, a
+        // proxy's bare status, a 202 without a job) may have started the decision.
         deciding = false; box.remove();
-        const definite = (r.status >= 400 && r.status < 500) || r.status === 503;
+        const definite = ((r.status >= 400 && r.status < 500) || r.status === 503) &&
+          !!(r.json && typeof r.json.error === "string" && r.json.error);
         failure("The decision was not accepted: " + why(r));
-        resync(myRun, !definite); return;
+        resync(myRun, definite ? false : "decision"); return;
       }
       live.textContent = "working…";
       poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });

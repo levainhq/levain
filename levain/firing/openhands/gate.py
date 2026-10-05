@@ -156,19 +156,22 @@ def _action_fields(action_event: Any) -> dict[str, Any]:
 
 
 def _dump_fields(action_event: Any) -> dict[str, Any] | None:
-    """The action's arguments from ``model_dump()`` ONLY, or ``None``. The ``vars()`` fallback of
-    :func:`_action_fields` is good enough to CLASSIFY an action (an unreadable one gates) but may be a
-    partial view, so it must never stand as "the whole action" for an approval."""
+    """The action's arguments as shown for approval, or ``None`` when they cannot stand as the whole action.
+
+    ONE test, upstream of every way a dump can leave something out (a ``vars()`` fallback, ``Field(exclude=True)``
+    at any depth, a custom serializer): the dump is the whole action only if the action REBUILT from it equals
+    the action (``model_validate(dump) == action``; pydantic compares every field, excluded and nested ones
+    included). Anything that cannot be rebuilt, or rebuilds differently, is reject-only. The ``vars()`` view of
+    :func:`_action_fields` stays good enough to CLASSIFY an action, never to approve one."""
     action = _safe_attr(action_event, "action")
     if action is None:
         return None
     try:
         dump = dict(action.model_dump())
-    except Exception:  # noqa: BLE001
+        if type(action).model_validate(dump) != action:
+            return None
+    except Exception:  # noqa: BLE001 - no model_dump/model_validate, or the dump does not rebuild: not the whole action
         return None
-    declared = getattr(type(action), "model_fields", None)
-    if isinstance(declared, dict) and not set(declared) <= set(dump):
-        return None   # a field the dump leaves out (Field(exclude=True)) may still change what runs
     return dump
 
 

@@ -1001,23 +1001,33 @@ def test_full_is_non_empty_only_for_an_exact_json_native_dump():
     assert _full_for("terminal", None) == ""
 
 
-def test_a_model_dump_that_leaves_out_a_declared_field_is_not_the_whole_action():
-    """L3 r4 (complement): model_dump() omits Field(exclude=True), so a dump can be exact and still not the whole
-    action. A dump missing any declared field gives no `full` (reject only)."""
+def test_a_model_dump_that_leaves_out_a_field_at_any_depth_is_not_the_whole_action():
+    """L3 r4 (complement) and r5 (codex): model_dump() omits Field(exclude=True), at the top level or inside a
+    nested model, so a dump can look whole and still leave out what runs. The dump stands as the whole action
+    only if the action rebuilt from it equals the action."""
     from types import SimpleNamespace
+
+    from pydantic import BaseModel, Field
 
     from levain.firing.openhands.gate import _dump_fields
 
-    class Action:
-        model_fields = {"command": None, "secret_target": None}
+    class Target(BaseModel):
+        label: str
+        secret: str = Field(default="staging", exclude=True)
 
-        def model_dump(self):
-            return {"command": "deploy"}
+    class Nested(BaseModel):
+        command: str
+        target: Target
 
-    assert _dump_fields(SimpleNamespace(action=Action())) is None
+    class Top(BaseModel):
+        command: str
+        secret_target: str = Field(default="staging", exclude=True)
 
-    class Whole(Action):
-        def model_dump(self):
-            return {"command": "deploy", "secret_target": "prod"}
+    class Whole(BaseModel):
+        command: str
+        target: Target | None = None
 
-    assert _dump_fields(SimpleNamespace(action=Whole())) == {"command": "deploy", "secret_target": "prod"}
+    assert _dump_fields(SimpleNamespace(action=Nested(command="deploy", target=Target(label="l", secret="prod")))) is None
+    assert _dump_fields(SimpleNamespace(action=Top(command="deploy", secret_target="prod"))) is None
+    assert _dump_fields(SimpleNamespace(action=Whole(command="deploy"))) == {"command": "deploy", "target": None}
+    assert _dump_fields(SimpleNamespace(action=object())) is None            # no model_dump: not the whole action
