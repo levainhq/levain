@@ -297,3 +297,37 @@ def test_an_indented_block_of_call_json_is_not_a_whole_fence():
     # r3 LOW: a leading strip made this 4-space opener a column-0 fence; it is an indented code line, not a fence
     assert not unreadable_tool_call('    ```json\n{"name": "terminal", "arguments": {}}\n```', TOOLS)
     assert unreadable_tool_call('\n```json\n{"name": "terminal", "arguments": {}}\n```\n', TOOLS)
+
+
+# ---------- L3 r4 (Phill's A): code regions come from a CommonMark parser ----------
+
+@pytest.mark.parametrize("reply", [
+    # a heading, a list item or a block quote ends the paragraph, so a stray backtick cannot pair across it
+    "Stray ` here\n# heading\n" + CALL + "\n`",
+    "Stray ` here\n- item\n\n" + CALL + "\n`",
+    # an autolink or an inline HTML tag owns its backtick
+    "<https://example.com/`>\n" + CALL + "\n`",
+    '<a title="`">x</a>\n' + CALL + "\n`",
+])
+def test_a_real_leak_is_not_hidden_by_a_backtick_another_construct_owns(reply):
+    assert unreadable_tool_call(reply, TOOLS)
+
+
+def test_a_code_span_cannot_pad_a_line_into_a_leak():
+    # r4 LOW: a span blanked to spaces left the markup within three columns of the line start
+    assert not unreadable_tool_call("`x`" + CALL, TOOLS)
+    assert not unreadable_tool_call("a`\nb`" + CALL, TOOLS)
+
+
+def test_an_entity_or_escape_is_quoted_markup():
+    assert not unreadable_tool_call("&lt;tool_call>{\"name\": \"terminal\"}", TOOLS)
+    assert not unreadable_tool_call("\\<tool_call>{\"name\": \"terminal\"}", TOOLS)
+
+
+def test_many_blank_lines_are_cheap():
+    import time
+
+    t = time.perf_counter()
+    assert unreadable_tool_call("\n" * 200_000 + GLM_REAL[1], TOOLS)
+    assert unreadable_tool_call("`" * 2000 + " " + "``` " * 2000 + "\n" + CALL, TOOLS)
+    assert time.perf_counter() - t < 5

@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import re
 
+from markdown_it import MarkdownIt
+
 # The discriminator of the built-in ``finish`` tool's action (a stable pydantic ``.kind``).
 FINISH_ACTION_KIND = "FinishAction"
 
@@ -200,122 +202,56 @@ _GLM_LINE = re.compile(r"(?m)^ {0,3}[^\s<]*</?arg_(?:key|value)>")
 # The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
 # argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
 _TOOL_CALL_OPEN = re.compile(r"(?m)^ {0,3}<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# Markdown code, by CommonMark 0.31.2: a reply quoting the markup is explaining it, not calling. Lines end only at
-# LF, CR or CRLF (s2.1; str.splitlines also splits on U+2028 and friends). A fenced block (s4.5) opens on 3+ backticks
-# or 3+ tildes after at most three spaces (a backtick fence's info string has no backtick) and closes on a run of the
-# SAME character at least as long, after at most three spaces and followed only by spaces or tabs; unclosed, it runs
-# to the end. A code span (s6.1) opens on a backtick string (a maximal run not begun by a backslash escape, s2.4) and
-# closes at the next backtick string of exactly that length, across line endings, within its paragraph (a blank
-# line or a fence ends one); an opener with no closer is literal. An indented (4-space) code block is excluded by
-# the shapes themselves: they must begin within the first three columns.
-_LINE_END = re.compile(r"\r\n|\r|\n")
-_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+# Markdown code, as a CommonMark parser reads it (markdown-it-py, "commonmark" preset): a reply quoting the markup
+# is explaining it, not calling. Fenced and indented code blocks and code spans are code; every other line keeps its
+# text as written (an entity or a backslash escape keeps its source, so "&lt;tool_call>" is not "<tool_call>"), on the
+# source line it came from. A code span becomes a placeholder that is neither a space nor markup, so it cannot pad a
+# line's indent. Block quote and list markers are dropped, so markup quoted in one begins its line (a known limit).
+_MD = MarkdownIt("commonmark").disable("text_join")
+_CODE_PLACEHOLDER = "\x00"
+_LINE_END = re.compile(r"\r\n?")
 
 
-def _lines(text: str) -> list[str]:
-    return _LINE_END.split(text)
+def _inline_text(token) -> str:
+    parts: list[str] = []
+    for c in token.children or ():
+        if c.type in ("softbreak", "hardbreak"):
+            parts.append("\n")
+        elif c.type == "code_inline":
+            parts.append(_CODE_PLACEHOLDER)
+        elif c.type == "text_special":
+            parts.append(c.markup or c.content)
+        elif c.type in ("text", "html_inline"):
+            parts.append(c.content)
+        elif c.type == "image":
+            parts.append(_inline_text(c))
+    return "".join(parts)
 
 
-def _fence_open(line: str) -> str | None:
-    m = _FENCE_OPEN.match(line)
-    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
-        return None
-    return m.group(1)
+def _markdown(text: str):
+    """(``text`` outside Markdown code, line for line; the body of ``text`` when its only block is one fence, else
+    ``None``). If the parser fails, all of ``text`` is read as prose and there is no fence."""
+    source = _LINE_END.sub("\n", text)
+    try:
+        tokens = _MD.parse(source)
+    except Exception:  # noqa: BLE001 — a display aid: read everything rather than fail the turn
+        return source, None
+    out = [""] * (source.count("\n") + 1)
 
+    def put(start: int, end: int, body: str) -> None:
+        for k, line in enumerate(body.split("\n")[: end - start]):
+            out[start + k] = line
 
-def _fence_closes(line: str, fence: str) -> bool:
-    m = _FENCE_CLOSE.match(line)
-    return bool(m) and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
-
-
-def _without_spans(paragraph: str) -> str:
-    """``paragraph`` with every code span blanked to spaces (its line endings kept)."""
-    out = list(paragraph)
-    i, n = 0, len(paragraph)
-    while i < n:
-        ch = paragraph[i]
-        if ch == "\\" and i + 1 < n and paragraph[i + 1] in _ASCII_PUNCT:
-            i += 2                                   # an escaped character, a backtick included, is literal
+    for t in tokens:
+        if t.map is None:
             continue
-        if ch != "`":
-            i += 1
-            continue
-        j = i
-        while j < n and paragraph[j] == "`":
-            j += 1
-        run = j - i
-        k = j
-        close = -1
-        while k < n:                                 # inside a span a backslash is literal: no escapes here
-            if paragraph[k] != "`":
-                k += 1
-                continue
-            m = k
-            while m < n and paragraph[m] == "`":
-                m += 1
-            if m - k == run:
-                close = m
-                break
-            k = m
-        if close < 0:
-            i = j                                    # no closer: the run is literal text
-            continue
-        for x in range(i, close):
-            if out[x] != "\n":
-                out[x] = " "
-        i = close
-    return "".join(out)
-
-
-def _without_code(text: str) -> str:
-    """``text`` with every fenced block and code span blanked, one output line per input line (LF-joined)."""
-    out: list[str] = []
-    para: list[str] = []
-    fence: str | None = None
-
-    def flush() -> None:
-        if para:
-            out.extend(_without_spans("\n".join(para)).split("\n"))
-            para.clear()
-
-    for line in _lines(text):
-        if fence is not None:
-            if _fence_closes(line, fence):
-                fence = None
-            out.append("")
-            continue
-        opened = _fence_open(line)
-        if opened is not None:
-            flush()
-            fence = opened
-            out.append("")
-        elif not line.strip(" \t"):
-            flush()
-            out.append("")
-        else:
-            para.append(line)
-    flush()
-    return "\n".join(out)
-
-
-def _whole_fence_body(text: str) -> str | None:
-    """The inside of ``text`` when ALL of it is one closed fenced block, else ``None``. Blank lines around it are
-    ignored; the first line keeps its indentation, so an indented block (not a fence) is not one."""
-    lines = _lines(text)
-    while lines and not lines[0].strip(" \t"):
-        lines.pop(0)
-    while lines and not lines[-1].strip(" \t"):
-        lines.pop()
-    if len(lines) < 2:
-        return None
-    fence = _fence_open(lines[0])
-    if fence is None or not _fence_closes(lines[-1], fence):
-        return None
-    if any(_fence_closes(line, fence) for line in lines[1:-1]):
-        return None
-    return "\n".join(lines[1:-1])
+        if t.type == "inline":
+            put(t.map[0], t.map[1], _inline_text(t))
+        elif t.type == "html_block":
+            put(t.map[0], t.map[1], t.content)
+    blocks = [t for t in tokens if t.level == 0 and not t.type.endswith("_close")]
+    body = blocks[0].content if len(blocks) == 1 and blocks[0].type == "fence" else None
+    return "\n".join(out), body
 
 
 def _json_call_names(text: str) -> list[str] | None:
@@ -364,12 +300,10 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     shape is not flagged. It reads the shape only: the call is never repaired or run."""
     if not text:
         return False
-    stripped = text.strip()
-    body = _whole_fence_body(text)
-    names = _json_call_names((body if body is not None else stripped).strip())
+    prose, body = _markdown(text)
+    names = _json_call_names((body if body is not None else text).strip())
     if names and all(n in tool_names for n in names):
         return True
-    prose = _without_code(text)
     if _TOOL_CALL_OPEN.search(prose):
         return True
     return bool(_GLM_LINE.search(prose) and _GLM_ARG_PAIR.search(prose))
