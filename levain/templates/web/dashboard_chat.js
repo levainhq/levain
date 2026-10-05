@@ -167,7 +167,7 @@
       clear(body); note("chat-note", "Opening a session on " + entity + "…");
       poll(r.json.job_id, myRun, (j) => {
         const st = j.result && j.result.session && j.result.session.state;
-        if (j.status === "done" && st === "idle") { session = { id: sid, entity: entity }; showConversation(); return; }
+        if (j.status === "done" && st === "idle") { session = { id: sid, entity: entity, workspace: j.result.session.workspace }; showConversation(); return; }
         clear(body);
         note("chat-err", "The session did not open: " + (j.error || (j.result && j.result.session && j.result.session.error) || j.status));
         const back = el("button", "chat-btn", "Back"); back.type = "button";
@@ -198,9 +198,16 @@
     form.addEventListener("submit", (ev) => { ev.preventDefault(); sendTurn(); });
     // Enter sends and Shift+Enter starts a new line, in THIS box only. Not while an input method is composing a
     // character (that Enter belongs to the IME). Nothing in the consent box listens for Enter: deciding is a click.
+    // Composition is tracked from its own events too: some browsers give the Enter that confirms a composed
+    // character neither isComposing nor keyCode 229.
+    let composing = false;
+    area.addEventListener("compositionstart", () => { composing = true; });
+    area.addEventListener("compositionend", () => { setTimeout(() => { composing = false; }, 0); });
     area.addEventListener("keydown", (ev) => {
-      if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing || ev.keyCode === 229) return;
+      if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing || ev.keyCode === 229 || composing) return;
       ev.preventDefault();
+      // Only a real keypress, and never while compose is disabled or a decision is in flight.
+      if (!ev.isTrusted || area.disabled || deciding) return;
       sendTurn();
     });
     body.appendChild(form);
@@ -229,7 +236,7 @@
 
   function sendTurn() {
     const text = area.value.trim();
-    if (!text || !session) return;
+    if (!text || !session || area.disabled || deciding) return;
     area.value = "";
     const mine = bubble("me", "you"); mine.appendChild(el("div", "chat-text", text));
     setComposeEnabled(false);
@@ -314,7 +321,7 @@
   }
   function rereadButton(myRun, warning) {
     const row = el("div", "chat-row");
-    const btn = el("button", "chat-btn", "Re-read the session"); btn.type = "button";
+    const btn = el("button", "chat-btn", "Check what happened"); btn.type = "button";
     btn.addEventListener("click", (ev) => {
       if (!ev.isTrusted || myRun !== run || !session) return;
       row.remove();
@@ -322,23 +329,66 @@
     });
     row.appendChild(btn); log.appendChild(row);
   }
+  // The server no longer knows this session: a restart ends every chat session (they live in its memory), and the
+  // per-launch token changes with it. Said plainly, with the outcome still unknown and where to look.
+  function restartedText() {
+    const where = (session && typeof session.workspace === "string" && session.workspace)
+      ? "the entity's workspace (" + visible(session.workspace) + ")" : "the entity's workspace";
+    return "The server restarted, so that session has ended. Your last request may or may not have run: check " +
+      where + " to see what changed.";
+  }
+  // What the session's most recent job did, as the server recorded it: the actions that ran and the reply. Text only;
+  // a consent box is never built from it (only from the session's current held set, below). True when it could say
+  // what the finished job did, so the outcome is no longer unknown.
+  function reportLastJob(last) {
+    if (!last || typeof last !== "object") return false;
+    const what = last.kind === "turn" ? "turn" : last.kind === "open" ? "open" : "decision (" + String(last.kind) + ")";
+    if (last.status === "running") { failure("The last " + what + " is still running."); return false; }
+    if (last.status === "unknown") { failure("The server no longer has a record of the last " + what + "."); return false; }
+    if (last.status === "failed") { failure("The last " + what + " failed: " + (last.error || "no detail")); return false; }
+    const res = last.result || {};
+    const ran = Array.isArray(res.tool_activity) ? res.tool_activity : [];
+    const b = bubble("them", session.entity + " · what the last " + what + " did");
+    b.appendChild(el("div", "chat-text", ran.length ? "These actions ran:" : "No action ran."));
+    addLines(b, ran);
+    if (res.reply) b.appendChild(el("div", "chat-text", res.reply));
+    if (res.error) b.appendChild(el("div", "chat-text", "error: " + res.error));
+    return true;
+  }
   // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that. Called
-  // only from the re-read button after an ambiguous outcome; `warning` is attached to whatever is shown. A gated
-  // session comes back with its held set and, while it is still approvable, its CURRENT decision id (the id only
-  // ever comes from the server's answer). Reads only.
+  // only from the "Check what happened" button after an ambiguous outcome; `warning` is attached to whatever is shown.
+  // A gated session comes back with its held set and, while it is still approvable, its CURRENT decision id (the id
+  // only ever comes from the server's answer). Reads only.
   function resync(myRun, warning) {
     if (!session) return;
     live.textContent = "reading the session…";
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
       if (myRun !== run) return;
       live.textContent = "";
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(restartedText()); return; }
       const s = r.json || {};
+      if (r.status === 404 && s.error === "unknown_session") {
+        failure(restartedText());
+        endOfTurn(true);
+        const row = el("div", "chat-row");
+        const fresh = el("button", "chat-btn", "Start a new session"); fresh.type = "button";
+        fresh.addEventListener("click", () => loadListing(false));
+        row.appendChild(fresh); log.appendChild(row);
+        return;
+      }
+      const known = r.status === 200 && reportLastJob(s.last_job);
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning); return;
       }
+      if (r.status === 200 && s.state === "busy") {
+        failure("The session is still working. Check again in a moment.");
+        endOfTurn(true);
+        if (warning) rereadButton(myRun, warning);
+        return;
+      }
       if (r.status === 200 && s.state === "idle") {
-        if (warning) failure("The session is idle now. " + warning);
+        if (known) note("chat-note", "The session is idle now; above is what the server recorded.");
+        else if (warning) failure("The session is idle now. " + warning);
         endOfTurn(false); return;
       }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));

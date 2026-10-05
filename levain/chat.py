@@ -219,6 +219,7 @@ class _Session:
     decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
     pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
     held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
+    last_job_id: str | None = None   # the most recent job that STARTED on this session, for a page that lost it
     session: Any = None          # the EntitySession once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
@@ -367,10 +368,14 @@ class ChatHost:
         ``pending`` set that id names, so a caller that lost the turn's result (a reloaded page, a lost
         poll) can decide again. Only here, never in :meth:`listing`: the id is addressed by a session id. A
         gated session with no current id (an approve found the held calls changed) still reports its
-        ``pending`` set, so it can be shown and rejected; without an id it cannot be approved."""
+        ``pending`` set, so it can be shown and rejected; without an id it cannot be approved. ``last_job`` is the
+        most recent job that started on the session (its kind, status, activity and result, as
+        :meth:`job_status` gives them), so a page that lost track of a turn or decision can see what it did."""
         with self._lock:
             rec = self._get(session_id)
             out = self._session_view(rec)
+            if rec.last_job_id is not None:
+                out["last_job"] = self._job_view(rec.last_job_id)
             if rec.state == "gated":
                 out["pending"] = [dict(p) for p in rec.pending]
                 if rec.decision_id is not None:
@@ -379,23 +384,27 @@ class ChatHost:
 
     def job_status(self, job_id: str) -> dict[str, Any]:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return {"job_id": job_id, "status": "unknown"}
-            out: dict[str, Any] = {
-                "job_id": job.job_id,
-                "session_id": job.session_id,
-                "kind": job.kind,
-                "status": job.status,
-                "activity": list(job.activity),
-                "activity_dropped": job.dropped,
-                "deadline_hit": job.deadline_hit,
-            }
-            if job.result is not None:
-                out["result"] = dict(job.result)
-            if job.error is not None:
-                out["error"] = job.error
-            return out
+            return self._job_view(job_id)
+
+    def _job_view(self, job_id: str) -> dict[str, Any]:
+        """One job as JSON-shaped data; ``status: unknown`` once it is no longer held. Caller holds the lock."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": "unknown"}
+        out: dict[str, Any] = {
+            "job_id": job.job_id,
+            "session_id": job.session_id,
+            "kind": job.kind,
+            "status": job.status,
+            "activity": list(job.activity),
+            "activity_dropped": job.dropped,
+            "deadline_hit": job.deadline_hit,
+        }
+        if job.result is not None:
+            out["result"] = dict(job.result)
+        if job.error is not None:
+            out["error"] = job.error
+        return out
 
     # -- operations ----------------------------------------------------------
 
@@ -506,6 +515,7 @@ class ChatHost:
         job = _Job(job_id=secrets.token_hex(8), session_id=rec.session_id, kind=kind)
         self._jobs[job.job_id] = job
         rec.job_id = job.job_id
+        rec.last_job_id = job.job_id
         finished = [j for j in self._jobs.values() if j.status != "running"]
         for old in finished[: max(0, len(finished) - _FINISHED_JOBS_KEPT)]:
             del self._jobs[old.job_id]
@@ -614,6 +624,7 @@ class ChatHost:
             rec.decision_id = None   # spent: whatever this decision does, no screen can decide this halt again
             before = rec.state
             rec.state = "busy"
+            prev_last = rec.last_job_id
             job = self._new_job(rec, kind)
             done = threading.Event()
             watcher = None
@@ -635,6 +646,7 @@ class ChatHost:
             if not started or not self._spawn(self._run_job, rec, job, call, done, watcher):
                 done.set()
                 rec.state, rec.job_id = before, None
+                rec.last_job_id = prev_last   # this job never started, so it is not "what happened"
                 rec.decision_id = spent   # nothing was decided: the halt is still held and still undecided
                 del self._jobs[job.job_id]
                 raise ChatError("busy", "could not start a worker; try again", 503)
