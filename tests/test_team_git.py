@@ -628,3 +628,158 @@ def test_a_merge_resolved_to_its_first_parent_cannot_hide_side_lines(two):
     led = gl.ledger()
     assert "s stays" in [e.get("words") for e in led.in_force]
     assert any("merge commit" in p for p in led.problems)
+
+
+# ---- 0.6.1 replay hardening ------------------------------------------------------------------------------------
+
+def _conflicting_replay(two):
+    """ana has an unpushed entry E and an unpushed team.toml change that conflicts with a remote change."""
+    tmp, ana, ben = two
+    ana2 = clone(tmp, "ana2", "ana@ex.com")
+    assert team("join", repo=ana2) == 0
+    assert record_ruling(ana, "src/e.py", "e stays", "--no-push") == 0
+    assert team("member", "add", "cat", "cat@ex.com", repo=ana2) == 0          # remote moves
+    assert team("member", "add", "dan", "dan@ex.com", "--no-push", repo=ana) == 0  # conflicts with cat
+    return GitLedger(Repo.discover(ana)), ana
+
+
+def _spy_git(monkeypatch, fail_pick=False, pick_rc=1, stale_pick_marker=False, fail_checkout=False):
+    """Record every git argv the transport runs; optionally make a replay cherry-pick fail, or the final checkout."""
+    import levain.team.transport as T
+    real, calls = T.git, []
+
+    def spy(args, cwd, **kw):
+        calls.append(list(args))
+        if fail_pick and "--allow-empty" in args and "cherry-pick" in args:
+            if stale_pick_marker:
+                marker = Path(real(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], cwd).stdout.strip())
+                (marker if marker.is_absolute() else Path(cwd) / marker).write_text("0" * 40 + "\n")
+            return subprocess.CompletedProcess(["git", *args], pick_rc, "", "fatal: Unable to create index.lock")
+        if fail_checkout and args == ["checkout", "-q", "levain-ledger"]:
+            raise T.TeamError("git checkout failed: untracked file in the way")
+        return real(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", spy)
+    return calls
+
+
+def test_the_replay_runs_with_rerere_off_and_in_topological_order(two, monkeypatch):
+    gl, ana = _conflicting_replay(two)
+    calls = _spy_git(monkeypatch)
+    assert team("sync", repo=ana) == 0
+    for verb, marker in (("rebase", "--empty=drop"), ("cherry-pick", "--allow-empty")):
+        argv = next(c for c in calls if verb in c and marker in c)
+        assert "rerere.enabled=false" in argv and "rerere.autoupdate=false" in argv
+        assert "commit.gpgsign=false" in argv
+    assert "--topo-order" in next(c for c in calls if "rev-list" in c and "--reverse" in c)
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+
+
+def test_a_cherry_pick_that_failed_without_a_pick_in_progress_is_not_skipped_as_upstream(two, monkeypatch, capsys):
+    gl, ana = _conflicting_replay(two)
+    tip = git("rev-parse", "levain-ledger", cwd=ana).strip()
+    calls = _spy_git(monkeypatch, fail_pick=True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    assert "index.lock" in capsys.readouterr().err                      # the real cause is named
+    assert not any("--skip" in c for c in calls)                        # the entry was not dropped as "already upstream"
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip    # nothing published, nothing lost
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+
+
+@pytest.mark.parametrize("rc", [1, 128])
+def test_a_marker_for_another_commit_is_not_skipped_as_upstream(two, monkeypatch, rc):
+    gl, ana = _conflicting_replay(two)
+    tip = git("rev-parse", "levain-ledger", cwd=ana).strip()
+    calls = _spy_git(monkeypatch, fail_pick=True, pick_rc=rc, stale_pick_marker=True)
+    assert team("sync", repo=ana) != 0
+    assert not any("--skip" in c for c in calls)
+    assert git("rev-parse", "levain-ledger", cwd=ana).strip() == tip    # the entry is still on the branch
+
+
+def test_an_empty_pick_git_stopped_on_is_really_skipped_and_the_entry_survives_once(two, capsys, monkeypatch):
+    tmp, ana, ben = two
+    calls = _spy_git(monkeypatch)
+    ana2 = clone(tmp, "ana2", "ana@ex.com")
+    assert team("join", repo=ana2) == 0
+    assert record_ruling(ana, "src/e.py", "e stays", "--no-push") == 0
+    gl = GitLedger(Repo.discover(ana))
+    e_sha = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    entry_file = git("diff-tree", "--no-commit-id", "--name-only", "-r", e_sha, cwd=gl.wt).split()[0]
+    assert team("member", "add", "cat", "cat@ex.com", repo=ana2) == 0          # remote moves
+    git("fetch", "-q", "origin", cwd=gl.wt)
+    git("checkout", "-q", "--detach", "origin/levain-ledger", cwd=gl.wt)
+    git("checkout", e_sha, "--", entry_file, cwd=gl.wt)                           # upstream gets E's change ...
+    (gl.wt / "side.txt").write_text("x\n")                                       # ... inside a different patch
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "E plus another file", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:refs/heads/levain-ledger", cwd=gl.wt)
+    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
+    assert team("member", "add", "dan", "dan@ex.com", "--no-push", repo=ana) == 0  # forces the replay path
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0
+    assert any(c[:2] == ["cherry-pick", "--skip"] for c in calls)               # the real empty-pick path ran
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+
+
+def test_a_failing_reattach_does_not_mask_the_error_that_sent_us_there(two, monkeypatch, capsys):
+    gl, ana = _conflicting_replay(two)
+    _spy_git(monkeypatch, fail_pick=True)
+    from levain.team.transport import GitLedger as G, TeamError
+    monkeypatch.setattr(G, "_reattach", lambda self: (_ for _ in ()).throw(TeamError("reattach exploded")))
+    capsys.readouterr()
+    assert team("sync", repo=ana) != 0
+    err = capsys.readouterr().err
+    assert "index.lock" in err                                  # the replay's own error is the one raised
+    assert "left detached (reattach exploded)" in err           # and the state it leaves behind is stated
+
+
+def test_a_checkout_that_fails_after_the_replay_published_keeps_the_discard_warning_and_reattaches(two, monkeypatch,
+                                                                                                capsys):
+    gl, ana = _conflicting_replay(two)
+    _spy_git(monkeypatch, fail_checkout=True)
+    capsys.readouterr()
+    assert team("sync", repo=ana) == 0                          # the forced checkout recovers, nothing is lost
+    err = capsys.readouterr().err
+    assert "were discarded" in err
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+
+
+def _plant_hooks(gl, *names):
+    common = Path(git("rev-parse", "--git-common-dir", cwd=gl.wt).strip())
+    hooks = (common if common.is_absolute() else gl.wt / common) / "hooks"
+    hooks.mkdir(exist_ok=True)
+    git("config", "core.hooksPath", str(hooks), cwd=gl.wt)   # a machine's own hooksPath would otherwise make these inert
+    for name in names:
+        hook = hooks / name
+        # the nonzero exit fails any step the hook runs in; the sentinel proves it ran
+        hook.write_text("#!/bin/sh\necho ran >> \"$0.ran\"\nexit 1\n")
+        hook.chmod(0o755)
+    return hooks
+
+
+def test_a_failing_project_hook_cannot_make_the_replay_fail_or_drop_an_entry(two):
+    # checkout and commit hooks run on Linux git for these steps; post-checkout runs on every git, so this fails
+    # on a regression here too
+    gl, ana = _conflicting_replay(two)
+    hooks = _plant_hooks(gl, "post-checkout", "prepare-commit-msg", "reference-transaction", "post-commit")
+    subprocess.run(["git", "checkout", "-q", "levain-ledger"], cwd=gl.wt)         # control: the planted hooks do run
+    assert list(hooks.glob("*.ran")), "the planted hooks never fire here, so this test proves nothing"
+    for f in hooks.glob("*.ran"):
+        f.unlink()
+    assert team("sync", repo=ana) == 0
+    assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+    assert not list(hooks.glob("*.ran"))                      # none of the project's hooks ran for levain's plumbing
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+
+
+def test_levains_hook_isolation_does_not_reach_the_remotes_own_server_hooks(two):
+    tmp, ana, ben = two
+    git("config", "core.hooksPath", str(tmp / "origin.git" / "hooks"), cwd=tmp / "origin.git")   # beats a machine-wide one
+    hook = tmp / "origin.git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'declined by the remote' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    before = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
+    assert record_ruling(ana, "src/z.py", "z stays") != 0                      # the push is refused ...
+    assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == before   # ... and the remote is unchanged

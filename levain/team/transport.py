@@ -50,13 +50,22 @@ class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
 
+# Every git call here is levain's own plumbing on a private worktree, so none of them runs the project's hooks: git on
+# Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
+# fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
+_NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+# rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; signing needs a
+# prompt a replay cannot answer
+_REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "commit.gpgsign=false"]
+
+
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     try:
-        cp = subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True, text=True,
+        cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
                             timeout=timeout, input=input_text,
                             stdin=None if input_text is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -594,7 +603,8 @@ class GitLedger:
             self._recover_dirty()
             orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             try:
-                cp = git(["rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt, check=False, timeout=timeout)
+                cp = git([*_REPLAY_CONFIG, "rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt,
+                         check=False, timeout=timeout)
             except TeamError:
                 self._restore(orig)
                 raise
@@ -602,7 +612,7 @@ class GitLedger:
                 return
             self._restore(orig)
             # Commits the remote already has under another SHA (--cherry-pick) and merges are not replayed.
-            local = git(["rev-list", "--reverse", "--right-only", "--cherry-pick", "--no-merges",
+            local = git(["rev-list", "--reverse", "--topo-order", "--right-only", "--cherry-pick", "--no-merges",
                          f"{rref}...{orig}"], self.wt).stdout.split()
             keep, drop = [], []
             for c in local:
@@ -614,28 +624,51 @@ class GitLedger:
             try:
                 git(["checkout", "-q", "--detach", rref], self.wt, timeout=timeout)
                 for c in keep:
-                    cp = git(["-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", c],
+                    cp = git([*_REPLAY_CONFIG, "cherry-pick", "--allow-empty", c],
                              self.wt, check=False, timeout=timeout)
                     if cp.returncode == 0:
                         continue
                     unmerged = git(["diff", "--name-only", "--diff-filter=U"], self.wt, check=False).stdout.strip()
-                    if not unmerged and git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0:
+                    marker = self.wt / git(["rev-parse", "--git-path", "CHERRY_PICK_HEAD"], self.wt).stdout.strip()
+                    try:
+                        picking = marker.read_text().strip()
+                    except OSError:
+                        picking = ""
+                    # git stops with exit 1 and CHERRY_PICK_HEAD naming THIS commit on an empty pick; any other state
+                    # (another exit code, a marker for a different commit, a conflict, staged changes) is a failure
+                    if (cp.returncode == 1 and picking == c and not unmerged
+                            and git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0):
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)   # already upstream: nothing to add
                         continue
                     raise TeamError("an unpushed entry cannot be replayed onto the remote ledger (two clones "
-                                    "share a device id?). Nothing was changed locally; if this clone's .git was "
+                                    "share a device id, or git could not run: "
+                                    f"{_tail(cp)}). Nothing was changed locally; if this clone's .git was "
                                     "copied from another, see `levain team join --new-device`")
                 new = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
                 git(["update-ref", "-m", "levain team: replay onto remote", REF, new, orig], self.wt)
                 published = True
-                git(["checkout", "-q", BRANCH], self.wt, timeout=60)
+                if drop:   # the branch now carries the replay, so nothing later can rediscover what was dropped
+                    self.warnings.append(f"{len(drop)} local team.toml/PROJECT.md change(s) conflicted with the "
+                                         "remote and were discarded; the remote's version stands. Re-run the "
+                                         "change (`levain team member add` / `levain team consolidate`) if still "
+                                         "wanted.")
+                try:
+                    git(["checkout", "-q", BRANCH], self.wt, timeout=60)
+                except TeamError as exc:
+                    try:
+                        self._reattach()    # the same checkout, forced
+                    except TeamError:
+                        raise TeamError(f"the replayed ledger was published to the local branch ({exc}) but the "
+                                        f"worktree could not be moved onto it; run `git -C {self.wt} checkout -f "
+                                        f"{BRANCH}`") from None
             finally:
                 if not published:
-                    self._reattach()
-            if drop:
-                self.warnings.append(f"{len(drop)} local team.toml/PROJECT.md change(s) conflicted with the remote "
-                                     "and were discarded; the remote's version stands. Re-run the change "
-                                     "(`levain team member add` / `levain team consolidate`) if still wanted.")
+                    try:
+                        self._reattach()
+                    except TeamError as exc:
+                        # the replay's own error is the one to raise; say what state this leaves behind
+                        self.warnings.append(f"the ledger worktree was left detached ({exc}); the next levain team "
+                                             "command re-attaches it")
 
     def _reattach(self) -> None:
         """Abort any replay in progress and put the worktree back on the branch, wherever the branch points."""
