@@ -463,22 +463,28 @@ class GitLedger:
         cp = git(["log", "--reverse", "--format=%H%x09%ae", rev, "--", "team.toml"], self.repo.toplevel,
                  check=False, timeout=30)
         prev: R.Team | None = None
-        for row in cp.stdout.splitlines():
-            sha, mail = row.split("\t", 1)
+        for row in cp.stdout.split("\n"):   # LF only: an author email may hold another line separator
+            if "\t" not in row:
+                continue
+            sha, raw_mail = row.split("\t", 1)
+            mail = E._printable(" ⏎ ".join(raw_mail.splitlines()))   # shown, never matched
             try:
                 cur = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
             except R.RolesError:
                 out.append(f"team.toml at {sha[:10]} (by {mail}) does not parse")
                 continue
             judge = prev or cur
-            if judge.handle_for_email(mail) != judge.owner:
+            if judge.handle_for_email(raw_mail) != judge.owner:
                 out.append(f"team.toml changed in {sha[:10]} by {mail}, who is not the owner ({judge.owner}) "
                            "of the version before it")
             prev = cur
         cp = git(["log", "--format=%H%x09%ae", rev, "--", CANON_FILE], self.repo.toplevel, check=False, timeout=30)
-        for row in cp.stdout.splitlines():
+        for row in cp.stdout.split("\n"):
+            if "\t" not in row:
+                continue
             sha, mail = row.split("\t", 1)
             if team.handle_for_email(mail) != team.owner:
+                mail = E._printable(" ⏎ ".join(mail.splitlines()))
                 out.append(f"{CANON_FILE} changed in {sha[:10]} by {mail}, who is not the owner ({team.owner})")
         return out
 

@@ -1058,3 +1058,16 @@ def test_a_repository_path_holding_a_line_break_is_still_discovered(tmp_path):
         repo = Repo.discover(d / "sub" / "file.py")
         assert repo is not None and os.path.realpath(repo.toplevel) == os.path.realpath(d), name
         assert os.path.realpath(repo.common) == os.path.realpath(d / ".git"), name
+
+
+def test_an_author_email_holding_a_line_separator_neither_breaks_verify_nor_draws_a_line(two, capsys):
+    # git keeps U+2028 in %ae; the history check split its rows with splitlines(), so the tail of such an email
+    # became a row with no tab and raised out of `levain team verify` (RUN 2026-10-05).
+    tmp, ana, ben = two
+    wt = GitLedger(Repo.discover(ben)).wt
+    (wt / "team.toml").write_text((wt / "team.toml").read_text() + "\n")
+    git("-c", "user.email=evil [team] FORGED@x", "commit", "-qam", "touch", cwd=wt)
+    capsys.readouterr()
+    team("verify", repo=ben)
+    out = capsys.readouterr().out
+    assert "FORGED" in out and not any(l.startswith("[team] FORGED") for l in out.splitlines()), out
