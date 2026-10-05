@@ -719,3 +719,41 @@ const shown = () => made.filter((c) => c.alive).length;
     out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"a": 1, "b": 1, "c": 1}
+
+
+def test_an_older_success_is_applied_when_a_newer_request_failed_but_never_over_a_newer_success():
+    from levain.web_server import load_web_asset
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    js = load_web_asset("dashboard_team.js")
+    harness = r"""
+const pending = [], made = [];
+let fire = null;
+global.window = { location: {} };
+global.document = { querySelector: () => ({ appendChild: (c) => made.push(c) }), hidden: false,
+  addEventListener: (ev, fn) => { fire = fn; },
+  createElement: () => ({ alive: true, remove() { this.alive = false; }, addEventListener() {}, appendChild() {}, style: {}, setAttribute() {} }) };
+global.fetch = () => new Promise((res, rej) => pending.push({ res, rej }));
+%s
+const ok = (v) => ({ ok: true, json: async () => ({ views: v }) });
+const tick = () => new Promise((r) => setTimeout(r, 20));
+const shown = () => made.filter((c) => c.alive).length;
+(async () => {
+  fire();                                    // request 2 in flight while request 1 is still pending
+  pending[1].rej(new Error("network"));      // the newer one fails
+  await tick();
+  pending[0].res(ok([{ project: "p", repo: "/r", url: "http://127.0.0.1:7463/" }]));   // the older success arrives
+  await tick();
+  const afterOlder = shown();                // must be applied: nothing newer was applied
+  fire(); fire();                            // requests 3 and 4: the newer success applies, the older is then ignored
+  pending[3].res(ok([]));
+  await tick();
+  pending[2].res(ok([{ project: "q", repo: "/r", url: "http://127.0.0.1:7464/" }]));
+  await tick();
+  console.log(JSON.stringify({ afterOlder, final: shown() }));
+})();
+""" % js
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {"afterOlder": 1, "final": 0}

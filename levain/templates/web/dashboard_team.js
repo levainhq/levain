@@ -55,15 +55,17 @@
 
   // No token logic here on purpose: the server answers /team_views.json only to a loopback peer on a loopback-bound
   // cockpit (anything else is a 404), so there is nothing off-box to authenticate.
-  // A response older than the latest request is ignored (loads can overlap: page load, then tab focus).
+  // Loads can overlap (page load, then tab focus). A success is applied unless a NEWER request has already been
+  // applied, so an older success is not thrown away just because a newer request failed (a failure applies nothing).
   let latest = 0;
+  let applied = 0;
   function load() {
     const mine = ++latest;
     // Only a successful response changes the UI: a non-ok answer or a failed fetch keeps what is shown now (an
     // empty list from a healthy server still clears it).
     fetch("/team_views.json", { headers: { Accept: "application/json" } })
       .then((r) => { if (!r.ok) throw new Error("status " + r.status); return r.json(); })
-      .then((j) => { if (mine === latest && Array.isArray(j.views)) render(j.views); })
+      .then((j) => { if (mine > applied && Array.isArray(j.views)) { applied = mine; render(j.views); } })
       .catch(() => {});
   }
   load();
