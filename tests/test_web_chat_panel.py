@@ -190,7 +190,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
       b.fire("keydown", { key: "Enter", isTrusted: true }); b.fire("keydown", { key: " ", isTrusted: true }); b.fire("keyup", { key: "Enter", isTrusted: true });
     }
     await sleep(60);
-    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "a key on Approve or Reject decides nothing beyond the button's own activation");
+    // and the click a browser synthesizes for Enter/Space on a focused button (trusted, detail 0) decides nothing either
+    for (const label of ["Approve", "Reject"]) byText(panel, label).fire("click", { isTrusted: true, detail: 0 });
+    await sleep(60);
+    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "no key, and no keyboard-activated click, on Approve or Reject decides anything");
     // compose is disabled while the hold waits: a trusted Enter on it (or held-down repeats) sends nothing
     area.value = "again"; area.fire("keydown", { key: "Enter", isTrusted: true }); area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(60);
     ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
@@ -344,6 +347,7 @@ def test_the_only_key_listener_is_the_compose_box():
     assert "!ev.isTrusted || area.disabled || deciding" in src
     # a script's requestSubmit() fires a TRUSTED submit, so the compose form's submit only prevents default
     assert 'form.addEventListener("submit", (ev) => { ev.preventDefault(); });' in src
+    assert src.count("!ev.isTrusted || ev.detail === 0 || deciding || !session") == 2   # decisions: pointer clicks only
     assert 'sendBtn.type = "button"' in src and 'sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });' in src
     assert 'area.addEventListener("keydown"' in src
     assert not re.search(r'addEventListener\("key(up|press)"|onkey(up|down|press)', src)

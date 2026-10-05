@@ -517,14 +517,16 @@
       poll(jid, myRun, (j) => { live.textContent = ""; decided(j, jid); });
     }
 
-    // THE ONLY /chat/approve POST in this file: a trusted click on this button, once, with both buttons locked.
+    // THE ONLY /chat/approve POST in this file: a trusted POINTER click on this button, once, with both buttons locked.
+    // A key on a focused button (Enter/Space) reaches the page as a trusted click with detail 0; for a decision that is
+    // refused, so no key ever decides (the reason box sits right before Approve in tab order: Tab, Enter would approve).
     approve.addEventListener("click", (ev) => {
-      if (!ev.isTrusted || deciding || !session) return;
+      if (!ev.isTrusted || ev.detail === 0 || deciding || !session) return;
       lock();
       api("POST", "/chat/approve", { session_id: session.id, expect: decisionId }).then(after);
     });
     reject.addEventListener("click", (ev) => {
-      if (!ev.isTrusted || deciding || !session) return;
+      if (!ev.isTrusted || ev.detail === 0 || deciding || !session) return;
       lock();
       const reason = reasonIn.value.trim();
       api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason, expect: decisionId } : { session_id: session.id, expect: decisionId }).then(after);
