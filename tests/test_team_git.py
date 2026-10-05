@@ -352,6 +352,25 @@ def test_the_export_is_framed_exactly_as_the_contract_says(two, capsys):
     assert not capsys.readouterr().out.startswith('{"anneal_team_stream"')    # the convenience view stays unframed
 
 
+def test_a_ledger_file_with_an_unframeable_path_is_still_exported(two, capsys):
+    import re
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/odd.py"],
+                          words="odd name stays"), "")
+    odd = gl.wt / "ledger" / "ana" / "device!.jsonl"
+    odd.write_text(json.dumps(root, ensure_ascii=False, sort_keys=True) + "\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "an odd file name", cwd=gl.wt)
+    capsys.readouterr()
+    assert team("export", "--jsonl", repo=ana) == 0
+    envs = [json.loads(r) for r in capsys.readouterr().out.splitlines()[1:]]
+    assert any("odd name stays" in e["line"] for e in envs) and any("a stays" in e["line"] for e in envs)   # nothing withheld
+    assert all(re.fullmatch(r"[A-Za-z0-9._@:+/=-]{1,200}", e["frame"]) for e in envs)
+    assert any(e["frame"].startswith("unnamed-") for e in envs)
+
+
 def _anneal_team_import(stdin: str, db: Path, extra=()):
     return subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
                            "--link-authority", "ana", *extra, "-"], input=stdin, capture_output=True, text=True, timeout=60)
