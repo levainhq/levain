@@ -78,21 +78,12 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
 
     live = [e for e in ledger.in_force if keep(e)]
 
-    # 1. waiting on the viewer: open questions and tensions they own, and proposed replacements of their rulings
+    # 1. waiting on the viewer: open questions and tensions they own
     waiting = [_card(e, now) for e in live
                if e.get("type") in ("question", "tension") and team.owns(handle, e.get("owner", ""))]
-    awaiting_words = []
-    for e in ledger.entries:
-        # A replacement awaiting the owner is a RULING that itself stands (a superseded one awaits nothing) and
-        # whose link to a ruling the viewer owns was refused at read (the proposer is neither the ruling's author
-        # nor the canon owner): it changes nothing until the owner records their own words.
-        if e.get("kind") != "ruling" or e["id"] in ledger.superseded:
-            continue
-        for sid in e.get("supersedes", []):
-            t = ledger.by_id.get(sid)
-            if (t and keep(t) and t.get("kind") == "ruling" and sid not in ledger.superseded
-                    and team.owns(handle, t.get("owner", "")) and I.may_link(e, t, ledger.owner) is not None):
-                awaiting_words.append({"replacement": _card(e, now), "ruling": _card(t, now)})
+    # Pane 1 is only this. There is deliberately no "replacement awaiting your words" half: the ledger cannot express a
+    # wordless replacement, and a supersede refused by authority (index.may_link) leaves BOTH entries in force, which
+    # is a ledger-level semantic that `levain team verify` reports. It is not the view's to narrate.
 
     # 2. where agents were stopped: acks by path of the ruling they acknowledge; never by who acked.
     # One ack ENTRY adds at most 1 to a path, however many refs or duplicate globs reach it; only a ref that resolves
@@ -150,7 +141,7 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
             "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
-            "waiting": waiting, "awaiting_words": awaiting_words, "stopped": stopped,
+            "waiting": waiting, "stopped": stopped,
             "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
             "in_force_count": len(live), "path_filter": pf,
             "generated": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -212,12 +203,8 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
     pf = m.get("path_filter") or ""
 
     p1 = "".join(_row(c) for c in m["waiting"])
-    p1 += "".join(_row(a["replacement"], "proposes to replace the ruling below; it changes nothing until the "
-                       "owner records their words") + _row(a["ruling"]) for a in m["awaiting_words"])
-    pane1 = _panel(1, "operate", "Waiting on you",
-                   "Questions and tensions you own; proposed replacements of your rulings, not in force until you give your words.",
-                   len(m["waiting"]) + len(m["awaiting_words"]),
-                   p1 or _empty("Nothing is waiting on you."))
+    pane1 = _panel(1, "operate", "Waiting on you", "Questions and tensions where you are the owner.",
+                   len(m["waiting"]), p1 or _empty("Nothing is waiting on you."))
 
     rows = []
     for r in m["stopped"]:
@@ -380,11 +367,16 @@ class _ViewServer(ThreadingHTTPServer):
     cockpit_url: str
     assets: dict
     model_lock: threading.Lock
+    model_lock_timeout: float
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
             return
         super().handle_error(request, client_address)
+
+
+class _Busy(Exception):
+    pass
 
 
 class _ViewHandler(GuardedHandler):
@@ -395,13 +387,18 @@ class _ViewHandler(GuardedHandler):
 
     def _model(self, path_filter: str = "") -> dict:
         gl: GitLedger = self.server.ledger_reader
-        # One reader at a time: the transport's history cache and git worktree are not written for concurrent
-        # readers. Static assets never come through here, so they are never queued behind a ledger read.
-        with self.server.model_lock:
+        # Serializes model generation WITHIN this process only (it says nothing about other processes' git use).
+        # A cold history read can take a minute, so a waiter gives up after model_lock_timeout and the caller
+        # answers 503 "busy" rather than piling up handler threads. Static assets never come through here.
+        if not self.server.model_lock.acquire(timeout=self.server.model_lock_timeout):
+            raise _Busy()
+        try:
             sha, team, ledger = gl.snapshot()
             return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
                                path_filter=path_filter)
+        finally:
+            self.server.model_lock.release()
 
     def do_GET(self) -> None:
         if self._refuse_read(head=False):
@@ -414,8 +411,13 @@ class _ViewHandler(GuardedHandler):
             pf = (parse_qs(query).get("path") or [""])[0][:300]
             try:
                 model = self._model(pf)
+            except _Busy:
+                return self._send(b"busy, retry in a moment\n", "text/plain; charset=utf-8", status=503)
             except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
-                print(f"levain team view: ledger unavailable: {exc}", file=sys.stderr, flush=True)
+                try:  # best effort: a closed stderr must not stop the 503, and repr() keeps it one unforgeable line
+                    print(f"levain team view: ledger unavailable: {exc!r}", file=sys.stderr, flush=True)
+                except (OSError, ValueError):
+                    pass
                 return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
                                   "text/plain; charset=utf-8", status=503)
             if path == "/view.json":
@@ -474,6 +476,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     httpd.allowed_hosts = _LOOPBACK | {bound.lower()}
     httpd.ledger_reader = gl
     httpd.model_lock = threading.Lock()
+    httpd.model_lock_timeout = 10.0
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag
     httpd.cockpit_url = cockpit_url if cockpit_url.startswith(("http://", "https://")) else DEFAULT_COCKPIT_URL

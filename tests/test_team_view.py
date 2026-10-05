@@ -346,30 +346,80 @@ def _plus(ledger, author, items):
     return I.build(files + [(f"{author}/g.jsonl", lines)], owner=ledger.owner), ids
 
 
-def test_awaiting_words_needs_a_ruling_replacement_that_still_stands():
+def test_pane_one_is_exactly_the_questions_and_tensions_the_viewer_owns():
+    # a supersede refused by authority leaves BOTH entries in force: a ledger semantic (`team verify` reports it),
+    # not something the view narrates. So there is no "proposed replacement" half to this pane, and no such field.
     ledger, ents = _build([("ana", "decision", 9, dict(kind="ruling", owner="ana", paths=["a.py"], words="Original."))])
     rid = ents[0]["id"]
-    # a question that supersedes the ruling is not a replacement awaiting words
-    led, _ = _plus(ledger, "ben", [("question", dict(owner="ana", paths=["a.py"], summary="why?", supersedes=[rid]), None)])
-    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
-    # a standing ruling by someone who is neither the ruling's author nor the canon owner is refused at read, so it
-    # awaits the owner (Ana owns the call and the canon here, so ben's proposal waits on her)
-    mk = dict(kind="ruling", owner="ana", paths=["a.py"], words="Use banker's rounding.", supersedes=[rid])
-    led, (rep,) = _plus(ledger, "ben", [("decision", mk, None)])
-    assert [a["replacement"]["id"] for a in V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"]] == [rep]
-    assert V.build_model(TEAM, led, "ben", None, "x", now=NOW)["awaiting_words"] == []      # not ben's call to answer
-    # the path filter applies to the ruling the owner sees
-    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW, path_filter="zzz.py")["awaiting_words"] == []
-    assert len(V.build_model(TEAM, led, "ana", None, "x", now=NOW, path_filter="a.py")["awaiting_words"]) == 1
-    # a practice (not a ruling) proposing the replacement is not shown either
-    led, _ = _plus(ledger, "ben", [("decision", dict(kind="practice", owner="ana", paths=["a.py"], supersedes=[rid]), None)])
-    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
-    # once the replacement is itself superseded (the owner replaced it) it awaits nothing
-    led, _ = _plus(ledger, "ben", [("decision", mk, None)])
-    led, _ = _plus(led, "ana", [("decision", dict(kind="ruling", owner="ana", paths=["a.py"], words="Final.",
-                                                   supersedes=[[e for e in led.entries if e.get("supersedes")][0]["id"]]),
-                                 None)])
-    assert V.build_model(TEAM, led, "ana", None, "x", now=NOW)["awaiting_words"] == []
+    led, _ = _plus(ledger, "ben", [("decision", dict(kind="ruling", owner="ana", paths=["a.py"],
+                                                      words="Banker's rounding.", supersedes=[rid]), None),
+                                   ("question", dict(owner="ana", paths=["a.py"], summary="why?"), None)])
+    m = V.build_model(TEAM, led, "ana", None, "x", now=NOW)
+    assert "awaiting_words" not in m
+    assert [c["type"] for c in m["waiting"]] == ["question"]
+    page = V.render_html(m)
+    pane1 = page.split('id="pane1"')[1].split('id="pane2"')[0]
+    assert "proposed replacements" not in pane1 and "proposes to replace" not in pane1
+
+
+def test_a_busy_ledger_answers_503_instead_of_hanging():
+    httpd = V.make_view_server(_Stub(), port=0)
+    httpd.model_lock_timeout = 0.3
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        httpd.model_lock.acquire()          # a cold history read is holding the lock
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 503 and b"busy" in body
+        assert _req(httpd.server_address[1], "GET", "/team_view.css")[0].status == 200
+    finally:
+        httpd.model_lock.release()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_503_diagnostic_is_best_effort_and_one_line(capfd, monkeypatch):
+    class Boom(_Stub):
+        def snapshot(self):
+            if getattr(self, "armed", False):
+                raise RuntimeError("fatal: first line\n[levain] FORGED log line\nthird")
+            return super().snapshot()
+    stub = Boom()
+    httpd = V.make_view_server(stub, port=0)
+    stub.armed = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 503
+        err = capfd.readouterr().err
+        assert "\n[levain] FORGED" not in err and "FORGED log line" in err    # one line, newlines escaped
+        # a closed stderr must not stop the 503 from being sent
+        import sys
+
+        class Dead:
+            def write(self, *a):
+                raise ValueError("I/O operation on closed file")
+            flush = write
+        monkeypatch.setattr(sys, "stderr", Dead())
+        assert _req(httpd.server_address[1], "GET")[0].status == 503
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_port_zero_is_accepted_and_help_agrees():
+    from levain.team.cli import _port
+    assert _port("0") == 0 and _port("65535") == 65535
+    h = V.make_view_server(_Stub(), port=0)          # 0 = ephemeral
+    assert h.server_address[1] > 0
+    h.server_close()
+    import argparse
+    from levain.team import cli
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="c")
+    cli.register(sub)
+    helptext = [a for a in sub.choices["team"]._subparsers._group_actions[0].choices["view"]._actions
+                if "--port" in a.option_strings][0].help
+    assert "0..65535" in helptext and "ephemeral" in helptext
 
 
 def test_a_held_entry_appears_once_with_both_reasons_and_paths_are_deduped():
