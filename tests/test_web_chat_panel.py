@@ -99,7 +99,7 @@ function fetch(path, init) {
   if (hdr["X-Levain-Chat-Token"] !== TOKEN) return reply(403, { error: "chat_token", message: "needs token" });
   if (path === "/chat.json") return reply(200, { entities: ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
-  if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle" } } });
+  if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
   if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "chat_token", message: "needs token" });
   if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "chat_token", message: "needs token" });
@@ -117,7 +117,11 @@ function fetch(path, init) {
   if (M === "proxy503json" && path === "/chat/approve") return reply(503, { error: "upstream_timeout" });
   if (M === "evicted" && path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "unknown" });
   if (["post500", "proxy503", "proxy503json", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
-    return reply(200, { state: "idle", job_id: null });
+    return reply(200, { state: "idle", job_id: null, last_job: { kind: "approve", status: "done",
+      result: { reply: "ran it", tool_activity: ["\u2699 terminal: rm -rf x"], gated: false, error: null } } });
+  if (M === "restart404" && path === "/chat/approve") return reply(500, {});
+  if (M === "restart404" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(404, { error: "unknown_session", message: "no such session" });
   if (M && M.startsWith("lost") && path.startsWith("/chat/session.json?id=S")) {
     sessionReads++;
     return M === "lostloop" ? reply(200, { state: "busy", job_id: "J-appr" }) : reply(200, { state: "idle", job_id: null });
@@ -154,15 +158,21 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
   if (process.argv[3] === "enter") {
     // 0.6.7: Enter sends from the compose box; Shift+Enter and an IME-composing Enter do not
-    area.fire("keydown", { key: "Enter", shiftKey: true }); await sleep(30);
-    area.fire("keydown", { key: "Enter", isComposing: true }); await sleep(30);
-    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter and a composing Enter send nothing");
-    area.fire("keydown", { key: "Enter" }); await sleep(80);
+    area.fire("keydown", { key: "Enter", shiftKey: true, isTrusted: true }); await sleep(30);
+    area.fire("keydown", { key: "Enter", isComposing: true, isTrusted: true }); await sleep(30);
+    area.fire("compositionstart", {}); area.fire("keydown", { key: "Enter", keyCode: 13, isTrusted: true }); await sleep(30);
+    area.fire("compositionend", {}); await sleep(30);
+    area.fire("keydown", { key: "Enter", isTrusted: false }); await sleep(30);
+    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter, a composing Enter (by flag or by composition events) and a synthetic Enter send nothing");
+    area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(80);
     ok(calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter sends the turn once");
     const reason = find(panel, (n) => n.tagName === "textarea" && n.attrs["aria-label"] === "reason for rejecting");
     ok(reason && reason.rows === 1, "the reject reason is a one-line growing textarea");
-    reason.fire("keydown", { key: "Enter" }); reason.fire("keydown", { key: "Enter", shiftKey: true }); await sleep(60);
+    reason.fire("keydown", { key: "Enter", isTrusted: true }); reason.fire("keydown", { key: "Enter", shiftKey: true, isTrusted: true }); await sleep(60);
     ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "Enter in the reason field decides nothing");
+    // compose is disabled while the hold waits: a trusted Enter on it (or held-down repeats) sends nothing
+    area.value = "again"; area.fire("keydown", { key: "Enter", isTrusted: true }); area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(60);
+    ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
     console.log("PASS"); return;
   }
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
@@ -175,7 +185,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
     ok(panel.textContent.includes("outcome of the last turn is unknown; the previous request may already have run"), "an ambiguous turn is reported unknown");
     ok(area.disabled, "compose is blocked");
-    const rr = byText(panel, "Re-read the session"); ok(rr, "a re-read button is offered");
+    const rr = byText(panel, "Check what happened"); ok(rr, "a re-read button is offered");
     rr.fire("click", { isTrusted: false }); await sleep(50);
     ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
     rr.fire("click", { isTrusted: true }); await sleep(80);
@@ -200,10 +210,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
+  if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "restart404", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
     // No clear answer to the approve (a bare 5xx, a proxy's status, an evicted job, lost polls): the decision may
     // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
-    // the session only on a trusted click of "Re-read the session", carrying the warning into what it shows.
+    // the session only on a trusted click of "Check what happened", carrying the warning into what it shows.
     const m = process.argv[3];
     approve.fire("click", { isTrusted: true }); await sleep(300);
     ok(approvals() === 1, "one approve was sent");
@@ -212,21 +222,29 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(!byText(panel, "Approve"), "no consent box is built on its own");
     ok(area.disabled, "compose stays blocked");
     ok(!panel.textContent.includes("done it"), "never shown as a completed turn");
-    const rr = byText(panel, "Re-read the session"); ok(rr, "a re-read button is offered");
+    const rr = byText(panel, "Check what happened"); ok(rr, "a re-read button is offered");
     rr.fire("click", { isTrusted: false }); await sleep(50);
     ok(!calls.some((c) => c.path === "/chat/session.json"), "a synthetic click reads nothing");
     rr.fire("click", { isTrusted: true }); await sleep(120);
     ok(calls.filter((c) => c.path === "/chat/session.json").length === 1, "a trusted click reads the session once");
-    if (m === "ambiguousgated" || m === "resync" || m === "stale") {
+    if (m === "restart404") {
+      ok(panel.textContent.includes("The server restarted, so that session has ended. Your last request may or may not have run"), "a session the server no longer knows is reported as a restart, outcome unknown");
+      ok(panel.textContent.includes("/ws/ent"), "it says where to look");
+      ok(byText(panel, "Start a new session") && !byText(panel, "Approve"), "a way forward, and no box");
+    } else if (m === "ambiguousgated" || m === "resync" || m === "stale") {
       const box = find(panel, (n) => n.className === "chat-consent");
       ok(box && box.textContent.includes("may already have run") && box.textContent.includes("y-after-reload"), "the re-read box carries the warning");
       const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
       again.fire("click", { isTrusted: true }); await sleep(80);
       ok(JSON.parse(calls.filter((c) => c.path === "/chat/approve")[1].body).expect === "D2", "it carries the id the server reported");
     } else if (m === "lostloop") {
-      ok(byText(panel, "Re-read the session") && area.disabled, "a busy session offers the re-read again; nothing loops");
+      ok(byText(panel, "Check what happened") && area.disabled, "a busy session offers the re-read again; nothing loops");
     } else {
-      ok(panel.textContent.includes("The session is idle now.") && !area.disabled, "an idle session is usable again, warning shown");
+      ok(panel.textContent.includes("The session is idle now") && !area.disabled, "an idle session is usable again");
+      if (["post500", "proxy503", "proxy503json", "evicted"].includes(m)) {
+        ok(panel.textContent.includes("These actions ran:") && panel.textContent.includes("terminal: rm -rf x"), "the check shows what the lost decision ran");
+        ok(panel.textContent.includes("above is what the server recorded"), "and says the record is the answer");
+      } else ok(panel.textContent.includes("The session is idle now. The outcome"), "with no record, the outcome stays unknown");
     }
     console.log("PASS"); return;
   }
@@ -251,7 +269,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
@@ -295,5 +313,6 @@ def test_the_only_key_listener_is_the_compose_box():
     # keystroke can approve or reject (the decision buttons are trusted clicks).
     src = JS.read_text()
     assert src.count('addEventListener("keydown"') == 1
+    assert "!ev.isTrusted || area.disabled || deciding" in src
     assert 'area.addEventListener("keydown"' in src
-    assert "keyup" not in src and "keypress" not in src
+    assert not re.search(r'addEventListener\("key(up|press)"|onkey(up|down|press)', src)

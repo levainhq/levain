@@ -1544,6 +1544,7 @@ def test_a_worker_that_cannot_start_restores_the_decision_id(tmp_path, monkeypat
         host.approve(sid, res["decision_id"])
     assert e.value.http_status == 503
     assert host.session_status(sid)["decision_id"] == res["decision_id"]
+    assert host.session_status(sid)["last_job"]["kind"] == "turn"   # the approve that never started is not "what happened"
     monkeypatch.undo()
     assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
 
@@ -1647,3 +1648,14 @@ def test_the_digest_recorded_is_the_one_read_with_the_shown_set(tmp_path):
     st = _wait(host, host.turn(sid, "list it")["job_id"])
     assert "held_digest" not in st["result"] and "held_digest" not in host.session_status(sid)
     assert _wait(host, host.approve(sid, expect=st["result"]["decision_id"])["job_id"])["result"]["reply"] == "listed"
+
+
+def test_session_json_reports_the_last_job_so_a_page_that_lost_it_can_see_what_ran(tmp_path):
+    """0.6.7 (Phill, after the step-3 click-through): "Check what happened" after a lost approve must show whether
+    the action ran. The page never got that job's id, so the session reports its most recent job."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed", tool_activity=["\u2699 terminal: git push"])])
+    job = host.approve(sid, res["decision_id"])["job_id"]
+    _wait(host, job)
+    last = host.session_status(sid)["last_job"]
+    assert last["job_id"] == job and last["kind"] == "approve" and last["status"] == "done"
+    assert last["result"]["tool_activity"] == ["\u2699 terminal: git push"] and last["result"]["reply"] == "pushed"
