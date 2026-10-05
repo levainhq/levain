@@ -309,6 +309,11 @@ def sessionstart(payload: dict) -> None:
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
     try:
         sha, team, ledger = gl.snapshot()
+        if ledger.tamper:
+            # Only the refusal: nothing of a refused ledger (rulings, counts, words) reaches the agent or its memory.
+            _out({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
+                  I.oneline(_tamper_text(ledger, team)) + " Every edit in this clone is denied until then."}})
+            return
         tree = gl.state_hash(ledger, team)
         canon_text = gl.read_canon(sha)
     except (R.RolesError, TeamError) as exc:
@@ -336,12 +341,7 @@ def sessionstart(payload: dict) -> None:
         lines.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
         lines.append(f"[team] ledger integrity: {len(ledger.problems)} problem(s); run `levain team verify`")
-    if ledger.tamper:
-        # Said first and plainly, and nothing of a tampered ledger is imported into the member's memory.
-        lines.insert(0, I.oneline(_tamper_text(ledger, team)) + " Every edit in this clone is denied until then.")
-        note = None
-    else:
-        note = anneal_import(gl, ledger, tree, team.owner)
+    note = anneal_import(gl, ledger, tree, team.owner)
     if note:
         lines.append(note)
     text = "\n".join(lines)

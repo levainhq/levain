@@ -7,7 +7,8 @@ can never conflict on an entry) and ``PROJECT.md`` (the generated canon, written
 Every read and write goes through a private worktree of that branch kept under
 ``<git common dir>/levain-team/worktree``: inside ``.git``, so the code branch never tracks it, and under the
 COMMON dir, so every ``git worktree`` of the project shares one ledger checkout. Writers hold an exclusive
-``flock`` on ``levain-team/lock``; readers hold a shared one, so a hook never reads a half-rebased tree.
+``flock`` on ``levain-team/lock``; readers take no lock: they read one commit of the branch (the tip, through git
+plumbing), never the worktree, so a hook never sees a half-rebased tree.
 
 POSIX only (``fcntl``). The transport is the class below; a self-hosted server is a second implementation of
 the same five operations (append, sync, fetch_if_due, ledger, write_canon), not a change to the callers.
@@ -388,6 +389,7 @@ class GitLedger:
             raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
         leaves: list[tuple[bytes, str]] = []
+        seen_paths: set[bytes] = set()
         for rec in cp.stdout_bytes.split(b"\0"):
             if not rec:
                 continue
@@ -396,6 +398,10 @@ class GitLedger:
             if not tab or len(fields) != 3:
                 raise TeamError("git ls-tree gave a record levain cannot read")
             mode, kind = fields[0], fields[1]
+            if path in seen_paths:                                        # two entries, one path: never valid
+                bad_paths.append(path)
+                continue
+            seen_paths.add(path)
             is_tree = mode == b"040000" and kind == b"tree"
             if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
                 ok = is_tree
@@ -433,7 +439,9 @@ class GitLedger:
             if team is not None and folder not in by_safe and not folder.startswith("pack-"):
                 problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
                 continue
-            lines = [_text(l) for l in _blob_lines(blobs.get(sha, b""))]
+            raw_lines = _blob_lines(blobs.get(sha, b""))
+            lines = [_text(l) for l in raw_lines]
+            raw = [l.decode("latin-1") for l in raw_lines]               # pins compare RAW bytes, not decoded text
             got, probs, _last = E.verify_lines(lines)
             for e in got:
                 other = seen_ids.setdefault(str(e.get("id")), rel)
@@ -441,11 +449,11 @@ class GitLedger:
                     tamper.append(f"ledger/{rel} and ledger/{other} both hold entry id {e.get('id')}; levain never "
                                   "writes an id twice (the owner removes the copy)")
             pin = pins.get(rel)
-            if pin and lines[:len(pin)] != pin:
+            if pin and raw[:len(pin)] != pin:
                 problems.append(f"ledger/{rel}: lines this clone had accepted were removed or rewritten; the ledger "
                                 "is append-only, so the lines already accepted still count and the rest of the "
                                 "file is not accepted")
-                files[rel] = list(pin)
+                files[rel] = [_text(p_.encode("latin-1")) for p_ in pin]
                 continue
             files[rel] = lines
             # Pin only what verified: the lines before the first one that did not, and only in a file filed under
@@ -457,11 +465,11 @@ class GitLedger:
             if any(E.safe_handle(e.get("author", "")) != folder for e in got):
                 continue
             if good > len(pin or []):
-                new_pins[rel] = lines[:good]
+                new_pins[rel] = raw[:good]
         for rel in sorted(set(pins) - {p[len(b"ledger/"):].decode("ascii") for p, _s in leaves}):
             problems.append(f"ledger/{rel}: a file this clone had accepted is gone; the ledger is append-only, so "
                             "its accepted lines still count")
-            files[rel] = list(pins[rel])
+            files[rel] = [_text(p_.encode("latin-1")) for p_ in pins[rel]]
         if not tamper and (new_pins != pins or pin_problem):      # a tampered read never advances the pins
             self._save_pins(new_pins)
         return files, problems, tamper
@@ -488,11 +496,23 @@ class GitLedger:
             return {}, _PINS_UNREADABLE
         return data, ""
 
-    def _save_pins(self, pins: dict[str, list[str]]) -> None:
+    def _save_pins(self, pins: dict[str, list[str]], *, merge: bool = True) -> None:
+        """Save under a small flock. Lock-free readers each load, compute and save, so a reader at an older tip must
+        not shrink a newer pin: the stored pins are re-read under the lock and merged monotonically per file (the
+        longer pin wins when one extends the other; on a CONFLICT the stored one is kept and the reader reports the
+        rewrite as usual)."""
         try:
-            self.base.mkdir(parents=True, exist_ok=True)
-            _atomic_write(self.base / "pins.json", json.dumps(pins))
-        except OSError:
+            with self.lock(name="pins.lock", timeout=5.0):
+                if merge:
+                    stored, _bad = self._pins()
+                    merged = dict(stored)
+                    for rel, new in pins.items():
+                        cur = stored.get(rel)
+                        if cur is None or new[:len(cur)] == cur:
+                            merged[rel] = new
+                    pins = merged
+                _atomic_write(self.base / "pins.json", json.dumps(pins))
+        except (OSError, TeamError):
             pass
 
     def repin(self, rel: str | None = None) -> list[str]:
@@ -509,7 +529,7 @@ class GitLedger:
         if rel not in pins:
             return []
         del pins[rel]
-        self._save_pins(pins)
+        self._save_pins(pins, merge=False)
         return [rel]
 
     def _blobs(self, shas: set[str]) -> dict[str, bytes]:
@@ -946,10 +966,6 @@ class GitLedger:
             return f"{type(exc).__name__}: {exc}"
 
     # ---- canon ---------------------------------------------------------------------------------------------
-
-    def ledger_tree(self) -> str:
-        cp = git(["rev-parse", "-q", "--verify", f"{REF}:ledger"], self.repo.toplevel, check=False)
-        return cp.stdout.strip() or "empty"
 
     def read_canon(self, rev: str | None = None) -> str | None:
         return self._show(CANON_FILE, rev or REF)

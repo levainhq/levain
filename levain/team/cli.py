@@ -228,7 +228,7 @@ def cmd_verify(args) -> int:
     print(C.staleness(canon_text, gl.state_hash(ledger, team)))
     for p in problems:
         print(f"PROBLEM: {p}")
-    print("ledger verified: every chain intact, every line written by the member it is filed under"
+    print("ledger verified: every chain intact, every line's author matches the folder it is filed under"
           if not problems else f"{len(problems)} problem(s)")
     return 0 if not problems else 1
 

@@ -570,6 +570,65 @@ def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
     assert not _pins_file(ben).exists()
 
 
+def test_session_start_on_a_tampered_ledger_emits_only_the_refusal(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays visible") == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    assert team("sync", repo=ben) == 0
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    ctx = hook("sessionstart", payload)["hookSpecificOutput"]["additionalContext"]
+    assert "REFUSED as tampered" in ctx
+    assert "a stays visible" not in ctx and "ruling(s)" not in ctx
+
+
+def test_an_older_shorter_pin_never_shrinks_a_longer_stored_one(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    gb = GitLedger(Repo.discover(ben))
+    stored = json.loads(_pins_file(ben).read_text())
+    key = next(k for k in stored if k.startswith("ana/"))
+    assert len(stored[key]) >= 2
+    gb._save_pins({key: stored[key][:1]})                            # a reader that saw an older tip
+    assert json.loads(_pins_file(ben).read_text())[key] == stored[key]
+    gb._save_pins({key: ["a different first line"]})                 # a conflict: the stored pin is kept
+    assert json.loads(_pins_file(ben).read_text())[key] == stored[key]
+
+
+def test_two_tree_entries_with_one_path_are_tamper(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    listing = git("ls-tree", "-z", "HEAD:ledger/ana", cwd=gl.wt).split("\0")
+    ents = [e.split("\t", 1) for e in listing if e]
+    mode, _t, sha = ents[0][0].split(" ")
+    other = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=gl.wt, input="something else\n", check=True,
+                           capture_output=True, text=True).stdout.strip()
+    raw = b""
+    for meta, name in ents + [[f"{mode} blob {other}", f.name]]:
+        m, _k, h = meta.split(" ")
+        raw += m.encode() + b" " + name.encode() + b"\0" + bytes.fromhex(h)
+    tree = subprocess.run(["git", "hash-object", "-t", "tree", "-w", "--literally", "--stdin"], cwd=gl.wt, input=raw,
+                          check=True, capture_output=True).stdout.decode().strip()
+    root_ents = [e for e in git("ls-tree", "-z", "HEAD:ledger", cwd=gl.wt).split("\0") if e]
+    root_ents = [e for e in root_ents if e.split("\t", 1)[1] != "ana"] + [f"040000 tree {tree}\tana"]
+    ledger_tree = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(root_ents) + "\0", check=True,
+                                 capture_output=True, text=True).stdout.strip()
+    top = [e for e in git("ls-tree", "-z", "HEAD", cwd=gl.wt).split("\0") if e]
+    top = [e for e in top if e.split("\t", 1)[1] != "ledger"] + [f"040000 tree {ledger_tree}\tledger"]
+    root = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(top) + "\0", check=True,
+                          capture_output=True, text=True).stdout.strip()
+    c = git("commit-tree", root, "-p", "HEAD", "-m", "dup path", cwd=gl.wt).strip()
+    git("update-ref", "refs/heads/levain-ledger", c, cwd=gl.wt)
+    assert any(f.name in t for t in ledger(ana).tamper), ledger(ana).tamper
+
+
 def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
