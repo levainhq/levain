@@ -23,7 +23,11 @@
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
   let deciding = false;      // an approve/reject POST or its job is in flight
-  let confirmedJob = null;   // the id of the last job whose start this page saw confirmed (a 202 carrying it)
+  let confirmedJob = null;
+  const APPROVE_LABEL = "Approve";
+  const ARM_TIMEOUT_MS = 5000;   // an armed Approve disarms itself after this long
+  const ARM_GUARD_MS = 300;      // a second activation sooner than this is a double press or key repeat, not a confirm
+  let disarmCurrent = null, armedButton = null;   // the armed Approve, if any, so a click elsewhere can disarm it   // the id of the last job whose start this page saw confirmed (a 202 carrying it)
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -61,6 +65,8 @@
     panel.setAttribute("data-zone", "operate");
     panel.setAttribute("aria-label", "chat with an entity");
     panel.appendChild(el("div", "chat-head", "▶ Chat"));
+    // A click anywhere in the panel other than the armed Approve itself disarms it.
+    panel.addEventListener("click", (ev) => { if (disarmCurrent && ev.target !== armedButton) disarmCurrent(); });
     body = el("div", "chat-body");
     panel.appendChild(body);
     const board = document.getElementById("board");
@@ -473,18 +479,18 @@
     reasonIn.setAttribute("aria-label", "reason for rejecting");
     reasonIn.maxLength = 500;
     autoGrow(reasonIn);
-    // Enter in this field only starts a new line: it sits outside any form and nothing here listens for Enter, so
-    // no key approves or rejects; the decision buttons are clicks.
-    const approve = el("button", "chat-btn approve", "Approve");
+    // Enter in this field only starts a new line: it sits outside any form and nothing here listens for Enter.
+    // Tab order is reason -> Reject -> Approve, so the key after typing a reason reaches the safe direction first.
+    const approve = el("button", "chat-btn approve", APPROVE_LABEL);
     const reject = el("button", "chat-btn reject", "Reject");
     approve.type = "button"; reject.type = "button";
     const row = el("div", "chat-row");
-    if (decidable) row.appendChild(approve);
     row.appendChild(reject);
+    if (decidable) row.appendChild(approve);
     box.appendChild(reasonIn); box.appendChild(row);
     log.appendChild(box);
 
-    function lock() { retireChecks(); deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
+    function lock() { disarm(); retireChecks(); deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
     function decided(j, jid) {
       deciding = false; box.remove();
       const res = j.result;
@@ -517,16 +523,38 @@
       poll(jid, myRun, (j) => { live.textContent = ""; decided(j, jid); });
     }
 
-    // THE ONLY /chat/approve POST in this file: a trusted POINTER click on this button, once, with both buttons locked.
-    // A key on a focused button (Enter/Space) reaches the page as a trusted click with detail 0; for a decision that is
-    // refused, so no key ever decides (the reason box sits right before Approve in tab order: Tab, Enter would approve).
+    // APPROVE IS TWO-STEP (Phill 2026-10-05: keyboard users must be able to decide, with a second press to confirm).
+    // A trusted activation of Approve (a click, or Enter/Space on the focused button) ARMS it; a second trusted
+    // activation of the same button, at least ARM_GUARD_MS later, confirms. Esc on the button, focus leaving it, a
+    // click elsewhere in the panel, or ARM_TIMEOUT_MS disarm it. A second activation inside the guard (a double press,
+    // a held key's repeat) is ignored and the button stays armed. Reject is one step: rejecting runs nothing.
+    let armedAt = 0, armTimer = null;
+    function disarm() {
+      if (!armedAt) return;
+      armedAt = 0; clearTimeout(armTimer); armTimer = null;
+      approve.textContent = APPROVE_LABEL; approve.className = "chat-btn approve";
+      if (disarmCurrent === disarm) disarmCurrent = null;
+    }
+    function arm() {
+      armedAt = Date.now();
+      approve.textContent = "Approve? Press again to confirm, Esc to cancel"; approve.className = "chat-btn approve armed";
+      armTimer = setTimeout(disarm, ARM_TIMEOUT_MS);
+      disarmCurrent = disarm; armedButton = approve;
+    }
+    approve.addEventListener("keydown", (ev) => { if (ev.key === "Escape") disarm(); });
+    approve.addEventListener("blur", disarm);
+    // THE ONLY /chat/approve POST in this file: the CONFIRMING trusted activation of this button, once, with both
+    // buttons locked.
     approve.addEventListener("click", (ev) => {
-      if (!ev.isTrusted || ev.detail === 0 || deciding || !session) return;
+      if (!ev.isTrusted || deciding || !session) return;
+      if (!armedAt) { arm(); return; }
+      if (Date.now() - armedAt < ARM_GUARD_MS) return;
+      disarm();
       lock();
       api("POST", "/chat/approve", { session_id: session.id, expect: decisionId }).then(after);
     });
     reject.addEventListener("click", (ev) => {
-      if (!ev.isTrusted || ev.detail === 0 || deciding || !session) return;
+      if (!ev.isTrusted || deciding || !session) return;
       lock();
       const reason = reasonIn.value.trim();
       api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason, expect: decisionId } : { session_id: session.id, expect: decisionId }).then(after);
