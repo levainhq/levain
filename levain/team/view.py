@@ -415,8 +415,8 @@ class _ViewHandler(GuardedHandler):
                 return self._send(b"busy, retry in a moment\n", "text/plain; charset=utf-8", status=503)
             except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
                 try:  # best effort: a closed stderr must not stop the 503, and repr() keeps it one unforgeable line
-                    print(f"levain team view: ledger unavailable: {exc!r}", file=sys.stderr, flush=True)
-                except (OSError, ValueError):
+                    print(f"levain team view: ledger unavailable: {exc!r}"[:600], file=sys.stderr, flush=True)
+                except Exception:  # noqa: BLE001 — no stream at all (pythonw, a closed pipe) is not a reason to drop the 503
                     pass
                 return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
                                   "text/plain; charset=utf-8", status=503)
