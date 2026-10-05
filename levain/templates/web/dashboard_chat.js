@@ -23,6 +23,7 @@
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
   let deciding = false;      // an approve/reject POST or its job is in flight
+  let confirmedJob = null;   // the id of the last job whose start this page saw confirmed (a 202 carrying it)
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -164,6 +165,7 @@
         return;
       }
       const sid = r.json.session_id, myRun = run;
+      confirmedJob = r.json.job_id;
       clear(body); note("chat-note", "Opening a session on " + entity + "…");
       poll(r.json.job_id, myRun, (j) => {
         const st = j.result && j.result.session && j.result.session.state;
@@ -195,7 +197,8 @@
     area.setAttribute("aria-label", "message");
     sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "submit";
     form.appendChild(area); form.appendChild(sendBtn);
-    form.addEventListener("submit", (ev) => { ev.preventDefault(); sendTurn(); });
+    // A trusted submit only (the Send button or the browser's own submit); a scripted submit sends nothing.
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); if (ev.isTrusted) sendTurn(); });
     // Enter sends and Shift+Enter starts a new line, in THIS box only. Not while an input method is composing a
     // character (that Enter belongs to the IME). Nothing in the consent box listens for Enter: deciding is a click.
     // Composition is tracked from its own events too: some browsers give the Enter that confirms a composed
@@ -248,8 +251,9 @@
         // No response from this page can prove who wrote it (a proxy can answer a JSON 4xx/503 after forwarding the
         // request), so anything but a 202 with a job may have started the turn.
         failure("The turn was not confirmed: " + why(r));
-        ambiguousStop(myRun, "turn"); return;
+        ambiguousStop(myRun, "turn", null); return;
       }
+      confirmedJob = r.json.job_id;
       followJob(r.json.job_id, myRun);
     });
   }
@@ -263,7 +267,7 @@
       live.textContent = "";
       const res = j.result;
       // "lost" (contact lost) and "unknown" (the server no longer holds the job) say nothing about what ran.
-      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the turn."); ambiguousStop(myRun, "turn"); return; }
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the turn."); ambiguousStop(myRun, "turn", jobId); return; }
       if (j.status !== "done" || !res) {   // failed: never rendered as success
         failure(j.error || ("the job ended as “" + j.status + "”"));
         endOfTurn(true); return;
@@ -313,29 +317,39 @@
   // AMBIGUOUS OUTCOME: the page cannot tell whether its last turn or decision ran. It NEVER builds a consent box on
   // its own here: it says the outcome is unknown, blocks compose, and offers one button. Only a trusted click on it
   // reads the session again, and whatever that read shows carries this warning.
-  function ambiguousStop(myRun, what) {
-    const warning = "The outcome of the last " + what + " is unknown; the previous request may already have run.";
-    failure(warning);
+  // `jobId` is the lost request's job when its start was confirmed (a lost poll, an evicted job), else null (the
+  // request got no 202). `before` is the last job this page saw start before it: what "nothing new started" means.
+  function ambiguousStop(myRun, what, jobId) {
+    const ctx = { what: what, jobId: jobId || null, before: jobId ? null : confirmedJob,
+      warning: "The outcome of the last " + what + " is unknown; the previous request may already have run." };
+    failure(ctx.warning);
     setComposeEnabled(false);
-    rereadButton(myRun, warning);
+    rereadButton(myRun, ctx);
   }
-  function rereadButton(myRun, warning) {
+  function rereadButton(myRun, ctx) {
     const row = el("div", "chat-row");
     const btn = el("button", "chat-btn", "Check what happened"); btn.type = "button";
     btn.addEventListener("click", (ev) => {
       if (!ev.isTrusted || myRun !== run || !session) return;
       row.remove();
-      resync(myRun, warning);
+      resync(myRun, ctx);
     });
     row.appendChild(btn); log.appendChild(row);
   }
   // The server no longer knows this session: a restart ends every chat session (they live in its memory), and the
   // per-launch token changes with it. Said plainly, with the outcome still unknown and where to look.
-  function restartedText() {
-    const where = (session && typeof session.workspace === "string" && session.workspace)
+  function whereToLook() {
+    return (session && typeof session.workspace === "string" && session.workspace)
       ? "the entity's workspace (" + visible(session.workspace) + ")" : "the entity's workspace";
+  }
+  // A 404 on the check: the server no longer has the session (a restart, or it ended and was cleaned up).
+  function goneText() {
+    return "The server no longer has that session (it restarted, or the session ended and was cleaned up). Your last " +
+      "request may or may not have run: check " + whereToLook() + " to see what changed.";
+  }
+  function restartedText() {
     return "The server restarted, so that session has ended. Your last request may or may not have run: check " +
-      where + " to see what changed.";
+      whereToLook() + " to see what changed.";
   }
   // What the session's most recent job did, as the server recorded it: the actions that ran and the reply. Text only;
   // a consent box is never built from it (only from the session's current held set, below). True when it could say
@@ -359,8 +373,31 @@
   // only from the "Check what happened" button after an ambiguous outcome; `warning` is attached to whatever is shown.
   // A gated session comes back with its held set and, while it is still approvable, its CURRENT decision id (the id
   // only ever comes from the server's answer). Reads only.
-  function resync(myRun, warning) {
+  // Which of the server's records answers for the lost request. The session's last job counts only when it IS that
+  // request: the same job id when its start was confirmed, or (no 202 came back) a job that started after the last one
+  // this page saw. Anything else is not an answer: "nothing new started" is said as such, never as "what happened".
+  // Returns "known" (the lost request's job was reported), "none" (nothing started since), or "" (still unknown).
+  function judgeLastJob(last, ctx) {
+    const lid = last && typeof last === "object" ? last.job_id : undefined;
+    if (ctx.jobId) {
+      if (lid === ctx.jobId) return reportLastJob(last) ? "known" : "";
+      failure("The server's most recent record is not the request this page lost track of.");
+      return "";
+    }
+    if (lid === undefined || lid === ctx.before) {
+      failure("No job has started on the server since your last confirmed request, so your last " + ctx.what +
+        " has not run. If it was only delayed on the way it could still arrive: check again before sending it again.");
+      return "none";
+    }
+    return reportLastJob(last) ? "known" : "";
+  }
+  // Asks the server what the session holds NOW (GET /chat/session.json) and rebuilds the screen from that. Called only
+  // from the "Check what happened" button after an ambiguous outcome; its warning is attached to whatever is shown. A
+  // gated session comes back with its held set and, while it is still approvable, its CURRENT decision id (the id only
+  // ever comes from the server's answer). Reads only.
+  function resync(myRun, ctx) {
     if (!session) return;
+    const warning = ctx.warning;
     live.textContent = "reading the session…";
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
       if (myRun !== run) return;
@@ -368,7 +405,7 @@
       if (isTokenRefusal(r)) { showTokenPrompt(restartedText()); return; }
       const s = r.json || {};
       if (r.status === 404 && s.error === "unknown_session") {
-        failure(restartedText());
+        failure(goneText());
         endOfTurn(true);
         const row = el("div", "chat-row");
         const fresh = el("button", "chat-btn", "Start a new session"); fresh.type = "button";
@@ -376,24 +413,24 @@
         row.appendChild(fresh); log.appendChild(row);
         return;
       }
-      const known = r.status === 200 && reportLastJob(s.last_job);
+      const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning); return;
       }
       if (r.status === 200 && s.state === "busy") {
         failure("The session is still working. Check again in a moment.");
         endOfTurn(true);
-        if (warning) rereadButton(myRun, warning);
+        rereadButton(myRun, ctx);
         return;
       }
       if (r.status === 200 && s.state === "idle") {
-        if (known) note("chat-note", "The session is idle now; above is what the server recorded.");
-        else if (warning) failure("The session is idle now. " + warning);
+        if (verdict === "known") note("chat-note", "The session is idle now; above is what the server recorded.");
+        else if (verdict !== "none") failure("The session is idle now. " + warning);
         endOfTurn(false); return;
       }
       failure("Could not recover the session's state: " + (r.status === 200 ? "it is " + s.state : why(r)));
       endOfTurn(true);
-      if (warning) rereadButton(myRun, warning);
+      rereadButton(myRun, ctx);
     });
   }
   function showConsent(pending, decisionId, myRun, warning) {
@@ -435,10 +472,10 @@
     log.appendChild(box);
 
     function lock() { deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
-    function decided(j) {
+    function decided(j, jid) {
       deciding = false; box.remove();
       const res = j.result;
-      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the decision."); ambiguousStop(myRun, "decision"); return; }
+      if (j.status === "lost" || j.status === "unknown") { failure(j.error || "This page lost track of the decision."); ambiguousStop(myRun, "decision", jid); return; }
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
@@ -459,10 +496,12 @@
         // unknown and the session is read only on a trusted click, never rebuilt here.
         deciding = false; box.remove();
         failure("The decision was not confirmed: " + why(r));
-        ambiguousStop(myRun, "decision"); return;
+        ambiguousStop(myRun, "decision", null); return;
       }
       live.textContent = "working…";
-      poll(r.json.job_id, myRun, (j) => { live.textContent = ""; decided(j); });
+      const jid = r.json.job_id;
+      confirmedJob = jid;
+      poll(jid, myRun, (j) => { live.textContent = ""; decided(j, jid); });
     }
 
     // THE ONLY /chat/approve POST in this file: a trusted click on this button, once, with both buttons locked.
