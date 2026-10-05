@@ -722,12 +722,12 @@ class _Handler(GuardedHandler):
 
         if path == "/team_views.json" and self._team_views_allowed():
             # The running `levain team view` servers registered on this machine (levain/team/registry.py): project,
-            # repo and loopback URL, each confirmed by a pid check and a nonce probe. Served ONLY to a loopback peer
-            # on a loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
+            # repo and loopback URL, each held live by its view's file lock. Served ONLY to a loopback peer on a
+            # loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
             # That one rule is why this needs no write token (dashboard_team.js carries no token logic), why repo
             # paths and project names never reach an off-box client, and why a remote browser is never handed a
-            # 127.0.0.1 link to the wrong machine. The registry probe is slow-ish, so it is NOT run under
-            # request_gate (that is for substrate reads); it has its own small cap.
+            # 127.0.0.1 link to the wrong machine. The listing opens and locks files, which can block on a dead hard
+            # mount, so it is NOT run under request_gate (that is for substrate reads); it has its own small cap.
             if not _TEAM_VIEWS_GATE.acquire(blocking=False):
                 self._send(
                     b"busy\n", "text/plain; charset=utf-8", status=503, head=head
