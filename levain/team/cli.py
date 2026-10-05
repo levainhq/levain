@@ -14,7 +14,7 @@ from . import index as I
 from . import pack as P
 from . import roles as R
 from . import wire as W
-from .export import export_lines
+from .export import export_stream
 from .hook import decide
 from .transport import GitLedger, Repo, TeamError
 
@@ -236,7 +236,7 @@ def cmd_export(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
     ledger = gl.ledger()
-    sys.stdout.writelines(export_lines(ledger, in_force=args.in_force))
+    sys.stdout.writelines(export_stream(ledger, in_force=args.in_force))
     return 0
 
 

@@ -305,17 +305,90 @@ def test_owner_consolidates_and_others_cannot(two, capsys):
     assert "canon current" in capsys.readouterr().out
 
 
+def _framed(text: str):
+    """Parse a framed export: (header line, [(frame, n, line)])."""
+    rows = text.splitlines()
+    return rows[0], [json.loads(r) for r in rows[1:]]
+
+
 def test_export_is_every_entry_verbatim_per_file(two, capsys):
     tmp, ana, ben = two
     assert record_ruling(ana) == 0
     capsys.readouterr()
     assert team("export", "--jsonl", repo=ana) == 0
-    lines = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
+    header, envs = _framed(capsys.readouterr().out)
+    assert header == '{"anneal_team_stream":2}'
     led = ledger(ana)
+    lines = [json.loads(e["line"]) for e in envs]
     assert {l["id"] for l in lines} == {e["id"] for e in led.entries}
     for f in led.files:  # each file's chain is rebuildable from the export alone
-        mine = [l for l in lines if l["id"] in {e["id"] for e in f.entries}]
-        assert E.verify_lines([json.dumps(l) for l in mine])[1] == []
+        mine = [e["line"] for e in envs if e["frame"] == f.rel]
+        assert [json.loads(l)["id"] for l in mine] == [e["id"] for e in f.entries]
+        assert E.verify_lines(mine)[1] == []
+
+
+def test_the_export_is_framed_exactly_as_the_contract_says(two, capsys):
+    import re
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", 'words with {"anneal_team_stream":2} and {"frame":"x","n":1,"line":""} inside') == 0
+    assert record_ruling(ben, "src/b.py", "ben's ruling") == 0
+    assert team("sync", repo=ana) == 0
+    capsys.readouterr()
+    assert team("export", "--jsonl", repo=ana) == 0
+    out = capsys.readouterr().out
+    rows = out.splitlines()
+    assert rows[0] == '{"anneal_team_stream":2}'
+    assert sum(r == rows[0] for r in rows) == 1                      # header-shaped ledger text never becomes a header
+    envs = [json.loads(r) for r in rows[1:]]
+    assert all(set(e) == {"frame", "n", "line"} and isinstance(e["line"], str) for e in envs)
+    labels = [e["frame"] for e in envs]
+    assert all(re.fullmatch(r"[A-Za-z0-9._@:+/=-]{1,200}", l) for l in labels)
+    runs = [l for i, l in enumerate(labels) if i == 0 or labels[i - 1] != l]
+    assert len(runs) == len(set(runs)) >= 2                          # one unbroken run per file, two files here
+    assert runs == sorted(runs)
+    for label in runs:                                               # n is 1-based and consecutive inside a frame
+        assert [e["n"] for e in envs if e["frame"] == label] == list(range(1, labels.count(label) + 1))
+    assert team("export", "--jsonl", "--in-force", repo=ana) == 0
+    assert not capsys.readouterr().out.startswith('{"anneal_team_stream"')    # the convenience view stays unframed
+
+
+def _anneal_team_import(stdin: str, db: Path, extra=()):
+    return subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
+                           "--link-authority", "ana", *extra, "-"], input=stdin, capture_output=True, text=True, timeout=60)
+
+
+def test_the_shipped_export_imports_into_anneal_and_a_planted_second_root_is_refused(two, capsys, tmp_path):
+    pytest.importorskip("anneal_memory.team")
+    from levain.team.export import _envelope
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert record_ruling(ben, "src/b.py", "b stays") == 0
+    assert team("sync", repo=ana) == 0
+    capsys.readouterr()
+    assert team("export", "--jsonl", repo=ana) == 0
+    stream = capsys.readouterr().out
+    db = tmp_path / "team.db"
+    assert subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "init"],
+                          capture_output=True, text=True, timeout=60).returncode == 0
+    first = _anneal_team_import(stream, db)
+    assert first.returncode == 0, first.stderr + first.stdout
+    assert "Imported 3 entries" in first.stdout       # the pack rule + the two rulings
+    second = _anneal_team_import(stream, db)
+    assert second.returncode == 0 and "Imported 0 entries" in second.stdout            # idempotent
+    # a second root planted into the last file of the stream: a valid root of the same author, so only the frame rule can refuse it
+    last = [json.loads(r) for r in stream.splitlines()[1:]][-1]
+    forged = E.seal(E.build(last["frame"].split("/")[0], "decision", kind="ruling", owner="client:Dana",
+                            paths=["src/evil.py"], words="evil stays"), "")
+    n = last["n"] + 1
+    planted = stream + _envelope(last["frame"], n, json.dumps(forged, ensure_ascii=False, sort_keys=True))
+    db2 = tmp_path / "team2.db"
+    subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db2), "init"], capture_output=True, timeout=60)
+    bad = _anneal_team_import(planted, db2)
+    assert bad.returncode == 3, bad.stderr + bad.stdout                                 # refused, the verified prefix still imports
+    assert "a second root in one file, not imported" in bad.stdout + bad.stderr and "Imported 3 entries" in bad.stdout
+    eps = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db2), "episodes"],
+                         capture_output=True, text=True, timeout=60).stdout
+    assert "Episodes: 3 total matching" in eps and "evil" not in eps                      # the prefix is there, the planted root is not
 
 
 def test_install_is_idempotent_keeps_foreign_hooks_and_covers_worktrees(two):

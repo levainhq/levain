@@ -6,6 +6,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-10-04
+
+The framed team export, the other half of anneal-memory 0.9.38's `team-import` contract v2.
+
+### Changed
+
+- **`levain team export --jsonl` now emits the framed stream** (anneal's contract v2): the header `{"anneal_team_stream":2}`, then one envelope `{"frame": <ledger file>, "n": <line number in that file>, "line": <the ledger line, as a JSON string>}` per verified entry, one unbroken run per ledger file, in file order. `anneal-memory team-import -` now requires exactly one root and one author per file, so a second root planted in one file is refused (before, anything after a first valid root in a stream was only judged by its chain). The envelope is built with `json.dumps`, so ledger text can never become structure. The SessionStart import into the member's anneal store uses the same stream. `--in-force` is unchanged and unframed (it is a reading convenience that cannot be chain-verified). **Anyone piping the old unframed export by hand keeps working**: anneal 0.9.38 still reads unframed input, with a stderr note that a second root in one file is not detected. Framing checks structure, not authenticity: the stream is still one trust unit the exporter vouches for.
+- **Levain now requires anneal-memory 0.9.38 or later** (`anneal-memory>=0.9.38,<0.10`), and 0.9.38 is the version it is tested against: it is the first release that reads framed input. No migration-manifest entry and no schema changed, so existing installs' seeds are unchanged.
+
 ## [0.6.2] — 2026-10-04
 
 0.6.1 was tagged and never published: CI on its tagged commit failed on Linux (a project's own commit hook ran during the replay), so what follows is 0.6.1's content plus the fix for that. No schema, id or exit-code change; the anneal floor stays at 0.9.36.
