@@ -2,8 +2,10 @@
 //
 // Present only when the server was started with `--chat` (GET /chat.json answers 403 chat_token or 200; a
 // plain cockpit answers 404 and nothing is added). Every /chat route needs the per-launch token the server
-// printed at start; it is typed into a password field and held in a closure variable ONLY — never storage,
-// cookie or URL — so a reload asks again by design.
+// printed at start. `levain serve --chat` opens the page with the token in the URL FRAGMENT (#chat_token=..., which
+// a browser never sends to a server, so it reaches no log and no Referer); the page reads it, keeps it in this tab's
+// sessionStorage, and strips it from the address bar at once. The printed token typed into the password field is
+// the fallback (a headless box, a second browser). It is never put in a cookie, storage that outlives the tab, or a request URL.
 //
 // ⛔ CONSENT SURFACE. A turn that halts on a gated action reports it as `pending`; nothing here may approve
 // it on the operator's behalf. The one POST to /chat/approve lives inside the Approve button's click handler
@@ -18,7 +20,8 @@
 
   const POLL_MS = 1500;
   const POLL_FAILS_MAX = 5;
-  let token = null;          // the chat token: this variable and nowhere else
+  const TOKEN_KEY = "levain.chat_token";
+  let token = takeToken();   // the chat token: this variable, and this tab's sessionStorage
   let session = null;        // {id, entity} once a session is open
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
@@ -69,9 +72,27 @@
   }
   function note(cls, text) { const p = el("p", cls, text); body.appendChild(p); return p; }
 
+  // ---- the token ---------------------------------------------------------------------------------------------
+  // The fragment the server opened the page with wins; otherwise what this tab kept. Storage can be absent or throw
+  // (a private window, blocked site data), so every access is guarded and the prompt is the fallback.
+  function takeToken() {
+    let t = null;
+    try {
+      const m = /^#chat_token=([A-Za-z0-9_-]+)$/.exec(location.hash);
+      if (m) {
+        t = m[1];
+        history.replaceState(null, "", location.pathname + location.search);
+      }
+    } catch (e) { /* no location or history: the prompt still works */ }
+    if (t) { keepToken(t); return t; }
+    try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch (e) { return null; }
+  }
+  function keepToken(t) { try { sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* held in memory only */ } }
+  function dropToken() { token = null; try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* nothing kept */ } }
+
   // ---- token prompt ----------------------------------------------------------------------------------------
   function showTokenPrompt(message) {
-    session = null; run++; deciding = false;
+    session = null; run++; deciding = false; dropToken();   // whatever token led here is not used again
     ensurePanel(); clear(body);
     note("chat-note", "This cockpit serves chat. Enter the token the server printed when it started.");
     if (message) note("chat-err", message);
@@ -86,7 +107,7 @@
       ev.preventDefault();
       const t = input.value.trim();
       if (!t) return;
-      token = t; input.value = "";
+      token = t; keepToken(t); input.value = "";
       go.disabled = true;
       loadListing(true);
     });
@@ -98,7 +119,7 @@
     api("GET", "/chat.json").then((r) => {
       if (r.status === 404) { if (panel) { panel.remove(); panel = null; } return; }  // not a chat cockpit (or gone)
       if (isTokenRefusal(r)) {
-        token = null;
+        dropToken();
         showTokenPrompt(afterToken ? "That token was not accepted." : null);
         return;
       }
@@ -115,14 +136,21 @@
     session = null; run++; deciding = false;
     ensurePanel(); clear(body);
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
+    // One entity: one click starts a session on it. The picker appears only when there is a choice to make.
     const row = el("div", "chat-row");
-    const sel = el("select", "chat-input");
-    sel.setAttribute("aria-label", "entity to chat with");
-    listing.entities.forEach((name) => { const o = el("option", null, name); o.value = name; sel.appendChild(o); });
-    const open = el("button", "chat-btn", "Open session");
+    let sel = null;
+    if (listing.entities.length > 1) {
+      sel = el("select", "chat-input");
+      sel.setAttribute("aria-label", "entity to chat with");
+      listing.entities.forEach((name) => { const o = el("option", null, name); o.value = name; sel.appendChild(o); });
+      row.appendChild(sel);
+    } else {
+      row.appendChild(el("span", "chat-note", listing.entities[0]));
+    }
+    const open = el("button", "chat-btn", "Start session");
     open.type = "button";
-    open.addEventListener("click", () => { open.disabled = true; openSession(sel.value); });
-    row.appendChild(sel); row.appendChild(open);
+    open.addEventListener("click", () => { open.disabled = true; openSession(sel ? sel.value : listing.entities[0]); });
+    row.appendChild(open);
     body.appendChild(row);
     note("chat-note dim", "model " + (listing.model || "?") + " · a session holds the entity's hands; close it when done.");
   }

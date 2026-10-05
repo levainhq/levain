@@ -4,6 +4,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+The chat panel says when a model's tool call could not be read, and opens unlocked.
+
+### Changed
+
+- **A reply that is a model's raw tool-call syntax is no longer shown as the entity's reply.** When an open model's tool call fails to parse before it reaches levain, its markup arrives as reply text and no tool runs (glm-5.2:cloud did this on 6 of 10 runs of one file-creation prompt on 0.6.7). The panel and the REPL now show "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models." with the text beneath it: collapsed under "What the model sent" in the panel, and escaped the way the consent box escapes a held call (printable ASCII as itself, every other character as `\u{XXXX}`). Three shapes are recognised, each only outside Markdown code, so a reply that quotes the markup to explain it is still an answer: GLM argument tags (`</arg_key><arg_value>`), a `<tool_call>` wrapper that opens a call, and a reply that is entirely function-call JSON naming one of the session's own tools. The call is never repaired or run. `levain run --task` prints the notice on stderr; with `--quiet` the stdout payload is still the text as it arrived, and the exit code is unchanged (0). The chat API's turn result carries `unreadable_call: true` for such a reply.
+- **`levain serve --chat` opens the cockpit unlocked.** The browser opens with the chat token in the URL fragment (`#chat_token=...`), which a browser never sends to a server, so the token reaches no access log and no Referer. The page keeps it in that tab's `sessionStorage` and removes it from the address bar at once; a reload in the same tab stays unlocked, and a new tab or a server restart asks again. The link is also printed (`open the cockpit, unlocked: ...`), and the printed token and the token field stay for a headless box or a second browser. The per-launch token itself is unchanged: it still guards every `/chat` route against anything else that can reach localhost.
+- **One click starts a session.** With one entity registered, the panel shows a "Start session" button for it; the picker appears only when there are several.
+- Known limits: a browser may keep the fragment link in its history list, which a later visit to that entry would reuse only while the same server is running. A leaked call cut off before any of the three shapes appears (a fragment with no argument tags) is still shown as a reply.
+
 ## [0.6.7] — 2026-10-05
 
 Chat panel polish from the first click-through.

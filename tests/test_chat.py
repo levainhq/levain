@@ -1659,3 +1659,62 @@ def test_session_json_reports_the_last_job_so_a_page_that_lost_it_can_see_what_r
     last = host.session_status(sid)["last_job"]
     assert last["job_id"] == job and last["kind"] == "approve" and last["status"] == "done"
     assert last["result"]["tool_activity"] == ["\u2699 terminal: git push"] and last["result"]["reply"] == "pushed"
+
+
+def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_only(tmp_path, monkeypatch, capsys):
+    # 0.6.8 (t), Phill 2026-10-05 "yes, add the token UX after (a)": the browser opens unlocked. The token rides the
+    # URL fragment, which a browser never sends, so it is never in a request line, a server log or a Referer.
+    import webbrowser
+    from types import SimpleNamespace
+
+    import levain.web_server as ws
+
+    db = tmp_path / "memory.db"
+    db.write_bytes(b"")
+    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+    fake_host = SimpleNamespace(listing=lambda: {"entities": ["ent"]}, shutdown=lambda: None)
+    monkeypatch.setattr(ws, "_build_chat_host", lambda *a, **k: (fake_host, None))
+
+    class _Httpd:
+        server_address = ("127.0.0.1", 7462)
+        chat_token = "tok_-AZ09"
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
+    out = capsys.readouterr().out
+    assert opened == ["http://127.0.0.1:7462/#chat_token=tok_-AZ09"]
+    assert "open the cockpit, unlocked: http://127.0.0.1:7462/#chat_token=tok_-AZ09" in out
+    assert "valid until this server stops): tok_-AZ09" in out          # the printed fallback stays
+    assert "?" not in opened[0]
+
+
+def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
+    import webbrowser
+
+    import levain.web_server as ws
+
+    (tmp_path / "memory.db").write_bytes(b"")
+    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+
+    class _Httpd:
+        server_address = ("127.0.0.1", 7463)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    assert ws.run_web_server(tmp_path) == 0
+    assert opened == ["http://127.0.0.1:7463/"] and "chat_token" not in capsys.readouterr().out

@@ -56,11 +56,19 @@ def test_approve_has_one_call_site_in_a_trusted_click_handler():
     assert "setTimeout" not in handler and "poll(" not in handler
 
 
-def test_no_innerhtml_and_no_token_persistence():
+def test_no_innerhtml_and_the_token_is_kept_only_in_this_tabs_session_storage():
+    # 0.6.8 (t), Phill 2026-10-05 "yes, add the token UX after (a)": the token arrives in the URL fragment and is
+    # kept in sessionStorage (per tab, gone with it); never localStorage, a cookie or a query string.
     src = JS.read_text()
-    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "sessionStorage",
-                   "document.cookie", "location.hash", "location.search"):
+    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "document.cookie",
+                   "searchParams", "URLSearchParams"):
         assert banned not in src
+    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(TOKEN_KEY[^)]*\)", src)} == {
+        "sessionStorage.getItem(TOKEN_KEY)", "sessionStorage.setItem(TOKEN_KEY, t)", "sessionStorage.removeItem(TOKEN_KEY)"}
+    assert src.count("sessionStorage.") == 3   # those three calls and no other use
+    # the fragment is read in one place, and the address bar is rewritten without it there
+    assert src.count("location.hash") == 1 and src.count("location.search") == 1
+    assert 'history.replaceState(null, "", location.pathname + location.search)' in src
 
 
 HARNESS = r"""
@@ -97,9 +105,9 @@ const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
-  calls.push({ path: path.split("?")[0], method: init.method, token: hdr["X-Levain-Chat-Token"], body: init.body });
+  calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Chat-Token"], body: init.body });
   if (hdr["X-Levain-Chat-Token"] !== TOKEN) return reply(403, { error: "chat_token", message: "needs token" });
-  if (path === "/chat.json") return reply(200, { entities: ["ent"], model: "m", sessions: [] });
+  if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
@@ -151,7 +159,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Polling timers run at once; a long timer (the armed-Approve timeout) waits until the test fires it.
 const longTimers = new Map(); let tid = 0;
 const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.delete(i); f(); } };
-const ctx = vm.createContext({ document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
+// The browser objects the token code touches, per mode. Absent by default: the prompt path must work without them.
+const MODE = process.argv[3], store = new Map(), replaced = [];
+const extra = {};
+if (["fragment", "stored", "storagethrows", "badfragment"].includes(MODE)) {
+  extra.location = { hash: { fragment: "#chat_token=" + TOKEN, storagethrows: "#chat_token=" + TOKEN, badfragment: "#chat_token=nope", stored: "" }[MODE],
+    pathname: "/", search: "" };
+  extra.history = { replaceState: (s, t, u) => { replaced.push(u); extra.location.hash = ""; } };
+  extra.sessionStorage = MODE === "storagethrows"
+    ? { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } }
+    : { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
+  if (MODE === "stored") store.set("levain.chat_token", TOKEN);
+}
+const ctx = vm.createContext({ ...extra, document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
   setTimeout: (f, ms) => { if (ms >= 2000) { const i = ++tid; longTimers.set(i, f); return i; } setImmediate(f); return 0; },
   clearTimeout: (i) => { longTimers.delete(i); } });
 // Approve opens the confirm row; Run them confirms.
@@ -162,7 +182,23 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   await sleep(30);
   const panel = find(body, (n) => n.className === "panel chat-panel");
-  ok(panel && body.children.indexOf(panel) === 1, "panel appears (403 chat_token) before the board");
+  ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
+  if (["fragment", "stored", "storagethrows"].includes(MODE)) {
+    // 0.6.8 (t): the link the server opens carries the token in its fragment; the page unlocks with no prompt
+    ok(!find(panel, (n) => n.tagName === "input" && n.type === "password"), "no token prompt");
+    ok(calls[0].token === TOKEN, "the first request already carries the token");
+    if (MODE !== "stored") ok(replaced.length === 1 && replaced[0] === "/" && extra.location.hash === "", "the fragment is stripped from the address bar");
+    if (MODE === "fragment") ok(store.get("levain.chat_token") === TOKEN, "kept in this tab's sessionStorage");
+    byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
+    ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
+    console.log("PASS"); return;
+  }
+  if (MODE === "badfragment") {
+    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "a refused fragment token falls back to the prompt");
+    ok(!store.has("levain.chat_token") && replaced.length === 1, "and is stripped and not kept");
+    console.log("PASS"); return;
+  }
   const pw = find(panel, (n) => n.tagName === "input");
   ok(pw.type === "password", "token field is a password input");
   // wrong token first
@@ -170,7 +206,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   ok(panel.textContent.includes("not accepted"), "wrong token is reported");
   const pw2 = find(panel, (n) => n.tagName === "input"); pw2.value = TOKEN;
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
-  byText(panel, "Open session").fire("click", { isTrusted: true }); await sleep(60);
+  if (MODE === "twoentities") {
+    ok(find(panel, (n) => n.tagName === "select") && byText(panel, "Start session"), "with a choice to make, the picker shows");
+    console.log("PASS"); return;
+  }
+  ok(!find(panel, (n) => n.tagName === "select"), "one entity: no picker");
+  byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
+  ok(calls.every((c) => !c.url.includes(TOKEN)), "the token is never in a request URL");
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
   if (process.argv[3] === "sendkey") {
     // Phill 2026-10-05 (a): keyboard access to Send is kept. Enter/Space on the focused button reaches the page as a
@@ -372,7 +414,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
-                                  "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose"])
+                                  "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
+                                  "fragment", "stored", "storagethrows", "badfragment", "twoentities"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is

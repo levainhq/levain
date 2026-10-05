@@ -1412,11 +1412,15 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-        # Flushed: this line is the only place the token is published, and stdout is block-buffered
+        # Flushed: this terminal is the only place the token is published, and stdout is block-buffered
         # when it is not a terminal (a supervisor, a log file), where it would otherwise not appear
         # until the buffer filled. RUN 2026-10-03: piped to a file, the token never showed.
         print(f"  chat token (send as {_CHAT_TOKEN_HEADER}; valid until this server stops): "
               f"{httpd.chat_token}", flush=True)
+        # The link carries the token in the URL FRAGMENT, which a browser keeps to itself: it is never sent to a
+        # server, so it reaches no access log and no Referer. The panel reads it and strips it from the address bar.
+        url = f"{url}#chat_token={httpd.chat_token}"
+        print(f"  open the cockpit, unlocked: {url}", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
