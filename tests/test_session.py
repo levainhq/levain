@@ -138,10 +138,14 @@ def test_turn_result_carries_no_task_success_field():
     no input into it at all — indeed the whole point is that it holds even when the agent has
     stopped responding entirely, which is the one circumstance in which a self-report is guaranteed
     to be absent. This test failing on that addition is the mechanism working: a new field on this
-    class is a decision, not a detail."""
+    class is a decision, not a detail.
+
+    ``held_digest`` (chat r7, 2026-10-05) is admissible on the same rule: a hash the HARNESS computes over the
+    held tool calls in the runtime's own event log, so an approval can bind to them. The agent asserts nothing
+    into it."""
     fields = set(TurnResult.__dataclass_fields__)
     assert fields == {
-        "reply", "tool_activity", "error", "nudged", "gated", "pending", "timed_out",
+        "reply", "tool_activity", "error", "nudged", "gated", "pending", "timed_out", "held_digest",
     }
     for forbidden in ("succeeded", "success", "task_ok", "passed", "verdict"):
         assert not hasattr(TurnResult(reply="x"), forbidden)
