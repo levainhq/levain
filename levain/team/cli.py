@@ -200,6 +200,17 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_repin(args) -> int:
+    gl = GitLedger(_repo(args))
+    dropped = gl.repin(args.file)
+    if not dropped:
+        print("no pins to drop" + (f" for {args.file}" if args.file else ""))
+        return 0
+    print(f"dropped {len(dropped)} pin(s): " + ", ".join(dropped))
+    print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then.")
+    return 0
+
+
 def cmd_verify(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
@@ -457,6 +468,9 @@ def register(subparsers) -> None:
     p = add("status", cmd_status, "What is in force (or, with --path, what governs one file).")
     p.add_argument("--path")
     p.add_argument("--json", action="store_true")
+
+    p = add("repin", cmd_repin, "Drop this clone's local rewrite-protection pins (all, or one file); they restart at the next read.")
+    p.add_argument("--file", help="one ledger file, as <member>/<device>.jsonl")
 
     add("verify", cmd_verify, "Walk every file's hash chain and every reference; exit 1 on any problem.")
 

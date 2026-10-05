@@ -496,6 +496,80 @@ def test_a_force_push_that_rewrites_a_pinned_file_is_a_rewrite_problem(two):
     assert {e["id"] for e in led.entries} == before   # the lines ben accepted stay, the rewritten tail is not accepted
 
 
+def _pins_file(repo):
+    return GitLedger(Repo.discover(repo)).base / "pins.json"
+
+
+def test_a_duplicate_id_in_another_file_is_tamper_not_a_shadow(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    shadow = f.with_name("0000000000000000.jsonl")                    # sorts first, right member folder
+    shadow.write_text(f.read_text())
+    _push_wt(gl, "a copy that sorts first")
+    assert team("sync", repo=ben) == 0
+    tamper = ledger(ben).tamper
+    assert any("0000000000000000.jsonl" in t and f.name in t and "twice" in t for t in tamper), tamper
+
+
+def test_a_tampered_read_does_not_advance_the_pins(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    assert not ledger(ben).tamper
+    pins = _pins_file(ben)
+    before = pins.read_bytes()
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "a new entry and a stray file together")
+    assert team("sync", repo=ben) == 0
+    assert ledger(ben).tamper
+    assert pins.read_bytes() == before
+
+
+def test_a_line_that_does_not_verify_is_not_pinned(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    good = len(f.read_text().splitlines())
+    with open(f, "a") as fh:
+        fh.write("this line is not a ledger entry\n")
+    _push_wt(gl, "a bad line")
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert len(json.loads(_pins_file(ben).read_text())[f"ana/{f.name}"]) == good
+
+
+def test_a_corrupt_pins_file_is_reported_not_silently_rebuilt(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _pins_file(ben).write_text("{not json")
+    assert any("pins are unreadable" in p for p in ledger(ben).problems)
+    assert not any("pins are unreadable" in p for p in ledger(ben).problems)   # restarted from that read
+
+
+def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    key = next(k for k in json.loads(_pins_file(ben).read_text()) if k.startswith("ana/"))
+    capsys.readouterr()
+    assert team("repin", "--file", key, repo=ben) == 0
+    assert "dropped 1 pin" in capsys.readouterr().out
+    assert key not in json.loads(_pins_file(ben).read_text())
+    ledger(ben)                                                      # the next read trusts what it sees and pins again
+    assert key in json.loads(_pins_file(ben).read_text())
+    assert team("repin", repo=ben) == 0
+    assert not _pins_file(ben).exists()
+
+
 def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0

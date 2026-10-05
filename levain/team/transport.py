@@ -24,6 +24,7 @@ import random
 import re
 import secrets
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,7 @@ _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
+_PINS_UNREADABLE = "this clone's ledger pins are unreadable; rewrite protection restarts from this read"
 _NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so it is a reported problem, never an entry
 _REGULAR_MODES = (b"100644", b"100755")
 
@@ -112,6 +114,22 @@ def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view):]
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write beside the target under a UNIQUE temp name (threads of one process share a pid), fsync, then rename
+    into place, so a reader sees the old file or the new one and two writers never share a temp file."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def require_untampered(ledger) -> None:
@@ -207,9 +225,7 @@ class GitLedger:
         data = self.state()
         data.update(changes)
         self.base.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        _atomic_write(self.state_path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
     @property
     def device(self) -> str:
@@ -329,7 +345,12 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v7|{head}|" + (R.dump_team(team) if team else "")
+        try:
+            st = (self.base / "pins.json").stat()
+            pin_state = f"{st.st_mtime_ns}:{st.st_size}"
+        except OSError:
+            pin_state = "none"
+        key = f"parser-v8|{head}|{pin_state}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -340,11 +361,8 @@ class GitLedger:
             pass
         files, problems, tamper = self._history(team, head)
         try:
-            tmp = cache.with_suffix(f".tmp{os.getpid()}")
-            tmp.write_text(json.dumps({"key": key, "files": sorted(files.items()), "problems": problems,
-                                       "tamper": tamper}),
-                           encoding="utf-8")
-            os.replace(tmp, cache)
+            _atomic_write(cache, json.dumps({"key": key, "files": sorted(files.items()), "problems": problems,
+                                             "tamper": tamper}))
         except OSError:
             pass
         return I.build(sorted(files.items()), team.owner if team else None, problems, tamper=tamper)
@@ -404,10 +422,11 @@ class GitLedger:
 
         blobs = self._blobs({sha for _p, sha in leaves if set(sha) - {"0"}})
         by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
-        pins = self._pins()
+        pins, pin_problem = self._pins()
         new_pins = dict(pins)
         files: dict[str, list[str]] = {}
-        problems: list[str] = []
+        problems: list[str] = [pin_problem] if pin_problem else []
+        seen_ids: dict[str, str] = {}
         for path, sha in sorted(leaves):
             rel = path[len(b"ledger/"):].decode("ascii")
             folder = rel.split("/", 1)[0]
@@ -415,6 +434,12 @@ class GitLedger:
                 problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
                 continue
             lines = [_text(l) for l in _blob_lines(blobs.get(sha, b""))]
+            got, probs, _last = E.verify_lines(lines)
+            for e in got:
+                other = seen_ids.setdefault(str(e.get("id")), rel)
+                if other != rel:
+                    tamper.append(f"ledger/{rel} and ledger/{other} both hold entry id {e.get('id')}; levain never "
+                                  "writes an id twice (the owner removes the copy)")
             pin = pins.get(rel)
             if pin and lines[:len(pin)] != pin:
                 problems.append(f"ledger/{rel}: lines this clone had accepted were removed or rewritten; the ledger "
@@ -423,34 +448,69 @@ class GitLedger:
                 files[rel] = list(pin)
                 continue
             files[rel] = lines
-            new_pins[rel] = lines
+            # Pin only what verified: the lines before the first one that did not, and only in a file filed under
+            # the folder its entries' author names.
+            firsts = [re.match(r"line (\d+)", p_) for p_ in probs]
+            if any(m is None for m in firsts):
+                continue
+            good = min((int(m.group(1)) - 1 for m in firsts if m), default=len(lines))
+            if any(E.safe_handle(e.get("author", "")) != folder for e in got):
+                continue
+            if good > len(pin or []):
+                new_pins[rel] = lines[:good]
         for rel in sorted(set(pins) - {p[len(b"ledger/"):].decode("ascii") for p, _s in leaves}):
             problems.append(f"ledger/{rel}: a file this clone had accepted is gone; the ledger is append-only, so "
                             "its accepted lines still count")
             files[rel] = list(pins[rel])
-        if new_pins != pins:
+        if not tamper and (new_pins != pins or pin_problem):      # a tampered read never advances the pins
             self._save_pins(new_pins)
         return files, problems, tamper
 
-    def _pins(self) -> dict[str, list[str]]:
-        """This clone's record, per ledger file, of the lines it has accepted (trust on first use). Local only:
-        it lives beside state.json and is never in the ledger branch. A clone that first sees an already rewritten
-        file cannot tell."""
+    def _pins(self) -> tuple[dict[str, list[str]], str]:
+        """(pins, problem). This clone's record, per ledger file, of the lines it has accepted (trust on first
+        use). Local only: it lives beside state.json and is never in the ledger branch. A MISSING file is the
+        documented start; one that exists but cannot be read is reported, and protection restarts from this read.
+        A clone that first sees an already rewritten file cannot tell."""
+        path = self.base / "pins.json"
         try:
-            data = json.loads((self.base / "pins.json").read_text(encoding="utf-8"))
-            return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, list)
-                    and all(isinstance(x, str) for x in v)}
-        except (OSError, ValueError, AttributeError):
-            return {}
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}, ""
+        except (OSError, ValueError):
+            return {}, _PINS_UNREADABLE
+        try:
+            data = json.loads(text)
+            if not isinstance(data, dict) or not all(
+                    isinstance(k, str) and isinstance(v, list) and all(isinstance(x, str) for x in v)
+                    for k, v in data.items()):
+                raise ValueError("wrong shape")
+        except ValueError:
+            return {}, _PINS_UNREADABLE
+        return data, ""
 
     def _save_pins(self, pins: dict[str, list[str]]) -> None:
         try:
             self.base.mkdir(parents=True, exist_ok=True)
-            tmp = self.base / f"pins.tmp{os.getpid()}"
-            tmp.write_text(json.dumps(pins), encoding="utf-8")
-            os.replace(tmp, self.base / "pins.json")
+            _atomic_write(self.base / "pins.json", json.dumps(pins))
         except OSError:
             pass
+
+    def repin(self, rel: str | None = None) -> list[str]:
+        """Drop this clone's pins (all, or one file) and return what was dropped. Local only: rewrite protection for
+        those files restarts at the next read."""
+        pins, bad = self._pins()
+        path = self.base / "pins.json"
+        if rel is None:
+            dropped = sorted(pins) or (["(an unreadable pins file)"] if bad else [])
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            return dropped
+        rel = rel[len("ledger/"):] if rel.startswith("ledger/") else rel
+        if rel not in pins:
+            return []
+        del pins[rel]
+        self._save_pins(pins)
+        return [rel]
 
     def _blobs(self, shas: set[str]) -> dict[str, bytes]:
         """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing.
