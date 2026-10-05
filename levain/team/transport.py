@@ -50,10 +50,13 @@ class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
 
-# rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; a commit hook of
-# the project's own (git on Linux runs them on a cherry-pick) can fail the pick or rewrite the index under it. The
-# ledger replay is levain's own plumbing, so neither is allowed to take part.
-_REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "core.hooksPath=/dev/null"]
+# Every git call here is levain's own plumbing on a private worktree, so none of them runs the project's hooks: git on
+# Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
+# fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
+_NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+# rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; signing needs a
+# prompt a replay cannot answer
+_REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "commit.gpgsign=false"]
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
@@ -62,7 +65,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     try:
-        cp = subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True, text=True,
+        cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
                             timeout=timeout, input=input_text,
                             stdin=None if input_text is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -621,7 +624,7 @@ class GitLedger:
             try:
                 git(["checkout", "-q", "--detach", rref], self.wt, timeout=timeout)
                 for c in keep:
-                    cp = git([*_REPLAY_CONFIG, "-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", c],
+                    cp = git([*_REPLAY_CONFIG, "cherry-pick", "--allow-empty", c],
                              self.wt, check=False, timeout=timeout)
                     if cp.returncode == 0:
                         continue

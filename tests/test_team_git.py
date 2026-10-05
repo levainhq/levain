@@ -669,7 +669,7 @@ def test_the_replay_runs_with_rerere_off_and_in_topological_order(two, monkeypat
     for verb, marker in (("rebase", "--empty=drop"), ("cherry-pick", "--allow-empty")):
         argv = next(c for c in calls if verb in c and marker in c)
         assert "rerere.enabled=false" in argv and "rerere.autoupdate=false" in argv
-        assert "core.hooksPath=/dev/null" in argv
+        assert "commit.gpgsign=false" in argv
     assert "--topo-order" in next(c for c in calls if "rev-list" in c and "--reverse" in c)
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
 
@@ -746,14 +746,29 @@ def test_a_checkout_that_fails_after_the_replay_published_keeps_the_discard_warn
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
 
 
-def test_a_failing_commit_hook_cannot_make_the_replay_drop_an_entry(two):
-    # git on Linux runs commit hooks on a cherry-pick (CI caught it); macOS git 2.50 does not, so this only fails there
-    gl, ana = _conflicting_replay(two)
-    hooks = Path(git("rev-parse", "--git-common-dir", cwd=gl.wt).strip())
-    hooks = (hooks if hooks.is_absolute() else gl.wt / hooks) / "hooks"
+def _plant_hooks(gl, *names):
+    common = Path(git("rev-parse", "--git-common-dir", cwd=gl.wt).strip())
+    hooks = (common if common.is_absolute() else gl.wt / common) / "hooks"
     hooks.mkdir(exist_ok=True)
-    hook = hooks / "prepare-commit-msg"
-    hook.write_text("#!/bin/sh\ngit restore --staged --source=HEAD -- . 2>/dev/null\nexit 1\n")
-    hook.chmod(0o755)
+    git("config", "core.hooksPath", str(hooks), cwd=gl.wt)   # a machine's own hooksPath would otherwise make these inert
+    for name in names:
+        hook = hooks / name
+        # the nonzero exit fails any step the hook runs in; the sentinel proves it ran
+        hook.write_text("#!/bin/sh\necho ran >> \"$0.ran\"\nexit 1\n")
+        hook.chmod(0o755)
+    return hooks
+
+
+def test_a_failing_project_hook_cannot_make_the_replay_fail_or_drop_an_entry(two):
+    # checkout and commit hooks run on Linux git for these steps; post-checkout runs on every git, so this fails
+    # on a regression here too
+    gl, ana = _conflicting_replay(two)
+    hooks = _plant_hooks(gl, "post-checkout", "prepare-commit-msg", "reference-transaction", "post-commit")
+    subprocess.run(["git", "checkout", "-q", "levain-ledger"], cwd=gl.wt)         # control: the planted hooks do run
+    assert list(hooks.glob("*.ran")), "the planted hooks never fire here, so this test proves nothing"
+    for f in hooks.glob("*.ran"):
+        f.unlink()
     assert team("sync", repo=ana) == 0
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
+    assert not list(hooks.glob("*.ran"))                      # none of the project's hooks ran for levain's plumbing
+    assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
