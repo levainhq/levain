@@ -165,6 +165,15 @@ def cmd_status(args) -> int:
     canon_text = gl.read_canon(sha)
     if args.path:
         rel = _repo_paths(repo, [args.path])[0]
+        if ledger.tamper:
+            text = "the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper)
+            if args.json:
+                print(json.dumps({"path": rel, "deny": True, "text": text, "tamper": ledger.tamper, "entries": []},
+                                 ensure_ascii=False))
+            else:
+                print(text)
+                print("\n(every edit in this clone is DENIED until the file is removed from the ledger branch)")
+            return 3
         d = decide(team, ledger, handle, rel, "", set())
         if args.json:
             print(json.dumps({"path": rel, "deny": bool(d and d.deny), "text": d.text if d else "",

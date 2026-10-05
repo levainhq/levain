@@ -15,7 +15,6 @@ the same five operations (append, sync, fetch_if_due, ledger, write_canon), not 
 from __future__ import annotations
 
 import contextlib
-import difflib
 import hashlib
 import fcntl
 import json
@@ -60,11 +59,34 @@ _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{
 _SHA_RE = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def _blob_lines(data: bytes) -> list[str]:
-    """A ledger file's lines. Split on LF only (a CR stays inside its line); bytes that are not UTF-8 become
-    replacement characters, so such a line fails its hash like any other bad line."""
-    lines = data.decode("utf-8", "replace").split("\n")
-    return lines[:-1] if lines and lines[-1] == "" else lines
+_NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so it is a reported problem, never an entry
+_REGULAR_MODES = (b"100644", b"100755")
+
+
+def _blob_lines(data: bytes) -> list[bytes]:
+    """A ledger file's lines as BYTES. Split on LF only (a CR stays inside its line)."""
+    lines = data.split(b"\n")
+    return lines[:-1] if lines and lines[-1] == b"" else lines
+
+
+def _added_removed(old: list[bytes], new: list[bytes]) -> tuple[list[bytes], list[bytes]]:
+    """Lines added and removed between two versions of a file, in linear time (a hook runs this).
+
+    Append-only is the shape levain writes, so it is the fast path; anything else is a set difference with order
+    kept, which is also what the retired quadratic diff reduced to for the question asked here."""
+    if new[:len(old)] == old:
+        return new[len(old):], []
+    sold, snew = set(old), set(new)
+    return [l for l in new if l not in sold], [l for l in old if l not in snew]
+
+
+def _text(line: bytes) -> str:
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError:
+        return _NON_UTF8_LINE
+
+
 # rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; signing needs a
 # prompt a replay cannot answer
 _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "commit.gpgsign=false"]
@@ -302,7 +324,7 @@ class GitLedger:
                 team = self.team(head)
             except R.RolesError:
                 team = None
-        key = f"parser-v4|{head}|" + (R.dump_team(team) if team else "")
+        key = f"parser-v5|{head}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
         try:
             cached = json.loads(cache.read_text(encoding="utf-8"))
@@ -323,15 +345,31 @@ class GitLedger:
         return I.build(sorted(files.items()), team.owner if team else None, problems, tamper=tamper)
 
     def _history(self, team: R.Team | None, rev: str) -> tuple[dict[str, list[str]], list[str], list[str]]:
-        """(files, problems, tamper) from the ledger branch's history, read through git plumbing only.
+        """(files, problems, tamper) from the ledger branch, read through git plumbing only.
 
         Levain owns the ledger namespace: it only ever writes ``ledger/<handle>/<16 hex>.jsonl`` as a regular file.
-        Every path git reports under ``ledger/`` is compared as BYTES against that grammar; anything else is not
-        decoded or read. It is tamper, and every reader refuses a tampered ledger as a whole. No human display
-        format of git (diff headers, quoted names) is parsed: commits come from ``log -z``, paths from
-        ``diff-tree -z --raw``, contents from ``cat-file --batch``, and added and removed lines are computed here.
+        Tamper is judged from the TIP TREE alone (``ls-tree -r -z``): any entry under ``ledger/`` that is not that
+        grammar, or is not a regular file (a gitlink, a symlink), is tamper, however it got there (a merge
+        resolution included), and deleting it clears the refusal. Paths are compared as BYTES; a tamper path or
+        gitlink is never read. History only attributes the lines of canonical paths: a non-canonical path in history
+        was refused while it existed and is skipped silently. No human display format of git is parsed: commits
+        from ``log -z``, paths from ``diff-tree -z --raw`` / ``ls-tree -z``, contents from ``cat-file --batch``.
         """
         top = self.repo.toplevel
+        cp = git(["ls-tree", "-r", "-z", "--full-tree", rev, "--", "ledger/"], top, check=False, timeout=30)
+        if cp.returncode != 0:
+            raise TeamError(f"could not read the ledger tree: {_tail(cp)}")
+        bad_paths: list[bytes] = []
+        for rec in cp.stdout_bytes.split(b"\0"):
+            if not rec:
+                continue
+            meta, tab, path = rec.partition(b"\t")
+            fields = meta.split(b" ")
+            if not tab or len(fields) != 3:
+                raise TeamError("git ls-tree gave a record levain cannot read")
+            if not (_LEDGER_PATH_RE.fullmatch(path) and fields[0] in _REGULAR_MODES and fields[1] == b"blob"):
+                bad_paths.append(path)
+
         cp = git(["log", "-z", "--reverse", "--topo-order", "--full-history", "--no-merges", "--format=%H%x1f%ae",
                   rev, "--", "ledger/"], top, check=False, timeout=60)
         if cp.returncode != 0:
@@ -350,12 +388,16 @@ class GitLedger:
             raise TeamError(f"could not list the ledger's merge commits: {_tail(cp)}")
         merges = cp.stdout.split()
 
-        changes: list[tuple[str, str, bytes, str, str, str, str]] = []   # sha, mail, path, status, mode, old, new
-        for sha, mail in commits:
-            cp = git(["diff-tree", "-z", "-r", "--raw", "--root", "--no-renames", "--no-commit-id", sha, "--",
-                      "ledger/"], top, check=False, timeout=30)
+        # sha, mail, path, status, old mode, new mode, old blob, new blob
+        changes: list[tuple[str, str, bytes, str, bytes, bytes, str, str]] = []
+        last_by: dict[bytes, str] = {}                                    # latest writer of a path, for tamper naming
+        for sha, mail, merge in [(s_, m_, False) for s_, m_ in commits] + [(m, "", True) for m in merges]:
+            args = ["diff-tree", "-z", "-r", "--raw", "--root", "--no-renames", "--no-commit-id"]
+            cp = git(args + (["-m"] if merge else []) + [sha, "--", "ledger/"], top, check=False, timeout=30)
             if cp.returncode != 0:
                 raise TeamError(f"could not read commit {sha[:10]}: {_tail(cp)}")
+            if merge:
+                mail = git(["log", "-1", "--format=%ae", sha], top, timeout=30).stdout.strip()
             parts = cp.stdout_bytes.split(b"\0")
             i = 0
             while i + 1 < len(parts) and parts[i].startswith(b":"):
@@ -364,47 +406,58 @@ class GitLedger:
                 i += 2
                 if len(meta) != 5:
                     raise TeamError(f"git diff-tree gave a record levain cannot read in {sha[:10]}")
-                _old_mode, new_mode, old_blob, new_blob, status = (m.decode("ascii", "replace") for m in meta)
-                changes.append((sha, mail, path, status, new_mode, old_blob, new_blob))
+                if meta[4][:1] != b"D":
+                    last_by[path] = f"{mail} in commit {sha[:10]}"
+                if merge or not _LEDGER_PATH_RE.fullmatch(path):
+                    continue
+                old_mode, new_mode = meta[0], meta[1]
+                old_blob, new_blob, status = (m.decode("ascii", "replace") for m in meta[2:])
+                changes.append((sha, mail, path, status, old_mode, new_mode, old_blob, new_blob))
             if any(parts[i:]) and i < len(parts):
                 raise TeamError(f"git diff-tree gave output levain cannot read in {sha[:10]}")
 
-        blobs = self._blobs({b for c in changes for b in (c[5], c[6]) if set(b) - {"0"}})
+        tamper: list[str] = []
+        for path in bad_paths:
+            shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
+            who = E._printable(" ⏎ ".join(last_by.get(path, "an author git does not attribute").splitlines()))
+            tamper.append(f"{shown!r} (written by {who}) is not a file levain writes")
+
+        # Only regular files of canonical paths are ever read: never a tamper path, never a gitlink.
+        def regular(mode: bytes) -> bool:
+            return mode in _REGULAR_MODES
+
+        wanted: set[str] = set()
+        for _sha, _mail, _path, status, old_mode, new_mode, old_blob, new_blob in changes:
+            if status != "A" and regular(old_mode) and set(old_blob) - {"0"}:
+                wanted.add(old_blob)
+            if status != "D" and regular(new_mode) and set(new_blob) - {"0"}:
+                wanted.add(new_blob)
+        blobs = self._blobs(wanted)
         by_safe = {E.safe_handle(h): h for h in (team.members if team else {})}
         files: dict[str, list[str]] = {}
         problems: list[str] = []
-        tamper: list[str] = []
         stranger: dict[tuple[str, str], int] = {}
-        for sha, mail, path, status, new_mode, old_blob, new_blob in changes:
-            if not _LEDGER_PATH_RE.fullmatch(path) or (status != "D" and new_mode not in ("100644", "100755")):
-                shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
-                tamper.append(f"{shown!r} ({'deleted' if status == 'D' else 'written'} in commit {sha[:10]} by "
-                              f"{E._printable(' ⏎ '.join(mail.splitlines()))}) is not a file levain writes")
-                continue
+        for sha, mail, path, status, old_mode, new_mode, old_blob, new_blob in changes:
+            if status != "D" and not regular(new_mode):
+                continue                                                  # a gitlink/symlink here is tamper at the tip
             rel = path[len(b"ledger/"):].decode("ascii")
-            old = _blob_lines(blobs.get(old_blob, b"")) if status != "A" else []
+            old = _blob_lines(blobs.get(old_blob, b"")) if status != "A" and regular(old_mode) else []
             new = _blob_lines(blobs.get(new_blob, b"")) if status != "D" else []
-            added: list[str] = []
-            removed: list[str] = []
-            for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
-                if op in ("delete", "replace"):
-                    removed += old[i1:i2]
-                if op in ("insert", "replace"):
-                    added += new[j1:j2]
-            gone = [r for r in removed if r.strip() and r not in added]
+            added, removed = _added_removed(old, new)
+            gone = [r for r in removed if r.strip()]
             if gone:
                 problems.append(f"ledger/{rel}: {len(gone)} line(s) removed or rewritten in commit {sha[:10]} by "
                                 f"{mail}; the ledger is append-only, so the original lines still count")
             owner_dir = rel.split("/", 1)[0]
             expected = (team.owner if owner_dir.startswith("pack-") else by_safe.get(owner_dir)) if team else None
             who = team.handle_for_email(mail) if team else None
-            for text in added:
-                if not text.strip():
+            for raw in added:
+                if not raw.strip():
                     continue
                 if team is not None and (expected is None or who != expected):
                     stranger[(rel, mail)] = stranger.get((rel, mail), 0) + 1
                     continue
-                files.setdefault(rel, []).append(text)
+                files.setdefault(rel, []).append(_text(raw))
         for m_sha in merges:
             problems.append(f"merge commit {m_sha[:10]} touches ledger/: levain keeps the ledger linear, so lines "
                             "that exist only in a merge resolution are not read")
@@ -414,7 +467,8 @@ class GitLedger:
         return files, problems, tamper
 
     def _blobs(self, shas: set[str]) -> dict[str, bytes]:
-        """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing."""
+        """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing.
+        Every frame is bounds-checked: its size must fit the output, a LF must close it, and nothing may remain."""
         if not shas:
             return {}
         order = sorted(shas)
@@ -430,8 +484,13 @@ class GitLedger:
             if len(head) != 3 or head[0] != want.encode("ascii") or head[1] != b"blob" or not head[2].isdigit():
                 raise TeamError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
             size = int(head[2])
-            out[want] = buf[nl + 1:nl + 1 + size]
-            pos = nl + 1 + size + 1
+            end = nl + 1 + size
+            if end >= len(buf) or buf[end:end + 1] != b"\n":
+                raise TeamError(f"git cat-file gave a frame levain cannot read for {want[:10]}")
+            out[want] = buf[nl + 1:end]
+            pos = end + 1
+        if pos != len(buf):
+            raise TeamError("git cat-file gave output levain cannot read after the last frame")
         return out
 
     def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:

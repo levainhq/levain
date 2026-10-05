@@ -382,6 +382,28 @@ def test_a_ledger_file_levain_never_writes_is_refused_as_tamper_not_read(two, ca
     assert "REFUSED as tampered" in ctx and "odd name stays" not in ctx
 
 
+def test_the_tamper_refusal_clears_when_the_bad_file_is_deleted(two):
+    # Tamper is judged from the tip tree, not accumulated from history: once the file is gone nothing is refused.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    bad = gl.wt / "ledger" / "ana" / "notes.txt"
+    bad.write_text("not a ledger file\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "a planted name", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 0
+    reason = edit(ben, "src/unrelated.py", session="t1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "notes.txt" in reason
+    bad.unlink()
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "the owner deletes it", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 0
+    after = edit(ben, "src/unrelated.py", session="t2")
+    assert "REFUSED as tampered" not in json.dumps(after)
+
+
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
     from levain.team.export import _label
     rels = ["ana/a.jsonl", "ana/device!.jsonl", "ana/other!.jsonl", "unnamed-0-" + "0" * 64, "ana/" + "x" * 300 + ".jsonl"]
