@@ -190,6 +190,13 @@ def _drain_gate(
     while result.gated:
         print("\n  ⛔ \033[1mheld at the efferent gate\033[0m — this changes the world:")
         _print_pending(result.pending)
+        if not all(item.decidable for item in result.pending):
+            # An approval runs the whole action; one that could not be shown whole cannot be approved.
+            print("  → this hold cannot be shown in full, so it can only be rejected.")
+            result = session.reject_turn("the held action could not be shown in full, so it was not approved")
+            if result.error is not None:
+                return result, False
+            continue
         try:
             answer = input("\n  approve? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):

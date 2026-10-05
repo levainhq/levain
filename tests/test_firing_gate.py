@@ -302,7 +302,8 @@ def test_visible_is_injective_over_backslash_tab_cr_and_every_control_or_format_
     # a typed escape sequence cannot read as the escape of a hidden character
     assert visible("​") == "\\u{200B}" and visible("\\u{200B}") == "\\\\u{200B}"
     assert visible("\t") == "\\u{0009}" and visible("\r") == "\\u{000D}" and visible("\x1b") == "\\u{001B}"
-    assert visible("a\nb") == "a\nb"                                  # the one line break kept
+    assert visible("a\nb", keep_newline=True) == "a\nb"                 # the one line break kept, only in `full`
+    assert visible("a\nb") == "a\\u{000A}b"
     cases = ["a\\b", "a\tb", "a\\tb", "a\rb", "a\\rb", "‮", "\\u{202E}", "\x1b[2J", "\\x1b[2J"]
     assert len({visible(c) for c in cases}) == len(cases)
     # the REPL line shows the whole action through it, and \r no longer splits a line
@@ -317,3 +318,18 @@ def test_line_shows_every_printed_field_through_visible():
     line = PendingEfferent("ter\x1bminal", "echo \x1b[2J‮gnirts", "why ‮\x1b").line()
     assert "\x1b" not in line and "‮" not in line
     assert "ter\\u{001B}minal" in line and "echo \\u{001B}[2J\\u{202E}gnirts" in line and "why \\u{202E}\\u{001B}" in line
+
+
+_TABLE = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378,
+          0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800]
+
+
+def test_visible_escapes_blank_invisible_and_overlaying_characters_table():
+    """Same table as the node harness in test_web_chat_panel: NBSP and other Zs, Zl/Zp, a lone surrogate, Mn/Me,
+    Co, Cn and the blank-rendering letters. A plain space stays."""
+    from levain.firing.gate import visible
+
+    for cp in _TABLE:
+        assert visible(chr(cp)) == "\\u{%04X}" % cp, hex(cp)
+    assert visible(" ") == " " and visible("a b") == "a b"
+    assert len({visible(chr(cp)) for cp in _TABLE}) == len(_TABLE)

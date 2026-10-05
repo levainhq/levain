@@ -181,7 +181,7 @@ def test_a_busy_session_refuses_a_second_turn_until_the_first_finishes(tmp_path)
 
 
 def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path):
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([
         _Result(reply=None, gated=True, pending=(held,)),
         _Result(reply="pushed"),
@@ -192,7 +192,7 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "push it")["job_id"])
     assert st["result"]["gated"] is True and st["result"]["exit_code"] == 4
-    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push", "full": "",
+    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push", "full": "git push",
                                         "reason": "network egress", "recognized": True}]
     assert host.session_status(sid)["state"] == "gated"
     # a decision made on another held set (a stale or re-armed screen) is refused and changes nothing
@@ -221,7 +221,7 @@ def test_a_held_action_streamed_mid_turn_does_not_stay_in_the_jobs_activity(tmp_
     """The stream fires when an action is ISSUED, before the gate holds it. At a gated finish the
     job's activity becomes the result's tool_activity (held actions removed), so a held push never
     reads as work that ran."""
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([_Result(reply=None, gated=True, pending=(held,),
                           tool_activity=["⚙ file_editor: view README.md"])])
     host = _host(tmp_path, f)
@@ -1453,7 +1453,7 @@ def test_each_launch_gets_its_own_token(tmp_path):
 def test_a_decision_id_is_single_use_even_when_two_holds_are_textually_identical(tmp_path):
     """codex L3: a content digest let a stale box approve a SECOND hold that read the same. The id names
     the halt, not its text."""
-    pend = PendingEfferent("terminal", "git push", "network egress")
+    pend = PendingEfferent("terminal", "git push", "network egress", full="git push")
     f = _Factory([_Result(reply=None, gated=True, pending=(pend,)),
                   _Result(reply=None, gated=True, pending=(pend,)),
                   _Result(reply="pushed")])
@@ -1535,3 +1535,24 @@ def test_a_worker_that_cannot_start_restores_the_decision_id(tmp_path, monkeypat
     assert host.session_status(sid)["decision_id"] == res["decision_id"]
     monkeypatch.undo()
     assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_an_approve_on_a_hold_that_cannot_be_shown_in_full_is_refused_and_the_hold_stays(tmp_path):
+    undecidable = PendingEfferent("terminal", "echo xxx", "bash fans in", full="")
+    f = _Factory([_Result(reply=None, gated=True, pending=(undecidable,)), _Result(reply="declined")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])                       # the RIGHT id
+    assert e.value.code == "undecidable" and e.value.http_status == 409
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]      # not spent
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert _wait(host, host.reject(sid, "no", res["decision_id"])["job_id"])["result"]["reply"] == "declined"
+
+
+def test_decision_id_required_message_says_where_a_turn_result_carries_it(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid)
+    assert "decision_id" in str(e.value) and "result" in str(e.value)

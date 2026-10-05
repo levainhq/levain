@@ -572,13 +572,20 @@ class ChatHost:
                 raise ChatError(
                     "decision_id_required",
                     f"{kind} needs the current decision id in the `expect` field; read it from "
-                    "GET /chat/session.json?id=<session_id> (`decision_id`) while the session is gated",
+                    "GET /chat/session.json?id=<session_id> (`decision_id`) while the session is gated; a turn that "
+                    "halts also returns it as `decision_id` in its result",
                     400,
                 )
             if expect is not None and (not isinstance(expect, str) or expect != rec.decision_id):
                 raise ChatError(
                     "stale_decision",
                     f"the held action is not the one this {kind} was made on; read the session again",
+                    409,
+                )
+            if kind == "approve" and (not rec.pending or any(not p.get("full") for p in rec.pending)):
+                raise ChatError(
+                    "undecidable",
+                    "this hold cannot be shown in full, so it can only be rejected",
                     409,
                 )
             spent = rec.decision_id

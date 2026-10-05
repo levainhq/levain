@@ -218,18 +218,27 @@ def classify_action(
     )
 
 
-def visible(text: str) -> str:
-    """``text`` with nothing hidden, for a surface where the operator decides on what they read. The
-    mapping is INJECTIVE: a backslash is escaped FIRST (so a literal ``\\u{200B}`` typed into a command
-    cannot read as the escape for a zero-width space), then every control (Cc) and format (Cf)
-    character, bidi overrides, ESC, tab and CR included, becomes ``\\u{XXXX}``. Only the newline is
-    left, because a multi-line action is shown line by line. The cockpit panel's ``visible()`` is the
-    same rule."""
+_ESCAPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp", "Mn", "Me"})
+_ESCAPED_BLANK_LETTERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
+
+
+def visible(text: str, *, keep_newline: bool = False) -> str:
+    """``text`` for a surface where the operator decides on what they read. The MAPPING is injective: a
+    backslash is escaped FIRST (so a typed ``\\u{200B}`` cannot read as the escape for a zero-width space),
+    then every character that is blank, invisible or overlays its neighbour is shown as ``\\u{XXXX}``:
+    general categories Cc, Cf, Cs, Co, Cn, Zl, Zp, Mn, Me, every Zs except the plain space, and the
+    letters that render blank (U+115F, U+1160, U+3164, U+FFA0, U+2800). ``keep_newline`` leaves LF
+    literal, for the one multi-line field (``full``); anywhere else a newline would forge the layout.
+    NOT detected: homoglyphs (a Cyrillic ``\u0430`` reads as a Latin ``a``). The cockpit panel's
+    ``visible()`` is the same rule; the two must change together."""
     out = []
     for ch in str(text):
         if ch == "\\":
             out.append("\\\\")
-        elif ch != "\n" and unicodedata.category(ch) in ("Cc", "Cf"):
+        elif ch == "\n" and keep_newline:
+            out.append(ch)
+        elif ch != " " and (unicodedata.category(ch) in _ESCAPED_CATEGORIES
+                            or (unicodedata.category(ch) == "Zs") or ch in _ESCAPED_BLANK_LETTERS):
             out.append("\\u{%04X}" % ord(ch))
         else:
             out.append(ch)
@@ -259,14 +268,21 @@ class PendingEfferent:
     # limit, or a newline flattened into a space, is exactly where a command can hide what it does.
     full: str = ""
 
+    @property
+    def decidable(self) -> bool:
+        """``False`` when the whole action could not be shown (``full`` empty): it can only be rejected."""
+        return bool(self.full)
+
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
         out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
-        if self.full and self.full != self.detail:
+        if not self.full:
+            out += "\n      NOT SHOWN IN FULL: this cannot be approved (only rejected)"
+        elif self.full != self.detail:
             # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
             # those inert, and the newline it kept is the only line break.
-            body = "\n".join("        " + ln for ln in visible(self.full).split("\n"))
+            body = "\n".join("        " + ln for ln in visible(self.full, keep_newline=True).split("\n"))
             out += f"\n      the whole action (what approving runs):\n{body}"
         return out
 

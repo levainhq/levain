@@ -256,15 +256,18 @@
   function endOfTurn(stuck) { setComposeEnabled(!stuck); if (!stuck && area) area.focus(); }
 
   // ---- the consent surface ------------------------------------------------------------------------------------
-  // Nothing in the consent box may hide or alias what it shows, so the mapping is injective: a backslash is
-  // escaped FIRST (a typed "\\u{200B}" cannot pass for the escape of a zero-width space), then every control
-  // (Cc) and format (Cf) character, bidi overrides, ESC, tab and CR included, is shown as \u{XXXX}. Only the
-  // newline stays, because a multi-line action is shown line by line. Python's levain.firing.gate.visible is
-  // the same rule.
-  function visible(text) {
-    return String(text).replace(/[\\\p{Cc}\p{Cf}]/gu, (c) => {
+  // The mapping is injective: a backslash is escaped FIRST (a typed "\\u{200B}" cannot pass for the escape of a
+  // zero-width space), then every character that is blank, invisible or overlays its neighbour is shown as
+  // \u{XXXX}: categories Cc, Cf, Cs, Co, Cn, Zl, Zp, Mn, Me, every Zs except the plain space, and the letters
+  // that render blank (U+115F, U+1160, U+3164, U+FFA0, U+2800). keepNewline leaves LF literal, for the one
+  // multi-line field (the whole action); anywhere else a newline would forge the layout. NOT detected:
+  // homoglyphs (a Cyrillic "a" reads as a Latin one). levain.firing.gate.visible is the same rule; the two
+  // must change together.
+  const HIDE = /[\\\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Mn}\p{Me}\p{Zs}\u115F\u1160\u3164\uFFA0\u2800]/gu;
+  function visible(text, keepNewline) {
+    return String(text).replace(HIDE, (c) => {
       if (c === "\\") return "\\\\";
-      if (c === "\n") return c;
+      if (c === " " || (c === "\n" && keepNewline)) return c;
       return "\\u{" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "}";
     });
   }
@@ -303,7 +306,7 @@
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
       // The whole action, never the bounded one-line detail: approving runs all of it.
       const whole = (typeof p.full === "string" && p.full) ? p.full : p.detail;
-      if (whole) item.appendChild(el("pre", "chat-detail", visible(whole)));
+      if (whole) item.appendChild(el("pre", "chat-detail", visible(whole, whole === p.full)));
       if (p.reason) item.appendChild(el("div", "chat-reason", visible(p.reason)));
       if (p.recognized === false) item.appendChild(el("div", "chat-reason", "This action was not recognised by the entity's policy."));
       box.appendChild(item);
@@ -342,10 +345,11 @@
     function after(r) {
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
       if (r.status === 409 && r.json && r.json.error === "stale_decision") {
-        // The server holds something other than what this box shows: the box is withdrawn, never re-armed.
+        // The server holds something other than what this box shows: the box is withdrawn, never re-armed, and
+        // a fresh one is built from what the server holds now.
         deciding = false; box.remove();
-        failure("The held action changed since it was shown; nothing was decided. Close the session and start again.");
-        endOfTurn(true); return;
+        failure("The held action changed since it was shown; nothing was decided; re-reading the session.");
+        resync(myRun); return;
       }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn and the server is asked what it holds now. If

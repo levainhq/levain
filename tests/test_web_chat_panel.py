@@ -87,6 +87,8 @@ body.appendChild(bar); body.appendChild(board);
 const document = { createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
   getElementById: (i) => (i === "board" ? board : null) };
 const TOKEN = "tok-123";
+const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800];
+const hex = (c) => "\\u{" + c.toString(16).toUpperCase().padStart(4, "0") + "}";
 const calls = [];
 const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
@@ -100,11 +102,13 @@ function fetch(path, init) {
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
-              { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true }],
+              { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true },
+              { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "q", reason: "r", recognized: true }],
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
   if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2",
     pending: [{ tool: "bash", detail: "rm -rf y", full: "rm -rf y-after-reload", reason: "destructive", recognized: true }] });
   if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
+  if (path === "/chat/approve" && process.argv[3] === "stale" && approvals() === 1) return reply(409, { error: "stale_decision", message: "not the one shown" });
   if (path === "/chat/approve") return reply(202, { job_id: "J-appr" });
   if (path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
   return reply(404, {});
@@ -129,6 +133,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
   ok(panel.textContent.includes("Held for your approval") && panel.textContent.includes("rm\\u{200B} -rf x"), "pending is shown, with the hidden character made visible");
   ok(panel.textContent.includes("x\\\\u{200B}\\u{0009}y\\u{000D}"), "a backslash is escaped and tab/CR are shown, so no two inputs read alike");
+  ok(panel.textContent.includes("q" + TBL.map(hex).join("") + "q"), "every blank/invisible/overlaying character in the table is shown as \\u{XXXX}");
+  ok(panel.textContent.includes("t\\u{000A}x"), "a newline outside the whole action is escaped");
   await sleep(100);
   if (process.argv[3] === "nodecision") {
     ok(!byText(panel, "Approve") && byText(panel, "Reject"), "no decision id: Reject only, no Approve");
@@ -141,7 +147,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (process.argv[3] === "resync") {
+  if (process.argv[3] === "resync" || process.argv[3] === "stale") {
     // a decision the server did not take: the box is withdrawn and rebuilt from GET /chat/session.json
     approve.fire("click", { isTrusted: true }); await sleep(80);
     ok(approvals() === 1, "one approve was sent");
@@ -165,9 +171,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
+    # mode "stale": a 409 stale_decision is re-read the same way, never a dead end
     # mode "resync": a decision the server refused is re-read (GET /chat/session.json), never re-armed
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)
@@ -196,7 +203,7 @@ def test_the_consent_shows_the_whole_action_that_approving_runs():
     assert _turn_payload(R())["pending"][0]["full"] == cmd   # ... and the chat payload carries it to the panel,
     js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "dashboard_chat.js").read_text()
     assert re.search(r'const whole = \(typeof p\.full === "string" && p\.full\) \? p\.full : p\.detail;', js)
-    assert 'el("pre", "chat-detail", visible(whole))' in js     # which renders it in place of the detail
+    assert 'el("pre", "chat-detail", visible(whole, whole === p.full))' in js     # which renders it in place of the detail
 
 
 def test_a_file_editor_create_shows_its_content_in_full_and_in_the_payload():

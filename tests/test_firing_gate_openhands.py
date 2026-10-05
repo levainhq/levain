@@ -895,3 +895,34 @@ def test_a_value_json_cannot_carry_exactly_gives_an_empty_full_not_a_lossy_rende
     for bad in (datetime.datetime(2026, 10, 5), {1, 2}, b"x", float("nan")):
         assert _full_for("file_editor", {"command": "create", "path": "/x", "extra": bad}) == ""
     assert _full_for("file_editor", {1: "a", "1": "b"}) == ""        # JSON would merge these two keys
+
+
+def test_a_hold_whose_full_cannot_be_rendered_cannot_be_approved_at_the_repl(monkeypatch, capsys):
+    """L1 r3: a NaN in an action made `full` "", and the REPL then showed only the elided detail and took `y`."""
+    from types import SimpleNamespace
+
+    from levain import run as run_mod
+    from levain.firing.gate import PendingEfferent
+    from levain.firing.openhands.gate import _detail_for, _full_for
+
+    fields = {"command": "x" * 500, "timeout": float("nan")}
+    assert _full_for("terminal", fields) == ""
+    held = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full="")
+    assert "NOT SHOWN IN FULL" in held.line()
+
+    class Session:
+        approved = rejected = 0
+
+        def resume_turn(self):
+            self.approved += 1
+            return SimpleNamespace(gated=False, error=None)
+
+        def reject_turn(self, reason):
+            self.rejected += 1
+            return SimpleNamespace(gated=False, error=None)
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    s = Session()
+    run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=(held,), error=None))
+    assert s.approved == 0 and s.rejected == 1
+    assert "cannot be shown in full" in capsys.readouterr().out
