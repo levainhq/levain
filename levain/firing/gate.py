@@ -262,7 +262,7 @@ class PendingEfferent:
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
-        out = f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
+        out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
         if self.full and self.full != self.detail:
             # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
             # those inert, and the newline it kept is the only line break.

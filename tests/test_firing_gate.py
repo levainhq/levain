@@ -309,3 +309,11 @@ def test_visible_is_injective_over_backslash_tab_cr_and_every_control_or_format_
     full = "echo a\r\\u{200B}\x1b[2Jrm -rf ~"
     line = PendingEfferent("terminal", "echo a", "bash fans in", full=full).line()
     assert "\r" not in line and "\x1b" not in line and "echo a\\u{000D}\\\\u{200B}\\u{001B}[2Jrm -rf ~" in line
+
+
+def test_line_shows_every_printed_field_through_visible():
+    from levain.firing.gate import PendingEfferent
+
+    line = PendingEfferent("ter\x1bminal", "echo \x1b[2J‮gnirts", "why ‮\x1b").line()
+    assert "\x1b" not in line and "‮" not in line
+    assert "ter\\u{001B}minal" in line and "echo \\u{001B}[2J\\u{202E}gnirts" in line and "why \\u{202E}\\u{001B}" in line
