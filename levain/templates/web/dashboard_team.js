@@ -53,11 +53,17 @@
     bar.appendChild(control);
   }
 
+  // No token logic here on purpose: the server answers /team_views.json only to a loopback peer on a loopback-bound
+  // cockpit (anything else is a 404), so there is nothing off-box to authenticate.
+  // A response older than the latest request is ignored (loads can overlap: page load, then tab focus).
+  let latest = 0;
   function load() {
+    const mine = ++latest;
+    const settle = (views) => { if (mine === latest) render(views); };
     fetch("/team_views.json", { headers: { Accept: "application/json" } })
       .then((r) => (r.ok ? r.json() : { views: [] }))
-      .then((j) => render(Array.isArray(j.views) ? j.views : []))
-      .catch(() => render([]));
+      .then((j) => settle(Array.isArray(j.views) ? j.views : []))
+      .catch(() => settle([]));
   }
   load();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });

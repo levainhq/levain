@@ -274,6 +274,19 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
+_TEAM_VIEWS_GATE = threading.BoundedSemaphore(2)
+
+
+def _peer_is_loopback(addr: str) -> bool:
+    """True iff the connecting peer is this machine (127.0.0.0/8, ::1, or an IPv4-mapped loopback)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
+
+
 def load_web_asset(filename: str) -> str:
     """Read a web UI asset from package data (``templates/web/``).
 
@@ -596,6 +609,9 @@ class _Handler(GuardedHandler):
     server_version = "levain-serve"
     server: _LevainHTTPServer  # narrow the type for typed attribute access
 
+    def _team_views_allowed(self) -> bool:
+        return bool(self.server.is_loopback_bind) and _peer_is_loopback(self.client_address[0])
+
     def _write_token_required(self) -> bool:
         """True iff this surface requires the ``X-Levain-Write-Token`` — i.e. it is writable AND
         bound off-loopback. The off-box governance factor that replaces loopback-is-auth once the
@@ -704,11 +720,15 @@ class _Handler(GuardedHandler):
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
-        if path == "/team_views.json":
-            # The running `levain team view` servers registered on this machine (levain/team/registry.py):
-            # project, repo, loopback URL only, each confirmed alive (pid + a short loopback probe). A read of
-            # the registry directory, never a write; bounded by the same gate as the other reads.
-            if not self.server.request_gate.acquire(blocking=False):
+        if path == "/team_views.json" and self._team_views_allowed():
+            # The running `levain team view` servers registered on this machine (levain/team/registry.py): project,
+            # repo and loopback URL, each confirmed by a pid check and a nonce probe. Served ONLY to a loopback peer
+            # on a loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
+            # That one rule is why this needs no write token (dashboard_team.js carries no token logic), why repo
+            # paths and project names never reach an off-box client, and why a remote browser is never handed a
+            # 127.0.0.1 link to the wrong machine. The registry probe is slow-ish, so it is NOT run under
+            # request_gate (that is for substrate reads); it has its own small cap.
+            if not _TEAM_VIEWS_GATE.acquire(blocking=False):
                 self._send(
                     b"busy\n", "text/plain; charset=utf-8", status=503, head=head
                 )
@@ -722,7 +742,7 @@ class _Handler(GuardedHandler):
             except Exception:  # noqa: BLE001 - a registry fault means "no team views", never a 500
                 body = b'{"views": []}'
             finally:
-                self.server.request_gate.release()
+                _TEAM_VIEWS_GATE.release()
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 

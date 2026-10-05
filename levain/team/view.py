@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 import json
 import ipaddress
+import secrets
 import sys
 import threading
 from urllib.parse import parse_qs
@@ -368,6 +369,7 @@ class _ViewServer(ThreadingHTTPServer):
     assets: dict
     model_lock: threading.Lock
     model_lock_timeout: float
+    nonce: str
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -480,7 +482,11 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag
     httpd.cockpit_url = cockpit_url if cockpit_url.startswith(("http://", "https://")) else DEFAULT_COCKPIT_URL
-    httpd.assets = {"/dashboard.css": (load_web_asset("dashboard.css").encode("utf-8"), "text/css; charset=utf-8"),
+    # The nonce ties a registry entry to THIS process: served at /team_view.id, written into the entry, and required
+    # by the cockpit's probe, so a reused pid or another view on the same port is not mistaken for this one.
+    httpd.nonce = secrets.token_hex(16)
+    httpd.assets = {"/team_view.id": (f"levain-team-view:{httpd.nonce}\n".encode("ascii"), "text/plain; charset=utf-8"),
+                    "/dashboard.css": (load_web_asset("dashboard.css").encode("utf-8"), "text/css; charset=utf-8"),
                     "/team_view.css": (CSS.encode("utf-8"), "text/css; charset=utf-8"),
                     "/team_view.js": (JS.encode("utf-8"), "text/javascript; charset=utf-8")}
     return httpd
@@ -495,22 +501,36 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
     url = f"http://{bh}:{bp}/"
     print(f"Levain team view -> {url}")
     print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
-    # Back-link: tell the cockpit this view exists (repo, URL, project, pid; see registry.py). Best effort: a
-    # registry that cannot be written costs the cockpit's Team tab, never the view.
     entry = None
+    previous = None
+    installed = False
     try:
-        registry.prune_dead()
-        entry = registry.register(str(gl.repo.toplevel), url, gl.team().project)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-    if threading.current_thread() is threading.main_thread():
-        import signal
-        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))  # a clean exit too
-    try:
+        # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
+        # written costs the cockpit's Team tab, never the view. Registration and the SIGTERM handler sit inside the
+        # same try, so the finally below undoes exactly what was done.
+        try:
+            registry.prune_dead()
+            entry = registry.register(str(gl.repo.toplevel), url, gl.team().project, nonce=httpd.nonce)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        if threading.current_thread() is threading.main_thread():
+            import signal
+            previous = signal.signal(signal.SIGTERM, _on_sigterm)   # SIGTERM exits as cleanly as Ctrl+C
+            installed = True
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if installed:
+            import signal
+            try:
+                signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
         httpd.server_close()
         registry.unregister(entry)
     return 0
+
+
+def _on_sigterm(signum, frame) -> None:
+    raise KeyboardInterrupt
