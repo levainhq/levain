@@ -1885,21 +1885,45 @@ def test_headroom_fails_over_the_bound_and_the_durable_section_does_not_count(tm
     assert r2.ok
 
 
-def test_headroom_counts_crlf_as_two_and_flags_a_tight_file(tmp_path: Path):
+def test_headroom_flags_a_tight_file(tmp_path: Path):
     from anneal_memory.schema import FLOW_SCHEMA, hard_max_chars
     from levain.doctor import _check_continuity_headroom
 
     bound = hard_max_chars(FLOW_SCHEMA)
-    lf = _flow_continuity(bound - 92)
-    assert len(lf) < bound and len(lf) + lf.count("\n") > bound   # LF fits, CRLF does not
-    d = _entity_with_continuity(tmp_path, lf)
-    assert _check_continuity_headroom(d)[0].ok
-    (tmp_path / "e2").mkdir()
-    crlf = _entity_with_continuity(tmp_path / "e2", lf.replace("\n", "\r\n"))   # every newline now counts two: over
-    assert not _check_continuity_headroom(crlf)[0].ok
-    (tmp_path / "e3").mkdir()
-    tight = _entity_with_continuity(tmp_path / "e3", _flow_continuity(bound - 700))
-    assert "under 10% left" in _check_continuity_headroom(tight)[0].detail
+    skeleton = len(_flow_continuity(0))
+    d = _entity_with_continuity(tmp_path, _flow_continuity(int(bound * 0.95) - skeleton))
+    (r,) = _check_continuity_headroom(d)
+    assert r.ok and "under 10% left" in r.detail
+    (tmp_path / "roomy").mkdir()
+    (r2,) = _check_continuity_headroom(_entity_with_continuity(tmp_path / "roomy", _flow_continuity(int(bound * 0.5) - skeleton)))
+    assert r2.ok and "under 10%" not in r2.detail
+
+
+def test_headroom_fails_on_a_continuity_anneals_next_wrap_could_not_read(tmp_path: Path):
+    from levain.doctor import _check_continuity_headroom
+
+    d = _entity_with_continuity(tmp_path, None)
+    (d / ".levain" / "memory.continuity.md").write_bytes(b"## State\nshort \xff\n")   # not UTF-8: anneal's load raises
+    (r,) = _check_continuity_headroom(d)
+    assert not r.ok and "could not measure" in r.detail and "UnicodeDecodeError" in r.detail
+    (tmp_path / "dir").mkdir()
+    d2 = _entity_with_continuity(tmp_path / "dir", None)
+    (d2 / ".levain" / "memory.continuity.md").mkdir()                                   # a directory where the file belongs
+    assert not _check_continuity_headroom(d2)[0].ok
+
+
+def test_headroom_fails_when_a_wrapped_entity_has_lost_its_continuity_but_not_a_fresh_one(tmp_path: Path):
+    import sqlite3
+    from levain.doctor import _check_continuity_headroom
+
+    d = _entity_with_continuity(tmp_path, None)
+    assert _check_continuity_headroom(d) == []                                         # fresh: no wrap yet, nothing to say
+    con = sqlite3.connect(d / ".levain" / "memory.db")
+    con.execute("INSERT INTO wraps (episodes_compressed) VALUES (3)")                  # one completed wrap, as anneal records it
+    con.commit()
+    con.close()
+    (r,) = _check_continuity_headroom(d)
+    assert not r.ok and "1 completed wrap" in r.detail and "missing" in r.detail
 
 
 def test_headroom_stays_quiet_without_a_file_or_a_store_and_reports_an_unreadable_store(tmp_path: Path):

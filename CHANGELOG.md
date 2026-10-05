@@ -8,7 +8,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 
-- **`levain doctor` reports each entity's continuity headroom against anneal's hard maximum.** The new `continuity headroom` line reads `.levain/memory.continuity.md` and the schema persisted in the entity's store, and says how many characters are used, the bound, and how many are left (flagging under 10%). It fails when the file is already over the maximum, because every wrap's save is refused until it is cut. The count is anneal's own: the file's characters minus the durable section (`anneal_memory.durable.section_chars`, a CRLF counting two), against `anneal_memory.schema.hard_max_chars`; nothing is re-implemented here. It needs anneal-memory 0.9.33 or later, which levain already requires.
+- **`levain doctor` reports each entity's continuity headroom against anneal's hard maximum.** The new `continuity headroom` line reads the entity's continuity through its store (`Store.load_continuity`, strict UTF-8, as the next wrap will) and the schema persisted there, and says how many characters are used, the bound, and how many are left (flagging under 10%). It fails when the file is over the maximum (a wrap's save is refused unless it recomposes the continuity below it), when the file cannot be read, and when the store has completed wraps but the continuity file is missing (the next wrap would start the memory over as a first wrap). The count is anneal's own: the file's characters minus the durable section (`anneal_memory.durable.section_chars`) against `anneal_memory.schema.hard_max_chars`; nothing is re-implemented here. It needs anneal-memory 0.9.33 or later, which levain already requires.
 
 ## [0.6.3] — 2026-10-04
 

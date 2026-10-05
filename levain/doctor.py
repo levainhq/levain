@@ -922,18 +922,19 @@ def _check_store(install: Path) -> list[CheckResult]:
 
 
 def _check_continuity_headroom(install: Path) -> list[CheckResult]:
-    """How much room the entity's continuity has left before anneal refuses a save.
+    """How much room the entity's continuity has left under anneal's hard maximum.
 
-    Counts what anneal counts: the file's characters minus the durable section
-    (``anneal_memory.durable.section_chars``), against ``hard_max_chars`` of the schema persisted in the
-    entity's store. Nothing here re-implements either measure. Fails only when the file is already over the
-    maximum: every wrap's save is refused until it is cut. A missing file or store is not this check's to
-    report (a fresh install has no continuity yet; ``_check_store`` names a missing store).
+    Reads the file the way the next wrap will, through the store (``Store.load_continuity``, strict UTF-8), and
+    counts what anneal counts: its characters minus the durable section (``anneal_memory.durable.section_chars``)
+    against ``hard_max_chars`` of the schema persisted in the entity's store. Nothing here re-implements a
+    measure or a read. Fails when the file is over the bound (a save is refused unless the wrap recomposes below
+    it), when it cannot be read, and when the store has completed wraps but no continuity file (the memory is
+    gone, and the next wrap would treat itself as the first). A fresh install with no wrap yet, or no store, has
+    nothing to report here (``_check_store`` names a missing store).
     """
     store = install / ".levain" / "memory.db"
-    continuity = install / ".levain" / "memory.continuity.md"
     name = "continuity headroom"
-    if not store.is_file() or not continuity.is_file():
+    if not store.is_file():
         return []
     try:
         from anneal_memory import Store
@@ -942,8 +943,15 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
 
         with Store(str(store), read_only=True) as st:
             schema = st.section_schema_for_wrap()
-        # decoded as anneal counts it: no newline translation (a CRLF counts two), so not read_text
-        text = continuity.read_bytes().decode("utf-8", "replace")
+            text = st.load_continuity()
+            wraps = st.last_wrap_id()
+        if text is None:
+            if wraps == 0:
+                return []
+            return [CheckResult(
+                name, False,
+                f"the store has {wraps} completed wrap(s) but .levain/memory.continuity.md is missing",
+                "Restore the file from a backup or from git; a wrap without it starts the memory over as a first wrap.")]
         bound = hard_max_chars(schema)
         used = len(text) - section_chars(text, schema)
     except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
@@ -953,8 +961,9 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
     if room < 0:
         return [CheckResult(
             name, False,
-            f"{used} of {bound} characters: {-room} over anneal's hard maximum, so every wrap's save is refused",
-            "Cut fetchable detail (State, Active Threads, Context) from .levain/memory.continuity.md, then wrap again; "
+            f"{used} of {bound} characters: {-room} over anneal's hard maximum, so a wrap's save is refused "
+            "unless it recomposes the continuity below it",
+            "Cut fetchable detail (State, Active Threads, Context) from .levain/memory.continuity.md; "
             "the Durable Facts section is outside this count.")]
     tight = " (under 10% left)" if room * 10 < bound else ""
     return [CheckResult(name, True, f"{used} of {bound} characters, {room} left{tight}")]
