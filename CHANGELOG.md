@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- **A teammate's ruling can no longer draw fake `[team]` lines into your session.** The `SessionStart` context printed each ruling's words, paths and owner exactly as recorded, so a line break in a member's ruling started a new line that read as the hook's own (`[team] ...`) in every teammate's agent context. Every line the hooks, `levain team status` and `PROJECT.md` assemble is now folded onto one line as a whole, whatever field or file name fed it (words, paths, owner, pack, author, the edited file's own name, warnings and git errors), so a line break in any of them stays inside its line. Found by the nightly review, reproduced, and pinned by a test that fails on 0.6.3.
+- **`team.toml` refuses member handles that would share a ledger folder.** A handle's ledger folder drops a trailing `-` or `.`, so `ana` and `ana-` (or `ana.`) both wrote `ledger/ana/`, and adding the second member made every line the first had written read as the second's: the first member's rulings stopped being enforced, and one member could sign as the other. Handles are now compared by their folder name ignoring case (which also covers the existing case-only check), and a team whose `team.toml` holds such a pair is refused with both names. A `team.toml` holding such a pair at the tip is treated like any unusable tip: the newest valid version is used, with a warning that now also reaches the session-start context, or the hooks print a visible `ledger unavailable` line. A project name that spans lines is folded onto one line when read (older files keep loading) and refused when written. Known limits: a member renamed from `ben` to `ben-` (no pair at any one time) still shares `ledger/ben/` across the rename, and an email written as `<a@x.com>` is a different roster entry from `a@x.com` though git records both the same way.
+- The `levain wrap` exit-code documentation no longer says exit 1 leaves the identity unchanged; on three save paths it is not established, and the printed message says what the store shows.
+
 ## [0.6.4] — 2026-10-05
 
 The team view and its cockpit back-link, and `levain doctor`'s continuity headroom line.

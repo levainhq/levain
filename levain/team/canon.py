@@ -26,18 +26,18 @@ def _entry_block(e: dict, team: R.Team) -> list[str]:
         meta.append(f"owner {I.oneline(e['owner'])}")
     if e.get("kind") == "ruling":
         meta.append(f"mode {e.get('mode') or team.mode}")
-    src = f"pack {e['pack']}" if e.get("pack") else e.get("author", "?")
+    src = f"pack {I.oneline(e['pack'])}" if e.get("pack") else I.oneline(str(e.get("author", "?")))
     meta.append(f"recorded by {src} {e.get('ts', '')[:10]}")
     out = [f"- {' · '.join(meta)}"]
     if e.get("words"):
         out.append(f'  > "{I.oneline(e["words"])}"')
     if e.get("summary"):
-        out.append(f"  summary by {e.get('author')}: {I.oneline(e['summary'])}")
+        out.append(f"  summary by {I.oneline(str(e.get('author')))}: {I.oneline(e['summary'])}")
     if e.get("reason"):
         out.append(f"  why: {I.oneline(e['reason'])}")
     if e.get("recheck"):
         out.append(f"  re-check: `{I.oneline(e['recheck'])}`")
-    return out
+    return [I.oneline(x) for x in out]   # every line, whatever field fed it (see index.render)
 
 
 def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> str:
@@ -94,7 +94,8 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
     if not any(l.startswith("## ") for l in lines):
         lines.append("Nothing is in force yet.")
         lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    # Every line folded, whatever fed it: the canon is read by agents, and its header lines interpolate team.toml.
+    return "\n".join(I.oneline(line) for line in lines).rstrip() + "\n"
 
 
 def header(text: str | None) -> dict | None:

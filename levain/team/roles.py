@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .entry import HANDLE_RE, MODES
+from .entry import HANDLE_RE, MODES, safe_handle
 
 
 class RolesError(ValueError):
@@ -66,7 +66,10 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
     except tomllib.TOMLDecodeError as exc:
         raise RolesError(f"{where} is not valid TOML: {exc}") from None
     try:
-        t = Team(project=str(raw["project"]), owner=str(raw["owner"]),
+        # Folded on read, so a team.toml written before the printable rule still loads (refusing it would roll the
+        # roster back or drop the whole team); writers go through validate_team with the folded name.
+        project = " ".join("".join(c if c.isprintable() else " " for c in str(raw["project"])).split())
+        t = Team(project=project, owner=str(raw["owner"]),
                  members={str(k): str(v) for k, v in dict(raw.get("members", {})).items()},
                  client_owners=raw.get("client_owners", []),
                  mode=str(raw.get("mode", "ask-once")), fetch_interval=int(raw.get("fetch_interval", 300)))
@@ -79,6 +82,10 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
 def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.mode not in MODES:
         raise RolesError(f"{where}: mode must be one of {', '.join(MODES)}")
+    if not t.project.isprintable():   # empty stays allowed, as in 0.6.3 (L3 r3: refusing it dropped old teams)
+        # The project name heads PROJECT.md and the hooks' lines: a line break in it would let whoever
+        # edits team.toml draw text that reads as levain's own.
+        raise RolesError(f"{where}: project must be a single line of printable text")
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")
     for h, mail in t.members.items():
@@ -90,12 +97,16 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
             raise RolesError(f"{where}: member {h!r} needs an email (it maps git's user.email to the handle)")
     if not isinstance(t.client_owners, list) or not all(isinstance(c, str) for c in t.client_owners):
         raise RolesError(f"{where}: client_owners must be a list of names")
+    # Two handles that reach the same ledger folder (safe_handle strips a trailing '-' or '.', and a
+    # case-insensitive disk folds case) would share one author's lines: the later member would be read
+    # as the earlier one's author, un-enforcing their rulings and letting one sign as the other.
     folded: dict[str, str] = {}
     for h in t.members:
-        if h.lower() in folded:
-            raise RolesError(f"{where}: handles {folded[h.lower()]!r} and {h!r} differ only by case "
-                             "(their ledger folders would collide on a case-insensitive disk)")
-        folded[h.lower()] = h
+        key = safe_handle(h).casefold()
+        if key in folded:
+            raise RolesError(f"{where}: handles {folded[key]!r} and {h!r} map to the same ledger folder "
+                             f"(ledger/{safe_handle(h)}/, ignoring case); rename one of them")
+        folded[key] = h
     seen: dict[str, str] = {}
     for h, mail in t.members.items():
         key = mail.strip().lower()
