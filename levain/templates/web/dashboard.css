@@ -283,6 +283,7 @@
     border-radius: 4px; padding: 8px 15px; cursor: pointer; transition: all .14s ease;
   }
   .tab:hover { color: var(--ink); border-color: var(--line-hot); }
+  .tab-team-note { align-self: center; font: 400 10px/1.2 var(--label); letter-spacing: .04em; color: var(--dim); }
   .tab.active {
     color: #06120c; background: linear-gradient(180deg, var(--mind), #43c089); border-color: var(--mind);
     border-bottom-width: 1px; transform: translateY(1px); box-shadow: 0 0 18px -4px var(--mind), inset 0 1px 0 rgba(255,255,255,.25);

@@ -24,7 +24,8 @@
   function go(raw) { const u = safeUrl(raw); if (u) window.location.href = u; }
   function label(v) { return "▣ Team · " + v.project; }
 
-  // The server stops scanning at a time limit; say so, once, instead of letting a short list pass as complete.
+  // The server says when its list may be incomplete (a cap, a time limit or a read error); say so, once, instead of
+  // letting a short list pass as complete.
   function render(views, truncated) {
     const ok = views.map((v) => ({ v: v, u: safeUrl(v.url) })).filter((x) => x.u);
     if (control) { control.remove(); control = null; }
@@ -32,7 +33,7 @@
     if (truncated) {
       note = document.createElement("span");
       note.className = "tab-team-note";
-      note.textContent = "team list may be incomplete (scan time limit)";
+      note.textContent = "team list may be incomplete";
       bar.appendChild(note);
     }
     if (!ok.length) return;

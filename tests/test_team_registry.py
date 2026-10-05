@@ -327,11 +327,63 @@ def test_t5_junk_old_grammar_and_poisoned_names_are_ignored_and_never_break_the_
             os.close(fd)
 
 
-def test_the_cap_applies_after_filtering(pub):
-    for i in range(R.MAX_VIEWS + 3):
-        pub(f"p{i:02d}", port=42000 + i)
-    views, truncated = R.live_views_scan()
-    assert len(views) == R.MAX_VIEWS and truncated is False
+def test_the_cap_applies_after_filtering_in_name_order_and_says_so(pub):
+    """Which views show past the cap must not depend on directory order, and a capped list is not complete."""
+    regs = [pub(f"p{i:02d}", port=42000 + i) for i in range(R.MAX_VIEWS + 3)]
+    first = sorted(regs, key=lambda r: r.name)[:R.MAX_VIEWS]
+    want = sorted(f"http://127.0.0.1:{42000 + regs.index(r)}/" for r in first)
+    for _ in range(3):
+        views, truncated = R.live_views_scan(budget=5)
+        assert sorted(v["url"] for v in views) == want and truncated is True
+    for r in regs[R.MAX_VIEWS:]:
+        r.unpublish()
+    views, truncated = R.live_views_scan(budget=5)
+    assert len(views) == R.MAX_VIEWS and truncated is False      # exactly the cap, nothing left unjudged
+
+
+def test_the_budget_is_checked_before_the_name_filter(pub):
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    for i in range(50):
+        (d / f"junk-{i}").write_bytes(b"")
+    assert R.live_views_scan(budget=0) == ([], True)            # junk alone still spends the budget
+
+
+def test_a_directory_read_error_part_way_reports_truncated(pub, monkeypatch):
+    pub("ledgerline")
+    real = R.os.scandir
+
+    class _Broken:
+        def __init__(self, fd):
+            self._it = real(fd)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self._it.close()
+
+        def __iter__(self):
+            yield next(iter(self._it))
+            raise OSError(5, "Input/output error")
+    monkeypatch.setattr(R.os, "scandir", _Broken)
+    views, truncated = R.live_views_scan(budget=5)
+    assert truncated is True and len(views) <= 1
+
+
+def test_a_registry_fault_in_the_handler_is_reported_as_incomplete(tmp_path, monkeypatch):
+    import levain.team.registry as reg
+
+    def boom(*a, **k):
+        raise RuntimeError("registry fault")
+    monkeypatch.setattr(reg, "live_views_scan", boom)
+    httpd = _cockpit(tmp_path)
+    try:
+        body = _get(httpd.server_address[1], "/team_views.json")[1]
+        assert json.loads(body) == {"views": [], "truncated": True}
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_many_dead_entries_never_hide_a_live_view(pub):

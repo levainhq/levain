@@ -16,11 +16,11 @@ The protocol, in one place:
 * The ``lock1-`` prefix is the liveness-generation marker. A future mechanism must use a different prefix, so an
   old view can never prune a newer view's files and a reader never has to parse a file to decide whether to trust it.
 * The cockpit never deletes anything. A starting view prunes entries nobody holds, strictly before it publishes.
-  A hidden temp file is swept by the same rule as an entry (only if a shared try-lock succeeds on it), never by
-  age: a publisher paused for any length of time still holds its exclusive lock, so its temp is never touched.
-  Readers ignore temp files.
-* A listing examines entries until MAX_VIEWS live ones are found, the entries run out, or LIST_BUDGET is spent; in
-  the last case it reports ``truncated`` so the cockpit can say the list may be incomplete.
+  Hidden temp files are never swept: a publisher creates its temp before it locks it, so no rule can tell a
+  starting view's temp from a dead one. A temp left by a killed view stays, and readers ignore temp files.
+* A listing judges entries in sorted name order until MAX_VIEWS live ones are found, the names run out, or
+  LIST_BUDGET is spent; whenever names were left unjudged, or the directory could not be read in full, it reports
+  ``truncated`` so the cockpit can say the list may be incomplete.
 * A forked child (no exec) closes its copy of the lock fd at once, so it cannot keep a dead view listed.
 * Before publishing, a view checks that ``flock`` really conflicts on this filesystem. On a filesystem that emulates
   it (NFS, some FUSE mounts) the view says why it is not registered and keeps serving.
@@ -170,7 +170,8 @@ if hasattr(os, "register_at_fork"):
 
 class Registration:
     """One published entry and the lock fd that makes it live. Owns the fd for the life of the view: keep this
-    object referenced (the view hangs it on its server), because dropping it closes the lock and the entry reads dead.
+    object referenced (the view hangs it on its server). There is no finalizer: dropping it without ``close`` leaves
+    the fds open, so the entry reads live until ``close`` or process exit.
     ``unpublish`` removes the entry, ``close`` releases the lock; both are idempotent and neither raises on a
     resource that is already gone."""
 
@@ -340,43 +341,48 @@ def _read_live(dir_fd: int, name: str) -> dict | None:
 
 
 def live_views_scan(budget: float = LIST_BUDGET) -> tuple[list[dict], bool]:
-    """(views, truncated): the registered views whose publisher holds its lock now. Read-only, no network. Entries
-    are judged one at a time until MAX_VIEWS live ones are found, they run out, or ``budget`` seconds are spent
-    (checked between files), so junk or dead entries can neither hide a live view nor hold the cockpit; only the
-    budget can end a scan early, and then ``truncated`` is True. One ``open`` hung on a dead hard mount cannot be
-    interrupted here; the caller's gate bounds how many requests that can trap."""
+    """(views, truncated): the registered views whose publisher holds its lock now. Read-only, no network.
+
+    The directory is read in full first (the budget is checked before every name, junk included), the entry names
+    are sorted, and entries are judged in that order, so which views show never depends on directory order. The scan
+    stops at MAX_VIEWS live views, at the end of the names, or when ``budget`` seconds are spent. ``truncated`` is
+    True whenever the result may be incomplete: names were left unexamined (the cap or the budget), or reading the
+    directory failed part way. One ``open`` hung on a dead hard mount cannot be interrupted here; the caller's gate
+    bounds how many requests that can trap."""
     if fcntl is None:
         return [], False
     try:
         dir_fd = _open_dir(create=False)
+    except FileNotFoundError:
+        return [], False                              # no view has ever registered: complete and empty
     except (OSError, RegistryUnavailable):
-        return [], False
+        return [], True
     end = time.monotonic() + budget
     out: list[dict] = []
     truncated = False
     try:
+        names: list[str] = []
         try:
-            it = os.scandir(dir_fd)
+            with os.scandir(dir_fd) as it:
+                for ent in it:
+                    if time.monotonic() >= end:
+                        truncated = True
+                        break
+                    if _NAME_RE.fullmatch(ent.name):
+                        names.append(ent.name)
         except OSError:
-            return [], False
-        with it:
-            for ent in it:
-                name = ent.name
-                if not _NAME_RE.fullmatch(name):
-                    continue
-                if len(out) >= MAX_VIEWS:
-                    break
-                if time.monotonic() >= end:
-                    truncated = True
-                    break
-                try:   # one poisoned file must never abort the loop or hide the real views after it
-                    e = _read_live(dir_fd, name)
-                except Exception:  # noqa: BLE001
-                    continue
-                if e:
-                    out.append(e)
-    except OSError:
-        pass
+            truncated = True
+        names.sort()
+        for i, name in enumerate(names):
+            if len(out) >= MAX_VIEWS or time.monotonic() >= end:
+                truncated = True                      # names[i:] were never judged
+                break
+            try:   # one poisoned file must never abort the loop or hide the real views after it
+                e = _read_live(dir_fd, name)
+            except Exception:  # noqa: BLE001
+                continue
+            if e:
+                out.append(e)
     finally:
         os.close(dir_fd)
     return sorted(out, key=lambda e: (e["project"].casefold(), e["url"])), truncated
