@@ -12,6 +12,8 @@ Chat panel polish from the first click-through.
 
 - **Enter sends a chat message; Shift+Enter starts a new line.** Only in the message box, and not while an input method is composing a character. No key approves or rejects a held action: the decision buttons are clicks, and Enter in the reject reason only starts a new line.
 - **The reject reason is a one-line field that grows as you type.** It rendered as a tall box with the placeholder centred vertically.
+- **"Check what happened" (was "Re-read the session") shows what the lost request did.** After an unclear outcome, `GET /chat/session.json` now returns `last_job`, the session's most recent job that started (its kind, status, activity and result), and the panel shows which actions ran and the entity's reply before anything else. A consent box still comes only from the session's current held set, with the "may already have run" warning. When the session is gone (the server answers `unknown_session`, or no longer accepts the token), the panel says "The server restarted, so that session has ended. Your last request may or may not have run" and names the entity's workspace to check: a restart ends every chat session, because they live in the server's memory.
+- Enter sends only on a real keypress, and never while the message box is disabled or a decision is in flight.
 
 ## [0.6.6] — 2026-10-05
 
