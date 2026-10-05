@@ -195,10 +195,12 @@
     form = el("form", "chat-compose");
     area = el("textarea", "chat-input chat-area"); area.rows = 3;
     area.setAttribute("aria-label", "message");
-    sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "submit";
+    sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "button";
     form.appendChild(area); form.appendChild(sendBtn);
-    // A trusted submit only (the Send button or the browser's own submit); a scripted submit sends nothing.
-    form.addEventListener("submit", (ev) => { ev.preventDefault(); if (ev.isTrusted) sendTurn(); });
+    // A turn is sent by a trusted click on Send or by Enter in the compose box (below), never by the form's submit
+    // event: a script's form.requestSubmit() fires a submit the browser marks trusted, so submit only prevents default.
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); });
+    sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });
     // Enter sends and Shift+Enter starts a new line, in THIS box only. Not while an input method is composing a
     // character (that Enter belongs to the IME). Nothing in the consent box listens for Enter: deciding is a click.
     // Composition is tracked from its own events too: some browsers give the Enter that confirms a composed
@@ -377,7 +379,7 @@
   // request: the same job id when its start was confirmed, or (no 202 came back) a job that started after the last one
   // this page saw. Anything else is not an answer: "nothing new started" is said as such, never as "what happened".
   // Returns "known" (the lost request's job was reported), "none" (nothing started since), or "" (still unknown).
-  function judgeLastJob(last, ctx) {
+  function judgeLastJob(last, ctx, myRun) {
     const lid = last && typeof last === "object" ? last.job_id : undefined;
     if (ctx.jobId) {
       if (lid === ctx.jobId) return reportLastJob(last) ? "known" : "";
@@ -387,6 +389,7 @@
     if (lid === undefined || lid === ctx.before) {
       failure("No job has started on the server since your last confirmed request, so your last " + ctx.what +
         " has not run. If it was only delayed on the way it could still arrive: check again before sending it again.");
+      rereadButton(myRun, ctx);
       return "none";
     }
     return reportLastJob(last) ? "known" : "";
@@ -413,7 +416,7 @@
         row.appendChild(fresh); log.appendChild(row);
         return;
       }
-      const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
+      const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx, myRun) : "";
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning); return;
       }
