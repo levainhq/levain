@@ -904,7 +904,7 @@ def _plant_named_ledger_files(ana, names, *, hooks_control=False):
     return planted
 
 
-ODD_NAMES = ["my file.jsonl", "café.jsonl", 'q"uote.jsonl', "tab\tname.jsonl"]
+ODD_NAMES = ["my file.jsonl", "café.jsonl", 'q"uote.jsonl', "tab\tname.jsonl", 'sp "q\u00e9.jsonl', "back\\slash.jsonl"]
 
 
 def test_a_ledger_file_whose_name_git_quotes_is_still_read_enforced_and_exported(two, capsys):
@@ -929,9 +929,9 @@ def test_diff_path_undoes_gits_quoting_and_leaves_what_it_cannot_read_unmatched(
     from levain.team.transport import _diff_path
     assert _diff_path("b/ledger/ana/x.jsonl") == "b/ledger/ana/x.jsonl"
     assert _diff_path("b/ledger/ana/my file.jsonl\t") == "b/ledger/ana/my file.jsonl"
-    assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/q"u\\o\tté.jsonl'
+    assert _diff_path('"b/ledger/ana/q\\"u\\\\o\\tt\\303\\251.jsonl"') == 'b/ledger/ana/\x00q"u\\\\o\\x09t\u00e9.jsonl'
     assert _diff_path('"b/ledger/ana/\\q.jsonl"') == '"b/ledger/ana/\\q.jsonl"'          # unknown escape: left quoted
-    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\udcff.jsonl"        # not UTF-8: a surrogate escape
+    assert _diff_path('"b/ledger/ana/\\377.jsonl"') == "b/ledger/ana/\x00\\xff.jsonl"        # not UTF-8: that component is an ASCII-escaped key behind a NUL
     assert _diff_path('"b/ledger/ana/\\377.jsonl"') != _diff_path('"b/ledger/ana/\\303\\277.jsonl"')   # \xff vs U+00FF never alias
     assert _diff_path('"b/ledger/ana/my \\"f.jsonl"\t') == 'b/ledger/ana/my "f.jsonl'     # a space makes git add the tab to a quoted name too
 
@@ -941,15 +941,21 @@ def test_a_non_utf8_ledger_file_name_or_content_cannot_crash_or_blind_the_read(t
     assert record_ruling(ana, "src/a.py", "a stays") == 0
     gl = GitLedger(Repo.discover(ana))
     root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/bad.py"], words="bad name"), "")
+    root2 = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/y.py"], words="y umlaut name"), "")
     # APFS refuses a non-UTF-8 file name, so both files go in through git plumbing, as a hostile member's push would
     for name, data in ((b"ledger/ana/\xff.jsonl", json.dumps(root, sort_keys=True).encode() + b"\n"),   # a name that is not UTF-8
+                       (b"ledger/ana/\xc3\xbf.jsonl", json.dumps(root2, sort_keys=True).encode() + b"\n"),   # U+00FF: must not alias \xff
+                       (b"ledger/ana/\xfe.jsonl", b"not a chain line\n"),                                      # a bad line in a bad name
                        (b"ledger/ana/junk.jsonl", b"\xff\xfe not json\n")):                            # content that is not UTF-8
         sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=gl.wt, input=data, check=True,
                              capture_output=True).stdout.decode().strip()
         subprocess.run(["git", "update-index", "--add", "--cacheinfo", b"100644," + sha.encode() + b"," + name],
                        cwd=gl.wt, check=True, capture_output=True)
     git("commit", "-qm", "non-utf8", cwd=gl.wt)
-    assert "bad name" in [e["words"] for e in ledger(ana).in_force]
+    words = [e["words"] for e in ledger(ana).in_force]
+    assert "bad name" in words and "y umlaut name" in words                         # two names, two files, both read
+    capsys.readouterr()
+    assert team("verify", repo=ana) == 1                                            # the bad line is reported, the report prints
     capsys.readouterr()
     assert team("export", "--jsonl", repo=ana) == 0
     assert "bad name" in capsys.readouterr().out
@@ -978,13 +984,13 @@ def test_the_git_helper_decodes_bytes_itself_never_through_the_locale_or_newline
     sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=tmp_path, input=data, check=True,
                          capture_output=True).stdout.decode().strip()
     out = tgit(["cat-file", "-p", sha], tmp_path).stdout
-    assert out == '{"w":"caf\u00e9"}\r+++ b/ledger/x.jsonl\r\ufffd\n'     # CR kept (no line split), bad byte replaced
+    assert out == '{"w":"caf\u00e9"}\r+++ b/ledger/x.jsonl\r\udcff\n'     # CR kept (no line split), a bad byte survives as a surrogate escape
     # the same read under a parent process whose locale is ASCII (text=True would decode with that)
     code = ("import sys; from pathlib import Path; from levain.team.transport import git; "
-            "sys.stdout.buffer.write(git(['cat-file','-p',sys.argv[1]], Path(sys.argv[2])).stdout.encode('utf-8'))")
+            "sys.stdout.buffer.write(git(['cat-file','-p',sys.argv[1]], Path(sys.argv[2])).stdout.encode('utf-8', 'surrogateescape'))")
     env = {**os.environ, "LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
     cp = subprocess.run([PY, "-P", "-c", code, sha, str(tmp_path)], env=env, capture_output=True, check=True)
-    assert cp.stdout.decode("utf-8") == out
+    assert cp.stdout.decode("utf-8", "surrogateescape") == out
 
 
 def test_a_ledger_file_git_would_call_binary_is_still_read(two):
