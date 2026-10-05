@@ -311,8 +311,12 @@ def test_team_roundtrip_and_refusals(tmp_path):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "nope"})))
     with pytest.raises(R.RolesError, match="reserved"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "pack-x": "p@x.com"})))
-    with pytest.raises(R.RolesError, match="differ only by case"):
+    with pytest.raises(R.RolesError, match="same ledger folder"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "Ana": "b@x.com"})))
+    # Diogenes 2026-10-05: safe_handle strips a trailing '-' or '.', so these shared ledger/ana/.
+    for twin in ("ana-", "ana.", "Ana.-"):
+        with pytest.raises(R.RolesError, match="same ledger folder"):
+            R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", twin: "b@x.com"})))
     with pytest.raises(R.RolesError, match="share the email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "ann": "A@X.com "})))
     with pytest.raises(R.RolesError, match="mode"):

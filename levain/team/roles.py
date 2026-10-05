@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .entry import HANDLE_RE, MODES
+from .entry import HANDLE_RE, MODES, safe_handle
 
 
 class RolesError(ValueError):
@@ -90,12 +90,16 @@ def validate_team(t: Team, where: str = "team.toml") -> None:
             raise RolesError(f"{where}: member {h!r} needs an email (it maps git's user.email to the handle)")
     if not isinstance(t.client_owners, list) or not all(isinstance(c, str) for c in t.client_owners):
         raise RolesError(f"{where}: client_owners must be a list of names")
+    # Two handles that reach the same ledger folder (safe_handle strips a trailing '-' or '.', and a
+    # case-insensitive disk folds case) would share one author's lines: the later member would be read
+    # as the earlier one's author, un-enforcing their rulings and letting one sign as the other.
     folded: dict[str, str] = {}
     for h in t.members:
-        if h.lower() in folded:
-            raise RolesError(f"{where}: handles {folded[h.lower()]!r} and {h!r} differ only by case "
-                             "(their ledger folders would collide on a case-insensitive disk)")
-        folded[h.lower()] = h
+        key = safe_handle(h).casefold()
+        if key in folded:
+            raise RolesError(f"{where}: handles {folded[key]!r} and {h!r} map to the same ledger folder "
+                             f"(ledger/{safe_handle(h)}/, ignoring case); rename one of them")
+        folded[key] = h
     seen: dict[str, str] = {}
     for h, mail in t.members.items():
         key = mail.strip().lower()
