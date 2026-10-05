@@ -144,7 +144,14 @@ function fetch(path, init) {
   return reply(404, {});
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ctx = vm.createContext({ document, fetch, setTimeout: (f) => setImmediate(f), clearTimeout() {}, encodeURIComponent, JSON, Promise, Array, Object, String });
+// Polling timers run at once; a long timer (the armed-Approve timeout) waits until the test fires it.
+const longTimers = new Map(); let tid = 0;
+const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.delete(i); f(); } };
+const ctx = vm.createContext({ document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
+  setTimeout: (f, ms) => { if (ms >= 2000) { const i = ++tid; longTimers.set(i, f); return i; } setImmediate(f); return 0; },
+  clearTimeout: (i) => { longTimers.delete(i); } });
+// Approve is two-step: arm, wait past the double-press guard, confirm.
+const approveTwice = async (b, ev) => { b.fire("click", ev || { isTrusted: true, detail: 1 }); await sleep(350); b.fire("click", ev || { isTrusted: true, detail: 1 }); };
 const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 (async () => {
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
@@ -184,16 +191,14 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(reason && reason.rows === 1, "the reject reason is a one-line growing textarea");
     reason.fire("keydown", { key: "Enter", isTrusted: true }); reason.fire("keydown", { key: "Enter", shiftKey: true, isTrusted: true }); await sleep(60);
     ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "Enter in the reason field decides nothing");
-    // a key on a decision button does nothing by itself: only the button's own activation (a click) decides
+    // a raw key event on a decision button decides nothing by itself: only the button's activation (a click, which a
+    // browser also delivers for Enter/Space on the focused button) does
     for (const label of ["Approve", "Reject"]) {
       const b = byText(panel, label);
       b.fire("keydown", { key: "Enter", isTrusted: true }); b.fire("keydown", { key: " ", isTrusted: true }); b.fire("keyup", { key: "Enter", isTrusted: true });
     }
     await sleep(60);
-    // and the click a browser synthesizes for Enter/Space on a focused button (trusted, detail 0) decides nothing either
-    for (const label of ["Approve", "Reject"]) byText(panel, label).fire("click", { isTrusted: true, detail: 0 });
-    await sleep(60);
-    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "no key, and no keyboard-activated click, on Approve or Reject decides anything");
+    ok(approvals() === 0 && !calls.some((c) => c.path === "/chat/reject"), "a raw key on Approve or Reject decides nothing");
     // compose is disabled while the hold waits: a trusted Enter on it (or held-down repeats) sends nothing
     area.value = "again"; area.fire("keydown", { key: "Enter", isTrusted: true }); area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(60);
     ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
@@ -239,7 +244,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     // have run. The page NEVER builds a box or claims an outcome on its own; it says so, blocks compose, and reads
     // the session only on a trusted click of "Check what happened", carrying the warning into what it shows.
     const m = process.argv[3];
-    approve.fire("click", { isTrusted: true }); await sleep(300);
+    await approveTwice(approve); await sleep(300);
     ok(approvals() === 1, "one approve was sent");
     ok(panel.textContent.includes("outcome of the last decision is unknown; the previous request may already have run"), "an ambiguous decision is reported unknown");
     ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
@@ -263,7 +268,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
       const box = find(panel, (n) => n.className === "chat-consent");
       ok(box && box.textContent.includes("may already have run") && box.textContent.includes("y-after-reload"), "the re-read box carries the warning");
       const again = byText(panel, "Approve"); ok(again && again !== approve, "a fresh box with its own Approve");
-      again.fire("click", { isTrusted: true }); await sleep(80);
+      await approveTwice(again); await sleep(80);
       ok(JSON.parse(calls.filter((c) => c.path === "/chat/approve")[1].body).expect === "D2", "it carries the id the server reported");
     } else if (m === "lostloop") {
       ok(byText(panel, "Check what happened") && area.disabled, "a busy session offers the re-read again; nothing loops");
@@ -281,13 +286,46 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   }
   if (process.argv[3] === "approve403json" || process.argv[3] === "poll403json") {
     // chat r8 L3 (codex HIGH, gemini HIGH): a chat_token 403 after the approve was sent proves nothing ran either
-    approve.fire("click", { isTrusted: true }); await sleep(150);
+    await approveTwice(approve); await sleep(150);
     ok(approvals() === 1, "one approve was sent");
     ok(panel.textContent.includes("may already have run"), "the token refusal reports an unknown outcome");
     ok(!byText(panel, "Approve") && !panel.textContent.includes("Held for your approval"), "no consent box remains or is built");
     console.log("PASS"); return;
   }
-  approve.fire("click", { isTrusted: true }); approve.fire("click", { isTrusted: true });
+  const M2 = process.argv[3];
+  const row = approve.parentNode;
+  ok(row.children.indexOf(reject) < row.children.indexOf(approve), "Reject comes before Approve, so Tab from the reason reaches Reject first");
+  if (["arm_esc", "arm_timeout", "arm_outside", "arm_double", "arm_key"].includes(M2)) {
+    const kb = { isTrusted: true, detail: 0 };   // what Enter/Space on the focused button delivers
+    approve.fire("click", M2 === "arm_key" ? kb : { isTrusted: true, detail: 1 }); await sleep(20);
+    ok(approvals() === 0 && approve.textContent.includes("Press again to confirm, Esc to cancel"), "the first activation only arms Approve");
+    if (M2 === "arm_double") {
+      approve.fire("click", { isTrusted: true, detail: 2 }); await sleep(20);
+      ok(approvals() === 0 && approve.textContent.includes("Press again"), "a second press inside the guard is ignored and Approve stays armed");
+      await sleep(350); approve.fire("click", { isTrusted: true, detail: 1 }); await sleep(80);
+      ok(approvals() === 1, "a press after the guard confirms");
+    } else if (M2 === "arm_key") {
+      await sleep(350); approve.fire("click", kb); await sleep(80);
+      ok(approvals() === 1, "keyboard arm then keyboard confirm approves once");
+    } else {
+      if (M2 === "arm_esc") approve.fire("keydown", { key: "Escape", isTrusted: true });
+      if (M2 === "arm_timeout") fireLong();
+      if (M2 === "arm_outside") panel.fire("click", { isTrusted: true });
+      await sleep(20);
+      ok(approve.textContent === "Approve", "Esc, the timeout or a click elsewhere disarms it");
+      await sleep(350); approve.fire("click", { isTrusted: true, detail: 1 }); await sleep(60);
+      ok(approvals() === 0 && approve.textContent.includes("Press again"), "after disarming, the next activation arms again and approves nothing");
+    }
+    console.log("PASS"); return;
+  }
+  if (M2 === "reject_key") {
+    reject.fire("click", { isTrusted: true, detail: 0 }); await sleep(80);
+    ok(calls.filter((c) => c.path === "/chat/reject").length === 1 && approvals() === 0, "Reject is one step, by keyboard too");
+    console.log("PASS"); return;
+  }
+  approve.fire("click", { isTrusted: true, detail: 1 }); approve.fire("click", { isTrusted: true, detail: 2 });
+  ok(approvals() === 0, "a double click arms and is not a confirm");
+  await sleep(350); approve.fire("click", { isTrusted: true, detail: 1 }); approve.fire("click", { isTrusted: true, detail: 1 });
   ok(approve.disabled && reject.disabled, "buttons lock while a decision is in flight");
   await sleep(80);
   ok(approvals() === 1, "a trusted click sends exactly one approve (got " + approvals() + ")");
@@ -300,7 +338,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
+                                  "arm_esc", "arm_timeout", "arm_outside", "arm_double", "arm_key", "reject_key"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
@@ -343,11 +382,12 @@ def test_the_only_key_listener_is_the_compose_box():
     # 0.6.7: Enter-to-send is wired to the compose textarea alone; nothing in the consent box reacts to a key, so no
     # keystroke can approve or reject (the decision buttons are trusted clicks).
     src = JS.read_text()
-    assert src.count('addEventListener("keydown"') == 1
+    # two keydown listeners: the compose box (Enter sends) and the armed Approve (Esc DISARMS, nothing else)
+    assert src.count('addEventListener("keydown"') == 2
+    assert 'approve.addEventListener("keydown", (ev) => { if (ev.key === "Escape") disarm(); });' in src
     assert "!ev.isTrusted || area.disabled || deciding" in src
     # a script's requestSubmit() fires a TRUSTED submit, so the compose form's submit only prevents default
     assert 'form.addEventListener("submit", (ev) => { ev.preventDefault(); });' in src
-    assert src.count("!ev.isTrusted || ev.detail === 0 || deciding || !session") == 2   # decisions: pointer clicks only
     assert 'sendBtn.type = "button"' in src and 'sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });' in src
     assert 'area.addEventListener("keydown"' in src
     assert not re.search(r'addEventListener\("key(up|press)"|onkey(up|down|press)', src)
@@ -359,6 +399,6 @@ def test_a_check_row_is_retired_whenever_a_new_request_is_sent():
     src = JS.read_text()
     send = src[src.index("function sendTurn()"):]
     assert "retireChecks();" in send[: send.index('api("POST", "/chat/turn"')]
-    assert "function lock() { retireChecks();" in src
+    assert "function lock() { disarm(); retireChecks();" in src
     judge = src[src.index("function judgeLastJob("):src.index("function resync(")]
     assert "rereadButton(" not in judge
