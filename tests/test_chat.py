@@ -1687,14 +1687,14 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
 
     monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
     opened = []
-    monkeypatch.setattr(webbrowser, "open", opened.append)
-    monkeypatch.setattr(ws, "_browser_takes_url_off_argv", lambda: True)
+    calls = []
+    monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
     assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
     out = capsys.readouterr().out
-    assert opened == ["http://127.0.0.1:7462/#chat_token=tok_-AZ09"]
+    assert calls == [("http://127.0.0.1:7462/", "http://127.0.0.1:7462/#chat_token=tok_-AZ09")]
     assert "open the cockpit, unlocked: http://127.0.0.1:7462/#chat_token=tok_-AZ09" in out
     assert "valid until this server stops): tok_-AZ09" in out          # the printed fallback stays
-    assert "?" not in opened[0]
+    assert "?" not in calls[0][1]
 
 
 def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
@@ -1722,35 +1722,47 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
 
 
 
-def test_serve_chat_never_hands_the_token_to_a_browser_launched_by_command_line(tmp_path, monkeypatch, capsys):
-    # L1+L2 r1: xdg-open, a browser binary or $BROWSER get the URL in argv, readable by other OS users (the callers
-    # the token keeps out). There the plain URL opens and the printed link is the way in.
+def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallback_chain(monkeypatch):
+    # L1+L2 r1 and L3 r1 (codex + gemini): every controller but macOS's osascript one puts the URL in argv, readable
+    # by other OS users. webbrowser.open walks every registered controller on a failure, so the token URL goes to the
+    # osascript controller directly or nowhere.
     import webbrowser
-    from types import SimpleNamespace
 
     import levain.web_server as ws
 
-    (tmp_path / "memory.db").write_bytes(b"")
-    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
-    monkeypatch.setattr(ws, "_build_chat_host", lambda *a, **k: (SimpleNamespace(listing=lambda: {"entities": ["e"]}, shutdown=lambda: None), None))
+    chain = []
+    monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: chain.append(u) or True)
 
-    class _Httpd:
-        server_address = ("127.0.0.1", 7462)
-        chat_token = "tok"
+    class _Osa(webbrowser.MacOSXOSAScript):
+        def __init__(self, ok):
+            super().__init__("default")
+            self.ok, self.got = ok, []
 
-        def serve_forever(self):
-            raise KeyboardInterrupt
+        def open(self, url, new=0, autoraise=True):
+            self.got.append(url)
+            return self.ok
 
-        def server_close(self):
-            pass
+    good = _Osa(True)
+    monkeypatch.setattr(webbrowser, "get", lambda *a: good)
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert good.got == ["http://h/#chat_token=t"] and chain == []
 
-    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
-    opened = []
-    monkeypatch.setattr(webbrowser, "open", opened.append)
+    bad = _Osa(False)                       # osascript failed (SSH, headless): the fallback gets the plain URL only
+    monkeypatch.setattr(webbrowser, "get", lambda *a: bad)
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert chain == ["http://h/"]
+
+    chain.clear()                           # xdg-open, a browser binary, $BROWSER
     monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.GenericBrowser("xdg-open"))
-    assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
-    assert opened == ["http://127.0.0.1:7462/"]
-    assert "unlocked: http://127.0.0.1:7462/#chat_token=tok" in capsys.readouterr().out
-    if hasattr(webbrowser, "MacOSXOSAScript"):
-        monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.MacOSXOSAScript("default"))
-        assert ws._browser_takes_url_off_argv() is True
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert chain == ["http://h/"]
+
+
+def test_the_osascript_controller_still_hands_the_url_over_on_stdin():
+    # The guarantee _open_browser relies on is CPython's: MacOSXOSAScript pipes its script to osascript's stdin. If a
+    # future CPython puts the URL on a command line instead, this fails rather than the token reaching argv.
+    import inspect
+    import webbrowser
+
+    src = inspect.getsource(webbrowser.MacOSXOSAScript.open)
+    assert 'os.popen("/usr/bin/osascript", "w")' in src and "subprocess" not in src

@@ -206,3 +206,37 @@ def test_the_repl_notice_after_actions_ran_does_not_say_nothing_ran(capsys):
         reply="Done with the push.\n" + GLM_REAL[1], tool_activity=["⚙ terminal: git push"], unreadable_call=True))
     out = capsys.readouterr().out
     assert "terminal: git push" in out and UNREADABLE_CALL_AFTER_ACTIONS_NOTICE in out and "nothing ran" not in out
+
+
+# ---------- L3 r1 ----------
+
+def test_deeply_nested_json_is_not_a_call_and_never_raises():
+    assert unreadable_tool_call("[" * 3000 + "]" * 3000, TOOLS) is False
+    assert unreadable_tool_call("[" * 1200 + '{"name": "terminal", "arguments": {}}' + "]" * 1200, TOOLS) is False
+    # only a top-level array of call objects counts; a nested array is not the call shape
+    assert unreadable_tool_call('[[{"name": "terminal", "arguments": {}}]]', TOOLS) is False
+
+
+@pytest.mark.parametrize("reply", [
+    "Here is the format:\n~~~xml\n<tool_call>{\"name\": \"terminal\"}</tool_call>\n~~~\nThat is a call.",
+    "Here is the format:\n\n    <tool_call>{\"name\": \"terminal\"}</tool_call>\n    </arg_key><arg_value>x\n\nAs above.",
+    "Here:\n````\n```\n<tool_call>{\"name\": \"terminal\"}</tool_call>\n```\n````",
+    "Use ``<tool_call>{...}`` around it.",
+])
+def test_markup_in_other_code_forms_is_an_answer(reply):
+    assert not unreadable_tool_call(reply, TOOLS)
+
+
+def test_a_whole_tilde_fence_of_call_json_is_flagged():
+    assert unreadable_tool_call('~~~json\n{"name": "terminal", "arguments": {"command": "ls"}}\n~~~', TOOLS)
+
+
+def test_a_classifier_failure_never_fails_the_turn(tmp_path, monkeypatch):
+    import levain.session as session_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("classifier bug")
+
+    monkeypatch.setattr(session_mod, "unreadable_tool_call", boom)
+    result = _leaking_session(tmp_path, GLM_REAL[0]).run_turn("x")
+    assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is False

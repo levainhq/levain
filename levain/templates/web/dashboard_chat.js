@@ -76,15 +76,17 @@
   // ---- the token ---------------------------------------------------------------------------------------------
   // The fragment the server opened the page with wins; otherwise what this tab kept. Storage can be absent or throw
   // (a private window, blocked site data), so every access is guarded and the prompt is the fallback.
+  // Any #chat_token= fragment is removed from the address bar, well-formed or not, and a token is used only once
+  // that removal succeeded: a token still showing in the address bar is not taken (the prompt asks instead).
   function takeToken() {
     let t = null;
     try {
-      const m = /^#chat_token=([A-Za-z0-9_-]+)$/.exec(location.hash);
+      const m = /^#chat_token=(.*)$/.exec(location.hash);
       if (m) {
-        t = m[1];
         history.replaceState(null, "", location.pathname + location.search);
+        if (/^[A-Za-z0-9_-]+$/.test(m[1])) t = m[1];
       }
-    } catch (e) { /* no location or history: the prompt still works */ }
+    } catch (e) { t = null; /* no location or history, or the strip failed: the prompt still works */ }
     if (t) { keepToken(t); return t; }
     try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch (e) { return null; }
   }
@@ -422,7 +424,7 @@
     if (last.status === "failed") { failure("The last " + what + " failed: " + (last.error || "no detail")); return false; }
     const res = last.result || {};
     const ran = Array.isArray(res.tool_activity) ? res.tool_activity : [];
-    const b = bubble("them", session.entity + " · what the last " + what + " did");
+    const b = bubble("them", (res.unreadable_call === true ? "levain" : session.entity) + " · what the last " + what + " did");
     b.appendChild(el("div", "chat-text", ran.length ? "These actions ran:" : "No action ran."));
     addLines(b, ran);
     if (res.reply) replyText(b, res, ran.length > 0);

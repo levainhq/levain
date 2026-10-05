@@ -1115,8 +1115,15 @@ class EntitySession:
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
-            unreadable_call=unreadable_tool_call(reply, self._tool_names()),
+            unreadable_call=self._unreadable_call(reply),
         )
+
+    def _unreadable_call(self, reply: str | None) -> bool:
+        """:func:`unreadable_tool_call` for this turn's reply. A display aid: it never fails a turn that ran."""
+        try:
+            return unreadable_tool_call(reply, self._tool_names())
+        except Exception:  # noqa: BLE001 — the reply is then shown as it arrived
+            return False
 
     def _tool_names(self) -> frozenset[str]:
         """The names of this conversation's tools, or none when they cannot be read (the bare-JSON shape of an

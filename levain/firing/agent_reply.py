@@ -196,26 +196,27 @@ def unreadable_call_notice(tool_activity) -> str:
 _GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
 # A leaked call begins its line: markup, or one cut-off word run straight into it ("_editor<arg_key>",
 # "create</arg_value>", as captured). A sentence that mentions the markup has a space before it, so it is an answer.
-_GLM_LINE = re.compile(r"(?m)^[ \t]*[^\s<]*</?arg_(?:key|value)>")
+_GLM_LINE = re.compile(r"(?m)^ {0,3}[^\s<]*</?arg_(?:key|value)>")
 # The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
 # argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
-_TOOL_CALL_OPEN = re.compile(r"(?m)^[ \t]*<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# Markdown code (a fenced block, or an inline `span`): a reply quoting the markup is explaining it, not calling.
-_CODE = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.DOTALL)
-_WHOLE_FENCE = re.compile(r"\A```[\w-]*\n(.*)\n```\Z", re.DOTALL)
+_TOOL_CALL_OPEN = re.compile(r"(?m)^ {0,3}<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
+# Markdown code: a fenced block (backticks or tildes, three or more, closed by the same run or left open to the end),
+# or an inline `span` of any backtick run. A reply quoting the markup is explaining it, not calling. An indented
+# (4-space) code block is excluded by the shapes themselves: they must begin within the first three columns.
+_CODE = re.compile(r"(?ms)^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^ {0,3}\1[ \t]*$|\Z)|(`+)[^\n]*?\2")
+_WHOLE_FENCE = re.compile(r"\A(`{3,}|~{3,})[\w-]*\n(.*)\n\1\Z", re.DOTALL)
 
 
 def _json_call_names(text: str) -> list[str] | None:
     """The tool names of ``text`` when ALL of it is one or more function-call JSON values, else ``None``.
     A call is an object with a string ``name`` and an ``arguments`` or ``parameters`` key, or an OpenAI
-    ``{"type": "function", "function": {...}}`` wrapper of one; a JSON array of calls counts too."""
+    ``{"type": "function", "function": {...}}`` wrapper of one; a top-level JSON array of call objects counts too.
+    Never raises: input the decoder cannot take (malformed, or nested past its recursion limit) is not a call."""
     decoder = json.JSONDecoder()
     names: list[str] = []
     idx, n = 0, len(text)
 
-    def calls(obj: object) -> bool:
-        if isinstance(obj, list):
-            return bool(obj) and all(calls(x) for x in obj)
+    def call(obj: object) -> bool:
         if not isinstance(obj, dict):
             return False
         if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
@@ -233,9 +234,10 @@ def _json_call_names(text: str) -> list[str] | None:
             break
         try:
             obj, idx = decoder.raw_decode(text, idx)
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
-        if not calls(obj):
+        items = obj if isinstance(obj, list) and obj else [obj]
+        if not all(call(x) for x in items):
             return None
     return names or None
 
@@ -253,7 +255,7 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
         return False
     stripped = text.strip()
     fenced = _WHOLE_FENCE.match(stripped)
-    names = _json_call_names(fenced.group(1).strip() if fenced else stripped)
+    names = _json_call_names(fenced.group(2).strip() if fenced else stripped)
     if names and all(n in tool_names for n in names):
         return True
     prose = _CODE.sub(" ", text)

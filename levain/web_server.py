@@ -1318,17 +1318,26 @@ def make_server(
     return httpd
 
 
-def _browser_takes_url_off_argv() -> bool:
-    """Whether ``webbrowser.open`` hands the URL to the browser without putting it on a command line. Only macOS's
-    osascript handler does (the URL goes through osascript's stdin, then an Apple Event). Every other handler
-    (xdg-open, a browser binary, ``$BROWSER``) puts it in argv, which other OS users can read from the process table:
-    the very callers the chat token exists to keep out. There, the plain URL opens and the token field asks."""
+def _open_browser(url: str, unlocked: str) -> None:
+    """Open the cockpit. ``unlocked`` (the URL with the chat token in its fragment) goes ONLY to macOS's osascript
+    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
+    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
+    users can read from the process table: the very callers the chat token exists to keep out. So the osascript
+    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
+    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
+    and the token field asks."""
     import webbrowser
 
     try:
-        return isinstance(webbrowser.get(), webbrowser.MacOSXOSAScript)
-    except Exception:  # noqa: BLE001 — no usable browser, or no MacOSXOSAScript on this platform
-        return False
+        ctl = webbrowser.get()
+        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
+            return
+    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
+        pass
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
+        pass
 
 
 def run_web_server(
@@ -1441,12 +1450,7 @@ def run_web_server(
         # The listening socket is already bound (ThreadingHTTPServer binds in
         # __init__), so the browser's connection queues until serve_forever
         # accepts it — opening before the blocking call is correct.
-        import webbrowser
-
-        try:
-            webbrowser.open(unlocked if _browser_takes_url_off_argv() else url)
-        except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-            pass
+        _open_browser(url, unlocked)
 
     try:
         httpd.serve_forever()

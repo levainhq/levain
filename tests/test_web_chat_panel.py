@@ -168,10 +168,10 @@ const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.dele
 // The browser objects the token code touches, per mode. Absent by default: the prompt path must work without them.
 const MODE = process.argv[3], store = new Map(), replaced = [];
 const extra = {};
-if (["fragment", "stored", "storagethrows", "badfragment"].includes(MODE)) {
-  extra.location = { hash: { fragment: "#chat_token=" + TOKEN, storagethrows: "#chat_token=" + TOKEN, badfragment: "#chat_token=nope", stored: "" }[MODE],
-    pathname: "/", search: "" };
-  extra.history = { replaceState: (s, t, u) => { replaced.push(u); extra.location.hash = ""; } };
+if (["fragment", "stored", "storagethrows", "badfragment", "malformedfragment", "replacethrows"].includes(MODE)) {
+  extra.location = { hash: { fragment: "#chat_token=" + TOKEN, storagethrows: "#chat_token=" + TOKEN, badfragment: "#chat_token=nope",
+    malformedfragment: "#chat_token=" + TOKEN + "=&x", replacethrows: "#chat_token=" + TOKEN, stored: "" }[MODE], pathname: "/", search: "" };
+  extra.history = { replaceState: (s, t, u) => { if (MODE === "replacethrows") throw new Error("SecurityError"); replaced.push(u); extra.location.hash = ""; } };
   extra.sessionStorage = MODE === "storagethrows"
     ? { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } }
     : { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
@@ -198,6 +198,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
     ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
     ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
+    console.log("PASS"); return;
+  }
+  if (MODE === "malformedfragment" || MODE === "replacethrows") {
+    // L3 r1: a malformed token fragment is still stripped; a token whose strip failed is never used or kept
+    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "the prompt asks");
+    ok(!store.has("levain.chat_token") && calls.every((c) => c.token !== TOKEN), "nothing kept, nothing sent with it");
+    ok(MODE === "replacethrows" || (replaced.length === 1 && extra.location.hash === ""), "a malformed fragment is still removed");
     console.log("PASS"); return;
   }
   if (MODE === "badfragment") {
@@ -319,6 +326,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     byText(panel, "Check what happened").fire("click", { isTrusted: true }); await sleep(150);
     ok(panel.textContent.includes("These actions ran:") && panel.textContent.includes("so that call did not run"), "the check's record of a leak says which call did not run");
     ok(!find(panel, (n) => n.className === "chat-text" && n._text === LEAK) && find(panel, (n) => n.tagName === "details"), "and shows the markup only collapsed");
+    ok(find(panel, (n) => n.className === "chat-who" && n._text.startsWith("levain · what the last")), "under levain's name");
     console.log("PASS"); return;
   }
   if (["post500", "proxy503", "proxy503json", "evicted", "ambiguousgated", "restart404", "notstarted", "lost", "lostok", "lostloop", "resync", "stale"].includes(process.argv[3])) {
@@ -436,7 +444,8 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "stored", "storagethrows", "badfragment", "twoentities",
-                                  "leakafterapprove", "leaklastjob"])
+                                  "leakafterapprove", "leaklastjob",
+                                  "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
