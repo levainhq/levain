@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- **A chat panel in the cockpit for `levain serve --chat`.** Enter the token the server printed (held in the page only, never stored), pick an entity, open a session, send a turn, and see the reply and tool activity. A held tool action shows the WHOLE action approving would run, including the inert members of the held batch (`finish`, `think`). In the consent box and the REPL's held-action line, printable ASCII is shown as itself and every other character (tab, CR, every non-ASCII letter, emoji and look-alike such as a Cyrillic `а`) is shown as `\u{XXXX}`, with a backslash shown as `\\`, so two different actions can never look the same; a newline is literal only inside the whole action. Only an action levain could read exactly (every field JSON-native) can be approved; anything else is marked "not shown in full" and can only be rejected. Approve is offered only when the held set can be shown in full and carries a decision id, and the server and the REPL both refuse to approve a hold that could not be shown in full (409 `undecidable`; reject still works). After a refused or stale decision, or a lost poll, the panel re-reads the session and rebuilds the consent box from what the server reports. `GET /chat/session.json?id=<session_id>` returns the current `decision_id` and the `pending` set for a gated session. After lost contact with a running decision, the panel fetches that decision's own result, or says the outcome is unknown and keeps compose blocked. Known limits: non-ASCII text (other languages, emoji) is shown escaped, and backslashes are doubled (the price of an unambiguous display); a reloaded page cannot resume a gated session, because the session id lives only in the page (nothing runs, and the hold stays for the API or the REPL); any token holder with a session id may reject it.
+
+### Changed
+
+- **BREAKING (chat API): `POST /chat/approve` requires the current decision id in `expect`.** There is no approve-by-session-id-alone path, for the panel or any API caller: a missing `expect` is refused with 400 `decision_id_required` (and does not spend the hold), and a stale or wrong one is 409 `stale_decision`. Read the id from the halting turn's result (`decision_id`) or from `GET /chat/session.json?id=<session_id>` while the session is gated. `POST /chat/reject` still accepts a missing `expect` (rejecting runs nothing); one that names an id must match. Clients that approved by session id alone (the 0.5.4 contract) must be updated.
+
 ## [0.6.5] — 2026-10-05
 
 A security fix for the team layer (a member could make the owner's consolidate write outside the ledger worktree; 0.6.0 to 0.6.4 are affected) and three team fixes from the nightly review.
