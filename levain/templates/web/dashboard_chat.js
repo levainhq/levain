@@ -24,10 +24,6 @@
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
   let deciding = false;      // an approve/reject POST or its job is in flight
   let confirmedJob = null;
-  const APPROVE_LABEL = "Approve";
-  const ARM_TIMEOUT_MS = 5000;   // an armed Approve disarms itself after this long
-  const ARM_GUARD_MS = 300;      // a second activation sooner than this is a double press or key repeat, not a confirm
-  let disarmCurrent = null, armedButton = null;   // the armed Approve, if any, so a click elsewhere can disarm it   // the id of the last job whose start this page saw confirmed (a 202 carrying it)
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -65,8 +61,6 @@
     panel.setAttribute("data-zone", "operate");
     panel.setAttribute("aria-label", "chat with an entity");
     panel.appendChild(el("div", "chat-head", "▶ Chat"));
-    // A click anywhere in the panel other than the armed Approve itself disarms it.
-    panel.addEventListener("click", (ev) => { if (disarmCurrent && ev.target !== armedButton) disarmCurrent(); });
     body = el("div", "chat-body");
     panel.appendChild(body);
     const board = document.getElementById("board");
@@ -481,7 +475,7 @@
     autoGrow(reasonIn);
     // Enter in this field only starts a new line: it sits outside any form and nothing here listens for Enter.
     // Tab order is reason -> Reject -> Approve, so the key after typing a reason reaches the safe direction first.
-    const approve = el("button", "chat-btn approve", APPROVE_LABEL);
+    const approve = el("button", "chat-btn approve", "Approve");
     const reject = el("button", "chat-btn reject", "Reject");
     approve.type = "button"; reject.type = "button";
     const row = el("div", "chat-row");
@@ -490,7 +484,10 @@
     box.appendChild(reasonIn); box.appendChild(row);
     log.appendChild(box);
 
-    function lock() { disarm(); retireChecks(); deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
+    function lock() {
+      retireChecks(); deciding = true;
+      approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; cancelBtn.disabled = true; runBtn.disabled = true;
+    }
     function decided(j, jid) {
       deciding = false; box.remove();
       const res = j.result;
@@ -523,46 +520,52 @@
       poll(jid, myRun, (j) => { live.textContent = ""; decided(j, jid); });
     }
 
-    // APPROVE IS TWO-STEP (Phill 2026-10-05: keyboard users must be able to decide, with a second press to confirm).
-    // A trusted activation of Approve (a click, or Enter/Space on the focused button) ARMS it; a SEPARATE second
-    // activation of the same button confirms. "Separate" is enforced, not timed: a held key's auto-repeat is cancelled
-    // (a repeat would otherwise reach the page as another trusted click), a keyboard confirm needs the key released and
-    // pressed again, the second click of a double click (detail > 1) never confirms, and nothing confirms inside
-    // ARM_GUARD_MS. Esc, focus leaving the button (arming focuses it), a click elsewhere in the panel or ARM_TIMEOUT_MS
-    // disarm it; the click handler also checks the deadline itself, so a click serviced late does not confirm.
-    // Reject is one step: rejecting runs nothing.
-    let armedAt = 0, armTimer = null, keyHeld = false;
-    function disarm() {
-      if (!armedAt) return;
-      armedAt = 0; clearTimeout(armTimer); armTimer = null;
-      approve.textContent = APPROVE_LABEL; approve.className = "chat-btn approve";
-      if (disarmCurrent === disarm) disarmCurrent = null;
+    // APPROVE OPENS A CONFIRM ROW (Phill 2026-10-05, the W3C alertdialog pattern): "Run the N held actions?
+    // [Cancel] [Run them]". Cancel takes Approve's exact place and gets the focus; reaching Run them takes a deliberate
+    // move (Tab or an arrow key), then Enter, Space or a click. Tab and the arrows stay inside the row while it is open;
+    // Esc and Cancel close it and return focus to Approve. The two presses are separated by STRUCTURE, not by time, so
+    // whatever repeats on the spot where Approve was (a held key, the second click of a double click) lands on Cancel
+    // and the failure direction is "nothing ran". Reject stays one step: rejecting runs nothing.
+    const ask = el("div", "chat-reason chat-ask", "Run the " + pending.length + " held action" +
+      (pending.length === 1 ? "" : "s") + "?");
+    const cancelBtn = el("button", "chat-btn quiet", "Cancel");
+    const runBtn = el("button", "chat-btn approve", "Run them");
+    cancelBtn.type = "button"; runBtn.type = "button";
+    function openConfirm() {
+      if (approve.offsetWidth) cancelBtn.style.minWidth = approve.offsetWidth + "px";   // covers Approve's spot
+      reject.style.visibility = "hidden"; reject.disabled = true;   // keeps its space, so Cancel sits where Approve was
+      box.insertBefore(ask, row);
+      row.replaceChild(cancelBtn, approve);
+      row.appendChild(runBtn);
+      cancelBtn.focus();
     }
-    function arm() {
-      armedAt = Date.now();
-      approve.textContent = "Approve? Press again to confirm, Esc to cancel"; approve.className = "chat-btn approve armed";
-      armTimer = setTimeout(disarm, ARM_TIMEOUT_MS);
-      disarmCurrent = disarm; armedButton = approve;
-      if (typeof approve.focus === "function") approve.focus();   // so Esc and blur reach it in every browser
+    function closeConfirm() {
+      if (cancelBtn.parentNode !== row) return;
+      row.replaceChild(approve, cancelBtn);
+      if (runBtn.parentNode) runBtn.remove();
+      if (ask.parentNode) ask.remove();
+      reject.style.visibility = ""; reject.disabled = deciding;
+      approve.focus();
     }
-    // Esc disarms; an activating key that is still down (or auto-repeating) cannot confirm.
-    approve.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") { disarm(); return; }
-      if (ev.key === "Enter" || ev.key === " ") {
-        if (ev.repeat || keyHeld) { ev.preventDefault(); return; }
-        keyHeld = true;
-      }
-    });
-    approve.addEventListener("keyup", (ev) => { if (ev.key === "Enter" || ev.key === " ") keyHeld = false; });
-    approve.addEventListener("blur", () => { keyHeld = false; disarm(); });   // a key released elsewhere never reaches us
-    // THE ONLY /chat/approve POST in this file: the CONFIRMING trusted activation of this button, once, with both
-    // buttons locked.
     approve.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
-      if (armedAt && Date.now() - armedAt >= ARM_TIMEOUT_MS) disarm();   // expired, whether or not its timer has run
-      if (!armedAt) { arm(); return; }
-      if (ev.detail > 1 || Date.now() - armedAt < ARM_GUARD_MS) return;   // a double click's second click; too soon
-      disarm();
+      openConfirm();
+    });
+    cancelBtn.addEventListener("click", (ev) => { if (ev.isTrusted) closeConfirm(); });
+    // Inside the open row: Tab, Shift+Tab and the arrow keys move between Cancel and Run them only; Esc cancels. No
+    // key here decides anything: Enter or Space activates whichever button has the focus, as on any button.
+    row.addEventListener("keydown", (ev) => {
+      if (cancelBtn.parentNode !== row) return;
+      if (ev.key === "Escape") { ev.preventDefault(); closeConfirm(); return; }
+      if (ev.key === "Tab" || ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        ev.preventDefault();
+        (ev.target === runBtn ? cancelBtn : runBtn).focus();
+      }
+    });
+    // THE ONLY /chat/approve POST in this file: a trusted activation of Run them, which exists only while the confirm
+    // row is open, once, with every button locked.
+    runBtn.addEventListener("click", (ev) => {
+      if (!ev.isTrusted || deciding || !session || runBtn.parentNode !== row) return;
       lock();
       api("POST", "/chat/approve", { session_id: session.id, expect: decisionId }).then(after);
     });
