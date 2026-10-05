@@ -17,7 +17,10 @@ from tests.test_team_view import _Stub
 
 @pytest.fixture(autouse=True)
 def levain_home(tmp_path, monkeypatch):
+    # autouse: no test in this file can reach the real ~/.levain (LEVAIN_HOME and HOME both point into tmp_path)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    assert str(R.registry_dir()).startswith(str(tmp_path))
     return tmp_path / "home"
 
 
@@ -454,3 +457,189 @@ const tick = () => new Promise((r) => setTimeout(r, 20));
     out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"shown": 1}
+
+
+# ---- L3 round 2 ----------------------------------------------------------------------------------------------
+
+POISON = ("99999999999999999999-1.json", "9" * 200 + "-1.json", "0-7450.json", "-5-1.json")
+
+
+def _poison(d):
+    d.mkdir(parents=True, exist_ok=True)
+    for n in POISON:
+        (d / n).write_text(json.dumps({"v": 1, "repo": "/r", "url": "http://127.0.0.1:1/", "project": "x",
+                                       "pid": 0, "started": "t", "nonce": N}))
+
+
+def test_poisoned_filenames_cannot_abort_the_loop_or_hide_real_views(live_view):
+    R.register("/r", live_view, "ledgerline", nonce=live_view.nonce)
+    _poison(R.registry_dir())
+    assert [v["project"] for v in R.live_views()] == ["ledgerline"]
+    R.prune_dead()                                                   # must not raise
+    assert [p.name for p in R.registry_dir().glob(f"{os.getpid()}-*.json")]
+
+
+def test_pid_zero_and_negative_are_never_alive():
+    for pid in (0, -1, 10 ** 30, True, "5", None):
+        assert R._pid_alive(pid) is False
+
+
+def test_an_entry_claiming_pid_zero_is_not_listed(live_view):
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    (d / f"0-{int(live_view.rstrip(chr(47)).rsplit(chr(58), 1)[1])}.json").write_text(json.dumps(
+        {"v": 1, "repo": "/r", "url": str(live_view), "project": "zero", "pid": 0, "started": "t",
+         "nonce": live_view.nonce}))
+    assert R.live_views() == []
+
+
+def test_a_prune_failure_does_not_skip_registering(monkeypatch):
+    from tests.test_team_view import TEAM as T
+
+    class GL(_Stub):
+        class repo:
+            toplevel = Path("/work/ledgerline")
+        def team(self):
+            return T
+    real = V.make_view_server
+
+    def make(*a, **k):
+        h = real(*a, **k)
+        def sf():
+            assert len(list(R.registry_dir().glob("*.json"))) == 1     # registered despite the prune failure
+            raise KeyboardInterrupt
+        h.serve_forever = sf
+        return h
+    monkeypatch.setattr(V, "make_view_server", make)
+    monkeypatch.setattr(R, "prune_dead", lambda: (_ for _ in ()).throw(RuntimeError("poisoned")))
+    assert V.serve(GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
+    assert list(R.registry_dir().glob("*.json")) == []
+
+
+def test_a_header_drip_listener_cannot_hold_the_probe(levain_home):
+    def drip(conn):
+        try:
+            conn.recv(2048)
+            for ch in b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":
+                conn.sendall(bytes([ch]))
+                time.sleep(0.49)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    port, close = _listener(drip)
+    try:
+        R.register("/r", f"http://127.0.0.1:{port}/", "header-dripper", nonce=N)
+        t = time.monotonic()
+        assert R.live_views() == []
+        assert time.monotonic() - t < 1.6
+    finally:
+        close()
+
+
+def test_the_probe_is_bounded_for_body_drip_and_redirect_listeners_too(live_view):
+    def body_drip(conn):
+        try:
+            conn.recv(2048)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 400\r\n\n")
+            for _ in range(60):
+                conn.sendall(b"x")
+                time.sleep(0.3)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    port, close = _listener(body_drip)
+    try:
+        t = time.monotonic()
+        assert R.probe(f"http://127.0.0.1:{port}/", N) is False
+        assert time.monotonic() - t < 1.6
+    finally:
+        close()
+    assert R.probe(live_view, live_view.nonce) is True
+    assert R.probe(live_view, "b" * 32) is False
+
+
+def test_localhost_is_probed_as_127_0_0_1_without_name_resolution(live_view, monkeypatch):
+    import socket as sk
+    def no_dns(*a, **k):
+        raise AssertionError("name resolution attempted")
+    monkeypatch.setattr(sk, "getaddrinfo", no_dns)
+    port = live_view.rstrip("/").rsplit(":", 1)[1]
+    assert R.probe(f"http://localhost:{port}/", live_view.nonce) is True
+
+
+def test_register_refuses_a_url_without_an_explicit_port():
+    with pytest.raises(ValueError):
+        R.register("/r", "http://127.0.0.1/", "p", nonce=N)
+    d = R.registry_dir()
+    assert not d.exists() or list(d.iterdir()) == []
+
+
+def test_serve_always_unregisters_even_if_cleanup_raises(monkeypatch):
+    from tests.test_team_view import TEAM as T
+
+    class GL(_Stub):
+        class repo:
+            toplevel = Path("/work/ledgerline")
+        def team(self):
+            return T
+    real = V.make_view_server
+
+    def make(*a, **k):
+        h = real(*a, **k)
+        def sf():
+            raise KeyboardInterrupt
+        def boom():
+            raise OSError("close failed")
+        h.serve_forever = sf
+        h.server_close = boom
+        return h
+    monkeypatch.setattr(V, "make_view_server", make)
+    with pytest.raises(OSError):
+        V.serve(GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
+    assert list(R.registry_dir().glob("*.json")) == []
+
+
+def test_team_views_with_a_foreign_host_header_is_403(tmp_path, live_view):
+    httpd = _cockpit(tmp_path)
+    try:
+        R.register("/work/secret", live_view, "secret-project", nonce=live_view.nonce)
+        r, body = _get(httpd.server_address[1], "/team_views.json", {"Host": "attacker.example"})
+        assert r.status == 403 and b"secret" not in body
+    finally:
+        httpd.shutdown(); httpd.server_close()
+
+
+def test_a_failed_fetch_keeps_the_current_tab():
+    from levain.web_server import load_web_asset
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    js = load_web_asset("dashboard_team.js")
+    harness = r"""
+const pending = [], made = [];
+let fire = null;
+global.window = { location: {} };
+global.document = { querySelector: () => ({ appendChild: (c) => made.push(c) }), hidden: false,
+  addEventListener: (ev, fn) => { fire = fn; },
+  createElement: () => ({ alive: true, remove() { this.alive = false; }, addEventListener() {}, appendChild() {}, style: {}, setAttribute() {} }) };
+global.fetch = () => new Promise((res, rej) => pending.push({ res, rej }));
+%s
+const tick = () => new Promise((r) => setTimeout(r, 20));
+const shown = () => made.filter((c) => c.alive).length;
+(async () => {
+  pending[0].res({ ok: true, json: async () => ({ views: [{ project: "p", repo: "/r", url: "http://127.0.0.1:7463/" }] }) });
+  await tick();
+  const a = shown();
+  fire(); pending[1].res({ ok: false, json: async () => ({}) });    // a non-ok answer
+  await tick();
+  const b = shown();
+  fire(); pending[2].rej(new Error("network"));                      // a failed fetch
+  await tick();
+  console.log(JSON.stringify({ a, b, c: shown() }));
+})();
+""" % js
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {"a": 1, "b": 1, "c": 1}

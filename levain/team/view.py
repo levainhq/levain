@@ -502,32 +502,37 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
     print(f"Levain team view -> {url}")
     print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
     entry = None
-    previous = None
-    installed = False
     try:
         # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
-        # written costs the cockpit's Team tab, never the view. Registration and the SIGTERM handler sit inside the
-        # same try, so the finally below undoes exactly what was done.
+        # written costs the cockpit's Team tab, never the view. Pruning and registering are separate steps, so a
+        # prune failure cannot skip the registration; the outer finally always unregisters, whatever else fails.
         try:
             registry.prune_dead()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (registry prune failed: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        try:
             entry = registry.register(str(gl.repo.toplevel), url, gl.team().project, nonce=httpd.nonce)
         except Exception as exc:  # noqa: BLE001
             print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-        if threading.current_thread() is threading.main_thread():
-            import signal
-            previous = signal.signal(signal.SIGTERM, _on_sigterm)   # SIGTERM exits as cleanly as Ctrl+C
-            installed = True
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if installed:
-            import signal
+        previous = None
+        installed = False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                import signal
+                previous = signal.signal(signal.SIGTERM, _on_sigterm)   # SIGTERM exits as cleanly as Ctrl+C
+                installed = True
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
             try:
-                signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+                if installed:
+                    import signal
+                    signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
             except (ValueError, OSError):
                 pass
-        httpd.server_close()
+            httpd.server_close()
+    finally:
         registry.unregister(entry)
     return 0
 

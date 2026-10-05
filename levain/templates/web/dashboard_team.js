@@ -59,11 +59,12 @@
   let latest = 0;
   function load() {
     const mine = ++latest;
-    const settle = (views) => { if (mine === latest) render(views); };
+    // Only a successful response changes the UI: a non-ok answer or a failed fetch keeps what is shown now (an
+    // empty list from a healthy server still clears it).
     fetch("/team_views.json", { headers: { Accept: "application/json" } })
-      .then((r) => (r.ok ? r.json() : { views: [] }))
-      .then((j) => settle(Array.isArray(j.views) ? j.views : []))
-      .catch(() => settle([]));
+      .then((r) => { if (!r.ok) throw new Error("status " + r.status); return r.json(); })
+      .then((j) => { if (mine === latest && Array.isArray(j.views)) render(j.views); })
+      .catch(() => {});
   }
   load();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });

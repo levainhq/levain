@@ -23,11 +23,11 @@ Stdlib only; imports nothing from the rest of levain.
 """
 from __future__ import annotations
 
-import http.client
 import ipaddress
 import json
 import os
 import re
+import socket
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -37,7 +37,7 @@ PROBE_PATH = "/team_view.id"
 PROBE_PREFIX = "levain-team-view:"      # the body is exactly PROBE_PREFIX + nonce
 PROBE_DEADLINE = 1.0                    # seconds, the WHOLE probe (connect + headers + body)
 LIST_DEADLINE = 2.0                     # seconds, the whole live_views() call
-PROBE_MAX_BYTES = 256
+PROBE_MAX_BYTES = 1024                 # status line + headers (the guard CSP alone is ~200) + body, all inside this
 MAX_VIEWS = 8
 _FIELDS = ("repo", "url", "project", "pid", "started", "nonce")
 _NAME_RE = re.compile(r"(\d+)-(\d+)\.json")
@@ -75,14 +75,15 @@ def loopback_http_url(url: object) -> str | None:
     return f"http://{host}:{port}/"
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: object) -> bool:
+    """Is this a live process? pid <= 0 and non-ints are never alive (kill(0, ...) would signal OUR process group)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):   # no such process, or a pid too large for the C long
         return False
     return True
 
@@ -121,6 +122,10 @@ def unregister(path: Path | None) -> None:
             pass
 
 
+def _pid_alive_shape(pid: object) -> bool:
+    return isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2 ** 31
+
+
 def _read(path: Path) -> dict | None:
     m = _NAME_RE.fullmatch(path.name)
     try:
@@ -129,7 +134,7 @@ def _read(path: Path) -> dict | None:
         return None
     if not m or not isinstance(raw, dict) or raw.get("v") != VERSION or not all(k in raw for k in _FIELDS):
         return None
-    if not isinstance(raw["pid"], int) or isinstance(raw["pid"], bool) or raw["pid"] != int(m.group(1)):
+    if not _pid_alive_shape(raw["pid"]) or raw["pid"] != int(m.group(1)):
         return None                    # the file name is the pid's identity; a mismatch is not ours to trust
     if not all(isinstance(raw[k], str) for k in ("repo", "project", "started", "nonce")):
         return None
@@ -151,46 +156,66 @@ def prune_dead() -> None:
     except OSError:
         return
     for n in names:
-        m = _NAME_RE.fullmatch(n) or _TMP_RE.fullmatch(n)
-        if m and not _pid_alive(int(m.group(1))):
-            try:
+        try:   # one poisoned name (a 200-digit pid, pid 0) must never abort the loop
+            m = _NAME_RE.fullmatch(n) or _TMP_RE.fullmatch(n)
+            if m and not _pid_alive(int(m.group(1))):
                 (d / n).unlink()
-            except OSError:
-                pass
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def probe(url: str, nonce: str, deadline: float = PROBE_DEADLINE) -> bool:
-    """Does this loopback URL answer GET /team_view.id with exactly this nonce? One plain 200, no redirect followed,
-    at most PROBE_MAX_BYTES read, everything inside one overall deadline (a slow-drip server cannot hold it)."""
+    """Does this loopback URL answer GET /team_view.id with exactly this nonce?
+
+    A raw socket, not http.client: its getresponse() has no overall deadline, so a status line or headers dripped
+    a byte at a time would hold the probe. Here connect, request, status line, headers and body all draw on ONE
+    budget (``deadline`` seconds, at most PROBE_MAX_BYTES received); the loop stops at the first complete answer.
+    Only the status line is parsed (it must be ``HTTP/1.x 200``), so no redirect is ever followed, and the body
+    must be exactly the nonce text. ``localhost`` is taken as 127.0.0.1 with no name resolution."""
     norm = loopback_http_url(url)
     if norm is None:
         return False
     u = urlsplit(norm)
+    host = "127.0.0.1" if u.hostname == "localhost" else u.hostname
     end = time.monotonic() + deadline
     want = (PROBE_PREFIX + nonce).encode()
-    conn = None
+    sock = None
     try:
-        conn = http.client.HTTPConnection(u.hostname, u.port, timeout=min(deadline, 0.5))
-        conn.request("GET", PROBE_PATH, headers={"Accept": "text/plain", "Connection": "close"})
-        resp = conn.getresponse()
-        if resp.status != 200:        # 3xx included: http.client never follows, and a redirect is not an answer
-            return False
-        got = b""
-        while len(got) < PROBE_MAX_BYTES and time.monotonic() < end:
-            if conn.sock is not None:
-                conn.sock.settimeout(max(0.05, min(0.25, end - time.monotonic())))
-            chunk = resp.read1(PROBE_MAX_BYTES - len(got))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # connect() to a numeric IPv4 tuple resolves nothing
+        sock.settimeout(max(0.05, min(deadline, end - time.monotonic())))
+        sock.connect((host, u.port))
+        sock.sendall(f"GET {PROBE_PATH} HTTP/1.1\r\nHost: {host}:{u.port}\r\nAccept: text/plain\r\n"
+                     "Connection: close\r\n\r\n".encode("ascii"))
+        buf = b""
+        while len(buf) < PROBE_MAX_BYTES:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            sock.settimeout(left)
+            chunk = sock.recv(PROBE_MAX_BYTES - len(buf))
             if not chunk:
                 break
-            got += chunk
-            if len(got) > len(want) + 1:
+            buf += chunk
+            head, sep, body = buf.partition(b"\r\n\r\n")
+            if sep and body.strip() == want:
+                return _status_ok(head)
+            if sep and len(body) > len(want) + 2:
                 return False
-        return got.strip() == want
+        head, sep, body = buf.partition(b"\r\n\r\n")
+        return bool(sep) and _status_ok(head) and body.strip() == want
     except Exception:  # noqa: BLE001 - any failure means "not a live view"
         return False
     finally:
-        if conn is not None:
-            conn.close()
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _status_ok(head: bytes) -> bool:
+    first = head.split(b"\r\n", 1)[0]
+    return re.fullmatch(rb"HTTP/1\.[01] 200( .*)?", first) is not None
 
 
 def live_views(deadline: float = LIST_DEADLINE) -> list[dict]:
@@ -207,8 +232,11 @@ def live_views(deadline: float = LIST_DEADLINE) -> list[dict]:
     for n in names:
         if time.monotonic() >= end or len(out) >= MAX_VIEWS:
             break
-        e = _read(d / n)
-        if e and _pid_alive(e["pid"]) and probe(e["url"], e["nonce"], min(PROBE_DEADLINE, end - time.monotonic())):
-            out.append(e)
+        try:   # one poisoned file must never abort the loop or hide the real views after it
+            e = _read(d / n)
+            if e and _pid_alive(e["pid"]) and probe(e["url"], e["nonce"], min(PROBE_DEADLINE, end - time.monotonic())):
+                out.append(e)
+        except Exception:  # noqa: BLE001
+            continue
     return sorted(({k: v for k, v in e.items() if k != "nonce"} for e in out),
                   key=lambda e: (e["project"].casefold(), e["url"]))

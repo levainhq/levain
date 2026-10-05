@@ -17,6 +17,13 @@ TEAM = R.Team(project="ledgerline", owner="ana", members={"ana": "a@x.io", "ben"
               client_owners=["Dana"])
 
 
+@pytest.fixture(autouse=True)
+def _isolated_levain_home(tmp_path, monkeypatch):
+    # autouse: nothing in this file may reach the real ~/.levain (the view registers there when serve() runs)
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+
+
 def _seal(chains, author, ts, type_, **kw):
     e = E.build(author, type_, **kw)
     e["ts"] = ts
