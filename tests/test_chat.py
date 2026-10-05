@@ -192,14 +192,21 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "push it")["job_id"])
     assert st["result"]["gated"] is True and st["result"]["exit_code"] == 4
-    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push",
+    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push", "full": "",
                                         "reason": "network egress", "recognized": True}]
     assert host.session_status(sid)["state"] == "gated"
+    # a decision made on another held set (a stale or re-armed screen) is refused and changes nothing
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect="0" * 64)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    expect = st["result"]["pending_digest"]
     with pytest.raises(ChatError) as e:
         host.turn(sid, "wait, don't")   # a new message here would be read as approval
     assert e.value.http_status == 409
 
-    assert _wait(host, host.approve(sid)["job_id"])["result"]["reply"] == "pushed"
+    assert _wait(host, host.approve(sid, expect=expect)["job_id"])["result"]["reply"] == "pushed"   # the shown set
     assert host.session_status(sid)["state"] == "idle"
     with pytest.raises(ChatError):
         host.approve(sid)               # nothing is held now

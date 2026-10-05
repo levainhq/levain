@@ -1114,6 +1114,6 @@
 .chat-consent { border: 1px solid color-mix(in srgb, var(--operate) 55%, var(--line)); border-radius: 5px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: rgba(245,177,78,.05); }
 .chat-consent-head { font: 700 11px/1 var(--label); letter-spacing: .14em; text-transform: uppercase; color: var(--operate); }
 .chat-tool { font: 700 12px/1.4 var(--mono); color: var(--ink); }
-.chat-detail { margin: 4px 0 0; padding: 8px; max-height: 12em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #0a1110; border: 1px solid var(--line); border-radius: 4px; font: 12px/1.4 var(--mono); color: var(--ink); }
+.chat-detail { margin: 4px 0 0; padding: 8px; overflow: visible; white-space: pre-wrap; overflow-wrap: anywhere; background: #0a1110; border: 1px solid var(--line); border-radius: 4px; font: 12px/1.4 var(--mono); color: var(--ink); }
 .chat-reason { margin-top: 4px; color: var(--dim); font: 11px/1.5 var(--mono); overflow-wrap: anywhere; }
 @media (pointer: coarse) { .chat-input { font-size: 16px; } }

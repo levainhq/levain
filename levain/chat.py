@@ -89,6 +89,8 @@ a failed start also runs one cyclic collection.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import logging
 import math
 import secrets
@@ -214,6 +216,7 @@ class _Session:
     session_id: str
     entity: str
     state: SessionState = "opening"
+    pending_digest: str | None = None   # what a gated session is holding, as shown to the operator
     session: Any = None          # the EntitySession once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
@@ -225,6 +228,11 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     result's own derived properties, so a client reads the harness's classification rather than
     re-deriving it."""
     activity = [_cap_line(x) for x in result.tool_activity]
+    pending = [
+        {"tool": p.tool_name, "detail": p.detail, "full": getattr(p, "full", ""), "reason": p.reason,
+         "recognized": p.recognized}
+        for p in result.pending
+    ]
     return {
         "reply": result.reply,
         "tool_activity": activity[-MAX_ACTIVITY_LINES:],
@@ -232,11 +240,11 @@ def _turn_payload(result: Any) -> dict[str, Any]:
         "nudged": result.nudged,
         "gated": result.gated,
         "timed_out": result.timed_out,
-        "pending": [
-            {"tool": p.tool_name, "detail": p.detail, "reason": p.reason,
-             "recognized": p.recognized}
-            for p in result.pending
-        ],
+        "pending": pending,
+        # A decision names the held set it was made on: approve and reject accept it as ``expect`` and
+        # refuse a mismatch, so a stale or re-armed screen cannot approve an action it never showed.
+        "pending_digest": hashlib.sha256(
+            json.dumps(pending, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
         "ok": result.ok,
         "exit_code": result.exit_code,
     }
@@ -415,15 +423,15 @@ class ChatHost:
             raise ChatError("too_large", f"message exceeds {MAX_MESSAGE_CHARS} characters", 413)
         return self._start(session_id, "turn", ("idle",), lambda s: s.run_turn(message))
 
-    def approve(self, session_id: Any) -> dict[str, Any]:
-        return self._start(session_id, "approve", ("gated",), lambda s: s.resume_turn())
+    def approve(self, session_id: Any, expect: Any = None) -> dict[str, Any]:
+        return self._start(session_id, "approve", ("gated",), lambda s: s.resume_turn(), expect=expect)
 
-    def reject(self, session_id: Any, reason: Any = None) -> dict[str, Any]:
+    def reject(self, session_id: Any, reason: Any = None, expect: Any = None) -> dict[str, Any]:
         if reason is None:
             reason = "the operator declined this action"
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
             raise ChatError("bad_reason", "reason must be a non-empty string under 2000 chars", 400)
-        return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason))
+        return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason), expect=expect)
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
@@ -536,6 +544,8 @@ class ChatHost:
         kind: JobKind,
         accepts: tuple[SessionState, ...],
         call: Callable[[Any], Any],
+        *,
+        expect: Any = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._refuse_if_shut()
@@ -544,6 +554,13 @@ class ChatHost:
                 raise ChatError(
                     "wrong_state",
                     f"the session is {rec.state}; {kind} needs it {' or '.join(accepts)}",
+                    409,
+                )
+            # Optional for API callers (a token holder is trusted); the cockpit panel always sends it.
+            if expect is not None and expect != rec.pending_digest:
+                raise ChatError(
+                    "stale_decision",
+                    f"the held action is not the one this {kind} was made on; read the session again",
                     409,
                 )
             before = rec.state
@@ -692,8 +709,10 @@ class ChatHost:
                 # The result's tool_activity leaves out held and stop-skipped actions; it replaces
                 # what was streamed on every finish (module docstring).
                 job.activity, job.dropped = list(payload["tool_activity"]), cut
+                rec.pending_digest = None
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
+                    rec.pending_digest = payload["pending_digest"]
                 elif payload["error"] is not None:
                     # A turn that raised or could not read its own gate leaves the conversation in a
                     # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a

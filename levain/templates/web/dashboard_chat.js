@@ -236,12 +236,12 @@
       }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
-      if (res.gated && Array.isArray(res.pending) && res.pending.length) {
+      if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
-        showConsent(res.pending, myRun);
+        showConsent(res.pending, res.pending_digest, myRun);
         return;
       }
-      if (res.gated) failure("The turn halted on a gated action but reported nothing to decide.");
+      if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
       if (res.reply) {
         const b = bubble("them", session.entity);
         b.appendChild(el("div", "chat-text", res.reply));
@@ -255,7 +255,7 @@
   function endOfTurn(stuck) { setComposeEnabled(!stuck); if (!stuck && area) area.focus(); }
 
   // ---- the consent surface ------------------------------------------------------------------------------------
-  function showConsent(pending, myRun) {
+  function showConsent(pending, digest, myRun) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
@@ -263,7 +263,10 @@
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", String(p.tool)));
-      if (p.detail) item.appendChild(el("pre", "chat-detail", String(p.detail)));
+      // The whole action, never the bounded one-line detail: approving runs all of it (L2: a tail past the
+      // display limit, or a newline shown as a space, hid what a command did).
+      const whole = (typeof p.full === "string" && p.full) ? p.full : p.detail;
+      if (whole) item.appendChild(el("pre", "chat-detail", String(whole)));
       if (p.reason) item.appendChild(el("div", "chat-reason", String(p.reason)));
       if (p.recognized === false) item.appendChild(el("div", "chat-reason", "This action was not recognised by the entity's policy."));
       box.appendChild(item);
@@ -288,9 +291,9 @@
       if (j.status !== "done" || !res) { failure(j.error || ("the job ended as “" + j.status + "”")); endOfTurn(true); return; }
       if (res.error) failure(res.error);
       if (res.timed_out) failure("The turn timed out before it finished.");
-      if (res.gated && Array.isArray(res.pending) && res.pending.length) {
+      if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
-        showConsent(res.pending, myRun); return;
+        showConsent(res.pending, res.pending_digest, myRun); return;
       }
       if (res.reply) { const b = bubble("them", session.entity); b.appendChild(el("div", "chat-text", res.reply)); addLines(b, res.tool_activity); }
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
@@ -298,8 +301,15 @@
     }
     function after(r) {
       if (isTokenRefusal(r)) { showTokenPrompt("The token was not accepted; enter it again."); return; }
+      if (r.status === 409 && r.json && r.json.error === "stale_decision") {
+        // The server holds something other than what this box shows: the box is withdrawn, never re-armed.
+        deciding = false; box.remove();
+        failure("The held action changed since it was shown; nothing was decided. Close the session and start again.");
+        endOfTurn(true); return;
+      }
       if (r.status !== 202 || !r.json.job_id) {
-        // Not retried: the operator may look at the session and decide again with a fresh click.
+        // Not retried: the operator may look at the session and decide again with a fresh click. A re-armed
+        // click is bound to this box's digest, so it cannot approve anything the box does not show.
         deciding = false; failure("The decision was not accepted: " + why(r));
         approve.disabled = false; reject.disabled = false; reasonIn.disabled = false; return;
       }
@@ -311,13 +321,13 @@
     approve.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
       lock();
-      api("POST", "/chat/approve", { session_id: session.id }).then(after);
+      api("POST", "/chat/approve", { session_id: session.id, expect: digest }).then(after);
     });
     reject.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
       lock();
       const reason = reasonIn.value.trim();
-      api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason } : { session_id: session.id }).then(after);
+      api("POST", "/chat/reject", reason ? { session_id: session.id, reason: reason, expect: digest } : { session_id: session.id, expect: digest }).then(after);
     });
   }
 

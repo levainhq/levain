@@ -146,3 +146,26 @@ def test_approve_posts_only_after_a_trusted_click(tmp_path):
     h.write_text(HARNESS)
     p = subprocess.run(["node", str(h), str(JS)], capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
+
+
+def test_the_consent_shows_the_whole_action_that_approving_runs():
+    # L2 2026-10-05: the held command was shown cut at the display limit and with newlines flattened, while
+    # approving ran all of it. The bounded `detail` stays for one-line surfaces; `full` is what runs.
+    from levain.chat import _turn_payload
+    from levain.firing.gate import PendingEfferent
+    from levain.firing.openhands.gate import _detail_for, _full_for
+
+    cmd = "echo " + "a" * 300 + "\nrm -rf ~/x"
+    fields = {"command": cmd}
+    p = PendingEfferent("terminal", _detail_for("terminal", fields, None), "bash fans in", full=_full_for(fields))
+    assert "rm -rf" not in p.detail                       # the bounded rendering hides the tail ...
+    assert p.full == cmd                                  # ... the whole action is carried unchanged ...
+    assert "\n        rm -rf ~/x" in p.line()             # ... the REPL line shows it ...
+
+    class R:  # the TurnResult fields _turn_payload reads
+        reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 0
+        pending = [p]
+    assert _turn_payload(R())["pending"][0]["full"] == cmd   # ... and the chat payload carries it to the panel,
+    js = (Path(__file__).parent.parent / "levain" / "templates" / "web" / "dashboard_chat.js").read_text()
+    assert re.search(r'const whole = \(typeof p\.full === "string" && p\.full\) \? p\.full : p\.detail;', js)
+    assert 'el("pre", "chat-detail", String(whole))' in js     # which renders it in place of the detail
