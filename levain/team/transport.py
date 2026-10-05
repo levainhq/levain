@@ -50,8 +50,10 @@ class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
 
-# rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty
-_NO_RERERE = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false"]
+# rerere replays a recorded resolution and can stage it, which makes a conflicting pick look empty; a commit hook of
+# the project's own (git on Linux runs them on a cherry-pick) can fail the pick or rewrite the index under it. The
+# ledger replay is levain's own plumbing, so neither is allowed to take part.
+_REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false", "-c", "core.hooksPath=/dev/null"]
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
@@ -598,7 +600,7 @@ class GitLedger:
             self._recover_dirty()
             orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             try:
-                cp = git([*_NO_RERERE, "rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt,
+                cp = git([*_REPLAY_CONFIG, "rebase", "-q", "--no-verify", "--empty=drop", rref], self.wt,
                          check=False, timeout=timeout)
             except TeamError:
                 self._restore(orig)
@@ -619,7 +621,7 @@ class GitLedger:
             try:
                 git(["checkout", "-q", "--detach", rref], self.wt, timeout=timeout)
                 for c in keep:
-                    cp = git([*_NO_RERERE, "-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", c],
+                    cp = git([*_REPLAY_CONFIG, "-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", c],
                              self.wt, check=False, timeout=timeout)
                     if cp.returncode == 0:
                         continue

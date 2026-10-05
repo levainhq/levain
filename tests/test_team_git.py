@@ -669,6 +669,7 @@ def test_the_replay_runs_with_rerere_off_and_in_topological_order(two, monkeypat
     for verb, marker in (("rebase", "--empty=drop"), ("cherry-pick", "--allow-empty")):
         argv = next(c for c in calls if verb in c and marker in c)
         assert "rerere.enabled=false" in argv and "rerere.autoupdate=false" in argv
+        assert "core.hooksPath=/dev/null" in argv
     assert "--topo-order" in next(c for c in calls if "rev-list" in c and "--reverse" in c)
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
 
@@ -746,7 +747,7 @@ def test_a_checkout_that_fails_after_the_replay_published_keeps_the_discard_warn
 
 
 def test_a_failing_commit_hook_cannot_make_the_replay_drop_an_entry(two):
-    # git 2.50 runs no commit hook on a clean cherry-pick, so this guards a git that does (it cannot fail today)
+    # git on Linux runs commit hooks on a cherry-pick (CI caught it); macOS git 2.50 does not, so this only fails there
     gl, ana = _conflicting_replay(two)
     hooks = Path(git("rev-parse", "--git-common-dir", cwd=gl.wt).strip())
     hooks = (hooks if hooks.is_absolute() else gl.wt / hooks) / "hooks"
