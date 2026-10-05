@@ -614,8 +614,8 @@ def wrap_entity(
         # Should be unreachable: nothing in the shipped consolidate path writes the crystal tier.
         # Reported as a DEFECT rather than an operator error, and deliberately NOT given a new exit
         # code — inventing a seventh rung for a state that should never occur is ceremony, while
-        # `1` already carries the correct operator response (the wrap did not complete; memory is
-        # unchanged; episodes are safe).
+        # `1` already carries the correct operator response (the wrap did not complete); the
+        # message below says what the store shows.
         print(
             f"levain wrap: {exc}\n"
             "  Nothing was saved; the entity's identity is unchanged and its episodes are safe.\n"

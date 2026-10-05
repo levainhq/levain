@@ -286,10 +286,10 @@ def render(e: dict) -> str:
         bits.append(f'  words: "{oneline(e["words"])}"')
     if e.get("owner"):
         bits.append(f"  owner of the call: {oneline(e['owner'])}")
-    src = f"pack {e['pack']}" if e.get("pack") else (e.get("agent") or "human")
-    bits.append(f"  recorded by {e.get('author')} ({src}), {age(e.get('ts', ''))}")
+    src = f"pack {oneline(e['pack'])}" if e.get("pack") else (e.get("agent") or "human")
+    bits.append(f"  recorded by {oneline(str(e.get('author')))} ({src}), {age(e.get('ts', ''))}")
     if e.get("summary"):
-        bits.append(f"  summary by {e.get('author')}: {oneline(e['summary'])}")
+        bits.append(f"  summary by {oneline(str(e.get('author')))}: {oneline(e['summary'])}")
     if e.get("reason"):
         bits.append(f"  why: {oneline(e['reason'])}")
     if e.get("paths"):
