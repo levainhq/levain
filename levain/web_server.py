@@ -250,6 +250,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
+    "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -265,6 +266,7 @@ _CHAT_POST_ROUTES = ("/chat/open", "/chat/turn", "/chat/approve", "/chat/reject"
 # chat routes. make_server refuses a collision loudly (a packaging-class bug, not runtime).
 _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/substrate.json",
+    "/team_views.json",
     "/recall.json",
     "/job.json",
     "/edit",
@@ -697,6 +699,28 @@ class _Handler(GuardedHandler):
                     "write_token_required": self._write_token_required(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
+            finally:
+                self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", head=head)
+            return
+
+        if path == "/team_views.json":
+            # The running `levain team view` servers registered on this machine (levain/team/registry.py):
+            # project, repo, loopback URL only, each confirmed alive (pid + a short loopback probe). A read of
+            # the registry directory, never a write; bounded by the same gate as the other reads.
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(
+                    b"busy\n", "text/plain; charset=utf-8", status=503, head=head
+                )
+                return
+            try:
+                from levain.team.registry import live_views
+
+                body = json.dumps({"views": [
+                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in live_views()
+                ]}).encode("utf-8")
+            except Exception:  # noqa: BLE001 - a registry fault means "no team views", never a 500
+                body = b'{"views": []}'
             finally:
                 self.server.request_gate.release()
             self._send(body, "application/json; charset=utf-8", head=head)

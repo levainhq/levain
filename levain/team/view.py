@@ -488,15 +488,29 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
 
 def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: int,
           cockpit_url: str = DEFAULT_COCKPIT_URL) -> int:
+    from . import registry
     httpd = make_view_server(gl, host=host, port=port, recheck_days=recheck_days, ack_flag=ack_flag,
                              cockpit_url=cockpit_url)
     bh, bp = str(httpd.server_address[0]), httpd.server_address[1]
-    print(f"Levain team view -> http://{f'[{bh}]' if ':' in bh else bh}:{bp}/")
+    url = f"http://{bh}:{bp}/"
+    print(f"Levain team view -> {url}")
     print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
+    # Back-link: tell the cockpit this view exists (repo, URL, project, pid; see registry.py). Best effort: a
+    # registry that cannot be written costs the cockpit's Team tab, never the view.
+    entry = None
+    try:
+        registry.prune_dead()
+        entry = registry.register(str(gl.repo.toplevel), url, gl.team().project)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+    if threading.current_thread() is threading.main_thread():
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))  # a clean exit too
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
+        registry.unregister(entry)
     return 0
