@@ -6,6 +6,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Known limits (released 0.6.x; found by running it; the fix design is not decided)
+
+- **The team ledger judges every past line against today's `team.toml`, not the `team.toml` in force when the line was written.** Two consequences, both measured with `levain team verify` / `status`:
+  - **An owner hand-off re-judges history.** When the owner sets `owner = "<other member>"` and commits it, the old owner's earlier, valid supersedes stop being honoured (`only <member> or the owner (<new owner>) may supersede ...; ignored`), so a tension that had been superseded comes back into force, and a tension denies every edit on its path for everyone.
+  - **A member leaving un-enforces everything they wrote.** When a member is removed from `[members]`, every line they ever recorded is dropped from force (`lines added by <email> (not a member) ... not enforced`), and the problems it raises are permanent, so `verify` stays red. The team view's design keeps a pane for rulings whose owner has left `team.toml`; the code erases them instead.
+  Workaround: do not hand off ownership or remove a member while rulings or tensions they recorded still matter; supersede or re-record them under the current owner first. The ledger stays append-only and nothing is lost on disk, only not enforced. Pack-rule lines are expected to be affected the same way after a hand-off (read, not run). The fix is a tenure design that records when each member held a role; it is the maintainer's to decide and is not in this release.
+
 ## [0.6.3] — 2026-10-04
 
 The framed team export, the other half of anneal-memory's `team-import` contract v2 (0.9.38, with the 0.9.39 fix).
