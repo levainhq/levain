@@ -259,3 +259,41 @@ def test_crlf_fences_close():
 def test_a_closer_of_the_other_character_or_shorter_does_not_close():
     # inside a ``` fence, ~~~ and `` are content, so the markup after them is still quoted
     assert not unreadable_tool_call("```\n~~~\n``\n<tool_call>{\"name\": \"terminal\"}\n```", TOOLS)
+
+
+# ---------- L3 r3 (Phill's B): code spans by CommonMark 0.31.2 s6.1, lines by s2.1 ----------
+
+CALL = '<tool_call>{"name": "terminal", "arguments": {}}'
+
+
+def test_a_code_span_that_crosses_a_line_ending_is_code():
+    assert not unreadable_tool_call("Example: `quoted\n" + CALL + "` done", TOOLS)
+    assert not unreadable_tool_call("Example: ``a\n" + GLM_REAL[1] + "\n`` done", TOOLS)
+
+
+def test_a_span_ends_with_its_paragraph():
+    # a blank line ends the paragraph, so the opener there has no closer and is literal; the call after it is real
+    assert unreadable_tool_call("Stray ` backtick.\n\n" + CALL + "\n\nand a later ` one", TOOLS)
+    # a fence ends the paragraph too
+    assert unreadable_tool_call("Stray ` here\n```\nx\n```\n" + CALL + "\n`", TOOLS)
+
+
+def test_an_opener_without_an_equal_closer_is_literal():
+    assert unreadable_tool_call("Look: ``\n" + CALL + "\n` (one backtick does not close two)", TOOLS)
+
+
+def test_a_backslash_escaped_backtick_does_not_open_a_span():
+    assert unreadable_tool_call("A literal \\`\n" + CALL + "\nand `", TOOLS)
+
+
+def test_only_cr_lf_and_crlf_end_lines():
+    # U+2028 is not a line ending: the ``` after it does not close the fence, so the markup stays quoted
+    assert not unreadable_tool_call("Example:\n```\nquoted\u2028```\n" + CALL + "\n```\nok", TOOLS)
+    assert unreadable_tool_call("Example:\r" + GLM_REAL[1], TOOLS)
+
+
+def test_an_indented_block_of_call_json_is_not_a_whole_fence():
+    assert not unreadable_tool_call('    ```json\n    {"name": "terminal", "arguments": {}}\n    ```', TOOLS)
+    # r3 LOW: a leading strip made this 4-space opener a column-0 fence; it is an indented code line, not a fence
+    assert not unreadable_tool_call('    ```json\n{"name": "terminal", "arguments": {}}\n```', TOOLS)
+    assert unreadable_tool_call('\n```json\n{"name": "terminal", "arguments": {}}\n```\n', TOOLS)

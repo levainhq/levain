@@ -200,15 +200,22 @@ _GLM_LINE = re.compile(r"(?m)^ {0,3}[^\s<]*</?arg_(?:key|value)>")
 # The <tool_call> wrapper opening an actual call, at the start of a line: a JSON object, a tool name followed by GLM
 # argument markup, or Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call.
 _TOOL_CALL_OPEN = re.compile(r"(?m)^ {0,3}<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# Markdown code, by CommonMark 0.31.2: a reply quoting the markup is explaining it, not calling. A fenced block (s4.5)
-# opens on 3+ backticks or 3+ tildes after at most three spaces (a backtick fence's info string has no backtick) and
-# closes on a run of the SAME character at least as long, after at most three spaces and followed only by spaces or
-# tabs; unclosed, it runs to the end. A code span (s6.1) closes on a backtick string of exactly its opener's length;
-# spans are taken within a line. An indented (4-space) code block is excluded by the shapes themselves: they must
-# begin within the first three columns.
+# Markdown code, by CommonMark 0.31.2: a reply quoting the markup is explaining it, not calling. Lines end only at
+# LF, CR or CRLF (s2.1; str.splitlines also splits on U+2028 and friends). A fenced block (s4.5) opens on 3+ backticks
+# or 3+ tildes after at most three spaces (a backtick fence's info string has no backtick) and closes on a run of the
+# SAME character at least as long, after at most three spaces and followed only by spaces or tabs; unclosed, it runs
+# to the end. A code span (s6.1) opens on a backtick string (a maximal run not begun by a backslash escape, s2.4) and
+# closes at the next backtick string of exactly that length, across line endings, within its paragraph (a blank
+# line or a fence ends one); an opener with no closer is literal. An indented (4-space) code block is excluded by
+# the shapes themselves: they must begin within the first three columns.
+_LINE_END = re.compile(r"\r\n|\r|\n")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _FENCE_CLOSE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-_CODE_SPAN = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
+_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+def _lines(text: str) -> list[str]:
+    return _LINE_END.split(text)
 
 
 def _fence_open(line: str) -> str | None:
@@ -223,24 +230,84 @@ def _fence_closes(line: str, fence: str) -> bool:
     return bool(m) and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
 
 
+def _without_spans(paragraph: str) -> str:
+    """``paragraph`` with every code span blanked to spaces (its line endings kept)."""
+    out = list(paragraph)
+    i, n = 0, len(paragraph)
+    while i < n:
+        ch = paragraph[i]
+        if ch == "\\" and i + 1 < n and paragraph[i + 1] in _ASCII_PUNCT:
+            i += 2                                   # an escaped character, a backtick included, is literal
+            continue
+        if ch != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and paragraph[j] == "`":
+            j += 1
+        run = j - i
+        k = j
+        close = -1
+        while k < n:                                 # inside a span a backslash is literal: no escapes here
+            if paragraph[k] != "`":
+                k += 1
+                continue
+            m = k
+            while m < n and paragraph[m] == "`":
+                m += 1
+            if m - k == run:
+                close = m
+                break
+            k = m
+        if close < 0:
+            i = j                                    # no closer: the run is literal text
+            continue
+        for x in range(i, close):
+            if out[x] != "\n":
+                out[x] = " "
+        i = close
+    return "".join(out)
+
+
 def _without_code(text: str) -> str:
-    """``text`` with every fenced block and code span blanked, line structure kept."""
+    """``text`` with every fenced block and code span blanked, one output line per input line (LF-joined)."""
     out: list[str] = []
+    para: list[str] = []
     fence: str | None = None
-    for line in text.splitlines():
+
+    def flush() -> None:
+        if para:
+            out.extend(_without_spans("\n".join(para)).split("\n"))
+            para.clear()
+
+    for line in _lines(text):
         if fence is not None:
             if _fence_closes(line, fence):
                 fence = None
             out.append("")
             continue
-        fence = _fence_open(line)
-        out.append("" if fence is not None else _CODE_SPAN.sub(" ", line))
+        opened = _fence_open(line)
+        if opened is not None:
+            flush()
+            fence = opened
+            out.append("")
+        elif not line.strip(" \t"):
+            flush()
+            out.append("")
+        else:
+            para.append(line)
+    flush()
     return "\n".join(out)
 
 
 def _whole_fence_body(text: str) -> str | None:
-    """The inside of ``text`` when ALL of it is one closed fenced block, else ``None``."""
-    lines = text.splitlines()
+    """The inside of ``text`` when ALL of it is one closed fenced block, else ``None``. Blank lines around it are
+    ignored; the first line keeps its indentation, so an indented block (not a fence) is not one."""
+    lines = _lines(text)
+    while lines and not lines[0].strip(" \t"):
+        lines.pop(0)
+    while lines and not lines[-1].strip(" \t"):
+        lines.pop()
     if len(lines) < 2:
         return None
     fence = _fence_open(lines[0])
@@ -298,7 +365,7 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     if not text:
         return False
     stripped = text.strip()
-    body = _whole_fence_body(stripped)
+    body = _whole_fence_body(text)
     names = _json_call_names((body if body is not None else stripped).strip())
     if names and all(n in tool_names for n in names):
         return True
