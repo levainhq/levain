@@ -1910,7 +1910,7 @@ def test_headroom_fails_on_a_continuity_anneals_next_wrap_could_not_read(tmp_pat
 
 
 
-def test_headroom_stays_quiet_for_a_missing_or_non_regular_continuity_even_after_a_wrap_and_never_blocks(tmp_path: Path):
+def test_headroom_stays_quiet_for_a_missing_continuity_even_after_a_wrap(tmp_path: Path):
     import sqlite3
     from levain.doctor import _check_continuity_headroom
 
@@ -1919,9 +1919,21 @@ def test_headroom_stays_quiet_for_a_missing_or_non_regular_continuity_even_after
     con.execute("INSERT INTO wraps (episodes_compressed) VALUES (3)")
     con.commit()
     con.close()
-    assert _check_continuity_headroom(d) == []                                         # not a headroom question
-    os.mkfifo(d / ".levain" / "memory.continuity.md")                                  # a read would block forever
-    assert _check_continuity_headroom(d) == []
+    assert _check_continuity_headroom(d) == []      # known limit (CHANGELOG): "lost" needs anneal's recovery check
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+def test_headroom_fails_without_opening_a_non_regular_continuity(tmp_path: Path):
+    from levain.doctor import _check_continuity_headroom
+
+    d = _entity_with_continuity(tmp_path, None)
+    os.mkfifo(d / ".levain" / "memory.continuity.md")     # opening it would block the whole run: the check must not
+    (r,) = _check_continuity_headroom(d)
+    assert not r.ok and "not a regular file" in r.detail
+    (tmp_path / "dir").mkdir()
+    d2 = _entity_with_continuity(tmp_path / "dir", None)
+    (d2 / ".levain" / "memory.continuity.md").mkdir()
+    assert not _check_continuity_headroom(d2)[0].ok
 
 
 def test_the_over_bound_hint_names_the_schemas_own_cuttable_sections(tmp_path: Path):

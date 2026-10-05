@@ -928,14 +928,20 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
     counts what anneal counts: its characters minus the durable section (``anneal_memory.durable.section_chars``)
     against ``hard_max_chars`` of the schema persisted in the entity's store. Nothing here re-implements a
     measure or a read. Fails when the file is over the bound (a save is refused unless the wrap recomposes below
-    it) or cannot be read or measured. It says nothing when there is no store or no regular continuity file:
-    ``_check_store`` names a missing store, and a continuity that is missing, or is not a regular file (a read of
-    a FIFO would block the whole run), is not a headroom question.
+    it) or cannot be read or measured, and when the path exists but is not a regular file (it is never opened: a
+    read of a FIFO would block the whole run). It says nothing when there is no store (``_check_store`` names
+    that) or no continuity file yet.
     """
     store = install / ".levain" / "memory.db"
     continuity = install / ".levain" / "memory.continuity.md"
     name = "continuity headroom"
-    if not store.is_file() or not continuity.is_file():
+    if not store.is_file():
+        return []
+    if continuity.is_symlink() or continuity.exists():
+        if not continuity.is_file():
+            return [CheckResult(name, False, ".levain/memory.continuity.md exists but is not a regular file",
+                                "Replace it with the entity's continuity file (restore it from a backup or git).")]
+    else:
         return []
     try:
         from anneal_memory import Store
@@ -949,19 +955,19 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
             return []
         bound = hard_max_chars(schema)
         used = len(text) - section_chars(text, schema)
+        cuttable = ", ".join(s["heading"] for s in schema if s["role"] in ("live-state", "narrative"))
     except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
         return [CheckResult(name, False, f"could not measure ({type(e).__name__}: {e})",
                             "Either anneal-memory is older than 0.9.33, the store needs a migration, or the "
                             "continuity file is not readable UTF-8; the error names which.")]
     room = bound - used
     if room < 0:
-        cuttable = ", ".join(s["heading"] for s in schema if s["role"] in ("live-state", "narrative"))
         return [CheckResult(
             name, False,
             f"{used} of {bound} characters: {-room} over anneal's hard maximum, so a wrap's save is refused "
             "unless it recomposes the continuity below it",
-            f"Cut fetchable detail ({cuttable}) from .levain/memory.continuity.md; "
-            "the Durable Facts section is outside this count.")]
+            "Cut fetchable detail" + (f" ({cuttable})" if cuttable else "") + " from .levain/memory.continuity.md; "
+            "a durable section is outside this count.")]
     tight = " (under 10% left)" if room * 10 < bound else ""
     return [CheckResult(name, True, f"{used} of {bound} characters, {room} left{tight}")]
 
