@@ -1834,3 +1834,82 @@ def test_doctor_fails_a_broken_config_even_when_the_diagnosis_raises(tmp_path, m
     (tmp_path / ".levain" / "confinement.json").write_text("{not json")
     r = _check_confinement(tmp_path)[0]
     assert r.ok is False and "refuse to start" in r.detail
+
+
+# --- continuity headroom -------------------------------------------------------------------------------------------
+
+def _entity_with_continuity(tmp_path: Path, text: str | None, *, schema=None) -> Path:
+    from anneal_memory import Store
+    from anneal_memory.schema import FLOW_SCHEMA
+
+    d = tmp_path / "ent"
+    (d / ".levain").mkdir(parents=True)
+    Store(str(d / ".levain" / "memory.db"), section_schema=schema or FLOW_SCHEMA).close()
+    if text is not None:
+        (d / ".levain" / "memory.continuity.md").write_bytes(text.encode("utf-8"))
+    return d
+
+
+def _flow_continuity(state_filler: int, durable_filler: int = 0) -> str:
+    body = "## State\n" + "x" * state_filler + "\n\n"
+    if durable_filler:
+        body += "## Durable Facts\n- " + "d" * durable_filler + "\n\n"
+    return body + "## Active Threads\n\n## Patterns\n\n## Decisions\n\n## Context\n\n## Understanding\n"
+
+
+def test_headroom_reports_the_room_left_against_anneals_own_bound(tmp_path: Path):
+    from anneal_memory.durable import section_chars
+    from anneal_memory.schema import FLOW_SCHEMA, hard_max_chars
+    from levain.doctor import _check_continuity_headroom
+
+    text = _flow_continuity(1000)
+    d = _entity_with_continuity(tmp_path, text)
+    (r,) = _check_continuity_headroom(d)
+    bound = hard_max_chars(FLOW_SCHEMA)
+    used = len(text) - section_chars(text, FLOW_SCHEMA)
+    assert r.ok and f"{used} of {bound} characters, {bound - used} left" in r.detail
+
+
+def test_headroom_fails_over_the_bound_and_the_durable_section_does_not_count(tmp_path: Path):
+    from anneal_memory.schema import FLOW_SCHEMA, hard_max_chars
+    from levain.doctor import _check_continuity_headroom
+
+    bound = hard_max_chars(FLOW_SCHEMA)
+    over = _entity_with_continuity(tmp_path, _flow_continuity(bound + 50))
+    (r,) = _check_continuity_headroom(over)
+    assert not r.ok and "over anneal's hard maximum" in r.detail and r.hint
+    # a huge durable section is outside the bound: the same non-durable size passes with it present
+    (tmp_path / "ent2").mkdir()
+    ok = _entity_with_continuity(tmp_path / "ent2", _flow_continuity(1000, durable_filler=bound))
+    (r2,) = _check_continuity_headroom(ok)
+    assert r2.ok
+
+
+def test_headroom_counts_crlf_as_two_and_flags_a_tight_file(tmp_path: Path):
+    from anneal_memory.schema import FLOW_SCHEMA, hard_max_chars
+    from levain.doctor import _check_continuity_headroom
+
+    bound = hard_max_chars(FLOW_SCHEMA)
+    lf = _flow_continuity(bound - 92)
+    assert len(lf) < bound and len(lf) + lf.count("\n") > bound   # LF fits, CRLF does not
+    d = _entity_with_continuity(tmp_path, lf)
+    assert _check_continuity_headroom(d)[0].ok
+    (tmp_path / "e2").mkdir()
+    crlf = _entity_with_continuity(tmp_path / "e2", lf.replace("\n", "\r\n"))   # every newline now counts two: over
+    assert not _check_continuity_headroom(crlf)[0].ok
+    (tmp_path / "e3").mkdir()
+    tight = _entity_with_continuity(tmp_path / "e3", _flow_continuity(bound - 700))
+    assert "under 10% left" in _check_continuity_headroom(tight)[0].detail
+
+
+def test_headroom_stays_quiet_without_a_file_or_a_store_and_reports_an_unreadable_store(tmp_path: Path):
+    from levain.doctor import _check_continuity_headroom
+
+    assert _check_continuity_headroom(_entity_with_continuity(tmp_path, None)) == []
+    bare = tmp_path / "bare"
+    (bare / ".levain").mkdir(parents=True)
+    (bare / ".levain" / "memory.continuity.md").write_text("## State\nx\n")
+    assert _check_continuity_headroom(bare) == []
+    (bare / ".levain" / "memory.db").write_text("not a database")
+    (r,) = _check_continuity_headroom(bare)
+    assert not r.ok and "could not measure" in r.detail

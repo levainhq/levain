@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- **`levain doctor` reports each entity's continuity headroom against anneal's hard maximum.** The new `continuity headroom` line reads `.levain/memory.continuity.md` and the schema persisted in the entity's store, and says how many characters are used, the bound, and how many are left (flagging under 10%). It fails when the file is already over the maximum, because every wrap's save is refused until it is cut. The count is anneal's own: the file's characters minus the durable section (`anneal_memory.durable.section_chars`, a CRLF counting two), against `anneal_memory.schema.hard_max_chars`; nothing is re-implemented here. It needs anneal-memory 0.9.33 or later, which levain already requires.
+
 ## [0.6.3] — 2026-10-04
 
 The framed team export, the other half of anneal-memory's `team-import` contract v2 (0.9.38, with the 0.9.39 fix).

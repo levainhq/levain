@@ -8,6 +8,7 @@ What it checks:
     the runtime condenser, not installed files.
   - Runtime: Python interpreter; `anneal-memory` available as CLI or module.
   - Store: `.levain/memory.db` opens cleanly via sqlite3.
+  - Continuity headroom: `.levain/memory.continuity.md` against anneal's hard maximum for the store's schema.
   - Per detected adapter (Claude Code if `CLAUDE.md` + `.claude/`; Codex if
     `AGENTS.md`; openhands via the marker with no residue):
       * Config files parse.
@@ -113,6 +114,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
     core.extend(_check_store(install))
+    core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     for r in core:
         _emit(r)
@@ -917,6 +919,45 @@ def _check_store(install: Path) -> list[CheckResult]:
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
     return [CheckResult(".levain/memory.db", True, label)]
+
+
+def _check_continuity_headroom(install: Path) -> list[CheckResult]:
+    """How much room the entity's continuity has left before anneal refuses a save.
+
+    Counts what anneal counts: the file's characters minus the durable section
+    (``anneal_memory.durable.section_chars``), against ``hard_max_chars`` of the schema persisted in the
+    entity's store. Nothing here re-implements either measure. Fails only when the file is already over the
+    maximum: every wrap's save is refused until it is cut. A missing file or store is not this check's to
+    report (a fresh install has no continuity yet; ``_check_store`` names a missing store).
+    """
+    store = install / ".levain" / "memory.db"
+    continuity = install / ".levain" / "memory.continuity.md"
+    name = "continuity headroom"
+    if not store.is_file() or not continuity.is_file():
+        return []
+    try:
+        from anneal_memory import Store
+        from anneal_memory.durable import section_chars
+        from anneal_memory.schema import hard_max_chars
+
+        with Store(str(store), read_only=True) as st:
+            schema = st.section_schema_for_wrap()
+        # decoded as anneal counts it: no newline translation (a CRLF counts two), so not read_text
+        text = continuity.read_bytes().decode("utf-8", "replace")
+        bound = hard_max_chars(schema)
+        used = len(text) - section_chars(text, schema)
+    except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
+        return [CheckResult(name, False, f"could not measure ({type(e).__name__}: {e})",
+                            "Check the store with `levain doctor`'s store line; anneal-memory must be 0.9.33 or later.")]
+    room = bound - used
+    if room < 0:
+        return [CheckResult(
+            name, False,
+            f"{used} of {bound} characters: {-room} over anneal's hard maximum, so every wrap's save is refused",
+            "Cut fetchable detail (State, Active Threads, Context) from .levain/memory.continuity.md, then wrap again; "
+            "the Durable Facts section is outside this count.")]
+    tight = " (under 10% left)" if room * 10 < bound else ""
+    return [CheckResult(name, True, f"{used} of {bound} characters, {room} left{tight}")]
 
 
 def _check_compat_set(install: Path) -> list[CheckResult]:
