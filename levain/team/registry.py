@@ -16,9 +16,12 @@ The protocol, in one place:
 * The ``lock1-`` prefix is the liveness-generation marker. A future mechanism must use a different prefix, so an
   old view can never prune a newer view's files and a reader never has to parse a file to decide whether to trust it.
 * The cockpit never deletes anything. A starting view prunes entries nobody holds, strictly before it publishes.
-  Hidden temp files are never swept: an age rule would be a heuristic, and a publisher paused longer than the age
-  (SIGSTOP, a sleeping laptop) would lose its file. A temp file left by a view killed mid-publish is harmless;
-  readers ignore it.
+  A hidden temp file is swept by the same rule as an entry (only if a shared try-lock succeeds on it), never by
+  age: a publisher paused for any length of time still holds its exclusive lock, so its temp is never touched.
+  Readers ignore temp files.
+* A listing examines entries until MAX_VIEWS live ones are found, the entries run out, or LIST_BUDGET is spent; in
+  the last case it reports ``truncated`` so the cockpit can say the list may be incomplete.
+* A forked child (no exec) closes its copy of the lock fd at once, so it cannot keep a dead view listed.
 * Before publishing, a view checks that ``flock`` really conflicts on this filesystem. On a filesystem that emulates
   it (NFS, some FUSE mounts) the view says why it is not registered and keeps serving.
 
@@ -46,6 +49,7 @@ import re
 import secrets
 import stat
 import time
+import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -57,12 +61,12 @@ except ImportError:                                  # not POSIX: nothing here c
 VERSION = 2
 PREFIX = "lock1-"
 MAX_VIEWS = 8
-MAX_NAMES = 256                  # entries a listing examines, however many are on disk
 LIST_BUDGET = 1.0                # seconds, the whole listing; checked between files
 PRUNE_MAX_NAMES = 1024
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
+_TMP_RE = re.compile(r"\.(?:lock1-[0-9a-f]{32}|selftest-[0-9a-f]{16})\.tmp")
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -151,6 +155,20 @@ def _flock_is_real(dir_fd: int) -> bool:
 
 # ---- the publisher ------------------------------------------------------------------------------------------------
 
+_LIVE: "weakref.WeakSet[Registration]" = weakref.WeakSet()
+
+
+def _forget_in_child() -> None:
+    """After a bare fork the child holds a copy of every lock fd, and the lock lives as long as any copy does. Close
+    the child's copies (never unlink: the entry is the parent's) so only the parent's view keeps its entry live."""
+    for reg in list(_LIVE):
+        reg._drop_fds()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_in_child)
+
+
 class Registration:
     """One published entry and the lock fd that makes it live. Owns the fd for the life of the view: keep this
     object referenced (the view hangs it on its server), because dropping it closes the lock and the entry reads dead.
@@ -161,6 +179,7 @@ class Registration:
         self.name = name
         self._dir_fd: int | None = dir_fd
         self._lock_fd: int | None = lock_fd
+        _LIVE.add(self)
 
     @property
     def path(self) -> Path:
@@ -174,6 +193,9 @@ class Registration:
                 pass
 
     def close(self) -> None:
+        self._drop_fds()
+
+    def _drop_fds(self) -> None:
         lock_fd, dir_fd = self._lock_fd, self._dir_fd
         self._lock_fd = self._dir_fd = None
         for fd in (lock_fd, dir_fd):
@@ -261,8 +283,10 @@ def prune_dead() -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        # Filter, then bound: junk names must not use up the examination budget (L2 2026-10-05, RUN).
-        for name in [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]:
+        # Filter, then bound: junk names must not use up the examination budget. Entries and abandoned temp files
+        # go by the same rule: removed only if a shared try-lock succeeds, i.e. no publisher holds them.
+        cand = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n) or _TMP_RE.fullmatch(n)]
+        for name in cand[:PRUNE_MAX_NAMES]:
             opened = _open_entry(dir_fd, name)
             if opened is None:
                 continue
@@ -315,33 +339,48 @@ def _read_live(dir_fd: int, name: str) -> dict | None:
         os.close(fd)
 
 
-def live_views(budget: float = LIST_BUDGET) -> list[dict]:
-    """The registered views whose publisher holds its lock now. Read-only, no network. At most MAX_NAMES entries are
-    examined and the listing stops at ``budget`` seconds between files, so a directory of junk cannot hold the
-    cockpit (one ``open`` hung on a dead hard mount cannot be interrupted here; the caller's gate bounds how many
-    requests that can trap)."""
+def live_views_scan(budget: float = LIST_BUDGET) -> tuple[list[dict], bool]:
+    """(views, truncated): the registered views whose publisher holds its lock now. Read-only, no network. Entries
+    are judged one at a time until MAX_VIEWS live ones are found, they run out, or ``budget`` seconds are spent
+    (checked between files), so junk or dead entries can neither hide a live view nor hold the cockpit; only the
+    budget can end a scan early, and then ``truncated`` is True. One ``open`` hung on a dead hard mount cannot be
+    interrupted here; the caller's gate bounds how many requests that can trap."""
     if fcntl is None:
-        return []
+        return [], False
     try:
         dir_fd = _open_dir(create=False)
     except (OSError, RegistryUnavailable):
-        return []
+        return [], False
     end = time.monotonic() + budget
     out: list[dict] = []
+    truncated = False
     try:
         try:
-            names = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)]
+            it = os.scandir(dir_fd)
         except OSError:
-            return []
-        for name in sorted(names)[:MAX_NAMES]:
-            if time.monotonic() >= end or len(out) >= MAX_VIEWS:
-                break
-            try:   # one poisoned file must never abort the loop or hide the real views after it
-                e = _read_live(dir_fd, name)
-            except Exception:  # noqa: BLE001
-                continue
-            if e:
-                out.append(e)
+            return [], False
+        with it:
+            for ent in it:
+                name = ent.name
+                if not _NAME_RE.fullmatch(name):
+                    continue
+                if len(out) >= MAX_VIEWS:
+                    break
+                if time.monotonic() >= end:
+                    truncated = True
+                    break
+                try:   # one poisoned file must never abort the loop or hide the real views after it
+                    e = _read_live(dir_fd, name)
+                except Exception:  # noqa: BLE001
+                    continue
+                if e:
+                    out.append(e)
+    except OSError:
+        pass
     finally:
         os.close(dir_fd)
-    return sorted(out, key=lambda e: (e["project"].casefold(), e["url"]))
+    return sorted(out, key=lambda e: (e["project"].casefold(), e["url"])), truncated
+
+
+def live_views(budget: float = LIST_BUDGET) -> list[dict]:
+    return live_views_scan(budget)[0]

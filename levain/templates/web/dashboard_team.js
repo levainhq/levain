@@ -11,6 +11,7 @@
   const bar = document.querySelector("nav.tabs");
   if (!bar) return;
   let control = null;
+  let note = null;
 
   function safeUrl(raw) {
     try {
@@ -23,9 +24,17 @@
   function go(raw) { const u = safeUrl(raw); if (u) window.location.href = u; }
   function label(v) { return "▣ Team · " + v.project; }
 
-  function render(views) {
+  // The server stops scanning at a time limit; say so, once, instead of letting a short list pass as complete.
+  function render(views, truncated) {
     const ok = views.map((v) => ({ v: v, u: safeUrl(v.url) })).filter((x) => x.u);
     if (control) { control.remove(); control = null; }
+    if (note) { note.remove(); note = null; }
+    if (truncated) {
+      note = document.createElement("span");
+      note.className = "tab-team-note";
+      note.textContent = "team list may be incomplete (scan time limit)";
+      bar.appendChild(note);
+    }
     if (!ok.length) return;
     if (ok.length === 1) {
       control = document.createElement("button");
@@ -65,7 +74,7 @@
     // empty list from a healthy server still clears it).
     fetch("/team_views.json", { headers: { Accept: "application/json" } })
       .then((r) => { if (!r.ok) throw new Error("status " + r.status); return r.json(); })
-      .then((j) => { if (mine > applied && Array.isArray(j.views)) { applied = mine; render(j.views); } })
+      .then((j) => { if (mine > applied && Array.isArray(j.views)) { applied = mine; render(j.views, j.truncated === true); } })
       .catch(() => {});
   }
   load();

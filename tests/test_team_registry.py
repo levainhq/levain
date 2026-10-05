@@ -224,10 +224,28 @@ def test_only_a_publisher_ever_takes_the_exclusive_lock(pub, monkeypatch):
     assert ops and set(ops) == {fcntl.LOCK_SH | fcntl.LOCK_NB}
 
 
-def test_prune_leaves_temp_files_and_other_grammars_alone(pub):
+def test_prune_sweeps_an_abandoned_temp_only_if_nobody_holds_it(pub):
+    import fcntl
     d = R.registry_dir()
     d.mkdir(parents=True)
-    keep = [".lock1-" + "a" * 32 + ".tmp", "4242-7000.json", "lock2-" + "b" * 32 + ".json", "notes.txt"]
+    abandoned = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
+    for n in abandoned:
+        (d / n).write_text("{half")
+    paused = f".lock1-{'c' * 32}.tmp"                        # a publisher paused mid-publish still holds LOCK_EX
+    (d / paused).write_text("{}")
+    fd = os.open(d / paused, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        R.prune_dead()
+        assert _names() == [paused]
+    finally:
+        os.close(fd)
+
+
+def test_prune_leaves_other_grammars_alone(pub):
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    keep = ["4242-7000.json", "lock2-" + "b" * 32 + ".json", "notes.txt"]
     for n in keep:
         (d / n).write_text("{half")
     gone = f"lock1-{_hex(9)}.json"
@@ -315,19 +333,30 @@ def test_t5_junk_old_grammar_and_poisoned_names_are_ignored_and_never_break_the_
             os.close(fd)
 
 
-def test_the_cap_applies_after_filtering_and_the_names_examined_are_bounded(pub, monkeypatch):
+def test_the_cap_applies_after_filtering(pub):
     for i in range(R.MAX_VIEWS + 3):
         pub(f"p{i:02d}", port=42000 + i)
-    assert len(R.live_views()) == R.MAX_VIEWS
+    views, truncated = R.live_views_scan()
+    assert len(views) == R.MAX_VIEWS and truncated is False
+
+
+def test_many_dead_entries_never_hide_a_live_view(pub):
+    """The old listing sliced the first 256 sorted names before judging liveness, so enough dead entries that sort
+    before a live one hid it on every refresh."""
     d = R.registry_dir()
-    for i in range(300):
-        (d / f"lock1-{_hex(10 ** 6 + i)}.json").write_bytes(b"")
-    calls = []
-    real = R._read_live
-    monkeypatch.setattr(R, "_read_live", lambda *a: (calls.append(1), real(*a))[1])
-    R.live_views()
-    assert len(calls) <= R.MAX_NAMES
-    assert R.live_views(budget=0) == []                      # the budget is checked before the first file
+    d.mkdir(parents=True)
+    for i in range(400):
+        (d / f"lock1-{_hex(i)}.json").write_bytes(b"")          # all sort before any random 32-hex name starting 1+
+    live = pub("ledgerline")
+    assert live.name > f"lock1-{_hex(399)}.json"
+    views, truncated = R.live_views_scan()
+    assert [v["project"] for v in views] == ["ledgerline"] and truncated is False
+
+
+def test_the_budget_ends_a_scan_and_says_so(pub):
+    pub("ledgerline")
+    assert R.live_views_scan(budget=0) == ([], True)            # stopped by time, with entries left unexamined
+    assert R.live_views_scan(budget=5)[1] is False              # exhaustion is not truncation
 
 
 def test_the_listing_response_carries_no_internal_fields(pub):
@@ -432,7 +461,7 @@ print(os.get_inheritable(fd), flush=True)
 if mode == "exec":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], close_fds=False)
     print(child.pid, flush=True)
-else:                                         # a bare fork, no exec: the one documented hole
+else:                                         # a bare fork, no exec: the child must not keep the lock
     pid = os.fork()
     if pid == 0:
         time.sleep(30); os._exit(0)
@@ -441,8 +470,8 @@ time.sleep(30)
 """
 
 
-@pytest.mark.parametrize("mode,survives", [("exec", False), ("fork", True)])
-def test_t2c_a_child_spawned_with_close_fds_false_does_not_keep_the_lock_but_a_bare_fork_does(
+@pytest.mark.parametrize("mode,survives", [("exec", False), ("fork", False)])
+def test_t2c_neither_an_exec_child_nor_a_bare_fork_child_keeps_a_dead_view_listed(
         mode, survives, tmp_path, levain_home):
     env = dict(os.environ, PYTHONPATH=os.getcwd(), LEVAIN_HOME=str(levain_home))
     p = subprocess.Popen([sys.executable, "-c", _HELPER, mode], env=env, stdout=subprocess.PIPE, text=True)
@@ -576,14 +605,14 @@ def test_cockpit_lists_only_live_views_and_stays_read_only(tmp_path, pub):
     try:
         port = httpd.server_address[1]
         r, body = _get(port, "/team_views.json")
-        assert r.status == 200 and json.loads(body) == {"views": []}      # no view: no tab
+        assert r.status == 200 and json.loads(body) == {"views": [], "truncated": False}   # no view: no tab
         v = pub("ledgerline")
         r, body = _get(port, "/team_views.json")
         assert json.loads(body) == {"views": [{"project": "ledgerline", "repo": "/work/ledgerline",
-                                                "url": "http://127.0.0.1:41000/"}]}
+                                                "url": "http://127.0.0.1:41000/"}], "truncated": False}
         assert "pid" not in body.decode() and "started" not in body.decode()
         v.unpublish()
-        assert json.loads(_get(port, "/team_views.json")[1]) == {"views": []}   # gone on the next load
+        assert json.loads(_get(port, "/team_views.json")[1]) == {"views": [], "truncated": False}   # gone on the next load
         # the guards every other cockpit GET has
         assert _get(port, "/team_views.json", {"Host": "evil.example"})[0].status == 403
         assert _get(port, "/team_views.json", {"Sec-Fetch-Site": "cross-site"})[0].status == 403
@@ -757,3 +786,35 @@ const shown = () => made.filter((c) => c.alive).length;
     out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"afterOlder": 1, "final": 0}
+
+
+def test_the_tab_says_so_when_the_server_reports_a_truncated_scan():
+    from levain.web_server import load_web_asset
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    js = load_web_asset("dashboard_team.js")
+    harness = r"""
+const pending = [], made = [];
+let fire = null;
+global.window = { location: {} };
+global.document = { querySelector: () => ({ appendChild: (c) => made.push(c) }), hidden: false,
+  addEventListener: (ev, fn) => { fire = fn; },
+  createElement: () => ({ alive: true, remove() { this.alive = false; }, addEventListener() {}, appendChild() {}, style: {}, setAttribute() {} }) };
+global.fetch = () => new Promise((res) => pending.push(res));
+%s
+const tick = () => new Promise((r) => setTimeout(r, 20));
+const notes = () => made.filter((c) => c.alive && c.className === "tab-team-note").map((c) => c.textContent);
+(async () => {
+  pending[0]({ ok: true, json: async () => ({ views: [], truncated: true }) });
+  await tick();
+  const a = notes();
+  fire(); pending[1]({ ok: true, json: async () => ({ views: [], truncated: false }) });
+  await tick();
+  console.log(JSON.stringify({ a, b: notes() }));
+})();
+""" % js
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    got = json.loads(out.stdout.strip().splitlines()[-1])
+    assert len(got["a"]) == 1 and "incomplete" in got["a"][0] and got["b"] == []

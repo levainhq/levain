@@ -734,13 +734,14 @@ class _Handler(GuardedHandler):
                 )
                 return
             try:
-                from levain.team.registry import live_views
+                from levain.team.registry import live_views_scan
 
+                found, truncated = live_views_scan()
                 body = json.dumps({"views": [
-                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in live_views()
-                ]}).encode("utf-8")
+                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in found
+                ], "truncated": truncated}).encode("utf-8")
             except Exception:  # noqa: BLE001 - a registry fault means "no team views", never a 500
-                body = b'{"views": []}'
+                body = b'{"views": [], "truncated": false}'
             finally:
                 _TEAM_VIEWS_GATE.release()
             self._send(body, "application/json; charset=utf-8", head=head)
