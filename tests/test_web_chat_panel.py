@@ -167,8 +167,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     area.fire("compositionstart", {}); area.fire("keydown", { key: "Enter", keyCode: 13, isTrusted: true }); await sleep(30);
     area.fire("compositionend", {}); await sleep(30);
     area.fire("keydown", { key: "Enter", isTrusted: false }); await sleep(30);
-    find(panel, (n) => n.tagName === "form" && n.className === "chat-compose").fire("submit", { isTrusted: false }); await sleep(30);
-    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter, a composing Enter (by flag or by composition events), a synthetic Enter and a scripted submit send nothing");
+    // a script's form.requestSubmit() fires a submit the browser marks TRUSTED: submit must send nothing either way
+    find(panel, (n) => n.tagName === "form" && n.className === "chat-compose").fire("submit", { isTrusted: true }); await sleep(30);
+    byText(panel, "Send").fire("click", { isTrusted: false }); await sleep(30);
+    ok(!calls.some((c) => c.path === "/chat/turn"), "Shift+Enter, a composing Enter (by flag or by composition events), a synthetic Enter, any form submit and an untrusted Send click send nothing");
     area.fire("keydown", { key: "Enter", isTrusted: true }); await sleep(80);
     ok(calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter sends the turn once");
     const reason = find(panel, (n) => n.tagName === "textarea" && n.attrs["aria-label"] === "reason for rejecting");
@@ -180,7 +182,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(area.disabled && calls.filter((c) => c.path === "/chat/turn").length === 1, "Enter on the disabled compose box sends nothing while a decision waits");
     console.log("PASS"); return;
   }
-  find(panel, (n) => n.tagName === "form").fire("submit", { isTrusted: true }); await sleep(80);
+  byText(panel, "Send").fire("click", { isTrusted: true }); await sleep(80);
   if (process.argv[3] === "turn403json") {
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
     console.log("PASS"); return;
@@ -235,6 +237,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     if (m === "notstarted") {
       ok(panel.textContent.includes("No job has started on the server since your last confirmed request, so your last decision has not run"), "a lost request that never started is said as such");
       ok(!panel.textContent.includes("These actions ran") && !panel.textContent.includes("the earlier turn"), "the earlier job is never shown as what happened");
+      ok(byText(panel, "Check what happened"), "and it can be checked again");
     } else if (m === "restart404") {
       ok(panel.textContent.includes("The server no longer has that session (it restarted, or the session ended and was cleaned up). Your last request may or may not have run"), "a session the server no longer knows: gone, outcome unknown");
       ok(panel.textContent.includes("/ws/ent"), "it says where to look");
@@ -325,5 +328,8 @@ def test_the_only_key_listener_is_the_compose_box():
     src = JS.read_text()
     assert src.count('addEventListener("keydown"') == 1
     assert "!ev.isTrusted || area.disabled || deciding" in src
+    # a script's requestSubmit() fires a TRUSTED submit, so the compose form's submit only prevents default
+    assert 'form.addEventListener("submit", (ev) => { ev.preventDefault(); });' in src
+    assert 'sendBtn.type = "button"' in src and 'sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });' in src
     assert 'area.addEventListener("keydown"' in src
     assert not re.search(r'addEventListener\("key(up|press)"|onkey(up|down|press)', src)
