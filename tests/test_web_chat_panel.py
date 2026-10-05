@@ -101,6 +101,9 @@ function fetch(path, init) {
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
+  if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "chat_token", message: "needs token" });
+  if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "chat_token", message: "needs token" });
+  if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "chat_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
@@ -150,6 +153,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   byText(panel, "Open session").fire("click", { isTrusted: true }); await sleep(60);
   const area = find(panel, (n) => n.tagName === "textarea"); area.value = "do the thing";
   find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(80);
+  if (process.argv[3] === "turn403json") {
+    ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "turn500" || process.argv[3] === "turn409") {
     ok(!panel.textContent.includes("Held for your approval"), "no consent box from a turn POST without a clear answer");
     ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
@@ -210,6 +217,14 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     }
     console.log("PASS"); return;
   }
+  if (process.argv[3] === "approve403json" || process.argv[3] === "poll403json") {
+    // chat r8 L3 (codex HIGH, gemini HIGH): a chat_token 403 after the approve was sent proves nothing ran either
+    approve.fire("click", { isTrusted: true }); await sleep(150);
+    ok(approvals() === 1, "one approve was sent");
+    ok(panel.textContent.includes("may already have run"), "the token refusal reports an unknown outcome");
+    ok(!byText(panel, "Approve") && !panel.textContent.includes("Held for your approval"), "no consent box remains or is built");
+    console.log("PASS"); return;
+  }
   approve.fire("click", { isTrusted: true }); approve.fire("click", { isTrusted: true });
   ok(approve.disabled && reject.disabled, "buttons lock while a decision is in flight");
   await sleep(80);
@@ -223,7 +238,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json"])
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
