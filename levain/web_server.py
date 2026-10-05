@@ -251,6 +251,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
+    "/dashboard_chat.js": ("dashboard_chat.js", "text/javascript; charset=utf-8"),
 }
 
 
