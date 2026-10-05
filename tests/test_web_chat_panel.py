@@ -108,7 +108,10 @@ function fetch(path, init) {
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
   const M = process.argv[3];
   if (M === "post500" && path === "/chat/approve") return reply(500, {});
-  if (M === "post500" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1) return reply(200, { state: "idle", job_id: null });
+  if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
+  if (M === "evicted" && path.startsWith("/chat/job.json?id=J-appr")) return reply(200, { status: "unknown" });
+  if (["post500", "proxy503", "evicted"].includes(M) && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(200, { state: "idle", job_id: null });
   if (M && M.startsWith("lost") && path.startsWith("/chat/session.json?id=S")) {
     sessionReads++;
     return M === "lostloop" ? reply(200, { state: "busy", job_id: "J-appr" }) : reply(200, { state: "idle", job_id: null });
@@ -161,11 +164,12 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
-  if (process.argv[3] === "post500") {
+  if (["post500", "proxy503", "evicted"].includes(process.argv[3])) {
     // the approve POST got no clear answer: the decision may have run, so an idle session is reported unknown
     approve.fire("click", { isTrusted: true }); await sleep(150);
     ok(approvals() === 1, "one approve was sent");
-    ok(panel.textContent.includes("outcome of the last decision is unknown"), "an ambiguous POST is reported unknown");
+    ok(panel.textContent.includes("outcome of the last decision is unknown"), "an ambiguous decision is reported unknown");
+    ok(calls.filter((c) => c.path === "/chat/session.json").length >= 1, "the session was re-read");
     ok(area.disabled, "compose stays blocked");
     console.log("PASS"); return;
   }
@@ -204,7 +208,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503", "evicted"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*": polls fail after an approve; the session is re-read once, the original job's result is
