@@ -524,11 +524,14 @@
     }
 
     // APPROVE IS TWO-STEP (Phill 2026-10-05: keyboard users must be able to decide, with a second press to confirm).
-    // A trusted activation of Approve (a click, or Enter/Space on the focused button) ARMS it; a second trusted
-    // activation of the same button, at least ARM_GUARD_MS later, confirms. Esc on the button, focus leaving it, a
-    // click elsewhere in the panel, or ARM_TIMEOUT_MS disarm it. A second activation inside the guard (a double press,
-    // a held key's repeat) is ignored and the button stays armed. Reject is one step: rejecting runs nothing.
-    let armedAt = 0, armTimer = null;
+    // A trusted activation of Approve (a click, or Enter/Space on the focused button) ARMS it; a SEPARATE second
+    // activation of the same button confirms. "Separate" is enforced, not timed: a held key's auto-repeat is cancelled
+    // (a repeat would otherwise reach the page as another trusted click), a keyboard confirm needs the key released and
+    // pressed again, the second click of a double click (detail > 1) never confirms, and nothing confirms inside
+    // ARM_GUARD_MS. Esc, focus leaving the button (arming focuses it), a click elsewhere in the panel or ARM_TIMEOUT_MS
+    // disarm it; the click handler also checks the deadline itself, so a click serviced late does not confirm.
+    // Reject is one step: rejecting runs nothing.
+    let armedAt = 0, armTimer = null, keyHeld = false;
     function disarm() {
       if (!armedAt) return;
       armedAt = 0; clearTimeout(armTimer); armTimer = null;
@@ -540,15 +543,25 @@
       approve.textContent = "Approve? Press again to confirm, Esc to cancel"; approve.className = "chat-btn approve armed";
       armTimer = setTimeout(disarm, ARM_TIMEOUT_MS);
       disarmCurrent = disarm; armedButton = approve;
+      if (typeof approve.focus === "function") approve.focus();   // so Esc and blur reach it in every browser
     }
-    approve.addEventListener("keydown", (ev) => { if (ev.key === "Escape") disarm(); });
-    approve.addEventListener("blur", disarm);
+    // Esc disarms; an activating key that is still down (or auto-repeating) cannot confirm.
+    approve.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") { disarm(); return; }
+      if (ev.key === "Enter" || ev.key === " ") {
+        if (ev.repeat || keyHeld) { ev.preventDefault(); return; }
+        keyHeld = true;
+      }
+    });
+    approve.addEventListener("keyup", (ev) => { if (ev.key === "Enter" || ev.key === " ") keyHeld = false; });
+    approve.addEventListener("blur", () => { keyHeld = false; disarm(); });   // a key released elsewhere never reaches us
     // THE ONLY /chat/approve POST in this file: the CONFIRMING trusted activation of this button, once, with both
     // buttons locked.
     approve.addEventListener("click", (ev) => {
       if (!ev.isTrusted || deciding || !session) return;
+      if (armedAt && Date.now() - armedAt >= ARM_TIMEOUT_MS) disarm();   // expired, whether or not its timer has run
       if (!armedAt) { arm(); return; }
-      if (Date.now() - armedAt < ARM_GUARD_MS) return;
+      if (ev.detail > 1 || Date.now() - armedAt < ARM_GUARD_MS) return;   // a double click's second click; too soon
       disarm();
       lock();
       api("POST", "/chat/approve", { session_id: session.id, expect: decisionId }).then(after);
