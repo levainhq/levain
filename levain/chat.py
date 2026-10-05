@@ -97,6 +97,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
+from levain.firing.gate import shown_in_full
+
 if TYPE_CHECKING:
     from levain.firing.drive import DriveMode
 
@@ -584,7 +586,7 @@ class ChatHost:
                     f"the held action is not the one this {kind} was made on; read the session again",
                     409,
                 )
-            if kind == "approve" and (not rec.pending or any(not str(p.get("full") or "").strip() for p in rec.pending)):
+            if kind == "approve" and (not rec.pending or any(not shown_in_full(p.get("full")) for p in rec.pending)):
                 raise ChatError(
                     "undecidable",
                     "this hold cannot be shown in full, so it can only be rejected",

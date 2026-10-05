@@ -107,6 +107,8 @@ function fetch(path, init) {
               { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "qA\\u{41}", reason: "r", recognized: true }],
     decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
   const M = process.argv[3];
+  if (M === "post500" && path === "/chat/approve") return reply(500, {});
+  if (M === "post500" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1) return reply(200, { state: "idle", job_id: null });
   if (M && M.startsWith("lost") && path.startsWith("/chat/session.json?id=S")) {
     sessionReads++;
     return M === "lostloop" ? reply(200, { state: "busy", job_id: "J-appr" }) : reply(200, { state: "idle", job_id: null });
@@ -159,17 +161,22 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   approve.fire("click", { isTrusted: false }); await sleep(50);
   ok(approvals() === 0, "a synthetic click sends no approve");
   ok(!approve.disabled, "a synthetic click does not lock the buttons");
+  if (process.argv[3] === "post500") {
+    // the approve POST got no clear answer: the decision may have run, so an idle session is reported unknown
+    approve.fire("click", { isTrusted: true }); await sleep(150);
+    ok(approvals() === 1, "one approve was sent");
+    ok(panel.textContent.includes("outcome of the last decision is unknown"), "an ambiguous POST is reported unknown");
+    ok(area.disabled, "compose stays blocked");
+    console.log("PASS"); return;
+  }
   if (["lost", "lostok", "lostloop"].includes(process.argv[3])) {
     approve.fire("click", { isTrusted: true }); await sleep(300);
     const m = process.argv[3];
-    if (m === "lostok") {
-      ok(panel.textContent.includes("done it"), "the ORIGINAL job's result is rendered after the re-read");
-      ok(!area.disabled, "a completed turn unblocks compose");
-    } else {
-      ok(panel.textContent.includes("outcome of the last decision is unknown"), "an unavailable result is reported unknown");
-      ok(area.disabled, "compose stays blocked");
-      ok(!panel.textContent.includes("done it"), "never shown as a completed turn");
-    }
+    // After a lost poll the page never follows a job or claims an outcome it did not see (even one the server
+    // could return later, "lostok"): a session that is not gated is reported unknown, with compose blocked.
+    ok(panel.textContent.includes("outcome of the last decision is unknown"), "the outcome is reported unknown");
+    ok(area.disabled, "compose stays blocked");
+    ok(!panel.textContent.includes("done it"), "never shown as a completed turn");
     ok(sessionReads <= 2, "the session is not re-read in a loop (reads: " + sessionReads + ")");
     console.log("PASS"); return;
   }
@@ -197,7 +204,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop"])
+@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
     # modes "lost*": polls fail after an approve; the session is re-read once, the original job's result is

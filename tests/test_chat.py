@@ -1551,6 +1551,21 @@ def test_an_approve_on_a_hold_that_cannot_be_shown_in_full_is_refused_and_the_ho
     assert _wait(host, host.reject(sid, "no", res["decision_id"])["job_id"])["result"]["reply"] == "declined"
 
 
+@pytest.mark.parametrize("full", [1, None, ["rm -rf x"], "", " \n "])
+def test_a_full_that_is_not_a_string_with_content_cannot_be_approved_at_the_server(tmp_path, full):
+    """L3 r4 (codex): the server judged `str(full).strip()`, so full=1 passed it while the panel withheld Approve.
+    One rule (shown_in_full) for the server, the REPL and the panel; blanks and non-strings are not "the whole action"."""
+    odd = PendingEfferent("terminal", "x", "bash fans in", full=full)
+    f = _Factory([_Result(reply=None, gated=True, pending=(odd,))])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.code == "undecidable"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+
+
 def test_decision_id_required_message_says_where_a_turn_result_carries_it(tmp_path):
     host, sid, res, f = _gated_host(tmp_path)
     with pytest.raises(ChatError) as e:

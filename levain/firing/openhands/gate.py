@@ -163,9 +163,13 @@ def _dump_fields(action_event: Any) -> dict[str, Any] | None:
     if action is None:
         return None
     try:
-        return dict(action.model_dump())
+        dump = dict(action.model_dump())
     except Exception:  # noqa: BLE001
         return None
+    declared = getattr(type(action), "model_fields", None)
+    if isinstance(declared, dict) and not set(declared) <= set(dump):
+        return None   # a field the dump leaves out (Field(exclude=True)) may still change what runs
+    return dump
 
 
 def _exact(value: Any) -> bool:

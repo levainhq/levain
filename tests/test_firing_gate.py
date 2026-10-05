@@ -364,3 +364,13 @@ def test_a_whitespace_only_full_is_undecidable():
 
     p = PendingEfferent("terminal", "x", "r", full="  \n ")
     assert not p.decidable and "NOT SHOWN IN FULL" in p.line()
+
+
+def test_shown_in_full_is_one_rule_and_a_non_string_never_crashes_the_repl_line():
+    from levain.firing.gate import PendingEfferent, shown_in_full
+
+    assert shown_in_full("x") and shown_in_full("\u0430") and shown_in_full(" a\n")
+    for bad in ("", " ", "\n \n", 1, None, ["x"]):
+        assert not shown_in_full(bad)
+        held = PendingEfferent("terminal", "d", "r", full=bad)
+        assert not held.decidable and "NOT SHOWN IN FULL" in held.line()
