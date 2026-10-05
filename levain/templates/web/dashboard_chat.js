@@ -197,8 +197,10 @@
     area.setAttribute("aria-label", "message");
     sendBtn = el("button", "chat-btn", "Send"); sendBtn.type = "button";
     form.appendChild(area); form.appendChild(sendBtn);
-    // A turn is sent by a trusted click on Send or by Enter in the compose box (below), never by the form's submit
-    // event: a script's form.requestSubmit() fires a submit the browser marks trusted, so submit only prevents default.
+    // A turn is sent only by a trusted activation of Send (a click, or Enter/Space on the focused button, which the
+    // browser delivers as a trusted click: keyboard access is kept on purpose, Phill 2026-10-05) or by Enter in the
+    // compose box (below). Never by the form's submit event: a script's form.requestSubmit() fires a submit the browser
+    // marks trusted, so submit only prevents default. Nothing else sends, and no key decides a held action.
     form.addEventListener("submit", (ev) => { ev.preventDefault(); });
     sendBtn.addEventListener("click", (ev) => { if (ev.isTrusted) sendTurn(); });
     // Enter sends and Shift+Enter starts a new line, in THIS box only. Not while an input method is composing a
@@ -243,6 +245,7 @@
     const text = area.value.trim();
     if (!text || !session || area.disabled || deciding) return;
     area.value = "";
+    retireChecks();
     const mine = bubble("me", "you"); mine.appendChild(el("div", "chat-text", text));
     setComposeEnabled(false);
     const myRun = run;
@@ -328,12 +331,19 @@
     setComposeEnabled(false);
     rereadButton(myRun, ctx);
   }
+  // Every "Check what happened" row on the page. A check answers for ONE lost request, so the moment the page sends
+  // another (a turn or a decision) every row is retired: a stale check could otherwise read the new request's job as
+  // the old one's outcome.
+  let checkRows = [];
+  function retireChecks() { checkRows.forEach((r) => r.remove()); checkRows = []; }
   function rereadButton(myRun, ctx) {
+    retireChecks();
     const row = el("div", "chat-row");
+    checkRows.push(row);
     const btn = el("button", "chat-btn", "Check what happened"); btn.type = "button";
     btn.addEventListener("click", (ev) => {
       if (!ev.isTrusted || myRun !== run || !session) return;
-      row.remove();
+      retireChecks();
       resync(myRun, ctx);
     });
     row.appendChild(btn); log.appendChild(row);
@@ -379,7 +389,7 @@
   // request: the same job id when its start was confirmed, or (no 202 came back) a job that started after the last one
   // this page saw. Anything else is not an answer: "nothing new started" is said as such, never as "what happened".
   // Returns "known" (the lost request's job was reported), "none" (nothing started since), or "" (still unknown).
-  function judgeLastJob(last, ctx, myRun) {
+  function judgeLastJob(last, ctx) {
     const lid = last && typeof last === "object" ? last.job_id : undefined;
     if (ctx.jobId) {
       if (lid === ctx.jobId) return reportLastJob(last) ? "known" : "";
@@ -388,8 +398,8 @@
     }
     if (lid === undefined || lid === ctx.before) {
       failure("No job has started on the server since your last confirmed request, so your last " + ctx.what +
-        " has not run. If it was only delayed on the way it could still arrive: check again before sending it again.");
-      rereadButton(myRun, ctx);
+        " has not run. If it was only delayed on the way it could still arrive: look at the entity's workspace before " +
+        "sending it again.");
       return "none";
     }
     return reportLastJob(last) ? "known" : "";
@@ -416,7 +426,7 @@
         row.appendChild(fresh); log.appendChild(row);
         return;
       }
-      const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx, myRun) : "";
+      const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning); return;
       }
@@ -474,7 +484,7 @@
     box.appendChild(reasonIn); box.appendChild(row);
     log.appendChild(box);
 
-    function lock() { deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
+    function lock() { retireChecks(); deciding = true; approve.disabled = true; reject.disabled = true; reasonIn.disabled = true; }
     function decided(j, jid) {
       deciding = false; box.remove();
       const res = j.result;
