@@ -541,9 +541,10 @@ def wrap_entity(
     Returns a process exit code: 0 on a clean consolidate (or an empty no-op); 2 for a
     precondition/environment error where nothing started (not an entity, isolation refusal, missing
     extra, wrong schema, an unreadable store, or a wrap already in progress); 1 only when THIS
-    invocation started a wrap that did not complete (the compose or the save failed) — in which case
-    the entity's identity is left UNCHANGED and its episodes are safe; **5 when the wall-clock bound
-    fired** (:data:`levain.session.EXIT_TIMEOUT`).
+    invocation started a wrap that did not complete cleanly. Exit 1 does NOT by itself mean the
+    identity is unchanged: the printed message says what the store establishes (refused and
+    unchanged, committed but not written out, or unknown, with the command that settles it);
+    **5 when the wall-clock bound fired** (:data:`levain.session.EXIT_TIMEOUT`).
 
     ``max_seconds`` bounds the WHOLE consolidate — store open, lock, prepare, compose and save — for
     the same reason the turn bound wraps startup and teardown: launchd coalesces on PROCESS lifetime
