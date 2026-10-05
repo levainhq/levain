@@ -772,3 +772,14 @@ def test_a_failing_project_hook_cannot_make_the_replay_fail_or_drop_an_entry(two
     assert [e.get("words") for e in gl.ledger().in_force].count("e stays") == 1
     assert not list(hooks.glob("*.ran"))                      # none of the project's hooks ran for levain's plumbing
     assert git("symbolic-ref", "HEAD", cwd=gl.wt).strip() == "refs/heads/levain-ledger"
+
+
+def test_levains_hook_isolation_does_not_reach_the_remotes_own_server_hooks(two):
+    tmp, ana, ben = two
+    git("config", "core.hooksPath", str(tmp / "origin.git" / "hooks"), cwd=tmp / "origin.git")   # beats a machine-wide one
+    hook = tmp / "origin.git" / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'declined by the remote' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    before = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
+    assert record_ruling(ana, "src/z.py", "z stays") != 0                      # the push is refused ...
+    assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == before   # ... and the remote is unchanged
