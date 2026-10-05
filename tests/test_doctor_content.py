@@ -8,6 +8,7 @@ check, not just a wiring one. This locks that check.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -1906,24 +1907,33 @@ def test_headroom_fails_on_a_continuity_anneals_next_wrap_could_not_read(tmp_pat
     (d / ".levain" / "memory.continuity.md").write_bytes(b"## State\nshort \xff\n")   # not UTF-8: anneal's load raises
     (r,) = _check_continuity_headroom(d)
     assert not r.ok and "could not measure" in r.detail and "UnicodeDecodeError" in r.detail
-    (tmp_path / "dir").mkdir()
-    d2 = _entity_with_continuity(tmp_path / "dir", None)
-    (d2 / ".levain" / "memory.continuity.md").mkdir()                                   # a directory where the file belongs
-    assert not _check_continuity_headroom(d2)[0].ok
 
 
-def test_headroom_fails_when_a_wrapped_entity_has_lost_its_continuity_but_not_a_fresh_one(tmp_path: Path):
+
+def test_headroom_stays_quiet_for_a_missing_or_non_regular_continuity_even_after_a_wrap_and_never_blocks(tmp_path: Path):
     import sqlite3
     from levain.doctor import _check_continuity_headroom
 
     d = _entity_with_continuity(tmp_path, None)
-    assert _check_continuity_headroom(d) == []                                         # fresh: no wrap yet, nothing to say
     con = sqlite3.connect(d / ".levain" / "memory.db")
-    con.execute("INSERT INTO wraps (episodes_compressed) VALUES (3)")                  # one completed wrap, as anneal records it
+    con.execute("INSERT INTO wraps (episodes_compressed) VALUES (3)")
     con.commit()
     con.close()
+    assert _check_continuity_headroom(d) == []                                         # not a headroom question
+    os.mkfifo(d / ".levain" / "memory.continuity.md")                                  # a read would block forever
+    assert _check_continuity_headroom(d) == []
+
+
+def test_the_over_bound_hint_names_the_schemas_own_cuttable_sections(tmp_path: Path):
+    from anneal_memory.schema import PROJECT_SCHEMA, hard_max_chars
+    from levain.doctor import _check_continuity_headroom
+
+    heads = {s["heading"]: s["role"] for s in PROJECT_SCHEMA}
+    live = [h for h, r in heads.items() if r in ("live-state", "narrative")]
+    d = _entity_with_continuity(tmp_path, "## " + next(iter(heads)) + "\n" + "x" * (hard_max_chars(PROJECT_SCHEMA) + 10) + "\n",
+                                schema=PROJECT_SCHEMA)
     (r,) = _check_continuity_headroom(d)
-    assert not r.ok and "1 completed wrap" in r.detail and "missing" in r.detail
+    assert not r.ok and all(h in r.hint for h in live) and "Active Threads" not in r.hint
 
 
 def test_headroom_stays_quiet_without_a_file_or_a_store_and_reports_an_unreadable_store(tmp_path: Path):
