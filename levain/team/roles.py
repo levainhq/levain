@@ -82,10 +82,10 @@ def parse_team(text: str, where: str = "team.toml") -> Team:
 def validate_team(t: Team, where: str = "team.toml") -> None:
     if t.mode not in MODES:
         raise RolesError(f"{where}: mode must be one of {', '.join(MODES)}")
-    if not t.project.strip() or not t.project.isprintable():
+    if not t.project.isprintable():   # empty stays allowed, as in 0.6.3 (L3 r3: refusing it dropped old teams)
         # The project name heads PROJECT.md and the hooks' lines: a line break in it would let whoever
         # edits team.toml draw text that reads as levain's own.
-        raise RolesError(f"{where}: project must be a non-empty single line of printable text")
+        raise RolesError(f"{where}: project must be a single line of printable text")
     if t.fetch_interval < 0:
         raise RolesError(f"{where}: fetch_interval must be >= 0 seconds")
     for h, mail in t.members.items():

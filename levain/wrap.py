@@ -617,7 +617,7 @@ def wrap_entity(
         # `1` already carries the correct operator response (the wrap did not complete).
         print(
             f"levain wrap: {exc}\n"
-            "  The wrap did not complete; check the store with `anneal-memory status` before retrying.\n"
+            "  The wrap did not complete; check it with `anneal-memory --db <entity>/.levain/memory.db wrap-status`.\n"
             "  Please report this — it means a code path tried to promote a pattern into the "
             "always-loaded tier with no human present.",
             file=sys.stderr, flush=True,

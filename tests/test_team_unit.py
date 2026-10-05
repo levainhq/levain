@@ -317,9 +317,8 @@ def test_team_roundtrip_and_refusals(tmp_path):
     for twin in ("ana-", "ana.", "Ana.-"):
         with pytest.raises(R.RolesError, match="same ledger folder"):
             R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", twin: "b@x.com"})))
-    for bad in ("", "  ", "\n\t"):
-        with pytest.raises(R.RolesError, match="project must be"):
-            R.parse_team(R.dump_team(R.Team(bad, "ana", {"ana": "a@x.com"})))
+    for empty in ("", "  ", "\n\t"):   # loaded on 0.6.3, so it still loads (L3 r3)
+        R.parse_team(R.dump_team(R.Team(empty, "ana", {"ana": "a@x.com"})))
     for odd in ("p\n# forged heading", "p\u2028x", "p\tq"):   # an older team.toml still loads, folded
         assert "\n" not in R.parse_team(R.dump_team(R.Team(odd, "ana", {"ana": "a@x.com"}))).project
     with pytest.raises(R.RolesError, match="project must be"):
