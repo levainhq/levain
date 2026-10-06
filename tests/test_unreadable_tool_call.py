@@ -421,3 +421,20 @@ def test_the_pair_is_searched_once_per_reply():
     unreadable_tool_call("<arg_key>x\n" * 18_000, TOOLS)
     unreadable_tool_call("<tool_call> \n" * 15_000, TOOLS)
     assert time.perf_counter() - t < 5
+
+
+# ---------- 0.6.9: the size bound never encodes a reply it will not classify ----------
+
+def test_a_reply_longer_than_the_bound_in_characters_is_never_encoded():
+    # L3 r7 (codex): the bound check encoded the whole reply first (300M characters: 0.03 s, ~286 MiB transient).
+    # UTF-8 spends at least one byte per character, so a reply with more characters than the bound has more bytes.
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
+
+    class NoEncode(str):
+        def encode(self, *a, **k):
+            raise AssertionError("encoded a reply already known to be over the bound")
+
+    assert unreadable_tool_call(NoEncode(GLM_REAL[1] + "a" * MAX_CLASSIFIED_BYTES), TOOLS) is False
+    # at or under the bound in characters the byte count still decides
+    assert unreadable_tool_call(GLM_REAL[1] + "a" * (MAX_CLASSIFIED_BYTES - len(GLM_REAL[1])), TOOLS) is True
+    assert unreadable_tool_call(GLM_REAL[1] + "é" * (MAX_CLASSIFIED_BYTES // 2), TOOLS) is False

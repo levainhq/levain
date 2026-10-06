@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Fixed
+
+- **The 200 kB size check no longer copies a reply it will not check.** It compared the reply's UTF-8 size by encoding the whole reply first, so a very large reply cost a transient copy of itself (a 300-million-character reply: 0.03 s and about 286 MiB, measured 2026-10-05). A reply with more characters than the bound is now refused before anything is encoded; UTF-8 spends at least one byte per character, so it is over the bound in bytes too.
+
 ## [0.6.8] — 2026-10-05
 
 The chat panel says when a model's tool call could not be read, and opens unlocked.

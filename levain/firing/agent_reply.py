@@ -295,7 +295,9 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     one fenced block) naming only ``tool_names``, the entity's own tools; with none known, that shape is not flagged.
     Replies over :data:`MAX_CLASSIFIED_BYTES` are not classified. It reads the shape only: the call is never repaired
     or run."""
-    if not text or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
+    # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
+    # bytes, and a reply that size is never encoded just to be refused (codex L3 r7).
+    if not text or len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
         return False
     prose, body = _read(text)
     names = _json_call_names((body if body is not None else text).strip())
