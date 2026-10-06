@@ -4,7 +4,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased]
+## [0.6.8] — 2026-10-05
 
 The chat panel says when a model's tool call could not be read, and opens unlocked.
 
@@ -14,7 +14,7 @@ The chat panel says when a model's tool call could not be read, and opens unlock
 - **`levain serve --chat` opens the cockpit unlocked on macOS.** The browser opens with the chat token in the URL fragment (`#chat_token=...`), which a browser never sends to a server, so the token reaches no access log and no Referer. The page keeps it in that tab's `sessionStorage` and removes it from the address bar at once; a reload stays unlocked, and a server restart asks again. The link is printed on every platform (`open the cockpit, unlocked: ...`). Where the browser would be launched with the URL on its command line (Linux `xdg-open`, a browser binary, or `$BROWSER` set), or when macOS's osascript launcher fails (an SSH session, for example), levain opens the plain URL instead, because other OS users can read a command line, and they are among the callers the token keeps out: open the printed link, or paste the printed token. The per-launch token itself is unchanged.
 - **New dependency: `markdown-it-py>=4,<5`**, the CommonMark parser that tells the classifier above which parts of a reply are code. An install with the `openhands` extra (what runs a chat turn) already had it, through that extra's own dependencies.
 - **One click starts a session.** With one entity registered, the panel shows a "Start session" button for it; the picker appears only when there are several.
-- Known limits: the browser's history keeps the link as first opened, with its fragment, and a duplicated or restored tab keeps the tab's `sessionStorage`; either works only while the same server runs. Leaked calls in other formats (MiniMax's `<minimax:tool_call>`, Llama's `<|python_tag|>`, Mistral's `[TOOL_CALLS]`, DeepSeek and Kimi tool tokens, a GLM call with no arguments, or a fragment cut off before any argument tag) are still shown as a reply. The leaked text is still captured in the entity's memory as that turn's reply.
+- Known limits: the browser's history keeps the link as first opened, with its fragment, and a duplicated or restored tab keeps the tab's `sessionStorage`; either works only while the same server runs. Leaked calls in other formats (MiniMax's `<minimax:tool_call>`, Llama's `<|python_tag|>`, Mistral's `[TOOL_CALLS]`, DeepSeek and Kimi tool tokens, a GLM call with no arguments, or a fragment cut off before any argument tag) are still shown as a reply. The leaked text is still captured in the entity's memory as that turn's reply. A leak in a reply over 200 kB is shown as the reply, because such replies are not checked. A `<tool_call>` written before a code block and JSON written after it are read as one call across the code, so that reply is flagged. Markup inside a link's URL or title, or inside a link reference definition, is not read. The size check encodes the whole reply first: on a 300-million-character reply that took 0.03 s and about 286 MiB of transient memory (measured 2026-10-05).
 
 ## [0.6.7] — 2026-10-05
 
