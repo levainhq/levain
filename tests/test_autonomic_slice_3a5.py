@@ -341,14 +341,19 @@ def test_stale_readd_does_not_strip_a_tightening(tmp_path):
     assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["later-kill"]
 
 
-def test_readd_unions_incoming_and_existing_tightenings(tmp_path):
+def test_a_re_add_carrying_tightenings_refuses_rather_than_dropping_them(tmp_path):
+    # add no longer merges (S1h-3). A no-op would silently drop the incoming kill, so it raises.
     store = BindingStore(tmp_path / "b.json")
     b = a_binding()
-    store.add(b)
+    assert store.add(b) is True
     store.tighten_guard(b.binding_id, guard(spike_id="on-disk"))
+    before = store.path.read_text()
     incoming = replace(b, guard_additions=(guard(spike_id="on-disk"), guard(spike_id="incoming")))
-    store.add(incoming)
-    assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["on-disk", "incoming"]
+    with pytest.raises(ValueError, match="use tighten_guard"):
+        store.add(incoming)
+    assert store.path.read_text() == before
+    assert store.add(b) is False                     # a bare re-add is a no-op
+    assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["on-disk"]
 
 
 def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
@@ -457,10 +462,9 @@ def test_a_legacy_entry_that_cannot_be_keyed_refuses_conversion(tmp_path, extra)
     assert store.path.read_text() == before
 
 
-def test_add_validates_the_merged_record_not_only_the_incoming_binding(tmp_path):
-    # codex S1h r2 HIGH (b): the carried guard_additions were never validated, so an impure kill
-    # added on disk rode a re-add into the persisted record unchecked.
-    from levain.autonomic.kill import KillImpurityError
+def test_a_re_add_never_writes_over_a_stored_impure_tightening(tmp_path):
+    # codex S1h r2 HIGH (b) was a merged record carrying an unvalidated stored kill; with no merge
+    # there is no carried record: the re-add writes nothing (S1h-3)
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
@@ -468,20 +472,23 @@ def test_add_validates_the_merged_record_not_only_the_incoming_binding(tmp_path)
     bad = dict(guard().to_dict(), kill_predicate={"field": "x", "op": "regex_sub", "value": "y"})
     _write(store, [dict(rec, guard_additions=[bad])])
     before = store.path.read_text()
-    with pytest.raises((KillImpurityError, ValueError)):
-        store.add(b)
+    assert store.add(b) is False
     assert store.path.read_text() == before
 
 
-def test_supersede_onto_an_existing_active_new_id_is_not_stranded(tmp_path):
+def test_supersede_onto_an_existing_new_id_aborts(tmp_path):
+    # the target id already exists (here ACTIVE): replace_atomic writes nothing and returns False,
+    # so neither grant is stranded and no bookkeeping is chosen between (S1h-3)
     store = BindingStore(tmp_path / "b.json")
     a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     b_active = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(a)
     store.add(b_active)
+    before = store.path.read_text()
     b_paused = a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED)   # same id, default PAUSED
-    assert store.replace_atomic(a.binding_id, b_paused)
-    assert [x.binding_id for x in store.list_active()] == [b_active.binding_id]
+    assert store.replace_atomic(a.binding_id, b_paused) is False
+    assert store.path.read_text() == before
+    assert {x.binding_id for x in store.list_active()} == {a.binding_id, b_active.binding_id}
 
 
 def test_a_present_non_dict_trajectory_bound_is_refused(tmp_path):
@@ -879,23 +886,15 @@ def test_gate_liveness_counts_terminal_states(tmp_path):
     assert stats["by_verdict"]["denied"] >= 2 and stats["by_verdict"]["auto"] == 1
 
 
-def test_replace_atomic_validates_the_merged_record(tmp_path):
-    # the same final-record rule on the supersede path: an impure kill already on the new id's
-    # stored record is carried into the persisted record, so it must be refused, not written
-    from levain.autonomic.kill import KillImpurityError
+def test_replace_atomic_validates_the_proposal_before_any_early_return(tmp_path):
+    # L3 S1h-2 (codex LOW, complement LOW): an invalid proposal returned False when the old grant
+    # was absent, indistinguishable from a lost race. It is validated first and raises.
     store = BindingStore(tmp_path / "b.json")
-    old = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
-    new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
-    store.add(old)
-    store.add(new)
-    recs = {r["binding_id"]: r for r in _raw(store)}
-    bad = dict(guard().to_dict(), kill_predicate={"field": "x", "op": "regex_sub", "value": "y"})
-    recs[new.binding_id]["guard_additions"] = [bad]
-    _write(store, list(recs.values()))
-    before = store.path.read_text()
-    with pytest.raises((KillImpurityError, ValueError)):
-        store.replace_atomic(old.binding_id, new)
-    assert store.path.read_text() == before
+    bad = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    tampered = replace(bad, posture=Posture.ON_LOOP)      # same id, different core: seal-broken
+    with pytest.raises(ValueError, match="seal-broken"):
+        store.replace_atomic("missing-id", tampered)
+    assert not store.path.exists()
 
 
 def test_a_null_trajectory_bound_is_descriptive_not_impure():
@@ -923,8 +922,23 @@ def test_add_cannot_revive_a_single_malformed_revoked_record(tmp_path):
     _malformed_revoked(store, b)
     before = store.path.read_text()
     assert store.list_active() == []
-    with pytest.raises(ValueError, match="malformed"):
-        store.add(b)
+    assert store.add(b) is False
+    assert store.path.read_text() == before and store.list_active() == []
+
+
+def test_add_cannot_revive_a_seal_broken_record(tmp_path):
+    # L3 S1h-2 codex HIGH, reproduced: add(original) over a tampered ACTIVE record restored the
+    # valid core under the stored ACTIVE status, fireable without ratification
+    import json
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    raw = json.loads(store.path.read_text())
+    raw[b.binding_id]["posture"] = "ABOVE_LOOP"
+    store.path.write_text(json.dumps(raw))
+    before = store.path.read_text()
+    assert store.list_active() == []
+    assert store.add(b) is False
     assert store.path.read_text() == before and store.list_active() == []
 
 
@@ -937,7 +951,6 @@ def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
     store.set_status(new.binding_id, BindingStatus.REVOKED)
     _malformed_revoked(store, new)
     before = store.path.read_text()
-    with pytest.raises(ValueError, match="malformed"):
-        store.replace_atomic(old.binding_id, new)
+    assert store.replace_atomic(old.binding_id, new) is False
     assert store.path.read_text() == before
     assert [x.binding_id for x in store.list_active()] == [old.binding_id]

@@ -45,8 +45,8 @@ The load-bearing cuts (each one an apparatus finding made structural):
    KEYLESS (like ``pending``'s seal) — it does not defend against a malicious local process that can
    also recompute it (full local compromise out of scope); it defends against accidental corruption,
    schema drift, and a buggy writer. An unsealed field (``status``) tampered DIRECTLY on disk is the
-   keyless boundary; the governed verbs (``set_status`` transitions, ``add`` bookkeeping-preserve) are
-   what close the realistic in-scope (buggy-writer) resurrection paths.
+   keyless boundary; the governed verbs (``set_status`` transitions, a create-only ``add`` that never
+   writes over an existing id) are what close the realistic in-scope (buggy-writer) resurrection paths.
 
 4. **The registry is MUTABLE standing state, not an append-only trace.** Bindings are created, paused,
    graduated, demoted, revoked — so the store is the ``PendingActionStore`` shape (a mutable JSON file,
@@ -132,26 +132,6 @@ _ALLOWED_TRANSITIONS: dict[BindingStatus, frozenset[BindingStatus]] = {
 }
 # (→EXPIRED from ACTIVE/PAUSED is a manual fail-CLOSED demotion — it only de-activates, never
 # resurrects; the Slice-4 staleness daemon is the primary expirer, a manual demotion is also valid.)
-
-# Restrictiveness rank for "most-restrictive lifecycle wins" when ``add``/``replace_atomic`` collide
-# with existing same-id record(s): a REVOKED tombstone can NEVER be overridden by a duplicate ACTIVE
-# (the resurrection-via-duplicate vector, L3 codex/nemotron). Higher = harder to fire.
-def _status_or_revoked(value: Any) -> "BindingStatus":
-    """Parse a raw status string; anything that does not parse reads as REVOKED (fail closed)."""
-    if isinstance(value, BindingStatus):
-        return value
-    try:
-        return BindingStatus(value)
-    except ValueError:
-        return BindingStatus.REVOKED
-
-
-_STATUS_RESTRICTIVENESS: dict[BindingStatus, int] = {
-    BindingStatus.ACTIVE: 0,
-    BindingStatus.PAUSED: 1,
-    BindingStatus.EXPIRED: 2,
-    BindingStatus.REVOKED: 3,
-}
 
 
 def _assert_json_canonical(obj: Any, path: str) -> None:
@@ -938,71 +918,38 @@ class BindingStore:
             if g.predicted_trajectory is not None:
                 assert_trajectory_pure(g.predicted_trajectory)
 
-    @staticmethod
-    def _preserve_bookkeeping(
-        records: list[dict[str, Any]], binding_id: str, record: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Carry verb-owned bookkeeping (``status`` + ``graduation`` + ``guard_additions``) forward onto
-        ``record`` from the EXISTING record for ``binding_id`` (at most one: the format cannot hold
-        two), so a re-``add`` can neither resurrect a revoked grant, wipe its evidence, nor strip a
-        tightening:
-          - status: the existing status wins (``set_status`` owns it, so a re-add never resets it);
-          - graduation: the existing evidence wins (``record_fire`` owns it), kept as stored so a
-            field this version does not know survives;
-          - guard_additions: the UNION, existing guards first (kept as stored, unknown fields
-            included), then any incoming guard not already present (tightening is monotone: a stale
-            writer re-adding the sealed grant it holds must not erase a kill added since).
-        An existing record that does not LOAD RAISES ``ValueError``: its status cannot be read, so
-        it may be a revoked tombstone, and neither its bookkeeping nor the incoming one can be
-        trusted over it. Repair is manual. The caller validates the RESULT, not the incoming binding."""
-        existing = next((r for r in records if r.get("binding_id") == binding_id), None)
-        if existing is None:
-            return record
-        loaded = BindingStore._load(existing)
-        if loaded is None:
-            # its status cannot be read, so it may be a revoked tombstone: writing the incoming
-            # bookkeeping over it could revive the grant (L1, S1h-2). Refuse like any corrupt file.
-            raise ValueError(f"binding store: the stored record for {binding_id!r} is malformed; "
-                             "refusing to write over it until it is repaired by hand")
-        record["status"] = loaded.status.value
-        raw_grad = existing.get("graduation")
-        record["graduation"] = ({**raw_grad, **loaded.graduation.to_dict()}
-                                if isinstance(raw_grad, dict) else loaded.graduation.to_dict())
-        raw_adds = existing.get("guard_additions")
-        carried = list(raw_adds) if isinstance(raw_adds, list) else []
-        if carried:
-            merged: list[dict[str, Any]] = []
-            seen: set[str] = set()
-            for g in (*carried, *record.get("guard_additions", [])):
-                # identity by the known fields, so a stored copy carrying an unknown field still
-                # matches the incoming copy of the same guard (it loaded, so every entry parses)
-                key = json.dumps(Guard.from_dict(g).to_dict(), sort_keys=True)
-                if key not in seen:
-                    seen.add(key)
-                    merged.append(g)
-            record["guard_additions"] = merged
-        return record
-
     # --- public API --------------------------------------------------------------------
-    def add(self, binding: Binding) -> None:
-        """Persist a binding. On a same-id collision the record is REPLACED but the on-disk ``status``
-        + ``graduation`` + ``guard_additions`` are PRESERVED via :meth:`_preserve_bookkeeping`
-        (existing status + existing evidence + the union of tightenings) — bookkeeping is owned by its
-        governed verbs (``set_status`` / ``record_fire``), never silently reset by ``add``. Closes: a
-        stale re-add wiping graduation (L1-M3) and the silent un-revoke (re-``create`` of a revoked
-        core → same id → default-ACTIVE → resurrection, L2-H1). ``add`` is not a repair verb: over a
-        registry holding duplicate ids it refuses like every other mutation. The binding's own seal
-        must hold and the injected validator (if any) must accept it, checked on the merged record
-        that will persist (it holds the whole incoming core plus the carried bookkeeping). Locked
+    def add(self, binding: Binding) -> bool:
+        """CREATE a binding. Returns True iff it was written; False iff its ``binding_id`` already
+        exists, in which case NOTHING is written and the stored record is neither read as trusted
+        nor touched, whatever state it is in (revoked, malformed, seal-broken).
+
+        ``add`` is create-only. A same-id record already holds the same sealed core (the id is the
+        seal of the core), so all a re-add could change is the unsealed bookkeeping: ``status``,
+        ``graduation`` and ``guard_additions``. Each of those has its own governed verb
+        (``set_status``/``ratify``, ``record_fire``, ``tighten_guard``). An earlier ``add`` merged
+        the bookkeeping instead, and review beat that merge three times (a duplicate copy, a
+        malformed revoked record, a seal-broken active one: each came back fireable); it is deleted.
+        A re-add is therefore a no-op, which keeps re-running a seeder safe, EXCEPT when the incoming
+        binding carries ``guard_additions``: then it RAISES, because a tightening must never be
+        dropped silently (use :meth:`tighten_guard`).
+
+        The binding's own seal must hold and the injected validator (if any) must accept it,
+        checked before the lock; the record written is exactly ``binding.to_dict()``. Locked
         read-modify-write."""
+        self._validate(binding)
         record = binding.to_dict()
         with self._locked():
             records = self._read_raw(for_mutation=True)
-            record = self._preserve_bookkeeping(records, binding.binding_id, record)
-            self._validate(Binding.from_dict(record))   # the record that will persist, not the input
-            kept = [r for r in records if r.get("binding_id") != binding.binding_id]
-            kept.append(record)
-            self._write_raw(kept)
+            if any(r.get("binding_id") == binding.binding_id for r in records):
+                if binding.guard_additions:
+                    raise ValueError(
+                        f"add: binding {binding.binding_id!r} already exists; add does not merge "
+                        "tightenings into it (use tighten_guard)")
+                return False
+            records.append(record)
+            self._write_raw(records)
+            return True
 
     def replace_atomic(self, old_binding_id: str, new_binding: Binding,
                        *, precondition: Callable[[Binding], bool] | None = None) -> bool:
@@ -1018,7 +965,10 @@ class BindingStore:
         ABSENT, the call writes NOTHING and returns ``False`` — re-ratification supersedes an EXISTING
         grant; with nothing to supersede the precondition failed, and writing the new (looser) grant
         anyway would be a fail-OPEN (a caller that ignores the bool would get a live autonomous grant
-        with no revoke). Returns True iff the old grant was found + revoked.
+        with no revoke). If ``new_binding``'s id ALREADY exists (a live grant, a paused candidate, or
+        a tombstone), the call also writes nothing and returns ``False``: superseding onto it would
+        mean choosing between two sets of bookkeeping, which this store no longer does. Returns True
+        iff the old grant was found + revoked and the new one written as given.
 
         ``precondition`` (Slice 4c — codex L3 HIGH-2 / L1 TOCTOU) is a COMPARE-AND-SWAP guard: the caller
         builds ``new_binding`` from a LOCKLESS read of the old grant, so between that read and this locked
@@ -1034,9 +984,18 @@ class BindingStore:
                 f"replace_atomic: old and new binding_id are identical ({old_binding_id!r}) — "
                 "re-ratification requires a different core (a no-op promotion is not a re-ratification)"
             )
+        self._validate(new_binding)
         record = new_binding.to_dict()
         with self._locked():
             records = self._read_raw(for_mutation=True)
+            if any(r.get("binding_id") == new_binding.binding_id for r in records):
+                # The new grant's id already exists (a live grant, a candidate, or a tombstone from
+                # A -> B -> A). Superseding onto it would mean choosing between its stored
+                # bookkeeping and the incoming one, the merge add() no longer does. Abort; write
+                # nothing; the caller re-derives (fail closed: the old grant stays as it is).
+                _log.warning("binding store: replace_atomic target %r already exists; aborting",
+                             new_binding.binding_id)
+                return False
             old_rec = next((r for r in records if r.get("binding_id") == old_binding_id), None)
             if old_rec is None:
                 return False   # nothing to supersede → abort, write nothing (fail-closed)
@@ -1049,22 +1008,9 @@ class BindingStore:
                                  "grant changed since the proposal (revoked/tightened/evidence); aborting",
                                  old_binding_id)
                     return False
-            incoming_status = record.get("status")
-            record = self._preserve_bookkeeping(records, new_binding.binding_id, record)
-            self._validate(Binding.from_dict(record))   # the record that will persist, not the input
-            if _STATUS_RESTRICTIVENESS.get(_status_or_revoked(record.get("status")), 0) > \
-                    _STATUS_RESTRICTIVENESS.get(_status_or_revoked(incoming_status), 0):
-                # The new grant's id already exists as a more restrictive tombstone (re-ratifying back
-                # to a revoked core, A -> B -> A): superseding would revoke the old grant and leave the
-                # new one inert, so nothing is live while the call reports success. Abort; write nothing.
-                _log.warning("binding store: replace_atomic target %r is already %s; aborting",
-                             new_binding.binding_id, record.get("status"))
-                return False
             kept: list[dict[str, Any]] = []
             for r in records:
                 rid = r.get("binding_id")
-                if rid == new_binding.binding_id:
-                    continue                                  # drop (merged into ``record``)
                 if rid == old_binding_id:
                     r["status"] = BindingStatus.REVOKED.value  # supersede the old grant
                 kept.append(r)
