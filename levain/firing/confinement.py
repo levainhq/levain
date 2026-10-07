@@ -19,6 +19,7 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
 **The crown-jewels denylist (structural, never — the Phill-ratified starting set):**
   - flow's store ``~/.anneal-memory/`` (the identity moat, in file terms);
   - the operator's Levain launch tokens ``~/.levain-runtime/`` (a running server's unlocked link);
+  - browser profiles (``BROWSER_PROFILE_DIRS``: every site's cookies, logins and local storage);
   - credential files (declared by the caller — this module does NOT guess where secrets live);
   - sibling entities' ``<other>/.levain/`` stores (one entity can't read another's memory);
   - the ``~/.ssh`` key material (``ssh_mode="agent"``): the entity may USE keys via the agent socket
@@ -688,6 +689,32 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
+
+# BROWSER PROFILES, home-relative, read AND write denied on every OS (head ruling 2026-10-07, after L2 measured the
+# cockpit's launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies, saved
+# logins and local storage unencrypted, so it is a crown jewel whatever Levain keeps in it. Both platforms' paths are
+# listed on both: a path that does not exist on this machine denies nothing and costs one rule.
+BROWSER_PROFILE_DIRS: tuple[str, ...] = (
+    # macOS
+    "Library/Application Support/Google/Chrome",                  # Chrome (all channels' profiles)
+    "Library/Application Support/Chromium",                       # Chromium
+    "Library/Application Support/BraveSoftware",                  # Brave
+    "Library/Application Support/Microsoft Edge",                 # Edge
+    "Library/Application Support/Arc",                            # Arc
+    "Library/Application Support/Vivaldi",                        # Vivaldi
+    "Library/Application Support/Firefox",                        # Firefox
+    "Library/Safari",                                             # Safari history, local storage
+    "Library/Containers/com.apple.Safari",                        # Safari's sandbox container
+    "Library/Cookies",                                            # the system cookie store Safari uses
+    # Linux
+    ".config/google-chrome",                                      # Chrome
+    ".config/chromium",                                           # Chromium
+    ".config/BraveSoftware",                                      # Brave
+    ".config/microsoft-edge",                                     # Edge
+    ".config/vivaldi",                                            # Vivaldi
+    ".mozilla",                                                   # Firefox
+    ".var/app",                                                   # every flatpak app's data, flatpak browsers among them
+)
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -971,7 +998,9 @@ def build_policy(
         terms (mirrors :func:`levain.firing.isolation.flow_store_dir`); a sovereign entity must never
         read the operator's own memory;
       - the operator's Levain launch tokens ``~/.levain-runtime/`` (subtree) — a running server's
-        unlocked link, which would let an entity read that memory over loopback instead;
+        token, which would let an entity read that memory over loopback instead;
+      - browser profiles (``BROWSER_PROFILE_DIRS``, subtrees) — every site's session cookies,
+        saved logins and local storage, the cockpit's own tab among them;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
@@ -1052,6 +1081,8 @@ def build_policy(
     # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
     runtime = (home / RUNTIME_DIR_NAME).resolve()
     subtrees.append(runtime)
+    browsers = [(home / rel).resolve() for rel in BROWSER_PROFILE_DIRS]
+    subtrees.extend(browsers)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1242,7 +1273,7 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
-        if (jewel in listed_dirs or jewel == runtime) and not jewel.is_file():
+        if (jewel in listed_dirs or jewel == runtime or jewel in browsers) and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -3018,7 +3049,12 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             return
         unverifiable(str(exc.filename or "a crown-jewel directory"), exc)
 
-    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
+    # Browser profiles are denied by path but not walked here: Safari's WebKit cache hardlinks its own files, its
+    # container is privacy-protected (os.walk is refused, which would refuse bash outright), and a Chrome profile can
+    # hold gigabytes; walking them at every shell start would refuse or stall every entity on a machine with a browser.
+    home = Path.home()
+    unwalked = {(home / rel).resolve() for rel in BROWSER_PROFILE_DIRS}
+    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,
                    key=lambda p: str(p))
     walked: list[Path] = []
     for root in roots:

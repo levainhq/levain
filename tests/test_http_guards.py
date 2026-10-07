@@ -721,3 +721,20 @@ def test_link_round_two_review_fixes(tmp_path, monkeypatch):
         httpd.shutdown()
         httpd.server_close()
         t.join(timeout=5)
+
+
+def test_a_stale_tmp_file_from_a_crashed_writer_is_removed(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    from levain.http_guards import publish_launch_token
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rt = tmp_path / ".levain-runtime"
+    rt.mkdir(mode=0o700)
+    stale = rt / f".7487.{2**22 + 99}.deadbeef.tmp"   # a pid no process has
+    stale.write_text("{}")
+    pub = publish_launch_token(SimpleNamespace(launch_token=_TOKEN), "http://127.0.0.1:7487/", port=7487,
+                               kind="serve", stream=io.StringIO())
+    assert not stale.exists() and (rt / "7487.json").exists()
+    pub.close()

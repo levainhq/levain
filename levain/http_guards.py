@@ -648,6 +648,15 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
         path = d / f"{int(port)}.json"
         tmp = d / f".{int(port)}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         with _PortLock(d, port):
+            # A tmp file a crashed writer left (head ruling: unlink it if stale): its name carries the writer's pid.
+            for old in d.glob(f".{int(port)}.*.tmp"):
+                try:
+                    old_pid = int(old.name.split(".")[2])
+                    os.kill(old_pid, 0)
+                except (ValueError, IndexError, ProcessLookupError, PermissionError):
+                    old.unlink(missing_ok=True)
+                except OSError:
+                    pass
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
