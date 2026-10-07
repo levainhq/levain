@@ -12,7 +12,7 @@ the stylesheet is a second GET route because the shared CSP forbids inline style
 that snapshot is the remote's ledger tip as this clone last accepted it (what the team has pushed), refreshed by a
 fetch when one is due. A fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch,
 and it shows how far that branch differs from the remote instead of reconciling them. The only things a GET may
-write are the fetched refs (quarantine, and the remote-tracking ref when the tip is accepted) and the clone's record
+write are the fetched refs (the quarantine, and levain's accepted ref when a tip is accepted) and the clone's record
 of when it last fetched.
 
 Stdlib only; the guards are the same ``levain.http_guards`` the cockpit and the docs server ride.
@@ -25,6 +25,7 @@ import ipaddress
 import os
 import sys
 import threading
+import time
 from urllib.parse import parse_qs
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -38,7 +39,7 @@ from . import canon as C
 from . import index as I
 from . import roles as R
 from . import verify as VF
-from .transport import REF, GitLedger, TeamError, git, require_untampered
+from .transport import REF, GitLedger, LedgerReadError, TeamError, git, require_untampered
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
@@ -225,7 +226,7 @@ def _fetch_status(f: dict | None) -> str:
                 '<button id="refresh" type="button" data-fetch="0">⟳ reload</button>')
     if f.get("source") == "remote":
         # "fetched T" only when the last fetch brought its tip in; after a failure the panes are an older copy
-        parts = ["remote, as last accepted" if f.get("error") else
+        parts = ["remote, as last accepted" if f.get("error") or f.get("busy") else
                  f"remote, fetched {_e(f['last_ok'])}" if f.get("last_ok") else "remote"]
     else:
         parts = ["this clone's copy: the remote ledger has not been fetched"]
@@ -239,6 +240,8 @@ def _fetch_status(f: dict | None) -> str:
                    ([f"{down} from the remote not yet in it"] if down else [])
             out += (f'<span class="warn fetch-local">this clone\'s own copy: {", ".join(bits)} '
                     f'(<code>levain team sync</code>)</span>')
+    if f.get("busy"):
+        out += '<span class="stamp fetch-busy">another sync is fetching now; fetch again in a moment</span>'
     if f.get("error"):
         out += f'<span class="warn fetch-error">⚠ {_e(f["error"])}</span>'
     return out + '<button id="refresh" type="button" data-fetch="1">⟳ fetch now</button>'
@@ -431,6 +434,7 @@ class _ViewServer(ThreadingHTTPServer):
     workers: threading.BoundedSemaphore
     problems_cache: tuple[tuple, list[str]] | None = None   # ((commit, history boundary), verify.problems); model_lock
     shallow_path: str | None = None
+    fetch_failure: tuple[float, str] | None = None   # (when, fetch_only's answer) until a later fetch succeeds
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -521,13 +525,13 @@ class _ViewHandler(GuardedHandler):
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
         """Fetch the remote's ledger when one is due, through ``fetch_only``: into quarantine, judged, and only an
-        accepted tip moves the remote-tracking ref. A fetch only, never a rebase, a merge or a push, so this clone's
-        branch and worktree are untouched. Paced by team.toml's
-        fetch_interval (as of the last page) and never more often than FETCH_FLOOR; the button asks for the floor.
+        accepted tip moves levain's accepted ref (what ``remote_ref`` reads). A fetch only, never a rebase, a merge or
+        a push, so this clone's branch and worktree are untouched. Paced by team.toml's fetch_interval (the accepted
+        remote's, as of the last page) and never more often than FETCH_FLOOR; the button asks for the floor.
         The page shows the clone's own record of its last fetch, so a fetch the hook made counts too. Never raises: a
         failure here is shown on the page and the panes still draw. A failure's detail goes to this server's terminal,
         never to the page (git's message can carry a remote URL with credentials, or local paths)."""
-        out: dict = {"remote": False, "last_ok": None, "error": "", "refused": False}
+        out: dict = {"remote": False, "last_ok": None, "error": "", "refused": False, "busy": False}
         try:
             remote = gl.remote
             if not remote:
@@ -535,17 +539,38 @@ class _ViewHandler(GuardedHandler):
             out["remote"] = True
             interval = FETCH_FLOOR if now else max(self.server.fetch_interval, FETCH_FLOOR)
             note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)
+            out["busy"] = bool(note and note.startswith("busy:"))
+            if out["busy"]:
+                note = None                     # another process is fetching the same remote: not a failure
             st = gl.state()
             out["last_ok"] = _iso(st.get("last_fetch_ok"))
+            # fetch_only reports a failed fetch once, in its answer; the view keeps it until a later fetch succeeds,
+            # so the next page (inside the pacing interval, no fetch) still says the remote could not be reached.
+            ok_at = _epoch(st.get("last_fetch_ok"))
+            if note:
+                self.server.fetch_failure = (time.time(), note)
+            elif self.server.fetch_failure and ok_at is not None and ok_at >= self.server.fetch_failure[0]:
+                self.server.fetch_failure = None
+            if not note and self.server.fetch_failure:
+                note = self.server.fetch_failure[1]
+            # The refusal is read from the quarantine itself, so it shows whichever command fetched the refused tip
+            # (this view, a sync, the hook), for as long as that tip is what the remote holds.
+            unjudged = False
+            try:
+                refusal = gl.incoming_refusal()
+            except LedgerReadError as exc:
+                refusal, unjudged = [str(exc)], True
             detail = note or st.get("last_fetch_error") or ""
-            if detail:
+            if refusal:
+                _log(f"the remote's ledger is refused: {'; '.join(refusal)!r}")
+                out["refused"] = True
+                out["error"] = (("the fetched remote ledger could not be judged" if unjudged else
+                                 "the remote's ledger was refused as tampered") +
+                                "; showing the last copy this clone accepted (the detail is in the terminal running "
+                                "the view)")
+            elif detail:
                 _log(f"fetch from {remote!r} failed: {detail!r}")
-                # A refused tip (judged tampered) stays in quarantine and the panes keep the last accepted one; that
-                # is said plainly. Any other failure gets a fixed sentence: git's words stay in the terminal.
-                out["refused"] = "is refused" in detail
-                out["error"] = ("the remote's ledger was refused as tampered; showing the last copy this clone "
-                                "accepted (the detail is in the terminal running the view)" if out["refused"] else
-                                "the last fetch from the remote failed (the detail is in the terminal running the view)")
+                out["error"] = "the last fetch from the remote failed (the detail is in the terminal running the view)"
         except Exception as exc:  # noqa: BLE001 - the fetch's own state is unreadable: the page says so and draws
             _log(f"fetch state unavailable: {exc!r}")
             out["error"] = "could not fetch from the remote (the detail is in the terminal running the view)"
@@ -637,6 +662,14 @@ def _read_or_none(path: str | None) -> bytes | None:
             return fh.read()
     except OSError:
         return None
+
+
+def _epoch(ts: object) -> float | None:
+    try:
+        v = float(ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
 
 
 def _iso(ts: object) -> str | None:

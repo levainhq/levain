@@ -647,6 +647,9 @@ class _RemoteStub(_Stub):
     def remote_ref(self):
         return None                     # no accepted remote tip: the panes come from this clone's copy
 
+    def incoming_refusal(self):
+        return []
+
     def state(self):
         if isinstance(self._state, Exception):
             raise self._state
@@ -798,6 +801,9 @@ def test_a_huge_fetch_interval_neither_stops_the_view_nor_breaks_a_page():
         def fetch_only(self, *, interval, timeout):
             self.asked = interval
 
+        def incoming_refusal(self):
+            return []
+
         def state(self):
             return {}
     stub = Huge()
@@ -863,3 +869,53 @@ def test_the_integrity_count_is_recomputed_when_the_history_it_saw_grows(tmp_pat
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_fetch_another_sync_is_running_is_said_as_that_not_as_a_failure():
+    # complement, L3 10-07: fetch_only answered a collision with the network lock exactly like success, so "fetch
+    # now" looked done while nothing was fetched. It now says "busy:", and the page says so without alarm.
+    httpd = _serve(_RemoteStub(note="busy: another sync is running"))
+    try:
+        page = _req(httpd.server_address[1], "GET", "/?fetch=1")[1].decode()
+        assert "another sync is fetching now" in page and "fetch-error" not in page
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_quarantine_that_cannot_be_judged_is_shown_as_a_refusal_not_a_503(capfd):
+    from levain.team.transport import LedgerReadError
+
+    class Unjudged(_RemoteStub):
+        def incoming_refusal(self):
+            raise LedgerReadError("the fetched remote ledger could not be judged (boom)")
+    httpd = _serve(Unjudged())
+    try:
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 200 and b"the fetched remote ledger could not be judged" in body and b"boom" not in body
+        assert "boom" in capfd.readouterr().err
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_view):
+    # codex, L3 10-07: a refusal recorded by another command's fetch (a CLI sync) never reached the page, which
+    # inferred refusal from the last error string. The page now reads the quarantine itself.
+    from levain.cli import main as levain_main
+    from levain.team.transport import GitLedger, Repo
+    ana, ben, port = two_clone_view
+    assert levain_main(["team", "record", "decision", "--kind", "ruling", "--owner", "ben", "--paths", "tax/**",
+                        "--words", "VAT rounds half-even.", "--repo", str(ben)]) == 0
+    _m, words = _words(port, "/view.json?fetch=1")
+    assert words == ["VAT rounds half-even."]                          # accepted
+    wt = GitLedger(Repo.discover(ben)).wt
+    (wt / "ledger" / "notes.txt").write_text("a file levain never writes\n")
+    _git("add", "-A", cwd=wt)
+    _git("commit", "-qm", "tamper", cwd=wt)
+    _git("push", "-q", "origin", "levain-ledger", cwd=wt)
+    levain_main(["team", "sync", "--repo", str(ana)])                   # another command fetches the tampered tip
+    m, words = _words(port, "/view.json")                              # no fetch from the view in this interval
+    assert m["fetch"]["refused"] is True and words == ["VAT rounds half-even."]   # the last accepted copy
+    page = _req(port, "GET", "/")[1].decode()
+    assert "refused as tampered" in page and "remote, as last accepted" in page and "notes.txt" not in page
