@@ -1,12 +1,10 @@
 // levain dashboard_chat.js — the cockpit's chat panel: talk to a registered entity from the browser.
 //
-// Present only when the server was started with `--chat` (GET /chat.json answers 403 chat_token or 200; a
-// plain cockpit answers 404 and nothing is added). Every /chat route needs the per-launch token the server
-// printed at start. `levain serve --chat` opens the page with the token in the URL FRAGMENT (#chat_token=..., which
-// a browser never sends to a server, so it reaches no log and no Referer); the page reads it, keeps it in this tab's
-// sessionStorage, and strips it from the address bar at once. The printed token typed into the password field is
-// the fallback (a headless box, a second browser, a platform where it is not opened for you). It is never put in a cookie,
-// storage that outlives the browser session, or a request URL; a duplicated or restored tab keeps its sessionStorage, as browsers do.
+// Present only when the server was started with `--chat` (GET /chat.json answers 200; a plain cockpit answers 404 and
+// nothing is added). Like every route but the page shell, the /chat routes need the launch token the server printed at
+// start. token.js holds it (the URL fragment, this tab's session storage, the unlock form); this file only sends it and,
+// on a refusal, hands the page back to that one unlock form. A refusal before the token is entered adds no panel: the
+// probe re-runs on the unlock.
 //
 // ⛔ CONSENT SURFACE. A turn that halts on a gated action reports it as `pending`; nothing here may approve
 // it on the operator's behalf. The one POST to /chat/approve lives inside the Approve button's click handler
@@ -21,8 +19,7 @@
 
   const POLL_MS = 1500;
   const POLL_FAILS_MAX = 5;
-  const TOKEN_KEY = "levain.chat_token";
-  let token = takeToken();   // the chat token: this variable, and this tab's sessionStorage
+  const auth = window.LevainToken;   // token.js, loaded first; without it every request goes untokened and is refused
   let session = null;        // {id, entity} once a session is open
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
@@ -37,23 +34,25 @@
   }
   function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
 
-  // One fetch wrapper: JSON in, {status, json} out; a network failure is a status of 0, never a thrown error.
+  // One fetch wrapper: JSON in, {status, json, sent} out (`sent`: the launch token the request carried); a network
+  // failure is a status of 0, never a thrown error.
   function api(method, path, payload) {
+    const sent = auth ? auth.get() : null;
     const headers = { Accept: "application/json" };
-    if (token) headers["X-Levain-Chat-Token"] = token;
+    if (auth) auth.headers(headers);
     const init = { method: method, headers: headers, cache: "no-store" };
     if (payload !== undefined) { headers["Content-Type"] = "application/json"; init.body = JSON.stringify(payload); }
     return fetch(path, init)
-      .then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j || {} })))
-      .catch(() => ({ status: 0, json: {} }));
+      .then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j || {}, sent: sent })))
+      .catch(() => ({ status: 0, json: {}, sent: sent }));
   }
-  function isTokenRefusal(r) { return r.status === 403 && r.json && r.json.error === "chat_token"; }
+  function isTokenRefusal(r) { return r.status === 403 && r.json && r.json.error === "launch_token"; }
   // A token refusal is a JSON body like any other: it cannot prove the request it answered did not run (a proxy can
   // send it after forwarding). So after the page has sent a request that changes something (open, turn, decision,
   // close), or while it follows one, the refusal never reads as "refused": the page drops the session (nothing more
   // can be decided from it) and says the outcome is unknown.
   const TOKEN_LOST_MID_REQUEST = "The token was not accepted, so this page has let go of the session. The outcome " +
-    "of the last request is unknown; it may already have run. Enter the token again.";
+    "of the last request is unknown; it may already have run. Enter the token again at the top of the page.";
   function why(r) {
     if (r.status === 0) return "could not reach the server";
     return (r.json && (r.json.message || r.json.error)) || ("status " + r.status);
@@ -73,57 +72,26 @@
   }
   function note(cls, text) { const p = el("p", cls, text); body.appendChild(p); return p; }
 
-  // ---- the token ---------------------------------------------------------------------------------------------
-  // The fragment the server opened the page with wins; otherwise what this tab kept. Storage can be absent or throw
-  // (a private window, blocked site data), so every access is guarded and the prompt is the fallback.
-  // Any #chat_token= fragment is removed from the address bar, well-formed or not, and a token is used only once
-  // that removal succeeded: a token still showing in the address bar is not taken (the prompt asks instead).
-  function takeToken() {
-    let t = null;
-    try {
-      const m = /^#chat_token=(.*)$/.exec(location.hash);
-      if (m) {
-        history.replaceState(null, "", location.pathname + location.search);
-        if (/^[A-Za-z0-9_-]+$/.test(m[1])) t = m[1];
-      }
-    } catch (e) { t = null; /* no location or history, or the strip failed: the prompt still works */ }
-    if (t) { keepToken(t); return t; }
-    try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch (e) { return null; }
+  // ---- a refused token ---------------------------------------------------------------------------------------
+  // Whatever token led here is not used again: the session is let go (nothing more can be decided from it), the
+  // panel says why when there is something to say, and token.js shows the one unlock form. `r` is the refused answer.
+  function showTokenPrompt(message, r) {
+    session = null; run++; deciding = false;
+    if (message) { ensurePanel(); clear(body); note("chat-err", message); }
+    else if (panel) { panel.remove(); panel = null; }
+    if (auth) auth.lock(null, r ? r.sent : undefined);
   }
-  function keepToken(t) { try { sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* held in memory only */ } }
-  function dropToken() { token = null; try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* nothing kept */ } }
-
-  // ---- token prompt ----------------------------------------------------------------------------------------
-  function showTokenPrompt(message) {
-    session = null; run++; deciding = false; dropToken();   // whatever token led here is not used again
-    ensurePanel(); clear(body);
-    note("chat-note", "This cockpit serves chat. Enter the token the server printed when it started.");
-    if (message) note("chat-err", message);
-    const form = el("form", "chat-row");
-    const input = el("input", "chat-input");
-    input.type = "password"; input.autocomplete = "off"; input.spellcheck = false;
-    input.setAttribute("aria-label", "chat token");
-    const go = el("button", "chat-btn", "Unlock");
-    go.type = "submit";
-    form.appendChild(input); form.appendChild(go);
-    form.addEventListener("submit", (ev) => {
-      ev.preventDefault();
-      const t = input.value.trim();
-      if (!t) return;
-      token = t; keepToken(t); input.value = "";
-      go.disabled = true;
-      loadListing(true);
-    });
-    body.appendChild(form);
-  }
+  if (auth) auth.onUnlock(() => loadListing(true));
 
   // ---- entity picker -----------------------------------------------------------------------------------------
   function loadListing(afterToken) {
     api("GET", "/chat.json").then((r) => {
       if (r.status === 404) { if (panel) { panel.remove(); panel = null; } return; }  // not a chat cockpit (or gone)
       if (isTokenRefusal(r)) {
-        dropToken();
-        showTokenPrompt(afterToken ? "That token was not accepted." : null);
+        // Before a session there is nothing to let go of: no panel, just the unlock form (and a word if the token
+        // just entered was the one refused).
+        showTokenPrompt(null, r);
+        if (afterToken && auth && !auth.get()) auth.lock("That token was not accepted.");
         return;
       }
       if (r.status !== 200 || !Array.isArray(r.json.entities)) {
@@ -165,7 +133,7 @@
       if (myRun !== run) return;
       api("GET", "/chat/job.json?id=" + encodeURIComponent(jobId)).then((r) => {
         if (myRun !== run) return;
-        if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+        if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
         if (r.status !== 200) {
           fails += 1;
           if (fails >= POLL_FAILS_MAX) { onEnd({ status: "lost", error: "lost contact with the server: " + why(r) }); return; }
@@ -188,7 +156,7 @@
   // ---- open ---------------------------------------------------------------------------------------------------
   function openSession(entity) {
     api("POST", "/chat/open", { entity: entity }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.session_id) {
         clear(body); note("chat-err", "Could not open a session: " + why(r));
         const back = el("button", "chat-btn", "Back"); back.type = "button";
@@ -282,7 +250,7 @@
     const myRun = run;
     api("POST", "/chat/turn", { session_id: session.id, message: text }).then((r) => {
       if (myRun !== run) return;
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // No response from this page can prove who wrote it (a proxy can answer a JSON 4xx/503 after forwarding the
         // request), so anything but a 202 with a job may have started the turn.
@@ -465,7 +433,7 @@
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
       if (myRun !== run) return;
       live.textContent = "";
-      if (isTokenRefusal(r)) { showTokenPrompt(restartedText()); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(restartedText(), r); return; }
       const s = r.json || {};
       if (r.status === 404 && s.error === "unknown_session") {
         failure(goneText());
@@ -554,7 +522,7 @@
       endOfTurn(!!res.gated);
     }
     function after(r) {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn. No response this page receives can prove who wrote
         // it (a proxy can answer a JSON 4xx/503 after forwarding the request), so anything but a 202 with a job,
@@ -632,7 +600,7 @@
     if (!session) return;
     closeBtn.disabled = true;
     api("POST", "/chat/close", { session_id: session.id }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 200) {   // e.g. 409 while a turn is still running: say so, keep the session
         closeBtn.disabled = false;
         live.textContent = "Could not close yet: " + why(r);
@@ -642,6 +610,6 @@
     });
   }
 
-  // Probe once at load. 404 leaves the page untouched; 403 chat_token opens the token prompt.
+  // Probe once at load. 404 leaves the page untouched; a launch_token 403 waits for the unlock and probes again.
   loadListing(false);
 })();

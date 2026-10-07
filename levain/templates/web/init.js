@@ -313,14 +313,19 @@
     submitBtn.disabled = true;
     setNote("installing…", false);
     try {
+      var sent = auth ? auth.get() : null;
       var res = await fetch("/init", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: tokenHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ adapter: adapter, answers: collectAnswers() }),
       });
       var data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
-      if (res.ok) {
+      if (auth && auth.isRefusal(res.status, data)) {
+        // Refused before the body was read: nothing was installed, and the answers are still in the form.
+        auth.lock(sent ? "That token was not accepted." : null, sent);
+        setNote("locked: enter the token at the top of the page, then Install again", true);
+      } else if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);
       } else {
@@ -340,16 +345,33 @@
     submitNote.className = "submit-note" + (bad ? " bad" : "");
   }
 
+  // ---- the launch token (token.js, loaded first) ----
+  var auth = window.LevainToken;
+  function tokenHeaders(h) { return auth ? auth.headers(h) : h; }
+
   // ---- load ----
+  var loaded = false;
   async function load() {
+    if (loaded) return;
     try {
-      var res = await fetch("/init-plan.json", { cache: "no-store" });
+      var sent = auth ? auth.get() : null;
+      var res = await fetch("/init-plan.json", { cache: "no-store", headers: tokenHeaders({}) });
+      if (res.status === 403 && auth) {
+        var refused = {};
+        try { refused = await res.json(); } catch (_) { /* a plain-text 403 is not the token's */ }
+        if (auth.isRefusal(res.status, refused)) {
+          auth.lock(sent ? "That token was not accepted." : null, sent);
+          statusEl.textContent = "locked: enter the token the server printed when it started";
+          return;
+        }
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       plan = await res.json();
       if (plan.errors) throw new Error(plan.errors.server || "plan error");
       renderBanner(plan);
       renderAdapters(plan);
       renderSections(plan);
+      loaded = true;
       submitBtn.disabled = false;
       statusEl.textContent = plan.fields.length + " fields · fill what you know, submit when ready";
     } catch (e) {
@@ -358,5 +380,6 @@
   }
 
   formEl.addEventListener("submit", submit);
+  if (auth) auth.onUnlock(load);
   load();
 })();

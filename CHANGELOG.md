@@ -4,6 +4,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Security
+
+- **Every Levain web page now needs a per-launch token, not only chat.** `levain serve` answered `GET /substrate.json` (the whole substrate, seed included), `/recall.json`, `/job.json` and `/team_views.json` to any process that could reach 127.0.0.1, and the rule that allowed it ("anything that can reach loopback can already edit your files") is false for three callers: another OS user on the machine, a container reaching host loopback (`host.docker.internal`), and a sandboxed app with a network entitlement. Each server (`levain serve`, `levain init --web` and `levain docs`) now generates a token when it starts, holds it only in memory, and prints it once with an unlocked link (`open it unlocked: http://127.0.0.1:7420/#token=...`); on macOS the browser opens on that link. Every request needs it in the `X-Levain-Token` header except the page itself and its scripts and stylesheet, which carry no operator data. A request without it gets a 403 with `{"error": "launch_token"}`, and a path that does not exist gets the same 403, not a 404. A POST is refused before its body is read. On your own laptop nothing changes: the page opens unlocked and keeps the token for that tab. A page opened without it shows one unlock form at the top; paste the printed token there.
+- `levain init --web` needs it because `POST /init` runs an install, and `levain docs` because an installed pack's chapters are your own material.
+- **For scripts:** send the printed token as `X-Levain-Token`. `X-Levain-Chat-Token`, the header the chat routes took before, is still accepted. The token changes on every start. The `levain daemon` cockpit prints it to its log (`~/Library/Logs/com.levainhq.levain.log` by default).
+- **For code that calls `make_server` directly:** the new `launch_token=` parameter turns the gate on; a `chat_host` turns it on with a fresh token. Without either, the server is ungated as before, so a downstream that runs its own auth (the off-box write token, for example) is unchanged. `chat_token=` still works as the older name, and an empty token is refused.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.

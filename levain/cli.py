@@ -585,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
             "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
-            "the same governed seam `levain tui` uses, under localhost-sovereign auth). "
+            "the same governed seam `levain tui` uses). Every launch prints a token and a "
+            "link that opens the page unlocked; every request but the page shell needs it. "
             "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
             "is the parked alternative."
         ),
@@ -623,8 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
             "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
-            "edits through the governed write seam. Loopback-sovereign (the localhost "
-            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "edits through the governed write seam. Behind the launch token, the localhost "
+            "bind and the Host/CSRF guards, and loopback-ONLY — there "
             "is no off-box writable serve (an install's seed/config is operator-private). "
             "Default is read-only."
         ),

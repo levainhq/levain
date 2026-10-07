@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 JS = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_chat.js"
+TOKEN_JS = JS.with_name("token.js")
 
 
 def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
@@ -58,17 +59,22 @@ def test_approve_has_one_call_site_in_a_trusted_click_handler():
 
 def test_no_innerhtml_and_the_token_is_kept_only_in_this_tabs_session_storage():
     # 0.6.8 (t), Phill 2026-10-05 "yes, add the token UX after (a)": the token arrives in the URL fragment and is
-    # kept in sessionStorage (per tab, gone with it); never localStorage, a cookie or a query string.
-    src = JS.read_text()
-    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "document.cookie",
-                   "searchParams", "URLSearchParams"):
-        assert banned not in src
-    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(TOKEN_KEY[^)]*\)", src)} == {
-        "sessionStorage.getItem(TOKEN_KEY)", "sessionStorage.setItem(TOKEN_KEY, t)", "sessionStorage.removeItem(TOKEN_KEY)"}
-    assert src.count("sessionStorage.") == 3   # those three calls and no other use
+    # kept in sessionStorage (per tab, gone with it); never localStorage, a cookie or a query string. Since
+    # np-ebb8a399 one launch token covers every route and token.js holds it for every page; the chat panel only
+    # sends it.
+    chat, tok = JS.read_text(), TOKEN_JS.read_text()
+    for src in (chat, tok):
+        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "document.cookie",
+                       "searchParams", "URLSearchParams"):
+            assert banned not in src
+    for touch in ("sessionStorage", "location.hash", "history."):
+        assert touch not in chat
+    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(KEY[^)]*\)", tok)} == {
+        "sessionStorage.getItem(KEY)", "sessionStorage.setItem(KEY, t)", "sessionStorage.removeItem(KEY)"}
+    assert tok.count("sessionStorage.") == 3   # those three calls and no other use
     # the fragment is read in one place, and the address bar is rewritten without it there
-    assert src.count("location.hash") == 1 and src.count("location.search") == 1
-    assert 'history.replaceState(null, "", location.pathname + location.search)' in src
+    assert tok.count("location.hash") == 1 and tok.count("location.search") == 1
+    assert 'history.replaceState(null, "", location.pathname + location.search)' in tok
 
 
 HARNESS = r"""
@@ -93,7 +99,7 @@ const find = (n, pred) => { if (pred(n)) return n; for (const c of n.children) {
 const byText = (root, text) => find(root, (n) => n.tagName === "button" && n._text === text);
 const body = new N("body"), bar = new N("nav"), board = new N("div");
 body.appendChild(bar); body.appendChild(board);
-const document = { createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
+const document = { body: body, createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
   getElementById: (i) => (i === "board" ? board : null) };
 let sessionReads = 0, jobReads = 0;
 const TOKEN = "tok-123";
@@ -105,15 +111,15 @@ const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
-  calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Chat-Token"], body: init.body });
-  if (hdr["X-Levain-Chat-Token"] !== TOKEN) return reply(403, { error: "chat_token", message: "needs token" });
+  calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Token"], body: init.body });
+  if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
-  if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "chat_token", message: "needs token" });
-  if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "chat_token", message: "needs token" });
-  if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "chat_token", message: "needs token" });
+  if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "launch_token", message: "needs token" });
+  if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn") && (process.argv[3] === "leak" || process.argv[3] === "prose"))
@@ -168,57 +174,69 @@ const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.dele
 // The browser objects the token code touches, per mode. Absent by default: the prompt path must work without them.
 const MODE = process.argv[3], store = new Map(), replaced = [];
 const extra = {};
-if (["fragment", "stored", "storagethrows", "badfragment", "malformedfragment", "replacethrows"].includes(MODE)) {
-  extra.location = { hash: { fragment: "#chat_token=" + TOKEN, storagethrows: "#chat_token=" + TOKEN, badfragment: "#chat_token=nope",
-    malformedfragment: "#chat_token=" + TOKEN + "=&x", replacethrows: "#chat_token=" + TOKEN, stored: "" }[MODE], pathname: "/", search: "" };
+if (["fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "malformedfragment", "replacethrows"].includes(MODE)) {
+  extra.location = { hash: { fragment: "#token=" + TOKEN, legacyfragment: "#chat_token=" + TOKEN, storagethrows: "#token=" + TOKEN,
+    badfragment: "#token=nope", malformedfragment: "#token=" + TOKEN + "=&x", replacethrows: "#token=" + TOKEN, stored: "" }[MODE],
+    pathname: "/", search: "" };
   extra.history = { replaceState: (s, t, u) => { if (MODE === "replacethrows") throw new Error("SecurityError"); replaced.push(u); extra.location.hash = ""; } };
   extra.sessionStorage = MODE === "storagethrows"
     ? { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } }
     : { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
-  if (MODE === "stored") store.set("levain.chat_token", TOKEN);
+  if (MODE === "stored") store.set("levain.token", TOKEN);
 }
 const ctx = vm.createContext({ ...extra, document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
   setTimeout: (f, ms) => { if (ms >= 2000) { const i = ++tid; longTimers.set(i, f); return i; } setImmediate(f); return 0; },
   clearTimeout: (i) => { longTimers.delete(i); } });
+ctx.window = ctx;   // token.js publishes window.LevainToken; the chat panel reads it
 // Approve opens the confirm row; Run them confirms.
 const runThem = () => find(body, (n) => n.tagName === "button" && n._text === "Run them");
 const approveTwice = async (b) => { b.fire("click", { isTrusted: true }); await sleep(20); const r = runThem(); if (r) r.fire("click", { isTrusted: true }); };
 const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
+const lockForm = () => find(body, (n) => n.className === "levain-lock");
+const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 (async () => {
+  vm.runInContext(fs.readFileSync(process.argv[4], "utf8"), ctx);   // token.js, loaded first as on the page
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   await sleep(30);
-  const panel = find(body, (n) => n.className === "panel chat-panel");
-  ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
-  if (["fragment", "stored", "storagethrows"].includes(MODE)) {
+  if (["fragment", "legacyfragment", "stored", "storagethrows"].includes(MODE)) {
     // 0.6.8 (t): the link the server opens carries the token in its fragment; the page unlocks with no prompt
-    ok(!find(panel, (n) => n.tagName === "input" && n.type === "password"), "no token prompt");
+    const panel = chatPanel();
+    ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
+    ok(!lockForm(), "no token prompt");
     ok(calls[0].token === TOKEN, "the first request already carries the token");
     if (MODE !== "stored") ok(replaced.length === 1 && replaced[0] === "/" && extra.location.hash === "", "the fragment is stripped from the address bar");
-    if (MODE === "fragment") ok(store.get("levain.chat_token") === TOKEN, "kept in this tab's sessionStorage");
+    if (MODE === "fragment" || MODE === "legacyfragment") ok(store.get("levain.token") === TOKEN, "kept in this tab's sessionStorage");
     byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
     ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
     ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
     console.log("PASS"); return;
   }
+  // Without a usable token the chat panel adds nothing: the page's one unlock form (token.js) asks.
+  ok(!chatPanel(), "no chat panel before the token is entered");
+  ok(lockForm() && body.children.indexOf(lockForm()) === 0, "the unlock form sits at the top of the page");
   if (MODE === "malformedfragment" || MODE === "replacethrows") {
     // L3 r1: a malformed token fragment is still stripped; a token whose strip failed is never used or kept
-    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "the prompt asks");
-    ok(!store.has("levain.chat_token") && calls.every((c) => c.token !== TOKEN), "nothing kept, nothing sent with it");
+    ok(find(lockForm(), (n) => n.tagName === "input" && n.type === "password"), "the prompt asks");
+    ok(!store.has("levain.token") && calls.every((c) => c.token !== TOKEN), "nothing kept, nothing sent with it");
     ok(MODE === "replacethrows" || (replaced.length === 1 && extra.location.hash === ""), "a malformed fragment is still removed");
     console.log("PASS"); return;
   }
   if (MODE === "badfragment") {
-    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "a refused fragment token falls back to the prompt");
-    ok(!store.has("levain.chat_token") && replaced.length === 1, "and is stripped and not kept");
+    ok(find(lockForm(), (n) => n.tagName === "input" && n.type === "password"), "a refused fragment token falls back to the prompt");
+    ok(!store.has("levain.token") && replaced.length === 1, "and is stripped and not kept");
     console.log("PASS"); return;
   }
-  const pw = find(panel, (n) => n.tagName === "input");
+  const pw = find(lockForm(), (n) => n.tagName === "input");
   ok(pw.type === "password", "token field is a password input");
   // wrong token first
-  pw.value = "nope"; find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
-  ok(panel.textContent.includes("not accepted"), "wrong token is reported");
-  const pw2 = find(panel, (n) => n.tagName === "input"); pw2.value = TOKEN;
-  find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
+  pw.value = "nope"; lockForm().fire("submit", {}); await sleep(30);
+  ok(lockForm() && lockForm().textContent.includes("not accepted"), "wrong token is reported");
+  ok(!chatPanel(), "and still no panel");
+  const pw2 = find(lockForm(), (n) => n.tagName === "input"); pw2.value = TOKEN;
+  lockForm().fire("submit", {}); await sleep(30);
+  ok(!lockForm(), "the right token removes the form");
+  const panel = chatPanel();
+  ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
   if (MODE === "twoentities") {
     ok(find(panel, (n) => n.tagName === "select") && byText(panel, "Start session"), "with a choice to make, the picker shows");
     console.log("PASS"); return;
@@ -443,7 +461,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
-                                  "fragment", "stored", "storagethrows", "badfragment", "twoentities",
+                                  "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities",
                                   "leakafterapprove", "leaklastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
@@ -454,7 +472,7 @@ def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # nothing about who wrote it, so it is ambiguous like any other non-202; the session is read only on a re-read click
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)
-    p = subprocess.run(["node", str(h), str(JS), mode], capture_output=True, text=True, timeout=60)
+    p = subprocess.run(["node", str(h), str(JS), mode, str(TOKEN_JS)], capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
 
 

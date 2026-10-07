@@ -8,23 +8,37 @@ on a write. The copies drifted: a fix that moved the security headers into ``end
 stdlib's own error responses carry them too) reached two of the three, and ``levain serve`` answered
 an OPTIONS or PUT with a 501 that had no CSP, no ``nosniff`` and no ``X-Frame-Options`` (spore-1013,
 reproduced 2026-10-03). Every guard now lives here once, in :class:`GuardedHandler`, and each server
-subclasses it. A server keeps only what is its own: its routes, its body limit, and the ORDER in which
-it applies the write checks. (Server-level setup, the allowed-hosts set and ``handle_error``, is still
+subclasses it. The guards that every request meets first (Host, cross-site or write origin, and the launch token)
+run in ``do_GET`` / ``do_HEAD`` / ``do_POST`` here, before a server's own ``_route`` / ``_post`` is reached. A
+server keeps only what is its own: its routes, its body limit, and the ORDER in which it applies the remaining
+write checks. (Server-level setup, the allowed-hosts set and ``handle_error``, is still
 per server; see the routed list in Levain's project notes.)
 
 Stdlib only; nothing here imports another Levain module, so every server can import it.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
 __all__ = [
+    "LAUNCH_TOKEN_HEADER",
     "GuardedHandler",
     "host_header_allowed",
 ]
+
+# The LAUNCH TOKEN (np-ebb8a399, codex HIGH f5d5e483a0c7e3a8). Loopback reachability is not file access: another OS
+# user, a container reaching host loopback (host.docker.internal) and a sandboxed app with a network entitlement can all
+# connect to 127.0.0.1 without being able to read the operator's files. So a server that sets ``launch_token`` on its
+# server instance refuses every request that does not carry it, except the paths it names in ``token_free_paths`` (the
+# page shell, which carries no operator data). The token is generated per launch, held only in the process, and printed
+# once to the terminal that started it. ``X-Levain-Chat-Token`` is the header the chat routes took before the token
+# covered every route; it is still accepted so a script written against it keeps working.
+LAUNCH_TOKEN_HEADER = "X-Levain-Token"
+_LEGACY_TOKEN_HEADERS = ("X-Levain-Chat-Token",)
 
 # A write only ever legitimately originates from our own dashboard page (which sends
 # ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-
@@ -138,6 +152,52 @@ class GuardedHandler(BaseHTTPRequestHandler):
         a hostile page that rebinds its own name to 127.0.0.1 still sends its own Host)."""
         return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
+    def _launch_token_required(self) -> bool:
+        """True iff this server was started with a launch token. A server that never set one is ungated (a
+        downstream ``make_server`` caller that keeps its own auth posture)."""
+        return getattr(self.server, "launch_token", None) is not None
+
+    def _launch_token_valid(self) -> bool:
+        """True iff the request carries this launch's token, in the current header or the legacy chat one.
+        Constant-time compare on bytes; an empty expected or supplied token fails closed."""
+        expected = (getattr(self.server, "launch_token", None) or "").encode("utf-8")
+        if not expected:
+            return False
+        for name in (LAUNCH_TOKEN_HEADER, *_LEGACY_TOKEN_HEADERS):
+            supplied = self.headers.get(name)
+            if supplied and hmac.compare_digest(supplied.encode("utf-8"), expected):
+                return True
+        return False
+
+    def _token_refusal_body(self) -> bytes:
+        return json.dumps({
+            "error": "launch_token",
+            "message": (f"this server needs the token printed when it started, sent as {LAUNCH_TOKEN_HEADER}"),
+        }).encode("utf-8")
+
+    def _refuse_untokened_read(self, *, head: bool) -> bool:
+        """The launch-token gate for a read: every path except the server's ``token_free_paths`` (the page shell)
+        needs the token, including a path that does not exist, so an unauthenticated caller cannot probe the route
+        set. Sends a JSON 403 (``error: launch_token``) and returns True when refused."""
+        if not self._launch_token_required():
+            return False
+        path = self.path.split("?", 1)[0]
+        if path in getattr(self.server, "token_free_paths", frozenset()):
+            return False
+        if self._launch_token_valid():
+            return False
+        self._send(self._token_refusal_body(), "application/json; charset=utf-8", status=403, head=head)
+        return True
+
+    def _refuse_untokened_write(self) -> bool:
+        """The launch-token gate for a POST: no POST path is token-free. Refused before any body read (the
+        connection closes, see :meth:`_reject`). Returns True when refused."""
+        if not self._launch_token_required() or self._launch_token_valid():
+            return False
+        self._reject(403, "launch_token",
+                     f"this server needs the token printed when it started, sent as {LAUNCH_TOKEN_HEADER}")
+        return True
+
     def _cross_site_read(self) -> bool:
         """True for a cross-site browser read. A same-origin fetch sends ``same-origin``, a top-level
         navigation ``none``, and a non-browser client nothing; only a hostile page sends
@@ -235,14 +295,32 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
     # -- routing and logging, the same on every server ------------------------
 
+    # DENY BY DEFAULT. The guards run HERE, before a server's own routing is reached: the Host allowlist, the
+    # cross-site refusal and the launch token for a read; the Host allowlist, the write-origin check and the launch
+    # token for a POST. A server defines ``_route`` and ``_post`` and never the ``do_*`` methods, so a route it adds
+    # later is behind every guard without writing one.
+
     def _route(self, *, head: bool) -> None:  # pragma: no cover — every server defines its own
         raise NotImplementedError
 
+    def _post(self) -> None:
+        """A server with no POST route refuses every POST (after the guards, so the answer does not reveal that)."""
+        self._reject(404, "not_found", "no such route")
+
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
+        if self._refuse_read(head=False) or self._refuse_untokened_read(head=False):
+            return
         self._route(head=False)
 
     def do_HEAD(self) -> None:  # noqa: N802 — same routing, headers only (no body)
+        if self._refuse_read(head=True) or self._refuse_untokened_read(head=True):
+            return
         self._route(head=True)
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
+        if self._refuse_write_origin() or self._refuse_untokened_write():
+            return
+        self._post()
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Quiet by default: each server prints its own startup line, and a per-request access log

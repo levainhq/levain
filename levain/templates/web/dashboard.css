@@ -1126,3 +1126,12 @@
 .chat-detail { margin: 4px 0 0; padding: 8px; overflow: visible; white-space: pre-wrap; overflow-wrap: anywhere; background: #0a1110; border: 1px solid var(--line); border-radius: 4px; font: 12px/1.4 var(--mono); color: var(--ink); }
 .chat-reason { margin-top: 4px; color: var(--dim); font: 11px/1.5 var(--mono); overflow-wrap: anywhere; }
 @media (pointer: coarse) { .chat-input { font-size: 16px; } }
+
+/* The launch-token unlock form (token.js): one per page, at the top of <body>, shown only when a request was refused. */
+.levain-lock { position: relative; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em;
+  margin: 0; padding: 0.75em 1em; background: #fff4d6; color: #3a2a00; border-bottom: 1px solid #d9b25c;
+  font: 14px/1.4 system-ui, -apple-system, sans-serif; }
+.levain-lock p { margin: 0; flex: 1 1 100%; }
+.levain-lock-note { color: #8a1c00; }
+.levain-lock input { flex: 1 1 16em; max-width: 28em; padding: 0.35em 0.5em; font: inherit; }
+.levain-lock button { padding: 0.35em 0.9em; font: inherit; cursor: pointer; }

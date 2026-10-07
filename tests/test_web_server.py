@@ -1931,3 +1931,59 @@ class TestOversizeWithALyingContentLength:
             "the body — the drain stranded on the socket timeout and handle_error swallowed it"
         )
         assert b"413" in raw.split(b"\r\n", 1)[0], f"expected a 413 status line, got: {raw[:120]!r}"
+
+
+def test_levain_serve_refuses_its_data_routes_without_the_launch_token(tmp_path):
+    """np-ebb8a399 (codex HIGH f5d5e483a0c7e3a8), reproduced 2026-10-07 on 00b0604: `levain serve` answered
+    GET /substrate.json with 200 and the seed's contents to a caller with no token. Any process that reaches
+    loopback is not the operator: another OS user, a container via host.docker.internal, a sandboxed app. The real
+    command, as a subprocess: the token comes from its stdout, the only place it is published."""
+    import os
+    import re
+    import selectors
+    import subprocess
+    import sys
+    import time
+
+    from anneal_memory import Store
+
+    (tmp_path / "inst" / ".levain").mkdir(parents=True)
+    with Store(tmp_path / "inst" / ".levain" / "memory.db") as store:
+        store.record("a private decision", "decision")
+    def call(url, *, headers=None, data=None):
+        req = urllib.request.Request(url, headers=headers or {}, data=data)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "levain", "serve", "--path", str(tmp_path / "inst"), "--port", "0", "--no-open"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        out, deadline = b"", time.monotonic() + 30
+        while b"open it unlocked" not in out and time.monotonic() < deadline:
+            if sel.select(timeout=0.5):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                out += chunk
+        assert proc.poll() is None, proc.stderr.read().decode()
+        m = re.search(rb"open it unlocked: (http://127\.0\.0\.1:\d+/)#token=([A-Za-z0-9_-]+)", out)
+        assert m, out
+        base, token = m.group(1).decode(), m.group(2).decode()
+        for path in ("substrate.json", "recall.json?keyword=private", "team_views.json", "job.json?id=x"):
+            code, body = call(base + path)
+            assert code == 403 and json.loads(body)["error"] == "launch_token", path
+        code, body = call(base + "substrate.json", headers={"X-Levain-Token": token})
+        assert code == 200 and json.loads(body)["paths"]
+        code, body = call(base + "edit", headers={"Content-Type": "application/json"}, data=b"{}")
+        assert code == 403 and json.loads(body)["error"] == "launch_token"
+        assert call(base)[0] == 200                     # the page shell, so the browser can read the fragment
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)

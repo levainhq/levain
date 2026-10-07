@@ -114,14 +114,36 @@
     });
   }
 
+  // The launch token (token.js, loaded first): sent with the one data read; a refusal shows the unlock form, and the
+  // read runs again once a token is entered.
+  var auth = window.LevainToken;
+  var LOCKED = {};
+  function load() {
+    var sent = auth ? auth.get() : null;
+    var headers = { Accept: "application/json" };
+    if (auth) auth.headers(headers);
+    fetch("/docs.json", { headers: headers })
+      .then(function (r) {
+        if (r.status === 403 && auth) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            if (!auth.isRefusal(r.status, j)) throw new Error("HTTP " + r.status);
+            auth.lock(sent ? "That token was not accepted." : null, sent);
+            return LOCKED;
+          });
+        }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        if (data === LOCKED) { fail("Locked: enter the token the server printed when it started."); return; }
+        render(data);
+      })
+      .catch(function (e) {
+        fail("Could not load the manual: " + (e && e.message ? e.message : e));
+      });
+  }
+
   initNavToggle();
-  fetch("/docs.json", { headers: { Accept: "application/json" } })
-    .then(function (r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    })
-    .then(render)
-    .catch(function (e) {
-      fail("Could not load the manual: " + (e && e.message ? e.message : e));
-    });
+  if (auth) auth.onUnlock(load);
+  load();
 })();

@@ -11,10 +11,11 @@ write-half (``apply_init``), so the questions, order, and writes can't drift.
 LOOPBACK-ONLY by construction. Onboarding writes operator-private seed/config
 and (for the codex adapter) mutates the global ``~/.codex`` — it has no business
 reachable off the machine, so unlike ``levain serve`` there is NO ``--host``
-off-box mode and NO write token: the loopback bind IS the auth. It REUSES the
+off-box mode and NO off-box write token: the loopback bind plus the per-launch token
+(the same launch token ``levain serve`` uses) is the auth. It REUSES the
 web-app's security primitives — the DNS-rebinding Host allowlist
-(``host_header_allowed``), the Sec-Fetch-Site CSRF check, ``application/json``
-enforcement, the CSP, and a concurrency bound — shared rather than
+(``host_header_allowed``), the Sec-Fetch-Site CSRF check, the launch token,
+``application/json`` enforcement, the CSP, and a concurrency bound — shared rather than
 re-implemented so the two surfaces can't diverge on a security contract.
 
 Init precedes install — there is no ``SubstrateSource`` / store yet — so this is
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import secrets
 import sys
 import threading
 from collections.abc import Sequence
@@ -55,7 +57,9 @@ from levain.http_guards import GuardedHandler
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
+    _open_browser,
     load_web_asset,
+    print_launch_token,
 )
 
 __all__ = ["DEFAULT_INIT_HOST", "DEFAULT_INIT_PORT", "make_init_server", "run_init_web"]
@@ -90,6 +94,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/": ("init.html", "text/html; charset=utf-8"),
     "/init.css": ("init.css", "text/css; charset=utf-8"),
     "/init.js": ("init.js", "text/javascript; charset=utf-8"),
+    "/token.js": ("token.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -129,6 +134,9 @@ class _InitServer(ThreadingHTTPServer):
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
     install_lock: threading.Lock
+    # The launch token GuardedHandler enforces on every path but the page shell (``token_free_paths``).
+    launch_token: str | None
+    token_free_paths: frozenset[str]
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family (idle keep-alive resets)
@@ -152,10 +160,7 @@ class _InitHandler(GuardedHandler):
     # ---- reads (GET/HEAD) ----
 
     def _route(self, *, head: bool) -> None:
-        # Host allowlist, then the cross-site read refusal (the shared read preamble).
-        if self._refuse_read(head=head):
-            return
-
+        # GuardedHandler has run the Host allowlist, the cross-site read refusal and the launch token.
         path = self.path.split("?", 1)[0]
 
         if path == "/init-plan.json":
@@ -205,17 +210,14 @@ class _InitHandler(GuardedHandler):
 
     # ---- the write route (POST /init) ----
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
+    def _post(self) -> None:
         """``POST /init`` — run the install from the submitted ``{adapter,
-        answers}``. The cheap fail-closed checks (Host → CSRF → Content-Type →
-        route → Content-Length) run BEFORE any body read and each closes the
+        answers}``. The cheap fail-closed checks (Host → CSRF → launch token, in
+        GuardedHandler.do_POST; then Content-Type → route → Content-Length here) run BEFORE any body read and each closes the
         connection on rejection. The install itself is serialized by
         ``install_lock`` (one install at a time — two into one dir would race) and
         owns its try/except → HTTP + partial-install reporting (no rollback; codex
         installs touch global ~/.codex)."""
-        # Host, then CSRF layer 1 (same-origin or a non-browser client only).
-        if self._refuse_write_origin():
-            return
         # CSRF layer 2: require application/json (a cross-origin page can't send it
         # without a CORS preflight this server never answers).
         if self._refuse_non_json():
@@ -550,6 +552,7 @@ def make_init_server(
     packs: Sequence[Path] = (),
     host: str = DEFAULT_INIT_HOST,
     port: int = DEFAULT_INIT_PORT,
+    launch_token: str | None = None,
 ) -> _InitServer:
     """Build a configured, bound (not-yet-serving) init server.
 
@@ -563,7 +566,9 @@ def make_init_server(
     non-loopback host, an unknown adapter, or a pack set that does not compose
     (validated BEFORE the bind, so a bad pack fails clean with no dangling port —
     the same fail-before-interview discipline ``run_init`` uses); ``OSError`` if
-    the bind fails. Separated from ``run_init_web`` so tests can drive a real
+    the bind fails. Every server runs with a launch token (``launch_token``, else a fresh one): the
+    form posts the operator's seed answers and ``POST /init`` runs an install, so a caller that can
+    reach loopback without being the operator must not read the plan or start an install. Separated from ``run_init_web`` so tests can drive a real
     bound server without the print/browser/serve_forever wrapper."""
     if not _is_loopback_host(host):
         raise ValueError(
@@ -573,6 +578,8 @@ def make_init_server(
         )
     if adapter is not None and adapter not in _ADAPTERS:
         raise ValueError(f"unknown adapter {adapter!r}: must be one of {list(_ADAPTERS)}")
+    if launch_token is not None and not launch_token:
+        raise ValueError("an empty launch token would let every request through; omit it or pass a real one.")
 
     # Resolve + validate the pack set BEFORE binding. `--path` expansion semantics
     # (argparse does not expand `~`), then a full compose (manifests + seed rosters
@@ -622,6 +629,8 @@ def make_init_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {bound.lower()}
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     httpd.install_lock = threading.Lock()
+    httpd.launch_token = launch_token or secrets.token_urlsafe(32)
+    httpd.token_free_paths = frozenset(_ASSETS)
     return httpd
 
 
@@ -687,14 +696,10 @@ def run_init_web(
     if httpd.pack_names:
         print(f"  composing packs: {', '.join(httpd.pack_names)}")
     print("  loopback-only · governed · Ctrl+C to stop")
+    unlocked = print_launch_token(url, httpd.launch_token)
 
     if open_browser:
-        import webbrowser
-
-        try:
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-            pass
+        _open_browser(url, unlocked)
 
     try:
         httpd.serve_forever()

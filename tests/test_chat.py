@@ -1375,9 +1375,9 @@ def test_chat_routes_refuse_a_missing_or_wrong_token(tmp_path, token):
     a sandboxed app, another OS user) must not drive an entity or read its sessions."""
     with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
         code, body = _call(f"{base}/chat.json", token=token)
-        assert code == 403 and body["error"] == "chat_token"
+        assert code == 403 and body["error"] == "launch_token"
         code, body = _call(f"{base}/chat/open", {"entity": "x"}, token=token)
-        assert code == 403 and body["error"] == "chat_token"
+        assert code == 403 and body["error"] == "launch_token"
 
 
 def test_a_head_refused_for_its_chat_token_carries_no_body(tmp_path):
@@ -1400,10 +1400,13 @@ def test_a_head_refused_for_its_chat_token_carries_no_body(tmp_path):
         assert body == b""
 
 
-def test_the_chat_token_does_not_gate_the_substrate_routes(tmp_path):
-    """/edit and the reads stay token-free on loopback (principle #6); only /chat takes the factor."""
+def test_the_token_gates_the_substrate_routes_too(tmp_path):
+    """np-ebb8a399: one launch token covers every route but the page shell; the chat routes are no longer the only
+    ones that take it (the no-token rule's premise is false for the same three callers)."""
     with _serving(_source(tmp_path), _host(tmp_path, _Factory([]))) as base:
         code, _ = _call(f"{base}/substrate.json", token=None)
+        assert code == 403
+        code, _ = _call(f"{base}/substrate.json")
         assert code == 200
 
 
@@ -1429,14 +1432,14 @@ def test_serve_publishes_the_chat_token_on_piped_stdout_before_it_blocks(tmp_pat
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ)
         out, deadline = b"", time.monotonic() + 30
-        while b"chat token" not in out and time.monotonic() < deadline:
+        while b"valid until this server stops" not in out and time.monotonic() < deadline:
             if sel.select(timeout=0.5):
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
                     break
                 out += chunk
         assert proc.poll() is None, proc.stderr.read().decode()   # still serving, i.e. blocked
-        line = next((x for x in out.decode().splitlines() if "chat token" in x), None)
+        line = next((x for x in out.decode().splitlines() if "valid until this server stops" in x), None)
         assert line is not None, f"no token line on stdout while serving: {out!r}"
         assert len(line.rsplit(": ", 1)[1].strip()) >= 32
     finally:
@@ -1451,13 +1454,13 @@ def test_each_launch_gets_its_own_token(tmp_path):
         httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0,
                             chat_host=_host(tmp_path, _Factory([])))
         try:
-            tokens.append(httpd.chat_token)
+            tokens.append(httpd.launch_token)
         finally:
             httpd.server_close()
     assert all(t and len(t) >= 32 for t in tokens) and tokens[0] != tokens[1]
     httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0)
     try:
-        assert httpd.chat_token is None            # no chat, no token
+        assert httpd.launch_token is None            # make_server alone: no chat, no token, ungated
     finally:
         httpd.server_close()
 
@@ -1678,7 +1681,7 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
 
     class _Httpd:
         server_address = ("127.0.0.1", 7462)
-        chat_token = "tok_-AZ09"
+        launch_token = "tok_-AZ09"
 
         def serve_forever(self):
             raise KeyboardInterrupt
@@ -1692,22 +1695,24 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
     monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
     assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
     out = capsys.readouterr().out
-    assert calls == [("http://127.0.0.1:7462/", "http://127.0.0.1:7462/#chat_token=tok_-AZ09")]
-    assert "open the cockpit, unlocked: http://127.0.0.1:7462/#chat_token=tok_-AZ09" in out
+    assert calls == [("http://127.0.0.1:7462/", "http://127.0.0.1:7462/#token=tok_-AZ09")]
+    assert "open it unlocked: http://127.0.0.1:7462/#token=tok_-AZ09" in out
     assert "valid until this server stops): tok_-AZ09" in out          # the printed fallback stays
     assert "?" not in calls[0][1]
 
 
-def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
-    import webbrowser
-
+def test_serve_without_chat_still_runs_with_a_launch_token_and_opens_unlocked(tmp_path, monkeypatch, capsys):
+    """np-ebb8a399: the token is no longer a chat feature. A plain `levain serve` asks make_server for a fresh one and
+    publishes it exactly as chat did."""
     import levain.web_server as ws
 
     (tmp_path / "memory.db").write_bytes(b"")
     monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+    asked = {}
 
     class _Httpd:
         server_address = ("127.0.0.1", 7463)
+        launch_token = None
 
         def serve_forever(self):
             raise KeyboardInterrupt
@@ -1715,11 +1720,20 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
         def server_close(self):
             pass
 
-    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
-    opened = []
-    monkeypatch.setattr(webbrowser, "open", opened.append)
+    def fake_make_server(*a, **k):
+        asked.update(k)
+        h = _Httpd()
+        h.launch_token = k.get("launch_token")
+        return h
+
+    monkeypatch.setattr(ws, "make_server", fake_make_server)
+    calls = []
+    monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
     assert ws.run_web_server(tmp_path) == 0
-    assert opened == ["http://127.0.0.1:7463/"] and "chat_token" not in capsys.readouterr().out
+    tok = asked.get("launch_token")
+    assert tok and len(tok) >= 32
+    assert calls == [("http://127.0.0.1:7463/", f"http://127.0.0.1:7463/#token={tok}")]
+    assert f"valid until this server stops): {tok}" in capsys.readouterr().out
 
 
 
