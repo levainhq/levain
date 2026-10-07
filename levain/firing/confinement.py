@@ -743,17 +743,24 @@ BROWSER_PROFILE_DIRS: tuple[tuple[str, str], ...] = (
 
 # The ONLY parts of a profile walked for other names (hardlinks) at shell start, ruled by Phill 2026-10-07 ("levain =
 # (a) please"): a profile is too large, and carries its own hardlinks (WebKit's cache), to walk whole. These are the
-# folders that hold a page's sessionStorage / localStorage, which is where the cockpit's launch token lives, at both
-# profile depths (Chrome <root>/<profile>/, Brave and Arc <root>/<browser>/<profile>/), plus Firefox's per-origin
-# storage and its session store. Cookies, Login Data and the rest of a profile are denied by path only, and
-# Safari's container cannot be walked at all (it refuses a listing).
-_BROWSER_STORAGE_GLOBS = (
-    "*/Session Storage", "*/*/Session Storage",                   # Chromium-family sessionStorage
-    "*/Local Storage", "*/*/Local Storage",                       # Chromium-family localStorage
-    "*/*/storage/default", "Profiles/*/storage/default",          # Firefox per-origin storage (localStorage)
-    "*/*/sessionstore.jsonlz4", "Profiles/*/sessionstore.jsonlz4",    # Firefox's session store (sessionStorage)
-    "*/*/sessionstore-backups", "Profiles/*/sessionstore-backups",
+# folders that hold a page's sessionStorage / localStorage, which is where the cockpit's launch token lives, plus
+# Firefox's per-origin storage and its session store. Cookies, Login Data and the rest of a profile are denied by path
+# only, and Safari's container cannot be walked at all (it refuses a listing). Each name is looked for at every
+# profile depth below, relative to a denied root.
+_BROWSER_PROFILE_DEPTHS = (
+    "*",                        # Chrome, Chromium, Edge, Vivaldi, Opera: <root>/<profile>/
+    "*/*",                      # Brave, Arc (<root>/<browser>/<profile>/), Firefox (<root>/Profiles/<profile>/)
+    "*/config/*/*",             # flatpak Chromium-family: .var/app/<id>/config/<browser>/<profile>/
+    "*/config/*/*/*",           # flatpak Brave: .var/app/<id>/config/BraveSoftware/Brave-Browser/<profile>/
+    "*/.mozilla/firefox/*",     # flatpak Firefox: .var/app/<id>/.mozilla/firefox/<profile>/
+    "*/.config/*/*/*",          # snap Brave: snap/brave/<revision>/.config/BraveSoftware/Brave-Browser/<profile>/
 )
+_BROWSER_STORAGE_NAMES = (
+    "Session Storage", "Local Storage",                           # Chromium-family sessionStorage, localStorage
+    "storage/default",                                            # Firefox per-origin storage (localStorage)
+    "sessionstore.jsonlz4", "sessionstore-backups",               # Firefox's session store (sessionStorage)
+)
+_BROWSER_STORAGE_GLOBS = tuple(f"{depth}/{name}" for depth in _BROWSER_PROFILE_DEPTHS for name in _BROWSER_STORAGE_NAMES)
 
 
 def _linux_config_homes(home: Path) -> list[Path]:

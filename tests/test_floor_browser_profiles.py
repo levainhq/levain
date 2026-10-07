@@ -198,3 +198,29 @@ def test_a_confined_shell_starts_with_profiles_present_and_cannot_read_them(home
             assert out.exit_code != 0 and any(m in out.output for m in _REFUSALS), (cmd, out.output)
     assert not (prof / "planted").exists()
     (prof / "Private").chmod(0o700)   # let pytest clean up
+
+
+@pytest.mark.parametrize("store", [
+    ".var/app/com.google.Chrome/config/google-chrome/Default/Session Storage",          # flatpak Chrome
+    ".var/app/org.chromium.Chromium/config/chromium/Default/Local Storage",            # flatpak Chromium
+    ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser/Default/Session Storage",   # flatpak Brave
+    ".var/app/org.mozilla.firefox/.mozilla/firefox/x.default/storage/default",         # flatpak Firefox
+    "snap/brave/current/.config/BraveSoftware/Brave-Browser/Default/Session Storage",  # snap Brave
+])
+def test_on_linux_a_hardlink_to_a_containerised_browsers_page_storage_refuses_bash(home: Path, monkeypatch,
+                                                                                   store) -> None:
+    """L1d: flatpak and snap keep a browser's profile several levels under the denied root, deeper than the plain
+    storage globs reach, so their page storage is walked by its own patterns."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    d = home / store
+    d.mkdir(parents=True)
+    (d / "000003.log").write_text("levain.token")
+    entity = _entity(home)
+    (entity / "workspace" / "alias.log").hardlink_to(d / "000003.log")
+    with pytest.raises(ConfinementError, match="names on disk"):
+        _refuse_multiply_linked_jewels(build_policy(entity))
