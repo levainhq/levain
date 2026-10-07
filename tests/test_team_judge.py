@@ -449,3 +449,19 @@ def test_a_team_toml_that_is_not_utf8_is_a_team_error_not_a_crash(two):
     git("commit", "-qm", "not utf-8", cwd=ga.wt)
     with pytest.raises(TeamError, match="not valid UTF-8"):
         ga.update_team(lambda t: None, "x", push=False)
+
+
+def test_read_plain_closes_its_descriptor_when_fdopen_fails(two, monkeypatch):
+    # E review (gemini LOW c), RUN: 20 failed reads leaked 20 descriptors.
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    before = len(os.listdir("/dev/fd"))
+
+    def boom(*a, **k):
+        raise ValueError("injected")
+    monkeypatch.setattr(os, "fdopen", boom)
+    for _ in range(20):
+        with pytest.raises(ValueError):
+            ga._read_plain("team.toml")
+    monkeypatch.undo()
+    assert len(os.listdir("/dev/fd")) - before <= 1

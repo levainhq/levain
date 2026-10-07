@@ -1334,7 +1334,12 @@ class GitLedger:
         except OSError as exc:
             raise TeamError(f"{name} in the team worktree cannot be read as a regular file ({exc.strerror}); a link "
                             f"or other entry was committed to the ledger branch, and levain will not follow it") from exc
-        with os.fdopen(fd, "rb") as fh:
+        try:
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)                                 # fdopen did not take the descriptor: close it here
+            raise
+        with fh:
             if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                 raise TeamError(f"{name} in the team worktree is not a regular file (a link or other entry was "
                                 f"committed to the ledger branch); levain will not read or write through it")
