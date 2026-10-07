@@ -1,4 +1,9 @@
-"""levain.autonomic.pending — the persisted pending-action queue (the confirm-map's durable record).
+"""levain.autonomic.pending — the pending action (the sealed record a person is asked about) and
+the store for MANUAL pendings.
+
+For a journaled binding run, the sealed :class:`PendingAction` is written INTO the run's hold in the
+run journal, which is then its only durable home (``levain.autonomic.journal``); the store below is not
+used for it. What follows describes the store, which holds manual (unjournaled) pendings.
 
 A confirm-class posture (cooling-off / confirm / confirm-elevated) does NOT fire at the gate; it
 PROPOSES (surfaces via the :class:`~levain.autonomic.transport.ConfirmTransport`) and persists a
@@ -187,10 +192,9 @@ class PendingAction:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "PendingAction":
-        """Reconstruct from a stored record. Raises ``KeyError``/``TypeError``/``ValueError`` on a
-        malformed record (the store's read CATCHES all three + skips it loudly — one bad line never
-        breaks the queue; L3 codex LOW: a non-dict ``authority`` made ``dict(...)`` raise ``ValueError``,
-        which the read sites didn't catch, blocking the whole sweep).
+        """Reconstruct from a stored record. Raises ``KeyError``/``TypeError`` on a malformed record (the
+        store's reads catch both + skip it loudly — one bad line never breaks the queue; a non-dict
+        ``authority`` is a ``TypeError`` from ``_authority_dict``, never ``dict(...)``'s ``ValueError``).
 
         ``fail_open`` / ``requires_typed`` are parsed STRICTLY (L1-HIGH-3): the pending file is
         editable, untrusted durable input, and ``bool("false")`` is truthy — a coerced bool would

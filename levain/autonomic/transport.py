@@ -17,7 +17,8 @@ instead of after. So this seam is deliberately NARROW + ASYNC:
     surface reached the operator. It does NOT block for the reply and it does NOT return the verdict.
   - the verdict returns OUT-OF-BAND: the operator's approve/deny (or a timeout) re-enters the gate
     via ``EfferentGate.resolve(pending_id, ConfirmDecision)``. The durable record that survives the
-    gap is the persisted :class:`~levain.autonomic.pending.PendingAction` (keyed by ``pending_id``).
+    gap is the sealed :class:`~levain.autonomic.pending.PendingAction` (keyed by ``pending_id``): inside
+    its run's hold in the run journal for a binding run, in the pending store for a manual action.
 
 Why async, not a blocking ``confirm() -> decision``: the reply arrives out-of-band (a phone tap,
 possibly much later) and routes back by name through the proven push/reply channel — the same

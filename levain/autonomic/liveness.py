@@ -47,12 +47,15 @@ def _journal_liveness(store: BindingStore) -> dict[str, Any] | None:
     try:
         holds = journal.open_holds()
         poisoned = journal.poisoned()
+        approved_unrun = journal.approved_unrun()
     except Exception as e:  # noqa: BLE001 — a liveness read reports, it never raises
-        return {"open_holds": {}, "poisoned": 0, "unreadable": f"{type(e).__name__}: {e}"}
+        return {"open_holds": {}, "poisoned": 0, "approved_unrun": 0,
+                "unreadable": f"{type(e).__name__}: {e}"}
     per_binding: dict[str, int] = {}
     for h in holds:
         per_binding[h["binding_id"]] = per_binding.get(h["binding_id"], 0) + 1
-    return {"open_holds": per_binding, "poisoned": len(poisoned), "unreadable": None}
+    return {"open_holds": per_binding, "poisoned": len(poisoned), "approved_unrun": len(approved_unrun),
+            "unreadable": None}
 
 
 def binding_liveness(store: BindingStore) -> dict[str, Any]:
@@ -67,9 +70,9 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
         not seal to its id, unreadable JSON). Without it a corrupt registry tallies exactly like an empty
         one; a non-``None`` value is a TAMPER/corruption signal and every other count below is zero.
       - ``journal`` — ``None`` without a run journal; else ``{"open_holds": {binding_id: n},
-        "poisoned": n, "unreadable": None | why}``. An open hold stops every undecided effect of its
-        binding, and a poisoned effect needs a person to check the world; neither shows in the counts
-        below, so they are surfaced here.
+        "poisoned": n, "approved_unrun": n, "unreadable": None | why}``. An open hold stops every
+        undecided effect of its binding, a poisoned effect needs a person to check the world, and an
+        approved effect not yet run waits for its run's next delivery; none shows in the counts below.
       - ``total`` / ``by_status`` — record count + lifecycle mix.
       - ``fireable`` — the ``list_active`` count (active + sealed + a sealed kill at confirm-class).
       - ``barred_confirm_no_kill`` — ACTIVE confirm-class records with no SEALED-floor kill (barred by

@@ -114,6 +114,11 @@ __all__ = [
 
 _log = logging.getLogger("levain.autonomic.chainpath")
 
+# Gate refusals of a journaled link's resolve that RECORD NOTHING: the hold is still open, so the chain
+# is still paused at that link (a typed proof or a person may still come).
+_STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_typed_proof",
+                         "binding_generation_unknown", "run_not_admitted"})
+
 
 class MalformedChainStateError(Exception):
     """Raised by :meth:`ChainStateStore.claim_by_pending` when a chain DID own the pending but its
@@ -250,8 +255,10 @@ class ChainOutcome:
     - ``aborted``   — a link was KILLED / REFUSED / DEFERRED (no transport) or a link's EFFECT failed, or
                       a denied resume, or a barred ratification-drift; ``reason`` says which, ``paused_at``
                       names the link it stopped at (when applicable). No further links ran.
-    - ``held``      — (journaled runs) a link did not run because a decision is open on the binding;
-                      ``paused_at`` names it. Not terminal: re-delivering the event resumes the run.
+    - ``held``      — (journaled runs) a link did not run and the chain did not end: a decision is open on
+                      the binding, the link's approval stands but its effect has not run yet, or another
+                      resolver's decision governs it. ``paused_at`` names it. Re-delivering the event
+                      resumes the run.
     ``links`` are the per-link rulings produced in THIS call (the resume segment's rulings on a resume)."""
 
     binding_id: str
@@ -894,7 +901,7 @@ class ChainExecutor:
         journal = self._gate.journal
         hold = journal.find_pending(pending_id) if journal is not None else None
         if hold is not None:
-            if not hold.get("chained"):
+            if not (hold.get("chained") or hold.get("chain") is not None):
                 return None   # a single-link journaled pending: the caller's plain resolve
             return self._resume_journaled(pending_id, hold, decision)
         return self._resume_unjournaled(pending_id, decision)
@@ -912,20 +919,39 @@ class ChainExecutor:
             binding = state.binding_obj()
             completed = state.completed_links()
             bad = None if state.seal_matches() else "integrity:seal_mismatch"
+            # the continuation must be THIS hold's: its own pending id and binding, a sealed binding
+            if bad is None and (state.pending_id != hold.get("hold_id") or state.binding_id != hold.get("binding_id")
+                                or not binding.seal_matches()):
+                bad = "integrity:continuation_not_this_hold"
             bad = bad or state.validate_against_binding(binding)
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             bad, state = f"chain_state_malformed:{type(e).__name__}", None
         if bad is not None:
             # the continuation is unreadable or altered: the link must not fire without its chain
             _log.error("chainpath resume: chain continuation of %s unusable (%s) — rejecting", pending_id, bad)
-            self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
-                                                           reason=f"chain_aborted:{bad}"), chain_owned=True)
-            return ChainOutcome(binding_id=binding_id, state="aborted", links=(),
-                                paused_at=state.paused_at_link if state is not None else None, reason=bad)
+            rejected = self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
+                                                                      reason=f"chain_aborted:{bad}"),
+                                          chain_owned=True)
+            paused_at = state.paused_at_link if state is not None else None
+            if rejected.reason == "journal:already_decided":
+                # another resolver decided first: this chain's end is that decision's, not this one's
+                return ChainOutcome(binding_id=binding_id, state="held", links=(), paused_at=paused_at,
+                                    reason=rejected.reason)
+            return ChainOutcome(binding_id=binding_id, state="aborted", links=(), paused_at=paused_at,
+                                reason=bad)
         assert state is not None
         link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
         if not link_outcome.fired:
+            if link_outcome.refused and link_outcome.reason in _STILL_OPEN:
+                # nothing was decided: the chain is still paused at this link, awaiting a decision
+                return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
+                                    paused_at=state.paused_at_link, pending_id=pending_id,
+                                    chain_id=state.chain_id, reason=link_outcome.reason)
+            if link_outcome.held or link_outcome.reason == "journal:already_decided":
+                # approved but not yet run, or another resolver's decision governs: not this chain's end
+                return ChainOutcome(binding_id=binding.binding_id, state="held", links=tuple(results),
+                                    paused_at=state.paused_at_link, reason=link_outcome.reason)
             return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
                                 paused_at=state.paused_at_link,
                                 reason=link_outcome.reason or "paused_link_not_fired")
@@ -951,7 +977,7 @@ class ChainExecutor:
             return []
         out: list[ChainOutcome] = []
         for h in holds:
-            if not h.get("chained") or not isinstance(h.get("pending"), dict):
+            if not (h.get("chained") or h.get("chain") is not None) or not isinstance(h.get("pending"), dict):
                 continue
             try:
                 decision = self._gate.silence_decision(h, now)
@@ -961,8 +987,8 @@ class ChainExecutor:
             except Exception as e:  # noqa: BLE001 — one bad hold never stops the sweep
                 _log.error("chainpath sweep: hold %s FAILED (%s): %s", h.get("hold_id"), type(e).__name__, e)
                 continue
-            if result is not None:
-                out.append(result)
+            if result is not None and result.reason != "journal:already_decided":
+                out.append(result)   # (a resolver that lost the race to a person changed nothing)
         return out
 
     def _resume_unjournaled(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:

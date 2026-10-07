@@ -83,6 +83,12 @@ def _default_summary(request: ActionRequest) -> str:
     return f"{request.action_name}: {head}"
 
 
+def _is_chained(hold: dict[str, Any]) -> bool:
+    """A hold belongs to a chain if it says so OR carries a chain continuation: fail toward the chain,
+    so a hold whose flag was altered still cannot be resolved as a lone action."""
+    return bool(hold.get("chained")) or hold.get("chain") is not None
+
+
 def _execution_record(result: ExecutionResult) -> dict[str, object]:
     return {"ok": result.ok, "detail": result.detail, "error": result.error,
             "downstream_id": result.downstream_id}
@@ -553,19 +559,13 @@ class EfferentGate:
         assert self._journal is not None
         created_at = self._clock().isoformat()
         hold_id = hold["hold_id"]
-        if hold.get("chained") and not chain_owned:
+        if _is_chained(hold) and not chain_owned:
             return self._refuse_open("chained_pending_resolves_through_its_chain", None)
         try:
             pending = PendingAction.from_dict(hold["pending"])
         except (KeyError, TypeError, ValueError, AttributeError):
             pending = None
         binding_id = pending.authority.get("binding_id") if pending is not None else hold.get("binding_id")
-        if hold.get("decided") is not None:
-            if hold["decided"] and decision.approved and pending is not None:
-                pass   # an approval already recorded and maybe not yet run: fire it (once) below
-            else:
-                return self._refuse_open("journal:already_decided", binding_id)
-
         if pending is None or not pending.seal_matches():
             # the record a person was asked about is unreadable or altered: never fire it. Reject the
             # hold (with the digest it was opened with; the record's own bytes are not trusted).
@@ -608,15 +608,20 @@ class EfferentGate:
         if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
             guard = "unattended_approval_not_allowed"
         if guard in ("elevated_requires_typed_proof", "unattended_approval_not_allowed"):
-            return self._refuse_open(guard, binding_id)   # not a decision: the hold stays open
+            if hold.get("decided") is not True:
+                return self._refuse_open(guard, binding_id)   # not a decision: the hold stays open
+            guard = None   # the approval that stands was given by its own decider, who met these checks
         if guard is not None:
             return reject(posture, guard)                  # a re-validation failure IS a decision
 
         authority = self._authority_of(pending)
-        verdict = "approved" if decision.by == "human" else "auto"
-        by = decision.by if decision.by == "human" else (
+        already_approved = hold.get("decided") is True
+        # the receipt names whoever made the decision that is firing: this resolver, or the earlier one
+        decider = hold["by"] if already_approved and hold.get("by") in ("human", "on-loop") else decision.by
+        verdict = "approved" if decider == "human" else "auto"
+        by = decider if decider == "human" else (
             "binding" if authority.grantor == "binding" else "on-loop")
-        run = RunRef(hold["run_id"], hold["effect_id"], chained=bool(hold.get("chained")))
+        run = RunRef(hold["run_id"], hold["effect_id"], chained=_is_chained(hold))
         request = ActionRequest(
             action_name=pending.action_name, payload=pending.payload, context_id=pending.context_id,
             query_text=pending.query_text, query_date=pending.query_date,
@@ -624,7 +629,23 @@ class EfferentGate:
             producers=pending.producers, proposal_id=pending.proposal_id,
             actor_first_estimate=decision.first_estimate, run=run,
         )
-        if hold.get("decided") is None:
+        if not already_approved:
+            # Everything that could stop this effect WITHOUT a decision is checked BEFORE the decision is
+            # written, so "refused" never coexists with an approval in the journal: an unreadable
+            # registry or an unadmitted run records nothing; a run that is already fenced or cancelled
+            # is a rejection (it can never fire), recorded as one.
+            gen = self._current_generation(request)
+            if gen is None:
+                return self._refuse_open("binding_generation_unknown", binding_id)
+            try:
+                barrier = self._journal.peek(run.run_id, run.effect_id, current_generation=gen,
+                                             digest=self._digest_of(request))
+            except KeyError:
+                return self._refuse_open("run_not_admitted", binding_id)
+            if barrier is not None:
+                if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
+                    return reject(posture, f"journal:{barrier.status.value}")
+                return self._refuse_open(f"journal:{barrier.status.value}", binding_id)
             d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by)
             if not d.ok:
                 if d.reason == "already_decided" and self._journal_hold_approved(hold_id):
@@ -637,11 +658,20 @@ class EfferentGate:
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate, decided=True,
         )
-        if fired.receipt_id is None and fired.refused and fired.reason.startswith("journal:"):
-            # an approval the journal stopped (the run was cancelled or fenced since it was proposed):
-            # the resolve still ends in a terminal decision, so it gets a receipt like every other one.
+        if fired.fired or fired.replayed or fired.receipt_id is not None:
+            return fired
+        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned"):
+            # an approval the journal stopped for good (fenced or cancelled since the decision, or an
+            # outcome already unknown): a terminal end, so it gets a receipt like every other one
             return deny(posture, fired.reason, by="on-loop")
-        return fired
+        # APPROVED, effect not yet run (a fault, an unreadable registry, the effect in flight elsewhere):
+        # the decision stands, so this is not a refusal. The approval runs once on a later delivery or
+        # resolve, and RunJournal.approved_unrun lists it meanwhile.
+        return GateOutcome(
+            posture=posture, fired=False, refused=False, deferred=False, held=True,
+            reason=f"approved_not_yet_run:{fired.reason}", receipt_id=None, execution=None,
+            binding_id=binding_id,
+        )
 
     def _journal_hold_approved(self, hold_id: str) -> bool:
         rec = self._journal.get_hold(hold_id) if self._journal is not None else None
@@ -813,13 +843,11 @@ class EfferentGate:
         (verdict ``denied``, by ``on-loop``). Idempotent + fail-soft per item (one bad pending never
         stops the sweep). Returns the resolved outcomes. NEVER raises.
 
-        ``skip`` (Slice 4c — L1 L3) is an optional caller-supplied predicate: a pending for which
-        ``skip(pending)`` is True is LEFT UNTOUCHED (not swept). The gate is deliberately chain-AGNOSTIC,
-        so the adapter passes ``skip=_is_chain_pending`` to keep this sweep from PLAIN-FIRING a
-        chain-shaped pending standalone — a crash-orphaned chain link (its ChainState lost before persist)
-        whose deliver action is allowlisted would otherwise auto-fire here, stranding the chain (the 4b
-        "never plain-fire a chain-shaped pending" rule the chain-resume path already enforces). A
-        ``skip`` fault on one item is fail-soft (treated as not-skipped is unsafe → treated as SKIPPED)."""
+        JOURNALED pendings (open holds) are swept first (:meth:`_sweep_holds`); a chain link's hold is
+        left to ``ChainExecutor.sweep_timeouts``. ``skip`` applies to MANUAL (unjournaled) pendings only:
+        an optional caller-supplied predicate; a pending for which ``skip(pending)`` is True is LEFT
+        UNTOUCHED. An unjournaled chain's adapter passes one to keep this sweep from plain-firing a
+        chain-shaped pending standalone. A ``skip`` fault on one item is fail-soft (treated as SKIPPED)."""
         # NEVER raises (L3 codex ship-gate MED): the clock + EACH item body are fail-soft, so a raising
         # clock or one malformed-but-loaded record can't crash the sweep (resolve has its own net; the
         # sweep's per-item work — seal_matches / _posture_of / claim — runs OUTSIDE resolve and so needs
@@ -836,7 +864,7 @@ class EfferentGate:
             pendings = self._pending_store.list_open()
         except Exception as e:  # noqa: BLE001 — defensive; list_open is already fail-soft
             _log.error("efferent gate sweep: list_open FAILED (%s): %s", type(e).__name__, e)
-            return []
+            return outcomes   # the journaled decisions this sweep already made stay reported
         for pending in pendings:
             if skip is not None:
                 try:
@@ -916,7 +944,7 @@ class EfferentGate:
             return []
         out: list[GateOutcome] = []
         for h in holds:
-            if h.get("chained") or not isinstance(h.get("pending"), dict):
+            if _is_chained(h) or not isinstance(h.get("pending"), dict):
                 continue
             try:
                 decision = self.silence_decision(h, now)
@@ -1234,8 +1262,9 @@ class EfferentGate:
         """The outcome for an effect the journal did not let run. HELD and IN_FLIGHT are not terminal
         (``held``: deliver the event again later); CANCELLED, FENCED and POISONED are (``refused``).
         No receipt here: the journal line that stopped it (the cancel, the fence, the unknown outcome)
-        is the record, and writing one per re-delivery would repeat it. (A RESOLVE that ends here is
-        the exception: ``_resolve_pending`` writes its receipt, since every resolve is a decision.)"""
+        is the record, and writing one per re-delivery would repeat it. (A resolve that ends here after
+        its approval was recorded, because the run was fenced or cancelled since, is the exception:
+        ``_resolve_hold`` writes its receipt.)"""
         held = out.status in (EffectStatus.HELD, EffectStatus.IN_FLIGHT)
         _log.info("efferent gate: %r stopped by the run journal (%s)", request.action_name, out.status.value)
         return GateOutcome(

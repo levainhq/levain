@@ -510,7 +510,8 @@ def test_liveness_surfaces_open_holds_and_poisoned_effects(tmp_path):
     from levain.autonomic import binding_liveness
     w = World(tmp_path)
     b = w.mint(chain=True)
-    assert binding_liveness(w.store)["journal"] == {"open_holds": {}, "poisoned": 0, "unreadable": None}
+    assert binding_liveness(w.store)["journal"] == {"open_holds": {}, "poisoned": 0, "approved_unrun": 0,
+                                                    "unreadable": None}
     w.dispatch("c1")
     assert binding_liveness(w.store)["journal"]["open_holds"] == {b.binding_id: 1}
     w.mint(chain=False)
@@ -581,7 +582,7 @@ def test_an_unattended_approval_of_a_confirm_pending_is_refused(tmp_path):
     w.mint(chain=True)
     w.dispatch("c1")
     out = w.resolve_open_as(ConfirmDecision(approved=True, by="on-loop"))
-    assert out.aborted and "unattended_approval_not_allowed" in out.reason
+    assert out.paused and out.reason == "unattended_approval_not_allowed"   # nothing decided
     assert w.outbox() == [("link0", "c1-0")]
 
 
@@ -1035,6 +1036,7 @@ def test_an_approval_racing_a_rejection_fires_nothing(tmp_path):
     w.journal.decide(stale["hold_id"], approve=False, by="human",
                      digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
     before = len(list(w.receipts.read()))
+    w.journal.peek = lambda *a, **k: None                          # the rejection landed after this check
     out = w.gate._resolve_hold(stale, ConfirmDecision(approved=True, by="human"), chain_owned=True)
     assert out.refused and out.reason == "journal:already_decided"
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
@@ -1051,3 +1053,166 @@ def test_the_unjournaled_chain_store_keeps_one_state_per_paused_link(tmp_path):
     assert first.chain_id != twin.chain_id
     assert store.add(first) == first.chain_id and store.add(twin) == first.chain_id
     assert [s.chain_id for s in store.list_open()] == [first.chain_id]
+
+
+
+# --- L1+L2 on the single-store commit (20ff4ca), each reproduced by a probe first ------------
+
+def test_a_resolve_that_cannot_read_the_registry_records_no_decision(tmp_path):
+    # HIGH: decide(approve) was written before the registry read; "refused" while the journal said
+    # "approved", the person could not take it back, and the effect fired on the next delivery
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    real = w.gate._binding_generation
+    w.gate._binding_generation = lambda bid: None
+    out = w.resolve_open(approve=True)
+    assert out.paused and out.reason == "binding_generation_unknown"
+    assert not any('"t":"decide"' in l for l in w.journal.path.read_text().splitlines())
+    w.gate._binding_generation = real
+    assert w.resolve_open(approve=False).aborted                   # the person's NO still counts
+    assert w.dispatch("c1").outcome.reason == "journal:cancelled" and w.outbox() == [("link0", "c1-0")]
+
+
+def test_an_approved_effect_that_could_not_run_yet_is_held_and_listed(tmp_path):
+    # MED: an approval whose effect hit a fault was reported "refused" and listed nowhere
+    from levain.autonomic import binding_liveness
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.gate.open_pendings()
+    real = w.journal.effect
+    w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    out = w.resolve_open(approve=True)
+    assert out.held and out.links[-1].outcome.reason.startswith("approved_not_yet_run:")
+    assert len(w.journal.approved_unrun()) == 1
+    assert binding_liveness(w.store)["journal"]["approved_unrun"] == 1
+    w.journal.effect = real
+    sweep_by = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))   # retried
+    assert sweep_by.completed and w.journal.approved_unrun() == []
+    receipts = [r for r in w.receipts.read() if r.fired]
+    assert len(receipts) == 2 and w.outbox() == [("link0", "c1-0"), ("link1", "c1-1")]
+
+
+def test_a_receipt_names_the_decider_whose_approval_fired(tmp_path):
+    # LOW: a later on-loop re-resolve of an earlier human approval wrote a receipt naming itself
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.gate.open_pendings()
+    from levain.autonomic import effect_digest
+    w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=True, by="human",
+                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    out = w.gate._resolve_hold(w.journal.find_pending(p.pending_id),
+                               ConfirmDecision(approved=True, by="on-loop"), chain_owned=True)
+    assert out.fired
+    [face] = [r.action_face for r in w.receipts.read() if r.fired and r.action_name == "link1"]
+    assert face["gate"]["by"] == "human" and face["gate"]["verdict"] == "approved"
+
+
+def test_a_late_no_after_a_completed_chain_reports_held_not_aborted(tmp_path):
+    # MED: "aborted" for a chain that had completed; the late NO changed nothing
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.gate.open_pendings()
+    assert w.resolve_open(approve=True).completed
+    late = w.chains.resume(p.pending_id, ConfirmDecision(approved=False, by="human"))
+    assert late.held and late.reason == "journal:already_decided"
+
+
+def test_the_chain_sweep_drops_a_race_it_lost(tmp_path):
+    # MED: the chain sweep reported "aborted already_decided" for a link a person had approved
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    stale = w.journal.open_holds()
+    assert w.resolve_open(approve=True).completed
+    w.journal.open_holds = lambda: stale                           # the sweep read the holds before the person
+    assert w.chains.sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []
+
+
+def test_a_chain_link_whose_flag_was_altered_still_cannot_fire_alone(tmp_path):
+    # LOW: chained=false on a chain link's hold let a plain resolve fire the link standalone
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.gate.open_pendings()
+    lines = w.journal.path.read_text().splitlines()
+    for k, line in enumerate(lines):
+        rec = json.loads(line)
+        if rec["t"] == "hold":
+            rec["chained"] = False
+            lines[k] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    w.journal.path.write_text("\n".join(lines) + "\n")
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert out.reason == "chained_pending_resolves_through_its_chain" and w.outbox() == [("link0", "c1-0")]
+
+
+def test_a_continuation_from_another_hold_is_refused(tmp_path):
+    # LOW: the continuation was not tied to its own hold (pending id, binding); a validly sealed
+    # continuation copied from elsewhere must not resume this hold's chain
+    from levain.autonomic import ChainState
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.gate.open_pendings()
+    lines = w.journal.path.read_text().splitlines()
+    for k, line in enumerate(lines):
+        rec = json.loads(line)
+        if rec["t"] == "hold":
+            st = ChainState.from_dict(rec["chain"])
+            other = ChainState.create(created_at="2026-10-07T12:30:00", binding=st.binding_obj(),
+                                      trigger_event=st.trigger_event, completed=st.completed_links(),
+                                      paused_at_link=st.paused_at_link, paused_payload=st.paused_payload,
+                                      pending_id="hold:run-other:link-1")
+            rec["chain"] = other.to_dict()
+            lines[k] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    w.journal.path.write_text("\n".join(lines) + "\n")
+    out = w.resolve_open(approve=True)
+    assert out.aborted and out.reason == "integrity:continuation_not_this_hold"
+    assert w.outbox() == [("link0", "c1-0")]
+
+
+def test_a_pause_between_the_approval_and_the_effect_stops_it_even_if_the_journal_missed_it(tmp_path):
+    # the registry generation read at effect time is what stops an approved effect when a pause lands
+    # after the decision and its journal fence could not be written
+    from levain.autonomic import FenceNotRecordedError
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("c1")
+    real_decide, real_fence = w.journal.decide, w.journal.fence
+
+    def decide_then_pause(*a, **k):
+        d = real_decide(*a, **k)
+        w.journal.fence = lambda *x, **y: (_ for _ in ()).throw(OSError("no space"))
+        try:
+            w.store.set_status(b.binding_id, BindingStatus.PAUSED)
+        except FenceNotRecordedError:
+            pass
+        w.journal.fence = real_fence
+        return d
+
+    w.journal.decide = decide_then_pause
+    out = w.resolve_open(approve=True)
+    assert not out.completed and w.outbox() == [("link0", "c1-0")]
+    assert out.links[-1].outcome.receipt_id is not None            # a terminal end: it gets a receipt
+    assert [r.fired for r in w.receipts.read() if r.action_name == "link1"] == [False]
+
+def test_a_sweep_keeps_its_journaled_outcomes_when_the_manual_store_faults(tmp_path):
+    # LOW: a manual-store read fault discarded decisions the same sweep had already made
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00k",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="s", tools=("mail.send",), output="email:x"),), tightness=TIGHT,
+                       posture=Posture.CONFIRM,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    w.dispatcher.dispatch({"type": "email", "id": "m1", "fields": {"from": "a@x.example", "dmarc": "pass"}})
+    w.pending.list_open = lambda: (_ for _ in ()).throw(OSError("EIO"))
+    out = w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
+    assert [o.reason for o in out] == ["denied:confirm_window_elapsed"]

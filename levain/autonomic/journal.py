@@ -570,6 +570,16 @@ class RunJournal:
             st = self._state()
         return [{k: h.get(k) for k in self._HOLD_FIELDS} for h in st.holds.values() if h["decided"] is None]
 
+    def approved_unrun(self) -> list[dict[str, Any]]:
+        """Every APPROVED hold whose effect has not started (no intent, result or unknown outcome): a
+        decision that stands and will run on the next delivery or resolve of its run."""
+        with self._locked():
+            st = self._state()
+            return [{k: h.get(k) for k in self._HOLD_FIELDS} for h in st.holds.values()
+                    if h["decided"] is True and (h["run_id"], h["effect_id"]) not in st.intents
+                    and (h["run_id"], h["effect_id"]) not in st.results
+                    and (h["run_id"], h["effect_id"]) not in st.unknown]
+
     def get_hold(self, hold_id: str) -> dict[str, Any] | None:
         """The hold record (open or decided), or ``None``."""
         with self._locked():
