@@ -478,6 +478,11 @@ def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path:
     (ed / ".levain" / "confinement.json").write_text(json.dumps(rec))
     probes = []
     monkeypatch.setattr(doctor, "_probe", lambda cmd: probes.append(cmd) or (True, ""))
+    from levain.firing import ws_git
+
+    # pinned: a runner image's own safe.directory=* would add a second (correct) warning
+    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda: [])
+    monkeypatch.setattr(ws_git, "operator_owned_gitdirs", lambda w, uid: [])
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
     (r,) = doctor._check_hands_isolation(ed)

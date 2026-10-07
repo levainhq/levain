@@ -39,6 +39,7 @@ info "safe.directory entries the operator already has: $(git config --show-origi
 setup || { echo "setup failed"; exit 1; }
 if [ "$(git config --global --get-all safe.directory 2>/dev/null | sort)" = "$OP_SAFE_BEFORE" ]; then pass "setup added no safe.directory entry for the operator"; else fail "setup changed the operator's safe.directory"; fi
 H="$(cfgval hands_user)"; HID="$(cfgval hands_uid)"; WS="$(cfgval hands_workspace)"; HHOME="$(eval echo ~"$H")"
+ME="$(id -un)"
 echo "hands user: $H (id $HID), workspace: $WS"
 case "$WS" in "$HOME"/*) fail "workspace is under the operator's home";; *) pass "workspace is outside the operator's home";; esac
 check "hands user has the recorded id" test "$(id -u "$H")" = "$HID"
