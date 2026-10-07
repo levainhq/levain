@@ -22,6 +22,15 @@ from levain import launch
 ROOT = Path(__file__).resolve().parent.parent
 PKG = ROOT / "levain"
 SECRET = "levain-test-secret-6f1d"
+
+
+@pytest.fixture(autouse=True)
+def _launch_state_is_per_test(monkeypatch):
+    """launch keeps process-wide state (the secret-file registry, a lifted key). A test that adds to
+    it left an API key file in every later build_policy's deny_files, which failed
+    test_build_policy_does_not_guess_cred_files whenever this file ran first."""
+    monkeypatch.setattr(launch, "_secret_files", [])
+    monkeypatch.setattr(launch, "_lifted_api_key", None)
 # The probes run with `python -c <source>`, and the source is itself in the argv the kernel reports,
 # so the secret is spelled there in two halves.
 _SPLIT = repr(SECRET[:9]) + " + " + repr(SECRET[9:])

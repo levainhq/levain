@@ -185,7 +185,9 @@ def test_a_link_flipped_after_the_path_check_is_refused_at_the_open(tmp_path: Pa
     obs = ex(FileEditorAction(command="view", path=str(link)))
     text = "".join(getattr(c, "text", "") for c in obs.to_llm_content)
     assert "JEWEL-CONTENT" not in text
-    assert obs.is_error and "crown" in text.lower()
+    # The editor's own existence check now answers through the floor, so the flipped path reads as
+    # missing, the same answer a missing path gets (head ruling 2026-10-07); the open refuses either way.
+    assert obs.is_error and ("crown" in text.lower() or "does not exist" in text)
 
 
 def test_the_open_check_is_inert_outside_a_floored_call(tmp_path: Path) -> None:
@@ -285,8 +287,9 @@ def test_a_file_shaped_procfs_mount_is_masked_not_tmpfsd(policy, tmp_path: Path,
     f.write_text("")
     monkeypatch.setattr(C, "_extra_procfs_mounts", lambda: [f])
     argv = C._bwrap_argv(policy)
-    assert ["--ro-bind", "/dev/null", str(f)] == argv[argv.index(str(f)) - 2: argv.index(str(f)) + 1]
-    assert "--tmpfs" != argv[argv.index(str(f)) - 1]
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--ro-bind", "/dev/null", str(f)] in triples
+    assert ["--tmpfs", str(f)] not in [argv[k:k + 2] for k in range(len(argv))]
 
 
 # --- L3 r1 -------------------------------------------------------------------------------------------
@@ -500,3 +503,90 @@ def test_a_cross_filesystem_insert_replaces_the_name_and_a_refused_one_leaves_no
         T._EDITOR_FLOOR.reset(token)
     assert target.read_text() == "NEW\n" and other.read_text() == "UNTOUCHED\n"
     assert not src.exists() and not refused_src.exists()
+
+
+# --- the walk's trusted prefix and the floored stats (head rulings 2026-10-07) -----------------------
+
+
+def _executor_through_a_linked_prefix(tmp_path: Path, monkeypatch):
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / "real"
+    (real / "ws").mkdir(parents=True)
+    lnk = tmp_path / "lnk"                     # what macOS /tmp is to /private/tmp
+    lnk.symlink_to(real)
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = lnk / "ws"
+    return T, T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws)), ws
+
+
+def _text(obs) -> str:
+    return "".join(getattr(c, "text", "") for c in obs.to_llm_content)
+
+
+def test_insert_and_view_under_a_workspace_reached_through_a_link_work(tmp_path: Path, monkeypatch) -> None:
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    T, ex, ws = _executor_through_a_linked_prefix(tmp_path, monkeypatch)
+    f = ws / "a.txt"
+    f.write_text("one\ntwo\n")
+    (ws / "sub").mkdir()
+    obs = ex(FileEditorAction(command="insert", path=str(f), insert_line=1, new_str="mid"))
+    assert not obs.is_error, _text(obs)
+    assert f.read_text() == "one\nmid\ntwo\n"
+    obs = ex(FileEditorAction(command="view", path=str(ws)))
+    assert not obs.is_error and "a.txt" in _text(obs) and "sub/" in _text(obs)
+
+
+def test_a_link_planted_below_the_workspace_is_still_not_followed(tmp_path: Path, monkeypatch) -> None:
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    T, ex, ws = _executor_through_a_linked_prefix(tmp_path, monkeypatch)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "NAME-BEYOND.txt").write_text("x")
+    (ws / "planted").symlink_to(elsewhere)
+    obs = ex(FileEditorAction(command="view", path=str(ws / "planted")))
+    assert obs.is_error and "NAME-BEYOND" not in _text(obs)
+    obs = ex(FileEditorAction(command="insert", path=str(ws / "planted" / "NAME-BEYOND.txt"),
+                              insert_line=0, new_str="PLANT"))
+    assert obs.is_error and (elsewhere / "NAME-BEYOND.txt").read_text() == "x"
+
+
+def test_a_denied_jewel_answers_exactly_as_a_missing_path(tmp_path: Path, monkeypatch) -> None:
+    """The editor's name-based checks ran in levain's own process, so a link flipped after the path
+    check told the entity whether a jewel existed. Now an existing jewel and a missing file read the
+    same."""
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    jewel_dir = tmp_path / ".anneal-memory"
+    jewel_dir.mkdir()
+    (jewel_dir / "present.txt").write_text("J")
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ex = T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws))
+    real_check = T.crown_jewel_reason
+    answers = []
+    for target in ("present.txt", "absent.txt"):
+        link = ws / "probe"
+        link.write_text("benign")
+
+        def check_then_flip(policy, path, _t=target):
+            out = real_check(policy, path)
+            if Path(path) == link and not link.is_symlink():
+                link.unlink()
+                link.symlink_to(jewel_dir / _t)
+            return out
+
+        monkeypatch.setattr(T, "crown_jewel_reason", check_then_flip)
+        answers.append(_text(ex(FileEditorAction(command="view", path=str(link)))))
+        monkeypatch.setattr(T, "crown_jewel_reason", real_check)
+        link.unlink()
+    assert answers[0] == answers[1], answers

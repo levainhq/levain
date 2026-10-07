@@ -129,13 +129,16 @@ def test_a_jewel_replaced_by_a_symlink_refuses(tmp_path, monkeypatch):
 
 
 def test_a_hidden_directory_swapped_for_a_link_refuses(tmp_path, monkeypatch):
-    """L3 r2 codex: a tmpfs-covered directory renamed away and replaced by a symlink."""
-    secrets = tmp_path / "secrets"
+    """L3 r2 codex: a tmpfs-covered directory renamed away and replaced by a symlink. Below a
+    subdirectory of $HOME: directly in $HOME the host rename is not even visible to bash (the
+    step (0) view), so there is nothing to recheck."""
+    (tmp_path / "sub").mkdir()
+    secrets = tmp_path / "sub" / "secrets"
     secrets.mkdir()
     (secrets / "token").write_text("x")
     sh = _shell(tmp_path, monkeypatch, extra=(secrets,))
-    secrets.rename(tmp_path / "moved")
-    secrets.symlink_to(tmp_path / "moved")
+    secrets.rename(tmp_path / "sub" / "moved")
+    secrets.symlink_to(tmp_path / "sub" / "moved")
     with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
 
@@ -230,7 +233,8 @@ def test_paths_inside_a_tmpfs_root_are_not_tracked(tmp_path, monkeypatch):
     policy = build_policy(_entity(tmp_path))
     mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
     ssh = str((tmp_path / ".ssh").resolve())
-    assert ssh in mounted
+    # ~/.ssh itself is inside step (0)'s $HOME view now: hidden from the host like what is in it.
+    assert ssh not in mounted
     assert not [q for q in [*mounted, *unmounted] if q.startswith(ssh + "/")]
 
 

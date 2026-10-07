@@ -474,8 +474,8 @@ _STANDARD_CRED_FILES = (
 # next uses the tool. Cost: inside a confined session the entity cannot create or rewrite a top-
 # level file in these directories (``aws configure set``, ``kubectl config use-context``,
 # ``git config --global`` for an XDG git user). macOS denies a path string whether it exists or
-# not, so it needs none of this. $HOME-level cred files have no such directory; on Linux an absent
-# one gets a 0444 placeholder that lasts for the session (:func:`_ledger_enter`).
+# not, so it needs none of this. $HOME itself is such a view on Linux (step (0) of the bwrap plan),
+# so an absent $HOME-level cred file needs no placeholder either.
 _CRED_TOOL_DIRS = ("~/.kube", "~/.docker", "~/.aws", "~/.config/git")
 
 
@@ -484,8 +484,8 @@ def floor_roots(specs) -> list[Path]:
     its three spellings (:func:`_spellings`). The standard cred stores, the cloud directories, the
     credential overrides and the ledger go through it; a new list (browser profiles) is one more
     tuple passed here, and the plan's absent-path handling (a tool directory read-only, an absent
-    directory created and ledgered, a $HOME-level file a session placeholder, a link refused where
-    it could be swapped) applies to it unchanged."""
+    directory created and ledgered, a $HOME-level file absent from the $HOME view, a link refused
+    where it could be swapped) applies to it unchanged."""
     return [p for spec in specs for p in _spellings(spec)]
 
 
@@ -838,6 +838,23 @@ class CrownJewelsPolicy:
     # (:func:`_cred_dir_sources`: ~/.config/gcloud, ~/.azure, and every directory override), lexical.
     # Their spellings are in ``deny_read_write``; this tells the Linux plan which absent roots may be
     # skipped when this user cannot create them. Empty unless ``deny_standard_creds``.
+    trusted_roots: tuple[tuple[Path, Path], ...] = ()  # (as spelled, real path) for the workspace,
+    # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
+    # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
+    # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
+
+
+def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
+    """``(as spelled, real)`` for the workspace, the entity dir and $HOME, longest first."""
+    ed = Path(os.path.abspath(os.path.expanduser(str(entity_dir))))
+    ws = (Path(os.path.abspath(os.path.expanduser(str(workspace)))) if workspace is not None
+          else ed / "workspace")
+    out: dict[Path, Path] = {}
+    for lex in (ws, ed, Path(os.path.abspath(os.path.expanduser("~")))):
+        real = lex.resolve()
+        out[lex] = real
+        out[real] = real
+    return tuple(sorted(out.items(), key=lambda kv: len(str(kv[0])), reverse=True))
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -1551,6 +1568,7 @@ def build_policy(
         sqlite_sidecars=sqlite_sidecars_t,
         ro_tool_dirs=tuple(tool_dirs),
         cred_dir_sources=tuple(cred_dir_sources),
+        trusted_roots=_trusted_roots(entity_dir, workspace),
     )
 
 
@@ -3680,6 +3698,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
             store_argv += ["--bind-try", str(child), str(child)]
     entity_store_dirs = list(ro_store_dirs)
+
+    def _nearest_existing(q: Path) -> Path:
+        q = q.parent.resolve() / q.name
+        while not os.path.lexists(q) and q != q.parent:
+            q = q.parent
+        return q
+
     # The standard cred files' TOOL directories (lane P2, items 5 and 6) get a VIEW, not the host
     # directory: a read-only tmpfs holding the real directory's existing entries except the cred
     # names. Subdirectories come back read-write, files read-only, links as the same links. A cred
@@ -3696,8 +3721,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # --remount-ro. A mountpoint inside the view is made in the tmpfs, except under a subdirectory
     # bound back from the host (a "window", ~/.aws/sso): there it is on the host, so it is prepared,
     # ledgered and watched like any other (:func:`_mount_plan_paths`; codex, L3 r3).
+    # The names a view (a tool directory, or $HOME in step (0)) leaves out. A denied socket is one:
+    # absent from the view, it stays unreachable across a daemon restart too.
     secret_names = {_host_spelling(p) for p in (*policy.deny_files, *policy.deny_read_write,
-                                               *policy.deny_write_files, *policy.sqlite_sidecars)}
+                                               *policy.deny_write_files, *policy.sqlite_sidecars,
+                                               *policy.deny_sockets)}
     tool_views: list[Path] = []
     tool_windows: list[Path] = []
     for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
@@ -3709,6 +3737,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue   # a file where the tool's directory should be: nothing can live under it
         if real in ro_store_dirs:
             continue
+        if not os.path.lexists(real) and _nearest_existing(real) in frozen_home:
+            continue   # absent, and not creatable in step (0)'s $HOME view: nothing to show or hide
         argv += ["--tmpfs", str(real)]
         remount_ro.append(str(real))
         ro_store_dirs.append(real)
@@ -3726,6 +3756,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             else:
                 argv += ["--ro-bind-try", str(child), str(child)]
     argv += store_argv
+    # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
+    ro_store_dirs += list(frozen_home)
 
     def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
@@ -3795,7 +3827,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # tmpfs view, so nothing is created on the host: what the operator's tool writes there
         # mid-session must stay unreadable (the aws caches, research §4; L2 r1), and in the view it
         # is not even present. Only the entity's own store dirs skip absent roots.
-        absent_in_store = _absent_in_ro_store(sub, entity_store_dirs)
+        absent_in_store = _absent_in_ro_store(sub, [*entity_store_dirs, *frozen_home])
         if not sub.exists() and not absent_in_store and not _mountpoint_creatable(sub):
             if sub in cred_dir_spellings:
                 continue   # a tool's home this user cannot create: the shell cannot create it either
@@ -4123,17 +4155,21 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
-    # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)). $HOME is bound
-    # read-only and each existing subdirectory bound back read-write, so inside bash nothing can be
-    # created, removed, renamed or swapped directly in $HOME, while everything below a subdirectory
-    # (the workspace, a repo, ~/.cache) is as writable as before. That makes every link at $HOME's
-    # top level (a dotfile manager's ~/.config, ~/.netrc) unswappable from inside, and stops a plant
-    # of any new top-level dotfile. It goes after the pins of $HOME's own ancestors and BEFORE every
-    # deeper mount: a bind takes its content from the host tree, so a later bind of $HOME would hide
-    # the mounts beneath it, and the deeper pins and the body land on top of it. $HOME's own pin is
-    # dropped: the read-only bind is itself a mountpoint, so $HOME still cannot be renamed.
-    # Cost: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
-    # fails inside bash.
+    # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
+    # ruling, same day, (b)). $HOME is a read-only tmpfs holding its existing entries except the
+    # credential names: each subdirectory bound back read-write, each file read-only, each link as
+    # the same link. Inside bash nothing can be created, removed, renamed or swapped directly in
+    # $HOME, while everything below a subdirectory (the workspace, a repo, ~/.cache) is as writable
+    # as before; every link at the top level (a dotfile manager's ~/.config, ~/.netrc) is
+    # unswappable from inside. And a credential file at the top level (~/.netrc, ~/.npmrc, ...) that
+    # the operator's tool creates on the host mid-session lands in the host directory, which bash
+    # never sees, not even in a command already running; an absent one needs no placeholder. It goes
+    # after the pins of $HOME's own ancestors and BEFORE every deeper mount: a later tmpfs on $HOME
+    # would hide the mounts beneath it, and the deeper pins and the body land on top of it. $HOME's
+    # own pin is dropped: the tmpfs is itself a mountpoint, so $HOME still cannot be renamed.
+    # Costs: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
+    # fails inside bash; a top-level file the host replaces after spawn is not seen (a per-file bind
+    # pins the inode).
     home_ops: list[str] = []
     home_real = home_ro
     if home_real is not None and policy.workspace.resolve() == home_real:
@@ -4143,13 +4179,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             "hands (fail-closed). Use a subdirectory of your home as the workspace."
         )
     if home_real is not None:
-        home_ops = ["--ro-bind", str(home_real), str(home_real)]
+        home_ops = ["--tmpfs", str(home_real)]
         for child in sorted(home_real.iterdir(), key=lambda p: p.name):
-            if child.is_symlink() or not child.is_dir():
+            if child in secret_names:
                 continue
-            # Not `-try`: a subdirectory removed between the plan and the spawn aborts bwrap (a
-            # refusal; the next spawn plans again) rather than starting with it silently read-only.
-            home_ops += ["--bind", str(child), str(child)]
+            if child.is_symlink():
+                home_ops += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                # Not `-try`: a subdirectory removed between the plan and the spawn aborts bwrap (a
+                # refusal; the next spawn plans again) rather than starting with it silently missing.
+                home_ops += ["--bind", str(child), str(child)]
+            else:
+                home_ops += ["--ro-bind-try", str(child), str(child)]
     outer: list[str] = []
     ancestors: list[str] = []
     create_first: list[str] = []
@@ -4166,6 +4207,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     out = head + outer + home_ops + ancestors + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
+    if home_ops:
+        out += ["--remount-ro", str(home_real)]
     _refuse_bind_after_mask(out)
     return out, create_first
 
@@ -4475,11 +4518,11 @@ def _prepare_mountpoints(mounted: dict[str, str | None],
 
 # --- the session-scoped placeholder ledger (Linux) -----------------------------------------------
 #
-# A mount needs a mountpoint, so an absent $HOME-level cred file (~/.netrc, ~/.npmrc, ~/.pypirc,
-# ~/.git-credentials) is masked over a 0444 placeholder the provider creates. Skipping it would let
-# the shell PLANT the file (a planted ~/.pypirc ``repository`` sends the operator's next upload
-# token elsewhere), so the placeholder stays, but only while a session needs it: before this ledger
-# it was left on the host for good, and ``npm login`` / ``docker login`` then failed on a 0444 file.
+# A mount needs a mountpoint, so an absent jewel under a writable directory (a cred directory under
+# an existing ~/.config, say) is masked over a placeholder the provider creates. Skipping it would let
+# the shell PLANT the file, so the placeholder stays, but only while a session needs it: before this
+# ledger such placeholders were left on the host for good, and ``npm login`` / ``docker login`` then
+# failed on a 0444 file. (A $HOME-level cred file needs none since $HOME became a view, step (0).)
 # ⛔ Never unlinked while a session might rely on it. Since Linux 3.18 a host-side unlink of a
 # file that is a mountpoint in ANOTHER mount namespace succeeds and lazily DETACHES that mount
 # (torvalds/linux 8ed936b, "vfs: Lazily remove mounts on unlinked files and directories"), which
@@ -4783,19 +4826,6 @@ def live_floor_placeholders() -> list[Path]:
     return [Path(e["path"]) for e in entries
             if isinstance(e, dict) and e.get("kind") == "file"
             and any(isinstance(c, str) and _claim_alive(c) for c in e.get("claims", []))]
-
-
-def session_placeholder_note(deny_standard_creds: bool, system: str | None = None) -> str | None:
-    """One banner line naming the $HOME-level cred files that will be empty read-only placeholders
-    while this session's bash runs on Linux (they are absent now), or None."""
-    if not deny_standard_creds or (system or platform.system()) != "Linux":
-        return None
-    home = Path.home()
-    absent = [f for f in _STANDARD_CRED_FILES if "/" not in f[2:] and not os.path.lexists(home / f[2:])]
-    if not absent:
-        return None
-    return (" · ".join(absent) + " are absent: while bash runs each is an empty read-only "
-            "placeholder (so nothing can be planted there), removed when the session ends")
 
 
 _LIVE_BWRAP_SHELLS: "weakref.WeakSet[_BwrapShell]" = weakref.WeakSet()

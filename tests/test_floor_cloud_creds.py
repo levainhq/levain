@@ -97,13 +97,16 @@ def test_a_relative_override_is_ignored_not_resolved_against_the_cwd(home: Path,
 
 
 def test_linux_creates_and_masks_an_absent_gcloud_and_azure(home: Path, linux) -> None:
+    (home / ".config").mkdir()   # an existing subdirectory: bound back writable, so gcloud is creatable
     policy = build_policy(_entity(home), deny_standard_creds=True)
     assert home / ".config" / "gcloud" in policy.deny_read_write and home / ".azure" in policy.deny_read_write
     argv, _ = C._bwrap_plan(policy)
-    for d in (home / ".config" / "gcloud", home / ".azure"):
-        assert [str(d)] in _ops(argv, "--tmpfs") and [str(d)] in _ops(argv, "--remount-ro"), d
+    gcloud = home / ".config" / "gcloud"
+    assert [str(gcloud)] in _ops(argv, "--tmpfs") and [str(gcloud)] in _ops(argv, "--remount-ro")
     mounted, _ = C._mount_plan_paths(argv, policy)
-    assert mounted[str(home / ".azure")] == "dir", "the provider creates it first, and the ledger owns it"
+    assert mounted[str(gcloud)] == "dir", "the provider creates it first, and the ledger owns it"
+    # ~/.azure directly in $HOME: absent from step (0)'s read-only view and not creatable there.
+    assert str(home / ".azure") not in argv and str(home / ".azure") not in mounted
 
 
 def test_linux_skips_a_cred_dir_override_this_user_cannot_create(home: Path, tmp_path: Path,
@@ -131,10 +134,12 @@ def test_linux_masks_every_aws_cache_after_the_aws_view(home: Path, linux) -> No
 
 
 def test_linux_masks_the_aws_caches_when_aws_is_absent_too(home: Path, linux) -> None:
+    # An absent ~/.aws is absent from step (0)'s $HOME view and cannot be created there, so neither it
+    # nor any cache under it needs a mount, and nothing is created on the host.
     argv, create_first = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
-    assert create_first.count(str(home / ".aws")) == 1
-    for rel in _AWS_CACHES:
-        assert [str(home / rel)] in _ops(argv, "--tmpfs"), rel
+    aws = str(home / ".aws")
+    assert aws not in create_first
+    assert not [a for a in argv if a == aws or a.startswith(aws + "/")]
 
 
 def test_the_credential_overrides_are_followed(home: Path, tmp_path: Path, monkeypatch) -> None:
@@ -181,8 +186,9 @@ def test_a_symlink_loop_in_a_cred_path_does_not_crash_the_build(home: Path, linu
     (home / ".netrc").symlink_to(home / ".netrc")
     policy = build_policy(_entity(home), deny_standard_creds=True)
     assert home / ".netrc" in policy.deny_files
-    with pytest.raises(C.ConfinementError):
-        C._bwrap_plan(policy)
+    # A credential name is left out of step (0)'s $HOME view, so the loop is never mounted on.
+    argv, _ = C._bwrap_plan(policy)
+    assert str(home / ".netrc") not in argv
 
 
 def test_a_link_root_whose_target_the_floor_does_not_name_refuses(home: Path, tmp_path: Path) -> None:

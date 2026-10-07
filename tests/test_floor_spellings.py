@@ -137,23 +137,27 @@ def test_linux_plan_refuses_a_symlinked_cred_subtree_in_a_writable_dir(home: Pat
 
 
 def test_linux_plan_creates_an_absent_tool_dir_and_puts_no_file_in_it(home: Path) -> None:
+    (home / ".config").mkdir()   # bound back writable: ~/.config/git is creatable, so it gets a view
     argv, create_first = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
-    for tool in (".kube", ".docker", ".aws", ".config/git"):
+    git = str(home.resolve() / ".config" / "git")
+    assert git in create_first and [git] in _ops(argv, "--tmpfs")
+    for tool in (".kube", ".docker", ".aws"):   # directly in $HOME: absent from its view, uncreatable
         d = str(home.resolve() / tool)
-        assert d in create_first, tool
-        assert [d] in _ops(argv, "--tmpfs"), tool
+        assert d not in create_first and d not in argv, tool
     masked = [d for s, d in _ops(argv, "--ro-bind") if s == "/dev/null"]
-    for f in (".kube/config", ".docker/config.json", ".aws/credentials", ".config/git/credentials"):
-        assert str(home.resolve() / f) not in masked, f"{f}: a 0444 stub inside a tool dir"
-    # a $HOME-level file has no tool dir to hide in, so it is still masked (with a session placeholder)
-    assert str(home.resolve() / ".netrc") in masked
+    for f in (".kube/config", ".docker/config.json", ".aws/credentials", ".config/git/credentials",
+              ".netrc"):
+        assert str(home.resolve() / f) not in masked, f"{f}: a 0444 stub"
 
 
-def test_mount_plan_records_home_level_cred_files_as_placeholders(home: Path) -> None:
+def test_home_level_cred_files_need_no_placeholder_in_the_home_view(home: Path) -> None:
+    """Ruling 2026-10-07 (b): an absent ~/.netrc is absent from step (0)'s view, so it needs no
+    placeholder on the host, and one the host creates later is never seen inside bash."""
     policy = build_policy(_entity(home), deny_standard_creds=True)
     argv, _ = C._bwrap_plan(policy)
-    mounted, _ = C._mount_plan_paths(argv, policy)
-    assert mounted[str(home.resolve() / ".netrc")] == "file"
+    mounted, unmounted = C._mount_plan_paths(argv, policy)
+    netrc = str(home.resolve() / ".netrc")
+    assert netrc not in mounted and netrc not in unmounted and netrc not in argv
 
 
 # --- the session-scoped placeholder ledger -----------------------------------------------------------
@@ -228,17 +232,6 @@ def test_the_ledger_is_a_crown_jewel(home: Path) -> None:
     policy = build_policy(_entity(home))
     assert C._ledger_dir().resolve() in policy.deny_read_write
     assert C.crown_jewel_reason(policy, C._ledger_dir() / "placeholders.json") is not None
-
-
-def test_the_banner_names_the_home_level_files_that_will_be_placeholders(home: Path) -> None:
-    (home / ".npmrc").write_text("registry=x\n")
-    note = C.session_placeholder_note(True, system="Linux")
-    assert note is not None
-    assert "~/.netrc" in note and "~/.pypirc" in note and "~/.git-credentials" in note
-    assert "~/.npmrc" not in note                     # present: masked over the real file, no placeholder
-    assert "~/.kube/config" not in note               # in a read-only tool dir: no placeholder at all
-    assert C.session_placeholder_note(True, system="Darwin") is None
-    assert C.session_placeholder_note(False, system="Linux") is None
 
 
 def test_doctor_sweeps_dead_placeholders_and_names_live_ones(home: Path) -> None:
@@ -385,15 +378,20 @@ def test_linux_plan_binds_home_read_only_with_subdirectories_back(home: Path) ->
     (home / ".zshrc").write_text("")
     argv, _ = C._bwrap_plan(build_policy(_entity(home)))
     h = str(home.resolve())
-    i_home = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--ro-bind", h, h])
+    i_home = next(i for i in range(len(argv) - 1) if argv[i:i + 2] == ["--tmpfs", h])
     for sub in ("proj", "dotfiles", "ent"):
         d = str(home.resolve() / sub)
         i_sub = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--bind", d, d])
         assert i_sub > i_home, sub
-    assert not any(a == str(home.resolve() / ".config") for a in argv), "a link stays a (frozen) link"
-    # every deeper mount comes after the read-only bind, or the bind would hide it
-    first_body = min(i for i, a in enumerate(argv) if a in ("--tmpfs",))
+    rc = str(home.resolve() / ".zshrc")
+    assert ["--ro-bind-try", rc, rc] in [argv[i:i + 3] for i in range(len(argv) - 2)]
+    cfg = str(home.resolve() / ".config")
+    assert ["--symlink", str(home / "dotfiles"), cfg] in [argv[i:i + 3] for i in range(len(argv) - 2)]
+    assert argv.count(cfg) == 1, "a link stays a (frozen) link, never a mount"
+    # every deeper mount comes after the view, or the view would hide it; the view goes read-only last
+    first_body = min(i for i, a in enumerate(argv) if a == "--tmpfs" and argv[i + 1] != h)
     assert first_body > i_home
+    assert argv[-2:] == ["--remount-ro", h]
     assert ["--bind", h, h] not in [argv[i:i + 3] for i in range(len(argv) - 2)]
 
 
@@ -508,7 +506,8 @@ def test_linux_plan_accepts_a_home_level_dir_link_and_mounts_at_the_resolved_tar
     cfg = _config_link(home)
     argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
     link = str(home.resolve() / ".config")
-    through_link = [a for a in argv if a == link or a.startswith(link + "/")]
+    through_link = [a for a in argv if a.startswith(link + "/")]
+    assert argv.count(link) == 1 and argv[argv.index(link) - 2] == "--symlink"
     assert through_link == [], "a mount spelled through the link cannot land inside bwrap's new root"
     assert any(a == str(cfg / "gh") or a.startswith(str(cfg / "gh")) for a in argv), "covered at its target"
     assert [str(cfg), str(cfg)] in _ops(argv, "--bind"), "the target is pinned against a rename"
@@ -705,3 +704,30 @@ def test_a_mask_nested_under_a_window_stays_hidden() -> None:
         mounted, _ = C._mount_plan_paths(argv, _P())
     assert str(aws / "sso" / "cache") in mounted
     assert str(aws / "sso" / "cache" / "tok.json") not in mounted
+
+
+@_live
+def test_linux_live_a_netrc_the_host_creates_during_a_running_command_is_unreadable(home: Path) -> None:
+    """Ruling 2026-10-07 (b): no window in which a $HOME-level cred file the host creates mid-session
+    is readable, not even by a command already running when it appears."""
+    import threading
+    import time
+
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                       deny_standard_creds=True))
+
+    def operator_logs_in() -> None:
+        time.sleep(1.5)
+        (home / ".netrc").write_text("machine example.com login u password SECRET-NETRC\n")
+
+    t = threading.Thread(target=operator_logs_in)
+    t.start()
+    try:
+        out = shell.run(f"for i in $(seq 1 40); do cat {home}/.netrc 2>/dev/null && break; "
+                        "sleep 0.1; done; echo END", timeout=30).output
+    finally:
+        t.join()
+        shell.close()
+    assert (home / ".netrc").exists(), "the host side did create it"
+    assert "SECRET-NETRC" not in out and "END" in out

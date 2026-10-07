@@ -1962,9 +1962,13 @@ def test_bwrap_uses_a_dev_null_mount_for_a_socket_in_a_shared_dir(tmp_path, monk
     sock.touch()
     argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
     assert ["--ro-bind", "/dev/null", str(sock.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
-    assert "--tmpfs" not in argv or str(tmp_path.resolve()) not in [
-        argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"
-    ]
+    # $HOME's only tmpfs is step (0)'s view, which carries its entries; the socket is left out of it
+    # (a denied name) and masked there, never hidden by a read-only tmpfs over its directory.
+    h = str(tmp_path.resolve())
+    assert ["--ro-bind-try", str(sock.resolve()), str(sock.resolve())] not in [
+        argv[k:k + 3] for k in range(len(argv))]
+    assert [h] == [argv[k + 1] for k, a in enumerate(argv) if a == "--remount-ro" and argv[k + 1] == h]
+    assert argv[-2:] == ["--remount-ro", h], "the view is made read-only last"
 
 
 def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monkeypatch) -> None:
@@ -2458,6 +2462,9 @@ def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
     the refusal honest (EROFS). Both measured; the pairing is the contract."""
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_read_write, "fixture must produce at least one crown-jewel subtree"
+    # Existing subtrees: an absent one directly in $HOME is simply absent from step (0)'s view.
+    for sub in policy.deny_read_write:
+        sub.mkdir(parents=True, exist_ok=True)
     argv = _bwrap_argv(policy)
     for sub in policy.deny_read_write:
         assert ("--tmpfs", str(sub)) in _pairs(argv, "--tmpfs")
@@ -2491,10 +2498,10 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
     argv = _bwrap_argv(policy)
-    # $HOME is pinned by its own read-only bind (step (0)), not by a second self-bind.
+    # $HOME is pinned by its own view (step (0)'s tmpfs), not by a second self-bind.
     home = str(Path.home().resolve())
-    bound = [argv[k + 2] for k, a in enumerate(argv[:-2])
-             if argv[k + 1] == argv[k + 2] and (a == "--bind" or (a == "--ro-bind" and argv[k + 2] == home))]
+    bound = [argv[k + 2] if a == "--bind" else home for k, a in enumerate(argv[:-2])
+             if (a == "--bind" and argv[k + 1] == argv[k + 2]) or (a == "--tmpfs" and argv[k + 1] == home)]
     for anc in policy.deny_write_dirs:
         # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
         # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
@@ -2535,20 +2542,20 @@ def _store_policy(tmp_path, monkeypatch):
     return build_policy(ent), lv
 
 
-def test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it(tmp_path, monkeypatch) -> None:
-    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv makes bwrap CREATE ~/.ssh to hold
-    the vector mounts; unpinned, the entity could rename it away, make a fresh one and plant
-    ``authorized_keys`` on the host. It must be created and pinned BEFORE any mount inside it."""
+def test_bwrap_an_absent_ssh_dir_needs_nothing_in_the_home_view(tmp_path, monkeypatch) -> None:
+    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv used to make bwrap CREATE ~/.ssh
+    to hold the vector mounts, pinned so it could not be renamed away and replaced with a planted
+    ``authorized_keys``. In step (0)'s read-only $HOME view an absent ~/.ssh cannot be created at
+    all, so nothing is created on the host and nothing is mounted under it (ruling 2026-10-07)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     assert not (tmp_path / ".ssh").exists()
     from levain.firing.confinement import _bwrap_plan
 
     argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path), ssh_mode="raw"))
     ssh = str(tmp_path / ".ssh")
-    assert ssh in create_first, "bwrap cannot pin a dir it creates; the provider must create it first"
-    i_pin = [argv[k:k + 3] for k in range(len(argv))].index(["--bind", ssh, ssh])
-    inside = [k for k, a in enumerate(argv) if a.startswith(ssh + "/")]
-    assert inside and min(inside) > i_pin, "a mount inside ~/.ssh landed before ~/.ssh was pinned"
+    assert ssh not in create_first
+    assert not [a for a in argv if a == ssh or a.startswith(ssh + "/")]
+    assert argv[-2:] == ["--remount-ro", str(tmp_path.resolve())]
 
 
 def test_bwrap_pins_a_home_level_symlinked_jewel_ancestor_at_its_target(tmp_path, monkeypatch) -> None:
@@ -2561,8 +2568,11 @@ def test_bwrap_pins_a_home_level_symlinked_jewel_ancestor_at_its_target(tmp_path
     (tmp_path / ".ssh").symlink_to(real)
     argv = _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
     assert ["--bind", str(real.resolve()), str(real.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
-    assert str(tmp_path / ".ssh") not in argv
-    assert not any(a.startswith(str(tmp_path / ".ssh") + "/") for a in argv)
+    # In the view the link is recreated as the same link; nothing is mounted at or through it.
+    link = str(tmp_path / ".ssh")
+    assert ["--symlink", str(real), link] in [argv[k:k + 3] for k in range(len(argv))]
+    assert argv.count(link) == 1
+    assert not any(a.startswith(link + "/") for a in argv)
 
 
 def test_bwrap_refuses_a_replaceable_symlinked_protected_file(tmp_path, monkeypatch) -> None:
@@ -2639,6 +2649,8 @@ def test_bwrap_distinct_roots_differing_only_in_case_both_keep_their_tmpfs(tmp_p
     swallowed the distinct /x/secret/inner and left it readable. Containment must be exact."""
     monkeypatch.setenv("HOME", str(tmp_path))
     a, b = tmp_path / "Secret", tmp_path / "secret" / "inner"
+    a.mkdir()
+    b.mkdir(parents=True)
     argv = _bwrap_argv(build_policy(_entity(tmp_path), extra_deny_read_write=(a, b)))
     tmpfs = [argv[k + 1] for k, x in enumerate(argv) if x == "--tmpfs"]
     assert str(a) in tmpfs and str(b) in tmpfs
