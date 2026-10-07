@@ -616,7 +616,7 @@ class GitLedger:
         return j.ledger
 
     def judge(self, rev: str, team: R.Team | None, pins: dict[str, dict], pin_problem: str = "", *,
-              lagging: dict[str, dict] | None = None) -> "Judgement":
+              lagging: Trust | None = None) -> "Judgement":
         """THE judgement of the ledger at ``rev``, with no side effect.
 
         Refused (``ledger.tamper`` non-empty, no entries) when the tip tree holds anything but ``ledger`` (a tree),
@@ -631,7 +631,7 @@ class GitLedger:
         Every git failure here raises LedgerReadError: a ledger that cannot be judged is denied, never allowed.
         """
         try:
-            return self._judge(rev, team, pins, pin_problem, lagging or {})
+            return self._judge(rev, team, pins, pin_problem, lagging)
         except LedgerReadError:
             raise
         except TeamError as exc:
@@ -642,7 +642,7 @@ class GitLedger:
         accepted (``files``) must still be there, and what the remote was accepted with (``remote``) must agree as
         far as the branch reaches."""
         rec, problem = self._trust()
-        return self.judge(rev, team, rec.files, problem, lagging=rec.remote)
+        return self.judge(rev, team, rec.files, problem, lagging=rec)
 
     def _judge(self, rev, team, pins, pin_problem, lagging):
         owner = team.owner if team else None
@@ -677,7 +677,9 @@ class GitLedger:
             raise LedgerReadError(f"the ledger holds {lines_in_tree} lines, past levain's limit of "
                                   f"{_MAX_LEDGER_LINES}; the team owner removes the extra files")
         whole = {path[len(b"ledger/"):].decode("ascii"): blobs[sha] for path, sha in leaves}
-        tamper += self._pin_violations(pins, whole) + self._pin_violations(lagging, whole, lag=True)
+        tamper += self._pin_violations(pins, whole)
+        if lagging is not None:
+            tamper += self._lag_violations(lagging, {r: d[:d.rfind(b"\n") + 1] for r, d in whole.items()})
         datas: dict[str, bytes] = {}
         files: list[tuple[str, list[str]]] = []
         problems: list[str] = []
@@ -869,10 +871,9 @@ class GitLedger:
             raise TeamError(f"--pins-from {path}: not a levain pins file (a clone's .git/{DIRNAME}/pins.json)")
         return rec.files
 
-    def _pin_violations(self, pins: dict[str, dict], datas: dict[str, bytes], *, lag: bool = False) -> list[str]:
-        """The files of ``datas`` that do not hold the bytes ``pins`` pin. ``lag``: a missing or shorter file is the
-        local branch not having replayed them yet, and only a file that reaches a pin's length is checked. A file of
-        THIS clone's device is never offered a repin (which would trust whatever replaced its own lines)."""
+    def _pin_violations(self, pins: dict[str, dict], datas: dict[str, bytes]) -> list[str]:
+        """The files of ``datas`` that do not hold the bytes ``pins`` pin. A file of THIS clone's device is never
+        offered a repin (which would trust whatever replaced its own lines)."""
         try:
             mine = f"{self.device}.jsonl" if self.device else None
         except TeamError:
@@ -880,8 +881,6 @@ class GitLedger:
         out = []
         for rel, pin in sorted(pins.items()):
             data = datas.get(rel)
-            if lag and (data is None or len(data) < pin["length"]):
-                continue
             if data is None or len(data) < pin["length"] or \
                     hashlib.sha256(data[:pin["length"]]).hexdigest() != pin["sha256"]:
                 if mine is not None and rel.rpartition("/")[2] == mine:
@@ -893,6 +892,25 @@ class GitLedger:
                            f"To recover: the team owner restores the file on the {BRANCH} branch, or, once someone "
                            "has checked that the rewrite is intended, run `levain team repin` in this clone and then "
                            "`levain team sync`")
+        return out
+
+    def _lag_violations(self, rec: Trust, datas: dict[str, bytes]) -> list[str]:
+        """This clone's branch (``datas``, each file through its last LF) against the bytes ``rec`` accepted from the
+        remote. The branch may be BEHIND them (a fetch accepted more than it has replayed): a file it does not hold
+        yet is fine, and one that reaches a pin's length must hold the pinned bytes. A file SHORTER than its pin must
+        be a prefix of that file in the accepted commit the record names (content-addressed by its sha, so the
+        record still decides): a hash of the longer bytes cannot vouch for a shorter prefix."""
+        long = {r: p for r, p in rec.remote.items() if r in datas and len(datas[r]) >= p["length"]}
+        out = self._pin_violations(long, datas)
+        short = sorted(r for r, p in rec.remote.items() if r in datas and len(datas[r]) < p["length"])
+        if short:
+            keep = set(short)
+            base = self._whole(rec.accepted, lambda r: r in keep) if rec.accepted else {}
+            for rel in short:
+                if rel not in base or not base[rel].startswith(datas[rel]):
+                    out.append(f"ledger/{rel} on this clone's {BRANCH} branch is not what the remote was accepted with; "
+                               f"to recover, run `levain team sync` (it replays the accepted ledger), and if it still "
+                               "refuses, the branch was rewritten locally: restore it from the remote")
         return out
 
     def _accept(self, datas: dict[str, bytes], rev: str) -> str | None:
@@ -910,7 +928,7 @@ class GitLedger:
                     raise LedgerReadError(bad)
                 if rev != self.head() or self._quarantined(rec):
                     return None
-                if self._pin_violations(rec.files, datas) or self._pin_violations(rec.remote, datas, lag=True):
+                if self._pin_violations(rec.files, datas) or self._lag_violations(rec, datas):
                     raise _PinRace()
                 new = Trust(files, rec.accepted, rec.noted(files), rec.remote)
                 digest = self._pins_digest()

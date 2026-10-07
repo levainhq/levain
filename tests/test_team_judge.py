@@ -1625,3 +1625,26 @@ def test_no_broad_handler_on_the_way_can_swallow_the_alarm(two, monkeypatch, cap
                                         "tool_input": {"file_path": str(ben / "src" / "billing.py")},
                                         "tool_use_id": "t"}, monkeypatch, capsys)
     assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
+
+
+def test_a_branch_behind_the_remote_must_be_a_prefix_of_what_was_accepted(two):
+    # codex HIGH on L3 r3: a local file SHORTER than its remote pin was skipped, so a local rewrite to A+C (shorter than
+    # the accepted A+B) passed and was pinned. It is compared against that file in the accepted commit.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)                                                     # pins A
+    assert record_ruling(ana, "src/b.py", "a long ruling " * 40) == 0
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None            # accepts A+B, branch still at A
+    f = gb.wt / "ledger" / "ana" / _own_file(_gl(ana)).name
+    lines = f.read_text().splitlines(keepends=True)
+    e = json.loads(lines[-1])
+    forged = E.seal({**{k: v for k, v in e.items() if k not in ("hash", "prev")}, "id": e["id"][:-8] + "0badf00d",
+                     "words": "forged"}, e["hash"])
+    f.write_text("".join(lines) + json.dumps(forged, ensure_ascii=False, sort_keys=True) + "\n")
+    git("add", "-A", ".", cwd=gb.wt)
+    git("commit", "-qm", "a local rewrite", cwd=gb.wt)
+    assert len(f.read_bytes()) < gb.trust_record().remote[f"ana/{f.name}"]["length"]
+    led = ledger(ben)
+    assert led.tamper and "forged" not in [x.get("words") for x in led.entries]
