@@ -14,7 +14,7 @@ import pytest
 from levain.team import entry as E
 from levain.team.transport import GitLedger, LedgerReadError, Repo
 
-from tests.test_team_git import _own_file, _pins_file, _push_wt, clone, edit, git, ledger, record_ruling, team, two  # noqa: F401
+from tests.test_team_git import _own_file, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
 
 
 def _gl(repo):
@@ -477,3 +477,18 @@ def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two
     finally:
         os.umask(old)
     assert os.stat(ga.wt / "PROJECT.md").st_mode & 0o777 == 0o664
+
+
+def test_a_warning_reaches_the_hook_output_once(two):
+    # E review (complement LOW f), RUN: one team.toml fallback was printed twice at SessionStart, three times at an
+    # edit (each team() read appends it again).
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    (ga.wt / "team.toml").write_text("not = [valid")
+    git("add", "-A", ".", cwd=ga.wt)
+    git("commit", "-qm", "bad toml", cwd=ga.wt)
+    ctx = hook("sessionstart", {"session_id": "s", "cwd": str(ana), "hook_event_name": "SessionStart",
+                                "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("team.toml at the tip is unusable") == 1, ctx
+    ctx = edit(ana, "src/billing.py")["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("team.toml at the tip is unusable") == 1, ctx

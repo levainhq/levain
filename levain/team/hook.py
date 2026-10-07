@@ -217,7 +217,7 @@ def _edit_verdict(gl: GitLedger, repo: Repo, target: str, payload: dict, fetch_n
     handle = gl.handle(team)
     d = decide(team, ledger, handle, rel, session, gl.session_denied(session) if session else set())
     from .transport import WARNINGS
-    notes = [f"[team] {w}" for w in WARNINGS]
+    notes = [f"[team] {w}" for w in dict.fromkeys(WARNINGS)]
     if fetch_note:
         notes.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
@@ -335,7 +335,7 @@ def sessionstart(payload: dict) -> None:
     lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
     from .transport import WARNINGS
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
-    lines += [f"[team] {w}" for w in WARNINGS]
+    lines += [f"[team] {w}" for w in dict.fromkeys(WARNINGS)]
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
