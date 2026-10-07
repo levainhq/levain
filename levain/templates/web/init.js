@@ -350,9 +350,10 @@
   function tokenHeaders(h) { return auth ? auth.headers(h) : h; }
 
   // ---- load ----
-  var loaded = false;
+  var loaded = false, loading = false;
   async function load() {
-    if (loaded) return;
+    if (loaded || loading) return;   // one plan render: the first load and an unlock can overlap
+    loading = true;
     try {
       var sent = auth ? auth.get() : null;
       var res = await fetch("/init-plan.json", { cache: "no-store", headers: tokenHeaders({}) });
@@ -376,6 +377,8 @@
       statusEl.textContent = plan.fields.length + " fields · fill what you know, submit when ready";
     } catch (e) {
       statusEl.textContent = "could not load the interview: " + (e && e.message ? e.message : e);
+    } finally {
+      loading = false;
     }
   }
 

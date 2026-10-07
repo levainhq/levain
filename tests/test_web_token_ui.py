@@ -38,6 +38,7 @@ const byId = { store: store, stamp: stamp, refresh: refresh };
 const document = { body: body, visibilityState: "visible", createElement: (t) => new N(t),
   getElementById: (i) => byId[i] || null, addEventListener() {} };
 const TOKEN = "tok-launch-1";
+let serverToken = TOKEN;   // what the server accepts; a restart changes it
 const MODE = process.argv[4];
 const calls = [];
 let prompted = 0;
@@ -45,7 +46,7 @@ const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
   calls.push({ path: path, method: init.method || "GET", token: hdr["X-Levain-Token"], url: path, body: init.body });
-  if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "this server needs the token printed when it started, sent as X-Levain-Token" });
+  if (hdr["X-Levain-Token"] !== serverToken) return reply(403, { error: "launch_token", message: "this server needs the token printed when it started, sent as X-Levain-Token" });
   if (path === "/substrate.json") return reply(200, { writable: true, paths: {} });
   if (path === "/edit") return reply(200, { ok: true });
   return reply(404, {});
@@ -53,7 +54,7 @@ function fetch(path, init) {
 const replaced = [], kept = new Map();
 const ctx = vm.createContext({ document, fetch, JSON, Promise, Array, Object, String, Date, encodeURIComponent,
   setTimeout: (f) => setImmediate(f),
-  location: { hash: MODE === "fragment" ? "#token=" + TOKEN : "", pathname: "/", search: "" },
+  location: { hash: (MODE === "fragment" || MODE === "hashjunk") ? "#token=" + TOKEN : "", pathname: "/", search: "" },
   history: { replaceState: (s, t, u) => { replaced.push(u); ctx.location.hash = ""; } },
   sessionStorage: { getItem: (k) => (kept.has(k) ? kept.get(k) : null), setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
@@ -71,6 +72,13 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   vm.runInContext(fs.readFileSync(process.argv[3], "utf8"), ctx);
   await sleep(30);
+  if (MODE === "hashjunk") {
+    // L1 2026-10-07: a page holding a reference to this tab can change its fragment. An unlocked page keeps its token.
+    ctx.location.hash = "#token=junk"; (winLs.hashchange || []).forEach((f) => f({})); await sleep(30);
+    ok(ctx.LevainToken.get() === TOKEN && kept.get("levain.token") === TOKEN, "the held token is kept");
+    ok(ctx.location.hash === "" && !lockForm(), "the junk fragment is stripped and nothing locks");
+    console.log("PASS"); return;
+  }
   if (MODE === "fragment") {
     ok(replaced.length === 1 && ctx.location.hash === "", "the fragment is stripped from the address bar");
     ok(calls[0].token === TOKEN && renders === 1 && !lockForm(), "the first read carries the token and renders");
@@ -99,13 +107,15 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
   ok(!lockForm() && renders === 1, "the right token unlocks and the board renders without another click");
   ok(kept.get("levain.token") === TOKEN, "kept in this tab's sessionStorage");
   if (MODE === "writerefused") {
-    // the server restarted (a new token): a write is refused, the form comes back, the edit is not lost to a prompt
-    kept.clear();
+    // the server restarted (a new token): a write sent with the old token is refused, the form comes back, and the
+    // off-box prompt does not fire
+    serverToken = "tok-after-restart";
     const before = calls.length;
-    ctx.LevainToken.lock(null, TOKEN);  // stand-in for a refused read elsewhere on the page
     const r = await transports.commit({ kind: "x" });
+    ok(calls[before].token === TOKEN, "the write carried the token the page held");
     ok(!r.ok && r.error === "launch_token", "a refused write reports launch_token");
     ok(lockForm() && prompted === 0 && calls.length === before + 1, "the form is back; no off-box prompt");
+    ok(ctx.LevainToken.get() === null && !kept.has("levain.token"), "the refused token is dropped");
   }
   console.log("PASS");
 })();
@@ -113,7 +123,7 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange"])
+@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk"])
 def test_the_cockpit_page_sends_the_launch_token_and_unlocks_in_place(tmp_path, mode):
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)

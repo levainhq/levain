@@ -34,8 +34,8 @@
   // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
   // factor that replaces loopback-is-auth once the surface leaves the machine. The server
   // signals it via `view.write_token_required` (set in load()); we hold the device's token in
-  // localStorage and attach it. On a loopback (default) surface this stays false and the
-  // localhost-sovereign token-free path is unchanged. (This localStorage entry is the
+  // localStorage and attach it. On a loopback (default) surface this stays false: no off-box
+  // token is asked for (the launch token, token.js, is a separate factor and is always sent). (This localStorage entry is the
   // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
   // and injects the same header — the server gate underneath is identical.)
   //
@@ -215,7 +215,7 @@
   }
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
-  // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
+  // /job.json off-box; no off-box token on loopback/read-only, the launch token everywhere). Throws on a non-OK (incl. the fail-closed
   // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
   async function pollJob(jobId) {
     return authedReadJson("/job.json?id=" + encodeURIComponent(jobId));
@@ -276,8 +276,9 @@
       // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
       // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
       // substrate.json, the chicken-and-egg). A token-class 403 means "off-box surface, token needed":
-      // prompt once, store, retry. A read-only mesh surface never 403s here (its reads are token-free),
-      // so it never prompts — iPad VIEWING stays open. The token, once entered, also unlocks writes.
+      // prompt once, store, retry. A read-only mesh surface never asks for the off-box token (it gates
+      // only a writable off-box bind), so it never prompts here. (A launch-token 403 is not this one:
+      // isTokenReject hands it to token.js's unlock form and returns false.) The token, once entered, also unlocks writes.
       if (res.status === 403 && await isTokenReject(res, sent)) {
         // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
         // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard

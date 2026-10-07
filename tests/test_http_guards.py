@@ -32,18 +32,37 @@ GUARD_METHODS = tuple(
 _TOKEN = "test-launch-token-guards"
 
 SECURITY_HEADERS = ("Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options",
-                    "Cache-Control")
+                    "Cache-Control", "Referrer-Policy")
+
+
+# The team view's handler still routes its own do_GET (the launch token for `levain team view` lands with the team
+# lane, after this one). Strict, so the day it moves onto `_route` this marker fails and has to be removed.
+_NOT_YET_ON_THE_SHARED_GUARDS = {"_ViewHandler": "levain team view: launch token pending (np-ebb8a399, team half)"}
 
 
 def _handlers():
-    from levain.docs_server import _DocsHandler
-    from levain.init_server import _InitHandler
-    from levain.web_server import _Handler
+    """Every GuardedHandler subclass in the package, found by walking the class tree (L1 2026-10-07: a hand-written
+    list of three missed the fourth server, whose own do_GET skipped the launch token)."""
+    import importlib
+    import pkgutil
 
-    return [_Handler, _InitHandler, _DocsHandler]
+    import levain
+
+    for mod in pkgutil.walk_packages(levain.__path__, "levain."):
+        if mod.name.endswith(("server", "view")) or ".team." in mod.name:
+            importlib.import_module(mod.name)
+    found, todo = [], [GuardedHandler]
+    while todo:
+        for sub in todo.pop().__subclasses__():
+            if sub.__module__.startswith("levain.") and sub not in found:
+                found.append(sub)
+                todo.append(sub)
+    assert len(found) >= 3
+    return [pytest.param(c, id=c.__name__, marks=pytest.mark.xfail(strict=True, reason=_NOT_YET_ON_THE_SHARED_GUARDS[c.__name__]))
+            if c.__name__ in _NOT_YET_ON_THE_SHARED_GUARDS else pytest.param(c, id=c.__name__) for c in found]
 
 
-@pytest.mark.parametrize("cls", _handlers(), ids=lambda c: c.__name__)
+@pytest.mark.parametrize("cls", _handlers())
 def test_every_server_inherits_the_guards_and_copies_none(cls):
     assert issubclass(cls, GuardedHandler)
     assert {"_refuse_read", "_refuse_oversize", "_declared_length", "_refuse_untokened_read",

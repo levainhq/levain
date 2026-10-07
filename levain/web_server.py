@@ -148,7 +148,7 @@ _MAX_INFLIGHT = 8
 # write MUST then carry a shared token the device holds, in this header, constant-time
 # compared against the token ``make_server`` was given. This is NOT a seat-layer password;
 # it is the factor that replaces loopback when the write surface leaves the machine.
-# Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
+# Loopback binds need no write token (the check below is skipped for a loopback-bound server).
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 
 # Loopback names a request's Host header may legitimately carry. A DNS-rebinding
@@ -398,7 +398,7 @@ def build_substrate_json(
     # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
     # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see _post).
     # It tells the frontend to attach the device-held token; on a loopback-bound (or read-only)
-    # surface it stays false and the localhost-sovereign token-free path is unchanged. The
+    # surface it stays false and no write token is asked for (the launch token is separate). The
     # handler computes the predicate (it owns the bound-address fact); default False here.
     assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
     payload["write_token_required"] = write_token_required
@@ -551,7 +551,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # OFF-BOX write auth (spore-129). ``is_loopback_bind`` is computed from the ACTUAL bound
     # address (un-foolable) and gates whether POST /edit requires a token. ``write_token`` is
     # the shared secret an off-loopback writable surface demands; None on a loopback-bound or
-    # read-only server (then the token check is skipped — the localhost path stays token-free).
+    # read-only server (then the token check is skipped — the localhost path needs no write token).
     is_loopback_bind: bool
     write_token: str | None
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
@@ -625,7 +625,8 @@ class _Handler(GuardedHandler):
         writes (spore-129), so a read can never be served under weaker auth than a write. Mirrors
         the _post + _route gates EXACTLY, so the frontend ``write_token_required`` signal can
         never disagree with the server's enforcement. Loopback-bound or read-only → False (a
-        read-only mesh bind stays token-free — iPad/iPhone VIEWING is unauthenticated by design)."""
+        read-only mesh bind needs no write token — iPad/iPhone VIEWING needs only the launch
+        token, and only if make_server was given one)."""
         return (
             not self.server.is_loopback_bind
             and self.server.levain_source.write_scope is not None
@@ -656,7 +657,8 @@ class _Handler(GuardedHandler):
         # node reads the full store (``/substrate.json`` / ``/recall.json`` / ``/job.json`` / a
         # downstream ``extra_json`` view) token-free over plain HTTP. Same predicate + constant-time
         # compare as ``_post`` (the two shared helpers), so a read is never served under weaker auth
-        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind
+        # than a write. Two deliberate carve-outs need no write token (the launch token, when the
+        # server has one, was checked before this): (1) a read-ONLY mesh bind
         # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
         # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
         # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
@@ -926,7 +928,7 @@ class _Handler(GuardedHandler):
         # into the two shared helpers so a write can never be served under weaker auth than a read
         # (or vice-versa). Fail CLOSED if off-loopback yet token-less (make_server refuses to bind a
         # writable off-loopback source WITHOUT a token, so reaching here token-less is defense-in-
-        # depth). A loopback bind skips this — the localhost-sovereign token-free path is unchanged.
+        # depth). A loopback bind skips this — the localhost path needs no write token.
         # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
         # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
         if self._write_token_required() and not self._off_box_token_valid():
@@ -1057,7 +1059,7 @@ def make_server(
       WireGuard) is the access boundary;
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
-      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no token
+      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no write token
       (the localhost-sovereign path is unchanged). Without a token a writable source stays
       loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
@@ -1102,7 +1104,7 @@ def make_server(
             )
         # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
         # the off-box governance factor that replaces loopback-is-auth. Without one it stays
-        # loopback-only (its no-token localhost-sovereign POST /edit boundary assumes loopback).
+        # loopback-only (its write-token-free POST /edit boundary assumes loopback).
         # `not write_token` (not `is None`): an EMPTY-string token must also refuse the bind, not
         # bind-then-brick. The per-request gate already treats "" as no-token (`not expected` →
         # 403), so without this an off-box writable bind with write_token="" would pass here and
@@ -1250,7 +1252,7 @@ def make_server(
     httpd.token_free_paths = frozenset(_ASSETS) | frozenset(extra_assets)
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
-    # server skips the POST /edit token check (the token-free localhost-sovereign path is
+    # server skips the POST /edit token check (the write-token-free localhost path is
     # unchanged); an off-loopback writable bind enforces ``write_token`` (the bind-refusal
     # above already guaranteed a writable off-loopback source was given one).
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))

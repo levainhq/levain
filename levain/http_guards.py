@@ -117,6 +117,9 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        # No page here has a reason to tell another site where it was opened from (a docs link to an outside
+        # site would otherwise carry this loopback URL in its Referer).
+        self.send_header("Referrer-Policy", "no-referrer")
         # Snapshots are per-request; never let a browser cache a stale one.
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
@@ -297,8 +300,9 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
     # DENY BY DEFAULT. The guards run HERE, before a server's own routing is reached: the Host allowlist, the
     # cross-site refusal and the launch token for a read; the Host allowlist, the write-origin check and the launch
-    # token for a POST. A server defines ``_route`` and ``_post`` and never the ``do_*`` methods, so a route it adds
-    # later is behind every guard without writing one.
+    # token for a POST. A server defines ``_route`` and ``_post``, not the ``do_*`` methods, so a route it adds later
+    # is behind every guard without writing one. tests/test_http_guards.py walks every subclass and fails on one
+    # that defines its own ``do_*``.
 
     def _route(self, *, head: bool) -> None:  # pragma: no cover — every server defines its own
         raise NotImplementedError

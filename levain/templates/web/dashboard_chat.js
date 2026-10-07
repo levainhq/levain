@@ -75,8 +75,14 @@
   // ---- a refused token ---------------------------------------------------------------------------------------
   // Whatever token led here is not used again: the session is let go (nothing more can be decided from it), the
   // panel says why when there is something to say, and token.js shows the one unlock form. `r` is the refused answer.
+  // The message is also kept for the picker the unlock brings back, so entering the token does not erase the word
+  // that the last request's outcome is unknown. A refusal of a token the page has already replaced (an unlock
+  // happened while it was in flight) shows no form: the picker comes back at once, with the message.
+  let lostNote = null;
   function showTokenPrompt(message, r) {
     session = null; run++; deciding = false;
+    lostNote = message || null;
+    if (r && auth && auth.get() && r.sent !== auth.get()) { loadListing(false); return; }
     if (message) { ensurePanel(); clear(body); note("chat-err", message); }
     else if (panel) { panel.remove(); panel = null; }
     if (auth) auth.lock(null, r ? r.sent : undefined);
@@ -106,6 +112,7 @@
   function showPicker(listing) {
     session = null; run++; deciding = false;
     ensurePanel(); clear(body);
+    if (lostNote) { note("chat-err", lostNote); lostNote = null; }
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
     // One entity: one click starts a session on it. The picker appears only when there is a choice to make.
     const row = el("div", "chat-row");

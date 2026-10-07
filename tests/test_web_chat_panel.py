@@ -72,9 +72,10 @@ def test_no_innerhtml_and_the_token_is_kept_only_in_this_tabs_session_storage():
     assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(KEY[^)]*\)", tok)} == {
         "sessionStorage.getItem(KEY)", "sessionStorage.setItem(KEY, t)", "sessionStorage.removeItem(KEY)"}
     assert tok.count("sessionStorage.") == 3   # those three calls and no other use
-    # the fragment is read in one place, and the address bar is rewritten without it there
-    assert tok.count("location.hash") == 1 and tok.count("location.search") == 1
-    assert 'history.replaceState(null, "", location.pathname + location.search)' in tok
+    # the fragment is read where the token is taken and where a later one is refused (an unlocked page's hashchange);
+    # both rewrite the address bar without it, the same way
+    assert tok.count("location.hash") == 2 and tok.count("location.search") == 2
+    assert tok.count('history.replaceState(null, "", location.pathname + location.search)') == 2
 
 
 HARNESS = r"""
@@ -117,7 +118,7 @@ function fetch(path, init) {
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
-  if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat/turn" && (process.argv[3] === "turn403json" || process.argv[3] === "turn403unlock")) return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
@@ -303,6 +304,15 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
     console.log("PASS"); return;
   }
+  if (process.argv[3] === "turn403unlock") {
+    // L1 2026-10-07: entering the token again brought the picker back and erased the word that the turn's outcome is
+    // unknown. The unlock form is token.js's; the message has to survive it.
+    ok(lockForm(), "the refusal shows the unlock form");
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    const p2 = chatPanel();
+    ok(p2 && byText(p2, "Start session") && p2.textContent.includes("may already have run"), "the picker returns with the unknown-outcome note");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "turn500" || process.argv[3] === "turn409") {
     ok(!panel.textContent.includes("Held for your approval"), "no consent box from a turn POST without a clear answer");
     ok(!calls.some((c) => c.path === "/chat/session.json"), "the session is not read on its own");
@@ -459,7 +469,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities",
                                   "leakafterapprove", "leaklastjob",

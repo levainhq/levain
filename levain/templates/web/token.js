@@ -2,7 +2,7 @@
 //
 // Each server generates a token when it starts and refuses every request without it, except this page shell. It opens
 // the page with the token in the URL FRAGMENT (#token=..., which a browser never sends to a server, so it reaches no
-// log and no Referer); this file reads it, keeps it in this tab's sessionStorage, and strips it from the address bar at
+// server log and no Referer; the browser's own history may still record the link as it was opened); this file reads it, keeps it in this tab's sessionStorage, and strips it from the address bar at
 // once. A token is used only once that strip succeeded: a token still showing in the address bar is not taken. The
 // token printed in the terminal, typed into the unlock form, is the fallback (a headless box, a second browser, a
 // platform where the page was opened without it). It is never put in a cookie, storage that outlives the browser
@@ -87,9 +87,17 @@
   }
 
   // The unlocked link opened in a tab already showing this page changes only the fragment, and a browser does not
-  // reload for that: the page is still the locked one. Take the token from the new fragment the same way.
+  // reload for that: the page is still the locked one. Take the token from the new fragment the same way, but only
+  // while the page is locked: a page that holds a window reference to this one can change its fragment, and an
+  // unlocked page must not let that swap its token for junk.
   try {
     window.addEventListener("hashchange", () => {
+      if (token && !form) {   // unlocked: drop the fragment from the address bar, keep the token held
+        try {
+          if (/^#(?:chat_)?token=/.test(location.hash)) history.replaceState(null, "", location.pathname + location.search);
+        } catch (e) { /* nothing to strip with */ }
+        return;
+      }
       const t = take();
       if (t && t !== token) { token = t; unlocked(); }
     });

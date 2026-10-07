@@ -118,7 +118,9 @@
   // read runs again once a token is entered.
   var auth = window.LevainToken;
   var LOCKED = {};
+  var rendered = false;   // render() removes #status, so a second render (two overlapping loads) must not run
   function load() {
+    if (rendered) return;
     var sent = auth ? auth.get() : null;
     var headers = { Accept: "application/json" };
     if (auth) auth.headers(headers);
@@ -136,6 +138,8 @@
       })
       .then(function (data) {
         if (data === LOCKED) { fail("Locked: enter the token the server printed when it started."); return; }
+        if (rendered) return;
+        rendered = true;
         render(data);
       })
       .catch(function (e) {
