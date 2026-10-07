@@ -103,7 +103,7 @@ body.appendChild(bar); body.appendChild(board);
 const document = { body: body, createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
   getElementById: (i) => (i === "board" ? board : null) };
 let sessionReads = 0, jobReads = 0;
-const TOKEN = "tok-123";
+const TOKEN = "tok-12345";
 const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09];
 const hex = (c) => "\\u{" + c.toString(16).toUpperCase().padStart(4, "0") + "}";
 const LEAK = "_editor<arg_key>command</arg_key><arg_value>create</arg_value><arg_key>path</arg_key><arg_value>t\u00e9st.txt";
@@ -183,7 +183,7 @@ const MODE = process.argv[3], store = new Map(), replaced = [];
 const extra = {};
 if (["fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "malformedfragment", "replacethrows"].includes(MODE)) {
   extra.location = { hash: { fragment: "#token=" + TOKEN, legacyfragment: "#chat_token=" + TOKEN, storagethrows: "#token=" + TOKEN,
-    badfragment: "#token=nope", malformedfragment: "#token=" + TOKEN + "=&x", replacethrows: "#token=" + TOKEN, stored: "" }[MODE],
+    badfragment: "#token=nope-nope", malformedfragment: "#token=" + TOKEN + "=&x", replacethrows: "#token=" + TOKEN, stored: "" }[MODE],
     pathname: "/", search: "" };
   extra.history = { replaceState: (s, t, u) => { if (MODE === "replacethrows") throw new Error("SecurityError"); replaced.push(u); extra.location.hash = ""; } };
   extra.sessionStorage = MODE === "storagethrows"
@@ -261,7 +261,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
   const pw = find(lockForm(), (n) => n.tagName === "input");
   ok(pw.type === "password", "token field is a password input");
   // wrong token first
-  pw.value = "nope"; lockForm().fire("submit", {}); await sleep(30);
+  pw.value = "nope-nope"; lockForm().fire("submit", {}); await sleep(30);
   ok(lockForm() && lockForm().textContent.includes("not accepted"), "wrong token is reported");
   ok(!chatPanel(), "and still no panel");
   const pw2 = find(lockForm(), (n) => n.tagName === "input"); pw2.value = TOKEN;

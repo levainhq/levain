@@ -1363,11 +1363,19 @@ def open_running(port: int, *, stream: "Any | None" = None) -> int:
         print(f"The server on port {port} did not give a link: {exc}", file=sys.stderr)
         return 1
     unlocked = f"{rec['url']}#code={code}"
-    _open_browser(rec["url"], unlocked)
-    print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}).", file=out, flush=True)
-    if bool(getattr(out, "isatty", lambda: False)()):
-        print(f"  if it opened locked, this link works once: {unlocked}", file=out, flush=True)
-    return 0
+    tty = bool(getattr(out, "isatty", lambda: False)())
+    if _open_browser(rec["url"], unlocked):
+        print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}).", file=out, flush=True)
+        if tty:
+            print(f"  if it opened locked, this link works once: {unlocked}", file=out, flush=True)
+        return 0
+    # No browser took the link (codex L3: "Opened" was printed regardless).
+    if tty:
+        print(f"Could not open a browser here. This link works once: {unlocked}", file=out, flush=True)
+        return 0
+    print(f"Could not open a browser, and this output is not a terminal, so the link is not printed. "
+          f"Run `levain serve --open-running --port {port}` from a terminal.", file=sys.stderr)
+    return 1
 
 
 def run_web_server(

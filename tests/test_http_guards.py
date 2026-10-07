@@ -509,7 +509,7 @@ def test_a_link_code_unlocks_once_and_the_token_never_rides_the_link(tmp_path, m
         pub = publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="serve", stream=io.StringIO())
         assert "#code=" in pub.unlocked and _TOKEN not in pub.unlocked
         opened = []
-        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: opened.append(unlocked))
+        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: opened.append(unlocked) or True)
         out = io.StringIO()
         assert ws.open_running(port, stream=out) == 0
         assert opened[0].startswith(f"http://127.0.0.1:{port}/#code=") and _TOKEN not in opened[0] + out.getvalue()
@@ -565,12 +565,17 @@ def test_a_link_code_expires(tmp_path, monkeypatch):
 
     import levain.http_guards as hg
 
-    now = [1000.0]
-    monkeypatch.setattr(hg, "_link_clock", lambda: now[0])
-    srv = SimpleNamespace(launch_token=_TOKEN)
-    code = hg.mint_link_code(srv)
-    now[0] += hg.LINK_CODE_SECONDS + 1
-    assert hg._spend_link_code(srv, code) is False
+    # either clock passing the deadline expires a code: the wall clock (it runs during sleep, macOS's monotonic one
+    # does not) and the monotonic one (immune to a wall clock set back)
+    for advance in ((0, 1), (1, 0)):
+        now = [1000.0, 5000.0]
+        monkeypatch.setattr(hg, "_now", lambda: (now[0], now[1]))
+        srv = SimpleNamespace(launch_token=_TOKEN)
+        code = hg.mint_link_code(srv)
+        assert hg._spend_link_code(srv, hg.mint_link_code(srv)) is True
+        now[0] += advance[0] * (hg.LINK_CODE_SECONDS + 1)
+        now[1] += advance[1] * (hg.LINK_CODE_SECONDS + 1)
+        assert hg._spend_link_code(srv, code) is False
 
 
 def test_a_do_method_from_a_mixin_is_refused_too():
@@ -682,3 +687,37 @@ def test_a_terminal_hears_when_the_runtime_file_could_not_be_written(tmp_path, m
     publish_launch_token(SimpleNamespace(launch_token=_TOKEN), "http://127.0.0.1:7488/", port=7488, kind="serve",
                          stream=out)
     assert _TOKEN in out.getvalue() and "could not write" in out.getvalue()
+
+
+def test_link_round_two_review_fixes(tmp_path, monkeypatch):
+    """L3 8a52a0cce9e685ed: a /link proof binds a time (a request replayed after its nonce is forgotten is stale);
+    the nonce memory exists from arming, so two first requests share it; --open-running that opened no browser
+    says so and fails rather than printing "Opened"."""
+    import io
+    import time as _time
+
+    import levain.http_guards as hg
+    import levain.web_server as ws
+    from levain.dashboard import AnnealPaths, SubstrateSource
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    httpd = ws.make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
+                           read_token=_TOKEN)
+    assert httpd.link_nonces == {}
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = httpd.server_address[1]
+        old = str(int(_time.time()) - hg.LINK_SKEW_SECONDS - 5)
+        nonce = "n" * 24
+        got = _raw_post(port, "/link", {"X-Levain-Token": "", "X-Levain-Link-Nonce": nonce, "X-Levain-Link-Time": old,
+                                        "X-Levain-Link-Proof": hg._link_proof(_TOKEN, "levain-link-request", nonce, old)})
+        assert got[0] == 403
+        pub = hg.publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="serve", stream=io.StringIO())
+        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: False)
+        assert ws.open_running(port, stream=io.StringIO()) == 1
+        pub.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)

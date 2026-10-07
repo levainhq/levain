@@ -27,6 +27,9 @@
   // The fragment the server opened the page with wins; otherwise what this tab kept. `#chat_token=` is the fragment
   // the chat panel was opened with before one token covered every route. Storage can be absent or throw (a private
   // window, blocked site data), so every access is guarded and the form is the fallback.
+  // A token is 8 to 256 characters of URL-safe base64, the shape the server accepts (codex L3: a longer one, pasted
+  // or kept, made every request fail before it reached the server, and a reload brought it back).
+  function tokenShaped(t) { return typeof t === "string" && t.length >= 8 && t.length <= 256 && /^[A-Za-z0-9_-]+$/.test(t); }
   function take() {
     let t = null;
     try {
@@ -36,7 +39,7 @@
       if (c || m) history.replaceState(null, "", location.pathname + location.search);
       if (c && /^[A-Za-z0-9_-]+$/.test(c[1])) pendingCode = c[1];
       if (m) {
-        if (/^[A-Za-z0-9_-]+$/.test(m[2])) t = m[2];
+        if (tokenShaped(m[2])) t = m[2];
         if (m[1]) {
           try { console.warn("levain: the #chat_token= link is deprecated; the server now prints a single-use #code= link."); }
           catch (e) { /* no console */ }
@@ -44,7 +47,11 @@
       }
     } catch (e) { t = null; /* no location or history, or the strip failed: the form still works */ }
     if (t) { keep(t); return t; }
-    try { return sessionStorage.getItem(KEY) || null; } catch (e) { return null; }
+    try {
+      const kept = sessionStorage.getItem(KEY);
+      if (kept && !tokenShaped(kept)) { drop(); return null; }
+      return kept || null;
+    } catch (e) { return null; }
   }
   function keep(t) { try { sessionStorage.setItem(KEY, t); } catch (e) { /* held in memory only */ } }
   function drop() { token = null; try { sessionStorage.removeItem(KEY); } catch (e) { /* nothing kept */ } }
@@ -85,10 +92,10 @@
         ev.preventDefault();
         const t = input.value.trim();
         if (!t) return;
-        if (!/^[A-Za-z0-9_-]+$/.test(t)) {
+        if (!tokenShaped(t)) {
           // A header value must be plain ASCII, and a printed token is only these characters (codex L3 r2: anything
           // else made fetch throw before a request left, so no refusal ever brought the form back).
-          noteEl.textContent = "That is not a token: the printed token uses only letters, digits, - and _.";
+          noteEl.textContent = "That is not a token: a token is 8 to 256 letters, digits, - and _.";
           noteEl.hidden = false;
           return;
         }
@@ -120,7 +127,7 @@
       .then(() => {
         exchanging = false;
         pendingCode = null;
-        if (typeof traded === "string" && /^[A-Za-z0-9_-]+$/.test(traded)) {
+        if (tokenShaped(traded)) {
           token = traded; keep(traded); deferredLock = null;
           unlocked();
         } else if (token) {

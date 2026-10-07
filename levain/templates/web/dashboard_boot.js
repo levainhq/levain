@@ -94,7 +94,9 @@
   }
   // The launch-token refusal (token.js): a 403 whose JSON says error "launch_token". Checked BEFORE the off-box
   // matcher below, whose /token/i would also match its message. `sent` is the launch token the request carried.
+  let lastLaunchRefusal = false;   // the last parsed 403 was the launch token's (not Host / cross-site)
   function launchRefused(status, data, sent) {
+    lastLaunchRefusal = !!(data && data.error === "launch_token");
     if (!(window.LevainToken && window.LevainToken.isRefusal(status, data))) return false;
     window.LevainToken.lock(sent ? "That token was not accepted." : null, sent);
     return true;
@@ -106,6 +108,7 @@
   // message ("missing or invalid write token") and is DUPLICATED in flow's fleetview_web.py — tighten
   // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
   async function isTokenReject(res, sent) {
+    lastLaunchRefusal = false;
     try {
       const d = await res.json();
       if (launchRefused(res.status, d, sent)) return false;
@@ -306,7 +309,10 @@
           return;
         }
       }
-      if (res.status === 403 && !sentLaunchToken()) { status("locked — see the form at the top of the page"); return; }
+      // "locked" only for the launch token's own refusal: a Host or cross-site 403 shows no form (complement L3).
+      if (res.status === 403 && !sentLaunchToken() && lastLaunchRefusal) {
+        status("locked — see the form at the top of the page"); return;
+      }
       // Refused for a launch token the page has since replaced: the unlock's own load() was latched behind this
       // one (pendingReload) and re-reads with the new token as soon as this returns (complement L3 r1).
       if (res.status === 403 && sent !== sentLaunchToken()) return;

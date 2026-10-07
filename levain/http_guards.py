@@ -77,6 +77,8 @@ LINK_PATH = "/link"       # mints a fresh link code (`levain serve --open-runnin
 # port, a proxy) learns nothing it can use and cannot hand back a code the caller will open (L2 2026-10-07).
 LINK_NONCE_HEADER = "X-Levain-Link-Nonce"
 LINK_PROOF_HEADER = "X-Levain-Link-Proof"
+LINK_TIME_HEADER = "X-Levain-Link-Time"   # the request's wall-clock second, inside the proof
+LINK_SKEW_SECONDS = 120                   # a proof older (or newer) than this is refused; nonces are kept longer
 
 
 def _link_proof(token: str, *parts: str) -> str:
@@ -446,10 +448,13 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         nonce = (self.headers.get(LINK_NONCE_HEADER) or "").strip()
         proof = (self.headers.get(LINK_PROOF_HEADER) or "").strip()
+        stamp = (self.headers.get(LINK_TIME_HEADER) or "").strip()
         token = self.server.launch_token
-        if (len(nonce) < 16 or not _token_shaped(nonce) or not proof
+        # The proof binds a time, so a request seen once cannot be replayed after its nonce is forgotten (gemini L3).
+        fresh = stamp.isascii() and stamp.isdigit() and abs(time.time() - int(stamp)) <= LINK_SKEW_SECONDS
+        if (len(nonce) < 16 or not _token_shaped(nonce) or not proof or not fresh
                 or not hmac.compare_digest(proof.encode("utf-8"),
-                                           _link_proof(token, "levain-link-request", nonce).encode("utf-8"))):
+                                           _link_proof(token, "levain-link-request", nonce, stamp).encode("utf-8"))):
             return self._send_json({"error": "link_proof", "message": "a link needs proof of this server's token"}, 403)
         if not _first_use_of_nonce(self.server, nonce):
             return self._send_json({"error": "link_proof", "message": "that request was already answered"}, 403)
@@ -485,10 +490,11 @@ def arm_launch_token(server: Any, token: "str | None", token_free_paths: "frozen
     server.launch_token = token
     server.token_free_paths = frozenset(token_free_paths)
     server.link_codes = {}
+    server.link_nonces = {}
     server.link_codes_lock = threading.Lock()
 
 
-def _link_state(server: Any) -> "tuple[dict[str, float], threading.Lock]":
+def _link_state(server: Any) -> "tuple[dict[str, tuple[float, float]], threading.Lock]":
     codes = getattr(server, "link_codes", None)
     lock = getattr(server, "link_codes_lock", None)
     if codes is None or lock is None:
@@ -497,34 +503,36 @@ def _link_state(server: Any) -> "tuple[dict[str, float], threading.Lock]":
     return codes, lock
 
 
-def _link_clock() -> float:
-    """Seconds on a clock that keeps running while the machine sleeps (L2 2026-10-07: macOS's time.monotonic stops
-    during sleep, so a code printed before the lid closed outlived its 10 minutes). CLOCK_MONOTONIC counts sleep on
-    macOS; elsewhere CLOCK_BOOTTIME does; wall time is the fallback."""
-    for name in ("CLOCK_BOOTTIME", "CLOCK_MONOTONIC") if sys.platform != "darwin" else ("CLOCK_MONOTONIC",):
-        clk = getattr(time, name, None)
-        if clk is not None:
-            try:
-                return time.clock_gettime(clk)
-            except OSError:
-                continue
-    return time.time()
+def _now() -> "tuple[float, float]":
+    """(monotonic, wall) seconds. A deadline holds while BOTH are short of it: the monotonic clock is immune to a wall
+    clock set back, and the wall clock keeps running through sleep, which macOS's monotonic clock does not (L2 + codex
+    L3 2026-10-07: a code printed before the lid closed outlived its 10 minutes)."""
+    return time.monotonic(), time.time()
+
+
+def _deadline(seconds: float) -> "tuple[float, float]":
+    mono, wall = _now()
+    return mono + seconds, wall + seconds
+
+
+def _expired(deadline: "tuple[float, float]", now: "tuple[float, float]") -> bool:
+    return now[0] >= deadline[0] or now[1] >= deadline[1]
 
 
 def _first_use_of_nonce(server: Any, nonce: str) -> bool:
     """True the first time ``nonce`` proves a /link request on this server (within LINK_CODE_SECONDS), so a request
     seen once cannot be replayed to mint more codes (complement L3)."""
     _codes, lock = _link_state(server)
-    seen = getattr(server, "link_nonces", None)
-    if seen is None:
-        seen = server.link_nonces = {}
-    now = _link_clock()
-    with lock:
-        for n in [n for n, exp in seen.items() if exp <= now]:
+    now = _now()
+    with lock:   # created under the lock (L3 consensus: two first requests could each make their own dict)
+        seen = getattr(server, "link_nonces", None)
+        if seen is None:
+            seen = server.link_nonces = {}
+        for n in [n for n, exp in seen.items() if _expired(exp, now)]:
             del seen[n]
         if nonce in seen:
             return False
-        seen[nonce] = now + LINK_CODE_SECONDS
+        seen[nonce] = _deadline(LINK_CODE_SECONDS)
         return True
 
 
@@ -532,11 +540,11 @@ def mint_link_code(server: Any) -> str:
     """A fresh single-use link code for ``server`` (see ``LINK_CODE_HEADER``)."""
     codes, lock = _link_state(server)
     code = new_launch_token()
-    now = _link_clock()
+    now = _now()
     with lock:
-        for c in [c for c, exp in codes.items() if exp <= now]:
+        for c in [c for c, exp in codes.items() if _expired(exp, now)]:
             del codes[c]
-        codes[code] = now + LINK_CODE_SECONDS
+        codes[code] = _deadline(LINK_CODE_SECONDS)
     return code
 
 
@@ -544,12 +552,12 @@ def _spend_link_code(server: Any, code: str) -> bool:
     """True, once, for a code this server minted and has not seen expire. Compared in constant time against every
     live code, so the answer's timing does not depend on how much of a code matches."""
     codes, lock = _link_state(server)
-    now = _link_clock()
+    now = _now()
     supplied = code.encode("utf-8")
     with lock:
         hit = None
         for c, exp in list(codes.items()):
-            if hmac.compare_digest(c.encode("utf-8"), supplied) and exp > now:
+            if hmac.compare_digest(c.encode("utf-8"), supplied) and not _expired(exp, now):
                 hit = c
         if hit is None:
             return False
@@ -572,6 +580,30 @@ def _private_runtime_dir() -> Path:
     return d
 
 
+class _PortLock:
+    """An exclusive flock on ``~/.levain-runtime/.<port>.lock`` around a record's write and its conditional removal,
+    so one server's close cannot remove another's just-published record between the read and the unlink (codex L3).
+    A no-op where fcntl is missing."""
+
+    def __init__(self, d: Path, port: int) -> None:
+        self.path = d / f".{int(port)}.lock"
+        self.fd: "int | None" = None
+
+    def __enter__(self) -> "_PortLock":
+        try:
+            import fcntl
+
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except ImportError:
+            self.fd = None
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)   # closing releases the flock
+
+
 @dataclass
 class PublishedToken:
     """What :func:`publish_launch_token` did: the unlocked URL, and the runtime file to remove at shutdown."""
@@ -586,9 +618,10 @@ class PublishedToken:
         if self.path is None:
             return
         try:
-            rec = json.loads(self.path.read_text(encoding="utf-8"))
-            if rec.get("pid") == os.getpid() and rec.get("token") == self.token:
-                self.path.unlink()
+            with _PortLock(self.path.parent, int(self.path.stem)):
+                rec = json.loads(self.path.read_text(encoding="utf-8"))
+                if rec.get("pid") == os.getpid() and rec.get("token") == self.token:
+                    self.path.unlink()
         except (OSError, ValueError):
             pass
 
@@ -614,14 +647,15 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
         d = _private_runtime_dir()
         path = d / f"{int(port)}.json"
         tmp = d / f".{int(port)}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid()}, fh)
-            os.replace(tmp, path)
-        except OSError:
-            tmp.unlink(missing_ok=True)
-            raise
+        with _PortLock(d, port):
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid()}, fh)
+                os.replace(tmp, path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
     except OSError as exc:
         err, path = exc, None
     tty = bool(getattr(out, "isatty", lambda: False)())
@@ -647,6 +681,8 @@ def read_running(port: int) -> dict[str, Any]:
     pid = rec.get("pid")
     if not isinstance(pid, int) or not isinstance(rec.get("token"), str) or not isinstance(rec.get("url"), str):
         raise ValueError(f"{path} is not a Levain runtime record")
+    if sys.platform == "win32":
+        return rec   # os.kill(pid, 0) sends CTRL_C on Windows; request_link_code's proof check is what refuses a stranger
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -675,9 +711,11 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     if parts.scheme != "http" or not loopback or parts.port is None:
         raise ValueError(f"refusing to ask {url!r} for a link: not an http loopback origin")
     nonce = secrets.token_urlsafe(24)
+    stamp = str(int(time.time()))
     req = urllib.request.Request(
         f"http://{parts.netloc}{LINK_PATH}", data=b"", method="POST",
-        headers={LINK_NONCE_HEADER: nonce, LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce)})
+        headers={LINK_NONCE_HEADER: nonce, LINK_TIME_HEADER: stamp,
+                 LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce, stamp)})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
         reply = json.loads(r.read())
@@ -691,26 +729,27 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     return code
 
 
-def open_unlocked(url: str, unlocked: str) -> None:
+def open_unlocked(url: str, unlocked: str) -> bool:
     """Open the page. ``unlocked`` (the URL with a single-use link code in its fragment) goes ONLY to macOS's osascript
     controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
     Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
     users can read from the process table: the very callers the token exists to keep out. So the osascript
     controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
     the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
-    and the page's unlock form asks."""
+    and the page's unlock form asks. Returns True only when the unlocked link was handed to a browser."""
     import webbrowser
 
     try:
         ctl = webbrowser.get()
         if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
-            return
+            return True
     except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
         pass
     try:
         webbrowser.open(url)
     except Exception:  # noqa: BLE001 — a headless box without a browser is fine
         pass
+    return False
 
 
 def stop_on_sigterm() -> "Callable[[], None]":

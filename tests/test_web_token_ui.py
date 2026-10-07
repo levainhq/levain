@@ -114,6 +114,8 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
     const before = calls.length;
     find(lockForm(), (n) => n.tagName === "input").value = "\u{1F512}"; lockForm().fire("submit", {}); await sleep(20);
     ok(lockForm() && lockForm().textContent.includes("not a token"), "the form stays and says why");
+    find(lockForm(), (n) => n.tagName === "input").value = "a".repeat(300); lockForm().fire("submit", {}); await sleep(20);
+    ok(lockForm() && ctx.LevainToken.get() === null, "a token too long for a header is refused too (codex L3)");
     ok(calls.length === before && ctx.LevainToken.get() === null, "nothing is sent or kept");
     console.log("PASS"); return;
   }
@@ -166,7 +168,7 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
   ok(prompted === 0, "the off-box token prompt does not fire for a launch-token refusal");
   const input = find(lockForm(), (n) => n.tagName === "input");
   ok(input.type === "password", "the token field is a password input");
-  input.value = "wrong"; lockForm().fire("submit", {}); await sleep(30);
+  input.value = "wrong-token"; lockForm().fire("submit", {}); await sleep(30);
   ok(lockForm() && lockForm().textContent.includes("not accepted"), "a wrong token is reported");
   ok(renders === 0 && prompted === 0, "still nothing rendered, still no off-box prompt");
   find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(30);

@@ -1253,5 +1253,6 @@ def test_a_symlinked_log_path_is_never_followed(tmp_path, monkeypatch):
     (tmp_path / "logs").mkdir(mode=0o700)
     target = tmp_path / "elsewhere.txt"
     spec.stdout_log.symlink_to(target)
-    d._prepare_private_logs(spec)
+    with pytest.raises(d.DaemonError, match="symlink"):   # codex L3: the service would follow it later
+        d._prepare_private_logs(spec)
     assert not target.exists()

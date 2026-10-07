@@ -255,14 +255,22 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
         if not d.exists():
             d.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
-        elif platform.system() != "Darwin" and d == _default_log_dir().expanduser().resolve():
+        elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
         if log.is_symlink():
-            continue   # never follow a link here: a dangling one would create, or chmod, its target
-        if not log.exists():
-            os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600))
+            # launchd and systemd would follow it to wherever it points, at whatever mode that file has (codex L3).
+            raise DaemonError(f"{log} is a symlink; a unit's log must be a regular file. Remove it and install again.")
+        try:
+            os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
             os.chmod(log, 0o600)
-        elif log.stat().st_uid == os.getuid():
+            continue
+        except FileExistsError:
+            pass
+        try:
+            st = log.stat()
+        except FileNotFoundError:
+            continue   # removed between the two calls: the service creates it, under the unit's umask
+        if st.st_uid == os.getuid():
             os.chmod(log, 0o600)   # a log an older unit created wider (its old token lines, since dead)
 
 

@@ -416,7 +416,9 @@
       statusEl.textContent = "could not load the interview: " + (e && e.message ? e.message : e);
     } finally {
       loading = false;
-      if (again && !loaded) { again = false; load(); }
+      var rerun = again && !loaded;
+      again = false;   // a latched unlock is spent either way (complement L3)
+      if (rerun) load();
     }
   }
 
