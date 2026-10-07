@@ -179,7 +179,11 @@ def _carry_fd(payload: bytes) -> int:
         fd = os.memfd_create("levain-carry", 0)   # no MFD_CLOEXEC: it must survive the exec
     else:
         d = CARRY_DIR.expanduser()
-        d.mkdir(parents=True, mode=0o700, exist_ok=True)
+        for level in (*reversed(d.parents[:3]), d):   # each level 0700, not the umask's mode
+            try:
+                level.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
         st = os.lstat(d)
         if not (os.path.isdir(d) and not os.path.islink(d) and st.st_uid == os.geteuid()):
             raise OSError(f"{d} is not a directory this user owns")

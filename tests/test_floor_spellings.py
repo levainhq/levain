@@ -380,3 +380,54 @@ def test_levain_exit_closes_every_live_shell(monkeypatch) -> None:
     assert closed == [s]
 
 
+
+
+# --- $HOME's own entries are read-only inside bash (desk ruling, option (c)) --------------------------
+
+
+def test_linux_plan_binds_home_read_only_with_subdirectories_back(home: Path) -> None:
+    (home / "proj").mkdir()
+    (home / "dotfiles").mkdir()
+    (home / ".config").symlink_to(home / "dotfiles")
+    (home / ".zshrc").write_text("")
+    argv, _ = C._bwrap_plan(build_policy(_entity(home)))
+    h = str(home.resolve())
+    i_home = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--ro-bind", h, h])
+    for sub in ("proj", "dotfiles", "ent"):
+        d = str(home.resolve() / sub)
+        i_sub = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--bind", d, d])
+        assert i_sub > i_home, sub
+    assert not any(a == str(home.resolve() / ".config") for a in argv), "a link stays a (frozen) link"
+    # every deeper mount comes after the read-only bind, or the bind would hide it
+    first_body = min(i for i, a in enumerate(argv) if a in ("--tmpfs",))
+    assert first_body > i_home
+    assert ["--bind", h, h] not in [argv[i:i + 3] for i in range(len(argv) - 2)]
+
+
+_live_bwrap = pytest.mark.skipif(
+    not (__import__("platform").system() == "Linux" and C.bwrap_available()),
+    reason="needs a Linux host where bwrap can actually establish a namespace",
+)
+
+
+@_live_bwrap
+def test_linux_live_home_entries_cannot_be_created_removed_or_swapped(home: Path) -> None:
+    (home / "sub").mkdir()
+    (home / "target").mkdir()
+    (home / "lnk").symlink_to(home / "target")
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace"))
+    try:
+        def rc(cmd: str) -> int:
+            return shell.run(cmd + " >/dev/null 2>&1; echo RC=$?", timeout=20).output.strip().split("RC=")[-1]
+        assert rc(f"ln -sfn / {home}/lnk") != "0"
+        assert rc(f"rm -f {home}/lnk") != "0"
+        assert rc(f"touch {home}/top") != "0"
+        assert rc(f"mkdir {home}/newdir") != "0"
+        assert rc(f"touch {home}/sub/ok") == "0"
+        assert rc(f"touch {ent}/workspace/w") == "0"
+    finally:
+        shell.close()
+    assert os.readlink(home / "lnk") == str(home / "target")
+    assert not (home / "top").exists() and not (home / "newdir").exists()
+    assert (home / "sub" / "ok").exists() and (ent / "workspace" / "w").exists()

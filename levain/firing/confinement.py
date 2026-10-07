@@ -4000,14 +4000,44 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
+    # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)). $HOME is bound
+    # read-only and each existing subdirectory bound back read-write, so inside bash nothing can be
+    # created, removed, renamed or swapped directly in $HOME, while everything below a subdirectory
+    # (the workspace, a repo, ~/.cache) is as writable as before. That makes every link at $HOME's
+    # top level (a dotfile manager's ~/.config, ~/.netrc) unswappable from inside, and stops a plant
+    # of any new top-level dotfile. It goes after the pins of $HOME's own ancestors and BEFORE every
+    # deeper mount: a bind takes its content from the host tree, so a later bind of $HOME would hide
+    # the mounts beneath it, and the deeper pins and the body land on top of it. $HOME's own pin is
+    # dropped: the read-only bind is itself a mountpoint, so $HOME still cannot be renamed.
+    # Cost: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
+    # fails inside bash.
+    home_ops: list[str] = []
+    try:
+        home_real = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home_real = None
+    if home_real is not None and home_real != Path(home_real.anchor) and home_real.is_dir():
+        home_ops = ["--ro-bind", str(home_real), str(home_real)]
+        for child in sorted(home_real.iterdir(), key=lambda p: p.name):
+            if child.is_symlink() or not child.is_dir():
+                continue
+            # Not `-try`: a subdirectory removed between the plan and the spawn aborts bwrap (a
+            # refusal; the next spawn plans again) rather than starting with it silently read-only.
+            home_ops += ["--bind", str(child), str(child)]
+    outer: list[str] = []
     ancestors: list[str] = []
     create_first: list[str] = []
     for path, create in sorted(pins):
         if create:
             create_first.append(path)
-        ancestors += ["--bind", path, path]
+        if home_ops and Path(path) == home_real:
+            continue
+        if home_ops and home_real.is_relative_to(path):
+            outer += ["--bind", path, path]
+        else:
+            ancestors += ["--bind", path, path]
 
-    out = head + ancestors + argv
+    out = head + outer + home_ops + ancestors + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
     _refuse_bind_after_mask(out)

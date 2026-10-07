@@ -2491,8 +2491,10 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
     argv = _bwrap_argv(policy)
-    self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
-    bound = [d for _, d in self_binds]
+    # $HOME is pinned by its own read-only bind (step (0)), not by a second self-bind.
+    home = str(Path.home().resolve())
+    bound = [argv[k + 2] for k, a in enumerate(argv[:-2])
+             if argv[k + 1] == argv[k + 2] and (a == "--bind" or (a == "--ro-bind" and argv[k + 2] == home))]
     for anc in policy.deny_write_dirs:
         # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
         # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
