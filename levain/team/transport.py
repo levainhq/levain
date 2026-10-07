@@ -1566,8 +1566,8 @@ class GitLedger:
         return self.accepted_tip()
 
     def incoming_refusal(self) -> list[str]:
-        """The reasons the quarantined remote tip is refused, or [] when there is none or it is now accepted. Raises
-        LedgerReadError when it cannot be judged."""
+        """The reasons the remote tip the record names as refused is still refused, or [] when there is none or it is
+        now accepted (a read that finds it acceptable accepts it). Raises LedgerReadError when it cannot be judged."""
         return self._incoming_refusal()
 
     def _incoming_refusal(self) -> list[str]:
@@ -1681,12 +1681,13 @@ class GitLedger:
             raise LedgerReadError(f"the remote ledger could not be judged ({exc})") from None
 
     def _fetch_quarantined(self, remote: str, timeout: float) -> str | None:
-        """Fetch the remote's ledger tip into the quarantine ref (git verifies every object it receives), then, under
-        ``pins.lock``, judge it against the trusted record read there and, only when accepted, write it into that
-        record as the accepted tip: one read-judge-write, so no concurrent read or push can slip between the judgement
-        and the advance. Then mirror it to the remote-tracking ref (for people) and drop the quarantine ref. Returns
-        the accepted SHA, which callers use, or None when the remote has no ledger branch. A refused tip raises
-        TeamError and stays quarantined. Every outcome is saved to state.json, so every reader sees the same one."""
+        """Fetch the remote's ledger tip into a ref of this call's own (git verifies every object it receives), then,
+        under ``pins.lock``, judge it against the trusted record read there and write the outcome into that record:
+        accepted (the accepted tip, its bytes pinned) or refused (``Trust.refused``): one read-judge-write, so no
+        concurrent read or push can slip between the judgement and the advance. Then mirror an accepted tip to the
+        remote-tracking ref (for people). Returns the accepted SHA, which callers use, or None when the remote has no
+        ledger branch. A refused tip raises TeamError. Every outcome is saved to state.json, so every reader sees the
+        same one."""
         try:
             return self._fetch_and_accept(remote, timeout)
         except TeamError as exc:
