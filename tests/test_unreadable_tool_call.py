@@ -237,6 +237,14 @@ def test_a_classifier_failure_never_fails_the_turn(tmp_path, monkeypatch):
     assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is True
 
 
+
+def test_unreadable_tool_names_fail_closed(tmp_path):
+    # L3 r2 (complement LOW): an unreadable tools_map read as no tools, so a bare call naming one passed with exit 0
+    session = _leaking_session(tmp_path, '{"name": "terminal", "arguments": {"command": "touch x"}}')
+    session.conversation.agent = object()
+    result = session.run_turn("x")
+    assert result.error is None and result.unreadable_call is True and result.exit_code == 7
+
 # ---------- L3 r2: fences by CommonMark 0.31.2 s4.5 ----------
 
 def test_a_longer_closing_fence_closes_and_a_leak_after_it_is_caught():
@@ -597,7 +605,6 @@ def test_text_sent_beside_a_parsed_finish_is_checked(tmp_path):
     # a terminal call in that text never ran and was never shown
     from types import SimpleNamespace
 
-    from tests.test_session import _Event
 
     sess = _leaking_session(tmp_path, "unused")
 
@@ -711,8 +718,6 @@ def test_a_thought_restating_a_call_that_ran_is_not_flagged(tmp_path):
 
 def test_a_flagged_message_is_not_repeated_when_its_text_was_repaired(tmp_path):
     # complement + glm: the repaired reply did not contain the raw part, so the part was prepended a second time
-    from types import SimpleNamespace
-
     from tests.test_session import _Event
 
     events = [_Event("agent", ["cafÃ© " + CALL_X]), _action("FinishAction", "finish", None, message="ok")]

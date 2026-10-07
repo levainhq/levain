@@ -624,13 +624,10 @@ def _drive_task(
             on_event=None if quiet else _emit_activity,
             max_iterations=max_iterations,
             # No human is driving. With `efferent_gate: "auto"` BOTH modes below resolve GATED —
-            # the fan-in a watching operator supplies at the REPL has to come from the gate here.
-            #
-            # The two are NOT interchangeable for the crown-jewels CRED floor, which is the whole
-            # reason this is a three-valued mode rather than the old `human_present` bool:
-            # `headless` is a human who typed this and will read the output (they may legitimately
-            # need `gh`), while `unattended` is a scheduler with nobody in the loop at all, where a
-            # silent credential read can compound into always-loaded memory. See
+            # the fan-in a watching operator supplies at the REPL has to come from the gate here —
+            # and both deny the standard credential stores unless confinement.json sets
+            # `deny_standard_creds`: the output is read after the turn was captured. `unattended`
+            # still records that a scheduler, not a person, invoked the run. See
             # `levain.firing.drive`.
             mode="unattended" if unattended else "headless",
         )
@@ -826,6 +823,7 @@ def _print_banner(
 
         if deny_standard_creds:
             print(f"             standard cred stores {cred_floor_label()}")
+            print("               (set deny_standard_creds false to allow)")
         else:
             print(f"             ⚠ standard cred stores {cred_floor_label()}")
             print("               are READABLE by this entity (deny_standard_creds is off)")

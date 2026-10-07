@@ -53,6 +53,7 @@ from levain.firing.agent_reply import (
     LEVAIN_ACT_NUDGE,
     finish_message,
     humanize_finish_json,
+    is_corrective_nudge,
     message_event_text,
     planned_without_acting,
     tool_action_summary,
@@ -394,11 +395,24 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
             "native_tool_calling": True}
 
 
-def turn_tool_activity(events, workspace: Path) -> list[str]:
+# What a shell prints when a credential it needs is unreadable: git over HTTPS with no credential to
+# offer, the macOS Keychain refusing git's credential helper, and gh with no readable token.
+_CRED_FAILURE_SIGNATURES = ("could not read Username for 'https://", "failed to get: -50", "gh auth login")
+CRED_FLOOR_NOTE = (
+    'the standard credential floor denied this; set "deny_standard_creds": false in '
+    ".levain/confinement.json, or use an ssh remote"
+)
+
+
+def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> list[str]:
     """The tool actions the entity ran THIS turn (since the last genuine user message), as
     compact display lines — so a workspace file op is VISIBLE, never silent. Paths are shown
     workspace-relative; the boundary skips the SDK's synthetic corrective nudge exactly as
-    :func:`latest_agent_text` does, so activity keys on the real turn."""
+    :func:`latest_agent_text` does, so activity keys on the real turn.
+
+    ``cred_floor`` is whether this session's floor denies the standard credential stores. When it
+    does and a shell output this turn reads like a missing credential, one :data:`CRED_FLOOR_NOTE`
+    ends the list, so the denial is not mistaken for a broken remote or a logged-out tool."""
     evs = list(events)
     start = turn_start(evs)
     prefix = str(workspace).rstrip(os.sep) + os.sep
@@ -414,7 +428,20 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
             continue
         tool_name, detail = summary
         lines.append(f"⚙ {tool_name}: {detail.replace(prefix, '')}")
+    if cred_floor and any(_reads_as_cred_failure(e) for e in evs[start:]):
+        lines.append(CRED_FLOOR_NOTE)
     return lines
+
+
+def _reads_as_cred_failure(event) -> bool:
+    """Whether ``event`` is a shell observation whose output reads like a missing credential."""
+    if getattr(event, "tool_name", None) != "terminal":
+        return False
+    try:
+        text = str(event.observation.text)
+    except Exception:  # noqa: BLE001 — a display note must never break a turn
+        return False
+    return any(sig in text for sig in _CRED_FAILURE_SIGNATURES)
 
 
 def _refused_action_ids(events) -> set[str]:
@@ -636,15 +663,17 @@ class EntitySession:
         not. The gate therefore treats ``headless`` and ``unattended`` identically, which is
         correct: neither has anyone to fan an action in to at the moment it would fire.
 
-        The **crown-jewels cred floor** resolves on the mode DIRECTLY, because it must NOT collapse
-        those two: a human typing ``--task "open a PR"`` legitimately needs ``gh``, while a
-        scheduled seat's silent credential read can compound into always-loaded memory with nobody
-        in the loop. That asymmetry — and why the rest of the floor is deliberately presence-
-        INDEPENDENT — is argued in full in :mod:`levain.firing.drive`.
+        The **crown-jewels cred floor** draws the same line: unless the entity's ``confinement.json``
+        sets ``deny_standard_creds``, the standard credential stores are denied in every mode but
+        ``interactive``. A ``headless`` turn is read after its text was captured, the same as a
+        scheduled seat's, so a credential it reads can compound into always-loaded memory before
+        anyone sees it. An entity whose task needs ``gh`` or an HTTPS git remote sets
+        ``"deny_standard_creds": false`` (or uses an ssh remote). Why this is the floor's one
+        drive-dependent part, and the rest of it presence-INDEPENDENT, is argued in full in
+        :mod:`levain.firing.drive`.
 
-        **It defaults to ``"headless"``** — a caller that forgets gets the GATE armed (governed,
-        not ungoverned) while keeping the cred floor at its documented default, so forgetting is
-        safe on the axis that can execute and non-surprising on the axis that cannot.
+        **It defaults to ``"headless"``** — a caller that forgets gets the GATE armed and the
+        standard credential stores denied: governed, not ungoverned, on both axes.
 
         Raises :class:`SessionStartError` (message already operator-ready) if the entity cannot
         be started sovereignly — INCLUDING a gate that would not arm. A session that believes it
@@ -776,7 +805,9 @@ class EntitySession:
                 "visualizer": None,
             }
             if on_event is not None:
-                conv_kwargs["callbacks"] = [_activity_callback(on_event, workspace)]
+                conv_kwargs["callbacks"] = [_activity_callback(
+                    on_event, workspace,
+                    cred_floor=conv_binding is not None and conv_binding.deny_standard_creds)]
             if max_iterations is not None:
                 conv_kwargs["max_iteration_per_run"] = max_iterations
             conversation = Conversation(binding.agent, **conv_kwargs)
@@ -1154,7 +1185,7 @@ class EntitySession:
             reply = "\n".join([*missing, reply] if reply else missing)
         return TurnResult(
             reply=reply,
-            tool_activity=turn_tool_activity(events, self.workspace),
+            tool_activity=turn_tool_activity(events, self.workspace, cred_floor=self.deny_standard_creds),
             error=None,
             nudged=nudged,
             unreadable_call=flagged,
@@ -1178,12 +1209,9 @@ class EntitySession:
         return bool(beside) or parts, beside
 
     def _tool_names(self) -> frozenset[str]:
-        """The names of this conversation's tools, or none when they cannot be read (the shapes that name a tool are
-        then not recognised; the other markup shapes still are)."""
-        try:
-            return frozenset(str(n) for n in self.conversation.agent.tools_map)
-        except Exception:  # noqa: BLE001 — never fails the turn
-            return frozenset()
+        """The names of this conversation's tools. When they cannot be read this raises, so :meth:`_unreadable_texts`
+        fails closed: an empty set would silently stop the shapes that name a tool from being recognised."""
+        return frozenset(str(n) for n in self.conversation.agent.tools_map)
 
     def request_stop(self) -> None:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
@@ -1284,7 +1312,7 @@ class EntitySession:
         refuse, and it is what would let the held actions run on the following turn."""
         return TurnResult(
             reply=None,
-            tool_activity=turn_tool_activity(self.conversation.state.events, self.workspace),
+            tool_activity=turn_tool_activity(self.conversation.state.events, self.workspace, cred_floor=self.deny_standard_creds),
             error=(
                 "could not determine whether the efferent gate is holding actions — ending the "
                 "turn rather than continuing blind. Restart the session; do not resume it."
@@ -1338,7 +1366,7 @@ class EntitySession:
                 events = [e for e in events if str(getattr(e, "id", "")) not in held]
         except Exception:  # noqa: BLE001 — a display filter must never break a turn
             pass
-        return turn_tool_activity(events, self.workspace)
+        return turn_tool_activity(events, self.workspace, cred_floor=self.deny_standard_creds)
 
     def _activity_after_fault(self) -> list[str]:
         """Activity for a turn that faulted partway: tools that ran before the fault did run, and an
@@ -1347,7 +1375,7 @@ class EntitySession:
         fault such an action may have been in flight, and partly run, so it stays listed. Never
         raises: an unreadable event log gives an empty list."""
         try:
-            return turn_tool_activity(self.conversation.state.events, self.workspace)
+            return turn_tool_activity(self.conversation.state.events, self.workspace, cred_floor=self.deny_standard_creds)
         except Exception:  # noqa: BLE001 — a display filter must never break a turn
             return []
 
@@ -1466,17 +1494,27 @@ class EntitySession:
         self.close()
 
 
-def _activity_callback(on_event: Callable[[str], None], workspace: Path):
+def _activity_callback(on_event: Callable[[str], None], workspace: Path, *, cred_floor: bool = False):
     """Adapt the SDK's per-event callback to a display-line emitter.
 
     Filters to agent tool actions and renders them workspace-relative, matching
     :func:`turn_tool_activity`'s formatting exactly so a streamed line and a post-turn line are
-    byte-identical. Fail-soft: a callback that raises would propagate into the SDK's run loop
-    and kill a turn over a display concern."""
+    byte-identical. The :data:`CRED_FLOOR_NOTE` streams when the failing output arrives, where the
+    post-turn list puts it last; at most once a turn, a turn starting where :func:`turn_start` says
+    one does. Fail-soft: a callback that raises would propagate into the
+    SDK's run loop and kill a turn over a display concern."""
     prefix = str(workspace).rstrip(os.sep) + os.sep
+    noted = False
 
     def _cb(event: object) -> None:
+        nonlocal noted
         try:
+            if (getattr(event, "source", None) == "user" and hasattr(event, "llm_message")
+                    and not is_corrective_nudge(event)):
+                noted = False
+            if cred_floor and not noted and _reads_as_cred_failure(event):
+                noted = True
+                on_event(CRED_FLOOR_NOTE)
             if getattr(event, "source", None) != "agent":
                 return
             summary = tool_action_summary(event)
