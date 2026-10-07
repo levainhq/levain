@@ -370,22 +370,22 @@ def test_revoked_is_terminal_and_inert_cannot_reactivate(tmp_path):
     assert s.set_status(b2.binding_id, BindingStatus.REVOKED) is True
 
 
-def test_add_preserves_status_so_a_re_add_cannot_resurrect_a_revoked_grant(tmp_path):
+def test_a_re_add_cannot_resurrect_a_revoked_grant(tmp_path):
     """L2-H1: re-create()-ing a revoked grant's core yields the same id with default-ACTIVE status; a
-    naive replace would un-revoke it. add must PRESERVE the on-disk REVOKED status."""
+    naive replace would un-revoke it. add is create-only, so the re-add writes nothing (S1h-3)."""
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
     s.set_status(b.binding_id, BindingStatus.REVOKED)
-    s.add(make_binding())                      # same core → same id, default ACTIVE
+    assert s.add(make_binding()) is False      # same core → same id, default ACTIVE: no write
     got = s.get(b.binding_id)
     assert got is not None and got.status is BindingStatus.REVOKED   # stayed dead
     assert s.list_active() == []
 
 
-def test_add_preserves_graduation_so_a_stale_re_add_cannot_wipe_evidence(tmp_path):
+def test_a_stale_re_add_cannot_wipe_evidence(tmp_path):
     """L1-M3: a benign reconcile re-adding a known binding (with graduation=0) must not wipe the
-    accumulated on-disk counters."""
+    accumulated on-disk counters; the re-add writes nothing (S1h-3)."""
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
@@ -393,7 +393,7 @@ def test_add_preserves_graduation_so_a_stale_re_add_cannot_wipe_evidence(tmp_pat
     s.record_fire(b.binding_id, clean=True, fired_at=FIRED_AT)
     s.add(make_binding())                      # stale in-memory object, graduation 0
     got = s.get(b.binding_id)
-    assert got is not None and got.graduation.fire_count == 2   # evidence preserved
+    assert got is not None and got.graduation.fire_count == 2   # the stored evidence is untouched
 
 
 # --- the registry: re-ratification (L2-M3) --------------------------------------------
@@ -465,6 +465,35 @@ def test_store_validator_enforces_and_passes_through(tmp_path):
     s_acc.add(b)
     assert acc.seen == [PATTERN]               # the validator saw the opaque pattern
     assert s_acc.get(b.binding_id) == b
+
+
+def test_the_validator_runs_outside_the_store_lock(tmp_path):
+    # L3 S1h-2 (codex MED): a validator called under the flock deadlocks if it touches the store
+    import fcntl
+    import os
+
+    s = None
+
+    class _LockProbe:
+        held: list[bool] = []
+
+        def validate(self, pattern: dict) -> None:
+            fd = os.open(s._lock_path, os.O_RDWR | os.O_CREAT, 0o644)   # a fresh fd, like a re-entry
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                self.held.append(False)
+            except BlockingIOError:
+                self.held.append(True)
+            finally:
+                os.close(fd)
+
+    probe = _LockProbe()
+    s = BindingStore(tmp_path / "b.json", validator=probe)
+    a = make_binding()
+    s.add(a)
+    s.replace_atomic(a.binding_id, make_binding(posture=Posture.ON_LOOP))
+    assert probe.held == [False, False]
 
 
 def test_validator_protocol_is_runtime_checkable():
