@@ -335,6 +335,34 @@ def test_the_old_chat_token_attribute_cannot_remove_the_token(tmp_path):
         httpd.server_close()
 
 
+def test_the_old_chat_token_attribute_cannot_rotate_the_token(tmp_path):
+    """codex L3 r3: a code minted under token A, still unspent after `httpd.chat_token = B`, unlocked token B, and the
+    published record still named A. The alias arms an ungated server; it never changes an armed token, and arming
+    spends every code minted before it."""
+    from levain import http_guards as hg
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    from levain.web_server import make_server
+
+    src = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db"))
+    httpd = make_server(src, host="127.0.0.1", port=0, read_token=_TOKEN)
+    try:
+        code = hg.mint_link_code(httpd)
+        with pytest.raises(ValueError, match="cannot be changed"):
+            httpd.chat_token = "rotated-" + _TOKEN
+        assert httpd.launch_token == _TOKEN
+        httpd.chat_token = _TOKEN   # the same token: nothing changes, the code still works
+        assert hg._spend_link_code(httpd, code) is True
+    finally:
+        httpd.server_close()
+    httpd = make_server(src, host="127.0.0.1", port=0, read_token=None)
+    try:
+        code = hg.mint_link_code(httpd)
+        httpd.chat_token = _TOKEN
+        assert hg._spend_link_code(httpd, code) is False
+    finally:
+        httpd.server_close()
+
+
 def test_a_server_that_never_says_launch_token_serves_nothing(tmp_path):
     """complement L3 r2: the gate read a missing attribute as "ungated". A server must set launch_token = None to be
     ungated; one that forgot fails the request rather than serving it."""
@@ -621,6 +649,23 @@ def test_a_sigterm_during_the_cleanup_does_not_cut_it_short():
         stop()
         pytest.fail("a SIGTERM during the cleanup still stops it")
     stop()
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_a_sigterm_while_the_handler_is_being_armed_puts_the_previous_one_back(monkeypatch):
+    """complement L3 r3: a SIGTERM landing after the handler was installed but before the caller held its SigtermStop
+    raised out of stop_on_sigterm, and the caller had nothing to restore with: the handler stayed a no-op."""
+    import signal
+
+    from levain import http_guards as hg
+
+    def lands(*_a, **_k):   # the SIGTERM arriving inside the arming window
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(hg, "SigtermStop", lands)
+    with pytest.raises(KeyboardInterrupt):
+        hg.stop_on_sigterm()
     assert signal.getsignal(signal.SIGTERM) == before
 
 

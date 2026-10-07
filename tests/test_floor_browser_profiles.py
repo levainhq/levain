@@ -437,3 +437,56 @@ def test_the_storage_scan_is_reused_across_a_replaced_policy_object(home: Path, 
     monkeypatch.setattr(cf, "_browser_roots", lambda h: globbed.append(h) or [])
     cf._browser_storage(dataclasses.replace(policy), fresh=False)
     assert globbed == []
+
+
+_CHROME = {"Darwin": "Library/Application Support/Google/Chrome", "Linux": ".config/google-chrome"}
+
+
+@pytest.mark.parametrize("osname", ["Darwin", "Linux"])
+@pytest.mark.parametrize("locked", ["root", "profile"])
+def test_page_storage_this_user_cannot_list_refuses_bash(home: Path, monkeypatch, osname, locked) -> None:
+    """codex L3 r3: Path.glob() returns nothing for a folder it cannot list, so `chmod 000` on a profile switched the
+    page-storage walk off while a link to its token file stayed reachable (the L2 ~/.ssh shape)."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: osname)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    store = home / _CHROME[osname] / "Default" / "Session Storage"
+    store.mkdir(parents=True)
+    (store / "000003.log").write_text("levain.token")
+    entity = _entity(home)
+    (entity / "workspace" / "alias.log").hardlink_to(store / "000003.log")
+    policy = build_policy(entity)
+    shut = home / _CHROME[osname] if locked == "root" else store.parent
+    shut.chmod(0o000)
+    try:
+        with pytest.raises(ConfinementError, match="could not check"):
+            _refuse_multiply_linked_jewels(policy)
+    finally:
+        shut.chmod(0o700)
+
+
+@pytest.mark.parametrize("osname", ["Darwin", "Linux"])
+def test_a_profile_root_under_a_folder_this_user_cannot_search_refuses_bash(home: Path, monkeypatch, osname) -> None:
+    """codex + glm L3 r3: a stat that fails for a reason other than absence or a loop (a parent this user cannot
+    search) left the root undenied on Linux and its storage unwalked, and is not reported as a symlink loop."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: osname)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    (home / _CHROME[osname] / "Default").mkdir(parents=True)
+    policy = build_policy(_entity(home))
+    shut = home / ("Library/Application Support" if osname == "Darwin" else ".config")   # the entry root's parent
+    shut.chmod(0o000)
+    try:
+        with pytest.raises(ConfinementError, match="could not check") as spawn:
+            cf._refuse_unresolvable_browser_roots(policy)
+        assert "symlink loop" not in str(spawn.value)
+        with pytest.raises(ConfinementError, match="could not check"):
+            _refuse_multiply_linked_jewels(policy)
+    finally:
+        shut.chmod(0o700)
