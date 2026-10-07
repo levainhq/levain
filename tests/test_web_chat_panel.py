@@ -120,6 +120,10 @@ function fetch(path, init) {
       .then(() => reply(403, { error: "launch_token", message: "needs token" }));
   }
   if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat.json" && process.argv[3] === "releasefailed") return reply(200, { entities: ["ent"], model: "m", sessions: [
+    { entity: "ent", state: "release_failed", error: "<b>close raised</b>", release_failed_since: "2026-10-07T17:00:00+00:00" },
+    { entity: "ent", state: "idle" }] });
+  if (path === "/chat.json" && process.argv[3] === "nosessions") return reply(200, { entities: ["ent"], model: "m" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
@@ -269,6 +273,18 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
   ok(!lockForm(), "the right token removes the form");
   const panel = chatPanel();
   ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
+  if (MODE === "releasefailed" || MODE === "nosessions") {
+    // lane B2: a session whose release failed still holds its slot; the picker names it, as text, until a restart
+    const lines = [];
+    const walk = (n) => { if (n.tagName === "p" && n.className === "chat-err") lines.push(n.textContent); n.children.forEach(walk); };
+    walk(panel);
+    const want = MODE === "releasefailed"
+      ? ["release failed: <b>close raised</b> since 2026-10-07T17:00:00+00:00; restart levain serve to free this slot"] : [];
+    ok(JSON.stringify(lines) === JSON.stringify(want), "release_failed lines: " + JSON.stringify(lines));
+    ok(!find(panel, (n) => n.tagName === "b"), "the error is text, never markup");
+    ok(byText(panel, "Start session"), "the picker still shows");
+    console.log("PASS"); return;
+  }
   if (MODE === "twoentities") {
     ok(find(panel, (n) => n.tagName === "select") && byText(panel, "Start session"), "with a choice to make, the picker shows");
     console.log("PASS"); return;
@@ -502,7 +518,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "stalelisting", "unlockkeeps", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
-                                  "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities",
+                                  "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities", "releasefailed", "nosessions",
                                   "leakafterapprove", "leaklastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
