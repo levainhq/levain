@@ -779,7 +779,8 @@ def test_a_join_whose_remote_team_toml_never_parses_changes_nothing(two, capsys)
                           capture_output=True, check=True).stdout.strip()
     tree = subprocess.run(["git", "mktree"], cwd=raw, input=f"100644 blob {blob}\tteam.toml\n", text=True,
                           capture_output=True, check=True).stdout.strip()
-    commit = git("commit-tree", tree, "-m", "orphan", cwd=raw).strip()
+    commit = git("-c", "user.name=ana", "-c", "user.email=ana@ex.com", "commit-tree", tree, "-m", "orphan",
+                 cwd=raw).strip()                     # a bare clone has no identity of its own (CI has no global one)
     git("push", "-qf", str(tmp / "origin.git"), f"{commit}:refs/heads/levain-ledger", cwd=raw)
     cat = clone(tmp, "cat", "ben@ex.com")
     assert team("join", "--no-install", repo=cat) == 2

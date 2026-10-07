@@ -198,7 +198,8 @@ def test_tampered_line_fails_verify(two):
     f.write_text(json.dumps(line) + "\n")
     git("commit", "-qam", "rewrite", cwd=gl.wt)
     assert team("verify", repo=ana) == 3   # the rewrite of a pinned file refuses the ledger
-    assert any("rewritten or removed" in t for t in gl.ledger().tamper)
+    # this clone's own file: the refusal says restore it, never repin (5a0bd1b)
+    assert any("no longer holds lines this clone wrote" in t for t in gl.ledger().tamper)
     assert not gl.ledger().in_force
 
 
