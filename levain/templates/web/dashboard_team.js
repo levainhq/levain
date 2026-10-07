@@ -63,8 +63,9 @@
     bar.appendChild(control);
   }
 
-  // No token logic here on purpose: the server answers /team_views.json only to a loopback peer on a loopback-bound
-  // cockpit (anything else is a 404), so there is nothing off-box to authenticate.
+  // The server answers /team_views.json only to a loopback peer on a loopback-bound cockpit (anything else is a 404).
+  // The request also carries the cockpit's own auth headers when dashboard_boot.js provides window.levainAuthHeaders,
+  // so it keeps working when the cockpit's data routes require them; without that function it sends none.
   // Loads can overlap (page load, then tab focus). A success is applied unless a NEWER request has already been
   // applied, so an older success is not thrown away just because a newer request failed (a failure applies nothing).
   let latest = 0;
@@ -73,11 +74,15 @@
     const mine = ++latest;
     // Only a successful response changes the UI: a non-ok answer or a failed fetch keeps what is shown now (an
     // empty list from a healthy server still clears it).
-    fetch("/team_views.json", { headers: { Accept: "application/json" } })
+    const auth = window.levainAuthHeaders ? window.levainAuthHeaders() : {};
+    fetch("/team_views.json", { headers: { ...auth, Accept: "application/json" } })
       .then((r) => { if (!r.ok) throw new Error("status " + r.status); return r.json(); })
       .then((j) => { if (mine > applied && Array.isArray(j.views)) { applied = mine; render(j.views, j.truncated === true); } })
       .catch(() => {});
   }
   load();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+  // The first load can run before the page has traded its one-time link code for the cockpit's token, and be
+  // refused; load again once it has (window.LevainToken exists only where the cockpit uses a token).
+  if (window.LevainToken) window.LevainToken.onUnlock(load);
 })();

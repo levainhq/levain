@@ -11,19 +11,29 @@ The protocol, in one place:
 
 * Only a PUBLISHER ever holds ``LOCK_EX``. Readers and pruners use ``LOCK_SH | LOCK_NB``, so contention always
   means "a publisher holds it" and a stalled pruner can never read as a live view.
-* An entry is written under its lock to a hidden temp name and then renamed into place. A rename keeps the inode, so
-  a visible entry is always already locked.
+* An entry's file is never visible unlocked, not even as a temp. On macOS and the BSDs it is created already locked
+  (``open`` with ``O_EXLOCK``: "if creating a file with O_CREAT, the request for the lock will never fail", open(2)),
+  under a hidden temp name, written, and renamed into place; a rename keeps the inode and its lock. On Linux it is
+  created unnamed (``O_TMPFILE``), locked and written, and only then given its name (``linkat`` through
+  ``/proc/self/fd``). Anywhere neither exists, or where the filesystem refuses them, the view does not register.
 * The ``lock1-`` prefix is the liveness-generation marker. A future mechanism must use a different prefix, so an
   old view can never prune a newer view's files and a reader never has to parse a file to decide whether to trust it.
 * The cockpit never deletes anything. A starting view prunes entries nobody holds, strictly before it publishes.
-  Hidden temp files are never swept: a publisher creates its temp before it locks it, so no rule can tell a
-  starting view's temp from a dead one. A temp left by a killed view stays, and readers ignore temp files.
+  It also sweeps the hidden temp files a killed view left behind. A temp is born locked, so one nobody holds is
+  dead, whatever its age. The ``x`` in its name marks that grammar. A temp from levain 0.6.9 or older was created
+  first and locked a moment later, so an unlocked one may belong to a publisher that is still starting. Those are
+  left alone; an older version makes no new ones, so they are a fixed set.
 * A listing judges entries in sorted name order until MAX_VIEWS live ones are found, the names run out, or
   LIST_BUDGET is spent; whenever names were left unjudged, or the directory could not be read in full, it reports
   ``truncated`` so the cockpit can say the list may be incomplete.
-* A forked child (no exec) closes its copy of the lock fd at once, so it cannot keep a dead view listed.
-* Before publishing, a view checks that ``flock`` really conflicts on this filesystem. On a filesystem that emulates
-  it (NFS, some FUSE mounts) the view says why it is not registered and keeps serving.
+* A forked child (no exec) closes its copy of every fd a publisher holds at once, so it cannot keep a dead view
+  listed. Each such fd (the directory, the lock file, the flock self-test's) is opened and recorded, and later
+  forgotten and closed, under the same lock the fork handlers take, so no fork copies one this module is not
+  tracking.
+* Before publishing, a view checks that ``flock`` really conflicts on this filesystem, creating its test file the
+  same way it creates an entry. On a filesystem that emulates flock (NFS, some FUSE mounts) or refuses ``O_EXLOCK``
+  or ``O_TMPFILE`` (Linux before 3.11, and filesystems without O_TMPFILE support, such as NFS, CIFS and older FUSE
+  and overlayfs), the view says why it is not registered and keeps serving.
 
 SCOPE AND TRUST: ``LEVAIN_HOME`` must be on a local filesystem and belong to one OS user; NFS and a registry shared
 across users are unsupported. The registry is a convenience index for one user's own processes, NOT an
@@ -49,6 +59,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -66,6 +77,10 @@ PRUNE_MAX_NAMES = 1024
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
+# The born-locked temps register() and the self-test make on macOS and the BSDs (Linux makes none). A temp from an
+# older levain has no ``x`` and is never swept (see prune_dead).
+_TEMP_RE = re.compile(r"\.(?:lock1-x[0-9a-f]{32}|selftest-x[0-9a-f]{16})\.tmp")
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -125,15 +140,54 @@ def _open_dir(*, create: bool) -> int:
     return fd
 
 
-def _flock_is_real(dir_fd: int) -> bool:
+def _how() -> str:
+    """How this platform creates a file nobody can see unlocked: "exlock" (macOS, the BSDs) or "tmpfile" (Linux).
+    Neither: the registry is unavailable here, never a weaker way."""
+    if hasattr(os, "O_EXLOCK"):
+        return "exlock"
+    if hasattr(os, "O_TMPFILE"):
+        return "tmpfile"
+    raise RegistryUnavailable("this platform can create a file neither already locked (O_EXLOCK) nor unnamed "
+                              "(O_TMPFILE), so the registry is unavailable")
+
+
+def _create(dir_fd: int, how: str, name: str) -> int:
+    """A new file that no other process can find unlocked: ``name``, created holding LOCK_EX, for "exlock"; an unnamed
+    file the caller locks before it links a name to it, for "tmpfile". A filesystem that refuses either is
+    RegistryUnavailable."""
+    try:
+        if how == "exlock":
+            return os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_EXLOCK | _CLOEXEC, 0o600, dir_fd=dir_fd)
+        return os.open(".", os.O_RDWR | os.O_TMPFILE | _CLOEXEC, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.EOPNOTSUPP, errno.ENOTSUP, errno.EISDIR, errno.EINVAL):
+            # EISDIR: a kernel older than O_TMPFILE reads its O_DIRECTORY bit and opens the directory
+            flag = "O_EXLOCK" if how == "exlock" else "O_TMPFILE"
+            raise RegistryUnavailable(f"this filesystem refuses {flag} ({os.strerror(exc.errno)})") from None
+        raise
+
+
+def _reopen(dir_fd: int, how: str, fd: int, name: str) -> int:
+    """A second, independent open of the file ``fd`` is on (its own open file description, so its own flock)."""
+    if how == "exlock":
+        return os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    try:
+        return os.open(f"/proc/self/fd/{fd}", os.O_RDONLY | _CLOEXEC)
+    except FileNotFoundError:
+        raise RegistryUnavailable("/proc is not mounted, so an unnamed file cannot be given a name") from None
+
+
+def _flock_is_real(dir_fd: int, how: str) -> bool:
     """Does an exclusive lock on one open file make a shared try-lock on another fail here? False on filesystems
-    that emulate flock (NFS, some FUSE mounts), where the whole design would silently list nothing."""
-    name = f".selftest-{secrets.token_hex(8)}.tmp"
-    fa = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
+    that emulate flock (NFS, some FUSE mounts), where the whole design would silently list nothing. The test file is
+    created exactly as an entry is, so a filesystem that refuses that refuses here first."""
+    name = f".selftest-x{secrets.token_hex(8)}.tmp"
+    fa = _create(dir_fd, how, name)
     fb = None
     try:
-        fb = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
-        fcntl.flock(fa, fcntl.LOCK_EX)
+        fb = _reopen(dir_fd, how, fa, name)
+        if how == "tmpfile":
+            fcntl.flock(fa, fcntl.LOCK_EX)
         try:
             fcntl.flock(fb, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -146,26 +200,53 @@ def _flock_is_real(dir_fd: int) -> bool:
                     os.close(fd)
                 except OSError:
                     pass
-        try:
-            os.unlink(name, dir_fd=dir_fd)
-        except OSError:
-            pass
+        if how == "exlock":
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except OSError:
+                pass
 
 
 # ---- the publisher ------------------------------------------------------------------------------------------------
 
 _LIVE: "set[Registration]" = set()      # strong: a dropped, unclosed Registration still has its fds closed at fork
+_PENDING: set[int] = set()              # fds register() has opened that no Registration owns yet
+# Held by a fork, and by every change to which lock fds exist and are tracked. Deliberately NOT reentrant: with an
+# RLock, a fork from a signal handler that interrupted a holder would proceed and copy half-updated fd sets. As it is,
+# such a fork deadlocks instead, so a process that registers a view must not fork from a signal handler (levain's own
+# SIGTERM handler only raises KeyboardInterrupt, which the ``with`` blocks release on).
+_FORK_LOCK = threading.Lock()
+
+
+def _before_fork() -> None:
+    _FORK_LOCK.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _FORK_LOCK.release()
 
 
 def _forget_in_child() -> None:
     """After a bare fork the child holds a copy of every lock fd, and the lock lives as long as any copy does. Close
-    the child's copies (never unlink: the entry is the parent's) so only the parent's view keeps its entry live."""
-    for reg in list(_LIVE):
-        reg._drop_fds()
+    the child's copies (never unlink: the entry is the parent's) so only the parent's view keeps its entry live. The
+    forking thread took _FORK_LOCK, so the sets are exactly the fds that existed; it is this thread's to release."""
+    try:
+        pending = set(_PENDING)
+        _PENDING.clear()
+        for reg in list(_LIVE):
+            reg._drop_fds_locked()
+        for fd in pending:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    finally:
+        _FORK_LOCK.release()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_forget_in_child)
+    os.register_at_fork(before=_before_fork, after_in_parent=_after_fork_in_parent,
+                        after_in_child=_forget_in_child)
 
 
 class Registration:
@@ -194,9 +275,10 @@ class Registration:
                 pass
 
     def close(self) -> None:
-        self._drop_fds()
+        with _FORK_LOCK:     # forget and close as one step: a fork in between would copy an fd nobody tracks
+            self._drop_fds_locked()
 
-    def _drop_fds(self) -> None:
+    def _drop_fds_locked(self) -> None:
         _LIVE.discard(self)
         lock_fd, dir_fd = self._lock_fd, self._dir_fd
         self._lock_fd = self._dir_fd = None
@@ -216,12 +298,17 @@ def register(repo: str, url: str, project: str) -> Registration:
         raise ValueError(f"not a loopback http URL: {url!r}")
     if fcntl is None:
         raise RegistryUnavailable("this platform has no flock; the registry is POSIX only")
-    dir_fd = _open_dir(create=True)
+    how = _how()
+    with _FORK_LOCK:         # open and record as one step, so no fork can copy the fd untracked
+        dir_fd = _open_dir(create=True)
+        _PENDING.add(dir_fd)
     lock_fd = None
     published = None
-    tmp = f".{PREFIX}{secrets.token_hex(16)}.tmp"
+    tmp = f".{PREFIX}x{secrets.token_hex(16)}.tmp"
     try:
-        if not _flock_is_real(dir_fd):
+        with _FORK_LOCK:     # the self-test opens, locks and closes its own fds: no fork sees them
+            real = _flock_is_real(dir_fd, how)
+        if not real:
             raise RegistryUnavailable("this filesystem does not support the registry's locks")
         name = f"{PREFIX}{secrets.token_hex(16)}.json"
         entry = {"v": VERSION, "repo": str(repo)[:500], "url": norm, "project": str(project)[:120],
@@ -229,15 +316,26 @@ def register(repo: str, url: str, project: str) -> Registration:
         data = json.dumps(entry, sort_keys=True).encode("utf-8")
         if len(data) > MAX_ENTRY_BYTES:      # a reader skips an oversized file, so it must never be published
             raise ValueError(f"registry entry is {len(data)} bytes, over {MAX_ENTRY_BYTES}")
-        lock_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600,
-                          dir_fd=dir_fd)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # A KeyboardInterrupt (levain's SIGTERM handler raises one) between _create returning and the assignment leaves
+        # that fd untracked and open; the process is exiting, and its exit closes the fd and releases the lock.
+        with _FORK_LOCK:     # open and record as one step, so no fork can copy the fd untracked
+            lock_fd = _create(dir_fd, how, tmp)          # "exlock": the temp exists only locked
+            _PENDING.add(lock_fd)
+        if how == "tmpfile":
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)          # unnamed: no other process can reach it yet
         view = memoryview(data)
         while view:
             view = view[os.write(lock_fd, view):]
-        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        if how == "exlock":
+            os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            os.link(f"/proc/self/fd/{lock_fd}", name, dst_dir_fd=dir_fd, follow_symlinks=True)
         published = name
-        return Registration(name, dir_fd, lock_fd)
+        with _FORK_LOCK:
+            reg = Registration(name, dir_fd, lock_fd)
+            _PENDING.discard(lock_fd)
+            _PENDING.discard(dir_fd)
+        return reg
     except BaseException:
         if published is not None:   # interrupted after the rename: withdraw the entry while still holding its lock
             try:
@@ -245,15 +343,20 @@ def register(repo: str, url: str, project: str) -> Registration:
             except OSError:
                 pass
         if lock_fd is not None:
+            with _FORK_LOCK:
+                _PENDING.discard(lock_fd)
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+        if how == "exlock":
             try:
-                os.close(lock_fd)
+                os.unlink(tmp, dir_fd=dir_fd)
             except OSError:
                 pass
-        try:
-            os.unlink(tmp, dir_fd=dir_fd)
-        except OSError:
-            pass
-        os.close(dir_fd)
+        with _FORK_LOCK:
+            _PENDING.discard(dir_fd)
+            os.close(dir_fd)
         raise
 
 
@@ -285,9 +388,9 @@ def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, o
 
 
 def prune_dead() -> None:
-    """Remove entries no publisher holds. A shared try-lock excludes exactly a publisher's exclusive lock, so a live
-    entry is never touched and a concurrent reader still sees the entry as dead. Nothing is decided by parsing: a
-    file of a newer grammar has a different name and is never looked at."""
+    """Remove entries and born-locked temps no publisher holds. A shared try-lock excludes exactly a publisher's
+    exclusive lock, so a live entry or temp is never touched and a concurrent reader still sees the entry as dead.
+    Nothing is decided by parsing: a file of another grammar has a different name and is never looked at."""
     if fcntl is None:
         return
     try:
@@ -295,11 +398,11 @@ def prune_dead() -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        # Filter, then bound: junk names must not use up the examination budget. Temp files are never swept: a
-        # publisher creates its temp and only then locks it, so a sweep in that window unregistered a starting view
-        # (seen in the lane's run). One left by a killed view is harmless and listed by nothing.
-        cand = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)]
-        for name in cand[:PRUNE_MAX_NAMES]:
+        # Filter, then bound: junk names must not use up the examination budget.
+        names = os.listdir(dir_fd)
+        cand = [n for n in names if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
+        cand += [n for n in names if _TEMP_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
+        for name in cand:
             opened = _open_entry(dir_fd, name)
             if opened is None:
                 continue
