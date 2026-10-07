@@ -26,7 +26,7 @@ import os
 import sys
 import threading
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from collections import defaultdict
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -436,7 +436,6 @@ class _ViewServer(ThreadingHTTPServer):
     workers: threading.BoundedSemaphore
     problems_cache: tuple[tuple, list[str]] | None = None   # (commit, history boundary, team): the history walk
     shallow_path: str | None = None
-    refusal_cache: tuple[Any, tuple[list[str], bool]] | None = None   # (last_fetch_attempt, _refusal's answer)
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -536,20 +535,16 @@ class _ViewHandler(GuardedHandler):
         cache safe."""
         return VF.problems(_HistoryCache(gl, self.server, _read_or_none(self.server.shallow_path)), sha, team, ledger)
 
-    def _refusal(self, gl: GitLedger, st: dict) -> tuple[list[str], bool]:
-        """(why the quarantined remote tip is refused, whether it could not be judged at all). Judging it is a full
-        read, and the quarantine changes only when some process fetches, which records an attempt first: so the
-        answer is kept until the recorded attempt changes. The model lock (held by the caller) makes that safe."""
-        key = st.get("last_fetch_attempt")
-        cached = self.server.refusal_cache
-        if cached is not None and key is not None and cached[0] == key:
-            return cached[1]
+    @staticmethod
+    def _refusal(gl: GitLedger) -> tuple[list[str], bool]:
+        """(why the quarantined remote tip is refused, whether it could not be judged at all), judged fresh on every
+        page: the answer depends on the quarantine, pins.json and this clone's own lines, and a repin changes it
+        without a fetch. Only while a refused tip sits in quarantine is this a ledger read; otherwise it is one ref
+        lookup."""
         try:
-            found: tuple[list[str], bool] = (gl.incoming_refusal(), False)
+            return gl.incoming_refusal(), False
         except LedgerReadError as exc:
-            found = ([str(exc)], True)
-        self.server.refusal_cache = (key, found)
-        return found
+            return [str(exc)], True
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
         """Fetch the remote's ledger when one is due, through ``fetch_only``: into quarantine, judged, and only an
@@ -580,7 +575,7 @@ class _ViewHandler(GuardedHandler):
                 note = None         # another process fetched successfully while this fetch was failing
             # The refusal is read from the quarantine itself, so it shows whichever command fetched the refused tip
             # (this view, a sync, the hook), for as long as that tip is what the remote holds.
-            refusal, unjudged = self._refusal(gl, st)
+            refusal, unjudged = self._refusal(gl)
             detail = note or st.get("last_fetch_error") or ""
             if refusal:
                 _log(f"the remote's ledger is refused: {'; '.join(refusal)!r}")
@@ -610,7 +605,8 @@ class _ViewHandler(GuardedHandler):
             try:
                 model = self._model(pf, fetch_now=(qs.get("fetch") or [""])[0] == "1")
             except _Busy:
-                return self._send_busy(html_page=path == "/")
+                again = "/?" + urlencode([(k, v) for k, vs in qs.items() if k != "fetch" for v in vs])
+                return self._send_busy(html_page=path == "/", again=again.rstrip("?"))
             except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
                 _log(f"ledger unavailable: {exc!r}")
                 return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
@@ -621,12 +617,14 @@ class _ViewHandler(GuardedHandler):
             return self._send(render_html(model, self.server.cockpit_url).encode("utf-8"), "text/html; charset=utf-8")
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404)
 
-    def _send_busy(self, *, html_page: bool) -> None:
+    def _send_busy(self, *, html_page: bool, again: str = "/") -> None:
         """503 at once, with Retry-After. The page is rendered on the server, so a browser that asked for it gets a
-        small page that asks again by itself (a meta refresh: the CSP governs scripts, not that)."""
+        small page that asks again by itself (a meta refresh: the CSP governs scripts, not that), for ``again``: the
+        same page and filter without ``fetch``, so the retries do not each ask for a fetch."""
         if html_page:
             body = (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-                    f'<meta http-equiv="refresh" content="{BUSY_RETRY}"><title>team view: busy</title></head>'
+                    f'<meta http-equiv="refresh" content="{BUSY_RETRY};url={_e(again)}">'
+                    f'<title>team view: busy</title></head>'
                     f'<body><p>The team view is reading the ledger. This page asks again in {BUSY_RETRY} seconds.</p>'
                     f'</body></html>').encode("utf-8")
             ctype = "text/html; charset=utf-8"

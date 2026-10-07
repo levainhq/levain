@@ -466,10 +466,14 @@ def test_a_request_during_a_cold_read_is_answered_503_at_once_and_the_page_asks_
         assert time.monotonic() - t0 < 1.0
         assert r.status == 503 and r.getheader("Retry-After") == str(V.BUSY_RETRY)
         assert r.getheader("Content-Type").startswith("text/html")
-        assert f'http-equiv="refresh" content="{V.BUSY_RETRY}"'.encode() in body and b"<script" not in body
+        assert f'http-equiv="refresh" content="{V.BUSY_RETRY};url=/"'.encode() in body and b"<script" not in body
         assert "frame-ancestors" in (r.getheader("Content-Security-Policy") or "")
         r, body = _req(port, "GET", "/view.json")
         assert r.status == 503 and r.getheader("Retry-After") and b"busy" in body and b"<html" not in body
+        # complement, L3 round 3: the refresh reloaded the same URL, so after "fetch now" every retry asked for
+        # another fetch. It asks again for the same page and filter, without the fetch.
+        body = _req(port, "GET", "/?fetch=1&path=src%2Ftax")[1]
+        assert f'content="{V.BUSY_RETRY};url=/?path=src%2Ftax"'.encode() in body and b"fetch" not in body
     finally:
         httpd.model_lock.release()
         httpd.shutdown()
@@ -1007,27 +1011,25 @@ def test_a_failed_fetch_is_not_shown_after_a_later_fetch_succeeded():
         httpd.server_close()
 
 
-def test_the_quarantine_is_judged_once_per_fetch_attempt_not_per_page():
-    # complement, L3 round 2: incoming_refusal() runs a full judgement, and it ran on every page while a refused tip
-    # sat in quarantine; the quarantine only changes when some process fetches, which records an attempt first.
-    class Counting(_RemoteStub):
+def test_the_quarantine_is_judged_fresh_on_every_page():
+    # complement + codex, L3 round 3 (base 40a838c): the refusal was cached by last_fetch_attempt, which a fetch
+    # writes BEFORE it moves the quarantine, and the judgement also depends on pins.json and this clone's own lines.
+    # A repin that accepts the quarantined tip records no attempt, so the page kept saying "refused" until the next
+    # fetch. Like the ledger's own problems, the refusal is now read fresh on every page.
+    class Repinned(_RemoteStub):
         def __init__(self):
             super().__init__(state={"last_fetch_ok": 1.0e9, "last_fetch_attempt": 1.0e9})
-            self.judged = 0
+            self.bad = ["ledger/notes.txt is not a file levain writes"]
 
         def incoming_refusal(self):
-            self.judged += 1
-            return ["ledger/notes.txt is not a file levain writes"]
-    stub = Counting()
+            return list(self.bad)
+    stub = Repinned()
     httpd = _serve(stub)
     try:
         port = httpd.server_address[1]
-        for _ in range(3):
-            assert "refused as tampered" in _req(port, "GET")[1].decode()
-        assert stub.judged == 1
-        stub._state = {"last_fetch_ok": 1.0e9, "last_fetch_attempt": 2.0e9}     # someone fetched again
-        _req(port, "GET")
-        assert stub.judged == 2
+        assert "refused as tampered" in _req(port, "GET")[1].decode()
+        stub.bad = []                                   # `levain team repin` accepted it: no fetch attempt
+        assert "refused as tampered" not in _req(port, "GET")[1].decode()
     finally:
         httpd.shutdown()
         httpd.server_close()
