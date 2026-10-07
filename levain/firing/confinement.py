@@ -2981,6 +2981,7 @@ class SeatbeltProvider(ConfinementProvider):
                 "Refusing to grant bash hands without the sandbox (fail-closed)."
             )
         profile_text = self.render_profile(policy)
+        _refuse_kernel_mask_rules(profile_text)
         # A temp profile file for the shell's lifetime — `sandbox-exec -f` reads it before the sandbox
         # applies, so it need not be inside the allow-set. The SandboxedShell owns unlink on close.
         fd, profile_path = tempfile.mkstemp(prefix="levain-seatbelt-", suffix=".sb")
@@ -4905,6 +4906,25 @@ class BwrapProvider(ConfinementProvider):
             shell.close()   # never orphan a started shell (glm L3 r2)
             raise
         return shell
+
+
+def _refuse_kernel_mask_rules(profile_text: str) -> None:
+    """Refuse, before any exec, a Seatbelt profile that would make XNU build a syscall mask.
+
+    A malformed one kernel-panicked a host on 2026-10-07 (a hand-written experiment, not levain's
+    profile). levain calls ``sandbox-exec`` by absolute path, so no PATH shim on the host sees its
+    profiles; this check is levain's own, at its only exec point, on every machine. The token set
+    and the computed-operation forms live in :mod:`levain.firing.seatbelt_guard`.
+    """
+    from levain.firing.seatbelt_guard import scan
+
+    hits = scan(profile_text)
+    if hits:
+        raise ConfinementError(
+            "refusing to start the macOS confinement floor: the Seatbelt profile contains "
+            f"{', '.join(hits)}, which makes the kernel build a syscall mask (a malformed one "
+            "panicked a Mac on 2026-10-07). levain never emits these; this profile was altered."
+        )
 
 
 def sandbox_exec_available() -> bool:

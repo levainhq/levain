@@ -25,6 +25,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 
 - **The confined shell's command channel no longer has a name another process could open.** It was a named pipe in a temp directory whose path sat on the shell's command line until the shell had started, so a process of the same user (another session's entity, say) could read the path and write commands into this shell or read them in that window. It is now an anonymous pipe the shell reads by descriptor and closes before running anything else.
+- **levain refuses to start its macOS floor with a profile that would make the kernel build a syscall mask.** A malformed syscall-mask rule in a hand-written Seatbelt profile kernel-panicked a Mac on 2026-10-07. levain never renders such a rule (a test pins it), and its one launch point now also scans the profile it is about to hand to the sandbox and refuses, before anything runs, if it finds one or a form that could compute one. A host-side PATH guard cannot see levain's launches, because levain calls the sandbox by absolute path.
 - **The launch banner names every credential store the floor covers.** Its "READABLE" warning named three of the five stores (it left out both git credential files); it now reads the floor's own list.
 
 ## [0.6.9] — 2026-10-05
