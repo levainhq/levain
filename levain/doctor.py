@@ -113,6 +113,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
+    core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -876,6 +877,28 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
     return [CheckResult("confinement floor", True, detail)]
+
+
+def _check_floor_placeholders() -> list[CheckResult]:
+    """Sweep the Linux floor's session placeholders (an absent ``~/.netrc`` the bash floor masks over
+    an empty 0444 file while a session runs): remove the ones whose session is gone, which a crash
+    or SIGKILL leaves behind, and name the ones a live session still holds. Silent where there are
+    none, which is every macOS host."""
+    try:
+        from levain.firing.confinement import live_floor_placeholders, sweep_floor_placeholders
+        removed = sweep_floor_placeholders()
+        live = live_floor_placeholders()
+    except Exception as exc:  # noqa: BLE001 — never let the sweep break the whole doctor run
+        return [CheckResult("floor placeholders", True, f"not determinable ({exc})")]
+    if not removed and not live:
+        return []
+    parts = []
+    if removed:
+        parts.append("removed, their session gone: " + ", ".join(removed))
+    if live:
+        parts.append("held by a running session (removed when it ends): "
+                     + ", ".join(str(p) for p in live))
+    return [CheckResult("floor placeholders", True, "; ".join(parts))]
 
 
 def _check_store(install: Path) -> list[CheckResult]:

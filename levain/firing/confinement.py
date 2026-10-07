@@ -221,6 +221,7 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import platform
@@ -370,6 +371,41 @@ _STANDARD_CRED_FILES = (
     "~/.kube/config",               # cluster credentials (client certs, bearer tokens, exec plugins)
 )
 
+# The tool directories that hold a standard cred file. On Linux each is mounted READ-ONLY with its
+# existing subdirectories bound back read-write (step (2a) of the bwrap plan, the construct the
+# entity's own .levain store uses), so an absent cred file in one needs no mountpoint on the host
+# and a link in one cannot be swapped from inside. A file planted at an absent cred path is a real
+# vector: kubeconfig ``users[].exec`` and docker ``credHelpers`` run a command when the operator
+# next uses the tool. Cost: inside a confined session the entity cannot create or rewrite a top-
+# level file in these directories (``aws configure set``, ``kubectl config use-context``,
+# ``git config --global`` for an XDG git user). macOS denies a path string whether it exists or
+# not, so it needs none of this. $HOME-level cred files have no such directory; on Linux an absent
+# one gets a 0444 placeholder that lasts for the session (:func:`_ledger_enter`).
+_CRED_TOOL_DIRS = ("~/.kube", "~/.docker", "~/.aws", "~/.config/git")
+
+
+def _spellings(spec: str | Path) -> list[Path]:
+    """A jewel path at the three spellings the ssh vectors have used since 2026-08-21: the raw
+    ``Path.home()`` form (the true lexical path), resolved HOME plus the unresolved rest, and the
+    fully resolved target. ``spec`` is ``~/rel`` or an absolute path (then the middle spelling is the
+    resolved parent plus the unresolved final component). Duplicates collapse, so in the ordinary
+    no-symlink case this is one path.
+
+    Why all three: Seatbelt canonicalises a path for data operations, but ``unlink``/``rename``/``ln``
+    act on the LINK and are matched lexically, so under a resolved-only deny ``rm -f <link>`` succeeds
+    and the recreated file is an object nothing names (the ssh finding, see ``build_policy`` (3)). On
+    Linux the lexical spelling is what lets the bwrap plan see that a jewel is a link at all.
+    Use it for every list of home-relative jewels (ssh, the standard cred stores, browser profiles),
+    so the next list cannot repeat the resolved-only miss."""
+    s = str(spec)
+    if s == "~" or s.startswith("~/"):
+        home = Path.home()
+        rel = s[2:]
+        raw = home / rel
+        return list(_dedup_paths([raw, home.resolve() / rel, raw.resolve()]))
+    p = Path(s)
+    return list(_dedup_paths([p, p.parent.resolve() / p.name, p.resolve()]))
+
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
 # ⛔ A REACHABLE CONTAINER DAEMON IS A TOTAL BYPASS OF EVERYTHING ELSE IN THIS MODULE, and it
@@ -498,12 +534,13 @@ class CrownJewelsPolicy:
     stores + ssh keys) is shared across OSes and is the load-bearing security surface.
 
     Paths are stored ABSOLUTE, and MOSTLY resolved (symlink-followed) so the rendered denies match
-    what the kernel sees. ⚠ ``deny_write_files`` IS THE DELIBERATE EXCEPTION AND THIS SENTENCE USED
-    TO DENY IT (it read "Every path is stored RESOLVED", which my own 2026-08-21 change falsified and
-    codex L3 caught): each ssh vector is stored at up to THREE spellings — raw ``Path.home()``,
-    resolved-HOME, and fully resolved — because resolving alone LOSES the lexical path that sshd
-    honours through ``realpath()``. ``deny_write_dirs`` carries the same exception for the ~/.ssh
-    anchor. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
+    what the kernel sees. ⚠ THE EXCEPTIONS ARE DELIBERATE (it once read "Every path is stored
+    RESOLVED", which the 2026-08-21 change falsified and codex L3 caught): each ssh vector in
+    ``deny_write_files``, and each standard cred store in ``deny_files`` / ``deny_read_write``, is
+    stored at up to THREE spellings (:func:`_spellings`) — raw ``Path.home()``, resolved-HOME, and
+    fully resolved — because resolving alone LOSES the lexical path, which link operations match
+    and which sshd honours through ``realpath()``. ``deny_write_dirs`` carries the lexical ancestors
+    too. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
     jail (the entity may read/write broadly under default-allow) — it is just where a fresh entity's
     work lands by convention."""
 
@@ -671,6 +708,10 @@ class CrownJewelsPolicy:
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
     # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
+    ro_tool_dirs: tuple[Path, ...] = ()  # the standard cred files' tool directories
+    # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
+    # only: the bwrap plan mounts each read-only and binds its existing subdirectories back read-write,
+    # creating an absent one at 0700 first. Seatbelt needs no counterpart (it denies absent paths).
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -993,11 +1034,14 @@ def build_policy(
       - ``~/.ssh/authorized_keys`` (+ ``authorized_keys2``) WRITE — denied in BOTH ssh_modes: planting
         a key is a persistent SSH backdoor with zero legit entity use (in agent-mode the whole ~/.ssh
         subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
-        expanded), so raw-mode keeps ~/.ssh otherwise writable.
+        expanded), so raw-mode keeps ~/.ssh otherwise writable;
+      - levain's ledger of the Linux floor's session placeholders, ``~/.levain-runtime/floor/``
+        (subtree): it decides what levain deletes from the operator's home.
 
     **``deny_standard_creds=True``:** fold the standard tool-canonical cred stores
-    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor. These are knowable
-    locations (not the false-security guessing the module refuses). This parameter's own default is
+    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor, each at its three
+    spellings, and name their tool directories (:data:`_CRED_TOOL_DIRS`) for the Linux plan. These
+    are knowable locations (not the false-security guessing the module refuses). This parameter's own default is
     False; the product default comes from :func:`levain.firing.drive.resolve_cred_floor`, which passes
     True in every drive except the interactive REPL unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
@@ -1066,9 +1110,17 @@ def build_policy(
     # (resolved by levain.firing.drive.resolve_cred_floor: True except at the interactive REPL, unless
     # the entity declares ``deny_standard_creds: false`` in confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
     # write-deny), so no separate rendering path is needed.
+    # Each at all three spellings (:func:`_spellings`): resolved-only left a stow-style
+    # ``~/.kube/config -> ~/dotfiles/kube/config`` link out of the floor, so ``rm`` + recreate of the
+    # link planted a kubeconfig the operator's next kubectl would run (codex L3, 2026-10-07).
+    tool_dirs: list[Path] = []
     if deny_standard_creds:
-        subtrees.extend(Path(s).expanduser().resolve() for s in _STANDARD_CRED_SUBTREES)
-        files.extend(Path(f).expanduser().resolve() for f in _STANDARD_CRED_FILES)
+        subtrees.extend(p for s in _STANDARD_CRED_SUBTREES for p in _spellings(s))
+        files.extend(p for f in _STANDARD_CRED_FILES for p in _spellings(f))
+        tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
+    # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
+    # deletes from the operator's home, so the entity may neither read nor write it.
+    subtrees.append(_ledger_dir().resolve())
 
     ssh_dir = (home / ".ssh").resolve() if ssh_mode == "agent" else None
 
@@ -1149,14 +1201,12 @@ def build_policy(
     #           target. Denying more endpoints does not fix resolve-first.
     #       (e) HARDLINKS — a pre-existing outside hardlink to a vector: refused at spawn and by the
     #           file editor (see the honest limits above).
-    ssh_home = home / ".ssh"
-    ssh_home_lexical = home.resolve() / ".ssh"      # resolved HOME + un-deref'd .ssh, as ``ssh_anchor``
     deny_write_files_l: list[Path] = []
     for n in _SSH_WRITE_DENIED:
-        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21).
-        deny_write_files_l.append(ssh_home / n)               # RAW ``Path.home()`` — the true lexical
-        deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
-        deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
+        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21): RAW
+        # ``Path.home()`` (the true lexical path), resolved HOME + un-deref'd .ssh, and the real
+        # content target through symlinks. One helper now builds them for every jewel list.
+        deny_write_files_l.extend(_spellings(f"~/.ssh/{n}"))
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1241,8 +1291,9 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
+    known_dirs = {*listed_dirs, _ledger_dir().resolve()}
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs and not jewel.is_file():
+        if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -1325,8 +1376,8 @@ def build_policy(
     # by this anchor and by nothing else."
     # ▶ MEASURED, NOT ARGUED (2026-09-03): ``_write_deny_ancestors`` walks ``jewel.parents`` and does
     # NOT resolve, so the DIRECTORY is produced by the FILES' own ancestors. Both lexical spellings
-    # are in ``all_jewels`` by construction thirty lines up — ``ssh_home / n`` (raw ``Path.home()``)
-    # and ``ssh_home_lexical / n`` (``home.resolve()`` + un-deref'd ``.ssh``) — so their parents are
+    # are in ``all_jewels`` by construction thirty lines up — ``Path.home() / ".ssh" / n`` and
+    # ``home.resolve() / ".ssh" / n``, the first two :func:`_spellings` — so their parents are
     # exactly ``home / ".ssh"`` AND ``home.resolve() / ".ssh"``. The second of those IS
     # ``ssh_anchor``. It is therefore already denied whether or not HOME is itself a symlink, which
     # is the one case the rebuttal's "and by nothing else" needed in order to be true.
@@ -1365,6 +1416,7 @@ def build_policy(
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
+        ro_tool_dirs=tuple(tool_dirs),
     )
 
 
@@ -3147,17 +3199,24 @@ def _bwrap_file_target(f: Path) -> Path:
     """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
     aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
     REFUSED, because masking its target leaves the link free to be swapped for a planted file; one
-    they cannot replace is masked at its real path."""
+    they cannot replace is masked at its real path. (A link in a directory the plan mounts read-only
+    cannot be replaced from inside either; step (4) handles that case before calling this.)"""
     if not f.is_symlink():
         return f
+    _refuse_replaceable_link(f)
+    return f.resolve()
+
+
+def _refuse_replaceable_link(f: Path) -> None:
+    """Refuse bash when the jewel spelling ``f`` is a symlink in a directory this user can write."""
     if os.access(f.parent, os.W_OK):
         raise ConfinementError(
             f"{f} is a symlink in a directory this user can write. The Linux floor protects files "
             "with mounts, and a mount cannot cover a symlink, so the link could be replaced by a "
             "planted file. Refusing to grant bash hands (fail-closed). Replace the symlink with the "
-            "real file to use bash."
+            "real file to use bash (for a standard credential store, setting "
+            "\"deny_standard_creds\": false in .levain/confinement.json also does it)."
         )
-    return f.resolve()
 
 
 _MASK_OPS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
@@ -3304,6 +3363,28 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
             argv += ["--bind-try", str(child), str(child)]
+    # The standard cred files' TOOL directories get the same construct (lane P2, items 5 and 6): an
+    # absent cred file in one then needs no mountpoint, so no 0444 stub lands on the host, and a
+    # link in one is masked at its target because it cannot be replaced from inside. An absent tool
+    # directory is created first (0700, by the provider: step (1) puts it in ``create_first``) and
+    # recorded in the placeholder ledger, which removes it at close if it is still empty.
+    for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
+        real = t.parent.resolve() / t.name
+        if real.is_symlink():
+            _refuse_replaceable_link(real)
+            real = real.resolve()
+        if os.path.lexists(real) and not real.is_dir():
+            continue   # a file where the tool's directory should be: nothing can live under it
+        if real in ro_store_dirs:
+            continue
+        argv += ["--ro-bind", str(real), str(real)]
+        ro_store_dirs.append(real)
+        if not real.is_dir():
+            continue
+        for child in sorted(real.iterdir(), key=lambda p: p.name):
+            if child.is_symlink() or not child.is_dir():
+                continue
+            argv += ["--bind-try", str(child), str(child)]
 
     def _absent_in_ro_store(f: Path) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
@@ -3313,10 +3394,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
         # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
         # (6): a path the HOST creates there after spawn is visible through the read-only bind.
+        # A read-only tool directory may not exist yet (the provider creates it just before
+        # bwrap), so the walk stops at one whether or not it exists. Compared at the real parent,
+        # because the read-only mounts are spelled that way.
         if f.exists():
             return False
-        anc = f.parent
-        while not anc.exists() and anc != anc.parent:
+        anc = f.parent.resolve()
+        while anc not in ro_store_dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
         return anc in ro_store_dirs
 
@@ -3336,6 +3420,17 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
+        # A subtree root spelled lexically (:func:`_spellings`) may be a link, and bwrap refuses to
+        # mount on one ("Can't mount on symlink destination", bubblewrap.c). Its resolved spelling is
+        # in the policy too and gets the tmpfs; the link itself is safe only where it cannot be
+        # replaced from inside, so a link this user can write the directory of refuses bash, as a
+        # cred FILE link does. Any other root is mounted at its real parent.
+        real = sub.parent.resolve() / sub.name
+        if real.is_symlink():
+            if real.parent not in ro_store_dirs:
+                _refuse_replaceable_link(real)
+            continue
+        sub = real
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
             continue
         # A root STRICTLY inside the ssh dir cannot be mounted here: step (3)'s ssh tmpfs, emitted
@@ -3438,7 +3533,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        if _shadowed_by(f, roots):
+            dest = str(f)
+        elif f.is_symlink() and f.parent.resolve() in ro_store_dirs:
+            dest = str(f.resolve())   # a link in a read-only tool dir: masked at its target (2a)
+        else:
+            dest = str(_bwrap_file_target(f))
         masks.append(dest)
         masked_both.append(dest)
 
@@ -3460,7 +3560,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # through, which a control run confirmed it does.
     # The entity's own store files never reach the missing-file branch: an absent one is covered by
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
-    # host's own store when it was tried there (measured 2026-09-30).
+    # host's own store when it was tried there (measured 2026-09-30). The same holds for a cred
+    # file in a tool directory (step 2a); a $HOME-level cred file's stub from step (4) lasts only
+    # for the session (:func:`_ledger_enter`). The ssh vectors' stubs here stay on the host.
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     # Targets steps (2) and (4) already mask, as those steps EMITTED them (codex, L3 r2: a second
     # resolve of the policy paths can observe a symlink retargeted after step (4) ran). EXACT
@@ -3591,7 +3693,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # The masks close the body (the masks-last rule above). They are appended BEFORE step (1), which
     # pins every directory the body makes bwrap create, so a mask's absent parent is pinned too
     # ("test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it" fails if not).
-    for m in masks:
+    # One mask per destination: a link and its target are both in the policy (:func:`_spellings`)
+    # and can name the same file.
+    for m in dict.fromkeys(masks):
         argv += ["--ro-bind", "/dev/null", m]
 
     # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
@@ -3607,7 +3711,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     #   · ABSENT: pinned only if the body will CREATE something under it — then it is created here
     #     first (by the provider on the host, 0700, just before bwrap runs: bwrap resolves a bind's
     #     SOURCE before it applies ``--dir``, so it cannot pin a directory it creates itself —
-    #     measured) and pinned, because an unpinned directory that bwrap creates on the
+    #     measured; recorded in the placeholder ledger, which removes it at close if it is still
+    #     empty) and pinned, because an unpinned directory that bwrap creates on the
     #     host can be renamed away and replaced with a planted one (L1 + L2 review: raw mode with no
     #     ~/.ssh, plant ``authorized_keys``). An absent ancestor nothing will be created under holds
     #     nothing and is skipped — a self-bind of a missing source aborts bwrap, which is how the
@@ -3860,12 +3965,14 @@ def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
     return list(dict.fromkeys(spelled(Path(p)) for p in named))
 
 
-def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
+def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]]:
     """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
     it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
-    which is still recorded before bwrap mounts over it."""
+    which is still recorded before bwrap mounts over it. Returns the mountpoints THIS call created,
+    as ``(path, "file" | "dir")``, so the caller can make the cred placeholders session-scoped."""
+    created: list[tuple[str, str]] = []
     for q, kind in mounted.items():
         p = Path(q)
         if kind is None or os.path.lexists(p):
@@ -3882,7 +3989,201 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
                 os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
                                  | getattr(os, "O_NOFOLLOW", 0), 0o444))
             except FileExistsError:
-                pass
+                continue
+            created.append((q, "file"))
+    return created
+
+
+# --- the session-scoped placeholder ledger (Linux) -----------------------------------------------
+#
+# A mount needs a mountpoint, so an absent $HOME-level cred file (~/.netrc, ~/.npmrc, ~/.pypirc,
+# ~/.git-credentials) is masked over a 0444 placeholder the provider creates. Skipping it would let
+# the shell PLANT the file (a planted ~/.pypirc ``repository`` sends the operator's next upload
+# token elsewhere), so the placeholder stays, but only while a session needs it: before this ledger
+# it was left on the host for good, and ``npm login`` / ``docker login`` then failed on a 0444 file.
+# ⛔ Never unlinked while a session might rely on it. Since Linux 3.18 a host-side unlink of a
+# file that is a mountpoint in ANOTHER mount namespace succeeds and lazily DETACHES that mount
+# (torvalds/linux 8ed936b, "vfs: Lazily remove mounts on unlinked files and directories"), which
+# would let a live shell create the file. So each object carries the claims of the shells that mask
+# it, and is removed only when none is left, at close, at levain exit, by the sweep at the next spawn
+# and by ``levain doctor`` (a crash or SIGKILL leaves claims whose process is gone).
+# ⛔ Removed only while it is still the object created: same device and inode, and for a file still
+# empty and 0444, for a directory still empty. An operator's ``npm login`` that replaced it by rename
+# leaves a different inode, which this keeps (and the replacement closed the live shell, through the
+# manifest check in :class:`_BwrapShell`).
+# The ledger directory is a crown jewel (``build_policy``), so the entity can neither read it nor
+# forge a claim. Directories the provider creates to pin them (an absent ~/.kube, say) are recorded
+# the same way.
+
+_LEDGER_NAME = "placeholders.json"
+
+
+def _ledger_dir() -> Path:
+    return Path.home() / ".levain-runtime" / "floor"
+
+
+def _claim_alive(claim: str) -> bool:
+    try:
+        pid = int(claim.split(":", 1)[0])
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # someone else's process with that pid: alive, so the claim is kept
+    except OSError:
+        return False
+    return True
+
+
+def _object_unchanged(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    if (st.st_dev, st.st_ino) != (entry.get("dev"), entry.get("ino")):
+        return False
+    if entry.get("kind") == "dir":
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        try:
+            return not os.listdir(entry["path"])
+        except OSError:
+            return False
+    return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0o444
+
+
+def _ledger_update(change) -> list[str]:
+    """Apply ``change(entries)`` to the ledger under an exclusive lock, then delete every entry that
+    no live claim holds, removing its object when it is unchanged. Returns the paths removed. Best
+    effort: a ledger that cannot be read or written leaves the objects where they are, which is the
+    behaviour before the ledger existed, never a deletion."""
+    import fcntl
+
+    d = _ledger_dir()
+    removed: list[str] = []
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(d / (_LEDGER_NAME + ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = d / _LEDGER_NAME
+            try:
+                entries = json.loads(path.read_text(encoding="utf-8")).get("entries", [])
+            except FileNotFoundError:
+                entries = []
+            except (OSError, ValueError, AttributeError):
+                return []   # unreadable: keep every object rather than guess
+            entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)]
+            change(entries)
+            kept: list[dict] = []
+            # Children before parents, so a created ~/.config/git goes before a created ~/.config.
+            for e in sorted(entries, key=lambda e: len(e["path"]), reverse=True):
+                e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str)]
+                if e["claims"]:
+                    kept.append(e)
+                    continue
+                if _object_unchanged(e):
+                    try:
+                        if e.get("kind") == "dir":
+                            os.rmdir(e["path"])
+                        else:
+                            os.unlink(e["path"])
+                        removed.append(e["path"])
+                    except OSError:
+                        kept.append(e)   # still there: try again next time
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps({"entries": sorted(kept, key=lambda e: e["path"])}, indent=1),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+    except OSError:
+        return removed
+    return removed
+
+
+def _ledger_enter(created: list[tuple[str, str]], mounted: set[str], claim: str) -> None:
+    """Record the objects a spawn just ``created`` and add ``claim`` to every ledger entry this
+    shell mounts on (``mounted``) whose object is still the one recorded, including those another
+    session created."""
+    def change(entries: list[dict]) -> None:
+        for path, kind in created:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            entries[:] = [e for e in entries if e["path"] != path]
+            entries.append({"path": path, "kind": kind, "dev": st.st_dev, "ino": st.st_ino,
+                            "claims": []})
+        for e in entries:
+            if e["path"] in mounted and _identity_matches(e):
+                e.setdefault("claims", []).append(claim)
+
+    _ledger_update(change)
+
+
+def _identity_matches(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (entry.get("dev"), entry.get("ino"))
+
+
+def _ledger_release(claim: str) -> list[str]:
+    """Drop ``claim`` (or, given ``"<pid>:"``, every claim of that process) and remove what no
+    session holds any more."""
+    def change(entries: list[dict]) -> None:
+        for e in entries:
+            e["claims"] = [c for c in e.get("claims", [])
+                           if not (c == claim or (claim.endswith(":") and c.startswith(claim)))]
+
+    return _ledger_update(change)
+
+
+def sweep_floor_placeholders() -> list[str]:
+    """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
+    before every Linux spawn and by ``levain doctor``. Returns the paths removed."""
+    if not (_ledger_dir() / _LEDGER_NAME).exists():
+        return []
+
+    def change(entries: list[dict]) -> None:
+        for e in entries:
+            e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str) and _claim_alive(c)]
+
+    return _ledger_update(change)
+
+
+def live_floor_placeholders() -> list[Path]:
+    """The placeholder FILES a live session holds on this host right now (for the banner)."""
+    try:
+        entries = json.loads((_ledger_dir() / _LEDGER_NAME).read_text(encoding="utf-8"))["entries"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [Path(e["path"]) for e in entries
+            if isinstance(e, dict) and e.get("kind") == "file"
+            and any(isinstance(c, str) and _claim_alive(c) for c in e.get("claims", []))]
+
+
+def session_placeholder_note(deny_standard_creds: bool, system: str | None = None) -> str | None:
+    """One banner line naming the $HOME-level cred files that will be empty read-only placeholders
+    while this session's bash runs on Linux (they are absent now), or None."""
+    if not deny_standard_creds or (system or platform.system()) != "Linux":
+        return None
+    home = Path.home()
+    absent = [f for f in _STANDARD_CRED_FILES if "/" not in f[2:] and not os.path.lexists(home / f[2:])]
+    if not absent:
+        return None
+    return (" · ".join(absent) + " are absent: while bash runs each is an empty read-only "
+            "placeholder (so nothing can be planted there), removed when the session ends")
+
+
+@atexit.register
+def _release_this_process() -> None:
+    if (_ledger_dir() / _LEDGER_NAME).exists():
+        _ledger_release(f"{os.getpid()}:")
 
 
 class _BwrapShell(SandboxedShell):
@@ -3924,6 +4225,17 @@ class _BwrapShell(SandboxedShell):
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
         self._manifest = dict(manifest)   # recorded before the start; never updated
+        self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
+
+    def close(self) -> None:
+        # Released only after the sandbox is gone, so no mount of this shell rests on a placeholder
+        # the release removes. `finally`, as `_SeatbeltShell.close`: the parent's teardown can raise.
+        try:
+            super().close()
+        finally:
+            claim, self._ledger_claim = self._ledger_claim, None
+            if claim is not None:
+                _ledger_release(claim)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -4036,10 +4348,20 @@ class BwrapProvider(ConfinementProvider):
         argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
+        # What this spawn creates (these directories, and the placeholders for absent cred files)
+        # goes in the placeholder ledger, which removes it when no session needs it any more.
+        created: list[tuple[str, str]] = []
+        claim = f"{os.getpid()}:{os.urandom(6).hex()}"
+        sweep_floor_placeholders()   # a crashed session's placeholders, before this plan counts on them
         for d in create_first:
             try:
-                Path(d).mkdir(mode=0o700, exist_ok=True)
+                Path(d).mkdir(mode=0o700)
+                created.append((d, "dir"))
+            except FileExistsError:
+                pass
             except OSError as exc:
+                _ledger_enter(created, set(), claim)
+                _ledger_release(claim)
                 raise ConfinementError(
                     f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
                     "bash hands (fail-closed)."
@@ -4047,16 +4369,22 @@ class BwrapProvider(ConfinementProvider):
         # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
+        cred_files = {str(f) for f in policy.deny_files}
         try:
-            _prepare_mountpoints(mounted)
+            made = _prepare_mountpoints(mounted) or []
+            created += [(q, k) for q, k in made if q in cred_files]
             manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
         except (OSError, RuntimeError) as exc:
+            _ledger_enter(created, set(), claim)
+            _ledger_release(claim)
             raise ConfinementError(
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
                 "bash hands (fail-closed)."
             ) from exc
+        _ledger_enter(created, {*mounted, *create_first}, claim)
         moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
         if moved:
+            _ledger_release(claim)
             raise ConfinementError(
                 f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
                 "— refusing to grant bash hands (fail-closed). Try again."
@@ -4076,6 +4404,7 @@ class BwrapProvider(ConfinementProvider):
             env=shell_env,
             default_timeout=default_timeout,
         )
+        shell._ledger_claim = claim
         try:
             shell.start()
             shell._recheck()   # whatever changed during the start closes it before any command

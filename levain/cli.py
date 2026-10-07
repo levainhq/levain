@@ -1674,6 +1674,10 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         why = ("pinned by deny_standard_creds: true" if cred_declared is True
                else "the default for an unattended seat")
         print(f"  cred floor: {cred_floor_label()} are DENIED ({why}).")
+        from levain.firing.confinement import session_placeholder_note
+
+        if (note := session_placeholder_note(True)) is not None:
+            print(f"  {note}.")
     elif cred_floor is False:
         print(
             f"  ⚠ cred floor: {cred_floor_label()} are READABLE by this\n"

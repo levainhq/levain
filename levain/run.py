@@ -824,6 +824,10 @@ def _print_banner(
 
         if deny_standard_creds:
             print(f"             standard cred stores {cred_floor_label()}")
+            from levain.firing.confinement import session_placeholder_note
+
+            if (_note := session_placeholder_note(True)) is not None:
+                print(f"             {_note}")
         else:
             print(f"             ⚠ standard cred stores {cred_floor_label()}")
             print("               are READABLE by this entity (deny_standard_creds is off)")
