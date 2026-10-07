@@ -62,10 +62,13 @@ class TeamBusy(TeamError):
 # Every git call here is levain's own plumbing on a private worktree, so none of them runs the project's hooks: git on
 # Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
 # fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
-_NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+# Nor any attributes but the branch's own (refused unless absent): a user-wide attributes file must not re-encode or
+# filter a ledger file levain writes.
+_NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null"]
 # The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_TOP_FILES = (b"team.toml", b"PROJECT.md")     # with `ledger`, the whole top level of the ledger branch
 
 
 _INCOMING = "refs/levain/incoming"
@@ -115,7 +118,8 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
-               GIT_NO_REPLACE_OBJECTS="1")   # a replace ref must not change what levain reads
+               GIT_NO_REPLACE_OBJECTS="1",   # a replace ref must not change what levain reads
+               GIT_ATTR_NOSYSTEM="1")        # nor a system-wide attributes file what it writes
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     # Bytes in, bytes out: text=True would decode with the parent's locale and turn a CR into a line break. The
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
@@ -505,9 +509,11 @@ class GitLedger:
         return Judgement(led, datas, files, problems)
 
     def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]]]:
-        """(bad_paths, leaves) of the ledger at ``rev``: one ``ls-tree -r -t -z``, judged as bytes. No blob is read."""
-        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger"], self.repo.toplevel, check=False,
-                 timeout=30)
+        """(bad_paths, leaves) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree, judged as
+        bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md`` (regular
+        files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or filter
+        what levain writes, a ``.gitmodules``, any other file) is tamper too. No blob is read."""
+        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30)
         if cp.returncode != 0:
             raise LedgerReadError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
@@ -526,7 +532,9 @@ class GitLedger:
                 continue
             seen_paths.add(path)
             is_tree = mode == b"040000" and kind == b"tree"
-            if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
+            if path in _TOP_FILES:
+                ok = mode in _REGULAR_MODES and kind == b"blob"
+            elif path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
                 ok = is_tree
             elif mode in _REGULAR_MODES and kind == b"blob" and _LEDGER_PATH_RE.fullmatch(path):
                 ok = True

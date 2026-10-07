@@ -358,3 +358,16 @@ def test_a_team_toml_that_does_not_parse_on_the_remote_is_refused(two):
     assert team("sync", repo=ben) == 2
     out = edit(ben, "src/settlement.py", session="tt")["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny" and "team.toml" in out["permissionDecisionReason"]
+
+
+def test_a_top_level_attributes_file_on_the_ledger_branch_is_tamper(two):
+    # L2 (round 0) #5, RUN: a member committed `.gitattributes` (ledger/** working-tree-encoding=UTF-16) at the top of
+    # the ledger branch; the judge looked only under ledger/, accepted it, and every later append failed at `git add`.
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    (ga.wt / ".gitattributes").write_text("ledger/** working-tree-encoding=UTF-16\n")
+    _push_wt(ga, "attributes")
+    assert team("sync", repo=ben) == 2
+    assert any(".gitattributes" in t for t in ledger(ben).tamper)
+    out = edit(ben, "src/unrelated.py", session="ga")["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
