@@ -18,6 +18,8 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
 
 **The crown-jewels denylist (structural, never — the Phill-ratified starting set):**
   - flow's store ``~/.anneal-memory/`` (the identity moat, in file terms);
+  - the operator's Levain launch tokens ``~/.levain-runtime/`` (a running server's unlocked link);
+  - browser profiles (``BROWSER_PROFILE_DIRS``: every site's cookies, logins and local storage);
   - credential files (declared by the caller — this module does NOT guess where secrets live);
   - sibling entities' ``<other>/.levain/`` stores (one entity can't read another's memory);
   - the ``~/.ssh`` key material (``ssh_mode="agent"``): the entity may USE keys via the agent socket
@@ -219,6 +221,7 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -241,6 +244,7 @@ from typing import IO, Literal, NoReturn
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
 # are stdlib-only leaves, so this adds no dependency weight.
 from levain.firing.gate import GATE_SETTINGS, GateSetting
+from levain.http_guards import RUNTIME_DIR_NAME
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -686,6 +690,168 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
+
+# BROWSER PROFILES, home-relative, read AND write denied (head ruling 2026-10-07, after L2 measured the cockpit's
+# launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies and saved logins
+# (Chromium browsers encrypt those with a Keychain or keyring key; their page storage is plain), so it is a crown
+# jewel whatever Levain keeps in it. A maintained list, like the credential stores: a browser not on it is not denied.
+#
+# Each entry is (platform, path, page-storage globs): data, read by the floor. On macOS every entry is denied, at its
+# literal and resolved spellings, whether or not it exists: a Seatbelt rule for an absent path costs nothing, and an
+# absent denied path cannot be created by the entity. On Linux an entry that exists is denied at its resolved
+# spelling; a mount needs a mountpoint, so an absent entry is left to the floor's handling of absent protected paths.
+# The roots are re-derived at every shell spawn (:func:`refresh_socket_denies`), so a profile created mid-session is
+# denied from the next spawn. An entry whose path is a symlink loop is not denied and refuses bash
+# (:func:`_refuse_unresolvable_browser_roots`). On Linux, entries under ``.config`` are denied under the default
+# ``~/.config`` AND under ``$XDG_CONFIG_HOME`` and ``$CHROME_CONFIG_HOME`` when those are set (both, not either: levain
+# reads the variables from its own environment, which may not be the browser's). Paths from the Chromium
+# user-data-dir doc (https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md), Kagi's Orion notes
+# (https://help.kagi.com/orion/misc/technical.html) and the vendors' layouts (L1 + L2, 2026-10-07).
+#
+# The globs are the ONLY parts of a profile walked for other names (hardlinks) at shell start, ruled by Phill
+# 2026-10-07 ("levain = (a) please"): a profile is too large, and carries its own hardlinks (WebKit's cache), to walk
+# whole. They name the folders that hold a page's sessionStorage / localStorage, which is where the cockpit's launch
+# token lives, at that browser's own profile depth. Cookies, Login Data and the rest of a profile are denied by path
+# only; an entry with no globs (Safari's container refuses a listing) is denied by path only.
+_CR = ("Session Storage", "Local Storage")                                         # Chromium-family page storage
+_FF = ("storage/default", "webappsstore.sqlite", "sessionstore.jsonlz4", "sessionstore-backups")   # Firefox-family
+
+
+def _at(depths: tuple[str, ...], names: tuple[str, ...]) -> tuple[str, ...]:
+    """Every storage name at every profile depth (``""`` = the root is the profile)."""
+    return tuple(f"{d}/{n}" if d else n for d in depths for n in names)
+
+
+_AS = "Library/Application Support"
+BROWSER_PROFILE_DIRS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("darwin", f"{_AS}/Google", _at(("*/*",), _CR)),               # every Chrome channel + Chrome for Testing (also
+                                                                  # holds Android Studio config: denied with it)
+    ("darwin", f"{_AS}/Chromium", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/BraveSoftware", _at(("*/*",), _CR)),        # Brave, all channels: <root>/<browser>/<profile>
+    ("darwin", f"{_AS}/Microsoft Edge", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/Microsoft Edge Beta", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/Microsoft Edge Dev", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/Microsoft Edge Canary", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/Arc", _at(("*/*",), _CR)),                  # Arc/User Data/<profile>
+    ("darwin", f"{_AS}/Vivaldi", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/Vivaldi Snapshot", _at(("*",), _CR)),
+    ("darwin", f"{_AS}/com.operasoftware.Opera", _at(("", "_side_profiles/*"), _CR)),    # the root IS the profile
+    ("darwin", f"{_AS}/com.operasoftware.OperaGX", _at(("", "_side_profiles/*"), _CR)),
+    ("darwin", f"{_AS}/com.operasoftware.OperaNext", _at(("", "_side_profiles/*"), _CR)),        # Opera beta
+    ("darwin", f"{_AS}/com.operasoftware.OperaDeveloper", _at(("", "_side_profiles/*"), _CR)),
+    ("darwin", f"{_AS}/com.openai.atlas", _at(("browser-data/host/*",), _CR)),   # ChatGPT Atlas (and its chats)
+    ("darwin", f"{_AS}/Firefox", _at(("Profiles/*",), _FF)),       # Firefox, Developer Edition and Nightly
+    ("darwin", f"{_AS}/zen", _at(("Profiles/*",), _FF)),           # Zen
+    ("darwin", f"{_AS}/librewolf", _at(("Profiles/*",), _FF)),     # LibreWolf
+    ("darwin", f"{_AS}/Waterfox", _at(("Profiles/*",), _FF)),      # Waterfox
+    ("darwin", f"{_AS}/Orion", ()),                                # Orion (WebKit): settings, history
+    ("darwin", "Library/WebKit/com.kagi.kagimacOS", _at(("WebsiteData/Default/*",), ("LocalStorage",))),  # its sites
+    ("darwin", "Library/HTTPStorages/com.kagi.kagimacOS", ()),     # Orion's cookies
+    ("darwin", "Library/HTTPStorages/com.kagi.kagimacOS.binarycookies", ()),
+    ("darwin", "Library/Safari", ()),                              # Safari history, local storage
+    ("darwin", "Library/Containers/com.apple.Safari", ()),         # Safari's sandbox container (refuses a listing)
+    ("darwin", "Library/SafariTechnologyPreview", ()),
+    ("darwin", "Library/Containers/com.apple.SafariTechnologyPreview", ()),
+    ("darwin", "Library/Cookies", ()),                             # the system cookie store Safari uses
+    ("darwin", ".cache/chrome-devtools-mcp", _at(("*/*",), _CR)),  # chrome-devtools-mcp's agent-driven Chrome
+    ("linux", ".config/google-chrome", _at(("*",), _CR)),
+    ("linux", ".config/google-chrome-beta", _at(("*",), _CR)),
+    ("linux", ".config/google-chrome-unstable", _at(("*",), _CR)),   # Chrome Dev
+    ("linux", ".config/google-chrome-canary", _at(("*",), _CR)),
+    ("linux", ".config/chromium", _at(("*",), _CR)),
+    ("linux", ".config/BraveSoftware", _at(("*/*",), _CR)),        # Brave, all channels
+    ("linux", ".config/microsoft-edge", _at(("*",), _CR)),
+    ("linux", ".config/microsoft-edge-beta", _at(("*",), _CR)),
+    ("linux", ".config/microsoft-edge-dev", _at(("*",), _CR)),
+    ("linux", ".config/vivaldi", _at(("*",), _CR)),
+    ("linux", ".config/vivaldi-snapshot", _at(("*",), _CR)),
+    ("linux", ".config/opera", _at(("", "_side_profiles/*"), _CR)),
+    ("linux", ".config/opera-beta", _at(("", "_side_profiles/*"), _CR)),
+    ("linux", ".config/opera-developer", _at(("", "_side_profiles/*"), _CR)),
+    ("linux", ".mozilla", _at(("firefox/*",), _FF)),               # Firefox
+    ("linux", ".config/mozilla", _at(("firefox/*",), _FF)),        # Firefox's XDG location (newer releases)
+    ("linux", ".zen", _at(("*",), _FF)),                           # Zen
+    ("linux", ".librewolf", _at(("*",), _FF)),                     # LibreWolf
+    ("linux", ".waterfox", _at(("*",), _FF)),                      # Waterfox
+    ("linux", "snap/firefox/common/.mozilla", _at(("firefox/*",), _FF)),    # Ubuntu's default Firefox (snap)
+    ("linux", "snap/chromium/common/chromium", _at(("*",), _CR)),  # Chromium (snap)
+    ("linux", "snap/brave", _at(("*/.config/BraveSoftware/*/*",), _CR)),    # Brave (snap): <revision>/.config/...
+    ("linux", ".var/app",                                          # every flatpak app's data, by design: browsers
+     # among them, and every other flatpak app too. Only the browsers' own app folders are walked (L1: walking
+     # every app's config refused bash for an unrelated app's link).
+     _at(("com.google.Chrome/config/google-chrome/*", "org.chromium.Chromium/config/chromium/*",
+          "com.brave.Browser/config/BraveSoftware/*/*", "com.microsoft.Edge/config/microsoft-edge/*",
+          "com.vivaldi.Vivaldi/config/vivaldi/*", "com.opera.Opera/config/opera"), _CR)
+     + _at(("org.mozilla.firefox/.mozilla/firefox/*", "org.mozilla.firefox/config/mozilla/firefox/*",
+            "io.gitlab.librewolf-community/.librewolf/*", "app.zen_browser.zen/.zen/*",
+            "net.waterfox.waterfox/.waterfox/*"), _FF)),
+    ("linux", ".cache/chrome-devtools-mcp", _at(("*/*",), _CR)),
+)
+
+
+def _linux_config_homes(home: Path) -> list[Path]:
+    homes = [home / ".config"]
+    for var in ("XDG_CONFIG_HOME", "CHROME_CONFIG_HOME"):
+        v = os.environ.get(var)
+        # a relative value is ignored, as the XDG Base Directory spec says to
+        if v and Path(v).expanduser().is_absolute() and Path(v).expanduser() not in homes:
+            homes.append(Path(v).expanduser())
+    return homes
+
+
+@dataclass(frozen=True)
+class _BrowserRoot:
+    path: Path                 # a profile root as denied: resolved, or on macOS also its literal spelling
+    globs: tuple[str, ...]     # its page storage, walked for other names
+    loop: bool = False         # its path does not resolve (a symlink loop): not denied, refuses bash
+
+
+def _browser_roots(home: Path) -> list[_BrowserRoot]:
+    """Every browser profile root denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
+    darwin = platform.system() == "Darwin"
+    out: list[_BrowserRoot] = []
+    for os_name, rel, globs in BROWSER_PROFILE_DIRS:
+        if os_name != ("darwin" if darwin else "linux"):
+            continue
+        cands = ([base / rel[len(".config/"):] for base in _linux_config_homes(home)]
+                 if not darwin and rel.startswith(".config/") else [home / rel])
+        for c in cands:
+            try:
+                os.stat(c)
+                looped = False
+            except OSError as exc:
+                looped = exc.errno == errno.ELOOP
+            try:
+                target = c.resolve()   # a loop raises RuntimeError on Python 3.12 and resolves quietly on 3.13 (L1)
+            except (OSError, RuntimeError):
+                looped = True
+            if looped:
+                out.append(_BrowserRoot(c, globs, loop=True))
+                continue
+            if darwin:
+                out.append(_BrowserRoot(target, globs))
+                if target != c:
+                    out.append(_BrowserRoot(c, globs))
+            elif os.path.exists(target):   # never raises (Path.exists() raises PermissionError before 3.14)
+                out.append(_BrowserRoot(target, globs))
+    return out
+
+
+def browser_profile_roots(home: Path) -> list[Path]:
+    """The browser profile paths denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
+    return list(_dedup_paths([r.path for r in _browser_roots(home) if not r.loop]))
+
+
+def _refuse_unresolvable_browser_roots(policy: CrownJewelsPolicy) -> None:
+    """Refuse bash when a browser profile root's path is a symlink loop: it cannot be resolved, so it cannot be denied
+    (L1, 2026-10-07: ``Path.resolve()`` raised out of ``build_policy`` and failed every session)."""
+    for root in _browser_roots(Path.home()):
+        if root.loop:
+            raise ConfinementError(
+                f"The browser profile path {root.path} is a symlink loop, so the floor cannot resolve it to deny it. "
+                "Refusing to grant bash hands (fail-closed); remove the link.")
+
+
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -968,6 +1134,10 @@ def build_policy(
       - the operator-laptop memory store ``~/.anneal-memory/`` (subtree) — the identity moat in file
         terms (mirrors :func:`levain.firing.isolation.flow_store_dir`); a sovereign entity must never
         read the operator's own memory;
+      - the operator's Levain launch tokens ``~/.levain-runtime/`` (subtree) — a running server's
+        token, which would let an entity read that memory over loopback instead;
+      - browser profiles (``BROWSER_PROFILE_DIRS``, subtrees) — every site's session cookies,
+        saved logins and local storage, the cockpit's own tab among them;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
@@ -1044,6 +1214,12 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
+    # The operator's Levain launch tokens (``~/.levain-runtime/<port>.json``, levain.http_guards): with one, an
+    # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
+    runtime = (home / RUNTIME_DIR_NAME).resolve()
+    subtrees.append(runtime)
+    browsers = browser_profile_roots(home)
+    subtrees.extend(browsers)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1234,7 +1410,7 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs and not jewel.is_file():
+        if (jewel in listed_dirs or jewel == runtime or jewel in browsers) and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -1466,7 +1642,10 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
-    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    # Browser profile roots likewise (L1, 2026-10-07): a browser first run, or a root reached through a link that
+    # appeared, after the session was built is denied from the next spawn on.
+    listed = [*listed, *browser_profile_roots(Path.home())]
+    new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
         policy = replace(
             policy,
@@ -2427,6 +2606,7 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
+        _refuse_unresolvable_browser_roots(refreshed)
         _refuse_multiply_linked_jewels(refreshed)
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
@@ -2952,13 +3132,41 @@ def _foreign_runtime_dirs() -> list[str]:
     return out
 
 
-def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, str]]:
+# The browser roots and which page-storage folders exist: found afresh at every shell spawn (the shell-start check)
+# and reused by the file editor's checks for a short while after (L1 cost: globbing every profile on every editor touch
+# of a file with two names, pnpm's node_modules hardlinks). Keyed by HOME, not by the policy object: the floor replaces
+# its policy object on every refresh (codex L3), so a per-object key never hit. A folder created since is seen by the
+# next spawn, or by the editor once the entry is older than _STORAGE_ROOTS_TTL.
+_STORAGE_ROOTS_CACHE: dict[str, tuple[float, list[_BrowserRoot], list[Path]]] = {}
+_STORAGE_ROOTS_TTL = 30.0
+_STORAGE_ROOTS_LOCK = threading.Lock()   # shells spawn concurrently (codex L3)
+
+
+def _browser_storage(policy: CrownJewelsPolicy, *, fresh: bool) -> tuple[list[_BrowserRoot], list[Path]]:
+    """The browser roots and the page-storage folders under them, found afresh or reused (see above)."""
+    home = Path.home()
+    key = f"{platform.system()}:{home}"
+    with _STORAGE_ROOTS_LOCK:
+        hit = _STORAGE_ROOTS_CACHE.get(key)
+    if not fresh and hit is not None and time.monotonic() - hit[0] < _STORAGE_ROOTS_TTL:
+        return hit[1], hit[2]
+    browsers = _browser_roots(home)
+    found = sorted({g for r in browsers if not r.loop and os.path.isdir(r.path)
+                    for pattern in r.globs for g in r.path.glob(pattern)}, key=str)
+    with _STORAGE_ROOTS_LOCK:
+        _STORAGE_ROOTS_CACHE[key] = (time.monotonic(), browsers, found)
+    return browsers, found
+
+
+def _jewel_inodes(policy: CrownJewelsPolicy, *, fresh: bool = True) -> dict[tuple[int, int], tuple[int, str]]:
     """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, one path to it)``.
 
-    The jewels are the named ones (followed through symlinks) plus every entry under the hidden
-    subtrees and the ssh dir (walked without following symlinks), and on Linux the session bus and
-    the systemd manager socket bwrap step (7) masks. An absent jewel is skipped: there is no file to
-    have other names.
+    The jewels are the named ones (followed through symlinks), on Linux the session bus and the systemd manager
+    socket bwrap step (7) masks, and every entry under the hidden subtrees and the ssh dir (walked without following
+    symlinks). Browser profiles are the exception among the subtrees: only the page storage their
+    ``BROWSER_PROFILE_DIRS`` globs name is walked (Phill, 2026-10-07). Which of those folders exist is found afresh,
+    unless ``fresh`` is False, when a recent answer is reused (``_STORAGE_ROOTS_TTL``). An absent jewel is
+    skipped: there is no file to have other names.
 
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("could not check"),
     whoever owns the directory in the way: a chmod on its own directory would otherwise switch the
@@ -3010,10 +3218,20 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             return
         unverifiable(str(exc.filename or "a crown-jewel directory"), exc)
 
-    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])},
+    # Browser profiles are denied by path but not walked whole: Safari's WebKit cache hardlinks its own files, its
+    # container is privacy-protected (os.walk is refused, which would refuse bash outright), and a Chrome profile can
+    # hold gigabytes. Their page storage (each entry's globs in BROWSER_PROFILE_DIRS), where the cockpit's token is
+    # kept, IS walked.
+    home = Path.home()
+    browsers, storage_roots = _browser_storage(policy, fresh=fresh)
+    # Only this platform's entries (codex L3: on macOS an operator-declared jewel at ~/.mozilla was left unwalked
+    # because .mozilla is a Linux browser entry).
+    mine = "darwin" if platform.system() == "Darwin" else "linux"
+    unwalked = {home / rel for os_name, rel, _globs in BROWSER_PROFILE_DIRS if os_name == mine} | {r.path for r in browsers}
+    roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,
                    key=lambda p: str(p))
     walked: list[Path] = []
-    for root in roots:
+    for root in [*roots, *storage_roots]:
         if any(root == w or root.is_relative_to(w) for w in walked):
             continue
         walked.append(root)
@@ -3076,7 +3294,7 @@ def linked_jewel_reason(policy: CrownJewelsPolicy, path: str | Path) -> str | No
     if stat.S_ISDIR(st.st_mode) or st.st_nlink < 2:
         return None
     try:
-        jewels = _jewel_inodes(policy)
+        jewels = _jewel_inodes(policy, fresh=False)
     except ConfinementError as exc:
         return f"{path} has more than one name, and the crown-jewel check failed: {exc}"
     hit = jewels.get((st.st_dev, st.st_ino))

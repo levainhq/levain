@@ -85,7 +85,8 @@
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
-  // off-box, exactly like /substrate.json). null → search falls back to a direct token-free fetch:
+  // off-box, exactly like /substrate.json; the launch token gates it everywhere `levain serve` runs).
+  // null → search falls back to a direct fetch that carries no token:
   // the transport-agnostic-core SAFETY NET so the core never hard-requires the transport. The
   // shipped web boot injects `recall` on EVERY surface (both render branches), so for `levain serve`
   // that fallback is not a live path — off-box search always rides the token-carrying transport.
@@ -796,7 +797,7 @@
       status.textContent = "searching…";
       try {
         // Route through the injected recall transport when present (it carries the off-box token —
-        // spore-220 gates /recall.json off-box); fall back to a direct token-free fetch otherwise.
+        // spore-220 gates /recall.json off-box); fall back to a direct fetch carrying no token otherwise.
         let data;
         if (recall) {
           data = await recall(q);

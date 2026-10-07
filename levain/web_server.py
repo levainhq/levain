@@ -43,17 +43,22 @@ Sovereignty boundary (load-bearing, not incidental):
   cross-origin). So every request's ``Host`` is checked against a loopback
   allowlist and anything else is a 403. The same check now also fronts the write
   route — it IS the Slice-2a write/auth boundary it was the seed of.
-- **no-token localhost-sovereign write/auth (Slice 2a)** — there is no password/
-  token (a startup token is SaaS thinking; principle #6 rejects it at the seat
-  layer). The ``/chat`` routes are the one exception: they make an entity act, so they
-  take a per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310). The auth for a write is the loopback bind + the Host allowlist + two
-  CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
+- **the launch token (np-ebb8a399)** — ``levain serve`` generates a token per launch, holds it
+  in the process, prints it only to a terminal, leaves it in a 0600 runtime file, and opens the
+  browser on a single-use link code (on macOS). Every route except the page shell needs it
+  (``LAUNCH_TOKEN_HEADER``, enforced in ``GuardedHandler`` before any route is reached). The
+  rule this replaced, no token at all because "anything that can reach loopback can already edit
+  your files" (principle #6), is false for three callers: another OS user, a container reaching
+  host loopback, a sandboxed app with a network entitlement. ``make_server`` sets the gate only
+  when given a token or a chat host, so a downstream that keeps its own posture is unchanged.
+- **localhost write/auth (Slice 2a)** — beneath the launch token, the auth for a write is the
+  loopback bind + the Host allowlist + two CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
   operator's own curl) or ``same-origin`` (our own dashboard page) — a hostile
   cross-site page's request carries ``cross-site`` and is refused; (2) the body
   must be ``application/json``, which a cross-origin page cannot send without a
-  CORS preflight we never satisfy. A malicious LOCAL process could omit the header
-  AND set the type — but a process with local code execution can already edit the
-  files directly, so that is not a new exposure. Reversibility (backup + audit) is
+  CORS preflight we never satisfy. A local process could omit the header AND set the
+  type; the launch token is what stops one that cannot read the operator's files.
+  Reversibility (backup + audit) is
   the safety net per the doctrine; destructive Class-B writes (Slice 2b) add a
   per-write confirm, Class-A does not.
 - **no dependencies, no CDN** — stdlib ``http.server`` + vanilla-JS assets served
@@ -76,7 +81,6 @@ from __future__ import annotations
 
 import dataclasses
 import hmac
-import secrets
 import ipaddress
 import json
 import sys
@@ -89,7 +93,21 @@ from typing import Any
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import GuardedHandler
+from levain.http_guards import (
+    LINK_PATH,
+    UNLOCK_PATH,
+    GuardedHandler,
+    arm_launch_token,
+    check_launch_token,
+    new_launch_token,
+    publish_launch_token,
+    SigtermStop,
+    stop_on_sigterm,
+    read_running,
+    request_link_code,
+    runtime_dir,
+)
+from levain.http_guards import open_unlocked as _open_browser  # the name tests patch on this module
 from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -108,6 +126,7 @@ __all__ = [
     "build_substrate_json",
     "load_web_asset",
     "make_server",
+    "open_running",
     "run_web_server",
 ]
 
@@ -143,17 +162,8 @@ _MAX_INFLIGHT = 8
 # write MUST then carry a shared token the device holds, in this header, constant-time
 # compared against the token ``make_server`` was given. This is NOT a seat-layer password;
 # it is the factor that replaces loopback when the write surface leaves the machine.
-# Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
+# Loopback binds need no write token (the check below is skipped for a loopback-bound server).
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
-
-# The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). The no-token rule above rests on
-# "anything that can reach loopback can already edit the files". That holds for /edit and fails for
-# /chat, which makes an entity execute and spend the model endpoint: a container reaching host
-# loopback through host.docker.internal, a sandboxed app with a network entitlement, or another OS
-# user can reach loopback without being able to edit your files. So every /chat route requires a
-# per-launch token, generated at startup, held only in this process and printed once to the
-# terminal that started it (never written to a file an entity's floor could read).
-_CHAT_TOKEN_HEADER = "X-Levain-Chat-Token"
 
 # Loopback names a request's Host header may legitimately carry. A DNS-rebinding
 # page rebinds its OWN name to 127.0.0.1, so its requests still arrive with
@@ -248,6 +258,7 @@ def _is_install_bearing(source: SubstrateSource) -> bool:
 _ASSETS: dict[str, tuple[str, str]] = {
     "/": ("dashboard.html", "text/html; charset=utf-8"),
     "/dashboard.css": ("dashboard.css", "text/css; charset=utf-8"),
+    "/token.js": ("token.js", "text/javascript; charset=utf-8"),
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
@@ -272,6 +283,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
+    UNLOCK_PATH,
+    LINK_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
@@ -399,9 +412,9 @@ def build_substrate_json(
     assert "writable" not in payload, "SubstrateView.to_dict() collided with transport `writable`"
     payload["writable"] = source.write_scope is not None
     # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
-    # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
+    # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see _post).
     # It tells the frontend to attach the device-held token; on a loopback-bound (or read-only)
-    # surface it stays false and the localhost-sovereign token-free path is unchanged. The
+    # surface it stays false and no write token is asked for (the launch token is separate). The
     # handler computes the predicate (it owns the bound-address fact); default False here.
     assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
     payload["write_token_required"] = write_token_required
@@ -554,14 +567,15 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # OFF-BOX write auth (spore-129). ``is_loopback_bind`` is computed from the ACTUAL bound
     # address (un-foolable) and gates whether POST /edit requires a token. ``write_token`` is
     # the shared secret an off-loopback writable surface demands; None on a loopback-bound or
-    # read-only server (then the token check is skipped — the localhost path stays token-free).
+    # read-only server (then the token check is skipped — the localhost path needs no write token).
     is_loopback_bind: bool
     write_token: str | None
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
-    # cached static bytes (ungated, like levain_assets); extra_json are per-request
+    # cached static bytes (gated unless named in extra_shell_paths); extra_json are per-request
     # builders served under the concurrency gate (like /substrate.json).
     extra_assets: dict[str, tuple[str, bytes]]
+    extra_shell_paths: frozenset[str]   # the extra assets that skip the launch token and off-box gates
     extra_json: dict[str, Callable[[], bytes]]
     # Downstream-injected READ-ONLY inline PANELS (the panel peer of the extra-route seam): a
     # per-request provider returning panel descriptors+data that render INLINE in the dashboard
@@ -582,6 +596,23 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The chat host (K1 part 2): live entity conversations, driven by jobs. None unless the operator
     # passed `--chat`; then the /chat routes are served, and make_server keeps the bind loopback-only.
     chat_host: "ChatHost | None"
+    # The launch token GuardedHandler enforces on every path outside ``token_free_paths`` (None: ungated).
+    launch_token: str | None
+    token_free_paths: frozenset[str]
+
+    @property
+    def chat_token(self) -> str | None:
+        """The name the token had when only the chat routes took it."""
+        return self.launch_token
+
+    @chat_token.setter
+    def chat_token(self, value: str) -> None:
+        # Setting it can change the token, never remove it: None here would turn the gate off on a running server
+        # (complement + codex L3 r2). An ungated server is a make_server decision, not an attribute write.
+        if value is None:
+            raise ValueError("the launch token cannot be removed from a running server.")
+        check_launch_token(value)
+        self.launch_token = value
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -618,9 +649,10 @@ class _Handler(GuardedHandler):
         bound off-loopback. The off-box governance factor that replaces loopback-is-auth once the
         surface leaves the machine now gates BOTH the substrate-bearing READS (spore-220) and the
         writes (spore-129), so a read can never be served under weaker auth than a write. Mirrors
-        the do_POST + _route gates EXACTLY, so the frontend ``write_token_required`` signal can
+        the _post + _route gates EXACTLY, so the frontend ``write_token_required`` signal can
         never disagree with the server's enforcement. Loopback-bound or read-only → False (a
-        read-only mesh bind stays token-free — iPad/iPhone VIEWING is unauthenticated by design)."""
+        read-only mesh bind needs no write token — iPad/iPhone VIEWING needs only the launch
+        token, and only if make_server was given one)."""
         return (
             not self.server.is_loopback_bind
             and self.server.levain_source.write_scope is not None
@@ -629,7 +661,7 @@ class _Handler(GuardedHandler):
     def _off_box_token_valid(self) -> bool:
         """True iff the request carries the correct off-box token (constant-time compare against the
         token ``make_server`` was given). The SINGLE compare shared by the read gate (``_route``) and
-        the write gate (``do_POST``) so the two can never diverge on the auth check
+        the write gate (``_post``) so the two can never diverge on the auth check
         (``structural_invariants_beat_discipline``). Only meaningful when ``_write_token_required()``
         — the callers check that first; a missing server token (``write_token=None``) or an empty
         supplied token fails CLOSED (``bool(expected)`` gates before the compare)."""
@@ -639,20 +671,9 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
-    def _chat_token_valid(self) -> bool:
-        """True iff the request carries this launch's chat token (constant-time compare). A server with
-        no token, or an empty supplied one, fails closed."""
-        expected = getattr(self.server, "chat_token", None) or ""
-        supplied = self.headers.get(_CHAT_TOKEN_HEADER, "")
-        return bool(expected) and hmac.compare_digest(
-            supplied.encode("utf-8"), expected.encode("utf-8")
-        )
-
     def _route(self, *, head: bool) -> None:
-        # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
-        # cannot even TRIGGER the per-request store read.
-        if self._refuse_read(head=head):
-            return
+        # GuardedHandler has already run the Host allowlist (DNS rebinding), the cross-site refusal (a
+        # cross-origin page cannot even TRIGGER the per-request store read) and the launch token.
 
         # Strip any query string; route on the bare path against the allowlist.
         path = self.path.split("?", 1)[0]
@@ -661,17 +682,18 @@ class _Handler(GuardedHandler):
         # token the writes do WHEN this surface is writable AND bound off-loopback — else any tailnet
         # node reads the full store (``/substrate.json`` / ``/recall.json`` / ``/job.json`` / a
         # downstream ``extra_json`` view) token-free over plain HTTP. Same predicate + constant-time
-        # compare as ``do_POST`` (the two shared helpers), so a read is never served under weaker auth
-        # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind
+        # compare as ``_post`` (the two shared helpers), so a read is never served under weaker auth
+        # than a write. Two deliberate carve-outs need no write token (the launch token, when the
+        # server has one, was checked before this): (1) a read-ONLY mesh bind
         # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
         # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
-        # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
+        # downstream ``extra_shell_paths``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
         if (
             self._write_token_required()
             and path not in _ASSETS
-            and path not in self.server.extra_assets
+            and path not in self.server.extra_shell_paths
             and not self._off_box_token_valid()
         ):
             # JSON body carrying a token message so the frontend distinguishes a token-403 from a
@@ -679,7 +701,7 @@ class _Handler(GuardedHandler):
             # 403-retry (dashboard_boot.js). Served via _send (GET has no unread body to drain).
             # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + flow's fleetview_web.py) match
             # ``/token/i`` on this "token" wording to trigger the prompt — keep the word "token" here
-            # AND in do_POST's identical message if ever reworded (spore-129/220, two repos).
+            # AND in _post's identical message if ever reworded (spore-129/220, two repos).
             self._send(
                 json.dumps(
                     {"error": "forbidden", "message": "missing or invalid write token"}
@@ -725,7 +747,8 @@ class _Handler(GuardedHandler):
             # The running `levain team view` servers registered on this machine (levain/team/registry.py): project,
             # repo and loopback URL, each held live by its view's file lock. Served ONLY to a loopback peer on a
             # loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
-            # That one rule is why this needs no write token (dashboard_team.js carries no token logic), why repo
+            # That one rule is why this needs no off-box write token (the launch token still applies, as on every data
+            # route; GuardedHandler checks it before this is reached), why repo
             # paths and project names never reach an off-box client, and why a remote browser is never handed a
             # 127.0.0.1 link to the wrong machine. The listing opens and locks files, which can block on a dead hard
             # mount, so it is NOT run under request_gate (that is for substrate reads); it has its own small cap.
@@ -777,11 +800,7 @@ class _Handler(GuardedHandler):
             return
 
         if path in _CHAT_GET_ROUTES and self.server.chat_host is not None:
-            if not self._chat_token_valid():
-                self._send_chat(({"error": "chat_token", "message": (
-                    f"this route needs the chat token printed when `levain serve --chat` started, "
-                    f"sent as {_CHAT_TOKEN_HEADER}")}, 403), head=head)
-                return
+            # A chat host always runs with the launch token (make_server), so the gate has passed here.
             self._send_chat(self._chat_get(path, self.server.chat_host), head=head)
             return
 
@@ -895,7 +914,12 @@ class _Handler(GuardedHandler):
             return {"error": "bad_request", "message": "body must be a JSON object"}, 400
         try:
             if route == "/chat/open":
-                return host.open(req.get("entity")), 202
+                # A client's idempotency key: an open sent again with the same key gets the same session back, so a
+                # retry after a lost answer cannot open a second one (codex). The key's rules are the host's.
+                key = req.get("idem_key")
+                if key is None or not _host_takes_idem_key(host):   # a host without keys opens as before (L3)
+                    return host.open(req.get("entity")), 202
+                return host.open(req.get("entity"), idem_key=key), 202
             sid = req.get("session_id")
             if route == "/chat/turn":
                 return host.turn(sid, req.get("message")), 202
@@ -914,30 +938,28 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
                    status=status, head=head)
 
-    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
+    def _post(self) -> None:
         """The POST routes — the governed writes ``/edit`` + ``/action``, and the ``/chat`` operations
         when a chat host is attached — behind one auth boundary. They fork only at dispatch, AFTER the
         shared checks. The two writes refuse with 422 ``read_only`` when the source carries no
         ``write_scope``; chat does not, because it acts through the entity's floor, not the substrate.
 
-        The cheap fail-closed checks (Host → CSRF → Content-Type → route →
-        Content-Length) run BEFORE any body read and each closes the connection on
+        The cheap fail-closed checks (Host → CSRF → launch token, in GuardedHandler.do_POST;
+        then the off-box token → Content-Type → route → Content-Length here) run BEFORE any body read and each closes the connection on
         rejection — so a wrong-Host / wrong-route client never reads a body and can't
         stall a thread there [L3 MED], and no unread body dangles on a kept-alive
         socket. The rate-gate is acquired BEFORE the body read, so the bounded
         read+drain+write phase is itself concurrency-bounded; a slowloris is capped by
         the gate + the 30s socket timeout. The write layer does the actual edit."""
-        # Same Host allowlist as reads (DNS rebinding), then CSRF layer 1: a write must come from
-        # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
-        if self._refuse_write_origin():
-            return
+        # GuardedHandler.do_POST has run the Host allowlist (DNS rebinding), CSRF layer 1 (a write must come
+        # from our own page or a non-browser client) and the launch token.
         # OFF-BOX governance factor (spore-129 writes / spore-220 reads): when this surface is bound
         # off-loopback, loopback-is-auth no longer holds, so the write MUST carry the shared device-
         # held token. SAME predicate + constant-time compare as the read gate in _route, factored
         # into the two shared helpers so a write can never be served under weaker auth than a read
         # (or vice-versa). Fail CLOSED if off-loopback yet token-less (make_server refuses to bind a
         # writable off-loopback source WITHOUT a token, so reaching here token-less is defense-in-
-        # depth). A loopback bind skips this — the localhost-sovereign token-free path is unchanged.
+        # depth). A loopback bind skips this — the localhost path needs no write token.
         # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
         # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
         if self._write_token_required() and not self._off_box_token_valid():
@@ -955,10 +977,6 @@ class _Handler(GuardedHandler):
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if route not in ("/edit", "/action") and not is_chat:
             return self._reject(404, "not_found", "no such route")
-        if is_chat and not self._chat_token_valid():   # before a byte of the body is read
-            return self._reject(403, "chat_token", (
-                f"this route needs the chat token printed when `levain serve --chat` started, "
-                f"sent as {_CHAT_TOKEN_HEADER}"))
         # Content-Length: required + ASCII digits (checked before reading a byte).
         clen = self._declared_length()
         if clen is None:
@@ -1019,6 +1037,17 @@ class _Handler(GuardedHandler):
             self._send_json(result, 200)
 
 
+def _host_takes_idem_key(host: Any) -> bool:
+    """Whether this chat host's ``open`` takes an ``idem_key`` (a host that predates it would raise TypeError)."""
+    import inspect
+
+    try:
+        params = inspect.signature(host.open).parameters
+    except (TypeError, ValueError):
+        return False
+    return "idem_key" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def make_server(
     source: SubstrateSource,
     *,
@@ -1031,7 +1060,8 @@ def make_server(
     write_token: str | None = None,
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
-    chat_token: str | None = None,
+    read_token: str | None,
+    extra_shell_paths: "frozenset[str] | set[str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1048,11 +1078,12 @@ def make_server(
     + ``/fleet.json`` (live) here rather than standing up a second server that would
     re-implement (and could drift from) the bind-refusal contract
     (``structural_invariants_beat_discipline``). ``extra_assets`` maps a path →
-    ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets); ⚠ SECURITY
-    (spore-220): an ``extra_asset`` is served TOKEN-FREE even on an off-box writable bind (it is the
-    app shell — the browser must load it to supply the off-box token on the data fetches), so it MUST
-    NOT carry substrate data — put any per-request substrate behind ``extra_json``, which the off-box
-    read gate covers. This is a REGISTRANT contract the kernel can't enforce on static bytes.
+    ``(content_type, body_bytes)`` (cached), served behind the launch token and the off-box read gate like
+    every other route. ``extra_shell_paths`` names the extra assets that are the registrant's app shell
+    (the page the browser must load before it has a token to send): those, and only those, skip both
+    gates, so they must carry no substrate data. It must be a subset of ``extra_assets``' paths
+    (``ValueError`` otherwise); a registrant that names none has every extra asset gated (codex L3,
+    head ruling 2026-10-07: the registrant names its shell, the kernel gates the rest).
     ``extra_json`` maps a path → a zero-arg builder called per request under the gate
     (like ``/substrate.json``), its body served as ``application/json``. Both are
     GET/HEAD-only: Levain dispatches them ONLY from the read path and has no POST handler
@@ -1071,12 +1102,20 @@ def make_server(
       WireGuard) is the access boundary;
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
-      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no token
+      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no write token
       (the localhost-sovereign path is unchanged). Without a token a writable source stays
       loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
+    ``read_token`` is REQUIRED, with no default, so every caller states its choice: a token turns on the
+    launch-token gate (every route except the page shell, the built-in assets and ``extra_shell_paths``,
+    then refuses a request without it), and ``None`` is the explicit, visible opt-out for an embedder
+    that runs its own auth. A ``chat_host`` always runs gated: with ``None`` it gets a fresh token. A
+    token that is empty or not URL-safe base64 is refused.
+
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
+    check_launch_token(read_token)
+    token = read_token
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1106,7 +1145,7 @@ def make_server(
             )
         # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
         # the off-box governance factor that replaces loopback-is-auth. Without one it stays
-        # loopback-only (its no-token localhost-sovereign POST /edit boundary assumes loopback).
+        # loopback-only (its write-token-free POST /edit boundary assumes loopback).
         # `not write_token` (not `is None`): an EMPTY-string token must also refuse the bind, not
         # bind-then-brick. The per-request gate already treats "" as no-token (`not expected` →
         # 403), so without this an off-box writable bind with write_token="" would pass here and
@@ -1117,7 +1156,7 @@ def make_server(
                 "(private-mesh / Tailscale) address ONLY with a write_token — the off-box "
                 "governance factor that replaces the loopback bind as the write auth. Pass "
                 "write_token=<shared secret the device holds>, or bind loopback "
-                "(127.0.0.1 / localhost) for the token-free localhost-sovereign write path."
+                "(127.0.0.1 / localhost) for the localhost write path, which needs no write_token."
             )
     # Validate downstream routes BEFORE binding a socket — a collision is a packaging
     # bug, caught at registration, never a silent shadow at request time.
@@ -1159,6 +1198,15 @@ def make_server(
                 f"refusing extra route {path!r}: it collides with a built-in route "
                 "(a dashboard asset, the JSON reads, or /edit) and may not be overridden."
             )
+    if extra_shell_paths is not None and not (isinstance(extra_shell_paths, (set, frozenset))
+                                              and all(isinstance(p, str) for p in extra_shell_paths)):
+        raise ValueError("extra_shell_paths must be a set of paths")
+    shell_paths = frozenset(extra_shell_paths or ())
+    if not shell_paths <= set(extra_assets):
+        raise ValueError(
+            f"refusing extra_shell_paths {sorted(shell_paths - set(extra_assets))!r}: a token-free path must be "
+            "one of extra_assets (a static app shell), never a JSON route or an unregistered path."
+        )
     dup = set(extra_assets) & set(extra_json)
     if dup:
         raise ValueError(
@@ -1241,16 +1289,20 @@ def make_server(
     httpd.levain_source = source
     httpd.levain_assets = assets
     httpd.extra_assets = extra_assets
+    httpd.extra_shell_paths = shell_paths
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
-    # A chat surface always has a token: the caller's, or a fresh per-launch one.
-    httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
+    # The launch token: the caller's, or a fresh one when a chat host needs it. The page shell is the only
+    # token-free set: the browser must load it to trade the link code in its fragment, and it carries no operator data.
+    if token is None and chat_host is not None:
+        token = new_launch_token()
+    arm_launch_token(httpd, token, frozenset(_ASSETS) | shell_paths)
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
-    # server skips the POST /edit token check (the token-free localhost-sovereign path is
+    # server skips the POST /edit token check (the write-token-free localhost path is
     # unchanged); an off-loopback writable bind enforces ``write_token`` (the bind-refusal
     # above already guaranteed a writable off-loopback source was given one).
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
@@ -1318,26 +1370,52 @@ def make_server(
     return httpd
 
 
-def _open_browser(url: str, unlocked: str) -> None:
-    """Open the cockpit. ``unlocked`` (the URL with the chat token in its fragment) goes ONLY to macOS's osascript
-    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
-    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
-    users can read from the process table: the very callers the chat token exists to keep out. So the osascript
-    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
-    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
-    and the token field asks."""
-    import webbrowser
-
+def open_running(port: int, *, stream: "Any | None" = None) -> int:
+    """``levain serve --open-running``: open the page of the Levain server on ``port``, unlocked, from the
+    runtime file it left (:func:`levain.http_guards.publish_launch_token`). The browser gets a fresh
+    single-use link code, never the token (:func:`levain.http_guards.request_link_code`); the link is printed
+    only to a terminal. Returns 1 when the page could not be opened: no live server left a record for that port, the
+    server gave no link, or no browser took it (or it opened locked) and the output is not a terminal."""
+    out = stream if stream is not None else sys.stdout
     try:
-        ctl = webbrowser.get()
-        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
-            return
-    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
-        pass
+        rec = read_running(port)
+    except FileNotFoundError:
+        print(f"No running Levain server left a link for port {port} (looked in {runtime_dir()}).",
+              file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"Cannot open the server on port {port}: {exc}", file=sys.stderr)
+        return 1
+    # A fresh single-use link code from the server itself (POST /link, proved without sending the token): the link a
+    # browser opens, and keeps in its history, never carries the token.
     try:
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-        pass
+        code = request_link_code(rec["url"], rec["token"])
+    except (OSError, ValueError) as exc:
+        print(f"The server on port {port} did not give a link: {exc}", file=sys.stderr)
+        return 1
+    unlocked = f"{rec['url']}#code={code}"
+    tty = bool(getattr(out, "isatty", lambda: False)())
+    how = _open_browser(rec["url"], unlocked)
+    if how == "locked":   # the plain URL opened (not macOS's osascript): the page asks for the token (gemini L3)
+        print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}); it asks for the token.", file=out, flush=True)
+        if tty:
+            print(f"  this link unlocks it, once: {unlocked}", file=out, flush=True)
+            return 0
+        print(f"This output is not a terminal, so the link is not printed. Run `levain serve --open-running --port "
+              f"{port}` from a terminal.", file=sys.stderr)
+        return 1
+    if how:
+        print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}).", file=out, flush=True)
+        if tty:
+            print(f"  if it opened locked, this link works once: {unlocked}", file=out, flush=True)
+        return 0
+    # No browser took the link (codex L3: "Opened" was printed regardless).
+    if tty:
+        print(f"Could not open a browser here. This link works once: {unlocked}", file=out, flush=True)
+        return 0
+    print(f"Could not open a browser, and this output is not a terminal, so the link is not printed. "
+          f"Run `levain serve --open-running --port {port}` from a terminal.", file=sys.stderr)
+    return 1
 
 
 def run_web_server(
@@ -1360,11 +1438,14 @@ def run_web_server(
     so every edit affordance is dark and ``POST /edit`` 422s — a pure inspection
     cockpit. ``write=True`` (``levain serve --write``) serves the GOVERNED WRITABLE
     cockpit — State / spore / Tray-Keep / episode edits through the same ``apply_edit``
-    seam ``levain tui`` uses, under the localhost-sovereign auth (the loopback bind +
-    the Host/CSRF guards ARE the auth; no token on loopback). An install-bearing
+    seam ``levain tui`` uses, under the launch token plus the loopback bind and the
+    Host/CSRF guards. An install-bearing
     substrate is loopback-only either way (its seed/config is operator-private), so
     ``serve`` never binds off-box — a posture that fits a network surface: read-only
     is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).
+
+    Every launch generates its own token. It is printed only to a terminal, always written to
+    ``~/.levain-runtime/<port>.json``, and the browser (on macOS) opens on a single-use link code.
 
     ``chat`` (``--chat``, repeatable) also serves the chat routes over those entities
     (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only
@@ -1407,7 +1488,8 @@ def run_web_server(
             return 1
 
     try:
-        httpd = make_server(source, host=host, port=port, chat_host=chat_host)
+        httpd = make_server(source, host=host, port=port, chat_host=chat_host,
+                            read_token=new_launch_token())
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1
@@ -1434,32 +1516,36 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-        # Flushed: this terminal is where the token is published (and, on macOS, the browser it opens), and stdout is block-buffered
-        # when it is not a terminal (a supervisor, a log file), where it would otherwise not appear
-        # until the buffer filled. RUN 2026-10-03: piped to a file, the token never showed.
-        print(f"  chat token (send as {_CHAT_TOKEN_HEADER}; valid until this server stops): "
-              f"{httpd.chat_token}", flush=True)
-        # The link carries the token in the URL FRAGMENT, which a browser keeps to itself: it is never sent to a
-        # server, so it reaches no access log and no Referer. The panel reads it and strips it from the address bar.
-        unlocked = f"{url}#chat_token={httpd.chat_token}"
-        print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
-    else:
-        unlocked = url
-
-    if open_browser:
-        # The listening socket is already bound (ThreadingHTTPServer binds in
-        # __init__), so the browser's connection queues until serve_forever
-        # accepts it — opening before the blocking call is correct.
-        _open_browser(url, unlocked)
-
     try:
+        published = publish_launch_token(httpd, url, port=bound_port, kind="serve")
+    except OSError as exc:
+        print(f"Could not write the launch token to {exc.filename or 'the runtime directory'}: {exc}.\n"
+              "This output is not a terminal, so there is no other place to hand it over; not serving.",
+              file=sys.stderr)
+        httpd.server_close()
+        if chat_host is not None:
+            chat_host.shutdown()
+        return 1
+    unlocked = published.unlocked
+
+    restore_sigterm = SigtermStop()
+    try:
+        restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        if open_browser:
+            # The listening socket is already bound (ThreadingHTTPServer binds in __init__), so the browser's
+            # connection queues until serve_forever accepts it. Inside the try: a Ctrl+C while the browser opens
+            # still removes the runtime file (complement L3).
+            _open_browser(url, unlocked)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
+        published.close()
         httpd.server_close()
         if chat_host is not None:
             chat_host.shutdown()
+        restore_sigterm()
     return 0
 
 

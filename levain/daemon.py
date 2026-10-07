@@ -16,9 +16,11 @@ LOAD-BEARING INVARIANT — per-user, NO admin/root. A launchd *user* agent
 ``schtasks`` task WITHOUT ``/RU SYSTEM`` — never a system LaunchDaemon / service. This keeps the
 install sovereign + sudo-free, and is exactly what rejects the Windows-*Service* path.
 
-THREAT-MODEL (M2): always-on means a 24/7 token-free loopback-LOCAL write window — any *local*
-process can POST to the cockpit. That is the same posture as any localhost dev server;
-browser/cross-origin attacks stay kernel-blocked (Host allowlist + CSRF + the loopback bind).
+THREAT-MODEL (M2): always-on means a 24/7 loopback-LOCAL cockpit behind a per-launch token. The
+daemon-run server never prints the token (its stdout is a log file); it leaves the unlocked link in
+``~/.levain-runtime/<port>.json`` (0600, in a 0700 directory an entity's floor denies), and the
+operator opens the page with ``levain serve --open-running``. Every restart mints a new token.
+Browser/cross-origin attacks stay blocked (Host allowlist + CSRF + the loopback bind).
 Off-box (``--host <mesh>``) is deliberately NOT daemonized here — an install-bearing serve is
 loopback-only by construction (its seed/config is operator-private).
 """
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import os
 import platform
+import stat
 import re
 import shlex
 import shutil
@@ -237,6 +240,93 @@ def _daemon_env(invocation: list[str]) -> dict[str, str]:
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     return {"PATH": path, "PYTHONPATH": pkg_parent, "HOME": str(Path.home()),
             "PYTHONUNBUFFERED": "1"}
+
+
+# The umask every unit runs under (launchd ``Umask``, systemd ``UMask=``): files it creates are 0600, dirs 0700.
+_PRIVATE_UMASK = 0o077
+
+
+def _others_can_write(st: os.stat_result, *, sticky_ok: bool = True) -> bool:
+    """Whether a directory with this ``lstat`` lets another user add, rename or remove entries: world-writable, or
+    group-writable unless the group is this user's own private group (Ubuntu and Fedora give every user one, with a
+    002 umask, so a normal ``~/.local`` is 0775; complement L3). With ``sticky_ok`` the sticky bit makes either safe
+    (others cannot rename or remove what is not theirs), which holds for a parent but not for the log directory
+    itself, where another user could still create the log first."""
+    if sticky_ok and st.st_mode & stat.S_ISVTX:
+        return False
+    if st.st_mode & 0o002:
+        return True
+    return bool(st.st_mode & 0o020) and not _private_group(st.st_gid)
+
+
+def _private_group(gid: int) -> bool:
+    """True when no user but this one is in group ``gid`` (by membership list or as a primary group)."""
+    import grp
+    import pwd
+
+    me = pwd.getpwuid(os.getuid()).pw_name
+    if gid != os.getgid():
+        return False
+    try:
+        if any(m != me for m in grp.getgrgid(gid).gr_mem):
+            return False
+    except KeyError:
+        return False
+    return not any(p.pw_gid == gid and p.pw_name != me for p in pwd.getpwall())
+
+
+def _prepare_private_logs(spec: "DaemonSpec") -> None:
+    """Create the log directory 0700 and both log files 0600 before the service first writes them (an append
+    keeps a file's mode); an existing log file this user owns is narrowed to 0600 too. Levain's own default directory
+    on Linux is also chmod-ed back to 0700 if it exists wider; a directory Levain does not own (macOS's
+    ~/Library/Logs, a caller's --log-dir) is created private when missing and otherwise left as it is, but it must be
+    this user's and writable by no one else: the service manager opens the log by path later, and in a directory
+    another user can write, the file checked here could be swapped before then (codex L3)."""
+    for log in (spec.stdout_log, spec.stderr_log):
+        d = log.parent
+        if not d.exists():
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
+        elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
+            os.chmod(d, 0o700)
+        dst = os.lstat(d)   # the spec's path is already resolved (build_spec), so this is the directory itself
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or _others_can_write(dst, sticky_ok=False):
+            kind = "a symlink" if stat.S_ISLNK(dst.st_mode) else f"mode {stat.S_IMODE(dst.st_mode):04o}"
+            raise DaemonError(f"{d} must be a directory this user owns that no other user can write (it is {kind}, "
+                              f"owner uid {dst.st_uid}); pass another --log-dir.")
+        # Every directory above it too (codex L3 + L1): one another user can write, without the sticky bit, lets them
+        # rename the log directory away and put their own in its place.
+        for anc in d.parents:
+            ast_ = os.lstat(anc)
+            if stat.S_ISLNK(ast_.st_mode) or ast_.st_uid not in (0, os.getuid()) or _others_can_write(ast_):
+                raise DaemonError(f"{d} sits under {anc} (mode {stat.S_IMODE(ast_.st_mode):04o}, owner uid "
+                                  f"{ast_.st_uid}), which another user could replace it in; pass another --log-dir.")
+        # The service will append to whatever is at this path: it must be a regular file this user owns with one
+        # name, never a link (it would be followed), a hardlink to another file, a FIFO or device (it would block), or
+        # another user's file (codex L3: in a shared --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed
+        # through that descriptor, so nothing can be swapped in between the check and the chmod (L1 L3).
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_NOCTTY", 0))
+        try:
+            fd = os.open(log, flags, 0o600)
+        except OSError as exc:
+            if os.path.islink(log):
+                raise DaemonError(
+                    f"{log} is a symlink; a unit's log must be a regular file. Remove it and install again.") from exc
+            if isinstance(exc, PermissionError):   # another user's file (say, root's from an earlier sudo install)
+                raise DaemonError(
+                    f"{log} is not a regular file this user owns; remove it or pass another --log-dir.") from exc
+            raise DaemonError(f"could not open {log}: {exc}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise DaemonError(f"{log} is not a regular file this user owns; remove it or pass another --log-dir.")
+            if st.st_nlink != 1:   # another name for one of this user's files: the service would append to it (L2)
+                raise DaemonError(f"{log} has {st.st_nlink} names on disk (a hardlink); remove it or pass another "
+                                  "--log-dir.")
+            os.fchmod(fd, 0o600)   # new, or an older unit's log created wider (its old token lines, since dead)
+        finally:
+            os.close(fd)
 
 
 def _default_log_dir() -> Path:
@@ -467,6 +557,9 @@ class LaunchdProvider(DaemonProvider):
             "KeepAlive": spec.keep_alive,
             "StandardOutPath": str(spec.stdout_log),
             "StandardErrorPath": str(spec.stderr_log),
+            # Files the job creates (its logs among them) are this user's alone. Belt and braces: no
+            # Levain server prints its launch token to a non-terminal stdout (levain.http_guards).
+            "Umask": _PRIVATE_UMASK,
         }
         if spec.start_interval is not None:
             # A PERIODIC seat (K4a): launchd re-runs the job every N seconds and the process is
@@ -514,8 +607,7 @@ class LaunchdProvider(DaemonProvider):
     def install(self, spec: DaemonSpec) -> str:
         _refuse_root()
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_logs(spec)
         plist_path = self._plist_path(spec.label)
         domain = self._domain()
         # TRANSACTIONAL + ATOMIC (the install-honesty floor): a failed bootstrap must neither DESTROY a
@@ -832,6 +924,8 @@ class SystemdUserProvider(DaemonProvider):
             # untested by us — the distinction matters because the failure would be at unit LOAD.
             f"StandardOutput=append:{_systemd_specifiers(stdout_log)}",
             f"StandardError=append:{_systemd_specifiers(stderr_log)}",
+            # The launchd Umask analogue: what the unit creates is this user's alone.
+            f"UMask={_PRIVATE_UMASK:04o}",
         ]
         if not periodic and spec.keep_alive:
             # The launchd KeepAlive analogue: survive a crash. Deliberately NOT set for a seat —
@@ -963,8 +1057,7 @@ class SystemdUserProvider(DaemonProvider):
                 "(StandardOutput=append:). Nothing was written."
             )
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_logs(spec)
 
         service_path = self._service_path(spec.label)
         timer_path = self._timer_path(spec.label)
@@ -1222,8 +1315,9 @@ def select_provider(system: str | None = None) -> DaemonProvider:
 
 
 THREAT_MODEL_NOTE = (
-    "An always-on serve is a 24/7 loopback-LOCAL write window: any LOCAL process on this "
-    "machine can write to the cockpit (no token — the localhost bind + Host/CSRF guards are "
-    "the auth, same as any localhost dev server). Cross-origin/browser attacks stay blocked. "
+    "An always-on serve is a 24/7 loopback-LOCAL write window behind a per-launch token. The "
+    "token is never written to the log: open the cockpit with `levain serve --open-running "
+    "--port <port>`, which reads it from ~/.levain-runtime/ (yours only, denied to entities). "
+    "Each restart mints a new token. Cross-origin/browser attacks stay blocked. "
     "Off-box (--host <mesh>) is NOT daemonized — an install-bearing serve is loopback-only."
 )

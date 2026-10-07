@@ -1201,3 +1201,179 @@ def test_systemd_reinstall_during_a_turn_reads_a_shebang_cmdline(systemd, tmp_pa
     assert "PREVIOUS definition" not in systemd.install(seat)
     changed = replace(seat, argv=[*seat.argv[:-1], "a different task"])
     assert "PREVIOUS definition" in systemd.install(changed)
+
+
+# --- head ruling 2026-10-07 (L2 MED): a daemon's logs are private, and hold no token ----------------------------
+
+
+def test_every_unit_runs_with_a_private_umask():
+    spec = build_spec(install_path=Path("/tmp/inst"), port=7420, label="com.levainhq.t")
+    assert plistlib.loads(LaunchdProvider().render_unit(spec).encode())["Umask"] == 0o077
+    assert "UMask=0077" in SystemdUserProvider().render_unit(spec).splitlines()
+
+
+def test_the_log_directory_and_files_are_created_private_under_a_linux_style_path(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    import levain.daemon as d
+
+    monkeypatch.setattr(d.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old = os.umask(0o022)   # the wide default a login shell hands a user unit
+    try:
+        spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t")
+        assert spec.stdout_log.parent == tmp_path / ".local" / "state" / "levain"
+        d._prepare_private_logs(spec)
+        assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
+        for log in (spec.stdout_log, spec.stderr_log):
+            assert stat.S_IMODE(log.stat().st_mode) == 0o600
+        # an existing, wider Levain-owned directory and log (an older unit's) are narrowed back
+        os.chmod(spec.stdout_log.parent, 0o755)
+        os.chmod(spec.stdout_log, 0o644)
+        d._prepare_private_logs(spec)
+        assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(spec.stdout_log.stat().st_mode) == 0o600
+    finally:
+        os.umask(old)
+
+
+def test_the_threat_model_note_no_longer_says_there_is_no_token():
+    from levain.daemon import THREAT_MODEL_NOTE
+
+    assert "no token" not in THREAT_MODEL_NOTE and "--open-running" in THREAT_MODEL_NOTE
+
+
+def test_a_symlinked_log_path_is_never_followed(tmp_path, monkeypatch):
+    """complement L3: a dangling symlink at a log path made the O_CREAT follow it and create its target."""
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    target = tmp_path / "elsewhere.txt"
+    spec.stdout_log.symlink_to(target)
+    with pytest.raises(d.DaemonError, match="symlink"):   # codex L3: the service would follow it later
+        d._prepare_private_logs(spec)
+    assert not target.exists()
+
+
+def test_a_log_path_that_is_not_this_users_regular_file_is_refused(tmp_path, monkeypatch):
+    """codex L3: in a shared --log-dir another user could pre-create the log world-readable, or put a FIFO there."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    os.mkfifo(spec.stdout_log)
+    with pytest.raises(d.DaemonError, match="not a regular file|could not open"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    """codex L3: a shared --log-dir where another user pre-created the log, world-readable."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    spec.stdout_log.write_text("")
+    import stat as _stat
+    from types import SimpleNamespace
+
+    me = os.getuid()   # the file now belongs to "someone else" (the directory is still this user's)
+    monkeypatch.setattr(d.os, "fstat", lambda fd: SimpleNamespace(st_mode=_stat.S_IFREG | 0o644, st_uid=me + 1,
+                                                                   st_nlink=1))
+    with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_this_user_cannot_open_gets_the_ownership_message(tmp_path, monkeypatch):
+    """L1: a root-owned 0644 leftover log fails the open itself (EACCES), and says what to do about it."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    spec.stdout_log.write_text("")
+    spec.stdout_log.chmod(0o444)
+    if os.access(spec.stdout_log, os.W_OK):
+        pytest.skip("running as a user who can write a 0444 file")
+    with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_with_another_name_is_refused(tmp_path, monkeypatch):
+    """L2: a hardlink at the log path is another of this user's files; the service would append to it."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    other = tmp_path / "notes.txt"
+    other.write_text("mine")
+    os.link(other, spec.stdout_log)
+    with pytest.raises(d.DaemonError, match="2 names"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_dir_others_can_write_is_refused(tmp_path, monkeypatch):
+    """codex L3: the service manager opens the log by path later; in a shared writable directory the checked file
+    could be swapped first."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=shared)
+    with pytest.raises(d.DaemonError, match="no other user can write .it is mode 1777"):
+        d._prepare_private_logs(spec)
+
+
+
+def test_a_log_dir_under_a_directory_others_can_rename_in_is_refused(tmp_path, monkeypatch):
+    """codex L3 + L1: a private log dir in a non-sticky shared parent can be renamed away and replaced."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o777)
+    (shared / "logs").mkdir(mode=0o700)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=shared / "logs")
+    with pytest.raises(d.DaemonError, match="another user could replace it in"):
+        d._prepare_private_logs(spec)
+    os.chmod(shared, 0o1777)   # sticky: others cannot rename what is not theirs
+    d._prepare_private_logs(spec)
+
+
+def test_a_group_writable_parent_is_refused_unless_the_group_is_this_users_own(tmp_path, monkeypatch):
+    """complement L3: on Ubuntu/Fedora (user-private groups, umask 002) ~/.local is 0775 and must not refuse."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parent = tmp_path / "local"
+    parent.mkdir()
+    os.chmod(parent, 0o775)
+    (parent / "logs").mkdir(mode=0o700)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=parent / "logs")
+    monkeypatch.setattr(d, "_private_group", lambda gid: True)
+    d._prepare_private_logs(spec)
+    monkeypatch.setattr(d, "_private_group", lambda gid: False)
+    with pytest.raises(d.DaemonError, match="another user could replace it in"):
+        d._prepare_private_logs(spec)

@@ -34,8 +34,8 @@
   // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
   // factor that replaces loopback-is-auth once the surface leaves the machine. The server
   // signals it via `view.write_token_required` (set in load()); we hold the device's token in
-  // localStorage and attach it. On a loopback (default) surface this stays false and the
-  // localhost-sovereign token-free path is unchanged. (This localStorage entry is the
+  // localStorage and attach it. On a loopback (default) surface this stays false: no off-box
+  // token is asked for (the launch token, token.js, is a separate factor and is always sent). (This localStorage entry is the
   // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
   // and injects the same header — the server gate underneath is identical.)
   //
@@ -69,8 +69,15 @@
   // Headers for a READ (GET): attach the stored off-box token OPPORTUNISTICALLY if we hold one.
   // Harmless on a loopback / read-only surface (the server skips the read gate there); REQUIRED on
   // an off-box writable surface (spore-220 gates the substrate reads). No Content-Type — GET has no body.
+  // Both header builders start from the LAUNCH token (token.js), which every route but the page shell needs.
+  function launchHeaders(h) {
+    return window.LevainToken ? window.LevainToken.headers(h) : h;
+  }
+  // For the page's other scripts (dashboard_team.js): the launch-token header as a plain object, {} without a
+  // token. No arguments; a fresh object each call.
+  window.levainAuthHeaders = function () { return launchHeaders({}); };
   function readHeaders() {
-    const h = {};
+    const h = launchHeaders({});
     const tok = storedToken();
     if (tok) h["X-Levain-Write-Token"] = tok;
     return h;
@@ -78,20 +85,36 @@
   // Headers for a WRITE (POST): Content-Type + the token when the surface requires it, PROMPTING if
   // we don't hold one yet (the write path always knows writeTokenRequired by commit time).
   function writeHeaders() {
-    const h = { "Content-Type": "application/json" };
+    const h = launchHeaders({ "Content-Type": "application/json" });
     if (!writeTokenRequired) return h;
     let tok = storedToken();
     if (!tok) tok = promptForToken();
     if (tok) h["X-Levain-Write-Token"] = tok;
     return h;
   }
+  // The launch-token refusal (token.js): a 403 whose JSON says error "launch_token". Checked BEFORE the off-box
+  // matcher below, whose /token/i would also match its message. `sent` is the launch token the request carried.
+  function launchRefused(status, data, sent) {
+    if (!(window.LevainToken && window.LevainToken.isRefusal(status, data))) return false;
+    window.LevainToken.lock(sent ? "That token was not accepted." : null, sent);
+    return true;
+  }
+  function sentLaunchToken() { return window.LevainToken ? window.LevainToken.get() : null; }
   // True iff a 403 is the off-box token gate (JSON body w/ a token message) vs a Host / cross-site
   // refusal (plain text). Consumes the body — the caller re-fetches on retry, so that's fine.
   // NB (complement L3 FIND-4): this ``/token/i`` matcher is coupled to the kernel's literal token-403
   // message ("missing or invalid write token") and is DUPLICATED in flow's fleetview_web.py — tighten
   // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
-  async function isTokenReject(res) {
-    try { const d = await res.json(); return /token/i.test((d && d.message) || ""); }
+  // `seen` (optional) learns whether the 403 was the launch token's own: per call, never shared state, so a job poll
+  // landing between a read and its check cannot change the answer (complement L3).
+  async function isTokenReject(res, sent, seen) {
+    try {
+      const d = await res.json();
+      if (seen) seen.launch = !!(d && d.error === "launch_token");
+      if (launchRefused(res.status, d, sent)) return false;
+      if (d && d.error === "launch_token") return false;   // even with token.js missing: never the off-box prompt
+      return /token/i.test((d && d.message) || "");
+    }
     catch (_) { return false; }
   }
 
@@ -103,6 +126,7 @@
   // core can surface it inline.
   async function postWrite(route, body) {
     try {
+      const sent = sentLaunchToken();
       const res = await fetch(route, {
         method: "POST",
         headers: writeHeaders(),
@@ -120,6 +144,9 @@
           await load();
         }
         return { ok: true, data: data };
+      }
+      if (launchRefused(res.status, data, sent)) {
+        return { ok: false, error: "launch_token", message: "locked: see the form at the top of the page" };
       }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
@@ -158,10 +185,14 @@
     const body = { verb: verb, params: params || {}, confirm: confirm === true };
     if (idempotencyKey) body.idempotency_key = idempotencyKey;
     try {
+      const sent = sentLaunchToken();
       const res = await fetch("/action", { method: "POST", headers: writeHeaders(), body: JSON.stringify(body) });
       let data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
       if (res.ok) { return { ok: true, job_id: data.job_id, status: data.status }; }
+      if (launchRefused(res.status, data, sent)) {
+        return { ok: false, error: "launch_token", message: "locked: see the form at the top of the page" };
+      }
       if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();
       return { ok: false, error: data.error || "HTTP " + res.status, message: data.message || "HTTP " + res.status };
     } catch (e) {
@@ -175,21 +206,28 @@
   // (codex L3 LOW). Preserves the server's error message on a hard non-OK (e.g. the fail-closed 500 a
   // corrupt job store returns); the caller surfaces it. The token-class 403 is handled here.
   async function authedReadJson(url) {
+    const sent = sentLaunchToken();
     let res = await fetch(url, { cache: "no-store", headers: readHeaders() });
-    if (res.status === 403 && await isTokenReject(res)) {
+    if (res.status === 403 && await isTokenReject(res, sent)) {
       if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders() });
       if (res.status === 403) { dropToken(); throw new Error("off-box token missing or invalid"); }
+    }
+    // A refusal of a launch token the page has since replaced (an unlock while this was in flight): ask once
+    // more with the token held now, rather than report a 403 for a token that is gone (complement L3 r1).
+    if (res.status === 403 && sentLaunchToken() && sent !== sentLaunchToken()) {
+      res = await fetch(url, { cache: "no-store", headers: readHeaders() });
     }
     if (!res.ok) {
       let m = "HTTP " + res.status;
       try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
+      if (res.status === 403 && !sentLaunchToken()) m = "locked: see the form at the top of the page";
       throw new Error(m);
     }
     return res.json();
   }
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
-  // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
+  // /job.json off-box; no off-box token on loopback/read-only, the launch token everywhere). Throws on a non-OK (incl. the fail-closed
   // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
   async function pollJob(jobId) {
     return authedReadJson("/job.json?id=" + encodeURIComponent(jobId));
@@ -245,13 +283,16 @@
     inflight = true;
     if (btn) btn.disabled = true;
     try {
+      const sent = sentLaunchToken();
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
       // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
       // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
       // substrate.json, the chicken-and-egg). A token-class 403 means "off-box surface, token needed":
-      // prompt once, store, retry. A read-only mesh surface never 403s here (its reads are token-free),
-      // so it never prompts — iPad VIEWING stays open. The token, once entered, also unlocks writes.
-      if (res.status === 403 && await isTokenReject(res)) {
+      // prompt once, store, retry. A read-only mesh surface never asks for the off-box token (it gates
+      // only a writable off-box bind), so it never prompts here. (A launch-token 403 is not this one:
+      // isTokenReject hands it to token.js's unlock form and returns false.) The token, once entered, also unlocks writes.
+      const seen = {};
+      if (res.status === 403 && await isTokenReject(res, sent, seen)) {
         // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
         // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
@@ -269,6 +310,13 @@
           return;
         }
       }
+      // "locked" only for the launch token's own refusal: a Host or cross-site 403 shows no form (complement L3).
+      if (res.status === 403 && !sentLaunchToken() && seen.launch) {
+        status("locked — see the form at the top of the page"); return;
+      }
+      // Refused for a launch token the page has since replaced: the unlock's own load() was latched behind this
+      // one (pendingReload) and re-reads with the new token as soon as this returns (complement L3 r1).
+      if (res.status === 403 && sent !== sentLaunchToken()) return;
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
@@ -302,6 +350,8 @@
   // wrap, so we don't poll; visibilitychange catches "something moved while you were
   // away" — but never at the cost of the operator's in-progress text.
   if (btn) btn.addEventListener("click", function () { load({ passive: true }); });
+  // An unlock is authoritative: it re-reads at once (non-passive), so the page renders without another click.
+  if (window.LevainToken) window.LevainToken.onUnlock(function () { load(); });
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "visible") load({ passive: true });
   });

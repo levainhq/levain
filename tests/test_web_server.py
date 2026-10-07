@@ -59,7 +59,7 @@ def _store_with_data(tmp_path: Path) -> SubstrateSource:
 def _serving(source: SubstrateSource):
     """Bring up a real server on an ephemeral loopback port, yield its base URL,
     and tear it down cleanly — the live integration harness for the route tests."""
-    httpd = make_server(source, host="127.0.0.1", port=0)
+    httpd = make_server(source, host="127.0.0.1", port=0, read_token=None)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address[0], httpd.server_address[1]
@@ -276,7 +276,7 @@ class TestSubstrateJson:
         from levain.web_server import make_server
 
         with pytest.raises(ValueError, match="extra_panels must be a zero-arg callable"):
-            make_server(_store_with_data(tmp_path), port=0, extra_panels=[{"id": "x"}])
+            make_server(_store_with_data(tmp_path), port=0, extra_panels=[{"id": "x"}], read_token=None)
 
     def test_writable_flag_tracks_write_scope(self, tmp_path: Path) -> None:
         # The frontend gates every edit affordance on `writable` (NO THEATER). A
@@ -317,11 +317,11 @@ class TestSubstrateJson:
             write_scope=WriteScope.from_install_root(tmp_path),
         )
         with pytest.raises(ValueError, match="loopback"):
-            make_server(writable, host="192.0.2.1", port=0)  # guard fires BEFORE bind
+            make_server(writable, host="192.0.2.1", port=0, read_token=None)  # guard fires BEFORE bind
         # the read-only source clears the guard, then fails to BIND the unroutable
         # address (OSError, not ValueError) — proving the guard was bypassed for it.
         with pytest.raises(OSError):
-            make_server(ro, host="192.0.2.1", port=0)
+            make_server(ro, host="192.0.2.1", port=0, read_token=None)
 
     def test_nonloopback_refused_for_install_bearing_readonly(self, tmp_path: Path) -> None:
         # [codex L3 MED] An install-bearing but READ-ONLY source (install_root set,
@@ -333,7 +333,7 @@ class TestSubstrateJson:
         src = _store_with_data(tmp_path)
         install_ro = SubstrateSource(anneal=src.anneal, install_root=tmp_path)  # write_scope=None
         with pytest.raises(ValueError, match="loopback"):
-            make_server(install_ro, host="192.0.2.1", port=0)
+            make_server(install_ro, host="192.0.2.1", port=0, read_token=None)
 
     def test_wildcard_and_public_bind_refused_for_any_source(self, tmp_path: Path) -> None:
         # A wildcard / public bind is refused for ANY source (read-only included) —
@@ -353,7 +353,7 @@ class TestSubstrateJson:
         )
         for h in bad:
             with pytest.raises(ValueError, match="refusing to bind"):
-                make_server(ro, host=h, port=0)
+                make_server(ro, host=h, port=0, read_token=None)
 
     def test_endpoint_serves_the_view(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
@@ -384,7 +384,7 @@ class TestSubstrateJson:
         bind — spore-178) raises ConnectionResetError up through socketserver; the
         ``_LevainHTTPServer.handle_error`` override swallows that family silently, while
         a genuine error still delegates to the base so real bugs surface."""
-        httpd = make_server(_store_with_data(tmp_path), host="127.0.0.1", port=0)
+        httpd = make_server(_store_with_data(tmp_path), host="127.0.0.1", port=0, read_token=None)
         try:
             try:
                 raise ConnectionResetError(54, "Connection reset by peer")
@@ -855,13 +855,13 @@ class TestLoopbackBindBoundary:
         # guard (wildcard/public are refused for any source — separate test).
         for bad in ("192.168.1.5", "10.0.0.1", "::1"):  # ::1 = IPv6, Slice-2+ nicety
             with pytest.raises(ValueError, match="loopback"):
-                make_server(writable, host=bad)
+                make_server(writable, host=bad, read_token=None)
 
     def test_make_server_allows_loopback(self, tmp_path: Path) -> None:
         from levain.web_server import make_server
 
         for ok in ("127.0.0.1", "localhost"):  # both reliably bind everywhere
-            httpd = make_server(_store_with_data(tmp_path), host=ok, port=0)
+            httpd = make_server(_store_with_data(tmp_path), host=ok, port=0, read_token=None)
             try:
                 assert httpd.server_address[0].startswith("127.")
             finally:
@@ -957,7 +957,7 @@ class TestStartupContract:
 
         # occupy a port, then ask the server to bind the same one
         blocker = make_server(
-            SubstrateSource(anneal=AnnealPaths.from_db(levain_dir / "memory.db")), port=0
+            SubstrateSource(anneal=AnnealPaths.from_db(levain_dir / "memory.db")), port=0, read_token=None
         )
         busy_port = blocker.server_address[1]
         try:
@@ -1358,12 +1358,14 @@ class TestRecallJson:
 
 
 @contextmanager
-def _serving_extra(source: SubstrateSource, *, extra_assets=None, extra_json=None):
+def _serving_extra(source: SubstrateSource, *, extra_assets=None, extra_json=None, extra_shell_paths=None,
+                   read_token=None):
     """A real server carrying downstream-registered read-only extra routes — the live
     harness for the FleetView extension point (make_server extra_assets/extra_json)."""
     httpd = make_server(
         source, host="127.0.0.1", port=0,
-        extra_assets=extra_assets, extra_json=extra_json,
+        extra_assets=extra_assets, extra_json=extra_json, read_token=read_token,
+        extra_shell_paths=extra_shell_paths,
     )
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -1462,7 +1464,7 @@ class TestExtraRoutes:
         source = _store_with_data(tmp_path)
         for reserved in ("/", "/substrate.json", "/recall.json", "/edit"):
             try:
-                make_server(source, port=0, extra_assets={reserved: ("text/html", b"x")})
+                make_server(source, port=0, extra_assets={reserved: ("text/html", b"x")}, read_token=None)
                 raised = False
             except ValueError:
                 raised = True
@@ -1472,7 +1474,7 @@ class TestExtraRoutes:
         source = _store_with_data(tmp_path)
         try:
             make_server(source, port=0, extra_assets={"/x": ("text/html", b"a")},
-                        extra_json={"/x": lambda: b"{}"})
+                        extra_json={"/x": lambda: b"{}"}, read_token=None)
             raised = False
         except ValueError:
             raised = True
@@ -1486,7 +1488,7 @@ class TestExtraRoutes:
                     "/double//slash", "/trailing/", "/semi;colon", "/dot/./seg",
                     "/dot/../seg"):
             try:
-                make_server(source, port=0, extra_json={bad: lambda: b"{}"})
+                make_server(source, port=0, extra_json={bad: lambda: b"{}"}, read_token=None)
                 raised = False
             except ValueError:
                 raised = True
@@ -1498,7 +1500,7 @@ class TestExtraRoutes:
         source = _store_with_data(tmp_path)
         for clash in ("/EDIT", "/Substrate.json", "/RECALL.json"):
             try:
-                make_server(source, port=0, extra_assets={clash: ("text/html", b"x")})
+                make_server(source, port=0, extra_assets={clash: ("text/html", b"x")}, read_token=None)
                 raised = False
             except ValueError:
                 raised = True
@@ -1513,7 +1515,7 @@ class TestExtraRoutes:
             ("text/html", "str-body"),      # body must be bytes
         ):
             try:
-                make_server(source, port=0, extra_assets={"/x": bad_value})
+                make_server(source, port=0, extra_assets={"/x": bad_value}, read_token=None)
                 raised = False
             except ValueError:
                 raised = True
@@ -1524,7 +1526,7 @@ class TestExtraRoutes:
         source = _store_with_data(tmp_path)
         for bad_ct in ("text/html\r\nX-Evil: 1", "text/html\nSet-Cookie: x"):
             try:
-                make_server(source, port=0, extra_assets={"/x": (bad_ct, b"body")})
+                make_server(source, port=0, extra_assets={"/x": (bad_ct, b"body")}, read_token=None)
                 raised = False
             except ValueError:
                 raised = True
@@ -1568,7 +1570,7 @@ class TestOffBoxWriteToken:
         import pytest
         # writable + no-install + non-loopback + NO token → refused BEFORE any bind.
         with pytest.raises(ValueError, match="write_token"):
-            make_server(self._writable_noinstall(tmp_path), host="192.0.2.1", port=0)
+            make_server(self._writable_noinstall(tmp_path), host="192.0.2.1", port=0, read_token=None)
 
     def test_writable_offloopback_with_token_clears_bind_guard(self, tmp_path: Path) -> None:
         import pytest
@@ -1577,7 +1579,7 @@ class TestOffBoxWriteToken:
         # guard was cleared for it (same proof shape as the read-only mesh test).
         with pytest.raises(OSError):
             make_server(self._writable_noinstall(tmp_path), host="192.0.2.1", port=0,
-                        write_token="s3cret")
+                        write_token="s3cret", read_token=None)
 
     def test_install_bearing_offloopback_token_does_not_relax(self, tmp_path: Path) -> None:
         import pytest
@@ -1589,7 +1591,7 @@ class TestOffBoxWriteToken:
             write_scope=WriteScope.from_install_root(tmp_path),
         )
         with pytest.raises(ValueError, match="install-bearing"):
-            make_server(install_writable, host="192.0.2.1", port=0, write_token="s3cret")
+            make_server(install_writable, host="192.0.2.1", port=0, write_token="s3cret", read_token=None)
 
     def test_loopback_writable_is_token_free(self, tmp_path: Path) -> None:
         # The localhost-sovereign path is UNCHANGED: a loopback writable bind needs no token,
@@ -1678,23 +1680,48 @@ class TestOffBoxWriteToken:
             assert _get_h(base + "/substrate.json")[0] == 200
             assert _get_h(base + "/recall.json?keyword=x")[0] == 200
 
-    def test_offbox_extra_json_gated_but_extra_asset_free(self, tmp_path: Path) -> None:
+    def test_offbox_extra_json_gated_but_a_named_shell_asset_free(self, tmp_path: Path) -> None:
         # spore-220: a downstream extra_json view (the Bridge's /fleet.json = flow's fleet topology)
         # rides the SAME off-box gate — the kernel owns the security envelope for EVERY read route it
-        # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset
-        # (the /fleet app shell) stays token-free like the built-in assets (bootstrap, no data).
+        # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset is
+        # token-free only when the registrant names it in extra_shell_paths (codex L3, head ruling
+        # 2026-10-07); an unnamed one is gated like the JSON.
         src = self._writable_noinstall(tmp_path)
         with _serving_extra(
             src,
-            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>fleet</title>")},
+            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>fleet</title>"),
+                          "/fleet-data.js": ("text/javascript", b"var secret = 1;")},
             extra_json={"/fleet.json": lambda: b'{"fleet":[]}'},
+            extra_shell_paths=frozenset({"/fleet"}),
         ) as (base, httpd):
             httpd.is_loopback_bind = False
             httpd.write_token = "s3cret"
             assert _get_h(base + "/fleet.json")[0] == 403
             assert _get_h(base + "/fleet.json",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
-            assert _get_h(base + "/fleet")[0] == 200  # app shell token-free
+            assert _get_h(base + "/fleet")[0] == 200  # the named app shell is token-free
+            assert _get_h(base + "/fleet-data.js")[0] == 403   # an unnamed extra asset is not
+
+    def test_an_extra_asset_needs_the_launch_token_unless_named_as_shell(self, tmp_path: Path) -> None:
+        """codex L3 HIGH: every extra asset was token-free, so a registrant's data in one was served ungated."""
+        tok = "T" * 32
+        with _serving_extra(
+            self._writable_noinstall(tmp_path),
+            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html>"),
+                          "/snapshot.json": ("application/json", b'{"secret": 1}')},
+            extra_shell_paths=frozenset({"/fleet"}), read_token=tok,
+        ) as (base, _httpd):
+            assert _get_h(base + "/snapshot.json")[0] == 403
+            assert _get_h(base + "/snapshot.json", headers={"X-Levain-Token": tok})[0] == 200
+            assert _get_h(base + "/fleet")[0] == 200
+
+    def test_extra_shell_paths_must_name_extra_assets(self, tmp_path: Path) -> None:
+        src = self._writable_noinstall(tmp_path)
+        for bad in (frozenset({"/fleet.json"}), frozenset({"/nowhere"}), ["/fleet"]):
+            with pytest.raises(ValueError, match="extra_shell_paths"):
+                make_server(src, host="127.0.0.1", port=0, read_token=None,
+                            extra_assets={"/fleet": ("text/html", b"x")},
+                            extra_json={"/fleet.json": lambda: b"{}"}, extra_shell_paths=bad)
 
     def test_offbox_write_requires_correct_token(self, tmp_path: Path) -> None:
         # The enforcement: off-box, POST /edit demands X-Levain-Write-Token == the server's
@@ -1743,7 +1770,7 @@ class TestOffBoxWriteToken:
             write_scope=WriteScope.from_install_root(tmp_path),  # install_root SET on the scope
         )
         with pytest.raises(ValueError, match="install-bearing"):
-            make_server(diverged, host="192.0.2.1", port=0, write_token="s3cret")
+            make_server(diverged, host="192.0.2.1", port=0, write_token="s3cret", read_token=None)
 
     def test_install_bearing_postbind_drift_refused(self, tmp_path: Path, monkeypatch) -> None:
         import pytest
@@ -1763,7 +1790,7 @@ class TestOffBoxWriteToken:
 
         monkeypatch.setattr(ws, "_is_loopback_host", fake)
         with pytest.raises(ValueError, match="operator-private"):
-            ws.make_server(install, host="127.0.0.1", port=0)
+            ws.make_server(install, host="127.0.0.1", port=0, read_token=None)
 
     def test_loopback_bind_ignores_passed_token(self, tmp_path: Path) -> None:
         # L1 LOW-2: exercise the REAL make_server computation — a 127.0.0.1 bind yields
@@ -1771,7 +1798,7 @@ class TestOffBoxWriteToken:
         # (the localhost-sovereign token-free path). (The other tests force the attr; this one
         # proves make_server derives it from the actual bound address.)
         httpd = make_server(self._writable_noinstall(tmp_path), host="127.0.0.1", port=0,
-                            write_token="ignored-on-loopback")
+                            write_token="ignored-on-loopback", read_token=None)
         assert httpd.is_loopback_bind is True
         assert httpd.write_token == "ignored-on-loopback"
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -1931,3 +1958,64 @@ class TestOversizeWithALyingContentLength:
             "the body — the drain stranded on the socket timeout and handle_error swallowed it"
         )
         assert b"413" in raw.split(b"\r\n", 1)[0], f"expected a 413 status line, got: {raw[:120]!r}"
+
+
+def test_levain_serve_refuses_its_data_routes_without_the_launch_token(tmp_path):
+    """np-ebb8a399 (codex HIGH f5d5e483a0c7e3a8), reproduced 2026-10-07 on 00b0604: `levain serve` answered
+    GET /substrate.json with 200 and the seed's contents to a caller with no token. Any process that reaches
+    loopback is not the operator: another OS user, a container via host.docker.internal, a sandboxed app. The real
+    command, as a subprocess with a piped stdout: the token comes from the runtime file, never the pipe."""
+    import os
+    import re
+    import selectors
+    import subprocess
+    import sys
+    import time
+
+    from anneal_memory import Store
+
+    (tmp_path / "inst" / ".levain").mkdir(parents=True)
+    with Store(tmp_path / "inst" / ".levain" / "memory.db") as store:
+        store.record("a private decision", "decision")
+    def call(url, *, headers=None, data=None):
+        req = urllib.request.Request(url, headers=headers or {}, data=data)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    env["HOME"] = str(home)   # the token goes to the runtime file under this home, not to the pipe
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "levain", "serve", "--path", str(tmp_path / "inst"), "--port", "0", "--no-open"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+    try:
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        out, deadline = b"", time.monotonic() + 30
+        while b"--open-running" not in out and time.monotonic() < deadline:
+            if sel.select(timeout=0.5):
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                out += chunk
+        assert proc.poll() is None, proc.stderr.read().decode()
+        m = re.search(rb"--open-running --port (\d+)", out)
+        assert m, out
+        rec = json.loads((home / ".levain-runtime" / f"{m.group(1).decode()}.json").read_text())
+        base, token = rec["url"], rec["token"]
+        assert token.encode() not in out
+        for path in ("substrate.json", "recall.json?keyword=private", "team_views.json", "job.json?id=x"):
+            code, body = call(base + path)
+            assert code == 403 and json.loads(body)["error"] == "launch_token", path
+        code, body = call(base + "substrate.json", headers={"X-Levain-Token": token})
+        assert code == 200 and json.loads(body)["paths"]
+        code, body = call(base + "edit", headers={"Content-Type": "application/json"}, data=b"{}")
+        assert code == 403 and json.loads(body)["error"] == "launch_token"
+        assert call(base)[0] == 200                     # the page shell, so the browser can read the fragment
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)

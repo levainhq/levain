@@ -5,15 +5,15 @@ chapters (`levain.docs.discover_chapters`) as a single, read-only local web page
 Same multi-root layering as the seed roster, applied to docs.
 
 READ-ONLY BY CONSTRUCTION. There is no write route, no store, no install — just
-GET/HEAD of four static assets and one JSON projection of the composed chapters.
-So this is a strict SUBSET of the init/dashboard servers: no POST, no lock, no
+GET/HEAD of the page's static assets and one JSON projection of the composed chapters.
+So this is a strict SUBSET of the init/dashboard servers: no POST route, no lock, no
 input validation. It still rides the SAME security envelope those surfaces share,
 re-used rather than re-implemented so a contract can't diverge: loopback-only bind
 (refused before AND re-verified after binding — a tampered hosts file can't map a
 loopback name off-box), the DNS-rebinding Host allowlist (`host_header_allowed`),
-the Sec-Fetch-Site cross-site read refusal, the CSP + security headers stamped on
-EVERY response (`end_headers`, so framework-generated error responses carry them
-too), and `no-store`.
+the Sec-Fetch-Site cross-site read refusal, the launch token on everything but the
+page shell, the CSP + security headers stamped on EVERY response (`end_headers`, so
+framework-generated error responses carry them too), and `no-store`.
 
 The composed payload is built ONCE at server construction (the manual is static
 for a serve session) and served from cache — so a corrupt wheel (missing base
@@ -29,7 +29,16 @@ from pathlib import Path
 from typing import Any
 
 from levain.docs import DocsError, chapters_payload
-from levain.http_guards import GuardedHandler
+from levain.http_guards import (
+    GuardedHandler,
+    arm_launch_token,
+    check_launch_token,
+    new_launch_token,
+    open_unlocked,
+    publish_launch_token,
+    SigtermStop,
+    stop_on_sigterm,
+)
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
@@ -52,6 +61,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/docs.css": ("docs.css", "text/css; charset=utf-8"),
     "/docs.js": ("docs.js", "text/javascript; charset=utf-8"),
     "/markdown.js": ("markdown.js", "text/javascript; charset=utf-8"),
+    "/token.js": ("token.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -63,6 +73,9 @@ class _DocsServer(ThreadingHTTPServer):
     docs_json: bytes
     assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
+    # The launch token GuardedHandler enforces on every path but the page shell (``token_free_paths``).
+    launch_token: str | None
+    token_free_paths: frozenset[str]
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family (idle keep-alive resets)
@@ -77,18 +90,14 @@ class _DocsServer(ThreadingHTTPServer):
 class _DocsHandler(GuardedHandler):
     """Serves the docs page (GET/HEAD only) behind the same DNS-rebinding Host
     allowlist + cross-site read refusal the dashboard/init servers use (the shared
-    :class:`~levain.http_guards.GuardedHandler`). No write route exists — an
-    unsupported method falls through to the stdlib's 501, which still carries the
-    security headers via ``end_headers``."""
+    :class:`~levain.http_guards.GuardedHandler`). No write route exists: a POST is refused
+    after the guards, and any other method gets the guards and then 405."""
 
     server_version = "levain-docs"
     server: _DocsServer  # narrow the type for typed attribute access
 
     def _route(self, *, head: bool) -> None:
-        # Host allowlist, then the cross-site read refusal (the shared read preamble).
-        if self._refuse_read(head=head):
-            return
-
+        # GuardedHandler has run the Host allowlist, the cross-site read refusal and the launch token.
         path = self.path.split("?", 1)[0]
 
         if path == "/docs.json":
@@ -111,6 +120,7 @@ def make_docs_server(
     *,
     host: str = DEFAULT_DOCS_HOST,
     port: int = DEFAULT_DOCS_PORT,
+    launch_token: str | None = None,
 ) -> _DocsServer:
     """Build a configured, bound (not-yet-serving) docs server.
 
@@ -121,7 +131,9 @@ def make_docs_server(
     ``FileNotFoundError``) fails cleanly at startup, not as a port error. Raises
     ``ValueError`` on a non-loopback host; ``DocsError`` on missing base docs;
     ``FileNotFoundError`` on a missing asset; ``OSError`` if the bind fails.
-    Separated from ``run_docs_web`` so tests can drive a real bound server without
+    Every server runs with a launch token (``launch_token``, else a fresh one): an installed pack's
+    chapters are the operator's own material, and a caller that can reach loopback without being the
+    operator must not read them. Separated from ``run_docs_web`` so tests can drive a real bound server without
     the print/browser/serve_forever wrapper."""
     if not _is_loopback_host(host):
         raise ValueError(
@@ -129,6 +141,7 @@ def make_docs_server(
             "(127.0.0.1 / localhost). The operator manual is a local read surface; "
             "there is no off-box docs server."
         )
+    check_launch_token(launch_token)   # before the bind, so a bad token leaves no socket behind
     # Build the payload + assets BEFORE binding — a corrupt wheel should fail with a
     # clear message, not a bind error (mirrors init's asset-load-before-bind).
     docs_json = json.dumps(chapters_payload(install)).encode("utf-8")
@@ -149,6 +162,7 @@ def make_docs_server(
     # Allow the canonical loopback names + the exact bound address (covers a
     # 127.0.0.x bind), lowercased to match the Host check; any other Host → 403.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {bound.lower()}
+    arm_launch_token(httpd, new_launch_token() if launch_token is None else launch_token, frozenset(_ASSETS))
     return httpd
 
 
@@ -198,19 +212,25 @@ def run_docs_web(
     print(f"Levain docs → {url}")
     print(f"  {n_chapters} chapter(s) · install: {install}")
     print("  loopback-only · read-only · Ctrl+C to stop")
-
-    if open_browser:
-        import webbrowser
-
-        try:
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-            pass
-
     try:
+        published = publish_launch_token(httpd, url, port=bound_port, kind="docs")
+    except OSError as exc:
+        print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
+              "other place to hand it over; not serving.", file=sys.stderr)
+        httpd.server_close()
+        return 1
+
+    restore_sigterm = SigtermStop()
+    try:
+        restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        if open_browser:   # inside it too: a Ctrl+C while the browser opens still removes the runtime file
+            open_unlocked(url, published.unlocked)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
+        published.close()
         httpd.server_close()
+        restore_sigterm()
     return 0

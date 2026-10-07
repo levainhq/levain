@@ -1,12 +1,10 @@
 // levain dashboard_chat.js — the cockpit's chat panel: talk to a registered entity from the browser.
 //
-// Present only when the server was started with `--chat` (GET /chat.json answers 403 chat_token or 200; a
-// plain cockpit answers 404 and nothing is added). Every /chat route needs the per-launch token the server
-// printed at start. `levain serve --chat` opens the page with the token in the URL FRAGMENT (#chat_token=..., which
-// a browser never sends to a server, so it reaches no log and no Referer); the page reads it, keeps it in this tab's
-// sessionStorage, and strips it from the address bar at once. The printed token typed into the password field is
-// the fallback (a headless box, a second browser, a platform where it is not opened for you). It is never put in a cookie,
-// storage that outlives the browser session, or a request URL; a duplicated or restored tab keeps its sessionStorage, as browsers do.
+// Present only when the server was started with `--chat` (GET /chat.json answers 200; a plain cockpit answers 404 and
+// nothing is added). Like every route but the page shell, the /chat routes need the server's launch token, which
+// token.js holds (a traded link code, this tab's session storage, the unlock form); this file only sends it and,
+// on a refusal, hands the page back to that one unlock form. A refusal before the token is entered adds no panel: the
+// probe re-runs on the unlock.
 //
 // ⛔ CONSENT SURFACE. A turn that halts on a gated action reports it as `pending`; nothing here may approve
 // it on the operator's behalf. The one POST to /chat/approve lives inside the Approve button's click handler
@@ -21,8 +19,7 @@
 
   const POLL_MS = 1500;
   const POLL_FAILS_MAX = 5;
-  const TOKEN_KEY = "levain.chat_token";
-  let token = takeToken();   // the chat token: this variable, and this tab's sessionStorage
+  const auth = window.LevainToken;   // token.js, loaded first; without it every request goes untokened and is refused
   let session = null;        // {id, entity} once a session is open
   let panel = null, body = null;
   let run = 0;               // bumped when a session ends, so a late poll of an old job cannot paint the new one
@@ -37,23 +34,74 @@
   }
   function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
 
-  // One fetch wrapper: JSON in, {status, json} out; a network failure is a status of 0, never a thrown error.
+  // The open session survives a reload (codex: a reload lost it, and its slot stayed held until the server
+  // restarted): its id and entity are kept in this tab's session storage, checked against the server when the page
+  // loads, and dropped only when the server confirms it closed or no longer has it. Never the token (token.js keeps
+  // that) and nothing else. Storage that throws or is absent just means no recovery.
+  const SESSION_KEY = "levain.chat.session";
+  // `unknown`: the token was refused while a request was out, so its outcome is unknown and a restore must not
+  // re-enable compose before the operator checks what happened (codex L3). `lastJob`: the last job this page saw start.
+  function rememberSession(s, unknown) {
+    const v = { id: s.id, entity: s.entity, workspace: s.workspace, unknown: !!unknown, lastJob: confirmedJob };
+    try { window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(v)); } catch (e) { /* none */ }
+  }
+  function forgetSession() {
+    try { window.sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* none */ }
+  }
+  function rememberedSession() {
+    try {
+      const v = JSON.parse(window.sessionStorage.getItem(SESSION_KEY) || "null");
+      return v && typeof v.id === "string" && typeof v.entity === "string" ? v : null;
+    } catch (e) { return null; }
+  }
+  // One key per open, sent with /chat/open and kept (with its entity) until the open's answer is known, so an open
+  // whose answer was lost, sent again by Try again, by a later Start on the same entity, or after a reload, gets the
+  // same session back instead of a second one (codex L3). Not a secret: uniqueness is all it needs.
+  const OPENING_KEY = "levain.chat.opening";
+  function pendingOpen() {
+    try {
+      const v = JSON.parse(window.sessionStorage.getItem(OPENING_KEY) || "null");
+      return v && typeof v.key === "string" && typeof v.entity === "string" ? v : null;
+    } catch (e) { return null; }
+  }
+  function setPendingOpen(v) {
+    try {
+      if (v) window.sessionStorage.setItem(OPENING_KEY, JSON.stringify({ entity: v.entity, key: v.key }));
+      else window.sessionStorage.removeItem(OPENING_KEY);
+    } catch (e) { /* none */ }
+  }
+  function openKeyFor(entity) {
+    const p = pendingOpen();
+    return p && p.entity === entity ? p.key : newOpenKey();
+  }
+  function newOpenKey() {
+    const c = window.crypto;
+    if (c && c.getRandomValues) {
+      const b = new Uint8Array(16); c.getRandomValues(b);
+      return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+    return Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+  }
+
+  // One fetch wrapper: JSON in, {status, json, sent} out (`sent`: the launch token the request carried); a network
+  // failure is a status of 0, never a thrown error.
   function api(method, path, payload) {
+    const sent = auth ? auth.get() : null;
     const headers = { Accept: "application/json" };
-    if (token) headers["X-Levain-Chat-Token"] = token;
+    if (auth) auth.headers(headers);
     const init = { method: method, headers: headers, cache: "no-store" };
     if (payload !== undefined) { headers["Content-Type"] = "application/json"; init.body = JSON.stringify(payload); }
     return fetch(path, init)
-      .then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j || {} })))
-      .catch(() => ({ status: 0, json: {} }));
+      .then((r) => r.json().catch(() => ({})).then((j) => ({ status: r.status, json: j || {}, sent: sent })))
+      .catch(() => ({ status: 0, json: {}, sent: sent }));
   }
-  function isTokenRefusal(r) { return r.status === 403 && r.json && r.json.error === "chat_token"; }
+  function isTokenRefusal(r) { return r.status === 403 && r.json && r.json.error === "launch_token"; }
   // A token refusal is a JSON body like any other: it cannot prove the request it answered did not run (a proxy can
   // send it after forwarding). So after the page has sent a request that changes something (open, turn, decision,
   // close), or while it follows one, the refusal never reads as "refused": the page drops the session (nothing more
   // can be decided from it) and says the outcome is unknown.
   const TOKEN_LOST_MID_REQUEST = "The token was not accepted, so this page has let go of the session. The outcome " +
-    "of the last request is unknown; it may already have run. Enter the token again.";
+    "of the last request is unknown; it may already have run. Enter the token again at the top of the page.";
   function why(r) {
     if (r.status === 0) return "could not reach the server";
     return (r.json && (r.json.message || r.json.error)) || ("status " + r.status);
@@ -73,57 +121,37 @@
   }
   function note(cls, text) { const p = el("p", cls, text); body.appendChild(p); return p; }
 
-  // ---- the token ---------------------------------------------------------------------------------------------
-  // The fragment the server opened the page with wins; otherwise what this tab kept. Storage can be absent or throw
-  // (a private window, blocked site data), so every access is guarded and the prompt is the fallback.
-  // Any #chat_token= fragment is removed from the address bar, well-formed or not, and a token is used only once
-  // that removal succeeded: a token still showing in the address bar is not taken (the prompt asks instead).
-  function takeToken() {
-    let t = null;
-    try {
-      const m = /^#chat_token=(.*)$/.exec(location.hash);
-      if (m) {
-        history.replaceState(null, "", location.pathname + location.search);
-        if (/^[A-Za-z0-9_-]+$/.test(m[1])) t = m[1];
-      }
-    } catch (e) { t = null; /* no location or history, or the strip failed: the prompt still works */ }
-    if (t) { keepToken(t); return t; }
-    try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch (e) { return null; }
+  // ---- a refused token ---------------------------------------------------------------------------------------
+  // Whatever token led here is not used again: the session is let go (nothing more can be decided from it), the
+  // panel says why when there is something to say, and token.js shows the one unlock form. `r` is the refused answer.
+  // The message is also kept for the picker the unlock brings back, so entering the token does not erase the word
+  // that the last request's outcome is unknown. A refusal of a token the page has already replaced is late news and
+  // changes nothing (codex L3 r1 HIGH): the replaced token was already refused, so it says nothing about a session
+  // opened since with the new one, and letting go of that session would strand it on the server.
+  let lostNote = null;
+  function showTokenPrompt(message, r) {
+    if (r && auth && auth.get() && r.sent !== auth.get()) return;
+    if (session && message === TOKEN_LOST_MID_REQUEST) rememberSession(session, true);
+    session = null; run++; deciding = false;
+    lostNote = message || null;
+    if (message) { ensurePanel(); clear(body); note("chat-err", message); }
+    else if (panel) { panel.remove(); panel = null; }
+    if (auth) auth.lock(null, r ? r.sent : undefined);
   }
-  function keepToken(t) { try { sessionStorage.setItem(TOKEN_KEY, t); } catch (e) { /* held in memory only */ } }
-  function dropToken() { token = null; try { sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* nothing kept */ } }
-
-  // ---- token prompt ----------------------------------------------------------------------------------------
-  function showTokenPrompt(message) {
-    session = null; run++; deciding = false; dropToken();   // whatever token led here is not used again
-    ensurePanel(); clear(body);
-    note("chat-note", "This cockpit serves chat. Enter the token the server printed when it started.");
-    if (message) note("chat-err", message);
-    const form = el("form", "chat-row");
-    const input = el("input", "chat-input");
-    input.type = "password"; input.autocomplete = "off"; input.spellcheck = false;
-    input.setAttribute("aria-label", "chat token");
-    const go = el("button", "chat-btn", "Unlock");
-    go.type = "submit";
-    form.appendChild(input); form.appendChild(go);
-    form.addEventListener("submit", (ev) => {
-      ev.preventDefault();
-      const t = input.value.trim();
-      if (!t) return;
-      token = t; keepToken(t); input.value = "";
-      go.disabled = true;
-      loadListing(true);
-    });
-    body.appendChild(form);
-  }
+  // An unlock that another part of the page asked for (the board's own read was refused) leaves an open session as
+  // it is: its next request carries the new token, and if the server no longer has it, that request says so. Only a
+  // panel with no session (the picker, or nothing yet) reloads the listing.
+  if (auth) auth.onUnlock(() => { if (!session) loadListing(true); });
 
   // ---- entity picker -----------------------------------------------------------------------------------------
   function loadListing(afterToken) {
     api("GET", "/chat.json").then((r) => {
       if (r.status === 404) { if (panel) { panel.remove(); panel = null; } return; }  // not a chat cockpit (or gone)
       if (isTokenRefusal(r)) {
-        dropToken();
-        showTokenPrompt(afterToken ? "That token was not accepted." : null);
+        // Before a session there is nothing to let go of: no panel, just the unlock form (and a word if the token
+        // just entered was the one refused).
+        showTokenPrompt(null, r);
+        if (afterToken && auth && !auth.get()) auth.lock("That token was not accepted.");
         return;
       }
       if (r.status !== 200 || !Array.isArray(r.json.entities)) {
@@ -131,13 +159,76 @@
         note("chat-err", "Chat is unavailable: " + why(r));
         return;
       }
-      showPicker(r.json);
+      const saved = session ? null : rememberedSession();
+      if (saved) restoreSession(saved, r.json); else showPicker(r.json);
+    });
+  }
+
+  // A session this tab had open before a reload: ask the server what it holds now. Gone (404 unknown_session): forget
+  // it and show the picker. Any other answer that is not a 200 leaves it remembered, says so, and shows the picker.
+  function restoreSession(saved, listing) {
+    run++;   // a second restore (an unlock while this one reads) supersedes the first (complement L3)
+    const myRun = run;
+    api("GET", "/chat/session.json?id=" + encodeURIComponent(saved.id)).then((r) => {
+      if (myRun !== run) return;
+      if (isTokenRefusal(r)) { showTokenPrompt(null, r); return; }
+      const s = r.json || {};
+      if (r.status === 404 && s.error === "unknown_session") {
+        forgetSession();
+        lostNote = "The session open before this page reloaded has ended.";
+        showPicker(listing); return;
+      }
+      if (r.status !== 200) {
+        // Not the picker: a new session would replace the only record of this one, which may still hold a slot
+        // (codex L3). Check again, or let it go explicitly.
+        ensurePanel(); clear(body);
+        note("chat-err", "Could not check the session open before this page reloaded (" + why(r) + ").");
+        const row = el("div", "chat-row");
+        const again = el("button", "chat-btn", "Check again"); again.type = "button";
+        again.addEventListener("click", (ev) => { if (ev.isTrusted) restoreSession(saved, listing); });
+        const drop = el("button", "chat-btn quiet", "Forget it"); drop.type = "button";
+        drop.addEventListener("click", (ev) => {
+          if (!ev.isTrusted) return;
+          forgetSession();
+          lostNote = "Forgot the earlier session; if it is still open on the server it holds a slot until it ends.";
+          showPicker(listing);
+        });
+        row.appendChild(again); row.appendChild(drop); body.appendChild(row);
+        return;
+      }
+      session = { id: saved.id, entity: saved.entity, workspace: saved.workspace };
+      confirmedJob = saved.lastJob || null;
+      ensurePanel(); showConversation();
+      if (saved.unknown) {
+        // The token was refused while a request was out: what it did is unknown until the operator checks
+        // (codex L3). Compose stays off; the check reads the session's last job like any lost request.
+        ambiguousStop(myRun, "request", null);
+        return;
+      }
+      if (s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
+        showConsent(s.pending, s.decision_id, myRun, "This page was reloaded while actions were held.", s.approvable);
+        return;
+      }
+      if (s.state === "idle") { note("chat-note", "Reconnected to the session open before this page reloaded."); endOfTurn(false); return; }
+      failure("The session is " + (s.state || "in an unknown state") + " after this page reloaded. Check again in a moment.");
+      endOfTurn(true);
+      const row = el("div", "chat-row");
+      const again = el("button", "chat-btn", "Check again"); again.type = "button";
+      again.addEventListener("click", (ev) => { if (ev.isTrusted) { session = null; loadListing(false); } });
+      row.appendChild(again); log.appendChild(row);
     });
   }
 
   function showPicker(listing) {
     session = null; run++; deciding = false;
     ensurePanel(); clear(body);
+    if (lostNote) { note("chat-err", lostNote); lostNote = null; }
+    // A session whose release failed still holds its slot until the server restarts (levain/chat.py); say so.
+    (Array.isArray(listing.sessions) ? listing.sessions : []).forEach((s) => {
+      if (!s || s.state !== "release_failed") return;
+      note("chat-err", "release failed" + (s.entity ? " (" + s.entity + ")" : "") + (s.error ? ": " + s.error : "") +
+        (s.release_failed_since ? " since " + s.release_failed_since : "") + "; restart levain serve to free this slot");
+    });
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
     // One entity: one click starts a session on it. The picker appears only when there is a choice to make.
     const row = el("div", "chat-row");
@@ -152,7 +243,7 @@
     }
     const open = el("button", "chat-btn", "Start session");
     open.type = "button";
-    open.addEventListener("click", () => { open.disabled = true; openSession(sel ? sel.value : listing.entities[0]); });
+    open.addEventListener("click", () => { open.disabled = true; const ent = sel ? sel.value : listing.entities[0]; openSession(ent, openKeyFor(ent)); });
     row.appendChild(open);
     body.appendChild(row);
     note("chat-note dim", "model " + (listing.model || "?") + " · a session holds the entity's hands; close it when done.");
@@ -165,7 +256,7 @@
       if (myRun !== run) return;
       api("GET", "/chat/job.json?id=" + encodeURIComponent(jobId)).then((r) => {
         if (myRun !== run) return;
-        if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+        if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
         if (r.status !== 200) {
           fails += 1;
           if (fails >= POLL_FAILS_MAX) { onEnd({ status: "lost", error: "lost contact with the server: " + why(r) }); return; }
@@ -186,21 +277,33 @@
   }
 
   // ---- open ---------------------------------------------------------------------------------------------------
-  function openSession(entity) {
-    api("POST", "/chat/open", { entity: entity }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+  function openSession(entity, key) {
+    setPendingOpen({ entity: entity, key: key });
+    api("POST", "/chat/open", { entity: entity, idem_key: key }).then((r) => {
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.session_id) {
         clear(body); note("chat-err", "Could not open a session: " + why(r));
-        const back = el("button", "chat-btn", "Back"); back.type = "button";
-        back.addEventListener("click", () => loadListing(false)); body.appendChild(back);
+        // The open may have happened anyway (the answer was lost): Try again sends the SAME key, which the server
+        // answers with that session rather than a second one.
+        const row = el("div", "chat-row");
+        const retry = el("button", "chat-btn", "Try again"); retry.type = "button";
+        retry.addEventListener("click", () => { retry.disabled = true; openSession(entity, key); });
+        const back = el("button", "chat-btn quiet", "Back"); back.type = "button";
+        back.addEventListener("click", () => loadListing(false));
+        row.appendChild(retry); row.appendChild(back); body.appendChild(row);
         return;
       }
       const sid = r.json.session_id, myRun = run;
       confirmedJob = r.json.job_id;
+      // Remembered at once, before the open job ends (complement + codex L3): a reload while it opens finds it.
+      rememberSession({ id: sid, entity: entity }); setPendingOpen(null);
       clear(body); note("chat-note", "Opening a session on " + entity + "…");
       poll(r.json.job_id, myRun, (j) => {
         const st = j.result && j.result.session && j.result.session.state;
-        if (j.status === "done" && st === "idle") { session = { id: sid, entity: entity, workspace: j.result.session.workspace }; showConversation(); return; }
+        if (j.status === "done" && st === "idle") {
+          session = { id: sid, entity: entity, workspace: j.result.session.workspace };
+          rememberSession(session); showConversation(); return;   // now with its workspace
+        }
         clear(body);
         note("chat-err", "The session did not open: " + (j.error || (j.result && j.result.session && j.result.session.error) || j.status));
         const back = el("button", "chat-btn", "Back"); back.type = "button";
@@ -282,7 +385,7 @@
     const myRun = run;
     api("POST", "/chat/turn", { session_id: session.id, message: text }).then((r) => {
       if (myRun !== run) return;
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // No response from this page can prove who wrote it (a proxy can answer a JSON 4xx/503 after forwarding the
         // request), so anything but a 202 with a job may have started the turn.
@@ -333,7 +436,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun);
+        showConsent(res.pending, res.decision_id, myRun, null, res.approvable);
         return;
       }
       if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
@@ -465,9 +568,10 @@
     api("GET", "/chat/session.json?id=" + encodeURIComponent(session.id)).then((r) => {
       if (myRun !== run) return;
       live.textContent = "";
-      if (isTokenRefusal(r)) { showTokenPrompt(restartedText()); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(restartedText(), r); return; }
       const s = r.json || {};
       if (r.status === 404 && s.error === "unknown_session") {
+        forgetSession();
         failure(goneText());
         endOfTurn(true);
         const row = el("div", "chat-row");
@@ -477,8 +581,9 @@
         return;
       }
       const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
+      if (r.status === 200) rememberSession(session);   // checked: a reload no longer has to ask again
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
-        showConsent(s.pending, s.decision_id, myRun, warning); return;
+        showConsent(s.pending, s.decision_id, myRun, warning, s.approvable); return;
       }
       if (r.status === 200 && s.state === "busy") {
         failure("The session is still working. Check again in a moment.");
@@ -496,15 +601,17 @@
       rereadButton(myRun, ctx);
     });
   }
-  function showConsent(pending, decisionId, myRun, warning) {
+  function showConsent(pending, decisionId, myRun, warning, approvable) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
     if (warning) box.appendChild(el("div", "chat-reason", "⚠ " + warning));
-    // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
-    // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
-    const decidable = typeof decisionId === "string" && decisionId !== "" && pending.every((p) => shownInFull(p.full));
+    // Fail closed: Approve exists only when this halt carries a decision id, the server says it is approvable
+    // (`approvable: true`; it is false when the hold does not name the bytes it would run), AND every held action is
+    // shown in full. Anything else (an unreadable action, an older server) can still be rejected or closed.
+    const decidable = typeof decisionId === "string" && decisionId !== "" && approvable === true &&
+      pending.every((p) => shownInFull(p.full));
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
@@ -547,14 +654,14 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun); return;
+        showConsent(res.pending, res.decision_id, myRun, null, res.approvable); return;
       }
       if (res.reply) replyBubble(res);
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
       endOfTurn(!!res.gated);
     }
     function after(r) {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.job_id) {
         // Not retried and not re-armed: this box is withdrawn. No response this page receives can prove who wrote
         // it (a proxy can answer a JSON 4xx/503 after forwarding the request), so anything but a 202 with a job,
@@ -632,16 +739,17 @@
     if (!session) return;
     closeBtn.disabled = true;
     api("POST", "/chat/close", { session_id: session.id }).then((r) => {
-      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST); return; }
+      if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 200) {   // e.g. 409 while a turn is still running: say so, keep the session
         closeBtn.disabled = false;
         live.textContent = "Could not close yet: " + why(r);
         return;
       }
+      forgetSession();
       loadListing(false);
     });
   }
 
-  // Probe once at load. 404 leaves the page untouched; 403 chat_token opens the token prompt.
+  // Probe once at load. 404 leaves the page untouched; a launch_token 403 waits for the unlock and probes again.
   loadListing(false);
 })();

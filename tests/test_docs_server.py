@@ -21,9 +21,14 @@ import pytest
 from levain.docs_server import make_docs_server
 
 
+# Every docs server runs with a launch token; the harness passes a known one and sends it on every request unless a
+# test asks for none (``token=None``).
+_TOKEN = "test-launch-token-docs"
+
+
 @contextmanager
 def _serving(install: Path):
-    httpd = make_docs_server(install, port=0)
+    httpd = make_docs_server(install, port=0, launch_token=_TOKEN)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address[0], httpd.server_address[1]
@@ -35,8 +40,11 @@ def _serving(install: Path):
         thread.join(timeout=5)
 
 
-def _req(url: str, *, method: str = "GET", headers: dict | None = None):
-    req = urllib.request.Request(url, method=method, headers=headers or {})
+def _req(url: str, *, method: str = "GET", headers: dict | None = None, token: str | None = _TOKEN):
+    h = dict(headers or {})
+    if token is not None:
+        h.setdefault("X-Levain-Token", token)
+    req = urllib.request.Request(url, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
             return r.status, dict(r.headers), r.read()
@@ -160,9 +168,9 @@ class TestSecurity:
             assert status == 403
 
     def test_post_not_supported_but_secured(self, tmp_path: Path) -> None:
-        # Read-only: there is no write route, so a POST falls through to the stdlib
-        # 501 — which still carries the security headers (via end_headers).
+        # Read-only: there is no write route. A POST meets the shared guards (GuardedHandler.do_POST), then the
+        # default "no such route" 404 — which still carries the security headers (via end_headers).
         with _serving(tmp_path) as (base, _port):
             status, headers, _b = _req(base + "/docs.json", method="POST")
-            assert status in (400, 501)
+            assert status == 404
             assert "default-src 'none'" in headers["Content-Security-Policy"]

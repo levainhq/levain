@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 JS = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_chat.js"
+TOKEN_JS = JS.with_name("token.js")
 
 
 def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
@@ -24,7 +25,7 @@ def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
     from levain.web_server import make_server
 
     source = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "memory.db"))
-    httpd = make_server(source, host="127.0.0.1", port=0)
+    httpd = make_server(source, host="127.0.0.1", port=0, read_token=None)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
@@ -58,17 +59,31 @@ def test_approve_has_one_call_site_in_a_trusted_click_handler():
 
 def test_no_innerhtml_and_the_token_is_kept_only_in_this_tabs_session_storage():
     # 0.6.8 (t), Phill 2026-10-05 "yes, add the token UX after (a)": the token arrives in the URL fragment and is
-    # kept in sessionStorage (per tab, gone with it); never localStorage, a cookie or a query string.
-    src = JS.read_text()
-    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "document.cookie",
-                   "searchParams", "URLSearchParams"):
-        assert banned not in src
-    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(TOKEN_KEY[^)]*\)", src)} == {
-        "sessionStorage.getItem(TOKEN_KEY)", "sessionStorage.setItem(TOKEN_KEY, t)", "sessionStorage.removeItem(TOKEN_KEY)"}
-    assert src.count("sessionStorage.") == 3   # those three calls and no other use
-    # the fragment is read in one place, and the address bar is rewritten without it there
-    assert src.count("location.hash") == 1 and src.count("location.search") == 1
-    assert 'history.replaceState(null, "", location.pathname + location.search)' in src
+    # kept in sessionStorage (per tab, gone with it); never localStorage, a cookie or a query string. Since
+    # np-ebb8a399 one launch token covers every route and token.js holds it for every page; the chat panel only
+    # sends it.
+    chat, tok = JS.read_text(), TOKEN_JS.read_text()
+    for src in (chat, tok):
+        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "localStorage", "document.cookie",
+                       "searchParams", "URLSearchParams"):
+            assert banned not in src
+    for touch in ("location.hash", "history.", "levain.token"):
+        assert touch not in chat
+    # codex 5: the chat panel keeps ONE thing in session storage, the open session's id and entity, under its own key
+    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\([^)]*\)", chat)} == {
+        "sessionStorage.setItem(SESSION_KEY, JSON.stringify(v)", "sessionStorage.removeItem(SESSION_KEY)",
+        "sessionStorage.getItem(SESSION_KEY)", "sessionStorage.getItem(OPENING_KEY)",
+        "sessionStorage.setItem(OPENING_KEY, JSON.stringify({ entity: v.entity, key: v.key })",
+        "sessionStorage.removeItem(OPENING_KEY)"}
+    assert re.search(r"const SESSION_KEY = \"levain\.chat\.session\";", chat)
+    assert re.search(r"const OPENING_KEY = \"levain\.chat\.opening\";", chat)
+    assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(KEY[^)]*\)", tok)} == {
+        "sessionStorage.getItem(KEY)", "sessionStorage.setItem(KEY, t)", "sessionStorage.removeItem(KEY)"}
+    assert tok.count("sessionStorage.") == 3   # those three calls and no other use
+    # the fragment is read where the token is taken and where a later one is refused (an unlocked page's hashchange);
+    # both rewrite the address bar without it, the same way
+    assert tok.count("location.hash") == 2 and tok.count("location.search") == 2
+    assert tok.count('history.replaceState(null, "", location.pathname + location.search)') == 2
 
 
 HARNESS = r"""
@@ -93,10 +108,11 @@ const find = (n, pred) => { if (pred(n)) return n; for (const c of n.children) {
 const byText = (root, text) => find(root, (n) => n.tagName === "button" && n._text === text);
 const body = new N("body"), bar = new N("nav"), board = new N("div");
 body.appendChild(bar); body.appendChild(board);
-const document = { createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
+const document = { body: body, createElement: (t) => new N(t), querySelector: (s) => (s === "nav.tabs" ? bar : null),
   getElementById: (i) => (i === "board" ? board : null) };
 let sessionReads = 0, jobReads = 0;
-const TOKEN = "tok-123";
+const opens = [];
+const TOKEN = "tok-12345";
 const TBL = [0xA0, 0x2003, 0x2028, 0x2029, 0xD800, 0x301, 0x20DD, 0xE000, 0x378, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x09CB, 0x09C7, 0x09BE, 0x430, 0x1F600, 0xE9, 0x09];
 const hex = (c) => "\\u{" + c.toString(16).toUpperCase().padStart(4, "0") + "}";
 const LEAK = "_editor<arg_key>command</arg_key><arg_value>create</arg_value><arg_key>path</arg_key><arg_value>t\u00e9st.txt";
@@ -105,15 +121,29 @@ const approvals = () => calls.filter((c) => c.path === "/chat/approve").length;
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
-  calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Chat-Token"], body: init.body });
-  if (hdr["X-Levain-Chat-Token"] !== TOKEN) return reply(403, { error: "chat_token", message: "needs token" });
+  calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Token"], body: init.body });
+  if (hdr["X-Levain-Token"] !== TOKEN && process.argv[3] === "stalelisting" && !globalThis.__staleSent) {
+    // the page's first, untokened probe stalls; its refusal arrives only when the test releases it
+    globalThis.__staleSent = true;
+    return new Promise((res) => { globalThis.__releaseStale = () => res(null); })
+      .then(() => reply(403, { error: "launch_token", message: "needs token" }));
+  }
+  if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat.json" && process.argv[3] === "releasefailed") return reply(200, { entities: ["ent"], model: "m", sessions: [
+    { entity: "ent", state: "release_failed", error: "<b>close raised</b>", release_failed_since: "2026-10-07T17:00:00+00:00" },
+    { state: "release_failed" }, { entity: "ent", state: "idle" }] });
+  if (path === "/chat.json" && process.argv[3] === "nosessions") return reply(200, { entities: ["ent"], model: "m" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
+  if ((process.argv[3] === "openretry" || process.argv[3] === "pendingkey") && path === "/chat/open") { opens.push(JSON.parse(init.body).idem_key); if (opens.length === 1) return reply(500, {}); }
+  if (process.argv[3] === "openslow" && path.startsWith("/chat/job.json?id=J-open")) return new Promise(() => {});
+  if (process.argv[3] === "reloadtransient" && path.startsWith("/chat/session.json?id=S")) return reply(503, {});
+  if (process.argv[3] === "reloadunknown" && path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-x", kind: "turn", status: "done", result: { reply: "it ran", tool_activity: ["\u2699 ran"], gated: false, error: null } } });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
-  if (path === "/chat/turn" && process.argv[3] === "turn403json") return reply(403, { error: "chat_token", message: "needs token" });
-  if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "chat_token", message: "needs token" });
-  if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "chat_token", message: "needs token" });
+  if (path === "/chat/turn" && (process.argv[3] === "turn403json" || process.argv[3] === "turn403unlock" || process.argv[3] === "lostmid")) return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "launch_token", message: "needs token" });
+  if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
   if (path.startsWith("/chat/job.json?id=J-turn") && (process.argv[3] === "leak" || process.argv[3] === "prose"))
@@ -122,8 +152,10 @@ function fetch(path, init) {
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
               { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true },
               { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "qA\\u{41}", reason: "r", recognized: true }],
-    decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
+    decision_id: process.argv[3] === "nodecision" ? undefined : "D1", approvable: process.argv[3] !== "notapprovable" } });
   const M = process.argv[3];
+  if (M === "reloadgone" && path.startsWith("/chat/session.json?id=S")) return reply(404, { error: "unknown_session", message: "no such session" });
+  if (M === "openclose" && path === "/chat/close") return reply(200, { closed: true });
   if ((M === "post500" || M === "ambiguousgated") && path === "/chat/approve") return reply(500, {});
   if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
   if (M === "proxy503json" && path === "/chat/approve") return reply(503, { error: "upstream_timeout" });
@@ -151,7 +183,7 @@ function fetch(path, init) {
     if (M === "lostok" && jobReads > 5) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
     return reply(500, {});
   }
-  if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2",
+  if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2", approvable: true,
     pending: [{ tool: "bash", detail: "rm -rf y", full: "rm -rf y-after-reload", reason: "destructive", recognized: true }] });
   if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
   if (path === "/chat/approve" && process.argv[3] === "stale" && approvals() === 1) return reply(409, { error: "stale_decision", message: "not the one shown" });
@@ -168,57 +200,196 @@ const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.dele
 // The browser objects the token code touches, per mode. Absent by default: the prompt path must work without them.
 const MODE = process.argv[3], store = new Map(), replaced = [];
 const extra = {};
-if (["fragment", "stored", "storagethrows", "badfragment", "malformedfragment", "replacethrows"].includes(MODE)) {
-  extra.location = { hash: { fragment: "#chat_token=" + TOKEN, storagethrows: "#chat_token=" + TOKEN, badfragment: "#chat_token=nope",
-    malformedfragment: "#chat_token=" + TOKEN + "=&x", replacethrows: "#chat_token=" + TOKEN, stored: "" }[MODE], pathname: "/", search: "" };
+const STORED_TOKEN_MODES = ["stored", "reload", "reloadgone", "openretry", "openclose", "notapprovable", "openslow",
+  "pendingkey", "reloadunknown", "reloadtransient", "lostmid"];
+if (["fragment", "legacyfragment", "storagethrows", "badfragment", "malformedfragment", "replacethrows", ...STORED_TOKEN_MODES].includes(MODE)) {
+  extra.location = { hash: { fragment: "#token=" + TOKEN, legacyfragment: "#chat_token=" + TOKEN, storagethrows: "#token=" + TOKEN,
+    badfragment: "#token=nope-nope", malformedfragment: "#token=" + TOKEN + "=&x", replacethrows: "#token=" + TOKEN }[MODE] || "",
+    pathname: "/", search: "" };
   extra.history = { replaceState: (s, t, u) => { if (MODE === "replacethrows") throw new Error("SecurityError"); replaced.push(u); extra.location.hash = ""; } };
   extra.sessionStorage = MODE === "storagethrows"
     ? { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } }
     : { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
-  if (MODE === "stored") store.set("levain.chat_token", TOKEN);
+  if (STORED_TOKEN_MODES.includes(MODE)) store.set("levain.token", TOKEN);
+  if (["reload", "reloadgone", "reloadtransient"].includes(MODE)) store.set("levain.chat.session", JSON.stringify({ id: "S", entity: "ent" }));
+  if (MODE === "reloadunknown") store.set("levain.chat.session", JSON.stringify({ id: "S", entity: "ent", unknown: true, lastJob: "J-turn" }));
 }
 const ctx = vm.createContext({ ...extra, document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
   setTimeout: (f, ms) => { if (ms >= 2000) { const i = ++tid; longTimers.set(i, f); return i; } setImmediate(f); return 0; },
   clearTimeout: (i) => { longTimers.delete(i); } });
+ctx.window = ctx;   // token.js publishes window.LevainToken; the chat panel reads it
 // Approve opens the confirm row; Run them confirms.
 const runThem = () => find(body, (n) => n.tagName === "button" && n._text === "Run them");
 const approveTwice = async (b) => { b.fire("click", { isTrusted: true }); await sleep(20); const r = runThem(); if (r) r.fire("click", { isTrusted: true }); };
 const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
+const lockForm = () => find(body, (n) => n.className === "levain-lock");
+const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 (async () => {
+  vm.runInContext(fs.readFileSync(process.argv[4], "utf8"), ctx);   // token.js, loaded first as on the page
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   await sleep(30);
-  const panel = find(body, (n) => n.className === "panel chat-panel");
-  ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
-  if (["fragment", "stored", "storagethrows"].includes(MODE)) {
+  if (MODE === "reload") {
+    // codex 5: a reload keeps the open session; it is checked against the server, never reopened
+    await sleep(30);
+    ok(calls.some((c) => c.url === "/chat/session.json?id=S"), "the remembered session is read from the server");
+    ok(!calls.some((c) => c.path === "/chat/open"), "no second session is opened");
+    ok(byText(chatPanel(), "Approve") && byText(chatPanel(), "Reject"), "the held actions are shown again");
+    ok(store.has("levain.chat.session"), "still remembered");
+    console.log("PASS"); return;
+  }
+  if (MODE === "reloadgone") {
+    await sleep(30);
+    ok(!store.has("levain.chat.session"), "a session the server no longer has is forgotten");
+    ok(chatPanel().textContent.includes("has ended") && byText(chatPanel(), "Start session"), "the picker says so");
+    console.log("PASS"); return;
+  }
+  if (MODE === "lostmid") {
+    // codex L3: a token refused while a turn was out marks the remembered session's outcome unknown
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    find(chatPanel(), (n) => n.tagName === "textarea").value = "do it";
+    byText(chatPanel(), "Send").fire("click", { isTrusted: true }); await sleep(60);
+    ok(JSON.parse(store.get("levain.chat.session")).unknown === true, "marked unknown");
+    console.log("PASS"); return;
+  }
+  if (MODE === "openslow") {
+    // complement + codex L3: remembered at the 202, before the open job ends, so a reload then finds it
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(40);
+    ok(JSON.parse(store.get("levain.chat.session")).id === "S" && !store.has("levain.chat.opening"), "remembered at 202");
+    console.log("PASS"); return;
+  }
+  if (MODE === "pendingkey") {
+    // codex L3: Back after an ambiguous open, then Start again on the same entity, resends the SAME key
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(40);
+    ok(store.has("levain.chat.opening"), "the pending key is kept");
+    byText(chatPanel(), "Back").fire("click", { isTrusted: true }); await sleep(40);
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(opens.length === 2 && opens[0] === opens[1], "one key: " + JSON.stringify(opens));
+    console.log("PASS"); return;
+  }
+  if (MODE === "reloadunknown") {
+    // codex L3: a token refused mid-request before the reload: compose stays off until the operator checks
+    await sleep(40);
+    const p = chatPanel();
+    ok(byText(p, "Check what happened") && find(p, (n) => n.tagName === "textarea").disabled, "check first, compose off");
+    byText(p, "Check what happened").fire("click", { isTrusted: true }); await sleep(40);
+    ok(p.textContent.includes("it ran"), "the check reports the last job");
+    ok(JSON.parse(store.get("levain.chat.session")).unknown === false, "checked: no longer unknown");
+    console.log("PASS"); return;
+  }
+  if (MODE === "reloadtransient") {
+    // codex L3: a failed check does not show the picker, where Start would replace the only record of the session
+    await sleep(40);
+    const p = chatPanel();
+    ok(!byText(p, "Start session") && byText(p, "Check again") && byText(p, "Forget it"), "blocked recovery view");
+    ok(store.has("levain.chat.session"), "still remembered");
+    byText(p, "Forget it").fire("click", { isTrusted: true }); await sleep(20);
+    ok(!store.has("levain.chat.session") && byText(chatPanel(), "Start session"), "forgotten only on request");
+    console.log("PASS"); return;
+  }
+  if (MODE === "openclose") {
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(JSON.parse(store.get("levain.chat.session")).id === "S", "the open session is remembered");
+    byText(chatPanel(), "Close session").fire("click", { isTrusted: true }); await sleep(40);
+    ok(!store.has("levain.chat.session"), "a confirmed close forgets it");
+    console.log("PASS"); return;
+  }
+  if (MODE === "openretry") {
+    // codex 6: an open whose answer was lost is retried with the SAME key, so the server can give that session back
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(40);
+    byText(chatPanel(), "Try again").fire("click", { isTrusted: true }); await sleep(60);
+    ok(opens.length === 2 && typeof opens[0] === "string" && opens[0].length >= 16 && opens[0] === opens[1],
+      "both opens carry one key: " + JSON.stringify(opens));
+    ok(byText(chatPanel(), "Send"), "the session opened");
+    console.log("PASS"); return;
+  }
+  if (MODE === "notapprovable") {
+    // B2: a halt the server marks approvable: false offers Reject only, and Reject names the halt (expect)
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    find(chatPanel(), (n) => n.tagName === "textarea").value = "do it";
+    byText(chatPanel(), "Send").fire("click", { isTrusted: true }); await sleep(80);
+    ok(!byText(chatPanel(), "Approve") && byText(chatPanel(), "Reject"), "Reject only");
+    byText(chatPanel(), "Reject").fire("click", { isTrusted: true }); await sleep(40);
+    const rej = calls.find((c) => c.path === "/chat/reject");
+    ok(rej && JSON.parse(rej.body).expect === "D1", "reject sends the decision id");
+    console.log("PASS"); return;
+  }
+  if (["fragment", "legacyfragment", "stored", "storagethrows"].includes(MODE)) {
     // 0.6.8 (t): the link the server opens carries the token in its fragment; the page unlocks with no prompt
-    ok(!find(panel, (n) => n.tagName === "input" && n.type === "password"), "no token prompt");
+    const panel = chatPanel();
+    ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
+    ok(!lockForm(), "no token prompt");
     ok(calls[0].token === TOKEN, "the first request already carries the token");
     if (MODE !== "stored") ok(replaced.length === 1 && replaced[0] === "/" && extra.location.hash === "", "the fragment is stripped from the address bar");
-    if (MODE === "fragment") ok(store.get("levain.chat_token") === TOKEN, "kept in this tab's sessionStorage");
+    if (MODE === "fragment" || MODE === "legacyfragment") ok(store.get("levain.token") === TOKEN, "kept in this tab's sessionStorage");
     byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
     ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
     ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
     console.log("PASS"); return;
   }
+  if (MODE === "unlockkeeps") {
+    // head ruling 2026-10-07 (second L1 (c)): an unlock the board asked for must not drop an open chat session.
+    ctx.LevainToken.lock(null, null);
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(byText(chatPanel(), "Send"), "a session is open");
+    ctx.LevainToken.lock(null, TOKEN);   // the board's read was refused: the form comes back
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    ok(byText(chatPanel(), "Send") && !byText(chatPanel(), "Start session"), "the session is still open after the unlock");
+    console.log("PASS"); return;
+  }
+  if (MODE === "stalelisting") {
+    // codex L3 r1 HIGH: an untokened probe stalls, the operator unlocks (the form here is boot's, raised by its own
+    // refused read) and opens a session, then the old refusal lands. The session must survive it.
+    ok(!chatPanel() && !lockForm(), "the probe is still in flight");
+    ctx.LevainToken.lock(null, null);
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    let p = chatPanel();
+    byText(p, "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(byText(chatPanel(), "Send"), "a session is open");
+    globalThis.__releaseStale(); await sleep(40);
+    ok(byText(chatPanel(), "Send") && !lockForm(), "the late refusal of the replaced token changes nothing");
+    ok(ctx.LevainToken.get() === TOKEN, "and the held token is kept");
+    console.log("PASS"); return;
+  }
+  // Without a usable token the chat panel adds nothing: the page's one unlock form (token.js) asks.
+  ok(!chatPanel(), "no chat panel before the token is entered");
+  ok(lockForm() && body.children.indexOf(lockForm()) === 0, "the unlock form sits at the top of the page");
   if (MODE === "malformedfragment" || MODE === "replacethrows") {
     // L3 r1: a malformed token fragment is still stripped; a token whose strip failed is never used or kept
-    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "the prompt asks");
-    ok(!store.has("levain.chat_token") && calls.every((c) => c.token !== TOKEN), "nothing kept, nothing sent with it");
+    ok(find(lockForm(), (n) => n.tagName === "input" && n.type === "password"), "the prompt asks");
+    ok(!store.has("levain.token") && calls.every((c) => c.token !== TOKEN), "nothing kept, nothing sent with it");
     ok(MODE === "replacethrows" || (replaced.length === 1 && extra.location.hash === ""), "a malformed fragment is still removed");
     console.log("PASS"); return;
   }
   if (MODE === "badfragment") {
-    ok(find(panel, (n) => n.tagName === "input" && n.type === "password"), "a refused fragment token falls back to the prompt");
-    ok(!store.has("levain.chat_token") && replaced.length === 1, "and is stripped and not kept");
+    ok(find(lockForm(), (n) => n.tagName === "input" && n.type === "password"), "a refused fragment token falls back to the prompt");
+    ok(!store.has("levain.token") && replaced.length === 1, "and is stripped and not kept");
     console.log("PASS"); return;
   }
-  const pw = find(panel, (n) => n.tagName === "input");
+  const pw = find(lockForm(), (n) => n.tagName === "input");
   ok(pw.type === "password", "token field is a password input");
   // wrong token first
-  pw.value = "nope"; find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
-  ok(panel.textContent.includes("not accepted"), "wrong token is reported");
-  const pw2 = find(panel, (n) => n.tagName === "input"); pw2.value = TOKEN;
-  find(panel, (n) => n.tagName === "form").fire("submit", {}); await sleep(30);
+  pw.value = "nope-nope"; lockForm().fire("submit", {}); await sleep(30);
+  ok(lockForm() && lockForm().textContent.includes("not accepted"), "wrong token is reported");
+  ok(!chatPanel(), "and still no panel");
+  const pw2 = find(lockForm(), (n) => n.tagName === "input"); pw2.value = TOKEN;
+  lockForm().fire("submit", {}); await sleep(30);
+  ok(!lockForm(), "the right token removes the form");
+  const panel = chatPanel();
+  ok(panel && body.children.indexOf(panel) === 1, "the panel appears before the board");
+  if (MODE === "releasefailed" || MODE === "nosessions") {
+    // lane B2: a session whose release failed still holds its slot; the picker names it, as text, until a restart
+    const lines = [];
+    const walk = (n) => { if (n.tagName === "p" && n.className === "chat-err") lines.push(n.textContent); n.children.forEach(walk); };
+    walk(panel);
+    const want = MODE === "releasefailed"
+      ? ["release failed (ent): <b>close raised</b> since 2026-10-07T17:00:00+00:00; restart levain serve to free this slot",
+         "release failed; restart levain serve to free this slot"] : [];
+    ok(JSON.stringify(lines) === JSON.stringify(want), "release_failed lines: " + JSON.stringify(lines));
+    ok(!find(panel, (n) => n.tagName === "b"), "the error is text, never markup");
+    ok(byText(panel, "Start session"), "the picker still shows");
+    console.log("PASS"); return;
+  }
   if (MODE === "twoentities") {
     ok(find(panel, (n) => n.tagName === "select") && byText(panel, "Start session"), "with a choice to make, the picker shows");
     console.log("PASS"); return;
@@ -283,6 +454,15 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
   }
   if (process.argv[3] === "turn403json") {
     ok(panel.textContent.includes("may already have run") && !panel.textContent.includes("Held for your approval"), "a token refusal on a turn POST reports an unknown outcome and builds no box");
+    console.log("PASS"); return;
+  }
+  if (process.argv[3] === "turn403unlock") {
+    // L1 2026-10-07: entering the token again brought the picker back and erased the word that the turn's outcome is
+    // unknown. The unlock form is token.js's; the message has to survive it.
+    ok(lockForm(), "the refusal shows the unlock form");
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    const p2 = chatPanel();
+    ok(p2 && byText(p2, "Start session") && p2.textContent.includes("may already have run"), "the picker returns with the unknown-outcome note");
     console.log("PASS"); return;
   }
   if (process.argv[3] === "turn500" || process.argv[3] === "turn409") {
@@ -441,9 +621,11 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "stalelisting", "unlockkeeps", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
-                                  "fragment", "stored", "storagethrows", "badfragment", "twoentities",
+                                  "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities", "releasefailed", "nosessions",
+                                  "reload", "reloadgone", "openclose", "openretry", "notapprovable",
+                                  "openslow", "pendingkey", "reloadunknown", "reloadtransient", "lostmid",
                                   "leakafterapprove", "leaklastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
@@ -454,7 +636,7 @@ def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # nothing about who wrote it, so it is ambiguous like any other non-202; the session is read only on a re-read click
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)
-    p = subprocess.run(["node", str(h), str(JS), mode], capture_output=True, text=True, timeout=60)
+    p = subprocess.run(["node", str(h), str(JS), mode, str(TOKEN_JS)], capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
 
 
@@ -514,3 +696,24 @@ def test_a_check_row_is_retired_whenever_a_new_request_is_sent():
     assert "retireChecks(); deciding = true;" in src[src.index("function lock()"):]
     judge = src[src.index("function judgeLastJob("):src.index("function resync(")]
     assert "rereadButton(" not in judge
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_a_malformed_kept_token_is_removed_when_the_page_loads(tmp_path):
+    """complement L3: take() called drop() before `token` was initialised, so the removal threw and was swallowed and
+    the malformed value stayed in session storage until the next lock()."""
+    h = tmp_path / "t.js"
+    h.write_text(r"""
+const fs = require("fs"), vm = require("vm");
+const store = new Map([["levain.token", "not a token!"]]);
+const ctx = vm.createContext({ JSON, Promise, String, Array, Object,
+  location: { hash: "", pathname: "/", search: "" }, history: { replaceState() {} },
+  sessionStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v),
+                    removeItem: (k) => store.delete(k) },
+  document: { addEventListener() {}, readyState: "loading" }, setTimeout, fetch: () => new Promise(() => {}) });
+ctx.window = ctx;
+vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
+console.log(store.has("levain.token") ? "KEPT" : "REMOVED");
+""")
+    p = subprocess.run(["node", str(h), str(TOKEN_JS)], capture_output=True, text=True, timeout=30)
+    assert p.stdout.strip() == "REMOVED", p.stdout + p.stderr

@@ -27,6 +27,11 @@ from levain.init_server import DEFAULT_INIT_PORT, make_init_server, run_init_web
 from levain.packs import PackError
 
 
+# Every init server runs with a launch token; the harness passes a known one and sends it on every request
+# unless a test asks for none (``token=None``).
+_TOKEN = "test-launch-token-init"
+
+
 class _OK:
     returncode = 0
     stdout = ""
@@ -44,7 +49,8 @@ def _serving(install: Path, *, adapter=None, force=False, packs=(), result=_OK):
     """A real init server on an ephemeral loopback port, with the anneal store
     subprocess mocked to ``result``. Yields ``(base_url, port)``."""
     with mock.patch.object(install_mod.subprocess, "run", lambda *a, **k: result()):
-        httpd = make_init_server(install, adapter=adapter, force=force, packs=packs, port=0)
+        httpd = make_init_server(install, adapter=adapter, force=force, packs=packs, port=0,
+                                 launch_token=_TOKEN)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         host, port = httpd.server_address[0], httpd.server_address[1]
@@ -56,8 +62,12 @@ def _serving(install: Path, *, adapter=None, force=False, packs=(), result=_OK):
             thread.join(timeout=5)
 
 
-def _req(url: str, *, method: str = "GET", headers: dict | None = None, data: bytes | None = None):
-    req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
+def _req(url: str, *, method: str = "GET", headers: dict | None = None, data: bytes | None = None,
+         token: str | None = _TOKEN):
+    h = dict(headers or {})
+    if token is not None:
+        h.setdefault("X-Levain-Token", token)
+    req = urllib.request.Request(url, method=method, headers=h, data=data)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
             return r.status, dict(r.headers), r.read()
@@ -65,12 +75,13 @@ def _req(url: str, *, method: str = "GET", headers: dict | None = None, data: by
         return e.code, dict(e.headers), e.read()
 
 
-def _post(url: str, payload, *, headers: dict | None = None, content_type="application/json"):
+def _post(url: str, payload, *, headers: dict | None = None, content_type="application/json",
+          token: str | None = _TOKEN):
     h = dict(headers or {})
     if content_type is not None:
         h["Content-Type"] = content_type
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
-    status, _hd, raw = _req(url, method="POST", headers=h, data=body)
+    status, _hd, raw = _req(url, method="POST", headers=h, data=body, token=token)
     try:
         return status, json.loads(raw)
     except (ValueError, TypeError):
@@ -486,7 +497,7 @@ class TestApparatusFixes:
         # Hold it and confirm a concurrent POST gets a clean 503, never a second install.
         install = tmp_path / "i"
         with mock.patch.object(install_mod.subprocess, "run", lambda *a, **k: _OK()):
-            httpd = make_init_server(install, port=0)
+            httpd = make_init_server(install, port=0, launch_token=_TOKEN)
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()
             port = httpd.server_address[1]
@@ -799,7 +810,7 @@ class TestOversizeWithALyingContentLength:
         s = _socket.create_connection((u.hostname, u.port), timeout=timeout)
         try:
             s.sendall(
-                f"POST /init HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                f"POST /init HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nX-Levain-Token: {_TOKEN}\r\n"
                 f"Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n".encode()
                 + actually_send
             )

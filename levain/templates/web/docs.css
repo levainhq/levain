@@ -171,3 +171,12 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-
   body.nav-open #toc { transform: translateX(0); }
   #content { padding: 3.4rem 1.2rem 5rem; }
 }
+
+/* The launch-token unlock form (token.js): one per page, at the top of <body>, shown only when a request was refused. */
+.levain-lock { position: relative; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em;
+  margin: 0; padding: 0.75em 1em; background: #fff4d6; color: #3a2a00; border-bottom: 1px solid #d9b25c;
+  font: 14px/1.4 system-ui, -apple-system, sans-serif; }
+.levain-lock p { margin: 0; flex: 1 1 100%; }
+.levain-lock-note { color: #8a1c00; }
+.levain-lock input { flex: 1 1 16em; max-width: 28em; padding: 0.35em 0.5em; font: inherit; }
+.levain-lock button { padding: 0.35em 0.9em; font: inherit; cursor: pointer; }

@@ -585,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
             "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
-            "the same governed seam `levain tui` uses, under localhost-sovereign auth). "
+            "the same governed seam `levain tui` uses). Every launch prints a token and a "
+            "link that opens the page unlocked; every request but the page shell needs it. "
             "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
             "is the parked alternative."
         ),
@@ -618,13 +619,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not open a browser tab on startup.",
     )
     web_p.add_argument(
+        "--open-running",
+        action="store_true",
+        dest="open_running",
+        help=(
+            "Do not start a server: open the page of the Levain server already running on --port "
+            "(a `levain daemon` cockpit, or any serve, init --web or docs started elsewhere), unlocked. "
+            "It reads the link from ~/.levain-runtime/<port>.json, which only you can read."
+        ),
+    )
+    web_p.add_argument(
         "--write",
         action="store_true",
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
             "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
-            "edits through the governed write seam. Loopback-sovereign (the localhost "
-            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "edits through the governed write seam. Behind the launch token, the localhost "
+            "bind and the Host/CSRF guards, and loopback-ONLY — there "
             "is no off-box writable serve (an install's seed/config is operator-private). "
             "Default is read-only."
         ),
@@ -1271,7 +1282,10 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from levain.web_server import run_web_server
+    from levain.web_server import open_running, run_web_server
+
+    if args.open_running:
+        return open_running(args.port)
 
     return run_web_server(
         path=args.path,
@@ -1330,6 +1344,7 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
         return 1
     print(result)
     print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
+    print(f"  open it: levain serve --open-running --port {args.port}")
     print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
     return 0
 

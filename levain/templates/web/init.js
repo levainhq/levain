@@ -126,7 +126,11 @@
       "codex": "OpenAI Codex CLI — AGENTS.md, global ~/.codex hooks + config.",
     };
     clear(adaptersEl);
-    var selected = p.default_adapter || p.adapters[0];
+    // A plan read again after a refused install keeps the operator's choice when it is still offered (codex L3:
+    // falling back to the default could install a different integration than the one they picked).
+    var selected = (keptAdapter && p.adapters.indexOf(keptAdapter) >= 0) ? keptAdapter
+      : (p.default_adapter || p.adapters[0]);
+    keptAdapter = null;
     p.adapters.forEach(function (name) {
       var radio = el("input", { type: "radio", name: "adapter", value: name });
       if (name === selected) radio.checked = true;
@@ -313,14 +317,25 @@
     submitBtn.disabled = true;
     setNote("installing…", false);
     try {
+      var sent = auth ? auth.get() : null;
       var res = await fetch("/init", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: tokenHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ adapter: adapter, answers: collectAnswers() }),
       });
       var data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
-      if (res.ok) {
+      if (auth && auth.isRefusal(res.status, data)) {
+        // Refused before the body was read: nothing was installed. A refused token means this is not the server
+        // the plan came from (it restarted, maybe with another target, packs or --force; codex L3 r2), so the plan
+        // is dropped and read again after the unlock, keeping the answers whose fields still exist.
+        auth.lock(sent ? "That token was not accepted." : null, sent);
+        invalidatePlan();
+        setNote("locked: unlock the page; the plan is read again, then check the target and Install", true);
+        // An unlock that landed while this install was in flight already holds a newer token, and its own
+        // load() returned early because the plan was loaded then (complement L3): read the plan again now.
+        if (auth.get() && auth.get() !== sent) load();
+      } else if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);
       } else {
@@ -331,7 +346,7 @@
       setNote("network error: " + (e && e.message ? e.message : e), true);
     } finally {
       installing = false;
-      submitBtn.disabled = false;
+      submitBtn.disabled = !loaded;   // stays off after a refusal dropped the plan, until it is read again
     }
   }
 
@@ -340,23 +355,74 @@
     submitNote.className = "submit-note" + (bad ? " bad" : "");
   }
 
+  // ---- the launch token (token.js, loaded first) ----
+  var auth = window.LevainToken;
+  function tokenHeaders(h) { return auth ? auth.headers(h) : h; }
+
+  // ---- a plan that may belong to another server ----
+  var keptAnswers = null;
+  var keptAdapter = null;   // the adapter the operator had chosen; restored if the new plan still offers it
+  function invalidatePlan() {
+    keptAdapter = selectedAdapter();
+    keptAnswers = {};
+    fieldControls.forEach(function (fc) { keptAnswers[fc.field.slot] = fc.control.value; });
+    loaded = false;
+    submitBtn.disabled = true;
+  }
+  function restoreAnswers() {
+    if (!keptAnswers) return 0;
+    var n = 0;
+    fieldControls.forEach(function (fc) {
+      if (Object.prototype.hasOwnProperty.call(keptAnswers, fc.field.slot)) { fc.control.value = keptAnswers[fc.field.slot]; n++; }
+    });
+    keptAnswers = null;
+    return n;
+  }
+
   // ---- load ----
+  // One plan render. An unlock that arrives while a load is in flight is latched and re-run when that load settles
+  // (codex L3 r1: dropping it left a page that held the right token showing "locked").
+  var loaded = false, loading = false, again = false;
   async function load() {
+    if (loaded) return;
+    if (loading) { again = true; return; }
+    loading = true;
     try {
-      var res = await fetch("/init-plan.json", { cache: "no-store" });
+      var sent = auth ? auth.get() : null;
+      var res = await fetch("/init-plan.json", { cache: "no-store", headers: tokenHeaders({}) });
+      if (res.status === 403 && auth) {
+        var refused = {};
+        try { refused = await res.json(); } catch (_) { /* a plain-text 403 is not the token's */ }
+        if (auth.isRefusal(res.status, refused)) {
+          auth.lock(sent ? "That token was not accepted." : null, sent);
+          if (!auth.get()) statusEl.textContent = "locked: see the form at the top of the page";
+          return;
+        }
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       plan = await res.json();
       if (plan.errors) throw new Error(plan.errors.server || "plan error");
       renderBanner(plan);
       renderAdapters(plan);
       renderSections(plan);
+      var reread = keptAnswers !== null;
+      var kept = restoreAnswers();
+      loaded = true;
       submitBtn.disabled = false;
-      statusEl.textContent = plan.fields.length + " fields · fill what you know, submit when ready";
+      statusEl.textContent = reread
+        ? "the plan was read again: check the target above; " + kept + " of " + plan.fields.length + " answers kept"
+        : plan.fields.length + " fields · fill what you know, submit when ready";
     } catch (e) {
       statusEl.textContent = "could not load the interview: " + (e && e.message ? e.message : e);
+    } finally {
+      loading = false;
+      var rerun = again && !loaded;
+      again = false;   // a latched unlock is spent either way (complement L3)
+      if (rerun) load();
     }
   }
 
   formEl.addEventListener("submit", submit);
+  if (auth) auth.onUnlock(load);
   load();
 })();
