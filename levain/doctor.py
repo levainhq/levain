@@ -958,7 +958,7 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
 
     try:
         foreign = foreign_entries(Hands(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace))
-    except WsGitError as exc:
+    except (WsGitError, OSError) as exc:
         return [CheckResult(name, False, str(exc), hint=redo), *extra]
     if foreign:
         return [CheckResult(

@@ -15,7 +15,7 @@ info() { echo "INFO $*"; }
 check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$what"; else fail "$what"; fi; }
 refused() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then fail "$what (was allowed)"; else pass "$what (refused)"; fi; }
 cfgval() { "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$E/.levain/confinement.json" "$1"; }
-as_hands() { sudo -n -u "$H" env -i "HOME=$HHOME" PATH=/usr/bin:/bin "$@"; }
+as_hands() { (cd / && sudo -n -u "$H" env -i "HOME=$HHOME" PATH=/usr/bin:/bin "$@"); }   # from /: the runner's cwd is closed to it
 setup() { sudo -E env "PATH=$PATH" "$LEVAIN" setup-isolation --path "$E" "$@"; }
 
 echo "== init a scratch OpenHands entity under \$HOME"
@@ -202,6 +202,8 @@ refused "ws-adopt of a repository inside the workspace" "$LEVAIN" ws-adopt --pat
 rm -rf "$MINE"
 
 echo "== undo, with a hands process still running"
+BAIT="$HOME/levain-iso-bait"; echo b > "$BAIT"; chmod 600 "$BAIT"
+as_hands ln -s "$BAIT" "$WS/to-bait"          # undo runs chmod as root: it must not follow this
 sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &
 sleep 1
 SUDOERS="/etc/sudoers.d/levain-$H"
@@ -219,6 +221,8 @@ check "and have the operator's group" test "$(stat -c %g "$WS/from-hands" 2>/dev
 check "and the operator can read them" /bin/cat "$WS/from-hands"
 if [ -n "$(sudo find "$WS" \( -user 0 -o -user "$ME" \) -print -quit 2>/dev/null)" ]; then fail "undo gave something in the workspace to root or the operator"; else pass "nothing in the workspace is root's or the operator's"; fi
 check "operator still reads the workspace after undo" /bin/ls "$WS"
+check "undo did not change what an entity link points at" test "$(stat -c %a "$BAIT" 2>/dev/null || stat -f %Lp "$BAIT")" = 600
+rm -f "$BAIT"
 check "the entity's repository keeps the retired id as owner" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = "$HID"
 refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
 refused "sudo git reads it after undo (git checks SUDO_UID, the operator)" sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short

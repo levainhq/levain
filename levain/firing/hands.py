@@ -444,7 +444,9 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, owner_uid: int | N
     accepts. No git trusts those repositories any more; this is belt and braces."""
     if not tree.exists():
         return True, "no workspace"
-    ok, why = _run_ok((_abs("find"), str(tree), *_owned_selector(owner_uid),
+    # ! -type l: chmod follows a link, and this runs as root; a link the entity left would aim it at
+    # any file on the machine.
+    ok, why = _run_ok((_abs("find"), str(tree), *_owned_selector(owner_uid), "!", "-type", "l",
                        "-gid", str(operator_gid), "-exec", _abs("chmod"), "g+rX,g-w", "{}", "+"))
     if not ok:
         return ok, why
@@ -846,6 +848,27 @@ def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner
     return levain_dir / "confinement.json"
 
 
+def _undo_lock(entity_dir: Path) -> int | None:
+    """The hands lock, exclusive, for the whole undo: no session, ws-git, ws-put or ws-adopt runs
+    while the account and its sudoers rule go. Opened without O_CREAT: root must not create the
+    operator's lock file (it would then be root's, and refuse the operator). Absent = nobody holds
+    it. Returns the fd, None when there is no lock file, or -1 when it is held."""
+    import fcntl
+
+    from levain.firing.ws_git import HANDS_LOCK
+
+    try:
+        fd = os.open(entity_dir / ".levain" / HANDS_LOCK, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return -1
+    return fd
+
+
 def _operator_path_under_home(operator: str) -> list[str]:
     home = _home_of(operator)
     path = os.environ.get("PATH", "")
@@ -887,6 +910,17 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
                   f"creates for {hands}; refusing (fix or remove the hands keys in confinement.json).")
             return 1
         hands_id: int | None = None
+        if not _user_exists(hands) and cfg.hands_uid is not None:
+            # The account was removed by someone else. Its files still carry the recorded id: retire
+            # it and work on it, unless another account has it now.
+            try:
+                taken = pwd.getpwuid(cfg.hands_uid).pw_name
+            except KeyError:
+                hands_id = cfg.hands_uid
+            else:
+                print(f"setup-isolation: {hands} is gone and its id {cfg.hands_uid} now belongs to {taken}; "
+                      "refusing to touch files by that id.")
+                return 1
         if _user_exists(hands):
             if not dry_run and not user_record_is_ours(hands, host):
                 print(f"setup-isolation: refusing to remove {hands}: it exists but was not created by Levain.")
@@ -905,7 +939,16 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
             print(f"setup-isolation: {exc}")
             return 1
         print(f"Removing hands isolation for {entity_dir} (user {hands}).")
-        rc = run_plan(plan, dry_run=dry_run)
+        lock_fd = None if dry_run else _undo_lock(entity_dir)
+        if lock_fd == -1:
+            print("setup-isolation: a session of this entity, or levain ws-git / ws-put / ws-adopt, is "
+                  "running; refusing to undo under it.")
+            return 1
+        try:
+            rc = run_plan(plan, dry_run=dry_run)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
         if dry_run or rc != 0:
             return rc
         # Asked of the directory service in a fresh process: this process's getpwnam can keep

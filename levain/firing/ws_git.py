@@ -53,7 +53,7 @@ _NEUTRALISE = (
     "-c", "core.editor=false", "-c", "core.sshCommand=/usr/bin/ssh", "-c", "credential.helper=",
     "-c", "core.askPass=", "-c", "core.gitProxy=", "-c", "gpg.program=false",
     "-c", "gpg.ssh.program=false", "-c", "gpg.x509.program=false", "-c", "safe.bareRepository=explicit",
-    "-c", "protocol.ext.allow=never",
+    "-c", "protocol.ext.allow=never", "-c", "core.alternateRefsCommand=",
 )
 
 
@@ -189,10 +189,19 @@ def _run_relayed(argv: list[str]) -> int:
     return proc.wait()
 
 
-#: Where macOS keeps the per-user agents launchd starts for a uid on its own (cfprefsd, distnoted,
-#: lsd, trustd, secd, containermanagerd and XPC services were measured on a CI runner, 2026-10-07):
+#: The per-user agents launchd starts for a uid on its own once it has run Apple code, measured on a
+#: CI runner 2026-10-07 (exact paths), plus XPC services, which launchd alone starts. They live on
 #: the sealed system volume, which no user can write.
-_DARWIN_AGENT_DIRS = ("/usr/sbin/", "/usr/libexec/", "/System/Library/")
+_DARWIN_USER_AGENTS = frozenset({
+    "/usr/sbin/cfprefsd", "/usr/sbin/distnoted", "/usr/libexec/lsd", "/usr/libexec/trustd",
+    "/usr/libexec/secd", "/usr/libexec/containermanagerd", "/usr/libexec/secinitd",
+    "/usr/libexec/UserEventAgent",
+})
+_DARWIN_XPC_SERVICE = re.compile(r"^/System/Library/[^\0]+\.xpc/Contents/MacOS/[^/]+$")
+
+
+def _darwin_agent(ppid: str, path: str) -> bool:
+    return ppid == "1" and (path in _DARWIN_USER_AGENTS or bool(_DARWIN_XPC_SERVICE.match(path)))
 
 
 def proc_hides_processes(mountinfo: str) -> bool:
@@ -220,24 +229,35 @@ def entity_session_live(hands_uid: int) -> bool:
         if proc_hides_processes(mounts):
             raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
                              "processes); refusing")
-    r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/")
-    if r.returncode == 1:
+    def pids() -> set[str]:
+        r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/")
+        if r.returncode not in (0, 1):
+            raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
+                             "refusing")
+        return set(r.stdout.split())
+
+    found = pids()
+    if not found:
         return False
-    if r.returncode != 0:
-        raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
-                         "refusing")
     if platform.system() != "Darwin":
         return True
     # macOS starts per-user system agents for any uid that has run Apple code (git and python3 in
-    # /usr/bin are xcrun shims): launchd's children, from the sealed system volume, which the entity
-    # does not drive. Anything else, an orphan of the entity's included (/bin and /usr/bin are not on
-    # the list), is a live session.
-    pids = r.stdout.split()
-    ps = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", ",".join(pids)], capture_output=True, text=True, cwd="/")
-    rows = [ln.split(None, 1) for ln in ps.stdout.splitlines() if ln.strip()]
-    if ps.returncode not in (0, 1) or not rows:
-        raise WsGitError("cannot tell whether the entity is running (ps failed); refusing")
-    return any(len(row) != 2 or row[0] != "1" or not row[1].strip().startswith(_DARWIN_AGENT_DIRS) for row in rows)
+    # /usr/bin are xcrun shims). Those, and only those, are not a session; an orphan of the
+    # entity's is. The pid set is read again after ps: a process that exited and forked in between
+    # would otherwise leave only agents in view.
+    ps = subprocess.run(["/bin/ps", "-o", "pid=,ppid=,comm=", "-p", ",".join(sorted(found))],
+                        capture_output=True, text=True, cwd="/")
+    rows = {}
+    for ln in ps.stdout.splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) == 3:
+            rows[parts[0]] = (parts[1], parts[2].strip())
+    if not all(_darwin_agent(ppid, path) for ppid, path in rows.values()):
+        return True
+    if set(rows) != found or pids() != found:
+        raise WsGitError("cannot tell whether the entity is running (its processes changed while being read); "
+                         "refusing")
+    return False
 
 
 #: Per entity, in the operator's tree (out of the hands user's reach). A session of a hands entity
@@ -423,9 +443,20 @@ def _hands_python(hands: Hands) -> str:
 
 def cmd_ws_put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int:
     """Copy one regular file of the operator's into the workspace, written by the hands user as plain
-    data (mode 0644, never executable). Nothing is run from the workspace and no terminal is given."""
+    data (mode 0644, never executable). Nothing is run from the workspace and no terminal is given.
+    Runs under the exclusive hands lock, and not while anything runs as the hands user."""
+    try:
+        with _exclusive(entity_dir):
+            return _put(entity_dir, src, dest)
+    except (WsGitError, OSError) as exc:
+        print(f"ws-put: {exc}")
+        return 1
+
+
+def _put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int:
     try:
         hands = load_hands(entity_dir)
+        _refuse_while_live(hands, "ws-put")
         parts = put_parts(hands.workspace, dest)
         src = Path(src).expanduser()
         _check_operator_source(src, hands)
@@ -475,6 +506,33 @@ cat > "$t/bundle"
 """
 
 
+def _check_source_repo(src: Path, hands: Hands) -> None:
+    """Before the operator's git reads a repository to import, it must be one nobody else could have
+    written: the operator's git trusts it and would run what its config names. A plain ``.git``
+    directory; every entry in it the operator's and not writable by others; no borrowed objects, no
+    linked worktrees, no config includes."""
+    gitdir = src / ".git"
+    st = gitdir.lstat()
+    if not stat.S_ISDIR(st.st_mode):
+        raise WsGitError(f"{gitdir} is not a plain directory (a gitfile or a link); refusing")
+    me = os.getuid()
+    for root, dirs, files in os.walk(gitdir):
+        for name in (".", *dirs, *files):
+            p = Path(root) if name == "." else Path(root) / name
+            pst = p.lstat()
+            if pst.st_uid != me or pst.st_mode & stat.S_IWOTH and not stat.S_ISLNK(pst.st_mode):
+                raise WsGitError(f"{p} is not yours alone (owner {pst.st_uid}, or writable by others); refusing "
+                                 "to let your git read this repository")
+    for name in ("commondir", "worktrees"):
+        if os.path.lexists(gitdir / name):
+            raise WsGitError(f"{gitdir}/{name} present (linked worktrees are not imported)")
+    alt = gitdir / "objects" / "info" / "alternates"
+    if alt.exists() and alt.stat().st_size:
+        raise WsGitError(f"{gitdir} borrows objects from elsewhere (alternates); refusing")
+    if any(k.startswith(("include.", "includeif.")) for k in _config_lines(gitdir / "config", "--list", "--name-only")):
+        raise WsGitError(f"{gitdir}/config includes another file; refusing")
+
+
 def _operator_git(src: Path, *args: str) -> subprocess.CompletedProcess:
     """The operator's git on the operator's own repository (outside every workspace)."""
     return subprocess.run([_abs("git"), *_NEUTRALISE, "-C", str(src), *args], capture_output=True, text=True,
@@ -508,6 +566,7 @@ def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
             raise WsGitError(f"{src} is inside an entity's workspace; ws-adopt imports a repository of yours "
                              "from outside it")
         _check_operator_source(src, hands)
+        _check_source_repo(src, hands)
         top = _operator_git(src, "rev-parse", "--show-toplevel")
         if top.returncode != 0 or Path(top.stdout.strip()).resolve() != src.resolve():
             raise WsGitError(f"{src} is not the top of a repository")
@@ -573,8 +632,10 @@ def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
         except (WsGitError, OSError) as exc:
             problem = str(exc)
     if problem:
-        subprocess.run(_as_hands(hands, "/bin/rm", "-rf", "--", str(dest)), capture_output=True, cwd="/")
-        print(f"ws-adopt: {problem}. Nothing was kept in the workspace; your repository is unchanged.")
+        rm = subprocess.run(_as_hands(hands, "/bin/rm", "-rf", "--", str(dest)), capture_output=True, cwd="/")
+        kept = ("Nothing was kept in the workspace" if rm.returncode == 0 and not os.path.lexists(dest)
+                else f"The partial import at {dest} could not be removed")
+        print(f"ws-adopt: {problem}. {kept}; your repository is unchanged.")
         return 1
     for rname, url in remotes.items():
         if subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
@@ -599,6 +660,8 @@ def foreign_entries(hands: Hands) -> list[Path]:
     can read its own tree however the entity set its modes; the writability is judged as the
     operator, with ``access(W_OK)``, which answers for mode bits and ACLs alike. Raises when the walk
     itself fails, so the caller fails closed."""
+    if os.geteuid() == 0:
+        raise WsGitError("run this as yourself, not as root: the check asks what YOU can write there")
     find = _abs("find")
 
     def walk(*predicate: str) -> list[Path]:
@@ -609,8 +672,11 @@ def foreign_entries(hands: Hands) -> list[Path]:
             raise WsGitError(f"the scan of the workspace as {hands.user} failed: {why[0]}")
         return [Path(os.fsdecode(x)) for x in r.stdout.split(b"\0") if x]
 
-    found = set(walk("!", "-user", str(hands.uid)))
-    found.update(p for p in walk("!", "-type", "l") if os.access(p, os.W_OK))
+    # -prune: an entry that is not the hands user's is a finding itself; the walk does not go into it
+    # (the hands user may not be able to), so only a failure inside its own tree fails the scan.
+    found = set(walk("!", "-user", str(hands.uid), "-prune"))
+    found.update(p for p in walk("!", "-user", str(hands.uid), "-prune", "-o", "!", "-type", "l")
+                 if p not in found and os.access(p, os.W_OK))
     return sorted(found)
 
 
@@ -619,7 +685,12 @@ def bare_repository_explicit() -> bool:
     explicit``), so a bare repository planted anywhere is never picked up by discovery. Read only."""
     r = subprocess.run([_abs("git"), "config", "--get", "safe.bareRepository"], capture_output=True, text=True,
                        stdin=subprocess.DEVNULL, cwd="/")
-    return r.stdout.strip().lower() == "explicit"
+    if r.stdout.strip().lower() != "explicit":
+        return False
+    # Before git 2.38 the key does not exist, so a value in it protects nothing.
+    m = re.search(r"(\d+)\.(\d+)", subprocess.run([_abs("git"), "--version"], capture_output=True, text=True,
+                                                   cwd="/").stdout)
+    return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2, 38)
 
 
 def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:

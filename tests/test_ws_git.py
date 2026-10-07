@@ -168,10 +168,11 @@ def test_the_scan_reports_every_entry_the_hands_user_does_not_own_or_the_operato
     (ws / "link").symlink_to("/etc")                           # a link: judged by its owner, never followed
     dirs = [ws.joinpath(*["d1", "d2", "d3", "d4", "d5", "d6"][:i]) for i in range(1, 7)]
     everything = {ws, deep / "f", ws / "bare", ws / "link", *dirs}
+    (deep / "foreign").mkdir()
     _read_only(ws)
     try:
         assert _scan(tmp_path, monkeypatch, ME) == []          # all the "hands user's", none writable to me
-        assert set(_scan(tmp_path, monkeypatch, ME + 1)) == everything   # none of it the hands user's
+        assert _scan(tmp_path, monkeypatch, ME + 1) == [ws]   # the workspace itself not the hands user's: a finding, not entered
         deep.chmod(0o755)                                      # a folder deep down opened up to the operator
         assert _scan(tmp_path, monkeypatch, ME) == [deep]
         deep.chmod(0o555)
@@ -194,6 +195,22 @@ def test_a_scan_that_cannot_walk_the_tree_fails_closed(tmp_path: Path, monkeypat
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+def test_a_foreign_folder_the_hands_user_cannot_enter_is_a_finding_not_a_failed_scan(tmp_path: Path, monkeypatch) -> None:
+    ws = tmp_path / "ws"
+    (ws / "x" / "inner").mkdir(parents=True)
+    (ws / "x").chmod(0)                         # "the operator's" (see uid below), closed to the walker
+    try:
+        assert _scan(tmp_path, monkeypatch, ME + 1) == [ws]   # pruned at the first foreign entry: no error
+    finally:
+        (ws / "x").chmod(0o755)
+
+
+def test_the_scan_refuses_to_answer_for_root(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ws_git.os, "geteuid", lambda: 0)
+    with pytest.raises(WsGitError, match="not as root"):
+        _scan(tmp_path, monkeypatch, ME)
+
+
 def test_a_file_only_its_owner_can_read_is_no_finding(tmp_path: Path, monkeypatch) -> None:
     # Linux: the operator's named entry is cut by the mask on a 0600 file; the hands-side walk
     # still sees it, so ordinary entity work is not a standing FAIL.
@@ -217,6 +234,10 @@ def test_the_bare_repository_setting_is_read_from_the_operators_git(tmp_path: Pa
     assert ws_git.bare_repository_explicit() is False
     cfg.write_text("[safe]\n\tbareRepository = explicit\n")
     assert ws_git.bare_repository_explicit() is True
+    real = subprocess.run
+    monkeypatch.setattr(ws_git.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, "git version 2.37.1\n", "") if argv[-1] == "--version" else real(argv, **kw))
+    assert ws_git.bare_repository_explicit() is False      # before 2.38 the key protects nothing
 
 
 # --- the liveness gate --------------------------------------------------------------------------
@@ -236,27 +257,31 @@ def test_liveness_fails_closed_when_the_process_table_cannot_be_read(monkeypatch
 
 def test_on_macos_only_launchds_own_per_user_agents_do_not_count_as_live(monkeypatch) -> None:
     monkeypatch.setattr(ws_git.platform, "system", lambda: "Darwin")
-    ps_out = {"value": ""}
+    state = {"pgrep": ["101\n102\n"], "ps": ""}
 
     def fake_run(argv, **kw):
         if argv[0].endswith("pgrep"):
-            return subprocess.CompletedProcess(argv, 0, "101\n102\n", "")
-        return subprocess.CompletedProcess(argv, 0, ps_out["value"], "")
+            out = state["pgrep"][0] if len(state["pgrep"]) == 1 else state["pgrep"].pop(0)
+            return subprocess.CompletedProcess(argv, 0, out, "")
+        return subprocess.CompletedProcess(argv, 0, state["ps"], "")
 
     monkeypatch.setattr(ws_git.subprocess, "run", fake_run)
-    ps_out["value"] = ("    1 /usr/sbin/cfprefsd\n    1 /usr/libexec/secd\n    1 /System/Library/Frameworks/NetFS.framework"
-                       "/Versions/A/XPCServices/PlugInLibraryService.xpc/Contents/MacOS/PlugInLibraryService\n")
+    xpc = "/System/Library/Frameworks/NetFS.framework/Versions/A/XPCServices/PlugInLibraryService.xpc/Contents/MacOS/PlugInLibraryService"
+    state["ps"] = f"  101     1 /usr/sbin/cfprefsd\n  102     1 {xpc}\n"
     assert ws_git.entity_session_live(4_000_017) is False
-    for rows in ("    1 /usr/sbin/cfprefsd\n    1 /bin/sh\n",           # an orphan of the entity's
-                 "    1 /usr/bin/python3\n",                            # /usr/bin is not on the list
-                 "  555 /usr/sbin/cfprefsd\n",                          # not launchd's child
-                 "    1 /tmp/usr/sbin/cfprefsd\n",                      # not the system's binary
-                 ""):                                                    # cannot tell
-        ps_out["value"] = rows
-        try:
-            assert ws_git.entity_session_live(4_000_017) is True, rows
-        except WsGitError:
-            assert rows == ""
+    for rows in ("  101     1 /usr/sbin/cfprefsd\n  102     1 /bin/sh\n",                 # an orphan of the entity's
+                 "  101     1 /usr/sbin/cfprefsd\n  102     1 /usr/bin/python3\n",
+                 "  101     1 /usr/sbin/cfprefsd\n  102     1 /System/Library/Frameworks/Ruby.framework/x/ruby\n",
+                 "  101     1 /usr/sbin/cfprefsd\n  102   555 /usr/sbin/distnoted\n"):    # not launchd's child
+        state["ps"] = rows
+        assert ws_git.entity_session_live(4_000_017) is True, rows
+    state["ps"] = "  101     1 /usr/sbin/cfprefsd\n"                                    # 102 gone in between
+    with pytest.raises(WsGitError, match="changed while being read"):
+        ws_git.entity_session_live(4_000_017)
+    state["ps"] = f"  101     1 /usr/sbin/cfprefsd\n  102     1 {xpc}\n"
+    state["pgrep"] = ["101\n102\n", "101\n102\n103\n"]                               # 103 forked in between
+    with pytest.raises(WsGitError, match="changed while being read"):
+        ws_git.entity_session_live(4_000_017)
 
 
 def test_a_proc_mounted_hidepid_means_liveness_cannot_be_told() -> None:
@@ -590,3 +615,50 @@ def test_a_hands_entitys_session_holds_the_lock_from_open_to_close(tmp_path: Pat
         s.close()
     with ws_git._exclusive(ent):                                # closed: ws-git may run
         pass
+
+
+def test_ws_put_takes_the_hands_lock_and_the_liveness_gate(put_env, tmp_path: Path, monkeypatch, capsys) -> None:
+    h, src = put_env
+    fd = ws_git.hold_session_lock(tmp_path)
+    try:
+        assert _put(h, src, "x") == 1 and "session of this entity is open" in capsys.readouterr().out
+    finally:
+        os.close(fd)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    assert _put(h, src, "x") == 1 and "processes running" in capsys.readouterr().out
+    assert not (h.workspace / "x").exists()
+
+
+def _src_repo(tmp_path: Path) -> Path:
+    src = tmp_path / "srcrepo"
+    _repo(src)
+    return src
+
+
+@pytest.mark.parametrize("plant", ["other-writable", "gitfile", "alternates", "include", "worktrees"])
+def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_written(tmp_path: Path, plant) -> None:
+    src = _src_repo(tmp_path)
+    h = _hands(tmp_path, uid=4_000_017)
+    ws_git._check_source_repo(src, h)                                   # control: clean
+    g = src / ".git"
+    if plant == "other-writable":
+        (g / "config").chmod(0o666)
+    elif plant == "gitfile":
+        shutil.rmtree(g)
+        g.write_text("gitdir: /elsewhere\n")
+    elif plant == "alternates":
+        (g / "objects" / "info").mkdir(parents=True, exist_ok=True)
+        (g / "objects" / "info" / "alternates").write_text("/x\n")
+    elif plant == "include":
+        _set(g, "include.path", "/tmp/x")
+    else:
+        (g / "worktrees").mkdir()
+    with pytest.raises(WsGitError):
+        ws_git._check_source_repo(src, h)
+
+
+def test_ws_adopt_checks_the_repository_before_your_git_reads_it(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    (src / ".git" / "config").chmod(0o666)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "not yours alone" in capsys.readouterr().out
+    assert not (h.workspace / "mine").exists()

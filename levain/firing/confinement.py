@@ -1888,7 +1888,7 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
     hands_workspace: Path | None = None
     present = [k for k in ("hands_user", "hands_uid", "hands_workspace") if k in data]
     if present:
-        from levain.firing.hands import HANDS_USER_RE, WORKSPACE_ROOT
+        from levain.firing.hands import HANDS_USER_RE, WORKSPACE_ROOT, hands_user_name
 
         redo = (" Run `sudo levain setup-isolation --undo` and set it up again — fail-closed.")
         if len(present) != 3:
@@ -1901,9 +1901,15 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
                 f"{base}: hands_user must be the name `levain setup-isolation` recorded, got "
                 f"{hands_user!r}.{redo}"
             )
+        if hands_user != hands_user_name(entity_dir):
+            # The name is derived from this entity's path. A record copied from another entity would
+            # share its hands user while locking a different hands.lock (levain.firing.ws_git).
+            raise ConfinementError(
+                f"{base}: hands_user {hands_user} was set up for another entity directory (this one's "
+                f"would be {hands_user_name(entity_dir)}).{redo}")
         if isinstance(hands_uid, bool) or not isinstance(hands_uid, int) or hands_uid <= 0:
             raise ConfinementError(f"{base}: hands_uid must be a positive integer, got {hands_uid!r}.{redo}")
-        # Exactly the path setup creates for THIS user: undo (as root) re-owns and re-modes that
+        # Exactly the path setup creates for THIS user: undo (as root) re-groups and re-modes that
         # tree, so a looser check would let a hand-edited path aim it at another directory.
         expected = {str(r / hands_user / "workspace") for r in WORKSPACE_ROOT.values()}
         home = str(Path.home()) + os.sep

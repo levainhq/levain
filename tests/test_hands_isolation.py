@@ -590,3 +590,69 @@ def test_record_hands_refuses_a_symlinked_store_directory(tmp_path: Path) -> Non
     with pytest.raises(HandsSetupError, match="refusing"):
         hands.record_hands(ed, _record(ed), owner_uid=os.getuid(), owner_gid=os.getgid())
     assert list(real.iterdir()) == []
+
+
+# --- L3 round 1 (e09dc54) ---------------------------------------------------------------------------
+
+
+def test_the_loader_refuses_a_hands_record_copied_from_another_entity(tmp_path: Path) -> None:
+    a, b = _entity(tmp_path, "a"), _entity(tmp_path, "b")
+    (b / ".levain" / "confinement.json").write_text(json.dumps(_record(a)))
+    with pytest.raises(ConfinementError, match="another entity directory"):
+        load_confinement_config(b)
+    (a / ".levain" / "confinement.json").write_text(json.dumps(_record(a)))
+    assert load_confinement_config(a).hands_user == hands_user_name(a)          # control
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_undo_never_changes_the_mode_of_what_an_entity_link_points_at(tmp_path: Path) -> None:
+    # undo runs this as root; chmod follows a link, so a link to /etc/shadow would have gained group read
+    target = tmp_path / "secret"
+    target.write_text("k")
+    target.chmod(0o600)
+    tree = tmp_path / "h" / "workspace"
+    tree.mkdir(parents=True)
+    (tree / "link").symlink_to(target)
+    (tree / "own").write_text("x")
+    (tree / "own").chmod(0o600)
+    ok, _ = hands._readable_and_sanitised(tree.parent, os.getgid(), owner_uid=os.getuid())
+    assert ok
+    assert target.stat().st_mode & 0o777 == 0o600                    # untouched
+    assert (tree / "own").stat().st_mode & 0o777 == 0o640              # the entity's own file: group read
+
+
+def _undo_dry(tmp_path: Path, monkeypatch, capsys, uid: int) -> tuple[int, str]:
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps({**_record(ed), "hands_uid": uid}))
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    rc = hands.cmd_setup_isolation(ed, undo=True, dry_run=True)
+    return rc, capsys.readouterr().out
+
+
+def test_undo_of_an_account_someone_else_deleted_retires_and_works_on_its_recorded_id(tmp_path: Path, monkeypatch, capsys) -> None:
+    rc, out = _undo_dry(tmp_path, monkeypatch, capsys, 4_000_017)    # no account has this id
+    assert rc == 0 and "retire the user id" in out and "stop every process" in out
+
+
+def test_undo_refuses_when_the_recorded_id_now_belongs_to_another_account(tmp_path: Path, monkeypatch, capsys) -> None:
+    rc, out = _undo_dry(tmp_path, monkeypatch, capsys, os.getuid())
+    assert rc == 1 and "now belongs to" in out and "retire the user id" not in out
+
+
+def test_undo_takes_the_hands_lock_exclusive_and_never_creates_it(tmp_path: Path) -> None:
+    from levain.firing import ws_git
+
+    ed = _entity(tmp_path)
+    assert hands._undo_lock(ed) is None and not (ed / ".levain" / ws_git.HANDS_LOCK).exists()
+    fd = ws_git.hold_session_lock(ed)                       # a session is open
+    try:
+        assert hands._undo_lock(ed) == -1
+    finally:
+        os.close(fd)
+    fd = hands._undo_lock(ed)
+    try:
+        assert fd is not None and fd >= 0
+        with pytest.raises(ws_git.WsGitError):              # and nothing starts under the undo
+            ws_git.hold_session_lock(ed, wait=0)
+    finally:
+        os.close(fd)
