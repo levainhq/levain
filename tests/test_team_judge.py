@@ -1101,3 +1101,14 @@ def test_a_branch_behind_what_a_fetch_accepted_still_reads_and_a_reset_below_a_r
     assert "two" in [e.get("words") for e in ledger(ben).entries]
     git("update-ref", "refs/heads/levain-ledger", before, cwd=ben)
     assert ledger(ben).tamper
+
+
+def test_the_trust_record_is_read_once_and_an_unreadable_one_raises(two):
+    tmp, ana, ben = two
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    rec = gb.trust_record()
+    assert rec.accepted == gb.accepted_tip() and not gb.judge_remote(rec.accepted, rec).ledger.tamper
+    _pins_file(ben).write_text("{not json")
+    with pytest.raises(LedgerReadError):
+        gb.trust_record()

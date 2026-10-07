@@ -729,6 +729,14 @@ class GitLedger:
                         "first_sight": seen["first"], "own": name == f"{self.device}.jsonl"})
         return out
 
+    def trust_record(self) -> Trust:
+        """This clone's trusted record (accepted tip, pins, first-seen times), read ONCE, so a caller judges against one
+        consistent record (``judge_remote(rec.accepted, rec)``). Raises LedgerReadError when it cannot be read."""
+        rec, problem = self._trust()
+        if problem:
+            raise LedgerReadError(problem)
+        return rec
+
     def accepted_tip(self) -> str | None:
         """The remote tip this clone last accepted, from its trusted record (None before any)."""
         return self._trust()[0].accepted
