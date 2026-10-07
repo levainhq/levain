@@ -173,11 +173,12 @@ stalls holds the session past the deadline until the SDK's own HTTP timeout and 
 a stalled call short needs the SDK's async run, which this host does not use."""
 
 _WATCHER_JOIN_SECONDS = 10.0
-_REAP_POLL_SECONDS = 60.0
-"""How often a reaper waiting on a handed-off release logs that it is still waiting."""
-
 """How long a worker waits for its deadline watcher to exit after the job returns. The watcher's
 stop request blocks only while a step runs, and none is running by then, so this is a backstop."""
+
+_REAP_POLL_SECONDS = 60.0
+"""How long a reaper waits on a handed-off release between log lines, and between asks of a driver
+that could not say whether it is released."""
 
 
 class ChatError(Exception):
@@ -523,9 +524,11 @@ class ChatHost:
             return self._session_view(rec)
 
     def shutdown(self) -> None:
-        """Close every idle or gated session and stop accepting work. A job still running is not
-        interrupted; its worker closes the session when the job ends, and if the process exits first
-        the SDK closes the conversation at interpreter exit."""
+        """Close every idle or gated session and stop accepting work. The closes run side by side, so
+        this returns within about one driver's close bound, not one per session; a release that outlives
+        it is finished on its own thread and the record reads ``closing`` until then. A job still running
+        is not interrupted; its worker closes the session when the job ends, and if the process exits
+        first the SDK closes the conversation at interpreter exit."""
         with self._lock:
             self._shut = True
             to_close = []
@@ -534,8 +537,19 @@ class ChatHost:
                     to_close.append((rec, rec.driver))
                     rec.driver = None
                     rec.state = "closing"
+        closers = []
         for rec, s in to_close:
-            self._close_then(rec, s, functools.partial(self._settle, rec, "closed"))
+            closer = threading.Thread(target=self._close_then,
+                                      args=(rec, s, functools.partial(self._settle, rec, "closed")),
+                                      daemon=True, name="levain-chat-shutdown")
+            try:
+                closer.start()
+            except RuntimeError:
+                self._close_then(rec, s, functools.partial(self._settle, rec, "closed"))
+            else:
+                closers.append(closer)
+        for closer in closers:
+            closer.join()      # each close is bounded by its driver, and they run together
 
     # -- internals -----------------------------------------------------------
 
@@ -570,19 +584,39 @@ class ChatHost:
                     # still counted: an unreleased session keeps its slot rather than freeing it early
                     _log.error("chat session %s: no reaper thread; it stays counted", rec.session_id)
 
-    def _released(self, driver: HarnessDriver, timeout: float | None) -> bool:
+    def _released(self, driver: HarnessDriver, timeout: float | None) -> bool | None:
+        """Whether ``driver`` has released everything, waiting at most ``timeout``; ``None`` when it could
+        not say (it raised), which every caller reads as not released: the slot stays counted."""
         try:
             return bool(driver.wait_closed(timeout))
-        except Exception as exc:  # noqa: BLE001 — unknown reads as not released: the slot stays counted
+        except Exception as exc:  # noqa: BLE001
             _log.error("chat: a driver could not say whether it is released: %s", exc)
-            return False
+            return None
 
     def _reap(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None]) -> None:
         """Wait for a handed-off release, then settle the record. Never gives up: a session whose shell
-        is never released stays counted, which is the true state of the machine."""
-        while not self._released(driver, _REAP_POLL_SECONDS):
+        is never released stays counted, which is the true state of the machine. A driver that cannot
+        say is asked again after the same interval, never in a tight loop (L1: it spun ~3M times a second)."""
+        while True:
+            released = self._released(driver, _REAP_POLL_SECONDS)
+            if released:
+                break
+            if released is None:
+                threading.Event().wait(_REAP_POLL_SECONDS)
             _log.warning("chat session %s: still releasing its shell", rec.session_id)
-        settle()
+        try:
+            settle()
+        except BaseException as exc:  # noqa: BLE001 — no worker is left to settle this record
+            text = f"{type(exc).__name__}: {exc}"
+            _log.error("chat session %s: settling after a late release failed: %s", rec.session_id, text)
+            with self._lock:
+                job = self._jobs.get(rec.job_id) if rec.job_id else None
+                if job is not None and job.status == "running":
+                    job.status, job.error = "failed", text
+                rec.job_id = None
+                if rec.state in ("opening", "busy", "closing"):
+                    ended: SessionState = "failed" if job is not None and job.kind == "open" else "broken"
+                    rec.state, rec.error = ended, text
 
     def _refuse_if_shut(self) -> None:
         if self._shut:

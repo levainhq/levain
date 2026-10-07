@@ -1097,3 +1097,80 @@ def test_a_broken_turn_whose_teardown_raises_still_publishes_its_result(tmp_path
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "done" and st["result"]["error"] == "boom"
     assert host.session_status(sid)["state"] == "broken"
+
+
+# -- L1 on 3331e91..3328b56 -----------------------------------------------------------------------------------
+
+
+class _LateRelease(_Fake):
+    """A driver whose close() returns before everything is released, until `done` is set."""
+
+    def __init__(self, script=None):
+        super().__init__(script or [])
+        self.done = threading.Event()
+        self.asks = 0
+
+    def wait_closed(self, timeout):
+        self.asks += 1
+        return self.done.wait(timeout if timeout is not None else 10)
+
+
+def test_a_reaper_whose_driver_cannot_say_does_not_spin(tmp_path, monkeypatch):
+    """L1 (RAN): `wait_closed` raising made the reaper's 60 s poll a 0 s poll, ~3M calls a second."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_REAP_POLL_SECONDS", 0.2)
+
+    class Mute(_Fake):
+        asks = 0
+
+        def wait_closed(self, timeout):
+            self.asks += 1
+            raise OSError("cannot tell")
+
+    d = Mute([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    host.close(sid)
+    time.sleep(1.0)
+    assert d.asks < 20 and host.session_status(sid)["state"] == "closing"   # counted, and not spinning
+
+
+def test_shutdown_closes_sessions_side_by_side(tmp_path):
+    """L1 (RAN): shutdown closed one session after another, so N slow releases cost N close bounds."""
+    gate = threading.Event()
+
+    class Slow(_Fake):
+        def close(self):
+            self.closed = True
+            gate.wait(0.5)          # a close that uses its whole bound
+
+    drivers = {n: Slow([]) for n in ("a", "b", "c", "d")}
+    host = _host(tmp_path, drivers)
+    for n in drivers:
+        _open(host, n)
+    started = time.monotonic()
+    host.shutdown()
+    assert time.monotonic() - started < 1.5 and all(d.closed for d in drivers.values())
+
+
+def test_a_settle_that_fails_after_a_late_release_still_ends_the_record(tmp_path):
+    """L1: a settle run on the reaper thread is outside every worker's guard; one that raised left the job
+    running and the record busy for good."""
+    d = _LateRelease()
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    rec = host._sessions[sid]
+    with host._lock:
+        job = host._new_job(rec, "turn")
+        rec.state = "busy"
+
+    def settle():
+        raise RuntimeError("publish failed")
+
+    host._close_then(rec, d, settle)
+    d.done.set()
+    end = time.monotonic() + 5
+    while host.session_status(sid)["state"] == "busy" and time.monotonic() < end:
+        time.sleep(0.02)
+    assert host.session_status(sid)["state"] == "broken" and host.job_status(job.job_id)["status"] == "failed"
