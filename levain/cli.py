@@ -1,6 +1,7 @@
 """Levain CLI — `levain init`, `levain doctor`, `levain verify-hooks`.
 
-The entry point declared by `pyproject.toml` ([project.scripts] levain).
+The CLI that `levain.launch.main` (the entry point declared by `pyproject.toml`, [project.scripts]
+levain) hands over to.
 Subcommand handlers live in sibling modules; this file is dispatch only.
 Lazy imports keep `levain --help` fast and isolate import errors per command.
 """

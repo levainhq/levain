@@ -1659,6 +1659,31 @@ def _ci_within(path: Path, root: Path) -> bool:
     return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
 
 
+# Paths that are views of a PROCESS rather than files (lane P2 item 2c). The file editor runs inside
+# levain's own process, so on Linux ``/proc/self/mem`` is levain's memory (a process may always read
+# itself), with the carried environment and the model API key in it, and ``/proc/<pid>/environ`` is
+# any same-user process's exec-time environment. ``/dev/fd/N`` and ``/dev/std*`` are levain's own open
+# files on both OSes (an open SQLite store, say). The editor has no reason to touch any of them.
+_PROCESS_VIEW_ROOTS = (Path("/proc"), Path("/dev/fd"))
+_PROCESS_VIEW_FILES = (Path("/dev/stdin"), Path("/dev/stdout"), Path("/dev/stderr"))
+
+
+def _process_view_reason(given: Path | str, resolved: Path) -> str | None:
+    """Why ``given`` (as the caller spelled it, and as it resolves) is a process view, or None. The
+    given spelling matters on Linux: ``/proc/self/fd/N`` resolves to wherever fd N points, which is
+    the file it exposes and may be an ordinary path."""
+    try:
+        spelled = Path(os.path.abspath(os.path.expanduser(str(given))))
+    except (ValueError, OSError, RuntimeError):
+        spelled = resolved
+    for q in (spelled, resolved):
+        if any(_ci_within(q, r) for r in _PROCESS_VIEW_ROOTS) or any(_canon(str(q)) == _canon(str(f))
+                                                                     for f in _PROCESS_VIEW_FILES):
+            return (f"{given} is a view of a running process (/proc, /dev/fd, /dev/std*), which "
+                    "would expose levain's own memory, open files and environment — refused")
+    return None
+
+
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
     """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
 
@@ -1707,6 +1732,8 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # whose row was in verdicts.jsonl the whole time. Every claim re-verified here by execution.)
     except (ValueError, OSError, RuntimeError) as exc:
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
+    if (why := _process_view_reason(path, p)) is not None:
+        return why
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
@@ -3299,6 +3326,35 @@ def _refuse_bind_after_mask(argv: list[str]) -> None:
             )
 
 
+def _unescape_mountinfo(field: str) -> str:
+    """mountinfo octal-escapes space, tab, newline and backslash as ``\\ooo`` (proc_pid_mountinfo(5))."""
+    import re
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _extra_procfs_mounts(mountinfo: str = "/proc/self/mountinfo") -> list[Path]:
+    """Every ``proc`` filesystem mounted outside ``/proc`` on this host, from ``mountinfo``. Empty
+    where the file does not exist (macOS). An unreadable or malformed table raises OSError, which
+    :func:`_bwrap_plan` turns into a refusal: a procfs it could not look for is not known absent."""
+    try:
+        text = Path(mountinfo).read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return []
+    out: list[Path] = []
+    for line in text.splitlines():
+        pre, sep, post = line.partition(" - ")
+        fields = pre.split(" ")
+        if not sep or len(fields) < 5 or not post:
+            raise OSError(f"unreadable mount table line in {mountinfo}: {line!r}")
+        if post.split(" ")[0] != "proc":
+            continue
+        mp = Path(_unescape_mountinfo(fields[4]))
+        if mp == Path("/proc") or mp.is_relative_to("/proc"):
+            continue
+        out.append(mp)
+    return list(_dedup_paths(out))
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
     return _bwrap_plan(policy)[0]
@@ -3344,6 +3400,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # The sandbox dies with the levain process that owns it. Complements — never replaces —
         # SandboxedShell.close()'s process-group teardown.
         "--die-with-parent",
+        # A new PID namespace (lane P2 item 2c), so the ``--proc /proc`` above shows only the
+        # sandbox's own processes: "A /proc filesystem shows (in the /proc/pid directories) only
+        # processes visible in the PID namespace of the process that performed the mount"
+        # (pid_namespaces(7)). Without it, bash read ``/proc/<pid>/environ`` and ``cmdline`` of levain
+        # and of every other process of this user, which is where their secrets live. Costs: bash
+        # cannot see or signal host processes (``ps``, ``kill`` of a server started outside), and
+        # bwrap runs a reaping pid 1. SIGINT/SIGTERM from ``_signal_group`` still reach bash, which is
+        # in the same process group; when pid 1 exits the kernel kills the rest of the namespace.
+        "--unshare-pid",
     ]
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
@@ -3740,6 +3805,16 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if _reachable(bus) and bus.exists():
             masks.append(str(bus))
 
+    # (8) ANY OTHER procfs MOUNT. ``--bind / /`` is recursive, so a procfs mounted elsewhere on the
+    # host (a container runtime's, a chroot's) would still show the host's processes after
+    # ``--unshare-pid``. Each is hidden by a read-only tmpfs. Read from this process's own
+    # /proc/self/mountinfo, which is the host mount namespace bwrap copies.
+    for mp in _extra_procfs_mounts():
+        if not _reachable(mp) or _shadowed_by(mp, tuple(tmpfs_roots)):
+            continue
+        argv += ["--tmpfs", str(mp)]
+        remount_ro.append(str(mp))
+
     # The masks close the body (the masks-last rule above). They are appended BEFORE step (1), which
     # pins every directory the body makes bwrap create, so a mask's absent parent is pinned too
     # ("test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it" fails if not).
@@ -3824,7 +3899,8 @@ def bwrap_available() -> bool:
         return False
     try:
         proc = subprocess.run(
-            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
+            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
+             "/bin/true"],
             capture_output=True,
             timeout=10,
         )
@@ -3848,7 +3924,7 @@ def bwrap_netns_available() -> bool:
     try:
         proc = subprocess.run(
             [BWRAP, "--unshare-net", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-             "/bin/true"],
+             "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
         )
@@ -4334,12 +4410,14 @@ class BwrapProvider(ConfinementProvider):
     message a human reads will say "No such file or directory", and anything matching on EPERM to
     detect a denial will not fire.
 
-    ⚠ NOT CLAIMED, BECAUSE NOT MEASURED: whether ``--unshare-pid`` would close the DAEMONIZED
-    SURVIVOR limit the module docstring documents as open on macOS. It plausibly would (a pid
-    namespace reaps its children when its init exits), it is one flag, and it is deliberately NOT
-    built here — K4c is PARITY, and the one attempt to measure it was invalidated by a container
-    artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
-    before it is either claimed or shipped."""
+    ``--unshare-pid`` IS NOW BUILT (lane P2 item 2c, 2026-10-07), for a different reason than the one
+    this paragraph once weighed it for: without it the sandbox's procfs showed every process of this
+    user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. What it does is read
+    from documentation, not measured on this branch: pid_namespaces(7) says the new procfs shows
+    only the namespace's processes, and "If the "init" process of a PID namespace terminates, the
+    kernel terminates all of the processes in the namespace via a SIGKILL signal", which on paper
+    also ends a ``setsid`` survivor when bash's shell ends. The ``linux_live`` tests exercise the
+    first on a host where bwrap runs; the second is not claimed until one does."""
 
     #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
     #: does not close is ``OFFLINE_RESIDUAL``.
