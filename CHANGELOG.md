@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 
 - **`levain.autonomic`: the governed action engine for work that runs with no session open.** Folded in from the vagus project's efferent half (vagus is retiring as a separate package; this is the second piece of that fold, after `levain.firing` in July). It holds bindings (a standing grant to act when an event matches), the risk and trust postures with floors that no trust level can buy down, the confirm-and-timeout queue, chains, graduation and the kill check. It ships as a library only: no command, server route or default config reaches it yet, so an install behaves exactly as before. It imports nothing outside itself and the standard library.
+- **`levain.autonomic.journal`: a durable run journal for unattended runs.** Each effect of a run is recorded with a stable id, so a run can stop for a decision before an effect and resume without repeating the ones already done. While a decision is open on a binding, no run of that binding acts; a rejection cancels the run; a fence (a demotion or a cancel) stops older runs at their next effect; and an effect whose outcome is unknown (the process died or the call failed mid-way) is never retried, only reported. Library only, like the rest of the package: nothing calls it yet.
 
 ## [0.6.9] — 2026-10-05
 
