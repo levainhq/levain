@@ -1045,3 +1045,51 @@ def test_a_read_only_server_declares_allow_once_and_a_post_gets_405(tmp_path):
         httpd.shutdown()
         httpd.server_close()
         t.join(timeout=5)
+
+
+def test_a_read_only_server_still_unlocks_and_mints_links(tmp_path, monkeypatch):
+    """Lane E2 (live team view): with allow = "GET, HEAD", POST /unlock and /link fell to the 405 path, so token.js
+    could never trade a #code= and --open-running could never mint one. The guard's own routes are served whatever
+    the handler's allow says, while a token is armed; any other POST is still a 405."""
+    import io
+    import json
+    import time as _time
+    from http.server import ThreadingHTTPServer
+
+    import levain.http_guards as hg
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class _ReadOnly(hg.GuardedHandler):
+        allow = "GET, HEAD"
+
+        def _route(self, *, head):
+            self._send(b"ok", "text/plain; charset=utf-8", head=head)
+
+    def serve(token):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ReadOnly)
+        httpd.allowed_hosts = frozenset({"127.0.0.1", "localhost"})
+        hg.arm_launch_token(httpd, token, frozenset({"/"}))
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        return httpd, t
+
+    httpd, t = serve(_TOKEN)
+    try:
+        port = httpd.server_address[1]
+        code = hg.mint_link_code(httpd)
+        status, _h, body = _request(port, "POST", "/unlock", {"X-Levain-Link-Code": code}, token=None, body=True)
+        assert status == 200 and json.loads(body)["token"] == _TOKEN
+        pub = hg.publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="t", stream=io.StringIO())
+        assert hg.request_link_code(f"http://127.0.0.1:{port}/", _TOKEN, timeout=3.0)   # /link mints
+        pub.close()
+        status, headers = _request(port, "POST", "/other")
+        assert status == 405 and headers.get("Allow") == "GET, HEAD"
+    finally:
+        httpd.shutdown(); httpd.server_close(); t.join(timeout=5)
+    httpd, t = serve(None)    # no token armed: /unlock is just another POST on a read-only server
+    try:
+        status, headers = _request(httpd.server_address[1], "POST", "/unlock", token=None)
+        assert status == 405 and headers.get("Allow") == "GET, HEAD"
+    finally:
+        httpd.shutdown(); httpd.server_close(); t.join(timeout=5)

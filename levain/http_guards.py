@@ -483,7 +483,14 @@ class GuardedHandler(BaseHTTPRequestHandler):
                 return   # an error was sent
             served = {m.strip() for m in self.allow.split(",")}
             route = {"GET": self.do_GET, "HEAD": self.do_HEAD, "POST": self.do_POST}.get(self.command)
-            (route if route is not None and self.command in served else self._other_method)()
+            # The guard's own routes (trade a link code, mint one) belong to the guard layer, not to the handler's
+            # `allow`: a read-only server must still unlock (lane E2, measured on a live team view).
+            if (self.command == "POST" and self.path.split("?", 1)[0] in (UNLOCK_PATH, LINK_PATH)
+                    and self._launch_token_required()):
+                route = self.do_POST
+            elif self.command not in served:
+                route = None
+            (route if route is not None else self._other_method)()
             self.wfile.flush()
         except TimeoutError as e:
             self.log_error("Request timed out: %r", e)
