@@ -714,12 +714,14 @@ def test_a_failed_fetch_shows_a_fixed_message_and_keeps_git_detail_in_the_termin
         httpd.server_close()
 
 
-def test_transport_warnings_are_shown_once_and_taken_off_the_process_list():
+def test_transport_warnings_are_counted_on_the_page_with_their_words_in_the_terminal(capfd):
     # L1/L2 10-07: the view never showed transport.WARNINGS, and in a long-lived view the list only grew.
+    # complement, L3 round 2: a warning's words can carry local paths or git's text, so like a failed fetch's they
+    # go to the terminal; the page counts them.
     class Warns(_Stub):
         def snapshot(self):
-            self.warnings.append("team.toml at the tip is unusable; using an older one")
-            self.warnings.append("team.toml at the tip is unusable; using an older one")
+            self.warnings.append("team.toml at the tip is unusable (/home/ana/secret); using an older one")
+            self.warnings.append("team.toml at the tip is unusable (/home/ana/secret); using an older one")
             return super().snapshot()
     stub = Warns()
     httpd = _serve(stub)
@@ -727,11 +729,57 @@ def test_transport_warnings_are_shown_once_and_taken_off_the_process_list():
         port = httpd.server_address[1]
         for _ in range(3):
             page = _req(port, "GET")[1].decode()
-            assert page.count("team.toml at the tip is unusable") == 1
-        assert stub.warnings == []
+            assert "1 warning from reading the ledger (see the terminal running the view)" in page
+            assert "/home/ana/secret" not in page
+        assert "/home/ana/secret" not in _req(port, "GET", "/view.json")[1].decode()
+        assert stub.warnings == [] and "/home/ana/secret" in capfd.readouterr().err
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_one_views_warning_is_never_drained_by_another_servers_request():
+    # codex, L3 round 2: transport.WARNINGS is one list per process and each server had only its own lock, so a
+    # second server's request could show and delete a warning the first server's request appended.
+    entered_a, go_a, appended_a, entered_b = (threading.Event() for _ in range(4))
+
+    class A(_Stub):
+        def snapshot(self):
+            entered_a.set()
+            go_a.wait(5)
+            self.warnings.append("warning of A")
+            appended_a.set()
+            return super().snapshot()
+
+    class B(_Stub):
+        def snapshot(self):
+            entered_b.set()
+            appended_a.wait(2)
+            self.warnings.append("warning of B")
+            return super().snapshot()
+    a, b = A(), B()
+    b.warnings = a.warnings = []                      # one process-wide list, as transport.WARNINGS is
+    ha, hb = _serve(a), _serve(b)
+    try:
+        res = {}
+        ta = threading.Thread(target=lambda: res.setdefault("a", _req(ha.server_address[1], "GET", "/view.json")))
+        ta.start()
+        assert entered_a.wait(5)
+        tb = threading.Thread(target=lambda: res.setdefault("b", _req(hb.server_address[1], "GET", "/view.json")))
+        tb.start()
+        entered_b.wait(1)
+        go_a.set()
+        ta.join(10)
+        tb.join(10)
+        ma = json.loads(res["a"][1])
+        assert ma["warning_count"] == 1                  # A's own warning reached A's page
+        if res["b"][0].status == 200:
+            assert json.loads(res["b"][1])["warning_count"] == 1
+    finally:
+        go_a.set()
+        for h in (ha, hb):
+            h.shutdown()
+            h.server_close()
 
 
 def test_connections_past_the_worker_bound_are_closed_without_a_thread():
@@ -919,3 +967,74 @@ def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_v
     assert m["fetch"]["refused"] is True and words == ["VAT rounds half-even."]   # the last accepted copy
     page = _req(port, "GET", "/")[1].decode()
     assert "refused as tampered" in page and "remote, as last accepted" in page and "notes.txt" not in page
+
+
+
+def test_a_failed_fetch_is_not_shown_after_a_later_fetch_succeeded():
+    # codex, L3 round 2: the view stamped its remembered failure with the time it read the answer, so a success by
+    # another process DURING the failing call looked older than the failure and the page kept saying "failed".
+    import time as _t
+
+    class Raced(_RemoteStub):
+        def fetch_only(self, *, interval, timeout):
+            self._state = {"last_fetch_ok": _t.time()}      # another process succeeds while this call fails
+            _t.sleep(0.01)
+            return "git fetch failed: the network went away"
+    httpd = _serve(Raced())
+    try:
+        page = _req(httpd.server_address[1], "GET", "/?fetch=1")[1].decode()
+        assert "fetch-error" not in page
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_quarantine_is_judged_once_per_fetch_attempt_not_per_page():
+    # complement, L3 round 2: incoming_refusal() runs a full judgement, and it ran on every page while a refused tip
+    # sat in quarantine; the quarantine only changes when some process fetches, which records an attempt first.
+    class Counting(_RemoteStub):
+        def __init__(self):
+            super().__init__(state={"last_fetch_ok": 1.0e9, "last_fetch_attempt": 1.0e9})
+            self.judged = 0
+
+        def incoming_refusal(self):
+            self.judged += 1
+            return ["ledger/notes.txt is not a file levain writes"]
+    stub = Counting()
+    httpd = _serve(stub)
+    try:
+        port = httpd.server_address[1]
+        for _ in range(3):
+            assert "refused as tampered" in _req(port, "GET")[1].decode()
+        assert stub.judged == 1
+        stub._state = {"last_fetch_ok": 1.0e9, "last_fetch_attempt": 2.0e9}     # someone fetched again
+        _req(port, "GET")
+        assert stub.judged == 2
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_ledgers_own_problems_are_read_fresh_on_every_page():
+    # complement, L3 round 2: the integrity cache was keyed by the commit, but the judgement of one commit can change
+    # without the commit moving (a repin, this clone's own writes); only the history walk is cached now.
+    chains: dict = {}
+    ts = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ruling = _seal(chains, "ana", ts, "decision", kind="ruling", owner="ana", paths=["a.py"], words="Keep it.")
+    clean = I.build([("ana/a.jsonl", [json.dumps(ruling, sort_keys=True)])], owner="ana")
+    dirty = I.build([("ana/a.jsonl", [json.dumps(ruling, sort_keys=True)])], owner="ana", problems=["a problem"])
+
+    class Flip(_Stub):
+        ledger = clean
+
+        def snapshot(self):
+            return "same-sha", TEAM, Flip.ledger
+    httpd = _serve(Flip())
+    try:
+        port = httpd.server_address[1]
+        assert json.loads(_req(port, "GET", "/view.json")[1])["problems"] == 0
+        Flip.ledger = dirty
+        assert json.loads(_req(port, "GET", "/view.json")[1])["problems"] == 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

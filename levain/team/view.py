@@ -316,7 +316,9 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             f"{_e(m['canon_status'])}"
             + (f" · <span class=\"warn\">{m['problems']} integrity problem(s): run levain team verify</span>"
                if m["problems"] else "")
-            + "".join(f" · <span class=\"warn\">{_e(w)}</span>" for w in m.get("warnings") or []) + "</p>"
+            + (f" · <span class=\"warn\">{m['warning_count']} warning{'s' if m['warning_count'] != 1 else ''} from "
+               "reading the ledger (see the terminal running the view)</span>" if m.get("warning_count") else "")
+            + "</p>"
             f"<nav class=\"tabs\"><a class=\"tab\" href=\"{_e(cockpit_url)}\">◍ Cockpit</a>"
             "<a class=\"tab active\" href=\"/\">▣ Team view</a></nav>"
             + pathfilter + pathbar
@@ -432,9 +434,10 @@ class _ViewServer(ThreadingHTTPServer):
     model_lock: threading.Lock
     fetch_interval: float       # team.toml's fetch_interval as of the last snapshot; read and set under model_lock
     workers: threading.BoundedSemaphore
-    problems_cache: tuple[tuple, list[str]] | None = None   # ((commit, history boundary), verify.problems); model_lock
+    problems_cache: tuple[tuple, list[str]] | None = None   # (commit, history boundary, team): the history walk
     shallow_path: str | None = None
-    fetch_failure: tuple[float, str] | None = None   # (when, fetch_only's answer) until a later fetch succeeds
+    fetch_failure: tuple[float, str] | None = None   # (when its fetch began, fetch_only's answer) until a later success
+    refusal_cache: tuple[Any, tuple[list[str], bool]] | None = None   # (last_fetch_attempt, _refusal's answer)
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -463,6 +466,9 @@ class _ViewServer(ThreadingHTTPServer):
             self.workers.release()
 
 
+_WARNINGS_LOCK = threading.Lock()   # one per process, as transport.WARNINGS is; taken with a server's model_lock
+
+
 class _Busy(Exception):
     pass
 
@@ -481,6 +487,11 @@ class _ViewHandler(GuardedHandler):
         # through here.
         if not self.server.model_lock.acquire(blocking=False):
             raise _Busy()
+        # transport.WARNINGS is one list per process: what a request appends is taken off it as that request ends, so
+        # two servers in one process take turns, or one would show and drop the other's.
+        if not _WARNINGS_LOCK.acquire(blocking=False):
+            self.server.model_lock.release()
+            raise _Busy()
         mark = len(gl.warnings)
         try:
             fetch = self._fetch(gl, fetch_now)
@@ -491,12 +502,17 @@ class _ViewHandler(GuardedHandler):
                             recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
                             path_filter=path_filter, problems=self._problems(gl, sha, team, ledger))
             m["fetch"] = dict(fetch, **source)
-            # What the transport wanted a person to hear (a team.toml it had to fall back from, say) is shown here
-            # and taken off the process-wide list, which would otherwise grow with every request this server answers.
-            m["warnings"] = list(dict.fromkeys(gl.warnings[mark:]))
+            # What the transport wanted a person to hear (a team.toml it had to fall back from, say) goes to the
+            # terminal, word for word (it can carry local paths or git's text); the page counts it. Either way it is
+            # taken off the process-wide list, which would otherwise grow with every request this server answers.
+            new = list(dict.fromkeys(gl.warnings[mark:]))
+            for w in new:
+                _log(f"ledger warning: {w!r}")
+            m["warning_count"] = len(new)
             return m
         finally:
             del gl.warnings[mark:]
+            _WARNINGS_LOCK.release()
             self.server.model_lock.release()
 
     def _snapshot(self, gl: GitLedger, fetch: dict) -> tuple[str, R.Team, I.Ledger, dict]:
@@ -514,14 +530,27 @@ class _ViewHandler(GuardedHandler):
         return rsha, team, ledger, {"source": "remote", "unpushed": unpushed, "unfetched": unfetched}
 
     def _problems(self, gl: GitLedger, sha: str, team: R.Team, ledger: I.Ledger) -> list[str]:
-        """verify.problems for this ledger commit, kept for the next request on the same commit and the same history:
-        it walks team.toml's history with git, and deepening a shallow clone reveals older history without moving the
-        tip, so the shallow boundary is part of the key. The model lock (held by the caller) makes the cache safe."""
-        key = (sha, _read_or_none(self.server.shallow_path))
-        cached = self.server.problems_cache
-        if cached is None or cached[0] != key:
-            cached = self.server.problems_cache = (key, VF.problems(gl, sha, team, ledger))
-        return cached[1]
+        """verify.problems for this snapshot. The ledger's own problems come with each read (one commit's judgement can
+        change without the commit moving: a repin, this clone's own writes); only the team.toml/PROJECT.md history walk
+        is kept, for the same commit and the same history (deepening a shallow clone reveals older history without
+        moving the tip, so the shallow boundary is part of the key). The model lock (held by the caller) makes the
+        cache safe."""
+        return VF.problems(_HistoryCache(gl, self.server, _read_or_none(self.server.shallow_path)), sha, team, ledger)
+
+    def _refusal(self, gl: GitLedger, st: dict) -> tuple[list[str], bool]:
+        """(why the quarantined remote tip is refused, whether it could not be judged at all). Judging it is a full
+        read, and the quarantine changes only when some process fetches, which records an attempt first: so the
+        answer is kept until the recorded attempt changes. The model lock (held by the caller) makes that safe."""
+        key = st.get("last_fetch_attempt")
+        cached = self.server.refusal_cache
+        if cached is not None and key is not None and cached[0] == key:
+            return cached[1]
+        try:
+            found: tuple[list[str], bool] = (gl.incoming_refusal(), False)
+        except LedgerReadError as exc:
+            found = ([str(exc)], True)
+        self.server.refusal_cache = (key, found)
+        return found
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
         """Fetch the remote's ledger when one is due, through ``fetch_only``: into quarantine, judged, and only an
@@ -538,6 +567,7 @@ class _ViewHandler(GuardedHandler):
                 return out
             out["remote"] = True
             interval = FETCH_FLOOR if now else max(self.server.fetch_interval, FETCH_FLOOR)
+            began = time.time()     # a failure is stamped with when its fetch began, so a success after that wins
             note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)
             out["busy"] = bool(note and note.startswith("busy:"))
             if out["busy"]:
@@ -547,19 +577,17 @@ class _ViewHandler(GuardedHandler):
             # fetch_only reports a failed fetch once, in its answer; the view keeps it until a later fetch succeeds,
             # so the next page (inside the pacing interval, no fetch) still says the remote could not be reached.
             ok_at = _epoch(st.get("last_fetch_ok"))
-            if note:
-                self.server.fetch_failure = (time.time(), note)
+            if note and (ok_at is None or ok_at < began):
+                self.server.fetch_failure = (began, note)
             elif self.server.fetch_failure and ok_at is not None and ok_at >= self.server.fetch_failure[0]:
                 self.server.fetch_failure = None
+            if note and ok_at is not None and ok_at >= began:
+                note = None         # another process fetched successfully while this fetch was failing
             if not note and self.server.fetch_failure:
                 note = self.server.fetch_failure[1]
             # The refusal is read from the quarantine itself, so it shows whichever command fetched the refused tip
             # (this view, a sync, the hook), for as long as that tip is what the remote holds.
-            unjudged = False
-            try:
-                refusal = gl.incoming_refusal()
-            except LedgerReadError as exc:
-                refusal, unjudged = [str(exc)], True
+            refusal, unjudged = self._refusal(gl, st)
             detail = note or st.get("last_fetch_error") or ""
             if refusal:
                 _log(f"the remote's ledger is refused: {'; '.join(refusal)!r}")
@@ -652,6 +680,23 @@ def _interval(team: R.Team) -> float:
     """team.toml's fetch_interval in seconds. team.toml takes any nonnegative integer, and float() of a huge one
     raises; a day is already longer than any useful pace, so the value is capped there."""
     return float(min(int(team.fetch_interval), MAX_FETCH_INTERVAL))
+
+
+class _HistoryCache:
+    """The GitLedger as verify.problems sees it, with ``team_history_problems`` answered from the server's cache."""
+
+    def __init__(self, gl: GitLedger, server: Any, boundary: bytes | None):
+        self._gl, self._server, self._boundary = gl, server, boundary
+
+    def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:
+        key = (rev, self._boundary, R.dump_team(team))
+        cached = self._server.problems_cache
+        if cached is None or cached[0] != key:
+            cached = self._server.problems_cache = (key, self._gl.team_history_problems(team, rev))
+        return list(cached[1])
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._gl, name)
 
 
 def _read_or_none(path: str | None) -> bytes | None:

@@ -241,8 +241,10 @@ def test_prune_sweeps_an_old_temp_nobody_holds_and_keeps_one_still_locked(pub):
     import fcntl
     d = R.registry_dir()
     d.mkdir(parents=True)
-    dead = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
-    held = f".lock1-{'c' * 32}.tmp"
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    dead = [f".lock1-p{gone.pid}-{'a' * 32}.tmp", f".selftest-p{gone.pid}-{'b' * 16}.tmp"]
+    held = f".lock1-p{gone.pid}-{'c' * 32}.tmp"
     old = time.time() - 3600                    # an hour: past any floor
     for n in dead + [held]:
         (d / n).write_text("{half")
@@ -1113,10 +1115,9 @@ def test_an_old_unlocked_temp_of_a_live_publisher_is_never_swept(pub):
     dead.wait()
     live = f".lock1-p{os.getpid()}-{'a' * 32}.tmp"
     gone = f".lock1-p{dead.pid}-{'b' * 32}.tmp"
-    legacy = f".lock1-{'c' * 32}.tmp"
     self_live = f".selftest-p{os.getpid()}-{'d' * 16}.tmp"
     old = time.time() - 3600
-    for n in (live, gone, legacy, self_live):
+    for n in (live, gone, self_live):
         (d / n).write_text("{half")
         os.utime(d / n, (old, old))
     R.prune_dead()
@@ -1137,3 +1138,74 @@ def test_a_publisher_names_its_temp_with_its_pid(monkeypatch):
     finally:
         r.unpublish()
         r.close()
+
+
+def test_no_fd_register_opens_is_left_in_a_fork_child(monkeypatch):
+    # glm + codex + gemini, L3 10-07 round 2: the directory fd and the self-test's fds were opened outside the fork
+    # lock, so a fork in that window left the child holding them. Every fd register() opens is now either opened
+    # under the fork lock and tracked, or never visible to a fork.
+    import os as real_os
+    paused, go = threading.Event(), threading.Event()
+    opened: list[int] = []
+
+    class OsShim:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def open(path, flags, *a, **k):
+            fd = real_os.open(path, flags, *a, **k)
+            opened.append(fd)
+            if len(opened) == 1:                    # the directory fd, the first thing register() opens
+                paused.set()
+                go.wait(1.0)
+            return fd
+    monkeypatch.setattr(R, "os", OsShim())
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("reg", R.register("/w", "http://127.0.0.1:43994/", "d")))
+    t.start()
+    assert paused.wait(5)
+    r_end, w_end = real_os.pipe()
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = real_os.fork()
+    if pid == 0:
+        try:
+            alive = []
+            for fd in list(opened):
+                try:
+                    real_os.fstat(fd)
+                    alive.append(fd)
+                except OSError:
+                    pass
+            real_os.write(w_end, json.dumps(alive).encode())
+        finally:
+            real_os._exit(0)
+    real_os.close(w_end)
+    leaked = json.loads(real_os.read(r_end, 4096) or b"[]")
+    real_os.close(r_end)
+    real_os.waitpid(pid, 0)
+    go.set()
+    t.join(5)
+    monkeypatch.setattr(R, "os", real_os)
+    out["reg"].unpublish()
+    out["reg"].close()
+    assert leaked == []
+
+
+def test_a_legacy_temp_that_names_no_publisher_is_never_swept(pub):
+    # codex, L3 10-07 round 2: a temp from an older levain names no pid, so nothing proves its publisher has exited
+    # (one suspended past the floor between creating and locking it would lose its registration); such temps are
+    # left alone, and an older version makes no new ones, so they are a fixed set.
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    legacy = [f".lock1-{'c' * 32}.tmp", f".selftest-{'d' * 16}.tmp"]
+    old = time.time() - 3600
+    for n in legacy:
+        (d / n).write_text("{half")
+        os.utime(d / n, (old, old))
+    R.prune_dead()
+    assert sorted(_names()) == sorted(legacy)
+    # complement: "p0" is no pid (os.kill(0, 0) would ask about the process group); such a name is not a temp of ours
+    assert R._TEMP_RE.fullmatch(f".lock1-p0-{'e' * 32}.tmp") is None

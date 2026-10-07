@@ -19,13 +19,15 @@ The protocol, in one place:
   It also sweeps hidden temp files a killed view left behind: only one older than TEMP_FLOOR, that nobody holds,
   and whose publisher (its pid is in the name) is no longer running. A publisher creates its temp a moment before it
   locks it; the age floor keeps a sweep out of that moment, and the pid keeps it away from a publisher that is still
-  alive however long it was suspended. A temp from an older levain names no pid and is judged by age and lock.
+  alive however long it was suspended. A temp from an older levain names no pid, so nothing proves its publisher
+  gone: it is left alone (an older version makes no new ones, so those are a fixed set).
 * A listing judges entries in sorted name order until MAX_VIEWS live ones are found, the names run out, or
   LIST_BUDGET is spent; whenever names were left unjudged, or the directory could not be read in full, it reports
   ``truncated`` so the cockpit can say the list may be incomplete.
-* A forked child (no exec) closes its copy of every lock fd at once, so it cannot keep a dead view listed. A lock fd
-  is opened and recorded, and later forgotten and closed, under the same lock the fork handlers take, so no fork
-  can copy one this module is not tracking.
+* A forked child (no exec) closes its copy of every fd a publisher holds at once, so it cannot keep a dead view
+  listed. Each such fd (the directory, the lock file, the flock self-test's) is opened and recorded, and later
+  forgotten and closed, under the same lock the fork handlers take, so no fork copies one this module is not
+  tracking.
 * Before publishing, a view checks that ``flock`` really conflicts on this filesystem. On a filesystem that emulates
   it (NFS, some FUSE mounts) the view says why it is not registered and keeps serving.
 
@@ -73,9 +75,9 @@ MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
 # The temps register() and the self-test make: ``.lock1-p<pid>-<32 hex>.tmp`` and ``.selftest-p<pid>-<16 hex>.tmp``.
-# Without the ``p<pid>-`` part: a temp from an older levain, which named no publisher.
-_TEMP_RE = re.compile(r"\.(?:lock1-(?:p(?P<pid>[0-9]{1,10})-)?[0-9a-f]{32}"
-                      r"|selftest-(?:p(?P<spid>[0-9]{1,10})-)?[0-9a-f]{16})\.tmp")
+# Without the ``p<pid>-`` part: a temp from an older levain, which named no publisher (never swept, see prune_dead).
+_TEMP_RE = re.compile(r"\.(?:lock1-(?:p(?P<pid>[1-9][0-9]{0,9})-)?[0-9a-f]{32}"
+                      r"|selftest-(?:p(?P<spid>[1-9][0-9]{0,9})-)?[0-9a-f]{16})\.tmp")
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -165,7 +167,7 @@ def _flock_is_real(dir_fd: int) -> bool:
 # ---- the publisher ------------------------------------------------------------------------------------------------
 
 _LIVE: "set[Registration]" = set()      # strong: a dropped, unclosed Registration still has its fds closed at fork
-_PENDING: set[int] = set()              # lock fds register() has opened that no Registration owns yet
+_PENDING: set[int] = set()              # fds register() has opened that no Registration owns yet
 # Held by a fork, and by every change to which lock fds exist and are tracked. Deliberately NOT reentrant: with an
 # RLock, a fork from a signal handler that interrupted a holder would proceed and copy half-updated fd sets. As it is,
 # such a fork deadlocks instead, so a process that registers a view must not fork from a signal handler (levain's own
@@ -253,12 +255,16 @@ def register(repo: str, url: str, project: str) -> Registration:
         raise ValueError(f"not a loopback http URL: {url!r}")
     if fcntl is None:
         raise RegistryUnavailable("this platform has no flock; the registry is POSIX only")
-    dir_fd = _open_dir(create=True)
+    with _FORK_LOCK:         # open and record as one step, so no fork can copy the fd untracked
+        dir_fd = _open_dir(create=True)
+        _PENDING.add(dir_fd)
     lock_fd = None
     published = None
     tmp = f".{PREFIX}p{os.getpid()}-{secrets.token_hex(16)}.tmp"
     try:
-        if not _flock_is_real(dir_fd):
+        with _FORK_LOCK:     # the self-test opens, locks and closes its own fds: no fork sees them
+            real = _flock_is_real(dir_fd)
+        if not real:
             raise RegistryUnavailable("this filesystem does not support the registry's locks")
         name = f"{PREFIX}{secrets.token_hex(16)}.json"
         entry = {"v": VERSION, "repo": str(repo)[:500], "url": norm, "project": str(project)[:120],
@@ -279,6 +285,7 @@ def register(repo: str, url: str, project: str) -> Registration:
         with _FORK_LOCK:
             reg = Registration(name, dir_fd, lock_fd)
             _PENDING.discard(lock_fd)
+            _PENDING.discard(dir_fd)
         return reg
     except BaseException:
         if published is not None:   # interrupted after the rename: withdraw the entry while still holding its lock
@@ -297,7 +304,9 @@ def register(repo: str, url: str, project: str) -> Registration:
             os.unlink(tmp, dir_fd=dir_fd)
         except OSError:
             pass
-        os.close(dir_fd)
+        with _FORK_LOCK:
+            _PENDING.discard(dir_fd)
+            os.close(dir_fd)
         raise
 
 
@@ -328,9 +337,9 @@ def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, o
     return fd, st
 
 
-def _publisher_alive(temp_name: str) -> bool:
-    """Is the process a temp names still running? False for a temp that names none (an older levain). Signal 0 only
-    asks; EPERM means a process of another user holds that pid, so it is alive (and the registry is one user's)."""
+def _publisher_gone(temp_name: str) -> bool:
+    """Has the process a temp names exited? False for a temp that names none (an older levain): nothing proves that
+    one gone. Signal 0 only asks; EPERM means a process of another user holds that pid, so it is not gone."""
     m = _TEMP_RE.fullmatch(temp_name)
     pid = m and (m.group("pid") or m.group("spid"))
     if not pid:
@@ -338,10 +347,10 @@ def _publisher_alive(temp_name: str) -> bool:
     try:
         os.kill(int(pid), 0)
     except (ProcessLookupError, OverflowError, ValueError):   # gone, or a number no process can have
-        return False
-    except PermissionError:
         return True
-    return True
+    except PermissionError:
+        return False
+    return False
 
 
 def prune_dead(temp_floor: float = TEMP_FLOOR) -> None:
@@ -363,7 +372,7 @@ def prune_dead(temp_floor: float = TEMP_FLOOR) -> None:
         cand = [(n, False) for n in names if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
         cand += [(n, True) for n in names if _TEMP_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
         for name, temp in cand:
-            if temp and _publisher_alive(name):
+            if temp and not _publisher_gone(name):
                 continue
             opened = _open_entry(dir_fd, name)
             if opened is None:

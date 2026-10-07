@@ -13,13 +13,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - With a remote, the panes now come from the remote's ledger as this clone last accepted it: what the team has pushed, as of the last fetch, judged without pinning anything. A remote tip refused as tampered is said so on the page, whichever command fetched it, and the panes keep the last accepted copy. A fetch that collides with another sync says so. A page load fetches when team.toml's `fetch_interval` says one is due. A fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch.
   - The page shows when the remote was fetched and how many of this clone's commits are not pushed, or not yet merged in (`levain team sync` reconciles them).
   - The button is now "⟳ fetch now". No request fetches more often than once every 10 seconds.
-  - A failed fetch shows a fixed message. git's own words, which can carry a remote URL or local paths, go to the terminal running the view.
+  - A failed fetch shows a fixed message, and so does a warning from reading the ledger (the page counts them). git's own words, which can carry a remote URL or local paths, go to the terminal running the view.
   - The integrity warning counts what `levain team verify` counts, through one shared check, `levain.team.verify.problems`. It used to miss a team.toml or PROJECT.md change made by someone other than the owner.
   - A request that arrives while the ledger is being read gets a 503 at once, with `Retry-After`. It used to wait up to 10 seconds, holding a server thread per request; a browser on the page now asks again by itself.
   - The server serves at most 32 connections at once.
   - Under a path filter, pane 2 no longer shows a project-wide ruling's acknowledgements. A filter such as `project` matched the "(project-wide)" label.
   - In the view registry, a fork at the moment a view opened or closed its lock file could leave the child holding the lock. A dead view then stayed listed in the cockpit for as long as the child lived. Opening, closing and forking are now serialised.
-  - Temp files left by a view killed mid-start are swept once they are a minute old, nobody holds them and the process that made them has exited.
+  - Temp files left by a view killed mid-start are swept once they are a minute old, nobody holds them and the process that made them has exited (a temp from an older levain, which names no process, is left alone).
 
 - **An acknowledgement no longer waits for the next ledger write to leave the clone.** Acks are committed without a push; a session start now sends unpushed ledger commits within a bound, and when it cannot, the session context and `levain team status` say how many are not pushed yet. The team view's "no agent has acknowledged a ruling" was wrong whenever an ack was the clone's last write.
 - `levain team` hooks print each read warning once (a `team.toml` fallback was repeated per read).
