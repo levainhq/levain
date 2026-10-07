@@ -315,8 +315,7 @@ class GuardedHandler(BaseHTTPRequestHandler):
     # DENY BY DEFAULT. The guards run HERE, before a server's own routing is reached: the Host allowlist, the
     # cross-site refusal and the launch token for a read; the Host allowlist, the write-origin check and the launch
     # token for a POST. A server defines ``_route`` and ``_post``, not the ``do_*`` methods, so a route it adds later
-    # is behind every guard without writing one. tests/test_http_guards.py walks every subclass and fails on one
-    # that defines its own ``do_*``.
+    # is behind every guard without writing one.
 
     def _route(self, *, head: bool) -> None:  # pragma: no cover — every server defines its own
         raise NotImplementedError
