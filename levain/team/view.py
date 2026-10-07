@@ -11,9 +11,9 @@ acknowledgements, which are. The page is rendered on the server from one ledger 
 the stylesheet is a second GET route because the shared CSP forbids inline styles. When the clone has a remote,
 that snapshot is the remote's ledger tip as this clone last accepted it (what the team has pushed), refreshed by a
 fetch when one is due. A fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch,
-and it shows how far that branch differs from the remote instead of reconciling them. The only things a GET may
-write are the fetched refs (the quarantine, and levain's accepted ref when a tip is accepted) and the clone's record
-of when it last fetched.
+and it shows how far that branch differs from the remote instead of reconciling them. A GET writes only what a
+fetch writes (the quarantine ref, the accepted tip in the trusted record, the record of the last fetch) and, while
+no remote tip has been accepted, what any read of this clone's own ledger writes (its pins).
 
 Stdlib only; the guards are the same ``levain.http_guards`` the cockpit and the docs server ride.
 """
