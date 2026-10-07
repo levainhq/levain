@@ -38,7 +38,7 @@ def _entity(tmp_path: Path, name: str = "coyote") -> Path:
 
 def _setup(tmp_path: Path, host: str = "darwin", **kw):
     kw.setdefault("hands_id", 499 if host == "darwin" else 999)
-    return plan_setup(_entity(tmp_path), operator="alice", host=host, operator_gid=20, **kw)
+    return plan_setup(_entity(tmp_path), operator="alice", host=host, **kw)
 
 
 def _undo(tmp_path: Path, host: str = "darwin", **kw):
@@ -178,7 +178,7 @@ def test_the_sudoers_text_parses(tmp_path: Path) -> None:
 @pytest.mark.parametrize("bad", ["a,b", "a b", "a:b", "a\\b", "-x", "1abc", "x" * 40])
 def test_setup_refuses_an_operator_name_that_could_change_a_sudoers_rule(tmp_path: Path, bad) -> None:
     with pytest.raises(HandsSetupError, match="refusing the account name"):
-        plan_setup(_entity(tmp_path), operator=bad, host="linux", hands_id=999, operator_gid=1)
+        plan_setup(_entity(tmp_path), operator=bad, host="linux", hands_id=999)
 
 
 def test_remote_login_is_refused_only_through_a_checked_sshd_drop_in(tmp_path: Path) -> None:

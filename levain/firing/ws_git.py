@@ -8,7 +8,10 @@ even parse a Git config of a repository owned by someone else, let alone run its
 git-config(1), safe.directory), so the operator's own git refuses every repository there. And
 because the operator owns no directory there, the entity has nowhere to build a repository the
 operator's git WOULD trust: git checks a bare repository's ownership on that directory alone, so an
-operator-owned folder the entity could write was enough for one.
+operator-owned folder the entity could write was enough for one. That holds while nothing in the
+workspace lets the operator write: the hands user owns every directory and could open one up, and
+then the operator's own tools would create folders there. ``levain doctor`` fails on any entry the
+operator can write, as well as on any the hands user does not own.
 
 The operator changes the workspace through the entity, or through four doors, none of which runs
 anything the entity wrote as the operator:
@@ -47,7 +50,7 @@ _URL_OK = re.compile(r"^(https://|ssh://|git@[A-Za-z0-9.-]+:)")
 #: for the program-naming keys git also reads from places the allowlist does not see.
 _NEUTRALISE = (
     "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "core.pager=cat",
-    "-c", "core.editor=false", "-c", "core.sshCommand=false", "-c", "credential.helper=",
+    "-c", "core.editor=false", "-c", "core.sshCommand=/usr/bin/ssh", "-c", "credential.helper=",
     "-c", "core.askPass=", "-c", "core.gitProxy=", "-c", "gpg.program=false",
     "-c", "gpg.ssh.program=false", "-c", "gpg.x509.program=false", "-c", "safe.bareRepository=explicit",
     "-c", "protocol.ext.allow=never",
@@ -186,6 +189,13 @@ def _run_relayed(argv: list[str]) -> int:
     return proc.wait()
 
 
+#: macOS per-user agents launchd starts for a uid on its own (parent pid 1). Exact paths only.
+_DARWIN_USER_AGENTS = frozenset({
+    "/usr/sbin/cfprefsd", "/usr/sbin/distnoted", "/usr/libexec/trustd", "/usr/libexec/secinitd",
+    "/usr/libexec/lsd", "/usr/libexec/containermanagerd", "/usr/libexec/UserEventAgent",
+})
+
+
 def proc_hides_processes(mountinfo: str) -> bool:
     """Whether ``/proc`` is mounted with ``hidepid`` (other users' processes invisible), from
     ``/proc/self/mountinfo`` text."""
@@ -201,7 +211,8 @@ def entity_session_live(hands_uid: int) -> bool:
     operator can only read it, so whatever can change it while ws-git works (an entity session's
     bash, anything it left running) runs as that user: this is the session's liveness measured where
     it cannot be missed, an orphaned background job included. Raises when it cannot tell (a process
-    table the operator cannot see all of), so callers fail closed."""
+    table the operator cannot see all of), so callers fail closed. It is checked once, when a command
+    starts; a session started while the command runs is not seen."""
     if platform.system() == "Linux":
         try:
             mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
@@ -211,11 +222,22 @@ def entity_session_live(hands_uid: int) -> bool:
             raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
                              "processes); refusing")
     r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/")
-    if r.returncode == 0:
-        return True
     if r.returncode == 1:
         return False
-    raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); refusing")
+    if r.returncode != 0:
+        raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
+                         "refusing")
+    if platform.system() != "Darwin":
+        return True
+    # macOS starts per-user system agents for any uid that has run Apple code (git and python3 in
+    # /usr/bin are xcrun shims): launchd's children, from the sealed system volume, which the entity
+    # does not drive. Anything else, an orphan of the entity's included, is a live session.
+    pids = r.stdout.split()
+    ps = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", ",".join(pids)], capture_output=True, text=True, cwd="/")
+    rows = [ln.split(None, 1) for ln in ps.stdout.splitlines() if ln.strip()]
+    if ps.returncode not in (0, 1) or not rows:
+        raise WsGitError("cannot tell whether the entity is running (ps failed); refusing")
+    return any(len(row) != 2 or row[0] != "1" or row[1].strip() not in _DARWIN_USER_AGENTS for row in rows)
 
 
 def _refuse_while_live(hands: Hands, what: str) -> None:
@@ -290,6 +312,24 @@ except BaseException:
 """
 
 
+def _check_operator_source(src: Path, hands: Hands) -> None:
+    """A file or repository the operator hands in must be reached only through the operator's own
+    folders: the entity can leave a link (or, on macOS, a hard link) in /tmp or /Users/Shared that
+    points at a secret of the operator's, and ask for it to be copied in. So nothing on the path may
+    belong to the hands user, no part of it may be a link anyone but the operator or root made, and
+    it may not lie in any entity's workspace."""
+    if _under_a_workspace_root(src):
+        raise WsGitError(f"{src} is in an entity's workspace; this copies something of yours into it")
+    path = Path(os.path.abspath(src))
+    me = os.getuid()
+    for p in (*reversed(path.parents), path):
+        st = p.lstat()
+        if st.st_uid == hands.uid:
+            raise WsGitError(f"{p} belongs to the entity's user; refusing a source it could have chosen for you")
+        if stat.S_ISLNK(st.st_mode) and st.st_uid not in (me, 0):
+            raise WsGitError(f"{p} is a link another user made; give the real path")
+
+
 def put_parts(workspace: Path, dest: Path | str) -> list[str]:
     """The destination's components below the workspace: ``dest`` is relative to it, or an absolute
     path inside it. Checked by name only (the hands user's write checks every component on disk)."""
@@ -326,16 +366,16 @@ def cmd_ws_put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int
         hands = load_hands(entity_dir)
         parts = put_parts(hands.workspace, dest)
         src = Path(src).expanduser()
-        if _under_a_workspace_root(src):
-            # The entity could have left a link there to a file of yours.
-            raise WsGitError(f"{src} is in an entity's workspace; ws-put copies files of yours into it")
-        fd = os.open(src, os.O_RDONLY)
+        _check_operator_source(src, hands)
+        # O_NONBLOCK: a FIFO is refused below instead of blocking the open; a regular file ignores it.
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except (WsGitError, OSError) as exc:
         print(f"ws-put: {exc}")
         return 1
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            print(f"ws-put: {src} is not a regular file")
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1:
+            print(f"ws-put: {src} must be a regular file of yours with no other names (no hard link)")
             return 1
         try:
             py = _hands_python(hands)
@@ -394,6 +434,7 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         if _under_a_workspace_root(src):
             raise WsGitError(f"{src} is inside an entity's workspace; ws-adopt imports a repository of yours "
                              "from outside it")
+        _check_operator_source(src, hands)
         top = _operator_git(src, "rev-parse", "--show-toplevel")
         if top.returncode != 0 or Path(top.stdout.strip()).resolve() != src.resolve():
             raise WsGitError(f"{src} is not the top of a repository")
@@ -410,11 +451,15 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         want = _heads(_operator_git(src, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads").stdout)
         if not want:
             raise WsGitError(f"{src} has no branches to import")
-        remotes = {}
+        remotes, dropped = {}, []
         for line in _operator_git(src, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
             key, _, url = line.partition(" ")
-            if _URL_OK.match(url):
-                remotes[key.split(".", 1)[1].rsplit(".", 1)[0]] = url
+            rname = key.split(".", 1)[1].rsplit(".", 1)[0]
+            # https://user:token@host would hand your token to the entity
+            if _URL_OK.match(url) and not (url.startswith("https://") and "@" in url[8:].split("/", 1)[0]):
+                remotes[rname] = url
+            else:
+                dropped.append(rname)
     except (WsGitError, OSError) as exc:
         print(f"ws-adopt: {exc}")
         return 1
@@ -434,10 +479,10 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         bundle_err.seek(0)
         bundle_msg = bundle_err.read().decode("utf-8", "replace").strip()
     problem = None
-    if bundle_rc != 0:
-        problem = f"git bundle failed: {bundle_msg}"
-    elif imp.returncode != 0:
+    if imp.returncode != 0:      # first: a failed import also makes the bundle fail, on a closed pipe
         problem = "the import failed: " + _sanitise(imp.stderr).decode("utf-8", "replace").strip()
+    elif bundle_rc != 0:
+        problem = f"git bundle failed: {bundle_msg}"
     else:
         try:
             check_repo(dest / ".git", hands.uid)
@@ -455,36 +500,44 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         print(f"ws-adopt: {problem}. Nothing was kept in the workspace; your repository is unchanged.")
         return 1
     for rname, url in remotes.items():
-        subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
-                       stdin=subprocess.DEVNULL, cwd="/")
+        if subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
+                          stdin=subprocess.DEVNULL, cwd="/").returncode != 0:
+            dropped.append(rname)
     print(f"Imported {src} as {dest} ({len(want)} branch(es)), owned by the entity's user. Your repository is "
           "unchanged where it is; uncommitted changes and stashes were not copied.")
+    if dropped:
+        print(f"Remotes not copied (not an https or ssh URL, or one carrying a login): {', '.join(sorted(dropped))}.")
     return 0
 
 
 def foreign_entries(workspace: Path, hands_uid: int) -> list[Path]:
     """Everything in the workspace (the workspace itself included, any type, no depth limit) that the
-    hands user does not own. Under ruling A there should be none: an operator-owned directory the
-    hands user can write is one the entity could fill with a repository the operator's git trusts.
-    An entry that cannot be read or stat'ed is reported too, never assumed clean."""
+    hands user does not own, or that the operator running this can write. Under ruling A there should
+    be none: an operator-owned directory the hands user can write is one the entity could fill with a
+    repository the operator's git trusts, and an entry the operator can write (the hands user, as
+    owner, can open one up) is where the operator's own tools would create one. ``access(W_OK)``
+    answers for the mode bits and any ACL alike. An entry that cannot be read or stat'ed is reported
+    too, never assumed clean."""
     found: list[Path] = []
 
     def unreadable(err: OSError) -> None:
         found.append(Path(err.filename or workspace))
 
-    try:
-        if workspace.lstat().st_uid != hands_uid:
-            found.append(workspace)
-    except OSError:
-        return [workspace]
+    def judge(p: Path) -> None:
+        try:
+            st = p.lstat()
+        except OSError:
+            found.append(p)
+            return
+        if st.st_uid != hands_uid or (not stat.S_ISLNK(st.st_mode) and os.access(p, os.W_OK)):
+            found.append(p)
+
+    judge(workspace)
+    if found:
+        return found
     for root, dirs, files in os.walk(workspace, onerror=unreadable):
         for name in (*dirs, *files):
-            p = Path(root) / name
-            try:
-                if p.lstat().st_uid != hands_uid:
-                    found.append(p)
-            except OSError:
-                found.append(p)
+            judge(Path(root) / name)
     return sorted(set(found))
 
 
@@ -521,7 +574,8 @@ def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
 def mask_repair_argv(hands: Hands) -> list[str]:
     """Linux: restore the ACL mask on files the hands user owns in its workspace. A file created with
     mode 0600 (an atomic write) gets a mask of ---, which cancels the operator's named read entry
-    (measured in CI). Run as the hands user, the owner, at the end of each turn."""
+    (measured in CI). Run as the hands user, the owner; it belongs at the end of each turn once bash
+    runs as the hands user (S2), and until then the e2e is its only caller."""
     return [
         "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}",
         _abs("find"), str(hands.workspace), "-user", hands.user, "-exec", _abs("setfacl"), "-m", "m::rX", "{}", "+",

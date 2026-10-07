@@ -134,6 +134,26 @@ def test_the_neutralised_settings_really_switch_hooks_off(tmp_path: Path) -> Non
     assert canary.exists()  # control: without the settings the hook fires
 
 
+def _read_only(tree: Path) -> None:
+    for root, dirs, files in os.walk(tree, topdown=False):
+        for f in files:
+            if not (Path(root) / f).is_symlink():
+                (Path(root) / f).chmod(0o444)
+        for d in dirs:
+            if not (Path(root) / d).is_symlink():
+                (Path(root) / d).chmod(0o555)
+    tree.chmod(0o555)
+
+
+def _writable(tree: Path) -> None:
+    tree.chmod(0o755)
+    for root, dirs, _files in os.walk(tree):
+        for d in dirs:
+            if not (Path(root) / d).is_symlink():
+                (Path(root) / d).chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anything")
 def test_the_scan_reports_every_entry_the_hands_user_does_not_own_at_any_depth(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
     deep = ws / "d1" / "d2" / "d3" / "d4" / "d5" / "d6"
@@ -143,8 +163,31 @@ def test_the_scan_reports_every_entry_the_hands_user_does_not_own_at_any_depth(t
     (ws / "link").symlink_to("/etc")                           # a link: judged by its own owner, never followed
     all_entries = {ws, deep / "f", ws / "bare", ws / "link", *[ws.joinpath(*["d1", "d2", "d3", "d4", "d5", "d6"][:i])
                                                                for i in range(1, 7)]}
-    assert set(foreign_entries(ws, ME + 1)) == all_entries
-    assert foreign_entries(ws, ME) == []
+    _read_only(ws)
+    try:
+        assert foreign_entries(ws, ME) == []
+        found = set(foreign_entries(ws, ME + 1))
+        assert found == {ws}                                   # the workspace itself not the entity's: stop there
+        ws.chmod(0o555)
+    finally:
+        _writable(ws)
+    _read_only(ws)
+    try:
+        # everything owned by the right user, but a folder deep down was opened up to the operator
+        deep.chmod(0o755)
+        assert foreign_entries(ws, ME) == [deep]
+        deep.chmod(0o555)
+        (ws / "bare").chmod(0o777)
+        assert foreign_entries(ws, ME) == [ws / "bare"]
+    finally:
+        _writable(ws)
+    assert foreign_entries(ws, ME) == [ws]                     # the workspace itself opened up: that is the finding
+    ws.chmod(0o555)
+    try:
+        found = set(foreign_entries(ws, ME))                   # everything below it writable
+    finally:
+        ws.chmod(0o755)
+    assert found == all_entries - {ws, ws / "link", deep / "f"}  # f stayed 0444; a link is judged by owner only
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
@@ -152,9 +195,11 @@ def test_the_scan_reports_a_folder_it_cannot_read_as_a_finding(tmp_path: Path) -
     ws = tmp_path / "ws"
     (ws / "locked" / "inner").mkdir(parents=True)
     (ws / "locked").chmod(0)
+    ws.chmod(0o555)
     try:
         assert foreign_entries(ws, ME) == [ws / "locked"]
     finally:
+        ws.chmod(0o755)
         (ws / "locked").chmod(0o755)
 
 
@@ -181,6 +226,29 @@ def test_liveness_fails_closed_when_the_process_table_cannot_be_read(monkeypatch
                         lambda *a, **k: subprocess.CompletedProcess(a, 3, "", "pgrep: cannot read"))
     with pytest.raises(WsGitError, match="cannot tell"):
         ws_git.entity_session_live(4_000_017)
+
+
+def test_on_macos_only_launchds_own_per_user_agents_do_not_count_as_live(monkeypatch) -> None:
+    monkeypatch.setattr(ws_git.platform, "system", lambda: "Darwin")
+    ps_out = {"value": ""}
+
+    def fake_run(argv, **kw):
+        if argv[0].endswith("pgrep"):
+            return subprocess.CompletedProcess(argv, 0, "101\n102\n", "")
+        return subprocess.CompletedProcess(argv, 0, ps_out["value"], "")
+
+    monkeypatch.setattr(ws_git.subprocess, "run", fake_run)
+    ps_out["value"] = "    1 /usr/sbin/cfprefsd\n    1 /usr/sbin/distnoted\n"
+    assert ws_git.entity_session_live(4_000_017) is False
+    for rows in ("    1 /usr/sbin/cfprefsd\n    1 /bin/sh\n",           # an orphan of the entity's
+                 "  555 /usr/sbin/cfprefsd\n",                          # not launchd's child
+                 "    1 /tmp/usr/sbin/cfprefsd\n",                      # not the system's binary
+                 ""):                                                    # cannot tell
+        ps_out["value"] = rows
+        try:
+            assert ws_git.entity_session_live(4_000_017) is True, rows
+        except WsGitError:
+            assert rows == ""
 
 
 def test_a_proc_mounted_hidepid_means_liveness_cannot_be_told() -> None:
@@ -238,7 +306,7 @@ def _put(h: ws_git.Hands, src: Path, dest: str) -> int:
 
 @pytest.fixture
 def put_env(tmp_path: Path, monkeypatch):
-    h = _hands(tmp_path)
+    h = _hands(tmp_path, uid=4_000_017)        # the source checks look for the hands user's folders
     _no_sudo(monkeypatch)
     monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
     src = tmp_path / "src.sh"
@@ -280,9 +348,38 @@ def test_ws_put_replaces_a_symlink_at_the_destination_instead_of_writing_through
 def test_ws_put_refuses_a_source_inside_a_workspace_and_a_non_file(put_env, tmp_path: Path, monkeypatch) -> None:
     h, src = put_env
     monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", h.workspace)
-    (h.workspace / "planted").symlink_to(src)       # the entity's link to a file of yours
+    (h.workspace / "planted").write_text("x")       # a file in the workspace, not yours to hand in
     assert _put(h, h.workspace / "planted", "copy") == 1 and not (h.workspace / "copy").exists()
     assert _put(h, tmp_path, "dir-copy") == 1 and not (h.workspace / "dir-copy").exists()
+
+
+def test_ws_put_refuses_a_source_reached_through_a_link_or_a_second_name(put_env, tmp_path: Path, capsys) -> None:
+    h, src = put_env
+    (tmp_path / "via-link").symlink_to(src)          # e.g. one the entity left in /tmp
+    assert _put(h, tmp_path / "via-link", "a") == 1
+    os.link(src, tmp_path / "hard")                  # a hard link: the same file under a second name
+    assert _put(h, tmp_path / "hard", "b") == 1 and "no hard link" in capsys.readouterr().out
+    os.unlink(tmp_path / "hard")
+    assert _put(h, src, "c") == 0                    # control: one name again, accepted
+    assert not (h.workspace / "a").exists() and not (h.workspace / "b").exists()
+
+
+def test_ws_put_refuses_a_fifo_without_waiting_on_it(put_env, tmp_path: Path) -> None:
+    h, _src = put_env
+    os.mkfifo(tmp_path / "fifo")
+    assert _put(h, tmp_path / "fifo", "f") == 1
+
+
+def test_a_source_under_a_folder_of_the_entitys_or_a_link_someone_else_made_is_refused(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "f").write_text("x")
+    (tmp_path / "l").symlink_to(tmp_path / "d")
+    ws_git._check_operator_source(tmp_path / "d" / "f", _hands(tmp_path, uid=4_000_017))   # control
+    with pytest.raises(WsGitError, match="belongs to the entity"):
+        ws_git._check_operator_source(tmp_path / "d" / "f", _hands(tmp_path, uid=ME))
+    monkeypatch.setattr(ws_git.os, "getuid", lambda: 4_000_018)  # the link is now someone else's
+    with pytest.raises(WsGitError, match="link another user made"):
+        ws_git._check_operator_source(tmp_path / "l" / "f", _hands(tmp_path, uid=4_000_017))
 
 
 # --- ws-adopt: an import ------------------------------------------------------------------------
@@ -299,6 +396,9 @@ def adopt_env(tmp_path: Path, monkeypatch):
     _no_sudo(monkeypatch)
     monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    # here "the hands user" is this test's own uid, which owns the source too; the source check has
+    # its own test above
+    monkeypatch.setattr(ws_git, "_check_operator_source", lambda src, hands: None)
     src = tmp_path / "mine"
     _repo(src)
     _git(src, "checkout", "-q", "-b", "main")
@@ -314,6 +414,7 @@ def adopt_env(tmp_path: Path, monkeypatch):
     _git(src, "tag", "v1")
     _git(src, "remote", "add", "origin", "git@github.com:o/r.git")
     _git(src, "remote", "add", "local", "/some/path")
+    _git(src, "remote", "add", "tok", "https://me:ghp_secret@github.com/o/r.git")
     (src / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\ntouch /tmp/never\n")
     return h, src
 
@@ -326,7 +427,7 @@ def test_ws_adopt_imports_every_branch_and_tag_and_leaves_the_original_alone(ado
     assert _git(dest, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags") == \
         _git(src, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
     assert _git(dest, "symbolic-ref", "HEAD") == "refs/heads/main" and (dest / "a").read_text() == "a"
-    assert _git(dest, "remote") == "origin"                                   # a local-path remote is dropped
+    assert _git(dest, "remote") == "origin"              # a local-path remote and one with a token are dropped
     assert not (dest / ".git" / "hooks").exists()                             # no hooks, not even samples
     assert _git(src, "for-each-ref") == before and (src / ".git").is_dir()    # the original is untouched
 
@@ -337,6 +438,12 @@ def test_ws_adopt_refuses_when_a_branch_did_not_come_across_and_keeps_nothing(ad
                                                                               "'+refs/heads/main:refs/heads/main'"))
     assert ws_git.cmd_ws_adopt(h.home, src) == 1
     assert "did not all come across" in capsys.readouterr().out and not (h.workspace / "mine").exists()
+
+
+def test_ws_adopt_checks_its_source_like_ws_put(adopt_env, monkeypatch, capsys) -> None:
+    h, src = adopt_env
+    monkeypatch.setattr(ws_git, "_check_operator_source", lambda s, hh: (_ for _ in ()).throw(WsGitError("chosen")))
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "chosen" in capsys.readouterr().out
 
 
 def test_ws_adopt_refuses_a_repository_inside_a_workspace_and_while_live(adopt_env, monkeypatch, capsys) -> None:

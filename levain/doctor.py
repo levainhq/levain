@@ -958,11 +958,12 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     if foreign:
         return [CheckResult(
             name, False,
-            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, or could not be "
-            "read: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must be the entity's: a "
-            "folder of yours that the entity can write is one it can turn into a repository your git trusts "
-            "and runs code from, as you.",
-            hint="move it out of the workspace (`sudo mv`), or import a repository with `levain ws-adopt`",
+            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, are writable by "
+            "you, or could not be read: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must "
+            "be the entity's and read-only to you: a folder of yours that the entity can write is one it can "
+            "turn into a repository your git trusts and runs code from, as you.",
+            hint="remove what is yours with `sudo rm -r`, take write away from you (`sudo chmod o-w`, or the "
+                 "ACL entry that grants it), or set the entity up again; import a repository with `levain ws-adopt`",
         ), *extra]
     return [CheckResult(
         name, True,

@@ -95,7 +95,8 @@ refused "operator renames the entity's file" mv "$WS/from-hands" "$WS/renamed"
 refused "operator deletes the entity's file" rm -f "$WS/from-hands"
 check "hands creates a folder" as_hands mkdir "$WS/hands-folder"
 refused "operator creates a file in the entity's folder" bash -c "echo o > '$WS/hands-folder/x'"
-as_hands /usr/bin/python3 -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')" 2>/dev/null
+check "hands writes a 0600 file atomically" as_hands /usr/bin/python3 -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')"
+info "its permissions: $(ls -le "$WS/atomic-0600" 2>&1 | tr '\n' ' ')$(getfacl -p "$WS/atomic-0600" 2>/dev/null | tr '\n' ' ')"
 if /bin/cat "$WS/atomic-0600" >/dev/null 2>&1; then pass "operator reads a 0600 file the hands wrote atomically"; else
   info "operator cannot read a 0600 file the hands wrote atomically (ACL mask follows the file mode)"
   "$PY" -c 'import json,subprocess,sys; from levain.firing import ws_git; h=ws_git.load_hands(sys.argv[1]); sys.exit(subprocess.run(ws_git.mask_repair_argv(h)).returncode)' "$E" >/dev/null 2>&1
@@ -112,7 +113,13 @@ as_hands ln -s "$OUT" "$WS/lnk"
 refused "ws-put through a symlinked folder" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh lnk/x
 check "nothing was written through it" test -z "$(ls -A "$OUT")"
 refused "ws-put out of the workspace" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh ../escaped
-refused "ws-put of a file inside the workspace (a link the entity left)" "$LEVAIN" ws-put --path "$E" "$WS/lnk" copied
+as_hands bash -c "echo planted > '$WS/planted.txt'"
+refused "ws-put of a file inside the workspace" "$LEVAIN" ws-put --path "$E" "$WS/planted.txt" copied
+check "control: the same file outside the workspace is copied" bash -c "cp '$WS/planted.txt' /tmp/levain-iso-mine.txt && '$LEVAIN' ws-put --path '$E' /tmp/levain-iso-mine.txt copied"
+as_hands ln -s "$SECRET" /tmp/levain-iso-bait
+refused "ws-put of a link the entity left in /tmp, pointing at a file of yours" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-bait stolen
+check "nothing of yours landed" test ! -e "$WS/stolen"
+rm -f /tmp/levain-iso-bait /tmp/levain-iso-mine.txt
 echo "== git: every repository is the hands user's (H)"
 CANARY_LOG=/tmp/levain-iso-canary; : > "$CANARY_LOG"; chmod 666 "$CANARY_LOG"
 PLANT="/usr/bin/id -un >> $CANARY_LOG"
@@ -123,6 +130,7 @@ check "hands creates and commits a repository" as_hands bash -c "cd '$WS' && git
 check "hands commits again, branches and runs gc" as_hands bash -c "cd '$WS/repo-h' && echo b > b && git add b && git commit -q -m two && git checkout -q -b side && git gc -q"
 check "the entity's commit carries the operator's git identity" as_hands bash -c "cd '$WS/repo-h' && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
 as_hands bash -c "cd '$WS/repo-h' && for h in pre-commit post-checkout post-commit; do printf '#!/bin/sh\n$PLANT\n' > .git/hooks/\$h; chmod +x .git/hooks/\$h; done"
+info "processes of the hands user now: $(ps -U "$HID" -o pid=,ppid=,comm= 2>&1 | tr '\n' ';')"
 refused "operator git reads a repository the hands user owns" opgit -C "$WS/repo-h" status --short
 refused "operator git log in it" opgit -C "$WS/repo-h" log -1
 check "ws-git status works on the hands repository" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
@@ -150,6 +158,12 @@ check "doctor warns that the runner's git trusts every repository" bash -c "\"$L
 check "doctor warns while safe.bareRepository is not explicit" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'safe.bareRepository is not'"
 printf '[safe]\n\tbareRepository = explicit\n' > /tmp/levain-iso-explicit-gitconfig
 if GIT_CONFIG_GLOBAL=/tmp/levain-iso-explicit-gitconfig "$LEVAIN" doctor --path "$E" | grep -q 'safe.bareRepository is not'; then fail "doctor warns although it is explicit"; else pass "doctor does not warn once it is explicit"; fi
+
+echo "== the entity opens a folder up to the operator: doctor fails"
+as_hands chmod 777 "$WS/hands-folder"
+check "doctor names the folder the operator can now write" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'writable by'"
+as_hands chmod 755 "$WS/hands-folder"
+if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports it once closed"; else pass "doctor no longer reports it once closed"; fi
 
 echo "== a folder force-created as the operator: doctor fails"
 sudo mkdir "$WS/forced" && sudo chown "$(id -u)" "$WS/forced"

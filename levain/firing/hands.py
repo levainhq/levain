@@ -34,7 +34,9 @@ deleting (Phill, 2026-10-07, ruling A: the operator edits the entity's workspace
 entity). The reason: git's ownership check for a BARE repository looks only at that directory, so
 any operator-owned directory the hands user could write would be one the operator's git trusts and
 the entity could fill with a repository whose config runs code as the operator. With nothing in the
-workspace owned by the operator, there is no such directory. The operator's other ways in are the
+workspace owned by the operator, and nothing there the operator can write, there is no such
+directory. The hands user owns every directory and could still open one up to the operator, so
+``levain doctor`` fails on any entry the operator can write. The operator's other ways in are the
 remote, ``levain ws-git``, ``levain ws-put`` (a file, as data) and ``levain ws-adopt`` (an import).
 
 The privilege it gives the operator is one sudoers line, ``<operator> ALL=(<hands>) NOPASSWD: ALL``:
@@ -196,7 +198,6 @@ def plan_setup(
     operator: str,
     host: HostOS,
     hands_id: int,
-    operator_gid: int,
     git_identity: dict[str, str] | None = None,
     sshd_dropins: bool = False,
     deny_lists: tuple[Path, ...] = (),
@@ -234,6 +235,7 @@ def plan_setup(
             Step("make the home private", ("/bin/chmod", "700", str(home))),
             Step("hide the home in Finder", ("/usr/bin/chflags", "hidden", str(home))),
             Step("create the shared workspace root", ("/bin/mkdir", "-p", "-m", "755", str(root))),
+            Step("check the shared root is still root's alone", call=lambda: _still_roots(host)),
             Step("create the entity's directory (root's)", ("/bin/mkdir", "-m", "755", str(ws_parent))),
             Step("create the workspace", ("/bin/mkdir", "-m", "700", str(ws))),
             Step("give the workspace to the hands user", ("/usr/sbin/chown", f"{hands}:{hands_id}", str(ws))),
@@ -251,6 +253,7 @@ def plan_setup(
                   "--comment", HANDS_MARKER, hands)),
             Step("make the home private", (_abs("chmod"), "700", str(home))),
             Step("create the shared workspace root", (_abs("mkdir"), "-p", "-m", "755", str(root))),
+            Step("check the shared root is still root's alone", call=lambda: _still_roots(host)),
             Step("create the entity's directory (root's)", (_abs("mkdir"), "-m", "755", str(ws_parent))),
             Step("create the workspace", (_abs("mkdir"), "-m", "700", str(ws))),
             Step("give the workspace to the hands user", (_abs("chown"), f"{hands}:{hands_id}", str(ws))),
@@ -639,6 +642,13 @@ def shared_root_problem(host: HostOS) -> str | None:
     return None
 
 
+def _still_roots(host: HostOS) -> tuple[bool, str]:
+    """After ``mkdir -p``: it accepts a directory another local account made first (``/Users/Shared``
+    is world-writable), so the root is checked again once it exists."""
+    problem = shared_root_problem(host)
+    return problem is None, problem or ""
+
+
 def stat_is_dir(mode: int) -> bool:
     import stat as _stat
 
@@ -919,7 +929,7 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
         return 1
     try:
         hands_id = choose_id(host, used_ids(host), retired_ids(host))
-        plan = plan_setup(entity_dir, operator=operator, host=host, hands_id=hands_id, operator_gid=op.pw_gid,
+        plan = plan_setup(entity_dir, operator=operator, host=host, hands_id=hands_id,
                           git_identity=operator_git_identity(operator),
                           sshd_dropins=sshd_reads_dropins(), deny_lists=existing_deny_lists(host))
     except (HandsSetupError, subprocess.CalledProcessError) as exc:
