@@ -13,34 +13,71 @@ from pathlib import Path
 import levain.autonomic
 
 PKG = Path(levain.autonomic.__file__).parent
+_DYNAMIC = {"import_module", "__import__"}
 
 
-def _imported_roots(path: Path) -> set[str]:
+def _offenders(path: Path) -> list[str]:
+    """Every import in ``path`` that leaves the package, plus any dynamic import call."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    names: set[str] = set()
+    bad: list[str] = []
     for node in ast.walk(tree):
+        names: list[str] = []
         if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module)
-    return names
-
-
-def test_every_module_imports_only_stdlib_and_itself():
-    offenders = []
-    modules = sorted(PKG.glob("*.py"))
-    assert len(modules) > 1
-    for path in modules:
-        for name in _imported_roots(path):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 1:
+                continue  # `from . import x` / `from .x import y`: inside the package
+            if node.level > 1:
+                bad.append(f"relative import leaving the package (level {node.level})")
+                continue
+            names = [node.module or ""]
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            called = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            if called in _DYNAMIC:
+                bad.append(f"dynamic import call {called}()")
+            continue
+        for name in names:
             if name == "levain.autonomic" or name.startswith("levain.autonomic."):
                 continue
             if name.split(".")[0] in sys.stdlib_module_names or name == "__future__":
                 continue
-            offenders.append(f"{path.name}: {name}")
-    assert offenders == []
+            bad.append(name)
+    return bad
 
 
-def test_the_check_sees_a_forbidden_import(tmp_path):
+def test_every_module_imports_only_stdlib_and_itself():
+    modules = sorted(PKG.rglob("*.py"))
+    assert len(modules) > 1
+    found = {p.name: _offenders(p) for p in modules}
+    assert {k: v for k, v in found.items() if v} == {}
+
+
+def test_the_check_flags_each_way_out(tmp_path):
     bad = tmp_path / "bad.py"
-    bad.write_text("from levain.kernel import x\nimport anneal_memory\n", encoding="utf-8")
-    assert _imported_roots(bad) == {"levain.kernel", "anneal_memory"}
+    bad.write_text(
+        "from levain.kernel import x\n"
+        "import anneal_memory\n"
+        "from .. import kernel\n"
+        "import importlib\n"
+        "importlib.import_module('levain.kernel')\n"
+        "__import__('levain.kernel')\n",
+        encoding="utf-8",
+    )
+    assert _offenders(bad) == [
+        "levain.kernel",
+        "anneal_memory",
+        "relative import leaving the package (level 2)",
+        "dynamic import call import_module()",
+        "dynamic import call __import__()",
+    ]
+
+
+def test_the_check_passes_stdlib_and_the_package(tmp_path):
+    ok = tmp_path / "ok.py"
+    ok.write_text(
+        "from __future__ import annotations\nimport json\nfrom levain.autonomic.posture import Posture\n"
+        "from . import risk\n",
+        encoding="utf-8",
+    )
+    assert _offenders(ok) == []

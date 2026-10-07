@@ -10,8 +10,8 @@ at the 2026-10-06 fold so the efferent engine imports no afferent code); this mo
 through a human).
 
 It populates a dict slice — it does NOT build a receipt system (the schema is anneal-owned). It
-REUSES the afferent builder so the persisted shape is EXACTLY the frozen contract (no new keys,
-just the nulls filled). anneal absorbs these fields as ``RECEIPT_VERSION=3`` when it unifies the
+carries the afferent face's builder (``build_action_face``, below) so the persisted shape is EXACTLY
+the frozen contract (no new keys, just the nulls filled). anneal absorbs these fields as ``RECEIPT_VERSION=3`` when it unifies the
 recall + action corpora (the ``spore-166`` coordination checkpoint) — DECOUPLED: the vagus writes
 its own slice now.
 """
