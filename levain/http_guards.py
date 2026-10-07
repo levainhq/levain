@@ -459,7 +459,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
         # BaseHTTPRequestHandler dispatches to ``do_<METHOD>`` when the attribute exists and answers 501 otherwise:
         # every method it would not find here (PROPFIND, a lowercase "get", any token) goes to _other_method, so
         # none reaches a response before the guards (L1).
-        if name.startswith("do_"):
+        # The one exempt handler (_DO_METHOD_EXEMPT) still routes its own methods until its gate lands.
+        if name.startswith("do_") and (type(self).__module__, type(self).__qualname__) not in _DO_METHOD_EXEMPT:
             return self._other_method
         raise AttributeError(name)
 
