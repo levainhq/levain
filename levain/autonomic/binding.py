@@ -917,15 +917,20 @@ class BindingStore:
             raise FenceNotRecordedError(failed)
 
     def refence(self, binding_id: str) -> None:
-        """Retry mirroring ``binding_id``'s registry generation into the run journal (after a
-        :class:`FenceNotRecordedError`). A no-op if the journal already has it."""
+        """Retry mirroring ``binding_id``'s fence into the run journal (after a
+        :class:`FenceNotRecordedError`). For a live record: the record's generation. For a removed
+        binding: a generation above every run the journal admitted for it. A no-op when the journal's
+        fence already covers that."""
         if self._journal is None:
             return
         with self._locked():   # read the authority under the lock that every fencing verb holds
             rec = next((r for r in self._read_raw(for_mutation=True) if r["binding_id"] == binding_id), None)
             if rec is None:
                 # removed: fence strictly above every run the journal ever admitted for it
-                gen = self._journal.next_generation(binding_id)
+                top = self._journal.max_run_generation(binding_id)
+                if top is None:
+                    return   # no run was ever admitted: nothing to fence
+                gen = top + 1
             else:
                 gen = _record_generation(rec)
             if self._journal.generation(binding_id) < gen:

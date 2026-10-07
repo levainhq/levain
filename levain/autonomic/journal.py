@@ -549,6 +549,20 @@ class RunJournal:
             self._append({"t": "withdraw", "hold_id": hold_id})
             return True
 
+    def hold_state(self, hold_id: str) -> str | None:
+        """``"open"``, ``"approved"``, ``"rejected"``, or ``None`` (no such hold, or it was withdrawn)."""
+        with self._locked():
+            h = self._state().holds.get(hold_id)
+        if h is None:
+            return None
+        return "open" if h["decided"] is None else ("approved" if h["decided"] else "rejected")
+
+    def max_run_generation(self, binding_id: str) -> int | None:
+        """The highest generation any run of ``binding_id`` was admitted at, or ``None`` (no runs)."""
+        with self._locked():
+            gens = [r["generation"] for r in self._state().runs.values() if r["binding_id"] == binding_id]
+        return max(gens) if gens else None
+
     def open_holds(self) -> list[dict[str, Any]]:
         """Every undecided hold (``hold_id``, ``binding_id``, ``run_id``, ``effect_id``, ``digest``,
         ``at``):
