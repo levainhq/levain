@@ -35,9 +35,8 @@ SECURITY_HEADERS = ("Content-Security-Policy", "X-Content-Type-Options", "X-Fram
                     "Cache-Control", "Referrer-Policy")
 
 
-# The team view's handler still routes its own do_GET (the launch token for `levain team view` lands with the team
-# lane, after this one). Strict, so the day it moves onto `_route` this marker fails and has to be removed.
-_NOT_YET_ON_THE_SHARED_GUARDS = {"_ViewHandler": "team view gate lands with seat/1007-5-teamview"}
+# Handlers not yet on the shared guards, each a strict xfail that fails the day it moves onto `_route`: none.
+_NOT_YET_ON_THE_SHARED_GUARDS: dict[str, str] = {}
 
 
 def _handlers():
@@ -380,10 +379,10 @@ def test_a_handler_that_defines_its_own_do_method_is_refused_when_its_class_is_m
                 pass
 
 
-def test_the_do_method_exemption_is_exactly_the_team_view_and_cannot_grow():
+def test_no_handler_is_exempt_from_the_shared_dispatch():
     from levain.http_guards import _DO_METHOD_EXEMPT
 
-    assert _DO_METHOD_EXEMPT == {("levain.team.view", "_ViewHandler")}
+    assert _DO_METHOD_EXEMPT == frozenset()
 
 
 def test_make_server_requires_an_explicit_read_token_choice(tmp_path):
@@ -945,7 +944,7 @@ def test_open_unlocked_says_locked_when_only_the_plain_url_opened(monkeypatch):
     assert open_unlocked("http://127.0.0.1:1/", "http://127.0.0.1:1/#code=x") is None
 
 
-@pytest.mark.parametrize("module", ["levain.web_server", "levain.docs_server", "levain.init_server"])
+@pytest.mark.parametrize("module", ["levain.web_server", "levain.docs_server", "levain.init_server", "levain.team.view"])
 def test_every_server_cleanup_holds_sigterm_first(module):
     """L1: the hold() is what keeps a SIGTERM from cutting the cleanup short; each server's serve_forever ``finally``
     must call it before anything else."""

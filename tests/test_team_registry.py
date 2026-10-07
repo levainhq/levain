@@ -28,6 +28,7 @@ def levain_home(tmp_path, monkeypatch):
     # autouse: no test in this file can reach the real ~/.levain (LEVAIN_HOME and HOME both point into tmp_path)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    (tmp_path / "userhome").mkdir()            # a real HOME exists: serve() writes the launch token's runtime file there
     assert str(R.registry_dir()).startswith(str(tmp_path))
     return tmp_path / "home"
 
@@ -418,7 +419,11 @@ def test_t7_flock_failing_with_enolck_keeps_the_view_serving(monkeypatch, capsys
 
     def enolck(*a, **k):
         raise OSError(errno.ENOLCK, "no locks available")
-    monkeypatch.setattr(fcntl, "flock", enolck)
+
+    class Fcntl:                    # the registry's flock only: the launch token's runtime file has its own lock
+        LOCK_EX, LOCK_SH, LOCK_NB = fcntl.LOCK_EX, fcntl.LOCK_SH, fcntl.LOCK_NB
+        flock = staticmethod(enolck)
+    monkeypatch.setattr(R, "fcntl", Fcntl)
     _serve_with(monkeypatch, _interrupt)
     assert V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
     assert "not registered with the cockpit" in capsys.readouterr().err
@@ -754,6 +759,25 @@ def test_the_cockpit_names_the_view_by_the_team_toml_the_panes_come_from(monkeyp
     assert names == ["renamed"]
 
 
+def test_serve_never_prints_the_token_off_a_terminal_and_removes_its_runtime_file(monkeypatch, capsys, tmp_path):
+    # The launch token reaches the operator through ~/.levain-runtime/<port>.json (0600) when the output is not a
+    # terminal (a pipe, a log); it is never printed there, and the file goes when the view stops.
+    seen = {}
+
+    def peek(h, s):
+        def sf():
+            seen["token"] = h.launch_token
+            seen["runtime"] = sorted(p.name for p in (tmp_path / "userhome" / ".levain-runtime").iterdir())
+            raise KeyboardInterrupt
+        return sf
+    _serve_with(monkeypatch, peek)
+    assert V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
+    out = capsys.readouterr()
+    assert seen["token"] and seen["token"] not in out.out + out.err
+    assert any(n.endswith(".json") for n in seen["runtime"])
+    assert not [p for p in (tmp_path / "userhome" / ".levain-runtime").iterdir() if p.name.endswith(".json")]
+
+
 def test_a_prune_failure_does_not_skip_registering(monkeypatch):
     seen = _serve_with(monkeypatch, _interrupt)
     monkeypatch.setattr(R, "prune_dead", lambda: (_ for _ in ()).throw(RuntimeError("poisoned")))
@@ -785,7 +809,7 @@ def test_t3_unpublish_then_close_then_server_close_whatever_fails_in_between(inj
 
         def sf():
             if inject == "sigterm":
-                V._on_sigterm(signal.SIGTERM, None)
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)   # the handler serve() installed
             raise KeyboardInterrupt
         return sf
     _serve_with(monkeypatch, sf_factory)
@@ -803,8 +827,8 @@ def test_a_keyboard_interrupt_during_prune_or_register_still_closes_the_socket()
             closed = []
             _serve_with(mp, lambda h, seen: (setattr(h, "server_close", lambda: closed.append(1)), lambda: None)[1])
             mp.setattr(R, target, lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
-            with pytest.raises(KeyboardInterrupt):
-                V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
+            # a Ctrl+C there is a clean stop now (the registry steps run inside serve's try), and the socket is closed
+            assert V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
             assert closed == [1]
 
 

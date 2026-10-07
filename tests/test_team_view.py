@@ -2,7 +2,10 @@
 and the privacy line (no count keyed by a person). Behaviour reproduced against the live demo server first."""
 import http.client
 import json
+import shutil
+import subprocess
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -17,11 +20,76 @@ TEAM = R.Team(project="ledgerline", owner="ana", members={"ana": "a@x.io", "ben"
               client_owners=["Dana"])
 
 
+TOKEN = "test-team-view-launch-token"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_levain_home(tmp_path, monkeypatch):
     # autouse: nothing in this file may reach the real ~/.levain (the view registers there when serve() runs)
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
     monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
+    (tmp_path / "userhome").mkdir()            # a real HOME exists: serve() writes the launch token's runtime file there
+    # every server these tests build gets this launch token, and _req sends it unless told not to
+    monkeypatch.setattr(V, "new_launch_token", lambda: TOKEN)
+
+
+_DOM = Path(__file__).with_name("team_view_dom.js")
+_HARNESS = r"""
+const { makeDocument, created } = require(%(dom)s);
+const PORT = %(port)d, TOKEN = %(token)s;
+global.document = makeDocument();
+const u = new URL("http://127.0.0.1:" + PORT + %(path)s);
+global.location = { href: u.href, search: u.search, hash: u.hash, pathname: u.pathname };
+global.history = { replaceState: (s, t, url) => { const n = new URL(url, u.href); location.href = n.href; location.search = n.search; } };
+const locks = [];
+let held = TOKEN, inflight = 0, unlock = null;
+global.window = { addEventListener() {}, LevainToken: TOKEN === null ? undefined : {
+  get: () => held, headers: (h) => { if (held) h["X-Levain-Token"] = held; return h; },
+  isRefusal: (s, j) => s === 403 && !!j && j.error === "launch_token",
+  lock: (msg, sent) => { locks.push(msg); held = null; }, onUnlock: (fn) => { unlock = fn; } } };
+const real = globalThis.fetch, MODEL = %(model)s;
+global.fetch = (url, opts) => {
+  inflight++;
+  const answer = MODEL !== null
+    ? Promise.resolve({ status: 200, ok: true, headers: { get: () => null }, json: async () => MODEL })
+    : real("http://127.0.0.1:" + PORT + url, { headers: opts && opts.headers });
+  return answer.finally(() => setTimeout(() => { inflight--; }, 30));
+};
+%(js)s
+(async () => {
+  const t0 = Date.now();
+  await new Promise((r) => setTimeout(r, 30));
+  while (inflight > 0 && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 20));
+  console.log(JSON.stringify({ html: document.deck.outerHTML, title: document.title, locks, created }));
+  process.exit(0);
+})();
+"""
+
+
+def _page_full(port, path="/", token=TOKEN, model=None):
+    """Run the page's own script under node against the live server, as a browser holding ``token`` would, and return
+    what it drew: the deck's HTML (every text escaped by the serializer), the title, the unlock-form calls and the
+    tags it created."""
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    harness = _HARNESS % {"dom": json.dumps(str(_DOM)), "port": port, "token": json.dumps(token),
+                          "path": json.dumps(path), "js": V.JS, "model": json.dumps(model)}
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def _page(port, path="/", token=TOKEN):
+    return _page_full(port, path, token)["html"]
+
+
+def _render(m):
+    """What the page's script draws for the model ``m`` (build_model's output, as /view.json serves it)."""
+    m = dict(m)
+    m.setdefault("fetch", {"remote": False})
+    m.setdefault("cockpit_url", V.DEFAULT_COCKPIT_URL)
+    m.setdefault("warning_count", 0)
+    return _page_full(0, model=m)
 
 
 def _seal(chains, author, ts, type_, **kw):
@@ -90,16 +158,33 @@ def test_no_count_is_keyed_by_a_person():
     for token in _walk(m["stopped"]):
         assert "zq9wv" not in token and not token.startswith("sess")
     assert not ({"author", "session", "by", "who"} & {t for t in _walk(m["stopped"])})
-    page = V.render_html(m)
+    page = _render(m)["html"]
     pane2 = page.split('id="pane2"')[1].split('id="pane3"')[0]
     assert "zq9wv" not in pane2 and "sess" not in pane2
 
 
-def test_page_escapes_recorded_text():
+def test_ledger_text_is_drawn_as_text_never_as_markup():
+    # The head's ruling (10-07): one renderer, in the browser, createElement/textContent only. A ledger string full of
+    # markup must arrive on the page as those characters, and no element it names may be created.
     ledger, _ = _ledger()
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
-    m["waiting"][0]["summary"] = "<script>alert(1)</script>"
-    assert "<script>alert(1)" not in V.render_html(m)
+    evil = '<img src=x onerror=alert(1)><script>alert(2)</script>'
+    m["waiting"][0]["summary"] = evil
+    m["waiting"][0]["paths"] = [evil]
+    m["project"] = evil
+    m["fetch"] = {"remote": True, "source": "remote", "error": evil, "last_ok": evil, "unpushed": 0, "unfetched": 0}
+    got = _render(m)
+    assert "img" not in got["created"] and "script" not in got["created"]
+    esc = "&lt;img src=x onerror=alert(1)&gt;&lt;script&gt;alert(2)&lt;/script&gt;"
+    assert got["html"].count(esc) >= 4 and "<img" not in got["html"] and "<script" not in got["html"]
+    assert got["title"] == evil + " \u00b7 team view"             # document.title is text, not markup
+
+
+def test_the_script_never_parses_a_string_as_markup():
+    # The construct, not just the case above: no API in the script turns a string into nodes.
+    for api in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "DOMParser", "createContextualFragment",
+                "eval(", "new Function"):
+        assert api not in V.JS, api
 
 
 class _Stub:
@@ -146,9 +231,12 @@ def server():
     httpd.server_close()
 
 
-def _req(port, method, path="/", headers=None):
+def _req(port, method, path="/", headers=None, token=TOKEN):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    c.request(method, path, headers=headers or {})
+    h = dict(headers or {})
+    if token is not None:
+        h.setdefault("X-Levain-Token", token)
+    c.request(method, path, headers=h)
     r = c.getresponse()
     body = r.read()
     c.close()
@@ -156,33 +244,64 @@ def _req(port, method, path="/", headers=None):
 
 
 def test_get_routes_serve_and_every_other_method_is_405(server):
-    r, body = _req(server, "GET")
-    assert r.status == 200 and b"Waiting on you" in body and b"carl" in body
+    page = _page(server)
+    assert "Waiting on you" in page and "carl" in page
     assert _req(server, "GET", "/team_view.css")[0].status == 200
     assert json.loads(_req(server, "GET", "/view.json")[1])["project"] == "ledgerline"
-    for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "FOO"):
+    r, body = _req(server, "HEAD", "/view.json")
+    assert r.status == 200 and body == b"" and int(r.getheader("Content-Length")) > 0
+    for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "FOO"):
         r, _ = _req(server, method)
         assert r.status == 405, method
-        assert r.getheader("Allow") == "GET"
+        assert r.getheader("Allow") == "GET, HEAD"
         assert "frame-ancestors" in (r.getheader("Content-Security-Policy") or "")
+
+
+def test_without_the_launch_token_only_the_data_free_shell_is_served(server):
+    # The head's ruling (10-07): the view rides the launch token. The page shell and its static assets are the only
+    # paths served without it, and they carry no ledger data; the ledger itself, and any other path, is a 403.
+    for path in ("/view.json", "/view.json?fetch=1", "/nope", "/board.html"):
+        r, body = _req(server, "GET", path, token=None)
+        assert r.status == 403 and json.loads(body)["error"] == "launch_token", path
+    assert _req(server, "GET", "/view.json", token="x" * 32)[0].status == 403
+    for path in ("/", "/team_view.css", "/team_view.js", "/dashboard.css", "/token.js"):
+        r, body = _req(server, "GET", path, token=None)
+        assert r.status == 200, path
+        text = body.decode()
+        for secret in ("carl", "ledgerline", "half-even", "Round per line", "billing.py"):   # ledger strings
+            assert secret not in text, (path, secret)
+    shell = _req(server, "GET", "/", token=None)[1].decode()
+    assert "Waiting on you" not in shell and 'id="pane1"' not in shell           # not even the empty panes
+    import re
+    assert re.findall(r'<script src="([^"]+)"', shell) == ["/token.js", "/team_view.js"]   # token.js first
+
+
+def test_a_browser_without_the_token_is_shown_the_unlock_form_and_no_data(server):
+    got = _page_full(server, token=None)
+    assert "carl" not in got["html"] and "Waiting on you" not in got["html"]
+    got = _page_full(server, token="y" * 32)          # a stale token: refused, and the form says so
+    assert got["locks"] == ["That token was not accepted."] and "carl" not in got["html"]
 
 
 def test_page_has_no_form_no_write_control_and_loads_only_own_assets(server):
     import re
-    text = _req(server, "GET")[1].decode()
+    text = _page(server)
     assert "<form" not in text and "<textarea" not in text and 'method="' not in text.lower()
     assert set(re.findall(r'<input[^>]*type="(\w+)"', text)) == {"search"}      # filters only
-    assert "<script>" not in text and " style=" not in text                       # CSP: no inline script or style
+    assert "<script" not in text and " style=" not in text                        # the script draws no script or style
     srcs = re.findall(r'(?:src|href)="([^"]+)"', text)
     external = [u for u in srcs if u.startswith("http") and u != V.DEFAULT_COCKPIT_URL]
     assert external == []                                                         # only the cockpit nav link leaves
-    assert {"/dashboard.css", "/team_view.css", "/team_view.js"} <= set(srcs)
+    shell = _req(server, "GET", "/", token=None)[1].decode()
+    assert "<script>" not in shell and " style=" not in shell                     # CSP: no inline script or style
+    assert {"/dashboard.css", "/team_view.css", "/team_view.js", "/token.js"} <= set(
+        re.findall(r'(?:src|href)="([^"]+)"', shell))
     assert "data-clamp" in text and 'id="inforce-q"' in text
 
 
 def test_cockpit_stylesheet_and_assets_are_served(server):
     for path, ctype in (("/dashboard.css", "text/css"), ("/team_view.css", "text/css"),
-                        ("/team_view.js", "text/javascript")):
+                        ("/team_view.js", "text/javascript"), ("/token.js", "text/javascript"), ("/", "text/html")):
         r, body = _req(server, "GET", path)
         assert r.status == 200 and r.getheader("Content-Type").startswith(ctype) and body
     assert b".pbody.clamped" in _req(server, "GET", "/dashboard.css")[1]
@@ -204,12 +323,13 @@ def test_path_filter_narrows_every_pane():
 def test_path_filter_over_http(server):
     r, body = _req(server, "GET", "/view.json?path=legacy")
     assert [g["path"] for g in json.loads(body)["in_force"]] == ["legacy/**"]
-    assert b"narrowed to what governs" in _req(server, "GET", "/?path=legacy")[1]
+    page = _page(server, "/?path=legacy")
+    assert "narrowed to what governs <code>legacy</code>" in page and "billing.py" not in page
 
 
 def test_host_guard_and_unknown_route(server):
     assert _req(server, "GET", headers={"Host": "evil.example"})[0].status == 403
-    assert _req(server, "GET", "/nope")[0].status == 404
+    assert _req(server, "GET", "/nope")[0].status == 404              # with the token; without it, 403 (above)
 
 
 def test_refuses_a_non_loopback_bind():
@@ -265,7 +385,7 @@ def test_an_ack_counts_once_per_distinct_path_and_only_for_rulings():
     assert [r["review"] for r in m["stopped"]] == [False, False]
     m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, ack_flag=2)
     assert all(r["review"] for r in m["stopped"])  # the threshold is compared per path
-    assert "<span class=\"src\">2</span>" in V.render_html(m).split('id="pane2"')[1].split('id="pane3"')[0]
+    assert "<span class=\"src\">2</span>" in _render(m)["html"].split('id="pane2"')[1].split('id="pane3"')[0]
 
 
 def test_ipv6_and_non_ipv4_loopback_are_refused_cleanly():
@@ -319,7 +439,7 @@ def test_model_generation_is_serialized_and_assets_are_not_gated():
     port = httpd.server_address[1]
     try:
         results = []
-        ts = [threading.Thread(target=lambda: results.append(_req(port, "GET")[0].status)) for _ in range(2)]
+        ts = [threading.Thread(target=lambda: results.append(_req(port, "GET", "/view.json")[0].status)) for _ in range(2)]
         ts[0].start()
         assert stub.entered.wait(5)
         ts[1].start()
@@ -346,9 +466,11 @@ def test_a_ledger_failure_does_not_echo_the_error_to_the_client(capfd):
     stub.armed = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        r, body = _req(httpd.server_address[1], "GET")
+        r, body = _req(httpd.server_address[1], "GET", "/view.json")
         assert r.status == 503 and b"secret" not in body and b"fatal" not in body
-        assert b"ledger unavailable" in body
+        assert json.loads(body) == {"error": "ledger_unavailable"}
+        page = _page(httpd.server_address[1])
+        assert "The ledger is unavailable" in page and "secret" not in page and "Waiting on you" not in page
         assert "/Users/secret/path" in capfd.readouterr().err          # the detail goes to the operator's stderr
     finally:
         httpd.shutdown()
@@ -384,7 +506,7 @@ def test_pane_one_is_exactly_the_questions_and_tensions_the_viewer_owns():
     m = V.build_model(TEAM, led, "ana", None, "x", now=NOW)
     assert "awaiting_words" not in m
     assert [c["type"] for c in m["waiting"]] == ["question"]
-    page = V.render_html(m)
+    page = _render(m)["html"]
     pane1 = page.split('id="pane1"')[1].split('id="pane2"')[0]
     assert "proposed replacements" not in pane1 and "proposes to replace" not in pane1
 
@@ -394,7 +516,7 @@ def test_a_busy_ledger_answers_503_instead_of_hanging():
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         httpd.model_lock.acquire()          # a cold history read is holding the lock
-        r, body = _req(httpd.server_address[1], "GET")
+        r, body = _req(httpd.server_address[1], "GET", "/view.json")
         assert r.status == 503 and b"busy" in body
         assert _req(httpd.server_address[1], "GET", "/team_view.css")[0].status == 200
     finally:
@@ -414,7 +536,7 @@ def test_the_503_diagnostic_is_best_effort_and_one_line(capfd, monkeypatch):
     stub.armed = True
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        r, body = _req(httpd.server_address[1], "GET")
+        r, body = _req(httpd.server_address[1], "GET", "/view.json")
         assert r.status == 503
         err = capfd.readouterr().err
         assert "\n[levain] FORGED" not in err and "FORGED log line" in err    # one line, newlines escaped
@@ -426,7 +548,7 @@ def test_the_503_diagnostic_is_best_effort_and_one_line(capfd, monkeypatch):
                 raise ValueError("I/O operation on closed file")
             flush = write
         monkeypatch.setattr(sys, "stderr", Dead())
-        assert _req(httpd.server_address[1], "GET")[0].status == 503
+        assert _req(httpd.server_address[1], "GET", "/view.json")[0].status == 503
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -473,21 +595,19 @@ def test_a_request_during_a_cold_read_is_answered_503_at_once_and_the_page_asks_
     try:
         httpd.model_lock.acquire()          # a cold history read is holding the lock
         t0 = time.monotonic()
-        r, body = _req(port, "GET")
+        r, body = _req(port, "GET", "/view.json")
         assert time.monotonic() - t0 < 1.0
         assert r.status == 503 and r.getheader("Retry-After") == str(V.BUSY_RETRY)
-        assert r.getheader("Content-Type").startswith("text/html")
-        assert f'http-equiv="refresh" content="{V.BUSY_RETRY};url=/"'.encode() in body and b"<script" not in body
+        assert json.loads(body) == {"error": "busy"}
         assert "frame-ancestors" in (r.getheader("Content-Security-Policy") or "")
-        r, body = _req(port, "GET", "/view.json")
-        assert r.status == 503 and r.getheader("Retry-After") and b"busy" in body and b"<html" not in body
-        # complement, L3 round 3: the refresh reloaded the same URL, so after "fetch now" every retry asked for
-        # another fetch. It asks again for the same page and filter, without the fetch.
-        body = _req(port, "GET", "/?fetch=1&path=src%2Ftax")[1].decode()
-        assert f'content="{V.BUSY_RETRY};url=/?path=src%2Ftax"' in body and "fetch=" not in body
-        # complement, L3 round 2: dropping the fetch silently made "fetch now" look done. The page says it did not run.
-        assert "Your fetch did not run" in body
-        assert "Your fetch did not run" not in _req(port, "GET", "/?path=src%2Ftax")[1].decode()
+        # The page's script says so and asks again after Retry-After, WITHOUT a fetch (complement, L3 round 3: a retry
+        # that repeated the fetch asked for one every two seconds); a fetch it asked for is said not to have run
+        # (complement, L3 round 2).
+        page = _page(port, "/?fetch=1&path=src%2Ftax")
+        assert "The team view is reading the ledger. Asking again in 2 seconds." in page
+        assert "Your fetch did not run" in page
+        assert "Your fetch did not run" not in _page(port, "/?path=src%2Ftax")
+        assert "retry = setTimeout(function () { load(false); }, a.wait * 1000);" in V.JS
     finally:
         httpd.model_lock.release()
         httpd.shutdown()
@@ -572,7 +692,7 @@ def test_the_fetch_button_brings_in_a_ruling_another_clone_pushed_without_moving
     assert m["fetch"]["source"] == "remote" and m["fetch"]["error"] == "" and m["fetch"]["last_ok"]
     assert (m["fetch"]["unpushed"], m["fetch"]["unfetched"]) == (0, 1)
     assert _local_tip(ana) == before                                   # the GET moved nothing of ana's
-    page = _req(port, "GET", "/")[1].decode()
+    page = _page(port, "/")
     assert "fetch now" in page and f"remote, fetched {m['fetch']['last_ok']}" in page
     assert "1 from the remote not yet in it" in page and "fetch-error" not in page
 
@@ -588,7 +708,7 @@ def test_an_unpushed_local_entry_is_counted_not_hidden_or_pushed(two_clone_view,
     assert _local_tip(ana) == tip
     remote_tip = _git("rev-parse", "refs/heads/levain-ledger", cwd=tmp_path / "origin.git").strip()
     assert remote_tip != tip                                            # and nothing was pushed
-    assert "1 commit not pushed" in _req(port, "GET", "/")[1].decode()
+    assert "1 commit not pushed" in _page(port, "/")
 
 
 def test_a_failed_fetch_is_shown_on_the_page_without_git_detail(two_clone_view, tmp_path, capfd):
@@ -597,14 +717,14 @@ def test_a_failed_fetch_is_shown_on_the_page_without_git_detail(two_clone_view, 
     _git("remote", "set-url", "origin", str(gone), cwd=ana)
     m, _ = _words(port, "/view.json?fetch=1")
     assert m["fetch"]["error"].startswith("the last fetch from the remote failed")
-    page = _req(port, "GET", "/")[1].decode()
+    page = _page(port, "/")
     assert 'class="warn fetch-error">⚠ the last fetch from the remote failed' in page
     assert "gone-remote" not in page and "gone-remote" not in json.dumps(m)
     assert "git fetch failed" in capfd.readouterr().err                # the detail is in the terminal
 
 
 def test_with_no_remote_the_button_only_redraws_and_says_so(server):
-    page = _req(server, "GET")[1].decode()
+    page = _page(server)
     assert "this clone only: no remote" in page and 'data-fetch="0">⟳ reload<' in page and "fetch now" not in page
 
 
@@ -639,7 +759,7 @@ def test_the_integrity_warning_counts_what_team_verify_counts(two_clone_view):
     want = VF.problems(ga, rsha, ga.team(rsha), ga.judge_remote(rsha).ledger)
     assert any("d-000000000000" in p for p in want) and any("not the owner" in p for p in want)
     assert m["problems"] == len(want) >= 1
-    assert f"{len(want)} integrity problem(s): run levain team verify".encode() in _req(port, "GET")[1]
+    assert f"{len(want)} integrity problem(s): run levain team verify" in _page(port)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         assert team_cli.cmd_verify(type("A", (), {"repo": str(ben)})()) == 1   # verify fails on the same ledger
@@ -709,10 +829,10 @@ def test_a_broken_fetch_record_is_shown_and_the_panes_still_draw(monkeypatch, st
     # 503 "ledger unavailable" while the ledger itself was fine.
     httpd = _serve(_RemoteStub(state=state))
     try:
-        r, body = _req(httpd.server_address[1], "GET")
-        assert r.status == 200 and b"Waiting on you" in body
+        page = _page(httpd.server_address[1])
+        assert "Waiting on you" in page and "half-even?" in page
         if isinstance(state, Exception):
-            assert b"could not fetch from the remote" in body and "read-only .git" in capfd.readouterr().err
+            assert "could not fetch from the remote" in page and "read-only .git" in capfd.readouterr().err
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -724,7 +844,7 @@ def test_a_failed_fetch_shows_a_fixed_message_and_keeps_git_detail_in_the_termin
     httpd = _serve(_RemoteStub(note=secret))
     try:
         port = httpd.server_address[1]
-        page = _req(port, "GET", "/?fetch=1")[1].decode()
+        page = _page(port, "/?fetch=1")
         js = _req(port, "GET", "/view.json")[1].decode()
         for out in (page, js):
             assert "hunter2" not in out and "netrc" not in out and "git.example" not in out
@@ -748,7 +868,7 @@ def test_transport_warnings_are_counted_on_the_page_with_their_words_in_the_term
     try:
         port = httpd.server_address[1]
         for _ in range(3):
-            page = _req(port, "GET")[1].decode()
+            page = _page(port)
             assert "1 warning from reading the ledger (see the terminal running the view)" in page
             assert "/home/ana/secret" not in page
         assert "/home/ana/secret" not in _req(port, "GET", "/view.json")[1].decode()
@@ -849,8 +969,9 @@ def test_a_comparison_git_cannot_finish_shows_unknown_not_a_whole_page_503(two_c
         return real(args, *a, **k)
     monkeypatch.setattr(V, "git", slow)
     _ana, _ben, port = two_clone_view
-    r, body = _req(port, "GET", "/?fetch=1")
-    assert r.status == 200 and "could not compare" in body.decode()
+    r, body = _req(port, "GET", "/view.json?fetch=1")
+    assert r.status == 200 and json.loads(body)["fetch"]["unpushed"] is None
+    assert "this clone's own copy: could not compare" in _page(port)
 
 
 def test_a_huge_fetch_interval_neither_stops_the_view_nor_breaks_a_page():
@@ -878,7 +999,7 @@ def test_a_huge_fetch_interval_neither_stops_the_view_nor_breaks_a_page():
     httpd = V.make_view_server(stub, port=0)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        assert _req(httpd.server_address[1], "GET")[0].status == 200
+        assert _req(httpd.server_address[1], "GET", "/view.json")[0].status == 200
         assert V.FETCH_FLOOR <= stub.asked < float("inf")
     finally:
         httpd.shutdown()
@@ -926,14 +1047,14 @@ def test_the_integrity_count_is_recomputed_when_the_history_it_saw_grows(tmp_pat
     try:
         port = httpd.server_address[1]
         shallow.write_text("aaaa\n")
-        _req(port, "GET")
-        _req(port, "GET")
+        _req(port, "GET", "/view.json")
+        _req(port, "GET", "/view.json")
         assert Counting.calls == 1                       # same tip, same history: cached
         shallow.write_text("bbbb\n")                     # a deepen rewrites the shallow boundary
-        _req(port, "GET")
+        _req(port, "GET", "/view.json")
         assert Counting.calls == 2
         shallow.unlink()                                 # unshallowed completely
-        _req(port, "GET")
+        _req(port, "GET", "/view.json")
         assert Counting.calls == 3
     finally:
         httpd.shutdown()
@@ -945,7 +1066,7 @@ def test_a_fetch_another_sync_is_running_is_said_as_that_not_as_a_failure():
     # now" looked done while nothing was fetched. It now says "busy:", and the page says so without alarm.
     httpd = _serve(_RemoteStub(note="busy: another sync is running"))
     try:
-        page = _req(httpd.server_address[1], "GET", "/?fetch=1")[1].decode()
+        page = _page(httpd.server_address[1], "/?fetch=1")
         assert "another sync is fetching now" in page and "fetch-error" not in page
     finally:
         httpd.shutdown()
@@ -960,7 +1081,7 @@ def test_a_quarantine_that_cannot_be_judged_is_shown_as_a_refusal_not_a_503(capf
             raise LedgerReadError("the fetched remote ledger could not be judged (boom)")
     httpd = _serve(Unjudged())
     try:
-        r, body = _req(httpd.server_address[1], "GET")
+        r, body = _req(httpd.server_address[1], "GET", "/view.json")
         assert r.status == 200 and b"the fetched remote ledger could not be judged" in body and b"boom" not in body
         assert "boom" in capfd.readouterr().err
     finally:
@@ -986,7 +1107,7 @@ def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_v
     levain_main(["team", "sync", "--repo", str(ana)])                   # another command fetches the tampered tip
     m, words = _words(port, "/view.json")                              # no fetch from the view in this interval
     assert m["fetch"]["refused"] is True and words == ["VAT rounds half-even."]   # the last accepted copy
-    page = _req(port, "GET", "/")[1].decode()
+    page = _page(port, "/")
     assert "refused as tampered" in page and "remote, as last accepted" in page and "notes.txt" not in page
 
 
@@ -998,10 +1119,10 @@ def test_a_failure_another_command_saved_is_shown_until_a_success_clears_it(capf
     httpd = _serve(stub)
     try:
         port = httpd.server_address[1]
-        assert "fetch-error" in _req(port, "GET")[1].decode()             # this view never fetched-and-failed
+        assert "fetch-error" in _page(port)             # this view never fetched-and-failed
         assert "no route" in capfd.readouterr().err
         stub._state = {"last_fetch_ok": 2.0e9, "last_fetch_error": ""}     # a later fetch, by anyone, succeeded
-        assert "fetch-error" not in _req(port, "GET")[1].decode()
+        assert "fetch-error" not in _page(port)
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -1032,7 +1153,7 @@ def test_a_quarantined_tip_that_cannot_be_judged_does_not_stop_the_view_starting
     httpd = V.make_view_server(Unjudgeable(), port=0)      # not _serve: the stub must be the one the server starts on
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
-        r, body = _req(httpd.server_address[1], "GET")
+        r, body = _req(httpd.server_address[1], "GET", "/view.json")
         assert r.status == 200 and b"the fetched remote ledger could not be judged" in body and b"boom" not in body
     finally:
         httpd.shutdown()
@@ -1066,7 +1187,7 @@ def test_the_accepted_tip_is_judged_against_the_record_it_was_read_from():
     stub = Raced()
     httpd = _serve(stub)
     try:
-        assert _req(httpd.server_address[1], "GET")[0].status == 200
+        assert _req(httpd.server_address[1], "GET", "/view.json")[0].status == 200
         assert seen == [("a" * 40, stub.rec)]
     finally:
         httpd.shutdown()
@@ -1087,7 +1208,7 @@ def test_an_unreadable_trusted_record_is_said_on_the_page_not_a_503(capfd):
     httpd = _serve(Unreadable())
     try:
         port = httpd.server_address[1]
-        r, body = _req(port, "GET")
+        r, body = _req(port, "GET", "/view.json")
         page = body.decode()
         assert r.status == 200 and "the ledger could not be judged" in page and "Waiting on you" not in page
         assert "/home/ana" not in page and "/home/ana" in capfd.readouterr().err
@@ -1113,7 +1234,7 @@ def test_an_idle_connection_is_closed_so_idle_ones_cannot_lock_the_page_out(monk
     idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]
     try:
         _t.sleep(1.5)                                   # past the idle timeout: both slots are given back
-        assert _req(port, "GET")[0].status == 200
+        assert _req(port, "GET", "/view.json")[0].status == 200
     finally:
         for c in idle:
             c.close()
@@ -1165,7 +1286,7 @@ def test_a_failed_fetch_is_not_shown_after_a_later_fetch_succeeded():
             return "git fetch failed: the network went away"
     httpd = _serve(Raced())
     try:
-        page = _req(httpd.server_address[1], "GET", "/?fetch=1")[1].decode()
+        page = _page(httpd.server_address[1], "/?fetch=1")
         assert "fetch-error" not in page
     finally:
         httpd.shutdown()
@@ -1188,9 +1309,9 @@ def test_the_quarantine_is_judged_fresh_on_every_page():
     httpd = _serve(stub)
     try:
         port = httpd.server_address[1]
-        assert "refused as tampered" in _req(port, "GET")[1].decode()
+        assert "refused as tampered" in _page(port)
         stub.bad = []                                   # `levain team repin` accepted it: no fetch attempt
-        assert "refused as tampered" not in _req(port, "GET")[1].decode()
+        assert "refused as tampered" not in _page(port)
     finally:
         httpd.shutdown()
         httpd.server_close()
