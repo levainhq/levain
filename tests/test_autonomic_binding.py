@@ -495,6 +495,8 @@ def test_non_object_top_level_reads_empty(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         assert s.list_all() == []
     assert "not an object" in caplog.text
+    with pytest.raises(ValueError, match=f"{s.path.name}.*repaired by hand"):   # names the file
+        s.add(make_binding())
 
 
 def test_an_entry_whose_id_is_not_its_key_reads_empty_and_refuses_writes(tmp_path, caplog):
@@ -617,17 +619,40 @@ def test_a_duplicate_key_inside_a_record_is_refused(tmp_path):
         s.ratify(b.binding_id)
 
 
-def test_re_add_over_only_malformed_record_uses_incoming_not_entomb(tmp_path, caplog):
+def test_re_add_over_a_malformed_record_refuses(tmp_path):
+    # Was: the incoming record was written over it. But a record whose status cannot be read may be
+    # a revoked tombstone, and writing over it revived the grant (L1+L2, S1h-2, reproduced). Refuse.
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
     rec = json.loads(s.path.read_text())[b.binding_id]
     s.path.write_text(json.dumps({b.binding_id: dict(rec, status="frozen")}))   # malformed status
-    with caplog.at_level("WARNING"):
+    before = s.path.read_text()
+    with pytest.raises(ValueError, match="malformed"):
         s.add(make_binding())
-    got = s.get(b.binding_id)
-    assert got is not None and got.status is BindingStatus.ACTIVE  # not entombed; incoming used
-    assert "malformed" in caplog.text
+    assert s.path.read_text() == before
+
+
+def test_a_non_dict_graduation_is_skipped_not_raised(tmp_path):
+    # Graduation.from_dict raised AttributeError on a non-dict, which escaped _load and made every
+    # read of the registry raise (L1+L2, S1h-2)
+    s = store(tmp_path)
+    good, other = make_binding(), make_binding(posture=Posture.ON_LOOP)
+    s.add(good)
+    s.add(other)
+    raw = json.loads(s.path.read_text())
+    raw[other.binding_id]["graduation"] = "x"
+    s.path.write_text(json.dumps(raw))
+    assert [x.binding_id for x in s.list_all()] == [good.binding_id]
+
+
+def test_nesting_too_deep_reads_empty_and_refuses_writes(tmp_path):
+    # json.loads raises RecursionError, not ValueError, on deep nesting (L2, S1h-2)
+    s = store(tmp_path)
+    s.path.write_text("[" * 100_000 + "]" * 100_000)
+    assert s.list_all() == []
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.add(make_binding())
 
 
 # --- read failure UNDER MUTATION must fail loud, never write-on-empty (nemotron-MED-1) ---
