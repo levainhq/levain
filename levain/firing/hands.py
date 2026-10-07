@@ -13,7 +13,7 @@ one.
 WHAT THIS MODULE DOES. It builds and runs the one-time, root-only setup (``sudo levain
 setup-isolation``) and its exact reverse (``--undo``). The plan is computed as data first
 (:func:`plan_setup`, :func:`plan_undo`), so tests check it without root and ``--dry-run`` prints it.
-The spawn that USES the user lives in :mod:`levain.firing.confinement`.
+Nothing here starts the entity's bash; this module only creates and removes the user.
 
 The hands user:
   - is named ``_levain_<slug>_<hash>`` from the entity's resolved path, so two entities never share
@@ -168,8 +168,11 @@ def plan_setup(
     host: HostOS,
     used_ids: set[int] | None = None,
     hands_home_darwin: Path | None = None,
+    git_identity: dict[str, str] | None = None,
 ) -> Plan:
-    """The setup, as data. ``used_ids`` (macOS only) is every UniqueID and PrimaryGroupID in use."""
+    """The setup, as data. ``used_ids`` (macOS only) is every UniqueID and PrimaryGroupID in use.
+    ``git_identity`` is the operator's ``user.name`` / ``user.email``, copied to the hands user so
+    the entity's commits carry the operator's identity, as they did when bash ran as the operator."""
     ed = Path(entity_dir).expanduser().resolve()
     ws = ed / "workspace"
     hands = hands_user_name(ed)
@@ -232,6 +235,10 @@ def plan_setup(
         validate=("visudo", "-cf"),
     ))
     steps += _git_safe_dir_steps(hands, hands_home, safe_value, add=True)
+    for key, value in sorted((git_identity or {}).items()):
+        steps.append(Step(f"give the hands user your git {key}",
+                          ("/usr/bin/sudo", "-u", hands, "/usr/bin/env", f"HOME={hands_home}",
+                           "git", "config", "--global", key, value)))
     op_home = _home_of(operator)
     steps += _git_safe_dir_steps(operator, op_home, safe_value, add=True)
     return Plan(host, operator, hands, group, ed, ws, tuple(steps))
@@ -287,6 +294,19 @@ def _home_of(user: str, default: str | None = None) -> str:
         if default is not None:
             return default
         raise HandsSetupError(f"no such user {user!r}") from None
+
+
+def operator_git_identity(operator: str) -> dict[str, str]:
+    """The operator's global ``user.name`` / ``user.email``, read as the operator; missing keys are
+    left out."""
+    found: dict[str, str] = {}
+    for key in ("user.name", "user.email"):
+        r = subprocess.run(["/usr/bin/sudo", "-u", operator, "/usr/bin/env", f"HOME={_home_of(operator)}",
+                            "git", "config", "--global", "--get", key],
+                           capture_output=True, text=True, cwd="/")
+        if r.returncode == 0 and r.stdout.strip():
+            found[key] = r.stdout.strip()
+    return found
 
 
 def host_os() -> HostOS:
@@ -460,7 +480,8 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
               + ("Run with --undo, then again." if what.startswith("a previous") else "Remove or rename it first."))
         return 1
     plan = plan_setup(entity_dir, operator=operator, host=host,
-                      used_ids=darwin_used_ids() if host == "darwin" else None)
+                      used_ids=darwin_used_ids() if host == "darwin" else None,
+                      git_identity=operator_git_identity(operator) if not dry_run else None)
     print(f"Setting up hands isolation for {entity_dir}: bash will run as {plan.hands_user}.")
     rc = run_plan(plan, dry_run=dry_run)
     if rc != 0:

@@ -1761,9 +1761,8 @@ class ConfinementConfig:
     # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
     # ``test_confinement_config_field_order_is_append_only`` pins it.
     hands_user: str | None = None
-    # M2: the dedicated unprivileged user the entity's bash runs as outside the interactive REPL,
-    # written by `sudo levain setup-isolation` and removed by its `--undo`. Absent means not set up:
-    # bash runs as the operator. Appended last, per the rule above.
+    # M2: the dedicated unprivileged user `sudo levain setup-isolation` created for this entity's
+    # bash, removed by its `--undo`. Absent means not set up. Appended last, per the rule above.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"

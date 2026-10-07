@@ -887,10 +887,9 @@ def _check_confinement(install: Path) -> list[CheckResult]:
 def _check_hands_isolation(install: Path) -> list[CheckResult]:
     """Is this entity's bash run as its own unprivileged user outside the interactive REPL (M2)?
 
-    Not set up is a WARNING, loud but not a failure: the entity works, but a headless chat turn or
-    an unattended run executes as the operator, so its bash can read the argv and environment of
-    every process the operator runs. Set up but not usable (the user or the sudoers rule is gone)
-    is a FAILURE: those runs refuse to start rather than fall back to the operator's account."""
+    Not set up is a WARNING, loud but not a failure: the entity works, but its bash runs as the
+    operator, so it can read the argv and environment of every process the operator runs. A
+    recorded user that cannot be started (deleted, or its sudoers rule gone) is a FAILURE."""
     name = "hands isolation"
     try:
         from levain.firing.confinement import load_confinement_config
@@ -918,8 +917,7 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     try:
         pwd.getpwnam(cfg.hands_user)
     except KeyError:
-        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist; headless and "
-                            "unattended runs will refuse to start",
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist",
                             hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
     # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
     # operator cannot see it. Starting a process as the hands user is the test that matters.

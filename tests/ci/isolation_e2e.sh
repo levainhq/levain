@@ -28,6 +28,7 @@ check "dry run" "$LEVAIN" setup-isolation --path "$E" --dry-run
 refused "non-root setup" "$LEVAIN" setup-isolation --path "$E"
 
 echo "== setup"
+git config --global user.name "CI Operator"; git config --global user.email ci-operator@invalid
 sudo -E env "PATH=$PATH" "$LEVAIN" setup-isolation --path "$E" || { echo "setup failed"; exit 1; }
 H=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["hands_user"])' "$E/.levain/confinement.json")
 echo "hands user: $H"
@@ -79,7 +80,7 @@ check "operator creates a file" bash -c "echo o > '$WS/from-op'"
 check "hands appends to it" sudo -n -u "$H" bash -c "cd '$WS' && echo h >> from-op"
 check "operator git repo" bash -c "cd '$WS' && git init -q repo && cd repo && git -c user.name=ci -c user.email=ci@invalid commit -q --allow-empty -m init"
 check "hands git status in the operator's repo" sudo -n -u "$H" env "HOME=$(eval echo ~"$H")" bash -c "cd '$WS/repo' && git status --short"
-check "hands git commit in it" sudo -n -u "$H" env "HOME=$(eval echo ~"$H")" bash -c "cd '$WS/repo' && echo x > f && git add f && git -c user.name=h -c user.email=h@invalid commit -q -m h"
+check "hands git commit in it, with the operator's git identity" sudo -n -u "$H" env "HOME=$(eval echo ~"$H")" bash -c "cd '$WS/repo' && echo x > f && git add f && git commit -q -m h && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
 check "operator git log sees it" bash -c "cd '$WS/repo' && test \"\$(git log --oneline | wc -l)\" -eq 2"
 
 echo "== undo"

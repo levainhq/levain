@@ -310,3 +310,14 @@ def test_setup_generates_the_entity_key_as_the_hands_user_without_a_passphrase_p
     mk = next(s for s in plan.steps if s.argv[-1] == str(Path(key).parent))
     assert "-m" in mk.argv and mk.argv[mk.argv.index("-m") + 1] == "700"
     assert plan.steps.index(mk) < plan.steps.index(keygen)
+
+
+def test_the_operators_git_identity_is_copied_to_the_hands_user(tmp_path: Path) -> None:
+    ident = {"user.name": "Alice A", "user.email": "a@example.invalid"}
+    plan = plan_setup(_entity(tmp_path), operator="alice", host="linux", git_identity=ident)
+    sets = {s.argv[-2]: s.argv[-1] for s in plan.steps
+            if s.argv[-3:-2] == ("--global",) and s.argv[-2] in ident}
+    assert sets == ident
+    assert all(s.argv[2] == plan.hands_user for s in plan.steps if s.argv[-2:-1] in (("user.name",), ("user.email",)))
+    assert not [s for s in plan_setup(_entity(tmp_path / "b"), operator="alice", host="linux").steps
+                if "user.name" in s.argv]
