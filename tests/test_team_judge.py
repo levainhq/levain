@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1184,3 +1185,116 @@ def test_recovery_commits_only_an_append_to_this_clones_own_file(two):
     own = git("cat-file", "blob", f"levain-ledger:{f.relative_to(gb.wt).as_posix()}", cwd=ben)
     assert "an append" not in own and "mine" in own and "second" in own
     assert any((gb.base / "set-aside").iterdir())
+
+
+def _edit_in_process(repo, rel="src/settlement.py"):
+    from levain.team import hook as H
+    import io
+    import contextlib as _cl
+    buf = io.StringIO()
+    with _cl.redirect_stdout(buf):
+        H.pretooluse({"session_id": "dl", "transcript_path": "/x", "cwd": str(repo), "hook_event_name": "PreToolUse",
+                      "tool_name": "Edit", "tool_input": {"file_path": str(repo / rel)}, "tool_use_id": "t"})
+    return json.loads(buf.getvalue()) if buf.getvalue().strip() else {}
+
+
+def test_a_judgement_slowed_by_a_held_lock_is_denied_inside_the_deadline(two, monkeypatch):
+    # Head ruling on L1 r3 MED 4: Claude Code lets an edit through when the hook is killed at its timeout, so a slow
+    # judgement was a fail-open path. ONE deadline; running out while waiting for a lock is a deny.
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.5)
+    gb = _gl(ben)
+    (gb.base / "history.json").unlink(missing_ok=True)       # a read must accept, under pins.lock
+    fd = os.open(gb.base / "pins.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        t0 = time.monotonic()
+        out = _edit_in_process(ben, "src/billing.py")
+        took = time.monotonic() - t0
+    finally:
+        os.close(fd)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert took < 4
+
+
+def test_a_judgement_slowed_by_git_is_denied_inside_the_deadline(two, monkeypatch):
+    from levain.team import hook as H
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.5)
+    real = T.subprocess.run
+
+    def slow(cmd, *a, **k):
+        if "ls-tree" in cmd:
+            cmd = ["sh", "-c", "sleep 5"]
+        return real(cmd, *a, **k)
+    monkeypatch.setattr(T.subprocess, "run", slow)
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    t0 = time.monotonic()
+    out = _edit_in_process(ben, "src/billing.py")
+    assert time.monotonic() - t0 < 4
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_the_alarm_backstop_denies_time_spent_outside_git_and_locks(two, monkeypatch, capsys):
+    from levain.team import hook as H
+    from levain.team import index as I
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+    real = I.build
+
+    def slow(*a, **k):
+        time.sleep(3)
+        return real(*a, **k)
+    monkeypatch.setattr(I, "build", slow)
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    payload = {"session_id": "al", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+               "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "billing.py")}, "tool_use_id": "t"}
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
+    t0 = time.monotonic()
+    assert H.main(["pretooluse"]) == 0
+    assert time.monotonic() - t0 < 2.5
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "took too long" in out["permissionDecisionReason"]
+
+
+def test_an_edit_outside_every_clone_is_not_judged_by_the_sessions_cwd(two):
+    # L1 r3 LOW 11: the session's cwd widens only the boundary's deny condition; it is not a place to judge from.
+    tmp, ana, ben = two
+    outside = tmp / "elsewhere"
+    outside.mkdir()
+    (_gl(ben).base / "state.json").write_text('{"device": "not hex"}')
+    out = hook("pretooluse", {"session_id": "cw", "transcript_path": "/x", "cwd": str(ben),
+                              "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                              "tool_input": {"file_path": str(outside / "a.py")}, "tool_use_id": "t"})
+    assert out == {}
+
+
+def test_a_busy_session_record_keeps_the_rulings_words_in_the_deny(two):
+    # L1 r3 LOW 9: a TeamBusy from mark_denied reached the boundary, and the deny lost the ruling's text.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    fd = os.open(gb.base / "sessions.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        out = edit(ben, "src/settlement.py", session="busy")["hookSpecificOutput"]
+    finally:
+        os.close(fd)
+    assert out["permissionDecision"] == "deny" and "write_batch" in out["permissionDecisionReason"]
+
+
+def test_a_deleted_process_cwd_does_not_break_the_boundary(tmp_path):
+    # L1 r3 LOW 12: with no payload cwd and this process's own cwd deleted, the boundary's own check raised.
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    payload = json.dumps({"session_id": "g", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                          "tool_input": {"file_path": "rel.py"}, "tool_use_id": "t"})
+    import sys as _sys
+    cp = subprocess.run(["sh", "-c", f'cd "{gone}" && rmdir "{gone}" && exec "$0" -P -m levain.team.hook pretooluse',
+                         _sys.executable], input=payload, capture_output=True, text=True, timeout=60,
+                        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout.strip() == "", cp.stdout

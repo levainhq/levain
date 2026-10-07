@@ -17,6 +17,7 @@ the same five operations (append, sync, fetch_if_due, ledger, write_canon), not 
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import hashlib
 import fcntl
 import json
@@ -58,6 +59,43 @@ class LedgerReadError(TeamError):
 
 class TeamBusy(TeamError):
     """A lock was not acquired in time."""
+
+
+class DeadlineExceeded(TeamError):
+    """The caller's one deadline (``deadline``) ran out: the work was cut off, so its answer is not known."""
+
+
+# ONE deadline for a whole operation (the edit hook's judgement): every git call and every lock wait below is clamped to
+# what is left of it, and none starts after it. Unset, nothing is clamped.
+_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar("levain_team_deadline", default=None)
+
+
+@contextlib.contextmanager
+def deadline(seconds: float):
+    """Run the block under one deadline ``seconds`` from now (an outer, earlier deadline wins)."""
+    end = time.monotonic() + seconds
+    outer = _DEADLINE.get()
+    token = _DEADLINE.set(end if outer is None else min(outer, end))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def expired() -> bool:
+    end = _DEADLINE.get()
+    return end is not None and time.monotonic() >= end
+
+
+def left(cap: float) -> float:
+    """``cap`` clamped to what is left of the current deadline; DeadlineExceeded when nothing is."""
+    end = _DEADLINE.get()
+    if end is None:
+        return cap
+    remaining = end - time.monotonic()
+    if remaining <= 0:
+        raise DeadlineExceeded("the ledger judgement ran out of time")
+    return min(cap, remaining)
 
 
 # Every git call here is levain's own plumbing on a private worktree, so none of them runs the project's hooks: git on
@@ -214,11 +252,14 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
     # that is a path or ledger content is read from stdout_bytes. ``binary``: plumbing whose output is ledger content
     # or a tree; stdout is left empty (never a second, decoded copy of up to the size limits in memory).
+    timeout = left(timeout)
     try:
         data = input_bytes if input_bytes is not None else (None if input_text is None else input_text.encode("utf-8"))
         raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True,
                              timeout=timeout, input=data, stdin=None if data is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
+        if expired():
+            raise DeadlineExceeded(f"the ledger judgement ran out of time (in git {args[0]})") from None
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
         raise TeamError("git is not on PATH") from None
@@ -417,13 +458,16 @@ class GitLedger:
         fd = os.open(self.base / name, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
-            deadline = time.monotonic() + timeout
+            until = time.monotonic() + left(timeout)
             while True:
                 try:
                     fcntl.flock(fd, mode)
                     break
                 except BlockingIOError:
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= until:
+                        if expired():
+                            raise DeadlineExceeded(f"the ledger judgement ran out of time (waiting for {name})") \
+                                from None
                         raise TeamBusy("ledger busy (another levain team operation holds the lock)") from None
                     time.sleep(0.05)
             yield
