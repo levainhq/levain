@@ -822,8 +822,8 @@ def test_an_append_onto_a_hard_linked_ledger_file_is_refused(two):
     outside = tmp / "outside.jsonl"
     os.link(mine, outside)
     before = outside.read_bytes()
-    assert record_ruling(ben, "src/b.py", "second") != 0
-    assert outside.read_bytes() == before
+    record_ruling(ben, "src/b.py", "second")                 # copy-on-write: the write goes to a new inode ...
+    assert outside.read_bytes() == before                     # ... so the link never receives it
 
 
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():

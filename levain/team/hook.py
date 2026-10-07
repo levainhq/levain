@@ -347,7 +347,7 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
     return f"[team] ledger imported into your memory store ({db.name})"
 
 
-_SESSIONSTART_BUDGET = 20.0   # seconds, the session start's whole network allowance (fetch plus the ack flush)
+_SESSIONSTART_BUDGET = 20.0   # seconds: the ack flush gets only what the fetch leaves of this
 
 
 def sessionstart(payload: dict) -> None:
