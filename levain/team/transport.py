@@ -683,6 +683,19 @@ class GitLedger:
             git(["update-ref", _ACCEPTED, rec.accepted], self.repo.toplevel, check=False)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    def devices(self) -> list[dict]:
+        """Every ledger file (one per member device) this clone has accepted, with when it was first seen and whether
+        that was this clone's first sight of the ledger: {"member", "device", "first_seen", "first_sight", "own"}.
+        Attribution is by folder and authenticated only by the git host's push permissions, so a device nobody added
+        is SHOWN here (and at session start), never refused: a teammate legitimately adds a laptop."""
+        rec, _problem = self._trust()
+        out = []
+        for rel, seen in sorted(rec.seen.items()):
+            member, _, name = rel.partition("/")
+            out.append({"member": member, "device": name[:-len(".jsonl")], "first_seen": seen["t"],
+                        "first_sight": seen["first"], "own": name == f"{self.device}.jsonl"})
+        return out
+
     def accepted_tip(self) -> str | None:
         """The remote tip this clone last accepted, from its trusted record (None before any)."""
         return self._trust()[0].accepted

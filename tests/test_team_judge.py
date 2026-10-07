@@ -962,3 +962,26 @@ def test_a_failed_fetch_is_saved_where_every_reader_sees_it(two):
     note = gb.fetch_only(interval=0, timeout=30)
     assert note and "fetch failed" in note
     assert "fetch failed" in GitLedger(Repo.discover(ben)).state().get("last_fetch_error", "")
+
+
+def test_a_device_file_pushed_under_another_member_is_shown(two, capsys):
+    # Head ruling on L3 r1 complement MED 1: attribution is by folder (authenticated only by the git host), so a new
+    # device file under ana's folder, pushed by ben, is not refused but must be SHOWN in status and at session start.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ana)                                                              # ana's first sight is behind her
+    gb = _gl(ben)
+    forged = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/z.py"],
+                            words="ana never said this"), "")
+    (gb.wt / "ledger" / "ana").mkdir(exist_ok=True)
+    (gb.wt / "ledger" / "ana" / "fedcba9876543210.jsonl").write_text(json.dumps(forged, sort_keys=True) + "\n")
+    _push_wt(gb, "a device under ana's folder")
+    assert team("sync", repo=ana) == 0
+    ledger(ana)
+    capsys.readouterr()
+    assert team("status", repo=ana) == 0
+    assert "fedcba9876543210" in capsys.readouterr().out
+    ctx = hook("sessionstart", {"session_id": "nd", "cwd": str(ana), "hook_event_name": "SessionStart",
+                                "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+    assert "new device fedcba9876543210 under ana" in ctx

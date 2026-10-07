@@ -17,6 +17,7 @@ extraction from shell is unreliable); that gap is documented, not hidden.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
@@ -422,6 +423,20 @@ def sessionstart(payload: dict) -> None:
     if pending:
         lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet"
                      + (f" ({I.oneline(push_note)})" if push_note else "") + "; run `levain team sync`")
+    # A device nobody here added is SHOWN (attribution is by folder; the git host authenticates pushes): one line for
+    # each one first seen in the last week, after this clone's first sight of the ledger.
+    week = time.time() - 7 * 86400
+    for d in gl.devices():
+        if d["own"] or d["first_sight"]:
+            continue
+        try:
+            fresh = calendar.timegm(time.strptime(d["first_seen"], "%Y-%m-%dT%H:%M:%SZ")) >= week   # UTC stamps
+        except (ValueError, OverflowError):
+            fresh = True
+        if fresh:
+            lines.append(f"[team] new device {I.oneline(d['device'])} under {I.oneline(d['member'])}, first seen "
+                         f"{I.oneline(d['first_seen'])}; if {I.oneline(d['member'])} did not add it, the remote was "
+                         "written by someone else")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
