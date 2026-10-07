@@ -31,7 +31,8 @@ snapshot that breaks one cannot exist):
   it and refuses an approve when the two differ or either is missing, so a driver with no digest has a
   hold that can only be rejected (not a contract violation: it fails closed).
 * The driver's :attr:`~HarnessDriver.state` is derived from the snapshot it returns, in the same step
-  that ends the turn: ``awaiting_approval`` exactly when that snapshot halted, ``idle`` otherwise. It is
+  that ends the turn: ``awaiting_approval`` when that snapshot halted, or when no snapshot could be built
+  (the call or the read raised: what the harness holds is unknown, so it fails closed), ``idle`` otherwise. It is
   for display and for the driver's own guards; the host does not check it against the outcome, because
   a state read after the turn returned can already have moved on (a close landing in between).
 
@@ -69,8 +70,8 @@ the neutral value (``0`` or ``3`` by ``ok``, ``False``, an empty list), never an
 from __future__ import annotations
 
 import abc
+import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, Sequence, runtime_checkable
@@ -235,6 +236,7 @@ class TurnSnapshot:
                 "nothing would stop them being run")
 
 
+_log = logging.getLogger(__name__)
 _ABSENT = object()
 _OUTCOME_FIELDS = ("reply", "tool_activity", "error", "nudged", "gated", "timed_out", "pending",
                    "held_digest", "ok", "exit_code")
@@ -250,16 +252,21 @@ def _lines(value: Any, what: str) -> tuple[Any, ...]:
 
 def _pending_row(p: Any) -> PendingApproval:
     """One held call, each attribute read ONCE and handed to :class:`PendingApproval`, which checks it.
-    The one value normalised rather than refused is a ``full`` that is not text: it reads as ``""``, the
-    contract's "could not be read", which makes the hold reject-only (fail closed, never open)."""
-    full: Any = getattr(p, "full", "")
-    name: Any = getattr(p, "tool_name", None)    # checked by PendingApproval, never coerced
+    A missing ``tool_name``, ``detail`` or ``reason`` is refused (a consent row with a blank explanation is
+    not one an operator can judge). Two values fail closed instead of being refused: a ``full`` that is
+    missing or not text reads as ``""``, the contract's "could not be read" (the hold is then reject-only),
+    and a missing ``recognized`` reads as ``False``."""
+    got = {n: getattr(p, n, _ABSENT) for n in ("tool_name", "detail", "reason", "full", "recognized")}
+    missing = [n for n in ("tool_name", "detail", "reason") if got[n] is _ABSENT]
+    if missing:
+        raise DriverContractError(f"a held action does not carry {', '.join(missing)}: there is no consent row to judge")
+    full, recognized = got["full"], got["recognized"]
     return PendingApproval(
-        tool_name=name,
-        detail=getattr(p, "detail", ""),
+        tool_name=got["tool_name"],
+        detail=got["detail"],
         full=full if isinstance(full, str) else "",
-        reason=getattr(p, "reason", ""),
-        recognized=getattr(p, "recognized", False),
+        reason=got["reason"],
+        recognized=False if recognized is _ABSENT else recognized,
     )
 
 
@@ -400,9 +407,10 @@ class OpenHandsDriver(HarnessDriver):
     A turn starts only from ``open`` and at most one runs; it ends in one lock hold that releases the turn
     guard and sets the state from the snapshot it returns, whatever it raised. :meth:`close` never
     releases a session under a running turn: it stops the turn and waits up to ``close_wait`` seconds for
-    the turn's own return, then releases (the turn is ended, not torn down). A turn still running when
-    that wait runs out, or when a stop request raises out of :meth:`close`, releases the session itself on
-    its return: the session is released exactly once and the phase then reads ``closed``, either way."""
+    the turn's own return, then releases (the turn is ended, not torn down). The stop requests run on a
+    thread of their own, so a blocking one cannot hold :meth:`close` past that wait. A turn still running
+    when the wait runs out releases the session itself on its return: the session is released exactly
+    once and the phase then reads ``closed``, either way."""
 
     entity_dir: Path
     opener: SessionOpener
@@ -417,7 +425,8 @@ class OpenHandsDriver(HarnessDriver):
     _cond: Any = field(default_factory=threading.Condition, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not (isinstance(self.close_wait, (int, float)) and 0 < self.close_wait <= threading.TIMEOUT_MAX):
+        wait = self.close_wait
+        if isinstance(wait, bool) or not (isinstance(wait, (int, float)) and 0 < wait <= threading.TIMEOUT_MAX):
             raise ValueError("close_wait must be a finite number of seconds above 0: close() is bounded")
 
     def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
@@ -497,7 +506,12 @@ class OpenHandsDriver(HarnessDriver):
                     owned, self._session = self._session, None
                 self._cond.notify_all()
             if release:
-                self._release(owned)
+                # The turn's own outcome is what this call returns (or raises); a failed release is logged,
+                # never allowed to replace it. _release marks the driver closed whatever the close raised.
+                try:
+                    self._release(owned)
+                except Exception as exc:  # noqa: BLE001
+                    _log.error("openhands driver: releasing the session after its turn failed: %s", exc)
 
     def send_turn(self, message: str, *, options: TurnOptions | None = None) -> TurnSnapshot:
         if options is not None and (options.model is not None or options.effort is not None):
@@ -535,24 +549,20 @@ class OpenHandsDriver(HarnessDriver):
                 self._cond.wait_for(lambda: self._phase == "closed", timeout=self.close_wait)
                 return
             self._phase = "closing"      # no new turn can start from here
-        deadline = time.monotonic() + self.close_wait
+            running = self._running
         owned: Any = None
         try:
-            while True:
-                with self._cond:
-                    if not self._running or time.monotonic() >= deadline:
-                        break
-                try:
-                    self.interrupt()
-                except Exception:  # noqa: BLE001 — keep asking; the turn's own return is what we wait for
-                    pass
-                with self._cond:
-                    if self._running:
-                        # repeated: a stop request landing before the run loop starts is undone by it
-                        self._cond.wait(max(0.0, min(1.0, deadline - time.monotonic())))
+            if running:
+                # The stop requests run on their own thread: one may block (the SDK's pause waits for a
+                # step's state lock), and close() waits only on the turn guard, with a deadline.
+                threading.Thread(target=self._stop_until_ended, daemon=True,
+                                 name="levain-driver-stop").start()
+            with self._cond:
+                self._cond.wait_for(lambda: not self._running, timeout=self.close_wait)
         finally:
-            # Reached when the wait runs out AND on a raise out of the stop request: whoever holds the
-            # session releases it, never both and never under a running turn.
+            # Reached when the wait runs out AND on a raise (a stopper that could not start, an interrupt
+            # of this thread): whoever holds the session releases it, never both and never under a
+            # running turn.
             with self._cond:
                 mine = not self._running
                 if mine:
@@ -561,6 +571,22 @@ class OpenHandsDriver(HarnessDriver):
                     self._turn_releases = True   # _run's own return releases it
             if mine:
                 self._release(owned)
+
+    def _stop_until_ended(self) -> None:
+        """Ask the running turn to stop, about once a second, until it ends (a stop request landing before
+        the run loop starts is undone by it). Outlives a close() that stopped waiting: the turn still
+        has to end for its own return to release the session."""
+        while True:
+            with self._cond:
+                if not self._running:
+                    return
+            try:
+                self.interrupt()
+            except Exception as exc:  # noqa: BLE001 — keep asking; the turn's own return is what ends this
+                _log.error("openhands driver: stop request failed: %s", exc)
+            with self._cond:
+                if self._running:
+                    self._cond.wait(1.0)
 
     def describe(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

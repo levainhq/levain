@@ -742,27 +742,24 @@ def test_a_base_exception_reading_the_result_still_releases_the_turn(tmp_path):
     assert not t.is_alive() and sess.closed and d.state == "closed"
 
 
-def test_a_stop_request_that_raises_out_of_close_still_ends_closed_and_released_once(tmp_path):
-    """L3 r2 (codex HIGH): a BaseException out of `request_stop` in close() left the phase `closing` forever and
-    the session never released. The running turn now releases it on its own return."""
-    class Bail(BaseException):
-        pass
-
+def test_a_failing_stop_request_never_releases_under_the_turn_and_close_still_ends_closed(tmp_path):
+    """L3 r2 (codex HIGH): a raise out of `request_stop` in close() left the phase `closing` forever and the
+    session never released. The stop requests now run on their own thread; a failing one is logged and
+    retried, close() returns at its bound, and the running turn releases the session on its own return."""
     hands = _Hands()
 
     def stop():
         hands.log.append("stop-raised")
-        raise Bail()
+        raise OSError("the stop request failed")
 
     hands.request_stop = stop                          # type: ignore[method-assign]
-    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=5)
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.3)
     d.open(lambda e: None)
     t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
     t.start()
     assert hands.entered.wait(5)
-    with pytest.raises(Bail):
-        d.close()
-    assert d.state == "active" and "close" not in hands.log     # never released under the running turn
+    d.close()
+    assert "stop-raised" in hands.log and d.state == "active" and "close" not in hands.log
     with pytest.raises(RuntimeError, match="not open"):
         d.send_turn("y")
     hands.stop.set()                                   # the turn returns on its own
@@ -771,6 +768,72 @@ def test_a_stop_request_that_raises_out_of_close_still_ends_closed_and_released_
     assert d.state == "closed" and d.native is None
     d.close()                                          # idempotent after the hand-off
     assert hands.log.count("close") == 1
+
+
+def test_a_blocking_stop_request_does_not_hold_close_past_its_bound(tmp_path):
+    """L1 (80d2fc4): close() called `request_stop` inline, which may block (the SDK's pause waits for a step's
+    state lock), so close_wait bounded nothing while it did. RAN: a 5 s stop request held close() 5 s."""
+    hands = _Hands()
+    release = threading.Event()
+
+    def stop():
+        hands.log.append("stop-blocking")
+        release.wait(5)
+        hands.stop.set()
+
+    hands.request_stop = stop                          # type: ignore[method-assign]
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.2)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
+    t.start()
+    assert hands.entered.wait(5)
+    started = time.monotonic()
+    d.close()
+    assert time.monotonic() - started < 1.5 and "close" not in hands.log
+    release.set()
+    t.join(5)
+    assert hands.log.count("close") == 1 and d.state == "closed"
+
+
+def test_a_release_that_fails_after_the_turn_does_not_replace_its_outcome(tmp_path):
+    """L1 + L2 (80d2fc4): when close() handed the release to the turn and the session's close raised, that
+    error replaced the turn's snapshot: a valid outcome turned into an exception, r2's class on the release side."""
+    hands = _Hands()
+    hands.request_stop = lambda: None                  # type: ignore[method-assign]
+
+    def bad_close():
+        hands.log.append("close")
+        raise OSError("close failed")
+
+    hands.close = bad_close                            # type: ignore[method-assign]
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.2)
+    d.open(lambda e: None)
+    got: list[Any] = []
+    t = threading.Thread(target=lambda: got.append(d.send_turn("x")), daemon=True)
+    t.start()
+    assert hands.entered.wait(5)
+    d.close()                                          # gives up waiting; the turn owns the release
+    hands.stop.set()
+    t.join(5)
+    assert got and isinstance(got[0], TurnSnapshot) and got[0].reply == "stopped"
+    assert hands.log.count("close") == 1 and d.state == "closed"
+
+
+def test_a_held_row_missing_its_explanation_is_refused():
+    """L1 (80d2fc4): a missing `reason` or `detail` read as "", a consent row with a blank explanation."""
+    class Row:
+        tool_name, full = "terminal", "{}"
+
+    for present in ({"reason": "r"}, {"detail": "d"}):
+        row = Row()
+        for k, v in present.items():
+            setattr(row, k, v)
+        with pytest.raises(DriverContractError, match="does not carry"):
+            read_outcome(_Out(reply=None, gated=True, pending=(row,), held_digest="d"))
+    row = Row()
+    row.detail, row.reason = "d", "r"                  # type: ignore[attr-defined]
+    snap = read_outcome(_Out(reply=None, gated=True, pending=(row,), held_digest="d"))
+    assert snap.pending[0].recognized is False         # a missing `recognized` fails closed
 
 
 def test_close_is_bounded_and_a_turn_outliving_it_releases_on_its_return(tmp_path):
@@ -797,7 +860,7 @@ def test_close_is_bounded_and_a_turn_outliving_it_releases_on_its_return(tmp_pat
     assert hands.log.count("close") == 1 and d.state == "closed"
 
 
-@pytest.mark.parametrize("wait", [0, -1, float("inf"), float("nan"), "30"])
+@pytest.mark.parametrize("wait", [0, -1, float("inf"), float("nan"), "30", True])
 def test_close_wait_must_be_a_finite_bound(tmp_path, wait):
     with pytest.raises(ValueError, match="bounded"):
         OpenHandsDriver(tmp_path, lambda p, on_event: None, close_wait=wait)
