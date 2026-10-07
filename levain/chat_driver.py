@@ -582,6 +582,15 @@ class OpenHandsDriver(HarnessDriver):
             else:
                 closed = _call_driver(lambda: session.close())     # the lookup is the session's code too
                 failure = None if closed.ok else f"close: {closed.error}"
+                if failure is None:
+                    # EntitySession.close never raises; a failed release is recorded on it instead, and a
+                    # close that returned normally is not a release until that says so (codex L3 r5).
+                    said = _call_driver(lambda: getattr(session, "release_error", None))
+                    if not said.ok:
+                        failure = f"close: release_error could not be read: {said.error}"
+                    elif said.value is not None:
+                        failure = (f"close: {said.value}" if type(said.value) is str
+                                   else "close: release_error is not text")
                 if failure is not None:
                     forced = _call_driver(self._escalate_release, session)
                     if forced.ok and forced.value is True:

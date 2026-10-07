@@ -1490,7 +1490,7 @@ def test_the_host_holds_no_driver_method():
     contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
     exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
     assert exposed == {"call", "read", "harness", "caps", "make", "submit_close", "retire", "release",
-                       "early_report", "stop_idle"}
+                       "early_report", "stop_idle", "fail_pending", "rec"}
     assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
     proxy = _DriverProxy("t")
     assert proxy.make(lambda: _Fake([]), timeout=2).ok
@@ -2023,7 +2023,7 @@ def test_a_stop_request_the_driver_never_answers_breaks_the_session(tmp_path, mo
     still outstanding breaks the session instead of handing it back for another turn."""
     import levain.chat as chat
 
-    monkeypatch.setattr(chat, "_CALL_SECONDS", 0.1)
+    monkeypatch.setattr(chat, "_STOP_SECONDS", 0.1)
     gate, stop = threading.Event(), threading.Event()
 
     class Stuck(_Fake):
@@ -2303,3 +2303,155 @@ def test_a_key_is_forgotten_after_its_ttl_and_the_oldest_past_the_cap(tmp_path, 
     for k in keys:
         host.open("alpha", idem_key=k)
     assert keys[0] not in host._idem and list(host._idem) == keys[1:]
+
+
+# -- the 2026-10-07 rulings on r5's two codex HIGHs ---------------------------------------------------------------
+
+
+def test_a_harness_that_ends_on_its_own_ends_the_session_and_frees_the_slot(tmp_path):
+    """codex r5 HIGH (RAN): a live driver's spontaneous release report was parked; the session stayed idle,
+    counted, and took turns to a dead backend. Ruled: no close in flight means the conversation ENDED."""
+    d = _Fake([_Out()])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    d.report(None)                                     # the harness died; nothing is live
+    view = host.session_status(sid)
+    assert view["state"] == "broken" and "ended on its own" in view["error"]
+    with pytest.raises(ChatError):
+        host.turn(sid, "hello?")
+    assert not d.calls
+    _open(host, "beta")                                # the slot is free
+
+
+def test_a_harness_that_ends_with_something_still_live_stays_counted(tmp_path):
+    d = _Fake([])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    d.report("OSError: the shell would not stop")
+    view = host.session_status(sid)
+    assert view["state"] == "release_failed" and "would not stop" in view["error"]
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.code == "too_many_sessions"
+
+
+def test_a_harness_that_ends_during_a_turn_takes_no_further_turn(tmp_path):
+    gate = threading.Event()
+
+    class Dies(_Fake):
+        def send_turn(self, message):
+            self.report(None)                          # it ends mid-turn ...
+            assert gate.wait(5)
+            return self._next("send_turn", message)   # ... and the call in flight still answers
+
+    d = Dies([_Out()])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    job = host.turn(sid, "go")["job_id"]
+    gate.set()
+    assert _wait(host, job)["status"] == "done"       # the turn keeps its own outcome
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the end")
+    assert "ended on its own" in host.session_status(sid)["error"]
+    _open(host, "beta")
+
+
+def test_a_harness_that_ends_while_opening_fails_the_open(tmp_path):
+    class DiesOpening(_Fake):
+        def open(self, on_event, *, on_released, resume=None):
+            super().open(on_event, on_released=on_released)
+            self.report(None)
+
+    host = _host(tmp_path, {"alpha": DiesOpening([]), "beta": _Fake([])}, max_sessions=1)
+    sid, st = _open(host, "alpha")
+    assert st["status"] == "failed" and "ended on its own" in st["error"]
+    _until(lambda: host.session_status(sid)["state"] == "failed", what="the release")
+    _open(host, "beta")
+
+
+def test_a_harness_that_ends_during_an_approve_runs_nothing(tmp_path):
+    class DiesOnDigest(_Fake):
+        def held_digest(self):
+            if self._state == "awaiting_approval" and self.reported is False and self.calls:
+                self.report(None)
+            return "d1"
+
+    d = DiesOnDigest([_halt(), _Out()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    did = _wait(host, host.turn(sid, "go")["job_id"])["result"]["decision_id"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=did)
+    assert e.value.code == "ended"
+    assert not [c for c in d.calls if c[0] == "approve"]
+    assert host.session_status(sid)["state"] == "broken"
+
+
+def test_entity_session_close_records_a_failed_release_and_never_raises():
+    """codex r5 HIGH (RAN): EntitySession.close swallowed a failed conversation close, so a release that
+    had failed read as done. It still never raises; the failure is recorded."""
+    from levain.session import EntitySession
+
+    class Conv:
+        def close(self):
+            raise RuntimeError("the shell would not stop")
+
+    s = object.__new__(EntitySession)
+    object.__setattr__(s, "_closed", False)
+    object.__setattr__(s, "release_error", None)
+    object.__setattr__(s, "conversation", Conv())
+    s.close()
+    assert s.release_error == "RuntimeError: the shell would not stop"
+
+
+def test_an_openhands_close_that_failed_quietly_keeps_the_slot(tmp_path):
+    """The head's fail-first test: the session's close fails (quietly, as EntitySession's does); the driver
+    reports the failure and the slot stays held, release_failed."""
+    class Sess:
+        release_error = None
+
+        def run_turn(self, m):
+            return _Out()
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            self.release_error = "RuntimeError: the shell would not stop"
+
+    host = ChatHost({"alpha": tmp_path / "a", "beta": tmp_path / "b"}, max_sessions=1,
+                    driver_factory=lambda n, p: OpenHandsDriver(p, lambda d, on_event: Sess(), close_wait=2))
+    sid, _ = _open(host, "alpha")
+    host.close(sid)
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the report")
+    assert "would not stop" in host.session_status(sid)["error"]
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.code == "too_many_sessions"
+
+
+def test_a_driver_made_after_its_deadline_is_closed(tmp_path, monkeypatch):
+    """L1 r5: a factory that answered after the host gave up made a driver nobody held or closed."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_OPEN_SECONDS", 0.2)
+    gate = threading.Event()
+    late = _Fake([])
+
+    def factory(name, path):
+        gate.wait(5)
+        return late
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=factory)
+    out = host.open("alpha")
+    assert _wait(host, out["job_id"])["status"] == "failed"
+    gate.set()
+    _until(lambda: late.closed, what="the late driver's close")
+
+
+def test_no_turn_runs_without_a_bound():
+    """L1 r5 #4 / L2 F8: turn_seconds=None meant an unbounded wait on the turn lane; it is the default, as
+    on the command line."""
+    from levain.chat import DEFAULT_TURN_SECONDS
+
+    host = ChatHost({"alpha": Path("/nonexistent")}, driver_factory=lambda n, p: _Fake([]), turn_seconds=None)
+    assert host.listing()["turn_seconds"] == DEFAULT_TURN_SECONDS

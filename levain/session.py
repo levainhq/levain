@@ -537,6 +537,10 @@ class EntitySession:
     """Why bash was dropped when the cause is THIS entity's floor rather than the host's sandbox
     (the host-side reasons come from ``diagnose_confinement``). The banner prints it verbatim."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    release_error: str | None = field(default=None, init=False, repr=False, compare=False)
+    """Why :meth:`close` could not release the conversation (its class and text), or ``None``. ``close``
+    never raises, so this is how a caller that must not count a live shell as released (the chat driver)
+    learns that it failed."""
     _stop_requested: bool = field(default=False, init=False, repr=False, compare=False)
     _turn_active: bool = field(default=False, init=False, repr=False, compare=False)
     _turn_start: int | None = field(default=None, init=False, repr=False, compare=False)
@@ -1390,14 +1394,22 @@ class EntitySession:
         lost. Here the boundary IS the availability of an OS resource — a leaked process group
         outlives the process that made it — so completing the release beats propagating the
         interruption. A genuinely hung teardown is still bounded, by layer 2 taking the whole
-        process down."""
+        process down.
+
+        Never raising is not the same as succeeding: a ``conversation.close()`` that raised did not
+        release the shell, and that is recorded in :attr:`release_error` (codex L3 r5 on the chat
+        driver, run: the driver reported a release that had failed)."""
         if self._closed:
             return
         self._closed = True
         try:
             self.conversation.close()
-        except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
-            pass
+        except BaseException as exc:  # noqa: BLE001 — teardown must never raise; see the docstring
+            try:
+                text = f"{type(exc).__name__}: {exc}"
+            except BaseException:  # noqa: BLE001 — an exception whose text cannot be read
+                text = "the conversation's close raised"
+            self.release_error = text
 
     @property
     def closed(self) -> bool:
