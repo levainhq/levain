@@ -1358,12 +1358,14 @@ class TestRecallJson:
 
 
 @contextmanager
-def _serving_extra(source: SubstrateSource, *, extra_assets=None, extra_json=None):
+def _serving_extra(source: SubstrateSource, *, extra_assets=None, extra_json=None, extra_shell_paths=None,
+                   read_token=None):
     """A real server carrying downstream-registered read-only extra routes — the live
     harness for the FleetView extension point (make_server extra_assets/extra_json)."""
     httpd = make_server(
         source, host="127.0.0.1", port=0,
-        extra_assets=extra_assets, extra_json=extra_json, read_token=None,
+        extra_assets=extra_assets, extra_json=extra_json, read_token=read_token,
+        extra_shell_paths=extra_shell_paths,
     )
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -1678,23 +1680,48 @@ class TestOffBoxWriteToken:
             assert _get_h(base + "/substrate.json")[0] == 200
             assert _get_h(base + "/recall.json?keyword=x")[0] == 200
 
-    def test_offbox_extra_json_gated_but_extra_asset_free(self, tmp_path: Path) -> None:
+    def test_offbox_extra_json_gated_but_a_named_shell_asset_free(self, tmp_path: Path) -> None:
         # spore-220: a downstream extra_json view (the Bridge's /fleet.json = flow's fleet topology)
         # rides the SAME off-box gate — the kernel owns the security envelope for EVERY read route it
-        # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset
-        # (the /fleet app shell) stays token-free like the built-in assets (bootstrap, no data).
+        # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset is
+        # token-free only when the registrant names it in extra_shell_paths (codex L3, head ruling
+        # 2026-10-07); an unnamed one is gated like the JSON.
         src = self._writable_noinstall(tmp_path)
         with _serving_extra(
             src,
-            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>fleet</title>")},
+            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html><title>fleet</title>"),
+                          "/fleet-data.js": ("text/javascript", b"var secret = 1;")},
             extra_json={"/fleet.json": lambda: b'{"fleet":[]}'},
+            extra_shell_paths=frozenset({"/fleet"}),
         ) as (base, httpd):
             httpd.is_loopback_bind = False
             httpd.write_token = "s3cret"
             assert _get_h(base + "/fleet.json")[0] == 403
             assert _get_h(base + "/fleet.json",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
-            assert _get_h(base + "/fleet")[0] == 200  # app shell token-free
+            assert _get_h(base + "/fleet")[0] == 200  # the named app shell is token-free
+            assert _get_h(base + "/fleet-data.js")[0] == 403   # an unnamed extra asset is not
+
+    def test_an_extra_asset_needs_the_launch_token_unless_named_as_shell(self, tmp_path: Path) -> None:
+        """codex L3 HIGH: every extra asset was token-free, so a registrant's data in one was served ungated."""
+        tok = "T" * 32
+        with _serving_extra(
+            self._writable_noinstall(tmp_path),
+            extra_assets={"/fleet": ("text/html; charset=utf-8", b"<!doctype html>"),
+                          "/snapshot.json": ("application/json", b'{"secret": 1}')},
+            extra_shell_paths=frozenset({"/fleet"}), read_token=tok,
+        ) as (base, _httpd):
+            assert _get_h(base + "/snapshot.json")[0] == 403
+            assert _get_h(base + "/snapshot.json", headers={"X-Levain-Token": tok})[0] == 200
+            assert _get_h(base + "/fleet")[0] == 200
+
+    def test_extra_shell_paths_must_name_extra_assets(self, tmp_path: Path) -> None:
+        src = self._writable_noinstall(tmp_path)
+        for bad in (frozenset({"/fleet.json"}), frozenset({"/nowhere"}), ["/fleet"]):
+            with pytest.raises(ValueError, match="extra_shell_paths"):
+                make_server(src, host="127.0.0.1", port=0, read_token=None,
+                            extra_assets={"/fleet": ("text/html", b"x")},
+                            extra_json={"/fleet.json": lambda: b"{}"}, extra_shell_paths=bad)
 
     def test_offbox_write_requires_correct_token(self, tmp_path: Path) -> None:
         # The enforcement: off-box, POST /edit demands X-Levain-Write-Token == the server's

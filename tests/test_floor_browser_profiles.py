@@ -155,12 +155,26 @@ def test_every_browser_profile_root_is_denied_to_the_file_editor(home: Path) -> 
         assert crown_jewel_reason(policy, home / rel / "Default" / "Cookies") is not None, rel
 
 
-@pytest.mark.skipif(platform.system() == "Darwin", reason="Linux-only rule")
-def test_on_linux_an_absent_browser_is_not_denied_so_bwrap_does_not_create_it(home: Path) -> None:
-    """codex L3: bwrap creates an absent denied path on the host to mount over it."""
-    assert browser_profile_roots(home) == []
+def test_on_linux_an_absent_root_is_denied_and_created_only_where_its_parent_exists(home: Path, monkeypatch) -> None:
+    """Head ruling 2026-10-07 (gemini L3): an absent root under a present parent is denied, so an entity cannot plant
+    it as a link mid-session; its mountpoint is levain's, recorded for removal at close. One whose parent is absent
+    (no ~/snap) is not denied, so nothing is created under a missing parent."""
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    (home / ".config").mkdir(exist_ok=True)
+    entity = _entity(home)
+    policy = build_policy(entity)
+    for rel in (".mozilla", ".zen", ".config/google-chrome", ".config/opera"):
+        root = (home / rel).resolve()
+        assert root in policy.deny_read_write and root in policy.browser_mountpoints, rel
+        assert not root.exists(), rel                          # building the policy creates nothing
+    for rel in ("snap/firefox/common/.mozilla", ".var/app", ".cache/chrome-devtools-mcp"):
+        assert (home / rel).resolve() not in policy.deny_read_write, rel
     (home / ".mozilla").mkdir()
-    assert browser_profile_roots(home) == [(home / ".mozilla").resolve()]
+    assert (home / ".mozilla").resolve() not in build_policy(entity).browser_mountpoints   # present: not ours
 
 
 def test_each_ruled_browser_profile_file_is_denied_on_macos(home: Path, monkeypatch) -> None:
@@ -254,10 +268,12 @@ def test_a_profile_that_appears_mid_session_is_denied_from_the_next_spawn(home: 
     """L1: the roots are re-derived at every spawn, as a union."""
     cf = _linux(monkeypatch)
     policy = build_policy(_entity(home))
-    assert crown_jewel_reason(policy, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is None
-    (home / ".mozilla").mkdir()
+    cookie = home / "snap" / "firefox" / "common" / ".mozilla" / "firefox" / "x" / "cookies.sqlite"
+    assert crown_jewel_reason(policy, cookie) is None          # no ~/snap/firefox yet: nothing to mount on
+    (home / "snap" / "firefox" / "common").mkdir(parents=True)   # snapd installs Firefox mid-session
     refreshed = cf.refresh_socket_denies(policy)
-    assert crown_jewel_reason(refreshed, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
+    assert crown_jewel_reason(refreshed, cookie) is not None
+    assert (home / "snap/firefox/common/.mozilla").resolve() in refreshed.browser_mountpoints
 
 
 @pytest.mark.parametrize("osname,store", [

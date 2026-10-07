@@ -572,9 +572,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     write_token: str | None
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
-    # cached static bytes (ungated, like levain_assets); extra_json are per-request
+    # cached static bytes (gated unless named in extra_shell_paths); extra_json are per-request
     # builders served under the concurrency gate (like /substrate.json).
     extra_assets: dict[str, tuple[str, bytes]]
+    extra_shell_paths: frozenset[str]   # the extra assets that skip the launch token and off-box gates
     extra_json: dict[str, Callable[[], bytes]]
     # Downstream-injected READ-ONLY inline PANELS (the panel peer of the extra-route seam): a
     # per-request provider returning panel descriptors+data that render INLINE in the dashboard
@@ -686,13 +687,13 @@ class _Handler(GuardedHandler):
         # server has one, was checked before this): (1) a read-ONLY mesh bind
         # (``write_scope`` None → not required) — iPad/iPhone VIEWING stays open, the whole point of a
         # read-only mesh serve; (2) the APP-SHELL static assets (the built-in html/css/js + any
-        # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
+        # downstream ``extra_shell_paths``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
         if (
             self._write_token_required()
             and path not in _ASSETS
-            and path not in self.server.extra_assets
+            and path not in self.server.extra_shell_paths
             and not self._off_box_token_valid()
         ):
             # JSON body carrying a token message so the frontend distinguishes a token-403 from a
@@ -1044,6 +1045,7 @@ def make_server(
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
     read_token: str | None,
+    extra_shell_paths: "frozenset[str] | set[str] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1060,11 +1062,12 @@ def make_server(
     + ``/fleet.json`` (live) here rather than standing up a second server that would
     re-implement (and could drift from) the bind-refusal contract
     (``structural_invariants_beat_discipline``). ``extra_assets`` maps a path →
-    ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets); ⚠ SECURITY
-    (spore-220): an ``extra_asset`` is served TOKEN-FREE even on an off-box writable bind (it is the
-    app shell — the browser must load it to supply the off-box token on the data fetches), so it MUST
-    NOT carry substrate data — put any per-request substrate behind ``extra_json``, which the off-box
-    read gate covers. This is a REGISTRANT contract the kernel can't enforce on static bytes.
+    ``(content_type, body_bytes)`` (cached), served behind the launch token and the off-box read gate like
+    every other route. ``extra_shell_paths`` names the extra assets that are the registrant's app shell
+    (the page the browser must load before it has a token to send): those, and only those, skip both
+    gates, so they must carry no substrate data. It must be a subset of ``extra_assets``' paths
+    (``ValueError`` otherwise); a registrant that names none has every extra asset gated (codex L3,
+    head ruling 2026-10-07: the registrant names its shell, the kernel gates the rest).
     ``extra_json`` maps a path → a zero-arg builder called per request under the gate
     (like ``/substrate.json``), its body served as ``application/json``. Both are
     GET/HEAD-only: Levain dispatches them ONLY from the read path and has no POST handler
@@ -1089,7 +1092,7 @@ def make_server(
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
     ``read_token`` is REQUIRED, with no default, so every caller states its choice: a token turns on the
-    launch-token gate (every route except the page shell, the built-in assets and any ``extra_assets``,
+    launch-token gate (every route except the page shell, the built-in assets and ``extra_shell_paths``,
     then refuses a request without it), and ``None`` is the explicit, visible opt-out for an embedder
     that runs its own auth. A ``chat_host`` always runs gated: with ``None`` it gets a fresh token. A
     token that is empty or not URL-safe base64 is refused.
@@ -1179,6 +1182,15 @@ def make_server(
                 f"refusing extra route {path!r}: it collides with a built-in route "
                 "(a dashboard asset, the JSON reads, or /edit) and may not be overridden."
             )
+    if extra_shell_paths is not None and not (isinstance(extra_shell_paths, (set, frozenset))
+                                              and all(isinstance(p, str) for p in extra_shell_paths)):
+        raise ValueError("extra_shell_paths must be a set of paths")
+    shell_paths = frozenset(extra_shell_paths or ())
+    if not shell_paths <= set(extra_assets):
+        raise ValueError(
+            f"refusing extra_shell_paths {sorted(shell_paths - set(extra_assets))!r}: a token-free path must be "
+            "one of extra_assets (a static app shell), never a JSON route or an unregistered path."
+        )
     dup = set(extra_assets) & set(extra_json)
     if dup:
         raise ValueError(
@@ -1261,6 +1273,7 @@ def make_server(
     httpd.levain_source = source
     httpd.levain_assets = assets
     httpd.extra_assets = extra_assets
+    httpd.extra_shell_paths = shell_paths
     httpd.extra_json = extra_json
     httpd.extra_panels = extra_panels
     httpd.extra_verbs = extra_verbs
@@ -1270,7 +1283,7 @@ def make_server(
     # token-free set: the browser must load it to trade the link code in its fragment, and it carries no operator data.
     if token is None and chat_host is not None:
         token = new_launch_token()
-    arm_launch_token(httpd, token, frozenset(_ASSETS) | frozenset(extra_assets))
+    arm_launch_token(httpd, token, frozenset(_ASSETS) | shell_paths)
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the write-token-free localhost path is

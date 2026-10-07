@@ -665,6 +665,9 @@ class CrownJewelsPolicy:
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
     # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
+    browser_mountpoints: tuple[Path, ...] = ()  # Linux: the absent browser profile roots in
+    # `deny_read_write` that levain creates (empty, 0700) for the session so an entity cannot plant
+    # a link there mid-session (head ruling 2026-10-07); the spawn records them for removal at close.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -697,9 +700,11 @@ PROJECT_MEMORY_HOME = ".anneal-projects"
 #
 # Each entry is (platform, path, page-storage globs). On macOS every entry is denied whether or not it exists: a
 # Seatbelt rule for an absent path costs nothing, and an absent denied path cannot be created by the entity. On Linux
-# only an entry that exists when the policy is built or refreshed is denied, because bwrap CREATES an absent denied
-# path on the host to mount over it (codex L3); the policy is built at session start and the roots are re-derived at
-# every shell spawn (:func:`refresh_socket_denies`), so a browser first run mid-session is denied from the next spawn.
+# a mount needs a mountpoint: an entry is denied when it exists, or when its parent exists, in which case levain
+# creates it empty (0700) for the session and the spawn removes it at close if it is still empty and still levain's
+# (``browser_mountpoints``; head ruling 2026-10-07), so an entity cannot plant it as a link while its shell is live.
+# An entry whose parent is absent too (no ~/snap) is not denied; the roots are re-derived at every shell spawn
+# (:func:`refresh_socket_denies`), so it is covered from the spawn after its parent appears.
 # A path whose components include a symlink is denied at both spellings, the link's and its target's; a link that
 # reaches the entity's own workspace or directory refuses bash (:func:`_refuse_planted_browser_links`). On Linux,
 # entries under ``.config`` are denied under the default ``~/.config`` AND under ``$XDG_CONFIG_HOME`` and
@@ -815,6 +820,7 @@ class _BrowserRoot:
     globs: tuple[str, ...]     # its page storage, walked for other names
     link: Path | None = None   # the symlink on the way, when there is one
     present: bool = True       # False: only checked for where its link leads (Linux denies only what exists)
+    created: bool = False      # Linux: absent, its parent present: levain creates it empty for the session
 
 
 def _links_below(root: Path, globs: tuple[str, ...]) -> list[Path]:
@@ -850,6 +856,13 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
             if link is None:
                 if darwin or exists:
                     out.append(_BrowserRoot(c.resolve(), globs))
+                elif c.parent.is_dir() and os.access(c.parent, os.W_OK):
+                    # Absent, under a parent that exists (head ruling 2026-10-07, gemini L3): denied too, so
+                    # bwrap mounts over it and an entity cannot plant it as a link while its shell is live. The
+                    # mountpoint is the empty 0700 directory levain makes (:func:`_prepare_mountpoints`), recorded
+                    # in ``browser_mountpoints`` so the spawn removes it at close if it is still empty and still
+                    # levain's. A root whose parent is absent too (no ~/snap) waits for the next spawn's check.
+                    out.append(_BrowserRoot(c.resolve(), globs, created=True))
             else:   # both spellings; an absent target is still checked for where it leads
                 present = darwin or exists
                 out.append(_BrowserRoot(c, globs, link, present))
@@ -1257,7 +1270,9 @@ def build_policy(
     # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
     runtime = (home / RUNTIME_DIR_NAME).resolve()
     subtrees.append(runtime)
-    browsers = browser_profile_roots(home)
+    browser_roots = _browser_roots(home)
+    browsers = list(_dedup_paths([r.path for r in browser_roots if r.present]))
+    browser_mountpoints = _dedup_paths([r.path for r in browser_roots if r.created])
     subtrees.extend(browsers)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
@@ -1572,6 +1587,7 @@ def build_policy(
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
+        browser_mountpoints=browser_mountpoints,
     )
 
 
@@ -1683,8 +1699,12 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
     # Browser profile roots likewise (L1, 2026-10-07): a browser first run, or a root reached through a link that
     # appeared, after the session was built is denied from the next spawn on.
-    listed = [*listed, *browser_profile_roots(Path.home())]
+    browser_roots = _browser_roots(Path.home())
+    listed = [*listed, *_dedup_paths([r.path for r in browser_roots if r.present])]
     new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
+    new_mountpoints = [r.path for r in browser_roots if r.created and r.path not in policy.browser_mountpoints]
+    if new_mountpoints:
+        policy = replace(policy, browser_mountpoints=_dedup_paths([*policy.browser_mountpoints, *new_mountpoints]))
     if new_dirs:
         policy = replace(
             policy,
