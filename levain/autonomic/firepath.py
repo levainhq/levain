@@ -66,6 +66,7 @@ from levain.autonomic.chainpath import ChainExecutor, ChainOutcome
 from levain.autonomic.executor import ActionRequest
 from levain.autonomic.gate import EfferentGate, GateOutcome
 from levain.autonomic.journal import RunRef, run_id_for
+from levain.autonomic.monitor import guard_trajectory
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk
 
@@ -107,17 +108,6 @@ class FireDispatch:
     binding_id: str
     outcome: GateOutcome
     chain: ChainOutcome | None = None
-
-
-def _predicted_trajectory(binding: Binding) -> dict[str, Any] | None:
-    """The binding's prediction-error envelope to thread onto the request (the gate's 3a.5 monitor
-    diffs actual-vs-this on an autonomous fire). Picks the FIRST ``effective_guard`` guard carrying a
-    ``predicted_trajectory`` (floor before additions). A binding with several trajectories is a Slice-4b
-    concern (one envelope per link); 4a is single-link, so the first is the binding's."""
-    for g in binding.effective_guard:
-        if g.predicted_trajectory is not None:
-            return g.predicted_trajectory
-    return None
 
 
 def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
@@ -305,7 +295,7 @@ class FireDispatcher:
             risk=self._risk_resolver(fresh),
             authority=binding_invocation(fresh, hops=0),
             kill_predicates=_kill_predicates(fresh),
-            predicted_trajectory=_predicted_trajectory(fresh),
+            predicted_trajectory=guard_trajectory(fresh.effective_guard),
             ratified_posture=fresh.posture,
             trigger_event=event,
             run=RunRef(run_id, "link-0") if run_id is not None else None,

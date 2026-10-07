@@ -61,3 +61,20 @@ def test_a_failed_rollback_does_not_mask_the_error_that_caused_it(tmp_path):
         with db.write() as conn:
             conn.execute("COMMIT")          # the transaction is gone: ROLLBACK will itself fail
             raise KeyError("the real cause")
+
+
+def test_a_directory_created_by_another_opener_meanwhile_is_not_an_error(tmp_path, monkeypatch):
+    # glm MED (slice L3 r1): exists-then-mkdir raised FileExistsError when another store object made
+    # the directory between the two calls
+    target = tmp_path / "store"
+    real_exists = type(target).exists
+
+    def racing_exists(self, *a, **k):
+        if self == target and not real_exists(self):
+            self.mkdir(mode=0o700)                 # the other opener wins the race
+            return False
+        return real_exists(self, *a, **k)
+
+    monkeypatch.setattr(type(target), "exists", racing_exists)
+    AutonomicDB(target).meta("format")
+    assert (target / DB_NAME).exists()

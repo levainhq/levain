@@ -47,6 +47,7 @@ __all__ = [
     "trajectory_bound",
     "bound_declared",
     "assert_trajectory_pure",
+    "guard_trajectory",
     "within_envelope",
     "prediction_diverged",
 ]
@@ -81,6 +82,25 @@ def bound_declared(predicted_trajectory: Any) -> bool:
     """True iff the trajectory carries a ``bound`` KEY, whatever its value. A declared bound opts the
     binding into the monitor; one that is not a predicate dict cannot be evaluated and fails closed."""
     return isinstance(predicted_trajectory, dict) and "bound" in predicted_trajectory
+
+
+def guard_trajectory(guards: Any) -> dict[str, Any] | None:
+    """The one prediction-error envelope the monitor checks for a binding, from its guards' trajectories
+    (``effective_guard``: the sealed floor, then the tightening additions). Every DECLARED bound counts:
+    one is that trajectory, several are joined with ``and`` (the actual must be within all of them), and
+    a declared bound that is not a predicate is returned as it is, so the monitor fails closed on it. A
+    descriptive trajectory never hides a bound declared after it. With no bound declared, the first
+    trajectory (descriptive; the monitor is inert), or ``None``."""
+    trajectories = [g.predicted_trajectory for g in guards if g.predicted_trajectory is not None]
+    declared = [t for t in trajectories if bound_declared(t)]
+    if not declared:
+        return trajectories[0] if trajectories else None
+    unusable = next((t for t in declared if trajectory_bound(t) is None), None)
+    if unusable is not None:
+        return unusable
+    if len(declared) == 1:
+        return declared[0]
+    return {"bound": {"op": "and", "clauses": [trajectory_bound(t) for t in declared]}}
 
 
 def assert_trajectory_pure(predicted_trajectory: Any) -> None:

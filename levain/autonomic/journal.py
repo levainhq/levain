@@ -24,7 +24,8 @@ hold instead of opening a second one.
 
 Four properties, each one a run that fails without it:
 
-  - **hold-until-decided** — while a hold is open on a binding, no effect of that binding runs
+  - **hold-until-decided** — while a hold is open on a binding (undecided, and its run neither
+    cancelled nor fenced: a dead run's hold can never fire, so it stops nothing), no effect of that binding runs
     WITHOUT a decision, in this run or a sibling run (the "sibling leak": a gate that pauses one
     branch while another branch's undecided effect runs during the pause). An effect whose own hold
     was approved runs: a person approved exactly those bytes;
@@ -54,6 +55,7 @@ import enum
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -68,6 +70,8 @@ __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
     "run_id_for", "hold_id_for", "effect_digest",
 ]
+
+_log = logging.getLogger(__name__)
 
 
 class JournalCorruptError(RuntimeError):
@@ -150,6 +154,17 @@ def run_id_for(binding_id: str, event: Any) -> str:
     return "run-" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
+# SQL over ``holds``: the hold's run is neither cancelled nor fenced. A hold of a dead run can never fire
+# (its effect's barrier stops it), so it is no decision anyone owes and it stops nothing.
+_RUN_LIVE = (
+    "NOT EXISTS (SELECT 1 FROM cancels c WHERE c.run_id = holds.run_id) AND NOT EXISTS (SELECT 1 FROM "
+    "runs r JOIN fences f ON f.binding_id = r.binding_id WHERE r.run_id = holds.run_id AND "
+    "f.generation > r.generation)")
+# An OPEN hold: undecided, of a live run. The one definition used by the open-decision list and by
+# hold-until-decided.
+_OPEN_HOLD = f"decided IS NULL AND {_RUN_LIVE}"
+
+
 def hold_id_for(run_id: str, effect_id: str) -> str:
     """The one hold that can guard ``effect_id`` of ``run_id``."""
     return f"hold:{run_id}:{effect_id}"
@@ -227,10 +242,15 @@ class RunJournal:
         return fd
 
     def _drop_lease(self, run_id: str, effect_id: str, fd: int) -> None:
+        """Release a lease. Never raises: it runs after the effect's outcome is committed, and a lease
+        file left behind is only debris (an unlocked lease marks nothing in flight)."""
         try:
             self._lease_path(run_id, effect_id).unlink()
         except FileNotFoundError:
             pass
+        except OSError as e:
+            _log.error("run journal: could not remove lease %s/%s (%s): %s", run_id, effect_id,
+                       type(e).__name__, e)
         finally:
             os.close(fd)   # releases the flock
 
@@ -459,7 +479,7 @@ class RunJournal:
         if not approved:
             # hold-until-decided: an open hold anywhere on the binding stops an undecided effect,
             # whether the hold belongs to this run or a sibling.
-            other = conn.execute("SELECT hold_id FROM holds WHERE binding_id = ? AND decided IS NULL "
+            other = conn.execute(f"SELECT hold_id FROM holds WHERE binding_id = ? AND {_OPEN_HOLD} "
                                  "ORDER BY seq LIMIT 1", (binding_id,)).fetchone()
             if other is not None:
                 return EffectOutcome(EffectStatus.HELD, hold_id=other[0])
@@ -528,19 +548,17 @@ class RunJournal:
         return [self._hold_dict(r) for r in rows]
 
     def open_holds(self) -> list[dict[str, Any]]:
-        """Every undecided hold, with its pending record and chain continuation: the OPEN DECISIONS.
-        This is the only list of pending decisions for journaled runs; each one is also stopping its
-        binding's undecided effects until someone decides it."""
-        return self._holds("WHERE decided IS NULL")
+        """Every OPEN hold (:data:`_OPEN_HOLD`), with its pending record and chain continuation: the
+        OPEN DECISIONS. This is the only list of pending decisions for journaled runs; each one is also
+        stopping its binding's undecided effects until someone decides it."""
+        return self._holds(f"WHERE {_OPEN_HOLD}")
 
     def approved_unrun(self) -> list[dict[str, Any]]:
         """Every APPROVED hold whose effect has not started and whose run is neither cancelled nor
         fenced: a decision that stands and will run on the next delivery or resolve of its run."""
         return self._holds(
             "WHERE decided = 1 AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = holds.run_id "
-            "AND e.effect_id = holds.effect_id) AND NOT EXISTS (SELECT 1 FROM cancels c WHERE "
-            "c.run_id = holds.run_id) AND NOT EXISTS (SELECT 1 FROM runs r JOIN fences f ON "
-            "f.binding_id = r.binding_id WHERE r.run_id = holds.run_id AND f.generation > r.generation)")
+            f"AND e.effect_id = holds.effect_id) AND {_RUN_LIVE}")
 
     def get_hold(self, hold_id: str) -> dict[str, Any] | None:
         """The hold record (open or decided), or ``None``."""

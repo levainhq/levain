@@ -91,6 +91,7 @@ from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
 from levain.autonomic.journal import RunRef, durable_replace, hold_id_for, run_id_for
+from levain.autonomic.monitor import guard_trajectory
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.transport import ConfirmDecision
 from levain.autonomic.trust import TrustContext
@@ -632,17 +633,6 @@ class ChainStateStore:
 # =================================================================================================
 # The chain executor — the per-link walk + the pause/resume continuation.
 # =================================================================================================
-def _predicted_trajectory(binding: Binding) -> dict[str, Any] | None:
-    """The binding's prediction-error envelope (4a-equivalent: the FIRST effective_guard trajectory).
-    Link-indexed trajectories are a guard-schema evolution (flagged, not built); 4b threads the
-    binding's first trajectory onto each link (inert for a confirm-class email slice — the monitor only
-    runs on a ``fires_immediately`` posture)."""
-    for g in binding.effective_guard:
-        if g.predicted_trajectory is not None:
-            return g.predicted_trajectory
-    return None
-
-
 def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
     """Every KNOWN-danger kill the runtime evaluates per link: the binding's ``effective_guard`` (sealed
     floor + tightening additions) kill predicates, evaluated against the IMMUTABLE original trigger
@@ -872,7 +862,7 @@ class ChainExecutor:
             trust=self._trust_resolver(binding, i),
             authority=binding_invocation(binding, hops=i),
             kill_predicates=_kill_predicates(binding),
-            predicted_trajectory=_predicted_trajectory(binding),
+            predicted_trajectory=guard_trajectory(binding.effective_guard),
             trigger_event=event,
             ratified_posture=(binding.posture if is_terminal else None),
             run=run,

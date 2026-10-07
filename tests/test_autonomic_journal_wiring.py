@@ -135,8 +135,11 @@ class World:
         return self.resolve_open_as(ConfirmDecision(approved=approve, by="human"))
 
     def resolve_open_as(self, decision):
-        [p] = self.gate.open_pendings()
-        return self.chains.resume(p.pending_id, decision)
+        # the reply to the one pending a person was sent: found by id, as a reply is, so a pending
+        # whose run has since been fenced or cancelled (no longer in the open list) is still answered
+        with self.journal.db.read() as conn:
+            [(pending_id,)] = conn.execute("SELECT pending_id FROM holds WHERE decided IS NULL").fetchall()
+        return self.chains.resume(pending_id, decision)
 
     def outbox(self) -> list[tuple[str, str]]:
         p = self.work / "outbox.jsonl"
@@ -1252,3 +1255,170 @@ def test_the_barrier_says_why_the_registry_bars_a_run(tmp_path, change, why):
     change(w, b.binding_id)
     out = w.journal.peek(run, "x")
     assert out is not None and out.status is EffectStatus.BARRED and out.result == why
+
+
+# --- the slice's code L3 r1 (input d783af7f37c64b35), each reproduced before the fix -----------------
+
+def test_a_hold_of_a_fenced_run_neither_blocks_the_binding_nor_lists_as_open(tmp_path):
+    # complement MED 1: a pause fenced the run whose link1 hold was open; the hold stayed "open", so after
+    # re-ratifying, every undecided effect of the binding waited on a decision that can never fire
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("f1")                                               # link0 fired, link1 held
+    w.store.set_status(b.binding_id, BindingStatus.PAUSED)         # fences f1, its hold left undecided
+    w.store.ratify(b.binding_id)
+    out = w.dispatch("f2")
+    assert ("link0", "f2-0") in w.outbox()
+    assert out.chain.state == "paused"
+    assert [p.context_id for p in w.gate.open_pendings()] == ["f2-1"]
+
+
+def test_a_cancelled_runs_hold_does_not_block_the_binding(tmp_path):
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("k1")
+    [h] = w.journal.open_holds()
+    w.journal.cancel(h["run_id"], reason="test")
+    w.dispatch("k2")
+    assert ("link0", "k2-0") in w.outbox()
+    assert [p.context_id for p in w.gate.open_pendings()] == ["k2-1"]
+
+
+def test_an_approval_met_by_an_unreadable_registry_leaves_the_decision_open(tmp_path):
+    # complement MED 2: BARRED at the resolve's own peek rejected the hold and cancelled the run, so the
+    # approval could never run after the registry was repaired
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("b1")
+    good = registry_of(w.store)
+    write_raw(w.store, {**good, "x": "not json"})
+    first = w.resolve_open(approve=True)
+    assert not first.links or not first.links[-1].outcome.fired
+    assert len(w.journal.open_holds()) == 1                        # nothing was decided
+    write_raw(w.store, good)
+    again = w.resolve_open(approve=True)
+    assert again.state == "completed" and ("link1", "b1-1") in w.outbox()
+
+
+def _kill_event(eid: str) -> dict:
+    return {"type": "email", "id": eid, "fields": {"from": "a@x.example", "dmarc": "fail"}}
+
+
+def test_a_kill_whose_cancel_did_not_land_is_not_reported_terminal(tmp_path):
+    # codex HIGH 3: _cancel_run swallowed the journal failure and the kill was reported and receipted as
+    # terminal, though no record stops the run from being decided again
+    w = World(tmp_path)
+    w.mint(chain=False)
+
+    def fail(*a, **k):
+        raise OSError(5, "EIO")
+
+    w.journal.cancel = fail
+    [d] = w.dispatcher.dispatch(_kill_event("x1"))
+    out = d.outcome
+    assert not out.killed and not out.refused and out.held
+    assert out.reason.startswith("cancel_unrecorded:")
+    assert list(w.receipts.read()) == [] and w.outbox() == []
+
+
+def test_a_deny_whose_cancel_did_not_land_is_not_reported_terminal(tmp_path):
+    w = World(tmp_path)
+    w.journal.cancel = lambda *a, **k: (_ for _ in ()).throw(OSError(28, "ENOSPC"))
+    request = ActionRequest(action_name="link0", payload="p", context_id="c", query_text="q",
+                            query_date="2026-10-07", trust=_trust(None, 0), grounded=True,
+                            authority=manual_invocation(), run=RunRef("r", "e"))
+    out = w.gate._deny(request, FIXED.isoformat(), Posture.REFUSE_ESCALATE, "screen:x")
+    assert out.held and not out.refused and out.receipt_id is None
+    assert list(w.receipts.read()) == []
+
+
+def test_a_lease_that_cannot_be_unlinked_does_not_unsay_a_done_effect(tmp_path, monkeypatch):
+    # codex MED 6: the 'done' row committed, then the lease unlink raised, and the fire reported
+    # outcome_unknown although the effect ran and its result is recorded
+    w = World(tmp_path)
+    w.mint(chain=False)
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **k):
+        if self.parent.name == "leases":
+            raise PermissionError(13, "EACCES")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    out = w.dispatch("l1").outcome
+    assert out.fired and out.execution.ok
+    assert w.outbox() == [("link0", "l1-0")]
+    assert [r.fired for r in w.receipts.read()] == [True]
+
+
+class _FailingLink1(OutboxExecutor):
+    def execute(self, action_name, payload, *, context_id):
+        if action_name == "link1":
+            return ExecutionResult(ok=False, detail="smtp 550", downstream_id=None)
+        return super().execute(action_name, payload, context_id=context_id)
+
+
+def test_an_approved_effect_that_failed_is_not_reported_as_not_yet_run(tmp_path):
+    # complement LOW 6: the effect ran and failed, the receipt could not be persisted, and the resolve
+    # said "approved_not_yet_run" (held) although the journal records the effect as done
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.gate._executor = _FailingLink1(tmp_path / "outbox.jsonl")
+    w.dispatch("n1")
+    w.receipts.append = lambda *a, **k: (_ for _ in ()).throw(OSError(28, "ENOSPC"))
+    out = w.gate.resolve(w.gate.open_pendings()[0].pending_id, ConfirmDecision(approved=True, by="human"),
+                         chain_owned=True)
+    assert not out.held and not out.reason.startswith("approved_not_yet_run")
+    assert out.execution is not None and not out.execution.ok
+
+
+def test_two_holds_cannot_share_a_pending_id(tmp_path):
+    # complement LOW 8: find_pending returns one row, so a second hold with the same pending id could
+    # never be resolved by id and blocked its binding; the store refuses the second one
+    from levain.autonomic.journal import JournalCorruptError
+    w = World(tmp_path)
+    b = w.mint(chain=False)
+    for run in ("r1", "r2"):
+        assert w.store.admit(b.binding_id, run) is not None
+    pending = {"pending_id": "pend-same"}
+    w.journal.hold("r1", "e", digest="d", pending=pending)
+    with pytest.raises(JournalCorruptError, match="UNIQUE"):
+        w.journal.hold("r2", "e", digest="d", pending=pending)
+
+
+class _Drifted:
+    name = "drifted"
+
+    def observe(self, action_name, payload, *, context_id):
+        return {"status": "DRIFTED"}
+
+
+def _watch(traj, tag):
+    return Guard(rationale=f"watch {tag}", dissent_author="codex", predicted_trajectory=traj,
+                 kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                 kill_drill={"dmarc": "fail"}, kill_authored_by="operator")
+
+
+def test_a_bound_added_after_a_descriptive_trajectory_still_arms_the_monitor(tmp_path):
+    # complement MED 3: the first trajectory won even when it was descriptive, so a bound added by a
+    # tightening never reached the monitor and the drifted world fired
+    w = World(tmp_path)
+    b = w.mint(chain=False)
+    w.store.tighten_guard(b.binding_id, _watch({"step": "summarize"}, "a"))
+    w.store.tighten_guard(b.binding_id, _watch({"bound": {"op": "==", "field": "status", "value": "ok"}}, "b"))
+    w.gate._trajectory_observer = _Drifted()
+    out = w.dispatch("t1").outcome
+    assert out.killed and not out.fired and w.outbox() == []
+
+
+def test_every_declared_bound_must_hold():
+    from levain.autonomic.monitor import guard_trajectory, prediction_diverged
+    ok = {"bound": {"op": "==", "field": "status", "value": "ok"}}
+    fresh = {"bound": {"op": "==", "field": "age", "value": "new"}}
+    traj = guard_trajectory([_watch({"step": 1}, "d"), _watch(ok, "a"), _watch(fresh, "b")])
+    assert prediction_diverged(traj, {"status": "ok", "age": "new"})[0] is False
+    assert prediction_diverged(traj, {"status": "ok", "age": "old"})[0] is True     # the later bound counts
+    broken = {"bound": "not-a-predicate"}
+    assert guard_trajectory([_watch(ok, "a"), _watch(broken, "x")]) is broken       # fails closed
+    assert guard_trajectory([_watch({"step": 1}, "d")]) == {"step": 1}             # descriptive: inert
+    assert guard_trajectory([]) is None

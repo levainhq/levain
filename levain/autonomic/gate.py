@@ -222,8 +222,9 @@ class EfferentGate:
         self._confirm_window_s = confirm_window_s
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
-        """The OPEN pending action by id (no claim), or ``None``: a journaled run's open hold, else the
-        manual pending store."""
+        """The UNDECIDED pending action by id (no claim), or ``None``: a journaled run's undecided hold
+        (also one whose run was fenced or cancelled since, which ``open_pendings`` leaves out: a reply
+        to it still resolves, as a stop), else the manual pending store."""
         if self._journal is not None:
             hold = self._journal.find_pending(pending_id)
             if hold is not None:
@@ -630,8 +631,10 @@ class EfferentGate:
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None:
-                if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED, EffectStatus.BARRED):
+                if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
                     return reject(posture, f"journal:{barrier.status.value}")
+                # BARRED (the registry cannot be read, or no longer grants the run) is a condition a
+                # repair can clear, as at the gate's entry: the decision stays open
                 return self._refuse_open(f"journal:{barrier.status.value}", binding_id)
             d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by)
             if not d.ok:
@@ -645,8 +648,8 @@ class EfferentGate:
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate, decided=True,
         )
-        if fired.fired or fired.replayed or fired.receipt_id is not None:
-            return fired
+        if fired.fired or fired.replayed or fired.receipt_id is not None or fired.execution is not None:
+            return fired   # (an execution without a receipt: the effect ran and failed, the receipt did not land)
         if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned",
                                               "journal:barred"):
             # an approval the journal stopped for good (fenced or cancelled since the decision, or an
@@ -1040,9 +1043,10 @@ class EfferentGate:
         stands against ``verdict=denied`` (the frozen enum has no ``constitution`` value). A deny of a
         journaled effect ends its run (:meth:`_cancel_run`), unless ``cancel=False``: a refusal caused
         by a condition that can clear (the registry could not be read, the run is not admitted yet)
-        must not end a run a re-delivery could finish."""
-        if cancel:
-            self._cancel_run(request, f"denied:{reason}")
+        must not end a run a re-delivery could finish. A cancel that cannot be recorded makes the deny
+        not terminal (:meth:`_cancel_unrecorded`)."""
+        if cancel and not self._cancel_run(request, f"denied:{reason}"):
+            return self._cancel_unrecorded(request, posture, f"denied:{reason}")
         return self._deny_fields(
             created_at=created_at, action_name=request.action_name, proposal_id=request.proposal_id,
             context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
@@ -1148,8 +1152,10 @@ class EfferentGate:
         ``gate.verdict`` is ``denied`` (the verdict enum has no ``killed`` — the MODE lives in
         ``terminal_state``, §2.1); ``by`` names the autonomous decider (on-loop / binding). Fail-soft on
         a face/persist fault (like ``_fire``/``_deny_fields``): the kill stands, the trace just drops.
-        A kill of a journaled effect ends its run (:meth:`_cancel_run`)."""
-        self._cancel_run(request, f"killed:{reason}")
+        A kill of a journaled effect ends its run (:meth:`_cancel_run`); a cancel that cannot be
+        recorded makes the kill not terminal (:meth:`_cancel_unrecorded`)."""
+        if not self._cancel_run(request, f"killed:{reason}"):
+            return self._cancel_unrecorded(request, posture, f"killed:{reason}")
         try:
             face = build_gate_face(
                 context_id=request.context_id, query_text=request.query_text,
@@ -1329,17 +1335,30 @@ class EfferentGate:
             _log.error("efferent gate: could not note receipt %s in the run journal (%s): %s",
                        receipt_id, type(e).__name__, e)
 
-    def _cancel_run(self, request: ActionRequest, reason: str) -> None:
+    def _cancel_run(self, request: ActionRequest, reason: str) -> bool:
         """End the run of a journaled effect the gate decided not to fire, so a re-delivered event
-        cannot reach a different decision for it (the monitor reads world state). Fail-soft: a journal
-        that cannot be written runs no effect either."""
+        cannot reach a different decision for it (the monitor reads world state). Returns False iff
+        the cancel could not be recorded; True when it was, or there is no run to end."""
         if request.run is None or self._journal is None:
-            return
+            return True
         try:
             self._journal.cancel(request.run.run_id, reason=reason)
         except Exception as e:  # noqa: BLE001
             _log.error("efferent gate: could not cancel run %s (%s): %s", request.run.run_id,
                        type(e).__name__, e)
+            return False
+        return True
+
+    @staticmethod
+    def _cancel_unrecorded(request: ActionRequest, posture: Posture, reason: str) -> GateOutcome:
+        """A decision not to fire whose cancel did not land. Nothing fired, but nothing durable says the
+        run is over either, so this is NOT a terminal outcome and writes no receipt: it is held (deliver
+        the event again later), and the next delivery decides again."""
+        return GateOutcome(
+            posture=posture, fired=False, refused=False, deferred=False, held=True,
+            reason=f"cancel_unrecorded:{reason}", receipt_id=None, execution=None,
+            binding_id=request.authority.binding_id,
+        )
 
     def _persist(self, *, created_at, action_name, proposal_id, posture, fired, face) -> str | None:
         """Append the gate-receipt FAIL-SOFT (L1-HIGH-1). A receipt-persist failure (a disk error, or

@@ -95,6 +95,19 @@ def test_the_floor_names_the_directory_db_py_creates(home, monkeypatch):
     assert default_store_dir().resolve() in policy.deny_read_write
 
 
+def test_a_relative_levain_home_names_one_store_whatever_the_cwd_does(home, tmp_path, monkeypatch):
+    # complement LOW (slice L3 r1): the floor resolved a relative $LEVAIN_HOME at policy time, the store
+    # left it relative, so a later chdir moved the store away from the directory the floor denies
+    from levain.autonomic.db import default_store_dir
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", "rel-home")
+    policy = build_policy(_entity(home))
+    store = default_store_dir()
+    monkeypatch.chdir(home)
+    assert store.is_absolute() and store in policy.deny_read_write
+
+
 def test_both_enforcers_render_the_store_as_a_denied_tree(home):
     store = _store(home / ".levain" / AUTONOMIC_STORE_DIR).resolve()
     policy = build_policy(_entity(home))

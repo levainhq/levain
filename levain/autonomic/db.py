@@ -53,7 +53,9 @@ _SCHEMA = (
     "effect_id TEXT NOT NULL, binding_id TEXT NOT NULL, digest TEXT NOT NULL, at TEXT, "
     "pending TEXT, pending_id TEXT, chain TEXT, chained INTEGER NOT NULL DEFAULT 0, "
     "decided INTEGER, decided_by TEXT, seq INTEGER NOT NULL)",
-    "CREATE INDEX IF NOT EXISTS holds_pending ON holds (pending_id)",
+    # one hold per pending id: a resolve finds a decision by its pending id, so a second hold sharing one
+    # could never be decided and would hold its binding; the second insert fails instead
+    "CREATE UNIQUE INDEX IF NOT EXISTS holds_pending_id ON holds (pending_id)",
     "CREATE TABLE IF NOT EXISTS effects (run_id TEXT NOT NULL, effect_id TEXT NOT NULL, "
     "digest TEXT NOT NULL, pid INTEGER, state TEXT NOT NULL CHECK (state IN ('intent','done','unknown')), "
     "result TEXT, receipt_id TEXT, PRIMARY KEY (run_id, effect_id))",
@@ -74,9 +76,11 @@ class StoreFormatError(RuntimeError):
 
 
 def default_store_dir() -> Path:
-    """``<levain home>/autonomic``: ``$LEVAIN_HOME/autonomic`` if set, else ``~/.levain/autonomic``."""
+    """``<levain home>/autonomic``: ``$LEVAIN_HOME/autonomic`` if set, else ``~/.levain/autonomic``. Made
+    absolute here, as the confinement floor's deny rule for it is, so a relative ``$LEVAIN_HOME`` names
+    one directory for the life of the store, whatever the working directory does later."""
     home = os.environ.get("LEVAIN_HOME")
-    return (Path(home).expanduser() if home else Path.home() / ".levain") / "autonomic"
+    return ((Path(home).expanduser() if home else Path.home() / ".levain") / "autonomic").resolve()
 
 
 class AutonomicDB:
@@ -96,7 +100,8 @@ class AutonomicDB:
             if not self.path.exists():
                 raise StoreFormatError(f"store {self.path} has disappeared")
         elif not self.directory.exists():
-            self.directory.mkdir(parents=True, mode=0o700)   # the umask can only narrow it
+            # another opener may create it between the two calls
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)   # the umask can only narrow it
         conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 30000")
