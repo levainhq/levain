@@ -4139,8 +4139,9 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]
 # file that is a mountpoint in ANOTHER mount namespace succeeds and lazily DETACHES that mount
 # (torvalds/linux 8ed936b, "vfs: Lazily remove mounts on unlinked files and directories"), which
 # would let a live shell create the file. So each object carries the claims of the shells that mask
-# it, and is removed only when none is left, at close, at levain exit, by the sweep at the next spawn
-# and by ``levain doctor`` (a crash or SIGKILL leaves claims whose process is gone).
+# it, and is removed only when none is left: at close, at levain exit, and by the sweep that runs
+# before every Linux spawn, at levain's launch and in ``levain doctor`` (a crash or SIGKILL leaves
+# claims whose process is gone).
 # ⛔ Removed only while it is still the object created: same device and inode, and for a file still
 # empty and 0444, for a directory still empty. An operator's ``npm login`` that replaced it by rename
 # leaves a different inode, which this keeps (and the replacement closed the live shell, through the
@@ -4279,7 +4280,8 @@ def _ledger_release(claim: str) -> list[str]:
 
 def sweep_floor_placeholders() -> list[str]:
     """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
-    before every Linux spawn and by ``levain doctor``. Returns the paths removed."""
+    before every Linux spawn, at launch (:mod:`levain.launch`) and by ``levain doctor``. Returns the
+    paths removed."""
     if not (_ledger_dir() / _LEDGER_NAME).exists():
         return []
 
