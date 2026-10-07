@@ -3807,7 +3807,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
     # host's own store when it was tried there (measured 2026-09-30). The same holds for a cred
     # file in a tool directory (step 2a); a $HOME-level cred file's stub from step (4) lasts only
-    # for the session (:func:`_ledger_enter`). The ssh vectors' stubs here stay on the host.
+    # for the session (:func:`_ledger_enter`), as does every stub this step creates: the provider
+    # records whatever it creates in the placeholder ledger, which removes it once no session needs it.
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     # Targets steps (2) and (4) already mask, as those steps EMITTED them (codex, L3 r2: a second
     # resolve of the policy paths can observe a symlink retargeted after step (4) ran). EXACT
@@ -4753,12 +4754,12 @@ class BwrapProvider(ConfinementProvider):
 
     ``--unshare-pid`` IS NOW BUILT (lane P2 item 2c, 2026-10-07), for a different reason than the one
     this paragraph once weighed it for: without it the sandbox's procfs showed every process of this
-    user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. What it does is read
-    from documentation, not measured on this branch: pid_namespaces(7) says the new procfs shows
-    only the namespace's processes, and "If the "init" process of a PID namespace terminates, the
-    kernel terminates all of the processes in the namespace via a SIGKILL signal", which on paper
-    also ends a ``setsid`` survivor when bash's shell ends. The ``linux_live`` tests exercise the
-    first on a host where bwrap runs; the second is not claimed until one does."""
+    user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. pid_namespaces(7): the
+    new procfs shows only the namespace's processes (asserted live by
+    ``test_linux_live_bash_sees_no_host_process``, which the CI workflow's live job runs), and "If
+    the "init" process of a PID namespace terminates, the kernel terminates all of the processes in
+    the namespace via a SIGKILL signal", which on paper also ends a ``setsid`` survivor when bash's
+    shell ends; that second effect is not claimed until a test measures it."""
 
     #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
     #: does not close is ``OFFLINE_RESIDUAL``.
