@@ -1866,10 +1866,11 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     SHELL's ssh can record host keys): the file editor has no legitimate need to touch ssh files (that
     is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
     polarity subtlety. Ancestor write-dirs are NOT checked — they exist to block ``mv``-relocation of a
-    jewel, and the file editor has no rename primitive (its commands are ``view``/``create``/
-    ``str_replace``/``insert``/``undo_edit``). Also denies the entity's OWN memory STORE files
-    (``own_memory_files`` — continuity/crystal/db + sidecars): the file editor has no rename primitive
-    and no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
+    jewel, and the file editor never renames an existing file or directory: its only rename is
+    ``insert`` moving its own temp file onto the target, which walks the target's parents by directory
+    fd and refuses a symlink among them (``levain.firing.openhands.tools._floored_move``). Also denies
+    the entity's OWN memory STORE files (``own_memory_files`` — continuity/crystal/db + sidecars): the
+    file editor has no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
     here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
     write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
@@ -1977,7 +1978,8 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
                         f"the operator's project memory re-derives against (spore-1308)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
-        # The file editor has no rename primitive and no legit reason to touch the entity's own store
+        # The file editor renames nothing but its own temp file, and has no legit reason to touch the
+        # entity's own store
         # (its memory is composed by the host-process wrap, never edited by hand) → denied OUTRIGHT
         # here (read included), same fail-closed stance as the ssh write-files. The SEATBELT hand still
         # allows the READ (bash may `cat` it); denying both hands the WRITE is what closes the poison-

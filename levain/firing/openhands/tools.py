@@ -65,6 +65,7 @@ from __future__ import annotations
 import builtins
 import contextvars
 import dataclasses
+import errno
 import logging
 import os
 import shutil
@@ -186,12 +187,203 @@ def _floored_open(file, *args, **kwargs):
     return builtins.open(file, *args, opener=opener, **kwargs)
 
 
+# THE EDITOR'S OTHER PRIMITIVES WALK BY DIRECTORY FD (codex, L3 r2 on the frozen tip). ``insert`` moves
+# a temp file onto its target with ``shutil.move`` and a directory ``view`` lists with ``Path.iterdir``,
+# neither through ``open``, so a parent link the shell flips after the executor's path check led the
+# move onto a jewel, or the listing into a denied subtree. Both now walk the path one component at a
+# time from ``/`` with O_NOFOLLOW, REFUSE any component that is a symlink (head ruling 2026-10-07:
+# never follow one), judge the directory they end up holding by its name and by the identity of it
+# and each of its ancestors, and then act relative to that held fd.
+
+
+class _FloorRefusedWalk(Exception):
+    """A non-open editor primitive the floor refused. Not an OSError, so the stock editor's own
+    ``except OSError`` around a directory listing does not turn it into a plain error message."""
+
+
+def _held_dir(path: str | Path) -> tuple[int, str]:
+    """``(fd, path)`` of the directory ``path``, opened component by component from ``/`` without
+    following a symlink anywhere. Refuses a symlink component; other errors propagate."""
+    p = os.path.abspath(os.path.expanduser(str(path)))
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    walked = "/"
+    try:
+        for part in [c for c in p.split("/") if c]:
+            st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            walked = os.path.join(walked, part)
+            if stat.S_ISLNK(st.st_mode):
+                raise _FloorRefusedWalk(
+                    f"{walked} is a symlink, and the editor does not follow a link it would act "
+                    "through (it could be repointed between the check and the act)"
+                )
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return fd, walked
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _held_dir_reason(policy: CrownJewelsPolicy, fd: int, walked: str) -> str | None:
+    """Why the held directory must not be used: its name is a jewel or inside one, or it or any
+    ancestor (reached through ``..`` from the fd itself, so a rename since the walk is seen) is a
+    denied subtree root by identity."""
+    reason = crown_jewel_reason(policy, walked)
+    if reason is not None:
+        return reason
+    roots: dict[tuple[int, int], str] = {}
+    for r in (*policy.deny_read_write, *((policy.ssh_dir,) if policy.ssh_dir else ())):
+        try:
+            rs = os.stat(r)
+        except OSError:
+            continue
+        roots[(rs.st_dev, rs.st_ino)] = str(r)
+    cur = os.dup(fd)
+    try:
+        for _ in range(4096):
+            st = os.fstat(cur)
+            hit = roots.get((st.st_dev, st.st_ino))
+            if hit is not None:
+                return f"{walked} is inside the crown-jewel directory {hit}, which the floor denies"
+            up = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=cur)
+            os.close(cur)
+            cur = up
+            ust = os.fstat(cur)
+            if (ust.st_dev, ust.st_ino) == (st.st_dev, st.st_ino):
+                return None   # the root is its own parent
+        return f"{walked}: the walk up to / did not end — refused"
+    finally:
+        os.close(cur)
+
+
+def _judged_dir(path: str | Path) -> tuple[int, str]:
+    """:func:`_held_dir`, refused unless :func:`_held_dir_reason` passes it."""
+    fd, walked = _held_dir(path)
+    try:
+        reason = _held_dir_reason(_EDITOR_FLOOR.get(), fd, walked)
+    except OSError as exc:
+        reason = f"{walked} could not be checked ({exc}) — refused"
+    if reason is not None:
+        os.close(fd)
+        raise _FloorRefusedWalk(reason)
+    return fd, walked
+
+
+def _floored_move(src, dst, *args, **kwargs):
+    """``shutil.move`` for the editor's ``insert``: its own temp file renamed onto ``dst`` relative to
+    the held, judged parent directory, with the target name judged too and never a link."""
+    policy = _EDITOR_FLOOR.get()
+    if policy is None:
+        return shutil.move(src, dst, *args, **kwargs)
+    dst = os.path.abspath(os.path.expanduser(str(dst)))
+    name = os.path.basename(dst)
+    pfd, walked = _judged_dir(os.path.dirname(dst))
+    try:
+        target = os.path.join(walked, name)
+        reason = crown_jewel_reason(policy, target)
+        if reason is None:
+            try:
+                st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+            if st is not None and stat.S_ISLNK(st.st_mode):
+                reason = f"{target} is a symlink; the editor does not replace a link it wrote through"
+            elif st is not None and st.st_nlink > 1:
+                reason = linked_jewel_reason(policy, target)
+        if reason is not None:
+            raise _FloorRefusedWalk(reason)
+        try:
+            os.rename(src, name, dst_dir_fd=pfd)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # The temp file is on another filesystem: copied into the held directory, then dropped.
+            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666,
+                          dir_fd=pfd)
+            with builtins.open(src, "rb") as fin, os.fdopen(out, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            os.unlink(src)
+        # Re-judged by what is now there, as an open is judged by the object it opened.
+        st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode):
+            raise _FloorRefusedWalk(f"{target} is not a regular file after the move")
+        return target
+    finally:
+        os.close(pfd)
+
+
+def _entries(fd: int) -> list[os.DirEntry]:
+    with os.scandir(fd) as it:
+        return sorted(it, key=lambda e: e.name)
+
+
+def _install_floored_dir_view(editor_cls) -> None:
+    """The directory ``view``, counted and listed through a held, judged fd. A child directory is
+    listed only when it is a real directory (a link is shown, never entered) that passes the same
+    judgement. Lines are formatted by the stock editor's own formatter."""
+    stock_count = editor_cls._count_hidden_children
+    stock_list = editor_cls._list_directory_for_view
+
+    def count(self, path):
+        if _EDITOR_FLOOR.get() is None:
+            return stock_count(self, path)
+        fd, _ = _judged_dir(path)
+        try:
+            return sum(1 for e in _entries(fd) if e.name.startswith("."))
+        finally:
+            os.close(fd)
+
+    def listing(self, path):
+        policy = _EDITOR_FLOOR.get()
+        if policy is None:
+            return stock_list(self, path)
+        fd, walked = _judged_dir(path)
+        shown = [path]
+        try:
+            for e in _entries(fd):
+                if e.name.startswith("."):
+                    continue
+                shown.append(path / e.name)
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    cfd = os.open(e.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    if _held_dir_reason(policy, cfd, os.path.join(walked, e.name)) is None:
+                        shown += [path / e.name / c.name for c in _entries(cfd)
+                                  if not c.name.startswith(".")]
+                except OSError:
+                    pass
+                finally:
+                    os.close(cfd)
+        finally:
+            os.close(fd)
+        return [self._format_directory_entry(path, entry) for entry in shown]
+
+    editor_cls._count_hidden_children = count
+    editor_cls._list_directory_for_view = listing
+
+
+class _FlooredShutil:
+    """The editor module's ``shutil`` with ``move`` floored; everything else is the real module."""
+
+    move = staticmethod(_floored_move)
+
+    def __getattr__(self, name):
+        return getattr(shutil, name)
+
+
 def _install_floored_open() -> None:
     from openhands.tools.file_editor import editor as _editor_mod
     from openhands.tools.file_editor.utils import encoding as _encoding_mod
 
     for mod in (_editor_mod, _encoding_mod):
         mod.open = _floored_open   # type: ignore[attr-defined]
+    _editor_mod.shutil = _FlooredShutil()   # type: ignore[attr-defined]
+    _install_floored_dir_view(_editor_mod.FileEditor)
 
 
 _install_floored_open()
@@ -567,7 +759,7 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
         token = _EDITOR_FLOOR.set(policy)
         try:
             return super().__call__(action, conversation)
-        except _FloorRefusedOpen as exc:
+        except (_FloorRefusedOpen, _FloorRefusedWalk) as exc:
             return FileEditorObservation.from_text(
                 text=(
                     f"REFUSED (crown-jewels floor): {exc}. Your hands reach the rest of the "

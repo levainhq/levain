@@ -399,3 +399,67 @@ def test_a_jewel_opened_through_a_name_swapped_away_before_the_check_is_refused(
         # How Linux names it (/proc/self/fd/N); macOS's F_GETPATH may name the jewel's other path.
         monkeypatch.setattr(C, "opened_file_path", lambda fd: f"{x} (deleted)")
         assert C.opened_file_reason(pol, fh.fileno()) is not None
+
+
+# --- the editor's non-open primitives walk by directory fd (codex #2, #6; head ruling 2026-10-07) ----
+
+
+def _jewel_dir_and_link(tmp_path: Path) -> tuple[Path, Path, Path]:
+    jewel_dir = tmp_path / ".anneal-memory"
+    jewel_dir.mkdir(exist_ok=True)
+    (jewel_dir / "SECRET-NAME.md").write_text("JEWEL\n")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    link = ws / "link"
+    link.symlink_to(jewel_dir)
+    return jewel_dir, ws, link
+
+
+def test_insert_moving_onto_a_path_through_a_symlinked_parent_is_refused(tmp_path: Path, monkeypatch) -> None:
+    """The move step of `insert` (shutil.move, not open): a parent link flipped to a jewel dir after
+    the executor's check would have the temp file renamed onto the jewel."""
+    from openhands.tools.file_editor import editor as E
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    jewel_dir, ws, link = _jewel_dir_and_link(tmp_path)
+    tmp = tmp_path / "tmpfile"
+    tmp.write_text("PLANTED\n")
+    try:
+        with pytest.raises(T._FloorRefusedWalk):
+            E.shutil.move(str(tmp), link / "SECRET-NAME.md")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert (jewel_dir / "SECRET-NAME.md").read_text() == "JEWEL\n"
+
+
+def test_view_of_a_symlinked_dir_into_a_denied_subtree_is_refused(tmp_path: Path, monkeypatch) -> None:
+    from openhands.tools.file_editor.editor import FileEditor
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    _, ws, link = _jewel_dir_and_link(tmp_path)
+    try:
+        with pytest.raises(T._FloorRefusedWalk):
+            FileEditor().view(link)
+        out = str(FileEditor().view(ws))
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert "SECRET-NAME" not in out, "a link inside the listed dir is shown, never entered"
+    assert "link" in out
+
+
+def test_insert_and_view_still_work_on_ordinary_paths(tmp_path: Path, monkeypatch) -> None:
+    from openhands.tools.file_editor.editor import FileEditor
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    ws = tmp_path / "ws"
+    (ws / "sub").mkdir(parents=True)
+    (ws / "sub" / "deep.txt").write_text("")
+    f = ws / "a.txt"
+    f.write_text("one\ntwo\n")
+    try:
+        FileEditor().insert(f, 1, "inserted")
+        out = str(FileEditor().view(ws))
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert f.read_text() == "one\ninserted\ntwo\n"
+    assert "a.txt" in out and "sub/" in out and "deep.txt" in out
