@@ -29,7 +29,7 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import BRANCH, DIRNAME, GitLedger, LedgerReadError, Repo, TeamError
+from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -101,10 +101,8 @@ def _out(obj: dict) -> None:
 
 def _tamper_text(ledger: I.Ledger, team: R.Team) -> str:
     shown = "; ".join(ledger.tamper[:3]) + (f"; and {len(ledger.tamper) - 3} more" if len(ledger.tamper) > 3 else "")
-    return (f"{TAG} the team ledger is REFUSED as tampered: {shown}. Levain only writes "
-            "ledger/<member>/<device>.jsonl, so nothing in this ledger is trusted until the team owner "
-            f"({team.owner}) removes those files and pushes; `levain team verify` lists them. Do not work around "
-            "this check.")
+    return (f"{TAG} the team ledger is REFUSED as tampered: {shown}. Nothing in this ledger is trusted until each "
+            f"reason is resolved (the team owner is {team.owner}). Do not work around this check.")
 
 
 def _fail_open(event: str, reason: str) -> None:
@@ -190,27 +188,27 @@ def pretooluse(payload: dict) -> None:
     # no lock (the ref only moves when a rebase or commit completes).
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
     try:
-        _, team, ledger = gl.snapshot()
-    except LedgerReadError as exc:
-        # git's answer about the ledger could not be read, so the ledger cannot be judged: fail CLOSED, naming why.
-        _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                     "permissionDecisionReason": I.oneline(
-                                         f"{TAG} the team ledger could not be read ({exc}); every edit is denied until "
-                                         "`levain team doctor` is clean.")}})
-        return
-    except (R.RolesError, TeamError) as exc:
-        _fail_open("PreToolUse", str(exc))
-        return
+        out = _edit_verdict(gl, repo, target, payload, fetch_note)
+    except Exception as exc:  # noqa: BLE001 - THE fail-closed boundary: a joined clone that cannot judge denies
+        out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                      "permissionDecisionReason": I.oneline(
+                                          f"{TAG} the team ledger could not be read ({type(exc).__name__}: {exc}); "
+                                          "every edit is denied until `levain team doctor` is clean.")}}
+    if out:
+        _out(out)
+
+
+def _edit_verdict(gl: GitLedger, repo: Repo, target: str, payload: dict, fetch_note: str | None) -> dict | None:
+    """The hook's answer for one edit in a joined clone. Any exception here is a DENY (``pretooluse``)."""
+    _, team, ledger = gl.snapshot()
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
     if rel is None:
-        return
+        return None
     if ledger.tamper:
-        # Fail closed: a file levain never writes sits in the ledger, so nothing it holds can be trusted to be
-        # the whole record. Every edit in this clone is denied until the team owner removes it.
-        _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                     "permissionDecisionReason": I.oneline(_tamper_text(ledger, team))}})
-        return
+        # Fail closed: nothing in a refused ledger can be trusted to be the whole record.
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": I.oneline(_tamper_text(ledger, team))}}
     # Claude Code always sends session_id; the transcript path is a stable stand-in if a build ever does not.
     session = str(payload.get("session_id") or "")
     if not session and payload.get("transcript_path"):
@@ -227,9 +225,9 @@ def pretooluse(payload: dict) -> None:
     notes = [I.oneline(n) for n in notes]   # a warning or a fetch error can carry git or ledger text
     if d is None:
         if notes:
-            _out({"systemMessage": notes[0],
-                  "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "\n".join(notes)}})
-        return
+            return {"systemMessage": notes[0],
+                    "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "\n".join(notes)}}
+        return None
     text = d.text + ("\n\n" + "\n".join(notes) if notes else "")
     if d.deny:
         if session and d.newly_denied:
@@ -238,9 +236,8 @@ def pretooluse(payload: dict) -> None:
             except OSError as exc:
                 # Not remembering the deny means the next attempt is denied again: never a reason to allow.
                 text += f"\n\n[team] could not record this denial ({I.oneline(str(exc))}); a retry will be denied again"
-        _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                     "permissionDecisionReason": text}})
-        return
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": text}}
     if d.ack and handle:
         try:
             gl.append(E.build(handle, "ack", refs=d.ack, session=session, agent="claude-code",
@@ -248,7 +245,7 @@ def pretooluse(payload: dict) -> None:
                       push=False, lock_timeout=3.0)
         except (TeamError, E.EntryError) as exc:
             text += f"\n\n[team] acknowledgement not recorded: {I.oneline(str(exc))}"
-    _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}}
 
 
 def _anneal_db(gl: GitLedger) -> Path | None:

@@ -13,6 +13,7 @@ from . import entry as E
 from . import index as I
 from . import pack as P
 from . import roles as R
+from . import verify as V
 from . import wire as W
 from .export import export_stream
 from .hook import decide
@@ -168,7 +169,7 @@ def cmd_status(args) -> int:
             print(json.dumps({"deny": True, "text": text, "tamper": ledger.tamper, "entries": []}, ensure_ascii=False))
         else:
             print(text)
-            print("\n(every edit in this clone is DENIED until the file is removed from the ledger branch)")
+            print("\n(every edit in this clone is DENIED until each reason above is resolved)")
         return 3
     state = gl.state_hash(ledger, team)
     canon_text = gl.read_canon(sha)
@@ -207,7 +208,8 @@ def cmd_repin(args) -> int:
         print("no pins to drop" + (f" for {args.file}" if args.file else ""))
         return 0
     print(f"dropped {len(dropped)} pin(s): " + ", ".join(dropped))
-    print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then.")
+    print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then. "
+          "If a sync refused the remote, run `levain team sync` to judge it again.")
     return 0
 
 
@@ -219,13 +221,7 @@ def cmd_verify(args) -> int:
         print("the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper))
         return 3
     canon_text = gl.read_canon(sha)
-    problems = list(ledger.problems) + gl.team_history_problems(team, sha)
-    for e in ledger.entries:
-        for s in e.get("supersedes", []) + e.get("refs", []):
-            if s not in ledger.by_id:
-                problems.append(f"{e['id']}: names {s}, which is not in the ledger")
-        if e.get("owner") and not team.owner_ok(e["owner"]):
-            problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
+    problems = V.problems(gl, sha, team, ledger)
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
     print(C.staleness(canon_text, gl.state_hash(ledger, team)))
@@ -333,10 +329,14 @@ def cmd_doctor(args) -> int:
                      f"git user.email {gl.email() or 'unset'} maps to no member"))
     except R.RolesError as exc:
         rows.append((False, str(exc)))
-    ledger = gl.ledger()
-    if ledger.tamper:
+    try:
+        ledger = gl.ledger()
+    except TeamError as exc:             # LedgerReadError included: the ledger could not be judged, a FAIL row
+        ledger = None
+        rows.append((False, f"the team ledger could not be read: {exc}"))
+    if ledger is not None and ledger.tamper:
         rows.append((False, "the team ledger is REFUSED as tampered: " + "; ".join(ledger.tamper[:3])))
-    else:
+    elif ledger is not None:
         rows.append((not ledger.problems, f"{len(ledger.entries)} entries, chains intact" if not ledger.problems
                      else f"{len(ledger.problems)} integrity problem(s): run `levain team verify`"))
     st = gl.state()
