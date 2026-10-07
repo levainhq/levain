@@ -226,6 +226,13 @@ class Capped(list):
     def extend(self, items) -> None:
         for item in items:
             self.append(item)
+        if isinstance(items, Capped):         # what the other one only counted is counted here too
+            self.more += items.more
+
+    def clone(self) -> "Capped":
+        out = Capped(limit=self.limit)
+        out.extend(self)                         # a Capped: its count comes with it
+        return out
 
     def __iadd__(self, items):
         self.extend(items)
@@ -242,7 +249,7 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
     ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which JSON written with ensure_ascii=False
     carries unescaped inside a string."""
     entries: list[dict] = []
-    problems = Capped(problems or [])
+    problems = problems.clone() if isinstance(problems, Capped) else Capped(problems or [])   # a Capped keeps its count
     out_files: list[LedgerFile] = []
     for rel, lines in sorted(files):
         got, probs, last = E.verify_lines(lines)
@@ -272,7 +279,8 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
     # every reader shows, caches and prints these: kept bounded, the rest counted
-    return Ledger(uniq, problems.done(), out_files, owner, Capped(tamper or []).done("reasons"))
+    tamper = tamper.clone() if isinstance(tamper, Capped) else Capped(tamper or [])
+    return Ledger(uniq, problems.done(), out_files, owner, tamper.done("reasons"))
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:

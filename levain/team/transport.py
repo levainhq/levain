@@ -178,7 +178,18 @@ class Trust:
         first, now, seen = not self.seen, E.now_iso(), dict(self.seen)
         for rel in rels:
             seen.setdefault(rel, {"t": now, "first": first})
+        return _prune_seen(seen, set(rels) | set(self.files) | set(self.remote))
+
+
+def _prune_seen(seen: dict[str, dict], live: set[str]) -> dict[str, dict]:
+    """``seen`` kept within what one record can hold (_MAX_LEDGER_LEAVES notes): notes for files the record still pins
+    stay; the rest go oldest first."""
+    if len(seen) <= _MAX_LEDGER_LEAVES:
         return seen
+    gone = sorted((v["t"], k) for k, v in seen.items() if k not in live)
+    for _t, k in gone[:len(seen) - _MAX_LEDGER_LEAVES]:
+        del seen[k]
+    return seen
 
 
 def _pin(data: bytes) -> dict:
@@ -595,12 +606,12 @@ class GitLedger:
                 except R.RolesError:
                     t = None
             try:
-                return self._read(t, head)
+                return self._read(t, head, explicit=rev is not None)
             except _PinRace:
                 time.sleep(random.uniform(0.02, 0.2))
         raise LedgerReadError(_PIN_RACE_TEXT)
 
-    def _read(self, team: R.Team | None, rev: str) -> I.Ledger:
+    def _read(self, team: R.Team | None, rev: str, *, explicit: bool = False) -> I.Ledger:
         """One read: the quarantined remote's refusal if it is refused, else the cache, else judge + accept. While a
         quarantined remote tip is waiting (refused or not yet taken by a sync), nothing is pinned: the quarantine is
         resolved first, so a repin followed by a read cannot re-pin the old tip over the remote's."""
@@ -626,9 +637,9 @@ class GitLedger:
             with contextlib.suppress(OSError):
                 cache.unlink()
             return j.ledger
-        digest = self._accept(j.datas, rev)
+        digest = self._accept(j.datas, rev, explicit=explicit)
         if digest is _QUARANTINED:                     # a fetch refused the remote while this read judged
-            return self._read(team, rev)
+            return self._read(team, rev, explicit=explicit)
         if digest is None:
             return j.ledger
         try:
@@ -732,8 +743,8 @@ class GitLedger:
                 continue
             files.append((rel, lines))
         if tamper:
-            return Judgement(I.build([], owner, problems.done(), tamper=tamper.done("reasons")))
-        led = I.build(files, owner, problems.done())
+            return Judgement(I.build([], owner, problems, tamper=tamper))
+        led = I.build(files, owner, problems)
         # The cross-entry checks `levain team verify` has always made, here so every reader reports them (a
         # `supersedes` to a missing id is already one of the build's link problems).
         extra = I.Capped()
@@ -743,8 +754,8 @@ class GitLedger:
             if team is not None and e.get("owner") and not team.owner_ok(e["owner"]):
                 extra.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
         if extra:
-            problems += extra.done()
-            led = I.build(files, owner, problems.done())
+            problems += extra
+            led = I.build(files, owner, problems)
         return Judgement(led, datas, files, problems.done())
 
     def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]], set[bytes]]:
@@ -947,7 +958,7 @@ class GitLedger:
         except TeamBusy as exc:
             raise LedgerReadError(f"this clone's trusted record is busy ({exc}); nothing was read") from None
 
-    def _accept(self, datas: dict[str, bytes], rev: str) -> "str | None | object":
+    def _accept(self, datas: dict[str, bytes], rev: str, *, explicit: bool = False) -> "str | None | object":
         """THE acceptance transaction of a judged read of this clone's own tip ``rev``: pin every file's accepted bytes
         and note when each was first seen, in the one trusted record, under ``pins.lock``. Everything it depends on is
         checked there: ``rev`` must still be the branch tip and no quarantined remote tip may be waiting (else None:
@@ -962,8 +973,10 @@ class GitLedger:
                     raise LedgerReadError(bad)
                 if self._quarantined(rec):
                     return _QUARANTINED
-                if rev != self.head():
-                    return None
+                if rev != self.head():          # the tip moved while this read judged
+                    if explicit:
+                        return None                  # a read of a named commit: judged, served, never pinned
+                    raise _PinRace()                 # a read of the tip: read the new tip (bounded, like a pin race)
                 if self._pin_violations(rec.files, datas) or self._lag_violations(rec, datas):
                     raise _PinRace()
                 new = Trust(files, rec.accepted, rec.noted(files), rec.remote)
@@ -1016,7 +1029,8 @@ class GitLedger:
             if not dropped:
                 return []
             try:
-                self._write_trust(Trust(files, rec.accepted, rec.seen, remote))
+                self._write_trust(Trust(files, rec.accepted, _prune_seen(dict(rec.seen), set(files) | set(remote)),
+                                        remote))
             except OSError as exc:
                 raise TeamError(f"could not save the pins: {exc.strerror}") from None
             return dropped
@@ -1178,7 +1192,9 @@ class GitLedger:
         self.save_state(device=self._new_device(), remote=remote or "")
         self._attach_worktree()
         if remote and push:
-            self._sync(push=True)
+            result = self._sync(push=True)
+            if result.startswith("pushed, but"):
+                return f"ledger created; {result}"
             return f"ledger created and pushed to {remote}/{BRANCH}"
         return f"ledger created locally ({'no remote' if not remote else 'not pushed'})"
 
@@ -1239,9 +1255,12 @@ class GitLedger:
                 j = self.judge_remote(tip, Trust(rec.files, floor, rec.seen, rec.remote))
             else:
                 j = self.judge(tip, tip_team, rec.files)
+            # this clone's own remote pins: a remote tip must hold them; its own branch (an offline re-join) may be
+            # behind them, never different
+            own_remote = self._pin_violations(rec.remote, j.datas) if remote_tip is not None \
+                else self._lag_violations(rec, j.datas)
             bad = j.ledger.tamper or self._pin_violations(seeded.files if seeded else {}, j.datas) \
-                or self._pin_violations(seeded.remote if seeded else {}, j.datas) \
-                or self._pin_violations(rec.remote, j.datas)
+                or self._pin_violations(seeded.remote if seeded else {}, j.datas) or own_remote
             if bad:
                 what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" if seed is not None \
                     else "the team ledger on the remote is refused"
@@ -1478,7 +1497,9 @@ class GitLedger:
                                 "run `levain team verify`")
         if push and self.remote:
             try:
-                self._sync(push=True)
+                result = self._sync(push=True)
+                if result.startswith("pushed, but"):
+                    self.warnings.append(f"recorded {sealed['id']}; it was {result}")
             except TeamError as exc:
                 raise TeamError(f"recorded {sealed['id']} locally, but the push failed ({exc}); "
                                 "it goes out with the next write or `levain team sync`") from None
@@ -1829,7 +1850,10 @@ class GitLedger:
                     except (TeamError, OSError) as exc:
                         recorded, why = False, str(exc)
                     try:
-                        recorded = self._fetch_quarantined(remote, left(timeout)) is not None or recorded
+                        took = self._fetch_quarantined(remote, left(timeout))
+                        if took is not None and git(["merge-base", "--is-ancestor", head, took], self.repo.toplevel,
+                                                    check=False, timeout=left(30)).returncode == 0:
+                            recorded = True          # the accepted remote tip holds what was pushed
                     except TeamError as exc:
                         why = why or str(exc)
                     if recorded:

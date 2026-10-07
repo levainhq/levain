@@ -1819,3 +1819,87 @@ def test_an_unreadable_record_is_said_not_shown_as_no_devices(two):
     with pytest.raises(LedgerReadError):
         _gl(ben).devices()
     assert "REFUSED" in _ss(ben)                                     # session start says it (before any device line)
+
+
+def test_a_tip_that_moves_while_it_is_read_is_read_again_never_served_unpinned(two, monkeypatch):
+    # codex HIGH on L3 r4: a tip that moved before _accept was served (the old tip, unpinned) while the new tip held a
+    # new ruling. A read of the tip retries, bounded, like a pin race.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "the new ruling") == 0
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None
+    newer = gb.accepted_tip()
+    (gb.base / "history.json").unlink(missing_ok=True)
+    real, moved = GitLedger.lock, []
+
+    def lock(self, *a, **k):
+        if k.get("name") == "pins.lock" and len(moved) == 1:          # the second take: _accept's
+            git("update-ref", "refs/heads/levain-ledger", newer, cwd=ben)
+        if k.get("name") == "pins.lock":
+            moved.append(1)
+        return real(self, *a, **k)
+    monkeypatch.setattr(GitLedger, "lock", lock)
+    led = gb.ledger()
+    assert "the new ruling" in [e.get("words") for e in led.entries]
+
+
+def test_a_capped_count_survives_build(monkeypatch):
+    # glm MED + codex LOW + gemini LOW on L3 r4: a Capped summary passed through build() was re-capped ("and 1 more").
+    from levain.team import index as I
+    monkeypatch.setattr(I, "MAX_PROBLEMS", 2)
+    tamper = I.Capped(f"r{i}" for i in range(7))
+    problems = I.Capped(f"p{i}" for i in range(5))
+    problems += I.Capped(f"x{i}" for i in range(4))
+    led = I.build([], None, problems, tamper=tamper)
+    assert led.tamper[-1] == "and 5 more reasons" and led.file_problems[-1] == "and 7 more problems"
+    assert I.build([], None, problems).file_problems == led.file_problems     # build never changes its input
+
+
+def test_repin_keeps_the_first_seen_notes_within_what_a_record_holds(monkeypatch):
+    # codex MED on L3 r4: repin kept every historical first-seen note, so they outgrew the derived leaf cap.
+    from levain.team import transport as T
+    monkeypatch.setattr(T, "_MAX_LEDGER_LEAVES", 3)
+    seen = {f"m/{i:016x}.jsonl": {"t": f"2026-10-0{i + 1}T00:00:00Z", "first": False} for i in range(6)}
+    kept = T._prune_seen(dict(seen), {"m/0000000000000000.jsonl"})
+    assert len(kept) == 3 and "m/0000000000000000.jsonl" in kept and "m/0000000000000005.jsonl" in kept
+
+
+def test_record_says_when_its_push_was_not_recorded(two, monkeypatch, capsys):
+    # codex HIGH on L3 r4: append() and init() dropped "pushed, but not recorded".
+    tmp, ana, ben = two
+    monkeypatch.setattr(GitLedger, "_sync", lambda self, **k: "pushed, but not recorded (x); run `levain team sync`")
+    capsys.readouterr()
+    assert record_ruling(ben, "src/a.py", "w") == 0
+    assert "not recorded" in capsys.readouterr().err
+
+
+def test_a_push_is_recorded_only_by_a_tip_that_holds_it(two, monkeypatch):
+    # complement LOW on L3 r4: any accepted SHA from the follow-up fetch counted the push as recorded.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    older = gb.accepted_tip()
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/x.py", "--words",
+                "w", "--no-push", repo=ben) == 0
+    monkeypatch.setattr(GitLedger, "_record_pushed", lambda self, *a: False)
+    real, calls = GitLedger._fetch_quarantined, []
+
+    def stale_second(self, remote, timeout):
+        calls.append(1)
+        return real(self, remote, timeout) if len(calls) == 1 else older
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", stale_second)
+    assert gb.sync().startswith("pushed, but not recorded")
+
+
+def test_an_offline_rejoin_of_a_branch_behind_its_fetch_is_not_refused(two, capsys):
+    # codex MED on L3 r4: an offline re-join checked the clone's own remote pins strictly against its lagging branch.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert _gl(ben).fetch_only(interval=0, timeout=30) is None       # remote pins A+B; the branch holds A
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    assert team("join", "--no-install", repo=ben) == 0
