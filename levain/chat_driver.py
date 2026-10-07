@@ -419,7 +419,7 @@ class OpenHandsDriver(HarnessDriver):
     caps: DriverCaps = field(default=DriverCaps(), init=False)
     _session: Any = field(default=None, init=False, repr=False)
     _phase: _Phase = field(default="new", init=False, repr=False)
-    _running: bool = field(default=False, init=False, repr=False)
+    _running: object | None = field(default=None, init=False, repr=False)   # the running turn's guard token
     _halted: bool = field(default=False, init=False, repr=False)
     _turn_releases: bool = field(default=False, init=False, repr=False)   # close() handed the release to the turn
     _cond: Any = field(default_factory=threading.Condition, init=False, repr=False)
@@ -433,28 +433,31 @@ class OpenHandsDriver(HarnessDriver):
         if resume is not None:
             raise DriverUnsupported(
                 "openhands conversations live in server memory only; resume across a restart is not offered")
-        with self._cond:
-            if self._phase != "new":
-                raise RuntimeError(f"the driver cannot open from {self._phase!r}: it opens once")
-            self._phase = "opening"
 
         def _sink(line: str) -> None:
             on_event(DriverEvent("activity", line))
 
+        # Every state change sits inside the try, so whatever raises at whatever point (the opener, or an
+        # asynchronous BaseException between statements), the finally sees the phase this call took and
+        # leaves the driver closed with anything built released, or published, never stuck at `opening`.
+        began = published = False
+        session: Any = None
         try:
-            session = self.opener(self.entity_dir, on_event=_sink)
-        except BaseException:
             with self._cond:
-                self._phase = "closed"
-                self._cond.notify_all()
-            raise
-        with self._cond:
-            won = self._phase == "opening"
-            if won:
-                self._session, self._phase = session, "open"
-        if not won:
-            # close() ran while the opener was building: this arrival is the release.
-            self._release(session)
+                if self._phase != "new":
+                    raise RuntimeError(f"the driver cannot open from {self._phase!r}: it opens once")
+                began = True
+                self._phase = "opening"
+            session = self.opener(self.entity_dir, on_event=_sink)
+            with self._cond:
+                if self._phase == "opening":
+                    self._session, self._phase = session, "open"
+                    published = True
+        finally:
+            if began and not published:
+                # The opener raised, or close() ran while it built: this is the release either way.
+                self._release(session)
+        if not published:
             raise RuntimeError("the driver was closed while it opened")
 
     def _release(self, session: Any) -> None:
@@ -482,36 +485,43 @@ class OpenHandsDriver(HarnessDriver):
             return "active" if self._running else ("awaiting_approval" if self._halted else "idle")
 
     def _run(self, call: Callable[[Any], Any]) -> TurnSnapshot:
-        with self._cond:
-            if self._phase != "open":
-                raise RuntimeError("the driver is not open")
-            if self._running:
-                raise RuntimeError("a turn is already running on this driver")
-            session = self._session
-            self._running = True
+        turn = object()     # the guard names THIS turn: set in one assignment, cleared only if still ours
         snap: TurnSnapshot | None = None
         try:
+            with self._cond:
+                if self._phase != "open":
+                    raise RuntimeError("the driver is not open")
+                if self._running:
+                    raise RuntimeError("a turn is already running on this driver")
+                session = self._session
+                self._running = turn
             snap = read_outcome(call(session))    # the turn's one terminal record, read once
             return snap
         finally:
-            # One hold, reached on any raise (BaseException included): the guard is released and the state
-            # is set from the snapshot being returned. No snapshot (the call or the read raised) reads as
-            # held: what the harness holds is unknown, so fail closed.
-            owned: Any = None
-            with self._cond:
-                self._running = False
-                self._halted = snap.gated if snap is not None else True
-                release = self._turn_releases
-                if release:
-                    owned, self._session = self._session, None
-                self._cond.notify_all()
+            self._end_turn(turn, snap)
+
+    def _end_turn(self, turn: object, snap: TurnSnapshot | None) -> None:
+        """The end of ``turn``, reached on any raise (BaseException included). One hold releases the guard
+        and sets the state from the snapshot being returned; no snapshot (the call or the read raised) reads
+        as held: what the harness holds is unknown, so fail closed. A turn that never took the guard (it
+        was refused, or a raise landed before the assignment) changes nothing."""
+        owned: Any = None
+        with self._cond:
+            if self._running is not turn:
+                return
+            self._running = None
+            self._halted = snap.gated if snap is not None else True
+            release = self._turn_releases
             if release:
-                # The turn's own outcome is what this call returns (or raises); a failed release is logged,
-                # never allowed to replace it. _release marks the driver closed whatever the close raised.
-                try:
-                    self._release(owned)
-                except Exception as exc:  # noqa: BLE001
-                    _log.error("openhands driver: releasing the session after its turn failed: %s", exc)
+                owned, self._session = self._session, None
+            self._cond.notify_all()
+        if release:
+            # The turn's own outcome is what this call returns (or raises); a failed release is logged,
+            # never allowed to replace it. _release marks the driver closed whatever the close raised.
+            try:
+                self._release(owned)
+            except Exception as exc:  # noqa: BLE001
+                _log.error("openhands driver: releasing the session after its turn failed: %s", exc)
 
     def send_turn(self, message: str, *, options: TurnOptions | None = None) -> TurnSnapshot:
         if options is not None and (options.model is not None or options.effort is not None):
@@ -537,21 +547,25 @@ class OpenHandsDriver(HarnessDriver):
             session.request_stop()
 
     def close(self) -> None:
-        with self._cond:
-            if self._phase in ("new", "closed"):
-                self._phase = "closed"
-                return
-            if self._phase in ("opening", "closing"):
-                # an opener in flight releases its own session on arrival (open()); another closer or a
-                # turn is mid-release. Either way, wait (bounded) until the release is done.
-                if self._phase == "opening":
-                    self._phase = "closing"
-                self._cond.wait_for(lambda: self._phase == "closed", timeout=self.close_wait)
-                return
-            self._phase = "closing"      # no new turn can start from here
-            running = self._running
+        # As in open(): every state change inside the try, so an asynchronous raise between two statements
+        # still reaches the finally that hands the session to whoever releases it.
+        took = False
         owned: Any = None
         try:
+            with self._cond:
+                if self._phase in ("new", "closed"):
+                    self._phase = "closed"
+                    return
+                if self._phase in ("opening", "closing"):
+                    # an opener in flight releases its own session on arrival (open()); another closer or a
+                    # turn is mid-release. Either way, wait (bounded) until the release is done.
+                    if self._phase == "opening":
+                        self._phase = "closing"
+                    self._cond.wait_for(lambda: self._phase == "closed", timeout=self.close_wait)
+                    return
+                took = True
+                self._phase = "closing"      # no new turn can start from here
+                running = self._running
             if running:
                 # The stop requests run on their own thread: one may block (the SDK's pause waits for a
                 # step's state lock), and close() waits only on the turn guard, with a deadline.
@@ -563,14 +577,15 @@ class OpenHandsDriver(HarnessDriver):
             # Reached when the wait runs out AND on a raise (a stopper that could not start, an interrupt
             # of this thread): whoever holds the session releases it, never both and never under a
             # running turn.
-            with self._cond:
-                mine = not self._running
+            if took:
+                with self._cond:
+                    mine = not self._running
+                    if mine:
+                        owned, self._session = self._session, None
+                    else:
+                        self._turn_releases = True   # _run's own return releases it
                 if mine:
-                    owned, self._session = self._session, None
-                else:
-                    self._turn_releases = True   # _run's own return releases it
-            if mine:
-                self._release(owned)
+                    self._release(owned)
 
     def _stop_until_ended(self) -> None:
         """Ask the running turn to stop, about once a second, until it ends (a stop request landing before

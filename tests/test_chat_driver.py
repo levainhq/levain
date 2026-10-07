@@ -864,3 +864,128 @@ def test_close_is_bounded_and_a_turn_outliving_it_releases_on_its_return(tmp_pat
 def test_close_wait_must_be_a_finite_bound(tmp_path, wait):
     with pytest.raises(ValueError, match="bounded"):
         OpenHandsDriver(tmp_path, lambda p, on_event: None, close_wait=wait)
+
+
+# -- the life cycle holds whatever raises wherever: an asynchronous BaseException at every line --------------
+
+
+class _Injected(BaseException):
+    pass
+
+
+def _body_lines(func) -> list[int]:
+    """The line numbers of ``func``'s body before its last ``finally:`` (an exception landing at the first
+    instruction of a finally cannot be closed by any structure, so the property is asked of the body)."""
+    import inspect
+
+    src, start = inspect.getsourcelines(func)
+    cut = max((i for i, line in enumerate(src) if line.strip() == "finally:"), default=len(src))
+    return [start + i for i in range(1, cut)]
+
+
+def _raise_at(func, lineno: int, fired: list[int]):
+    """A trace function raising _Injected once, when ``func``'s frame is about to run ``lineno``."""
+    def local(frame, event, arg):
+        if event == "line" and frame.f_lineno == lineno and not fired:
+            fired.append(lineno)
+            raise _Injected()
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code is func.__code__ else None
+
+    return tracer
+
+
+def _traced(func, lineno: int, call) -> bool:
+    import sys
+
+    fired: list[int] = []
+    sys.settrace(_raise_at(func, lineno, fired))
+    try:
+        call()
+    except _Injected:
+        pass
+    finally:
+        sys.settrace(None)
+    return bool(fired)
+
+
+class _Counted:
+    def __init__(self):
+        self.closes = 0
+        self.stop = threading.Event()
+        self.entered = threading.Event()
+
+    def run_turn(self, m):
+        self.entered.set()
+        assert self.stop.wait(5)
+        return _Out(reply="r")
+
+    def request_stop(self):
+        self.stop.set()
+
+    def close(self):
+        self.closes += 1
+
+
+def _closes_promptly(d) -> bool:
+    t = threading.Thread(target=d.close, daemon=True)
+    t.start()
+    t.join(3)
+    return not t.is_alive()
+
+
+@pytest.mark.parametrize("lineno", _body_lines(OpenHandsDriver._run))
+def test_a_raise_anywhere_in_a_turn_never_leaves_the_guard_set(tmp_path, lineno):
+    """L2 (80d2fc4, repro F): an asynchronous BaseException between `_running = True` and `try:` left the
+    driver `active` forever and close() handed the release to a turn that did not exist."""
+    s = _Counted()
+    s.stop.set()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.5)
+    d.open(lambda e: None)
+    if not _traced(OpenHandsDriver._run, lineno, lambda: d.send_turn("x")):
+        pytest.skip("line not executed on this path")
+    assert d.state != "active"
+    assert _closes_promptly(d) and s.closes == 1 and d.state == "closed"
+
+
+@pytest.mark.parametrize("busy", [False, True])
+@pytest.mark.parametrize("lineno", _body_lines(OpenHandsDriver.close))
+def test_a_raise_anywhere_in_close_still_releases_exactly_once(tmp_path, lineno, busy):
+    """L2 (80d2fc4): close() set `closing` before its try, so a raise in between left the phase there with no
+    one to release; a later close() then waited on a release that never came."""
+    s = _Counted()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.5)
+    d.open(lambda e: None)
+    t = None
+    if busy:
+        t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
+        t.start()
+        assert s.entered.wait(5)
+    else:
+        s.stop.set()
+    fired = _traced(OpenHandsDriver.close, lineno, d.close)
+    s.stop.set()
+    if t is not None:
+        t.join(5)
+    if not fired:
+        pytest.skip("line not executed on this path")
+    assert _closes_promptly(d) and s.closes == 1 and d.state == "closed"
+
+
+@pytest.mark.parametrize("lineno", _body_lines(OpenHandsDriver.open))
+def test_a_raise_anywhere_in_open_leaves_the_driver_closed_and_nothing_leaked(tmp_path, lineno):
+    """L2 (80d2fc4): a raise between the opener's return and the publish leaked the built session and left the
+    phase at `opening`; a close() then waited on an opener that had already gone."""
+    built: list[_Counted] = []
+
+    def opener(p, on_event):
+        built.append(_Counted())
+        return built[-1]
+
+    d = OpenHandsDriver(tmp_path, opener, close_wait=0.5)
+    if not _traced(OpenHandsDriver.open, lineno, lambda: d.open(lambda e: None)):
+        pytest.skip("line not executed on this path")
+    assert _closes_promptly(d) and d.state == "closed"
+    assert all(b.closes == 1 for b in built)
