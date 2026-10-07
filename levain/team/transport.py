@@ -596,9 +596,9 @@ class GitLedger:
             with contextlib.suppress(OSError):
                 cache.unlink()
             return j.ledger
-        if rev != self.head() or self._ref_sha(_INCOMING) is not None:
-            return j.ledger                            # only THIS clone's own tip is accepted, and never mid-quarantine
-        digest = self._accept(j.datas)
+        digest = self._accept(j.datas, rev)
+        if digest is None:
+            return j.ledger
         try:
             _atomic_write(cache, json.dumps({"key": key, "pins": digest, "problems": j.problems, "files": j.files}))
         except OSError:
@@ -884,17 +884,21 @@ class GitLedger:
                            "`levain team sync`")
         return out
 
-    def _accept(self, datas: dict[str, bytes]) -> str:
-        """THE acceptance transaction of a judged read of this clone's own tip: pin every file's accepted bytes and
-        note when each was first seen, in the one trusted record, under ``pins.lock``. The record is re-read there; if
-        its pins no longer hold for these bytes (a concurrent reader pinned a newer tip), _PinRace (the caller reads the
-        tip again). If it cannot be durably saved, the read is refused (LedgerReadError). Returns the record's digest."""
+    def _accept(self, datas: dict[str, bytes], rev: str) -> str | None:
+        """THE acceptance transaction of a judged read of this clone's own tip ``rev``: pin every file's accepted bytes
+        and note when each was first seen, in the one trusted record, under ``pins.lock``. Everything it depends on is
+        checked there: ``rev`` must still be the branch tip and no quarantined remote tip may be waiting (else None:
+        served, not pinned); the record's pins must still hold for these bytes (else _PinRace: a concurrent reader
+        pinned a newer tip, and the caller reads the tip again). If it cannot be durably saved, the read is refused
+        (LedgerReadError). Returns the record's digest."""
         files = {rel: _pin(d) for rel, d in datas.items()}
         try:
             with self.lock(name="pins.lock", timeout=15.0):
                 rec, bad = self._trust()
                 if bad:
                     raise LedgerReadError(bad)
+                if rev != self.head() or self._quarantined(rec):
+                    return None
                 if self._pin_violations(rec.files, datas) or self._pin_violations(rec.remote, datas, lag=True):
                     raise _PinRace()
                 new = Trust(files, rec.accepted, rec.noted(files), rec.remote)
@@ -1415,10 +1419,19 @@ class GitLedger:
         LedgerReadError when it cannot be judged."""
         return self._incoming_refusal()
 
+    def _quarantined(self, rec: Trust) -> bool:
+        """Is a fetched remote tip waiting in quarantine? One that the record already accepted (a crash between the
+        record's write and the ref's removal) is not waiting: it is removed here."""
+        sha = self._ref_sha(_INCOMING)
+        if sha is not None and sha == rec.accepted:
+            git(["update-ref", "-d", _INCOMING, sha], self.repo.toplevel, check=False)
+            return False
+        return sha is not None
+
     def _incoming_refusal(self) -> list[str]:
         try:
             sha = self._ref_sha(_INCOMING)
-            if sha is None:
+            if sha is None or sha == self._trust()[0].accepted:
                 return []
             bad = self.judge_remote(sha).ledger.tamper
         except TeamError as exc:

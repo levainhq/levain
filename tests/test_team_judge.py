@@ -845,6 +845,24 @@ def test_nothing_reads_the_accepted_anchor_ref_to_decide():
     from levain.team import transport as T
     src = inspect.getsource(T)
     assert "_ref_sha(_ACCEPTED)" not in src and src.count("_ACCEPTED") == 2   # the definition and the one write
+    # L1 r3 NOTE 14: nor through the literal ref name, in any team module.
+    import pathlib
+    def code(text):
+        return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+    named = [f.name for f in pathlib.Path(T.__file__).parent.glob("*.py") if "levain/accepted" in code(f.read_text())]
+    assert named == ["transport.py"] and code(src).count("levain/accepted") == 1
+
+
+def test_moving_the_anchor_ref_changes_no_judgement(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    acc = gb.accepted_tip()
+    git("update-ref", "refs/levain/accepted/levain-ledger", gb.head() + "~1", cwd=ben)
+    assert gb.accepted_tip() == acc and gb.remote_ref() == acc
+    git("update-ref", "-d", "refs/levain/accepted/levain-ledger", cwd=ben)
+    assert gb.accepted_tip() == acc and team("sync", repo=ben) == 0
 
 
 def test_a_clone_without_an_accepted_tip_refuses_the_remote_until_it_re_joins(two, capsys):
@@ -1359,3 +1377,36 @@ def test_problems_and_refusals_are_kept_bounded(monkeypatch):
     led = I.build([], None, ["a", "b", "c", "d"], tamper=["w", "x", "y"])
     assert led.file_problems == ["a", "b", "and 2 more problems"]
     assert led.tamper == ["w", "x", "and 1 more reasons"]
+
+
+def test_a_quarantine_that_appears_while_a_read_waits_for_the_pins_lock_stops_the_pin(two, monkeypatch):
+    # L1 r3 LOW 10 / L2 r3 LOW 3: the no-pin-while-quarantined check ran before pins.lock was taken.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    (gb.base / "history.json").unlink(missing_ok=True)
+    before = _pinned(ben)
+    real = GitLedger.lock
+
+    def lock(self, *a, **k):
+        if k.get("name") == "pins.lock":
+            git("update-ref", "refs/levain/incoming/levain-ledger", self.head() + "~1", cwd=ben)
+        return real(self, *a, **k)
+    monkeypatch.setattr(GitLedger, "lock", lock)
+    gb.ledger()
+    assert _pinned(ben) == before
+
+
+def test_a_leftover_quarantine_of_the_accepted_tip_is_swept(two):
+    # L2 r3 LOW 7: a crash after the record's write and before the quarantine ref's removal left reads never pinning.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    git("update-ref", "refs/levain/incoming/levain-ledger", gb.accepted_tip(), cwd=ben)
+    (gb.base / "history.json").unlink(missing_ok=True)
+    gb.ledger()
+    assert any(rel.startswith("ana/") for rel in _pinned(ben))           # the read pinned what it accepted
+    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
+                          capture_output=True).returncode != 0
