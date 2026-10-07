@@ -234,6 +234,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1165,7 +1166,9 @@ def build_policy(
         tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
     # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
     # deletes from the operator's home, so the entity may neither read nor write it.
-    subtrees.append(_ledger_dir().resolve())
+    # At all three spellings, like every other jewel (L1 r1): a link at ~/.levain-runtime must not
+    # leave the ledger reachable by a name the floor does not hold.
+    subtrees.extend(_spellings("~/.levain-runtime/floor"))
 
     ssh_dir = (home / ".ssh").resolve() if ssh_mode == "agent" else None
 
@@ -1336,7 +1339,7 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
-    known_dirs = {*listed_dirs, _ledger_dir().resolve()}
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor")}
     for jewel in _dedup(subtrees + files):
         if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
@@ -4095,26 +4098,39 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
     it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
-    which is still recorded before bwrap mounts over it. Returns the mountpoints THIS call created,
-    as ``(path, "file" | "dir")``, so the caller can make the cred placeholders session-scoped."""
+    which is still recorded before bwrap mounts over it. Returns every object THIS call created,
+    parents included, as ``(path, "file" | "dir")``: the ledger owns exactly those (its own
+    successful ``mkdir`` or ``O_EXCL`` create, never a path merely seen absent), and removes them
+    once no session needs them."""
     created: list[tuple[str, str]] = []
+
+    def mkdir(a: Path) -> None:
+        try:
+            a.mkdir(mode=0o700)   # each level 0700: mkdir(parents=True) gives the umask (glm L3 r5)
+        except FileExistsError:
+            return                # someone else's (or a racing spawn's): not levain's to remove
+        created.append((str(a), "dir"))
+
     for q, kind in mounted.items():
         p = Path(q)
         if kind is None or os.path.lexists(p):
             continue
         # bwrap would create missing parents too; without them a jewel under an absent directory
         # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
-        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
-        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
-            a.mkdir(mode=0o700, exist_ok=True)
+        for a in [a for a in reversed(p.parents) if not os.path.lexists(a)]:
+            mkdir(a)
         if kind == "dir":
-            p.mkdir(mode=0o700, exist_ok=True)
+            mkdir(p)
         else:
             try:
-                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                             0o444)
             except FileExistsError:
                 continue
+            try:
+                os.fchmod(fd, 0o444)   # exactly 0444 whatever the umask: the ledger checks the mode
+            finally:
+                os.close(fd)
             created.append((q, "file"))
     return created
 
@@ -4148,13 +4164,69 @@ def _ledger_dir() -> Path:
     return Path.home() / ".levain-runtime" / "floor"
 
 
-def _claim_alive(claim: str) -> bool:
+def _ledger_dir_problem(create: bool) -> str | None:
+    """Why the ledger directory cannot be trusted, or None. It must be a real directory (no link at
+    ``~/.levain-runtime`` or at ``floor``), owned by this user, and ``floor`` must be 0700: a link there
+    could point the ledger at a file someone else wrote, and the ledger decides what levain deletes.
+    With ``create``, absent levels are made 0700 first."""
+    d = _ledger_dir()
+    for level in (d.parent, d):
+        if create and not os.path.lexists(level):
+            try:
+                level.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                return f"cannot create {level} ({exc})"
+        try:
+            st = os.lstat(level)
+        except FileNotFoundError:
+            return f"{level} does not exist"
+        except OSError as exc:
+            return f"cannot inspect {level} ({exc})"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{level} is not a directory (a link or a file)"
+        if st.st_uid != os.geteuid():
+            return f"{level} is owned by another user"
+    if stat.S_IMODE(os.lstat(d).st_mode) != 0o700:
+        return f"{d} is not mode 0700"
+    return None
+
+
+def _proc_start_time(pid: int) -> str | None:
+    """The kernel's start time of ``pid`` (Linux, field 22 of /proc/<pid>/stat), or None elsewhere or
+    when unreadable. Part of a claim, so a reused pid does not keep a dead session's claim alive."""
     try:
-        pid = int(claim.split(":", 1)[0])
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return data.rsplit(")", 1)[-1].split()[19]
+
+
+def _pidns() -> str:
+    try:
+        return str(os.stat("/proc/self/ns/pid").st_ino)
+    except OSError:
+        return "-"
+
+
+def _new_claim() -> str:
+    """``pid:starttime:pidns:token``. A claim made in another pid namespace (a container sharing this
+    home) cannot be judged from here, so :func:`_claim_alive` keeps it."""
+    pid = os.getpid()
+    return f"{pid}:{_proc_start_time(pid) or '-'}:{_pidns()}:{os.urandom(6).hex()}"
+
+
+def _claim_alive(claim: str) -> bool:
+    parts = claim.split(":")
+    try:
+        pid = int(parts[0])
     except ValueError:
         return False
     if pid <= 0:
         return False
+    if len(parts) >= 4 and parts[2] != _pidns():
+        return True   # made in another pid namespace: not ours to judge, so kept
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -4163,6 +4235,10 @@ def _claim_alive(claim: str) -> bool:
         return True   # someone else's process with that pid: alive, so the claim is kept
     except OSError:
         return False
+    if len(parts) >= 4 and parts[1] != "-":
+        now = _proc_start_time(pid)
+        if now is not None and now != parts[1]:
+            return False   # the pid was reused by a process that started later
     return True
 
 
@@ -4183,32 +4259,89 @@ def _object_unchanged(entry: dict) -> bool:
     return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0o444
 
 
-def _ledger_update(change) -> list[str]:
-    """Apply ``change(entries)`` to the ledger under an exclusive lock, then delete every entry that
-    no live claim holds, removing its object when it is unchanged. Returns the paths removed. Best
-    effort: a ledger that cannot be read or written leaves the objects where they are, which is the
-    behaviour before the ledger existed, never a deletion."""
-    import fcntl
-
-    d = _ledger_dir()
-    removed: list[str] = []
+def _identity_matches(entry: dict) -> bool:
     try:
-        d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(d / (_LEDGER_NAME + ".lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            path = d / _LEDGER_NAME
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (entry.get("dev"), entry.get("ino"))
+
+
+class _LedgerTxn:
+    """One transaction on the ledger, under its exclusive lock: everything a spawn does to the objects
+    it relies on (sweep, plan, create, record, claim) happens inside one, so another session's release
+    or sweep cannot remove an object between this spawn deciding to use it and claiming it (L1 r1).
+    On exit, every entry no live claim holds is dropped, and its object removed when it is still the
+    one levain made. ``ok`` is False when the ledger cannot be trusted or read; then nothing is
+    recorded and nothing removed, which leaves objects where they are rather than guessing."""
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.problem: str | None = None
+        self.entries: list[dict] = []
+        self.removed: list[str] = []
+        self._lock = None
+
+    def __enter__(self) -> "_LedgerTxn":
+        import fcntl
+
+        self.problem = _ledger_dir_problem(create=True)
+        if self.problem is not None:
+            return self
+        d = _ledger_dir()
+        try:
+            self._lock = open(d / (_LEDGER_NAME + ".lock"), "a")
+            fcntl.flock(self._lock, fcntl.LOCK_EX)
             try:
-                entries = json.loads(path.read_text(encoding="utf-8")).get("entries", [])
+                data = json.loads((d / _LEDGER_NAME).read_text(encoding="utf-8"))
+                entries = data["entries"]
             except FileNotFoundError:
                 entries = []
-            except (OSError, ValueError, AttributeError):
-                return []   # unreadable: keep every object rather than guess
-            entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)]
-            change(entries)
+            if not isinstance(entries, list):
+                raise ValueError("entries is not a list")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.problem = f"the ledger {d / _LEDGER_NAME} cannot be read ({exc})"
+            return self
+        self.entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)]
+        for e in self.entries:
+            e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str)]
+        self.ok = True
+        return self
+
+    def sweep(self) -> None:
+        """Drop the claims of processes that no longer exist."""
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if _claim_alive(c)]
+
+    def record(self, created: list[tuple[str, str]]) -> None:
+        """Record objects levain itself just created (its own successful ``mkdir`` or ``O_EXCL``
+        create, never "absent when looked at"), with their identity, unclaimed."""
+        for path, kind in created:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            self.entries = [e for e in self.entries if e["path"] != path]
+            self.entries.append({"path": path, "kind": kind, "dev": st.st_dev, "ino": st.st_ino,
+                                 "claims": []})
+
+    def claim(self, paths: set[str], claim: str) -> None:
+        """Add ``claim`` to every entry at one of ``paths`` whose object is still the one recorded."""
+        for e in self.entries:
+            if e["path"] in paths and _identity_matches(e):
+                e["claims"].append(claim)
+
+    def drop(self, claim: str) -> None:
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if c != claim]
+
+    def __exit__(self, *exc: object) -> None:
+        try:
+            if not self.ok:
+                return
             kept: list[dict] = []
             # Children before parents, so a created ~/.config/git goes before a created ~/.config.
-            for e in sorted(entries, key=lambda e: len(e["path"]), reverse=True):
-                e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str)]
+            for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
                 if e["claims"]:
                     kept.append(e)
                     continue
@@ -4218,69 +4351,61 @@ def _ledger_update(change) -> list[str]:
                             os.rmdir(e["path"])
                         else:
                             os.unlink(e["path"])
-                        removed.append(e["path"])
+                        self.removed.append(e["path"])
                     except OSError:
                         kept.append(e)   # still there: try again next time
+                # else: it is no longer the object levain made (the operator's now); forget it
+            path = _ledger_dir() / _LEDGER_NAME
             tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(json.dumps({"entries": sorted(kept, key=lambda e: e["path"])}, indent=1),
-                           encoding="utf-8")
-            os.replace(tmp, path)
-    except OSError:
-        return removed
-    return removed
+            try:
+                tmp.write_text(json.dumps({"entries": sorted(kept, key=lambda e: e["path"])}, indent=1),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as exc:
+                self.problem = f"the ledger {path} cannot be written ({exc})"
+        finally:
+            if self._lock is not None:
+                self._lock.close()   # releases the flock
 
 
 def _ledger_enter(created: list[tuple[str, str]], mounted: set[str], claim: str) -> None:
-    """Record the objects a spawn just ``created`` and add ``claim`` to every ledger entry this
-    shell mounts on (``mounted``) whose object is still the one recorded, including those another
-    session created."""
-    def change(entries: list[dict]) -> None:
-        for path, kind in created:
-            try:
-                st = os.lstat(path)
-            except OSError:
-                continue
-            entries[:] = [e for e in entries if e["path"] != path]
-            entries.append({"path": path, "kind": kind, "dev": st.st_dev, "ino": st.st_ino,
-                            "claims": []})
-        for e in entries:
-            if e["path"] in mounted and _identity_matches(e):
-                e.setdefault("claims", []).append(claim)
-
-    _ledger_update(change)
-
-
-def _identity_matches(entry: dict) -> bool:
-    try:
-        st = os.lstat(entry["path"])
-    except OSError:
-        return False
-    return (st.st_dev, st.st_ino) == (entry.get("dev"), entry.get("ino"))
+    """Record ``created`` and claim every entry at a path in ``mounted`` (one transaction)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.record(created)
+            txn.claim(mounted, claim)
 
 
 def _ledger_release(claim: str) -> list[str]:
-    """Drop ``claim`` (or, given ``"<pid>:"``, every claim of that process) and remove what no
-    session holds any more."""
-    def change(entries: list[dict]) -> None:
-        for e in entries:
-            e["claims"] = [c for c in e.get("claims", [])
-                           if not (c == claim or (claim.endswith(":") and c.startswith(claim)))]
-
-    return _ledger_update(change)
+    """Drop ``claim`` and remove what no session holds any more. Called only once the claiming
+    shell's namespace is gone (:meth:`_BwrapShell.close`)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.drop(claim)
+    return txn.removed
 
 
 def sweep_floor_placeholders() -> list[str]:
     """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
-    before every Linux spawn, at launch (:mod:`levain.launch`) and by ``levain doctor``. Returns the
-    paths removed."""
+    inside every Linux spawn's own transaction, at launch (:mod:`levain.launch`) and by
+    ``levain doctor``. Returns the paths removed."""
     if not (_ledger_dir() / _LEDGER_NAME).exists():
         return []
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.sweep()
+    return txn.removed
 
-    def change(entries: list[dict]) -> None:
-        for e in entries:
-            e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str) and _claim_alive(c)]
 
-    return _ledger_update(change)
+def ledger_problem() -> str | None:
+    """Why the placeholder ledger cannot be used, or None (for ``levain doctor``: a ledger levain
+    cannot read or trust leaves every placeholder on disk, so it must be said, not swallowed)."""
+    d = _ledger_dir()
+    if not os.path.lexists(d) and not os.path.lexists(d.parent):
+        return None   # never used on this host
+    with _LedgerTxn() as txn:
+        pass
+    return txn.problem
 
 
 def live_floor_placeholders() -> list[Path]:
@@ -4307,10 +4432,34 @@ def session_placeholder_note(deny_standard_creds: bool, system: str | None = Non
             "placeholder (so nothing can be planted there), removed when the session ends")
 
 
+_LIVE_BWRAP_SHELLS: "weakref.WeakSet[_BwrapShell]" = weakref.WeakSet()
+
+
 @atexit.register
-def _release_this_process() -> None:
-    if (_ledger_dir() / _LEDGER_NAME).exists():
-        _ledger_release(f"{os.getpid()}:")
+def _close_live_shells() -> None:
+    """At levain's exit, close every Linux shell still open, so each releases its placeholders the
+    normal way, after its namespace is gone. Releasing a claim while its shell lived would let the
+    release unlink a placeholder still mounted in that shell, which detaches the mount."""
+    for shell in list(_LIVE_BWRAP_SHELLS):
+        try:
+            shell.close()
+        except Exception:  # noqa: BLE001 — exit must go on
+            pass
+
+
+def _group_gone(pgid: int, *, timeout: float) -> bool:
+    """True once no process is left in process group ``pgid`` (polled until ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass   # a member exists that this user may not signal: not gone
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 class _BwrapShell(SandboxedShell):
@@ -4355,13 +4504,22 @@ class _BwrapShell(SandboxedShell):
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
 
     def close(self) -> None:
-        # Released only after the sandbox is gone, so no mount of this shell rests on a placeholder
-        # the release removes. `finally`, as `_SeatbeltShell.close`: the parent's teardown can raise.
+        # The claim is released only once the sandbox's namespace is GONE, never while any process of
+        # it lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
+        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Reaping
+        # bwrap's monitor is not enough: on SIGTERM it dies at once, while the namespace's pid 1 (in
+        # the same process group, no --new-session) and everything under it go down asynchronously.
+        # So the release waits until no process of the group is left; with --unshare-pid, pid 1's
+        # exit kills and waits for every process of its namespace first, so an empty group means an
+        # empty namespace. If it is not empty in time, the claim stays, and the sweep at the next spawn
+        # or at launch releases it once this levain is gone. `finally`, as `_SeatbeltShell.close`.
+        pgid = self._proc.pid if self._proc is not None else None
         try:
             super().close()
         finally:
             claim, self._ledger_claim = self._ledger_claim, None
-            if claim is not None:
+            _LIVE_BWRAP_SHELLS.discard(self)
+            if claim is not None and (pgid is None or _group_gone(pgid, timeout=5.0)):
                 _ledger_release(claim)
 
     def _recheck(self) -> None:
@@ -4431,6 +4589,59 @@ class BwrapProvider(ConfinementProvider):
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
 
+    def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]]):
+        """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
+        ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
+        ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
+        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
+        # and the manifest (an absent root created as a directory, say) would be recorded in its new
+        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
+        try:
+            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
+                "(fail-closed)."
+            ) from exc
+        argv, create_first = _bwrap_plan(policy)
+        mounted, unmounted = _mount_plan_paths(argv, policy)
+        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
+        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
+        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
+        # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
+        # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
+        # Each one this process made is levain's, recorded in the placeholder ledger and removed once
+        # no session needs it; one that appeared meanwhile is someone else's and is left alone.
+        for d in create_first:
+            try:
+                Path(d).mkdir(mode=0o700)
+                made.append((d, "dir"))
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ConfinementError(
+                    f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
+                    "bash hands (fail-closed)."
+                ) from exc
+        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
+        # needs it to exist. Not a jail — reach is default-allowed.
+        policy.workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            made += _prepare_mountpoints(mounted) or []
+            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
+                "bash hands (fail-closed)."
+            ) from exc
+        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
+        if moved:
+            raise ConfinementError(
+                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
+                "— refusing to grant bash hands (fail-closed). Try again."
+            )
+        return argv, create_first, mounted, unmounted, manifest
+
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """The bwrap invocation as shell-quoted text.
 
@@ -4460,64 +4671,22 @@ class BwrapProvider(ConfinementProvider):
                 "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
                 "fails — which is why this is probed by running bwrap, not by reading either."
             )
-        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
-        # and the manifest (an absent root created as a directory, say) would be recorded in its new
-        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
-        try:
-            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
-        except (OSError, RuntimeError) as exc:
-            raise ConfinementError(
-                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
-                "(fail-closed)."
-            ) from exc
-        argv, create_first = _bwrap_plan(policy)
-        mounted, unmounted = _mount_plan_paths(argv, policy)
-        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
-        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
-        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
-        # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
-        # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
-        # What this spawn creates (these directories, and the placeholders for absent cred files)
-        # goes in the placeholder ledger, which removes it when no session needs it any more.
-        created: list[tuple[str, str]] = []
-        claim = f"{os.getpid()}:{os.urandom(6).hex()}"
-        sweep_floor_placeholders()   # a crashed session's placeholders, before this plan counts on them
-        for d in create_first:
+        # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
+        # cannot remove an object this plan relies on between the plan and the claim. The sweep runs
+        # FIRST, so a crashed session's objects are either gone before the plan looks or claimed by it.
+        claim = _new_claim()
+        made: list[tuple[str, str]] = []
+        with _LedgerTxn() as txn:
+            if txn.ok:
+                txn.sweep()
             try:
-                Path(d).mkdir(mode=0o700)
-                created.append((d, "dir"))
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                _ledger_enter(created, set(), claim)
-                _ledger_release(claim)
-                raise ConfinementError(
-                    f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
-                    "bash hands (fail-closed)."
-                ) from exc
-        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
-        # needs it to exist. Not a jail — reach is default-allowed.
-        policy.workspace.mkdir(parents=True, exist_ok=True)
-        cred_files = {str(f) for f in policy.deny_files}
-        try:
-            made = _prepare_mountpoints(mounted) or []
-            created += [(q, k) for q, k in made if q in cred_files]
-            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
-        except (OSError, RuntimeError) as exc:
-            _ledger_enter(created, set(), claim)
-            _ledger_release(claim)
-            raise ConfinementError(
-                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
-                "bash hands (fail-closed)."
-            ) from exc
-        _ledger_enter(created, {*mounted, *create_first}, claim)
-        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
-        if moved:
-            _ledger_release(claim)
-            raise ConfinementError(
-                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
-                "— refusing to grant bash hands (fail-closed). Try again."
-            )
+                argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made)
+            finally:
+                if txn.ok:
+                    # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
+                    txn.record(made)
+            if txn.ok:
+                txn.claim({*mounted, *create_first}, claim)
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).
@@ -4534,6 +4703,7 @@ class BwrapProvider(ConfinementProvider):
             default_timeout=default_timeout,
         )
         shell._ledger_claim = claim
+        _LIVE_BWRAP_SHELLS.add(shell)
         try:
             shell.start()
             shell._recheck()   # whatever changed during the start closes it before any command

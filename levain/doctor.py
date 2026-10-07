@@ -888,7 +888,18 @@ def _check_floor_placeholders() -> list[CheckResult]:
     or SIGKILL leaves behind, and name the ones a live session still holds. Silent where there are
     none, which is every macOS host."""
     try:
-        from levain.firing.confinement import live_floor_placeholders, sweep_floor_placeholders
+        from levain.firing.confinement import (
+            ledger_problem,
+            live_floor_placeholders,
+            sweep_floor_placeholders,
+        )
+        problem = ledger_problem()
+        if problem is not None:
+            return [CheckResult(
+                "floor placeholders", False,
+                f"{problem}: levain cannot tell which placeholders are its own, so it removes none",
+                hint="move the file or link aside; levain makes a fresh ledger at the next bash start",
+            )]
         removed = sweep_floor_placeholders()
         live = live_floor_placeholders()
     except Exception as exc:  # noqa: BLE001 — never let the sweep break the whole doctor run

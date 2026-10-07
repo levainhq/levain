@@ -273,10 +273,110 @@ def test_a_placeholder_written_in_place_is_left_alone(home: Path) -> None:
     assert f.read_text().endswith("=real\n")
 
 
-def test_levain_exit_releases_every_claim_of_its_process(home: Path) -> None:
-    a, b = home / ".netrc", home / ".pypirc"
-    C._prepare_mountpoints({str(a): "file", str(b): "file"})
-    C._ledger_enter([(str(a), "file")], {str(a)}, "4242:one")
-    C._ledger_enter([(str(b), "file")], {str(b)}, "4242:two")
-    C._ledger_release("4242:")                         # what the atexit hook passes for this pid
-    assert not a.exists() and not b.exists()
+def test_a_placeholder_made_under_a_strict_umask_is_still_removable(home: Path) -> None:
+    f = home / ".netrc"
+    old = os.umask(0o077)
+    try:
+        C._prepare_mountpoints({str(f): "file"})
+    finally:
+        os.umask(old)
+    assert (f.stat().st_mode & 0o777) == 0o444
+    C._ledger_enter([(str(f), "file")], {str(f)}, "1:a")
+    C._ledger_release("1:a")
+    assert not f.exists()
+
+
+def test_prepare_mountpoints_owns_only_what_its_own_mkdir_made(home: Path) -> None:
+    (home / ".config").mkdir()                       # the operator's, before levain looked
+    made = C._prepare_mountpoints({str(home / ".config" / "gh" / "x" / "hosts.yml"): "file",
+                                   str(home / ".aws" / "sso" / "cache"): "dir"})
+    paths = {p for p, _ in made}
+    assert str(home / ".config") not in paths
+    assert {str(home / ".config" / "gh"), str(home / ".config" / "gh" / "x"), str(home / ".aws"),
+            str(home / ".aws" / "sso"), str(home / ".aws" / "sso" / "cache")} <= paths
+    assert (str(home / ".config" / "gh" / "x" / "hosts.yml"), "file") in made
+
+
+def test_a_claim_from_another_pid_namespace_is_kept_and_a_reused_pid_is_not(monkeypatch) -> None:
+    assert C._claim_alive(f"{2 ** 22 + 9}:-:some-other-ns:x")       # not ours to judge
+    monkeypatch.setattr(C, "_pidns", lambda: "ours")
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "200")
+    assert C._claim_alive(f"{os.getpid()}:200:ours:x")
+    assert not C._claim_alive(f"{os.getpid()}:100:ours:x"), "the pid now names a later process"
+
+
+def test_a_ledger_reached_through_a_link_is_not_trusted(home: Path, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "forged"
+    (elsewhere / "floor").mkdir(parents=True, mode=0o700)
+    (home / ".levain-runtime").symlink_to(elsewhere)
+    f = home / ".netrc"
+    C._prepare_mountpoints({str(f): "file"})
+    st = f.stat()
+    (elsewhere / "floor" / "placeholders.json").write_text(
+        '{"entries": [{"path": "%s", "kind": "file", "dev": %d, "ino": %d, "claims": []}]}'
+        % (f, st.st_dev, st.st_ino))
+    assert C.sweep_floor_placeholders() == []
+    assert f.exists(), "nothing is removed on the word of a ledger levain cannot trust"
+    assert "not a directory" in (C.ledger_problem() or "")
+
+
+def test_a_corrupt_ledger_is_reported(home: Path) -> None:
+    from levain.doctor import _check_floor_placeholders
+
+    C._ledger_enter([], set(), "1:a")
+    (C._ledger_dir() / "placeholders.json").write_text("{not json")
+    [row] = _check_floor_placeholders()
+    assert row.ok is False and "cannot be read" in row.detail
+
+
+def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Path, monkeypatch) -> None:
+    f = home / ".netrc"
+    C._prepare_mountpoints({str(f): "file"})
+    C._ledger_enter([(str(f), "file")], {str(f)}, f"{os.getpid()}:-:-:k")
+    shell = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
+    shell._ledger_claim = f"{os.getpid()}:-:-:k"
+
+    class _P:
+        pid = 4242
+
+        def poll(self):
+            return 0
+    shell._proc = _P()
+    monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: False)
+    shell.close()
+    assert f.exists(), "the namespace may still hold the mount: keep the claim"
+    shell2 = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
+    shell2._ledger_claim = f"{os.getpid()}:-:-:k"
+    shell2._proc = _P()
+    monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: True)
+    shell2.close()
+    assert not f.exists()
+
+
+def test_group_gone_sees_a_live_and_a_finished_group() -> None:
+    import subprocess as sp
+
+    p = sp.Popen(["sleep", "5"], start_new_session=True, env={"PATH": "/bin:/usr/bin"})
+    try:
+        assert C._group_gone(p.pid, timeout=0.2) is False
+    finally:
+        p.kill()
+        p.wait()
+    assert C._group_gone(p.pid, timeout=2.0) is True
+
+
+def test_levain_exit_closes_every_live_shell(monkeypatch) -> None:
+    closed = []
+
+    class _S:
+        def close(self):
+            closed.append(self)
+    s = _S()
+    C._LIVE_BWRAP_SHELLS.add(s)
+    try:
+        C._close_live_shells()
+    finally:
+        C._LIVE_BWRAP_SHELLS.discard(s)
+    assert closed == [s]
+
+
