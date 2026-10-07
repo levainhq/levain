@@ -13,6 +13,7 @@ from . import entry as E
 from . import index as I
 from . import pack as P
 from . import roles as R
+from . import verify as VF
 from . import wire as W
 from .export import export_stream
 from .hook import decide
@@ -196,13 +197,7 @@ def cmd_verify(args) -> int:
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
     canon_text = gl.read_canon(sha)
-    problems = list(ledger.problems) + gl.team_history_problems(team, sha)
-    for e in ledger.entries:
-        for s in e.get("supersedes", []) + e.get("refs", []):
-            if s not in ledger.by_id:
-                problems.append(f"{e['id']}: names {s}, which is not in the ledger")
-        if e.get("owner") and not team.owner_ok(e["owner"]):
-            problems.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
+    problems = VF.problems(gl, sha, team, ledger)
     files = len(ledger.files)
     print(f"{len(ledger.entries)} entries in {files} file(s); {len(ledger.in_force)} in force")
     print(C.staleness(canon_text, gl.state_hash(ledger, team)))
