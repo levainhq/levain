@@ -436,7 +436,6 @@ class _ViewServer(ThreadingHTTPServer):
     workers: threading.BoundedSemaphore
     problems_cache: tuple[tuple, list[str]] | None = None   # (commit, history boundary, team): the history walk
     shallow_path: str | None = None
-    fetch_failure: tuple[float, str] | None = None   # (when its fetch began, fetch_only's answer) until a later success
     refusal_cache: tuple[Any, tuple[list[str], bool]] | None = None   # (last_fetch_attempt, _refusal's answer)
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
@@ -567,24 +566,18 @@ class _ViewHandler(GuardedHandler):
                 return out
             out["remote"] = True
             interval = FETCH_FLOOR if now else max(self.server.fetch_interval, FETCH_FLOOR)
-            began = time.time()     # a failure is stamped with when its fetch began, so a success after that wins
+            began = time.time()     # a success another process records after this fetch began beats its failure
             note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)
             out["busy"] = bool(note and note.startswith("busy:"))
             if out["busy"]:
                 note = None                     # another process is fetching the same remote: not a failure
             st = gl.state()
             out["last_ok"] = _iso(st.get("last_fetch_ok"))
-            # fetch_only reports a failed fetch once, in its answer; the view keeps it until a later fetch succeeds,
-            # so the next page (inside the pacing interval, no fetch) still says the remote could not be reached.
+            # A failed fetch is saved in state.json (last_fetch_error, cleared by the next success), whichever command
+            # made it, so later pages read it there; this page also shows its own fetch's answer.
             ok_at = _epoch(st.get("last_fetch_ok"))
-            if note and (ok_at is None or ok_at < began):
-                self.server.fetch_failure = (began, note)
-            elif self.server.fetch_failure and ok_at is not None and ok_at >= self.server.fetch_failure[0]:
-                self.server.fetch_failure = None
             if note and ok_at is not None and ok_at >= began:
                 note = None         # another process fetched successfully while this fetch was failing
-            if not note and self.server.fetch_failure:
-                note = self.server.fetch_failure[1]
             # The refusal is read from the quarantine itself, so it shows whichever command fetched the refused tip
             # (this view, a sync, the hook), for as long as that tip is what the remote holds.
             refusal, unjudged = self._refusal(gl, st)

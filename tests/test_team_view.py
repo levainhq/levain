@@ -642,6 +642,8 @@ class _RemoteStub(_Stub):
 
     def fetch_only(self, *, interval, timeout):
         self.calls.append(interval)
+        if self._note and not self._note.startswith("busy:") and isinstance(self._state, dict):
+            self._state = {**self._state, "last_fetch_error": self._note}   # as the transport saves a failure
         return self._note
 
     def remote_ref(self):
@@ -968,6 +970,22 @@ def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_v
     page = _req(port, "GET", "/")[1].decode()
     assert "refused as tampered" in page and "remote, as last accepted" in page and "notes.txt" not in page
 
+
+
+def test_a_failure_another_command_saved_is_shown_until_a_success_clears_it(capfd):
+    # lane E-team, after lane C saved every failed fetch in state.json: the view kept its own in-process memory of
+    # failures; it now reads the one record every reader shares, so a failure the hook or a sync saw is shown too.
+    stub = _RemoteStub(state={"last_fetch_ok": 1.0e9, "last_fetch_error": "git fetch failed: no route"})
+    httpd = _serve(stub)
+    try:
+        port = httpd.server_address[1]
+        assert "fetch-error" in _req(port, "GET")[1].decode()             # this view never fetched-and-failed
+        assert "no route" in capfd.readouterr().err
+        stub._state = {"last_fetch_ok": 2.0e9, "last_fetch_error": ""}     # a later fetch, by anyone, succeeded
+        assert "fetch-error" not in _req(port, "GET")[1].decode()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_a_failed_fetch_is_not_shown_after_a_later_fetch_succeeded():
