@@ -362,3 +362,40 @@ def test_init_and_docs_pages_unlock_and_reload_in_place(tmp_path, page, mode):
     p = subprocess.run(["node", str(h), str(WEB / "token.js"), page, mode, str(WEB / f"{page}.js")],
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
+
+
+FRAGMENT_HARNESS = r"""
+const fs = require("fs"), vm = require("vm");
+const [, , tokenJs, stored, frag] = process.argv;
+const kept = new Map();
+if (stored !== "-") kept.set("levain.token", stored);
+const replaced = [];
+const ctx = vm.createContext({ JSON, Promise, Array, Object, String,
+  location: { hash: frag, pathname: "/", search: "" },
+  history: { replaceState: (s, t, u) => { replaced.push(u); ctx.location.hash = ""; } },
+  sessionStorage: { getItem: (k) => (kept.has(k) ? kept.get(k) : null), setItem: (k, v) => kept.set(k, v),
+                    removeItem: (k) => kept.delete(k) },
+  addEventListener() {}, console });
+ctx.window = ctx;
+vm.runInContext(fs.readFileSync(tokenJs, "utf8"), ctx);
+console.log(JSON.stringify({ held: ctx.LevainToken.get(), kept: kept.get("levain.token") || null,
+                             stripped: replaced.length === 1 }));
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+@pytest.mark.parametrize("stored,expect", [("tok-stored-0123456789", "tok-stored-0123456789"),
+                                           ("-", "tok-from-link-0123456789")])
+def test_a_token_fragment_never_replaces_a_stored_token(tmp_path, stored, expect):
+    """lane E3: another localhost page could open this origin with a stale `#token=` and overwrite the tab's token
+    (it forced a re-unlock; it leaked nothing). Once a token is stored, `#token=` is ignored, and a link code
+    (POST /unlock) is how it is replaced; a tab with nothing stored still takes an old `#token=` link."""
+    import json
+
+    h = tmp_path / "harness.js"
+    h.write_text(FRAGMENT_HARNESS)
+    p = subprocess.run(["node", str(h), str(WEB / "token.js"), stored, "#token=tok-from-link-0123456789"],
+                       capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stderr
+    out = json.loads(p.stdout.strip().splitlines()[-1])
+    assert out == {"held": expect, "kept": expect, "stripped": True}

@@ -1138,3 +1138,67 @@ def test_a_read_only_server_still_unlocks_and_mints_links(tmp_path, monkeypatch)
         assert status == 405 and headers.get("Allow") == "GET, HEAD"
     finally:
         httpd.shutdown(); httpd.server_close(); t.join(timeout=5)
+
+
+def _sigterm_after_the_record_lands(monkeypatch, tmp_path):
+    """Deliver SIGTERM, through whatever handler is live, the moment the runtime record is written."""
+    import os
+    import signal
+
+    from levain import http_guards as hg
+
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    real = os.replace
+
+    def replace(src, dst):
+        real(src, dst)
+        handler = signal.getsignal(signal.SIGTERM)
+        if not callable(handler):
+            raise AssertionError("SIGTERM was not armed while the runtime file existed (it would kill the server "
+                                 "and leave the file)")
+        handler(signal.SIGTERM, None)
+
+    monkeypatch.setattr(hg.os, "replace", replace)
+    return lambda: list((tmp_path / "home" / hg.RUNTIME_DIR_NAME).glob("*.json"))
+
+
+def test_docs_a_sigterm_as_the_token_is_published_still_removes_the_runtime_file(tmp_path, monkeypatch):
+    """lane E3: SIGTERM between publish_launch_token and stop_on_sigterm killed the server and left the file."""
+    import signal
+
+    from levain.docs_server import run_docs_web
+
+    before = signal.getsignal(signal.SIGTERM)
+    records = _sigterm_after_the_record_lands(monkeypatch, tmp_path)
+    assert run_docs_web(tmp_path, port=0, open_browser=False) == 0
+    assert records() == [] and signal.getsignal(signal.SIGTERM) == before
+
+
+def test_init_a_sigterm_as_the_token_is_published_still_removes_the_runtime_file(tmp_path, monkeypatch):
+    import signal
+
+    from levain.init_server import run_init_web
+
+    before = signal.getsignal(signal.SIGTERM)
+    records = _sigterm_after_the_record_lands(monkeypatch, tmp_path)
+    assert run_init_web(tmp_path / "i", port=0, open_browser=False) == 0
+    assert records() == [] and signal.getsignal(signal.SIGTERM) == before
+
+
+def test_serve_a_sigterm_as_the_token_is_published_still_removes_the_runtime_file(tmp_path, monkeypatch):
+    import signal
+
+    import levain.web_server as ws
+    from levain.dashboard import AnnealPaths, SubstrateSource
+
+    real_make = ws.make_server
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: real_make(
+        SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
+        read_token=k["read_token"]))
+    (tmp_path / ".levain").mkdir()
+    (tmp_path / ".levain" / "memory.db").write_bytes(b"")
+    before = signal.getsignal(signal.SIGTERM)
+    records = _sigterm_after_the_record_lands(monkeypatch, tmp_path)
+    assert ws.run_web_server(tmp_path, port=0, open_browser=False) == 0
+    assert records() == [] and signal.getsignal(signal.SIGTERM) == before

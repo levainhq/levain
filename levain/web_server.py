@@ -1526,21 +1526,20 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-    try:
-        published = publish_launch_token(httpd, url, port=bound_port, kind="serve")
-    except OSError as exc:
-        print(f"Could not write the launch token to {exc.filename or 'the runtime directory'}: {exc}.\n"
-              "This output is not a terminal, so there is no other place to hand it over; not serving.",
-              file=sys.stderr)
-        httpd.server_close()
-        if chat_host is not None:
-            chat_host.shutdown()
-        return 1
-    unlocked = published.unlocked
-
+    # SIGTERM is armed BEFORE the runtime file is written, so the cleanup below covers it from the moment it exists
+    # (lane E3: a SIGTERM between the two killed the server and left the file).
     restore_sigterm = SigtermStop()
+    published = None
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        try:
+            published = publish_launch_token(httpd, url, port=bound_port, kind="serve")
+        except OSError as exc:
+            print(f"Could not write the launch token to {exc.filename or 'the runtime directory'}: {exc}.\n"
+                  "This output is not a terminal, so there is no other place to hand it over; not serving.",
+                  file=sys.stderr)
+            return 1   # the finally closes the server and the chat host
+        unlocked = published.unlocked
         if open_browser:
             # The listening socket is already bound (ThreadingHTTPServer binds in __init__), so the browser's
             # connection queues until serve_forever accepts it. Inside the try: a Ctrl+C while the browser opens
@@ -1551,7 +1550,8 @@ def run_web_server(
         print("\nstopped.")
     finally:
         restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
-        published.close()
+        if published is not None:
+            published.close()
         httpd.server_close()
         if chat_host is not None:
             chat_host.shutdown()

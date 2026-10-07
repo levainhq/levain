@@ -6,8 +6,8 @@
 // browser never sends a fragment to a server, so the code reaches no server log and no Referer; the browser's own
 // history does keep it, and there it is a code that has already been spent. The token printed in a terminal, typed
 // into the unlock form, is the fallback (a headless box, a second browser, a spent or expired link). An old
-// #token= / #chat_token= link still works when the page loads. The token is never put in a cookie (a cookie for
-// 127.0.0.1 would go to every port on it) or a request URL. sessionStorage is on disk: browsers write it into the
+// #token= / #chat_token= link still works when the page loads, in a tab that has no token kept. The token is never
+// put in a cookie (a cookie for 127.0.0.1 would go to every port on it) or a request URL. sessionStorage is on disk: browsers write it into the
 // profile for session restore (Chrome's Session Storage, measured 2026-10-07), where it lasts as long as the tab may be
 // restored. Browser profiles are crown jewels in an entity's confinement floor (levain.firing.confinement,
 // BROWSER_PROFILE_DIRS), so the browsers listed there are denied to an entity's hands; a browser not on that list is
@@ -29,8 +29,10 @@
   let form = null;
   let noteEl = null;
 
-  // The fragment the server opened the page with wins; otherwise what this tab kept. `#chat_token=` is the fragment
-  // the chat panel was opened with before one token covered every route. Storage can be absent or throw (a private
+  // What this tab kept wins over a `#token=` fragment: any page on this machine can open this origin with a fragment,
+  // so a stale one must not replace the tab's token (lane E3); a link code (POST /unlock) is how a kept token is
+  // replaced. A tab with nothing kept takes the fragment. `#chat_token=` is the fragment the chat panel was opened with
+  // before one token covered every route. Storage can be absent or throw (a private
   // window, blocked site data), so every access is guarded and the form is the fallback.
   // A token is 8 to 256 characters of URL-safe base64, the shape the server accepts (codex L3: a longer one, pasted
   // or kept, made every request fail before it reached the server, and a reload brought it back).
@@ -51,12 +53,14 @@
         }
       }
     } catch (e) { t = null; /* no location or history, or the strip failed: the form still works */ }
-    if (t) { keep(t); return t; }
+    let kept = null;
     try {
-      const kept = sessionStorage.getItem(KEY);
-      if (kept && !tokenShaped(kept)) { drop(); return null; }
-      return kept || null;
-    } catch (e) { return null; }
+      kept = sessionStorage.getItem(KEY);
+      if (kept && !tokenShaped(kept)) { drop(); kept = null; }
+    } catch (e) { kept = null; }
+    if (kept) return kept;
+    if (t) { keep(t); return t; }
+    return null;
   }
   function keep(t) { try { sessionStorage.setItem(KEY, t); } catch (e) { /* held in memory only */ } }
   function drop() { token = null; try { sessionStorage.removeItem(KEY); } catch (e) { /* nothing kept */ } }
