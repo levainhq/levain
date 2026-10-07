@@ -2225,3 +2225,81 @@ def test_a_failed_open_whose_teardown_fails_keeps_both_errors(tmp_path):
     _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the release")
     err = host.session_status(sid)["error"]
     assert "bad model" in err and "teardown failed" in err
+
+
+# -- ChatHost.open idempotency (codex 6 from the release-range review; spec by lane T2) -----------------------
+
+_KEY = "k" * 16
+
+
+def test_a_repeated_open_key_returns_the_first_ids_and_starts_nothing(tmp_path):
+    host = _host(tmp_path, {"alpha": _Fake([]), "beta": _Fake([])}, max_sessions=1)
+    first = host.open("alpha", idem_key=_KEY)
+    _wait(host, first["job_id"])
+    jobs = len(host._jobs)
+    again = host.open("alpha", idem_key=_KEY)       # the cap is full: a repeat is never refused by it
+    assert (again["session_id"], again["job_id"]) == (first["session_id"], first["job_id"])
+    assert len(host._jobs) == jobs and len(host._sessions) == 1
+
+
+def test_concurrent_opens_with_one_key_make_one_session(tmp_path):
+    host = _host(tmp_path, {"alpha": _Fake([])}, max_sessions=4)
+    out: list = []
+    go = threading.Barrier(8)
+
+    def one():
+        go.wait()
+        out.append(host.open("alpha", idem_key=_KEY)["session_id"])
+
+    threads = [threading.Thread(target=one) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert len(set(out)) == 1 and len(out) == 8 and len(host._sessions) == 1
+
+
+def test_one_key_for_another_entity_conflicts(tmp_path):
+    host = _host(tmp_path, {"alpha": _Fake([]), "beta": _Fake([])})
+    host.open("alpha", idem_key=_KEY)
+    with pytest.raises(ChatError) as e:
+        host.open("beta", idem_key=_KEY)
+    assert e.value.code == "idem_conflict" and e.value.http_status == 409
+
+
+@pytest.mark.parametrize("key", ["short", "x" * 65, "has space in it!!", 12345678901234567, "é" * 16])
+def test_a_malformed_key_is_a_bad_request(tmp_path, key):
+    host = _host(tmp_path, {"alpha": _Fake([])})
+    with pytest.raises(ChatError) as e:
+        host.open("alpha", idem_key=key)
+    assert e.value.code == "bad_request" and e.value.http_status == 400 and not host._sessions
+
+
+def test_a_refused_open_records_nothing(tmp_path):
+    host = _host(tmp_path, {"alpha": _Fake([]), "beta": _Fake([])}, max_sessions=1)
+    with pytest.raises(ChatError):
+        host.open("nope", idem_key=_KEY)                  # unknown entity
+    host.open("alpha")
+    with pytest.raises(ChatError) as e:
+        host.open("beta", idem_key=_KEY)                  # the cap
+    assert e.value.code == "too_many_sessions"
+    host.shutdown()
+    with pytest.raises(ChatError) as e:
+        host.open("beta", idem_key=_KEY)                  # shut down
+    assert e.value.code == "shutting_down" and not host._idem
+
+
+def test_a_key_is_forgotten_after_its_ttl_and_the_oldest_past_the_cap(tmp_path, monkeypatch):
+    import levain.chat as chat
+
+    host = _host(tmp_path, {"alpha": _Fake([])}, max_sessions=300)
+    first = host.open("alpha", idem_key=_KEY)
+    monkeypatch.setattr(chat, "_IDEM_SECONDS", 0.0)
+    again = host.open("alpha", idem_key=_KEY)             # expired: a new open
+    assert again["session_id"] != first["session_id"]
+    monkeypatch.setattr(chat, "_IDEM_SECONDS", 600.0)
+    monkeypatch.setattr(chat, "_IDEM_KEPT", 3)
+    keys = [f"key-{i:012d}" for i in range(4)]
+    for k in keys:
+        host.open("alpha", idem_key=k)
+    assert keys[0] not in host._idem and list(host._idem) == keys[1:]

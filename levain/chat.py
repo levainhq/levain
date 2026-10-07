@@ -130,10 +130,11 @@ import copy
 import gc
 import logging
 import math
+import re
 import secrets
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -244,6 +245,14 @@ reads ``release_failed`` (still counted); a ``None`` report that comes later sti
 _SHUTDOWN_JOIN_SECONDS = 60.0
 """How long :meth:`ChatHost.shutdown` waits for its closes (all started at once, each on its driver's own
 release lane)."""
+
+_IDEM_SECONDS = 600.0
+"""How long an open's ``idem_key`` is remembered, from its first use."""
+
+_IDEM_KEPT = 256
+"""How many ``idem_key`` entries are kept; past it the oldest is evicted."""
+
+_IDEM_KEY = re.compile(r"[A-Za-z0-9_-]{16,64}")
 
 _REAP_IDLE_SECONDS = 1.0
 """How often the reaper re-checks whether it is still needed when no deadline is pending."""
@@ -706,6 +715,8 @@ class ChatHost:
         self._reap_cond = threading.Condition(self._lock)
         self._reports: list[_Release] = []       # releases whose report deadline has not passed
         self._reaper_thread: threading.Thread | None = None
+        # idem_key -> (entity, session_id, job_id, first use, monotonic), oldest first
+        self._idem: OrderedDict[str, tuple[str, str, str, float]] = OrderedDict()
 
     # -- reads ---------------------------------------------------------------
 
@@ -773,11 +784,28 @@ class ChatHost:
 
     # -- operations ----------------------------------------------------------
 
-    def open(self, entity: Any) -> dict[str, Any]:
-        """Start opening a session on a registered entity. Returns the session id and the open job."""
+    def open(self, entity: Any, idem_key: Any = None) -> dict[str, Any]:
+        """Start opening a session on a registered entity. Returns the session id and the open job.
+
+        ``idem_key`` makes the open idempotent (a client whose response was lost retries with the same
+        key): a key seen in the last :data:`_IDEM_SECONDS` returns that first call's ids unchanged, whatever
+        the session's state, starting nothing, counting nothing and never refused by the cap; the same key
+        for another entity is a 409 ``idem_conflict``. A refused open records nothing. At most
+        :data:`_IDEM_KEPT` keys are kept, oldest evicted."""
+        if idem_key is not None and (type(idem_key) is not str or not _IDEM_KEY.fullmatch(idem_key)):
+            raise ChatError("bad_request", "idem_key must be 16 to 64 characters of A-Z, a-z, 0-9, _ or -", 400)
         if not isinstance(entity, str) or entity not in self._entities:
             raise ChatError("unknown_entity", "no such entity on this server", 404)
         with self._lock:
+            if idem_key is not None:
+                now = time.monotonic()
+                while self._idem and next(iter(self._idem.values()))[3] <= now - _IDEM_SECONDS:
+                    self._idem.popitem(last=False)
+                seen = self._idem.get(idem_key)
+                if seen is not None:
+                    if seen[0] != entity:
+                        raise ChatError("idem_conflict", "this idem_key opened a session on another entity", 409)
+                    return {"session_id": seen[1], "job_id": seen[2], "state": "opening"}
             self._refuse_if_shut()
             live = sum(1 for s in self._sessions.values() if s.state in _LIVE_STATES)
             if live >= self._max_sessions:
@@ -799,6 +827,11 @@ class ChatHost:
                 del self._sessions[sid]
                 del self._jobs[job.job_id]
                 raise ChatError("busy", "could not start a worker; try again", 503)
+            if idem_key is not None:
+                # In the critical section that created the session: two opens with one key make one session.
+                self._idem[idem_key] = (entity, sid, job.job_id, time.monotonic())
+                while len(self._idem) > _IDEM_KEPT:
+                    self._idem.popitem(last=False)
         return {"session_id": sid, "job_id": job.job_id, "state": "opening"}
 
     def turn(self, session_id: Any, message: Any) -> dict[str, Any]:
