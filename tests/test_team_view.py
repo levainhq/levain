@@ -251,7 +251,7 @@ def test_get_routes_serve_and_every_other_method_is_405(server):
 def test_without_the_launch_token_only_the_data_free_shell_is_served(server):
     # The head's ruling (10-07): the view rides the launch token. The page shell and its static assets are the only
     # paths served without it, and they carry no ledger data; the ledger itself, and any other path, is a 403.
-    for path in ("/view.json", "/view.json?fetch=1", "/nope", "/board.html"):
+    for path in ("/view.json", "/view.json?path=src", "/nope", "/board.html"):
         r, body = _req(server, "GET", path, token=None)
         assert r.status == 403 and json.loads(body)["error"] == "launch_token", path
     assert _req(server, "GET", "/view.json", token="x" * 32)[0].status == 403
@@ -788,8 +788,8 @@ def test_one_views_warning_is_never_drained_by_another_servers_request():
         tb.join(10)
         ma = json.loads(res["a"][1])
         assert ma["warning_count"] == 1                  # A's own warning reached A's page
-        if res["b"][0].status == 200:
-            assert json.loads(res["b"][1])["warning_count"] == 1
+        # B asked while A held the process-wide warnings lock: busy, never A's warning shown and drained by B
+        assert res["b"][0].status == 503 and json.loads(res["b"][1]) == {"error": "busy"}
     finally:
         go_a.set()
         for h in (ha, hb):
@@ -940,3 +940,33 @@ def test_the_ledgers_own_problems_are_read_fresh_on_every_page():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_runtime_file_that_cannot_be_removed_does_not_skip_the_rest_of_the_cleanup(monkeypatch):
+    # L1 10-07: the runtime file's close and the registry's unpublish shared one try, so a close that raised left the
+    # view listed in the cockpit after it stopped. Each step now has its own finally.
+    from levain.team import registry
+    calls = []
+
+    class Published:
+        unlocked = None
+
+        def close(self):
+            calls.append("runtime file")
+            raise OSError("read-only runtime dir")
+
+    class Reg:
+        def unpublish(self):
+            calls.append("unpublish")
+
+        def close(self):
+            calls.append("registry lock")
+    monkeypatch.setattr(V, "publish_launch_token", lambda *a, **k: Published())
+    monkeypatch.setattr(registry, "prune_dead", lambda: None)
+    monkeypatch.setattr(registry, "register", lambda *a, **k: Reg())
+    monkeypatch.setattr(V._ViewServer, "serve_forever", lambda self, *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    stub = _Stub()
+    stub.repo = type("Repo", (), {"toplevel": "/nonexistent"})()
+    with pytest.raises(OSError, match="read-only runtime dir"):
+        V.serve(stub, host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
+    assert calls == ["runtime file", "unpublish", "registry lock"]

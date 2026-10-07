@@ -72,8 +72,8 @@
   let applied = 0;
   function load() {
     const mine = ++latest;
-    // Only a successful response changes the UI: a non-ok answer or a failed fetch keeps what is shown now (an
-    // empty list from a healthy server still clears it).
+    // Only a successful response changes the UI, and never one older than the response already drawn: a non-ok
+    // answer or a failed fetch keeps what is shown now (an empty list from a healthy server still clears it).
     const auth = window.levainAuthHeaders ? window.levainAuthHeaders() : {};
     fetch("/team_views.json", { headers: { ...auth, Accept: "application/json" } })
       .then((r) => { if (!r.ok) throw new Error("status " + r.status); return r.json(); })

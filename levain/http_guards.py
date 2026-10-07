@@ -463,8 +463,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
         """The stdlib's request loop with ONE change, the dispatch: GET, HEAD and POST go to this class's guarded
         ``do_*``, and every other method, whatever its name (PROPFIND, a lowercase "get", any token), goes through
         the same guards to a 405 (:meth:`_other_method`). The stdlib looked up ``do_<METHOD>`` and answered 501
-        before any guard ran (codex L3 + L1). The one exempt handler (``_DO_METHOD_EXEMPT``) keeps the stdlib loop
-        until its gate lands."""
+        before any guard ran (codex L3 + L1). A handler in ``_DO_METHOD_EXEMPT`` (none now) would keep the stdlib
+        loop."""
         if (type(self).__module__, type(self).__qualname__) in _DO_METHOD_EXEMPT:
             return super().handle_one_request()
         try:

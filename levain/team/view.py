@@ -470,7 +470,7 @@ JS = r"""(function () {
       })
       .then(function (a) {
         if (mine !== seq) return;                  // a later request was made: its answer is the one to draw
-        if (a.locked) { say("Locked: see the form at the top of the page."); return; }
+        if (a.locked) { say("Locked: this page needs its token."); return; }
         if (a.unavailable === "busy") {
           // The server is reading the ledger for another request: ask again after the wait it named.
           say("The team view is reading the ledger. Asking again in " + a.wait + " seconds.");
@@ -558,8 +558,8 @@ class _ViewHandler(GuardedHandler):
     allow = "GET, HEAD"
     server: _ViewServer
     # A connection holds one of MAX_WORKERS slots for as long as it is open, idle keep-alives included: this closes an
-    # idle one (and bounds every read and write on its socket) after IDLE_TIMEOUT, so idle connections cannot hold
-    # every slot and lock the page out for the guard's 30 seconds.
+    # idle one (and bounds every read and write on its socket) after IDLE_TIMEOUT, so a browser's idle connections
+    # cannot hold every slot and lock the page out for the guard's 30 seconds.
     timeout = IDLE_TIMEOUT
 
     def _model(self, path_filter: str = "") -> dict:
@@ -781,13 +781,15 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
         # finally so a failure in one never skips the next. This order keeps "lock held implies socket held" true.
         try:
             published.close()
-            if httpd.registration is not None:
-                httpd.registration.unpublish()
         finally:
             try:
                 if httpd.registration is not None:
-                    httpd.registration.close()
+                    httpd.registration.unpublish()
             finally:
-                httpd.server_close()
-                restore_sigterm()
+                try:
+                    if httpd.registration is not None:
+                        httpd.registration.close()
+                finally:
+                    httpd.server_close()
+                    restore_sigterm()
     return 0
