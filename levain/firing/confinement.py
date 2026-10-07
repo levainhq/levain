@@ -3759,6 +3759,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
     ro_store_dirs += list(frozen_home)
 
+    view_roots = {*tool_views, *frozen_home}
+
+    def _left_out_of_a_view(f: Path) -> bool:
+        # A credential name directly in a view ($HOME, a tool directory) is not carried into it, so
+        # inside bash it is ABSENT, not an empty file: no mask (head ruling 2026-10-07). A link there
+        # still has its target masked, through the target's own spelling.
+        h = _host_spelling(f)
+        return h.parent in view_roots and h in secret_names and not f.is_symlink()
+
     def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
         # the NEAREST EXISTING ancestor, not the parent: an absent `.levain/vault` (or a path
@@ -3912,7 +3921,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # "SELECTS THE FORM rather than skipping the path" and points at the write-only block "for
         # why it is applied rather than skipping outright". It described step (5) while step (4),
         # its other call site, did the opposite. The helper was right; one caller was not.
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in policy.sqlite_sidecars and not f.exists():
             # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
@@ -3960,7 +3969,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # a distinct, write-only file on a case-sensitive volume (0.5.4 known open issue).
     denied_both_targets = set(masked_both)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
@@ -4999,6 +5008,10 @@ class BwrapProvider(ConfinementProvider):
                 f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
                 "(fail-closed)."
             ) from exc
+        # The workspace exists BEFORE the plan reads $HOME: one directly in $HOME made later would
+        # be missing from the step (0) view (codex, closing pass). Not a jail — reach is
+        # default-allowed; Popen needs it to exist.
+        policy.workspace.mkdir(parents=True, exist_ok=True)
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
@@ -5019,9 +5032,6 @@ class BwrapProvider(ConfinementProvider):
                     f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
                     "bash hands (fail-closed)."
                 ) from exc
-        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
-        # needs it to exist. Not a jail — reach is default-allowed.
-        policy.workspace.mkdir(parents=True, exist_ok=True)
         try:
             _prepare_mountpoints(mounted, made)
             manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}

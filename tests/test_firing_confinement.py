@@ -2519,12 +2519,16 @@ def test_bwrap_cred_files_and_config_deny_both_directions(tmp_path, monkeypatch)
     """``--ro-bind /dev/null`` denies READ (EACCES) as well as write — the closest analogue of macOS's
     ``(deny file-read* file-write* (literal ...))``. Measured to hold with AND without ``--dev``, so
     it does not depend on the device tree."""
-    secret = tmp_path / "secret.env"
+    (tmp_path / "creds").mkdir()
+    secret = tmp_path / "creds" / "secret.env"     # below a subdirectory of $HOME: on the host tree
     secret.write_text("TOKEN")
-    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret,))
+    top = tmp_path / "top.env"                      # directly in $HOME: left out of the step (0) view
+    top.write_text("TOKEN")
+    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret, top))
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
     assert str(secret.resolve()) in devnull_targets
+    assert str(top.resolve()) not in argv, "absent inside bash, not an empty file"
     if policy.config_file is not None:
         # An ABSENT config gets no mount (a /dev/null mountpoint would leave an empty JSON stub the
         # next session refuses); the read-only store dir is what stops the shell creating it.

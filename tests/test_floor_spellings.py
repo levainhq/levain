@@ -601,8 +601,7 @@ def test_linux_plan_gives_a_tool_dir_a_view_without_its_cred_names(home: Path) -
     assert [k + "/cache"] * 2 in _ops(argv, "--bind-try")
     assert [k + "/notes.txt"] * 2 in _ops(argv, "--ro-bind-try")
     assert ["cache", k + "/current"] in _ops(argv, "--symlink")
-    assert not any(s == k + "/config" for s, _ in _ops(argv, "--ro-bind-try") + _ops(argv, "--bind-try"))
-    assert ["/dev/null", k + "/config"] in _ops(argv, "--ro-bind")
+    assert k + "/config" not in argv, "a cred name is absent in the view, not masked by an empty file"
 
 
 def test_an_absent_cred_in_a_tool_dir_is_neither_mounted_nor_watched_on_the_host(home: Path) -> None:
@@ -731,3 +730,38 @@ def test_linux_live_a_netrc_the_host_creates_during_a_running_command_is_unreada
         shell.close()
     assert (home / ".netrc").exists(), "the host side did create it"
     assert "SECRET-NETRC" not in out and "END" in out
+
+
+@_live
+def test_linux_live_home_view_cred_absent_workspace_and_store_as_before(home: Path) -> None:
+    """Head checks on the $HOME view: an existing $HOME-level cred file is ABSENT inside (not an
+    empty file); the workspace and the entity's own store under $HOME keep their modes; and any entry
+    the host adds at the top of $HOME mid-session is simply not seen."""
+    (home / ".netrc").write_text("machine x password SECRET-EXISTING\n")
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                       deny_standard_creds=True))
+    try:
+        (home / "added-later").write_text("")
+        out = shell.run(f"ls -a {home}; test -e {home}/.netrc && echo NETRC-PRESENT; echo END",
+                        timeout=20).output
+        assert "NETRC-PRESENT" not in out and ".netrc" not in out and "added-later" not in out
+        assert _live_rc(shell, f"touch {ent}/workspace/w") == "0"
+        assert _live_rc(shell, f"touch {ent}/.levain/new-top-level") != "0"
+        assert _live_rc(shell, f"mkdir -p {ent}/.levain/sub && touch {ent}/.levain/sub/x") in ("0", "1")
+    finally:
+        shell.close()
+    assert (ent / "workspace" / "w").exists() and not (ent / ".levain" / "new-top-level").exists()
+
+
+def test_an_absent_workspace_directly_in_home_is_in_the_view(home: Path, monkeypatch) -> None:
+    """codex closing pass: the workspace was created after the plan read $HOME, so one directly in
+    $HOME was missing from the view and bash's cwd sat on a covered directory."""
+    ent = _entity(home)
+    ws = home / "newws"
+    policy = build_policy(ent, workspace=ws)
+    made: list = []
+    monkeypatch.setattr(C, "_prepare_mountpoints", lambda mounted, made=None: None)
+    argv, *_ = C.BwrapProvider()._prepare(policy, made)
+    w = str(ws.resolve())
+    assert ["--bind", w, w] in [argv[i:i + 3] for i in range(len(argv) - 2)]

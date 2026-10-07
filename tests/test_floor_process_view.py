@@ -590,3 +590,55 @@ def test_a_denied_jewel_answers_exactly_as_a_missing_path(tmp_path: Path, monkey
         monkeypatch.setattr(T, "crown_jewel_reason", real_check)
         link.unlink()
     assert answers[0] == answers[1], answers
+
+
+def test_a_cross_filesystem_move_never_follows_a_swapped_temp_file(tmp_path: Path, monkeypatch) -> None:
+    """codex closing pass: the EXDEV copy reopened the editor's temp file by NAME, in a directory the
+    sandbox shares, so a temp file swapped for a link to a jewel was copied into the workspace."""
+    from openhands.tools.file_editor import editor as E
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    jewel = tmp_path / ".anneal-memory"
+    jewel.mkdir(exist_ok=True)
+    (jewel / "m.md").write_text("JEWEL-CONTENT\n")
+    ws = tmp_path / "w"
+    ws.mkdir()
+    swapped = tmp_path / "tmpfile"
+    swapped.symlink_to(jewel / "m.md")
+    real_rename = os.rename
+
+    def exdev(a, b, *args, **kw):
+        if str(a) == str(swapped):
+            raise OSError(18, "Invalid cross-device link")
+        return real_rename(a, b, *args, **kw)
+
+    monkeypatch.setattr(T.os, "rename", exdev)
+    try:
+        with pytest.raises((T._FloorRefusedWalk, OSError)):
+            E.shutil.move(str(swapped), ws / "out.md")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert not (ws / "out.md").exists()
+    assert (jewel / "m.md").read_text() == "JEWEL-CONTENT\n"
+
+
+def test_a_directory_swapped_for_a_link_mid_walk_is_a_refusal(tmp_path: Path, monkeypatch) -> None:
+    """codex closing pass: a component replaced between the walk's stat and its O_NOFOLLOW open
+    raised a raw ELOOP past the executor instead of an in-band refusal."""
+    import errno
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    (tmp_path / "w" / "d").mkdir(parents=True)
+    real_open = os.open
+
+    def racing(path, flags, *args, **kw):
+        if path == "d" and kw.get("dir_fd") is not None and flags & os.O_NOFOLLOW:
+            raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+        return real_open(path, flags, *args, **kw)
+
+    monkeypatch.setattr(T.os, "open", racing)
+    try:
+        with pytest.raises(T._FloorRefusedWalk):
+            T._held_dir(tmp_path / "w" / "d")
+    finally:
+        T._EDITOR_FLOOR.reset(token)

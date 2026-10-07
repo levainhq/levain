@@ -230,7 +230,14 @@ def _held_dir(path: str | Path) -> tuple[int, str]:
                     f"{walked} is a symlink, and the editor does not follow a link it would act "
                     "through (it could be repointed between the check and the act)"
                 )
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    # Swapped for a link (or a file) after the stat above: the same refusal.
+                    raise _FloorRefusedWalk(f"{walked} changed into a link or a file during the walk "
+                                            "— refused") from None
+                raise
             os.close(fd)
             fd = nfd
         return fd, walked
@@ -292,9 +299,9 @@ def _floored_move(src, dst, *args, **kwargs):
         return shutil.move(src, dst, *args, **kwargs)
     try:
         return _floored_move_impl(policy, src, dst)
-    except _FloorRefusedWalk:
+    except BaseException:
         try:
-            os.unlink(src)   # the editor's own temp file, holding the refused edit (L1 r3)
+            os.unlink(src)   # the editor's temp file, holding the edit, on any failed move (L1 r3)
         except OSError:
             pass
         raise
@@ -326,24 +333,40 @@ def _floored_move_impl(policy: CrownJewelsPolicy, src, dst) -> str:
             # The temp file is on another filesystem: copied to a new name in the held directory and
             # renamed over the target there, so the target name is replaced, never opened (a FIFO
             # or a hardlink planted at it is not written through; L1 r3).
-            tmp = f".{name}.levain-{os.urandom(6).hex()}"
-            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
-                          dir_fd=pfd)
-            try:
-                with builtins.open(src, "rb") as fin, os.fdopen(out, "wb") as fout:
-                    shutil.copyfileobj(fin, fout)
-                os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
-            except BaseException:
+            # The source is opened once, without following a link, and judged like any editor
+            # open: the temp file sits in a directory the sandbox shares, so its name may have been
+            # swapped for a link to a jewel (codex, closing pass).
+            sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(sfd, "rb") as fin:
+                sst = os.fstat(sfd)
+                if not stat.S_ISREG(sst.st_mode) or sst.st_uid != os.geteuid():
+                    raise _FloorRefusedWalk(f"{src}: the editor's temp file was replaced")
+                why = opened_file_reason(policy, sfd)
+                if why is not None:
+                    raise _FloorRefusedWalk(why)
+                tmp = f".{name}.levain-{os.urandom(6).hex()}"
+                out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
+                              dir_fd=pfd)
                 try:
-                    os.unlink(tmp, dir_fd=pfd)
-                except OSError:
-                    pass
-                raise
+                    with os.fdopen(out, "wb") as fout:   # owns `out` from here, closed on any exit
+                        shutil.copyfileobj(fin, fout)
+                    os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+                except BaseException:
+                    try:
+                        os.unlink(tmp, dir_fd=pfd)
+                    except OSError:
+                        pass
+                    raise
             os.unlink(src)
-        # Re-judged by what is now there, as an open is judged by the object it opened.
+        # Re-judged by what is now there, as an open is judged by the object it opened. A swapped
+        # source moved in by the rename (a link, say) is removed again, not left in the workspace.
         st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
-        if not stat.S_ISREG(st.st_mode):
-            raise _FloorRefusedWalk(f"{target} is not a regular file after the move")
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            try:
+                os.unlink(name, dir_fd=pfd)
+            except OSError:
+                pass
+            raise _FloorRefusedWalk(f"{target}: what the move put there is not the editor's file")
         return target
     finally:
         os.close(pfd)
