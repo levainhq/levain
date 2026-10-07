@@ -141,6 +141,20 @@ def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     out = []
     for node in ast.walk(tree):
+        # Aliases would hide a call from the scan below: `from subprocess import run`, `import
+        # subprocess as sp`, `from webbrowser import open`.
+        if isinstance(node, ast.ImportFrom):
+            names = {a.name for a in node.names}
+            spawners = {n for _, n in _NO_ENV} | _ENV_EXEC
+            if (node.module in ("subprocess", "webbrowser")
+                    or (node.module == "os" and names & spawners)
+                    or (node.module == "asyncio" and any(n.startswith("create_subprocess") for n in names))):
+                out.append(f"{path.relative_to(root)}:{node.lineno} `from {node.module} import`: "
+                           "call it through the module so the scan sees the call")
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in ("subprocess", "webbrowser") and a.asname:
+                    out.append(f"{path.relative_to(root)}:{node.lineno} `import {a.name} as {a.asname}`")
         if not isinstance(node, ast.Call):
             continue
         f = node.func
@@ -151,14 +165,17 @@ def _spawn_problems(path: Path, root: Path = ROOT) -> list[str]:
         else:
             continue
         where = f"{path.relative_to(root)}:{node.lineno}"
+        if key[0] == "webbrowser" and path.name != "_browser.py":
+            out.append(f"{where} webbrowser.{key[1]}: open it through levain.launch.open_browser")
+            continue
         if key in _NO_ENV:
             out.append(f"{where} {key[0]}.{key[1]} cannot take an environment")
         elif key in _SPAWN or key[0] == "asyncio" and key[1].startswith("create_subprocess"):
             env = next((k.value for k in node.keywords if k.arg == "env"), None)
             if env is None:
                 out.append(f"{where} {key[0]}.{key[1]} without env=")
-            elif ast.unparse(env) == "os.environ":
-                out.append(f"{where} {key[0]}.{key[1]} with env=os.environ")
+            elif ast.unparse(env) == "None" or "os.environ" in ast.unparse(env):
+                out.append(f"{where} {key[0]}.{key[1]} with env={ast.unparse(env)}")
         elif key[0] == "os" and key[1] in _ENV_EXEC and path.name != "launch.py":
             out.append(f"{where} os.{key[1]}: only levain/launch.py re-executes")
     return out
@@ -181,8 +198,10 @@ def test_the_scan_catches_a_call_without_env(tmp_path: Path) -> None:
     bad = tmp_path / "bad.py"
     bad.write_text("import subprocess, os\nsubprocess.run(['x'])\nos.system('x')\n"
                    "subprocess.Popen(['x'], env=os.environ)\nos.execv('x', ['x'])\n"
-                   "subprocess.run(['x'], env={})\n")
-    assert len(_spawn_problems(bad, tmp_path)) == 4
+                   "subprocess.run(['x'], env={})\nsubprocess.run(['x'], env=None)\n"
+                   "subprocess.run(['x'], env=os.environ | {'A': 'b'})\nimport webbrowser\n"
+                   "webbrowser.open('u')\nfrom subprocess import run\nimport subprocess as sp\n")
+    assert len(_spawn_problems(bad, tmp_path)) == 9
 
 
 # --- the console entry --------------------------------------------------------------------------
@@ -247,3 +266,64 @@ def test_the_cli_takes_api_key_file_on_run_wrap_and_serve() -> None:
                                                 if isinstance(n, ast.FunctionDef) and n.name == fn))
         assert "_resolve_api_key(args)" in body, fn
     assert cli._resolve_api_key
+
+
+def test_the_browser_opens_from_a_child_with_the_allowlist_and_the_url_on_stdin(monkeypatch) -> None:
+    import levain.web_server as ws
+
+    monkeypatch.setenv("GH_TOKEN", SECRET)
+    monkeypatch.setenv("BROWSER", "firefox")
+    seen = []
+    monkeypatch.setattr(launch.subprocess, "run", lambda argv, **kw: seen.append((argv, kw)))
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    [(argv, kw)] = seen
+    assert argv[-2:] == ["-m", "levain._browser"] and not any("chat_token" in a for a in argv)
+    assert "chat_token=t" in kw["input"]
+    assert "GH_TOKEN" not in kw["env"] and kw["env"]["BROWSER"] == "firefox"
+
+
+def test_token_shaped_names_in_an_allowed_namespace_are_carried() -> None:
+    for name in ("LEVAIN_TEAM_TOKEN", "ANNEAL_API_KEY", "VAGUS_SECRET", "LEVAIN_SERVER_PASSWORD"):
+        assert not launch.allowed(name), name
+    for name in ("LEVAIN_HOME", "LEVAIN_SCOPE", "ANNEAL_MEMORY_DERIVE_TRUST", "LD_LIBRARY_PATH", "PWD"):
+        assert launch.allowed(name), name
+    assert launch.allowed_env({b"PATH": b"/bin", b"GH_TOKEN": b"x"}) == {b"PATH": b"/bin"}
+
+
+def test_an_unrebuildable_command_line_refuses_to_start(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("GH_TOKEN", SECRET)
+    monkeypatch.delenv(launch.CARRY_FD_ENV, raising=False)
+    monkeypatch.setattr(launch.sys, "argv", ["levain", "run"])
+    monkeypatch.setattr(launch.sys, "orig_argv", ["python", "something-else"])
+    with pytest.raises(SystemExit) as exc:
+        launch.reexec_if_needed()
+    assert exc.value.code == 2 and "not starting" in capsys.readouterr().err
+
+
+def test_the_macos_carry_file_has_no_name_while_it_holds_data(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(launch, "CARRY_DIR", tmp_path / "carry")
+    monkeypatch.delattr(launch.os, "memfd_create", raising=False)
+    fd = launch._carry_fd(b"payload")
+    try:
+        assert list((tmp_path / "carry").iterdir()) == []
+        assert (os.stat(tmp_path / "carry").st_mode & 0o777) == 0o700
+        assert os.read(fd, 100) == b"payload"
+    finally:
+        os.close(fd)
+
+
+def test_the_carry_dir_is_under_a_crown_jewel(tmp_path: Path, monkeypatch) -> None:
+    from levain.firing.confinement import build_policy, crown_jewel_reason
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    assert crown_jewel_reason(build_policy(ent), launch.CARRY_DIR.expanduser() / "c-x") is not None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="prctl is Linux")
+def test_the_restored_carry_arrives_in_a_process_already_not_dumpable() -> None:
+    code = ("import ctypes, os\nfrom levain import launch\nlaunch.reexec_if_needed()\n"
+            "print(ctypes.CDLL(None).prctl(3, 0, 0, 0, 0), launch.reexecuted)\n")
+    r = _run(code, env={"GH_TOKEN": SECRET, "HOME": "/tmp"})
+    assert r.stdout.split() == ["0", "True"], r.stderr

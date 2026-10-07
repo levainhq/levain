@@ -38,7 +38,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
+import subprocess
 import sys
+from pathlib import Path
 
 _PR_SET_DUMPABLE = 4   # <linux/prctl.h>
 CARRY_FD_ENV = "LEVAIN_CARRY_FD"
@@ -51,11 +54,22 @@ _ALLOW = frozenset({
     "COLUMNS", "LINES", "EDITOR", "VISUAL", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
     "__CF_USER_TEXT_ENCODING", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "CLOUDSDK_CONFIG",
     "AZURE_CONFIG_DIR", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_LOGIN_CACHE_DIRECTORY",
+    # The dynamic loader's search paths. Not secrets, and an interpreter or extension found only
+    # through one (an HPC module, a conda or nix build of libpython) would not start without it.
+    "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
 })
 # Config namespaces: the locale, XDG dirs, the interpreter's own switches, and this stack's settings.
+# A name in one of them that is SHAPED like a credential is carried all the same (:data:`_TOKEN_SHAPED`):
+# a namespace is a pattern, and a future ``LEVAIN_TEAM_TOKEN`` must not ride the exec-time block
+# because its prefix was allowed. Such a name is allowed only by being listed in :data:`_ALLOW`.
 _ALLOW_PREFIXES = ("LC_", "XDG_", "PYTHON", "LEVAIN_", "VAGUS_", "ANNEAL_")
+_TOKEN_SHAPED = re.compile(r"(^|_)(KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASS|PWD|"
+                           r"CREDENTIAL|CREDENTIALS|AUTH|COOKIE|SESSION)(_|$)")
 # Names in an allowed namespace that are secrets or plumbing, never allowed.
 _NEVER = frozenset({API_KEY_ENV, CARRY_FD_ENV})
+# Where the macOS carry file is made: a directory under the floor's own crown jewel
+# (``~/.levain-runtime/floor``, denied to every entity), so no confined shell can open it by name.
+CARRY_DIR = Path("~/.levain-runtime/floor/carry")
 
 # What a child that reaches the network needs from the carried environment.
 NETWORK = tuple(n for base in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "FTP_PROXY")
@@ -70,7 +84,22 @@ reexecuted = False   # True in an image this module re-executed (it restored a c
 def allowed(name: str) -> bool:
     """Whether ``name`` may stay in an exec-time environment (levain's own after the re-exec, and
     every child's by default)."""
-    return name not in _NEVER and (name in _ALLOW or name.startswith(_ALLOW_PREFIXES))
+    if name in _NEVER:
+        return False
+    if name in _ALLOW:
+        return True
+    return name.startswith(_ALLOW_PREFIXES) and not _TOKEN_SHAPED.search(name)
+
+
+def allowed_env(environ) -> dict:
+    """The allowlisted part of ``environ`` (a ``str`` or ``bytes`` mapping), the one list every exec
+    levain makes goes through: its own re-exec, :func:`child_env`, and a shell run as another user."""
+    out = {}
+    for k, v in environ.items():
+        name = os.fsdecode(k) if isinstance(k, bytes) else k
+        if allowed(name):
+            out[k] = v
+    return out
 
 
 def child_env(*names: str, prefixes: tuple[str, ...] = ()) -> dict[str, str]:
@@ -78,8 +107,23 @@ def child_env(*names: str, prefixes: tuple[str, ...] = ()) -> dict[str, str]:
     ``prefixes`` that child needs (a git push needs the proxy variables, say). Never the whole of
     ``os.environ``: whatever a child is given sits in ITS exec-time block while it runs, readable by
     every process of this user."""
-    return {k: v for k, v in os.environ.items()
-            if allowed(k) or k in names or (prefixes and k.startswith(prefixes))}
+    env = allowed_env(os.environ)
+    env.update({k: v for k, v in os.environ.items()
+                if k in names or (prefixes and k.startswith(prefixes))})
+    return env
+
+
+def open_browser(url: str, unlocked: str | None = None) -> None:
+    """Open ``url`` in the operator's browser (``unlocked``, a URL carrying a token, only through the
+    controller that keeps it off every command line; see :mod:`levain._browser`). Done in a child
+    with :func:`child_env` and the URLs on its stdin, because ``webbrowser`` hands the browser this
+    process's whole environment. Best effort: no browser is fine."""
+    payload = json.dumps({"url": url, "unlocked": unlocked})
+    try:
+        subprocess.run([sys.executable, "-P", "-m", "levain._browser"], input=payload, text=True,
+                       capture_output=True, timeout=60, env=child_env("BROWSER"))
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def take_lifted_api_key() -> str | None:
@@ -114,12 +158,21 @@ def _lift_api_key(args: list[str]) -> tuple[list[str], str | None]:
 
 
 def _carry_fd(payload: bytes) -> int:
+    """An inheritable descriptor holding ``payload``, which never has a name while it holds data.
+    Linux: a ``memfd`` (no name at all). Elsewhere: a file created ``O_CREAT|O_EXCL`` 0600 in
+    :data:`CARRY_DIR` (0700, under a directory the floor denies to every entity) and unlinked BEFORE
+    anything is written to it, so whoever opened it by name in that instant opened an empty file."""
     if hasattr(os, "memfd_create"):
         fd = os.memfd_create("levain-carry", 0)   # no MFD_CLOEXEC: it must survive the exec
     else:
-        import tempfile
-
-        fd, path = tempfile.mkstemp(prefix="levain-carry-")   # 0600
+        d = CARRY_DIR.expanduser()
+        d.mkdir(parents=True, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not (os.path.isdir(d) and not os.path.islink(d) and st.st_uid == os.geteuid()):
+            raise OSError(f"{d} is not a directory this user owns")
+        os.chmod(d, 0o700)
+        path = d / f"c-{os.urandom(16).hex()}"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.unlink(path)
     try:
         view = memoryview(payload)
@@ -136,6 +189,9 @@ def _carry_fd(payload: bytes) -> int:
 def _restore_carry(value: str) -> None:
     """In the re-executed image: read the carry, close it, put it back into ``os.environ``."""
     global _lifted_api_key, reexecuted
+    # Not dumpable BEFORE the carry enters this process's memory: until then nothing of this user
+    # may read it through /proc/<pid>/mem or /proc/<pid>/fd (Linux; execve reset the flag).
+    set_not_dumpable()
     os.environ.pop(CARRY_FD_ENV, None)
     try:
         fd = int(value)
@@ -166,13 +222,18 @@ def reexec_if_needed() -> None:
         _restore_carry(value)
         return
     args, key = _lift_api_key(sys.argv[1:])
-    keep = {k: v for k, v in os.environb.items() if allowed(os.fsdecode(k))}
+    keep = allowed_env(os.environb)
     carry = {k: v for k, v in os.environb.items() if k not in keep}
     if not carry and key is None:
         return
     head = sys.orig_argv[: len(sys.orig_argv) - len(sys.argv) + 1]
     if sys.orig_argv[len(head):] != sys.argv[1:] or not sys.executable:
-        return   # an interpreter invocation this cannot rebuild faithfully: run as started
+        # Running on would leave the launch environment readable for the whole session, and that is
+        # what this function exists to prevent, so it refuses and says how to start levain instead.
+        print("levain: could not rebuild this command line to start levain without its launch "
+              "environment; not starting. Run the `levain` command, or `python -m levain`.",
+              file=sys.stderr)
+        raise SystemExit(2)
     if key is not None:
         print("levain: --api-key on the command line was readable by other processes until now"
               " (on Linux, by every user); use --api-key-file PATH or LEVAIN_API_KEY instead.",

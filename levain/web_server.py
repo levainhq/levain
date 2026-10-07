@@ -1319,25 +1319,12 @@ def make_server(
 
 
 def _open_browser(url: str, unlocked: str) -> None:
-    """Open the cockpit. ``unlocked`` (the URL with the chat token in its fragment) goes ONLY to macOS's osascript
-    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
-    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
-    users can read from the process table: the very callers the chat token exists to keep out. So the osascript
-    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
-    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
-    and the token field asks."""
-    import webbrowser
+    """Open the cockpit: ``unlocked`` (the URL with the chat token in its fragment) only through the controller that
+    keeps it off every command line, else the plain URL (:func:`levain._browser.open_url` holds the rule). Run in a
+    child with an allowlisted environment, :func:`levain.launch.open_browser`."""
+    from levain.launch import open_browser
 
-    try:
-        ctl = webbrowser.get()
-        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
-            return
-    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
-        pass
-    try:
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-        pass
+    open_browser(url, unlocked)
 
 
 def run_web_server(

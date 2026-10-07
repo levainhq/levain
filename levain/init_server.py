@@ -689,12 +689,9 @@ def run_init_web(
     print("  loopback-only · governed · Ctrl+C to stop")
 
     if open_browser:
-        import webbrowser
+        from levain.launch import open_browser as _open   # an allowlisted env; no browser is fine
 
-        try:
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-            pass
+        _open(url)
 
     try:
         httpd.serve_forever()

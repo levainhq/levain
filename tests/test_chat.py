@@ -1717,9 +1717,10 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
     opened = []
-    monkeypatch.setattr(webbrowser, "open", opened.append)
+    import levain.launch as launch
+    monkeypatch.setattr(launch, "open_browser", lambda url, unlocked=None: opened.append((url, unlocked)))
     assert ws.run_web_server(tmp_path) == 0
-    assert opened == ["http://127.0.0.1:7463/"] and "chat_token" not in capsys.readouterr().out
+    assert opened == [("http://127.0.0.1:7463/", "http://127.0.0.1:7463/")] and "chat_token" not in capsys.readouterr().out
 
 
 
@@ -1731,7 +1732,7 @@ def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallba
     # osascript controller directly or nowhere.
     import webbrowser
 
-    import levain.web_server as ws
+    from levain import _browser
 
     chain = []
     monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: chain.append(u) or True)
@@ -1749,17 +1750,17 @@ def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallba
 
     good = _Osa(True)
     monkeypatch.setattr(webbrowser, "get", lambda *a: good)
-    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    _browser.open_url("http://h/", "http://h/#chat_token=t")
     assert good.got == ["http://h/#chat_token=t"] and chain == []
 
     bad = _Osa(False)                       # osascript failed (SSH, headless): the fallback gets the plain URL only
     monkeypatch.setattr(webbrowser, "get", lambda *a: bad)
-    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    _browser.open_url("http://h/", "http://h/#chat_token=t")
     assert chain == ["http://h/"]
 
     chain.clear()                           # xdg-open, a browser binary, $BROWSER
     monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.GenericBrowser("xdg-open"))
-    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    _browser.open_url("http://h/", "http://h/#chat_token=t")
     assert chain == ["http://h/"]
 
 

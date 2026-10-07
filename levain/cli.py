@@ -376,9 +376,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="api_key_file",
         metavar="PATH",
-        help="Read the endpoint's API key from PATH (refused if group- or world-readable). "
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
              "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
-             "processes can read it.",
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     run_p.add_argument(
         "--api-key",
@@ -532,9 +532,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="api_key_file",
         metavar="PATH",
-        help="Read the endpoint's API key from PATH (refused if group- or world-readable). "
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
              "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
-             "processes can read it.",
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     wrap_p.add_argument(
         "--api-key",
@@ -681,9 +681,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         dest="api_key_file",
         metavar="PATH",
-        help="With --chat: Read the endpoint's API key from PATH (refused if group- or world-readable). "
+        help="With --chat: Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
              "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
-             "processes can read it.",
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     web_p.add_argument(
         "--api-key",
@@ -1868,4 +1868,7 @@ def _cmd_daemon_restart(args: argparse.Namespace) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Through the console entry, so `python -m levain.cli` gets the launch re-exec too.
+    from levain.launch import main as _launch_main
+
+    sys.exit(_launch_main())
