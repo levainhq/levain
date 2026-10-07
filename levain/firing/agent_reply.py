@@ -158,6 +158,8 @@ def humanize_finish_json(text: str) -> str:
     call in it must be ``think`` or ``finish``: a payload that also holds any other call (``terminal``, a
     name it does not know) is kept whole, because that call did not run, and answering with the finish
     message ("Created x") would hide it from the unreadable-call check that reads this function's output."""
+    if len(text) > MAX_CLASSIFIED_BYTES:
+        return text  # never decoded whole: a large array of calls would expand to many times its size in memory
     calls = _json_calls(text.strip())
     if not calls or any(name not in _UNWRAPPABLE_CALLS for name, _ in calls):
         return text  # not a clean payload of think/finish calls only → leave untouched
@@ -217,6 +219,9 @@ _NAMED_CALL_MARKUP = (
 )
 # Where a function-call JSON object may start inside other text.
 _JSON_CALL_START = re.compile(r"\{\s*\"(?:name|type)\"\s*:")
+# A call's name and the key of its arguments, read without decoding: for text the decoder is not given (over the
+# bound, or nested past its limit).
+_LEXICAL_CALL = re.compile(r"\"name\"\s*:\s*\"([A-Za-z_][\w.-]*)\"\s*,\s*\"(?:arguments|parameters)\"\s*:")
 _SPACE = re.compile(r"\s*")
 
 # The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
@@ -324,51 +329,68 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     holds (an indented block likewise). The third is function-call JSON naming ``tool_names``, the entity's own tools:
     all of the reply (bare, or the whole of one code block) when every call names one, or one such call among other
     text outside code; with no tool names known, that shape is not flagged. A reply over
-    :data:`MAX_CLASSIFIED_BYTES` is not parsed as Markdown: all of it is searched as if no part were code. It reads
+    :data:`MAX_CLASSIFIED_BYTES` is neither parsed as Markdown nor decoded: all of it is searched as if no part were
+    code, and a JSON call in it is read by its name and arguments key. It reads
     the shape only: the call is never repaired or run."""
     if not text:
         return False
     # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
     # bytes, and a reply that size is never encoded just to be measured (codex L3 r7).
     if len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
-        prose, body = text, None
+        # Over the bound nothing is decoded either: a large array of calls would expand to many times its size.
+        regions = [text]
+        found_json = _lexical_call(text, 0, tool_names)
     else:
         prose, body = _read(text)
-    # No strip: it would copy a reply over the bound, and the JSON reader skips the space at either end itself.
-    names = _json_call_names(body if body is not None else text)
-    if names and all(n in tool_names for n in names):
-        return True
-    regions = [r for r in (prose, body) if r]
+        names = _json_call_names(body if body is not None else text)
+        if names and all(n in tool_names for n in names):
+            return True
+        regions = [r for r in (prose, body) if r]
+        found_json = any(_embedded_call(r, tool_names) for r in regions)
     return (
-        any(p.search(r) for r in regions for p in _CALL_MARKUP)
+        found_json
+        or any(p.search(r) for r in regions for p in _CALL_MARKUP)
         or any(m.group(1) in tool_names for r in regions for p in _NAMED_CALL_MARKUP for m in p.finditer(r))
-        or any(_embedded_call(r, tool_names) for r in regions)
     )
+
+
+def _lexical_call(text: str, pos: int, tool_names) -> bool:
+    return any(m.group(1) in tool_names for m in _LEXICAL_CALL.finditer(text, pos))
 
 
 def _embedded_call(text: str, tool_names) -> bool:
     """Whether ``text`` holds, among other text, a function-call JSON object naming one of ``tool_names`` (the head's
-    ruling, 2026-10-07: the notice is true then, and the text is still shown under it). Each attempt resumes where the
-    last one ended or failed, so nested or unterminated objects cost one pass, not one per brace; a call nested inside
-    another JSON value that decodes whole is therefore not looked for."""
+    ruling, 2026-10-07: the notice is true then, and the text is still shown under it). Each character is read once:
+    a value that decodes is searched whole for a call nested in it and the scan resumes after it; the span a failed
+    decode read is searched lexically (:data:`_LEXICAL_CALL`) and the scan resumes where it failed; text nested past
+    the decoder's limit is read lexically from there on. Retrying at each inner brace instead was quadratic (a valid
+    5,000-deep nest under the bound took 6 s). Called only under :data:`MAX_CLASSIFIED_BYTES`."""
     decoder = json.JSONDecoder()
     pos = 0
     while (m := _JSON_CALL_START.search(text, pos)) is not None:
         try:
             obj, pos = decoder.raw_decode(text, m.start())
-        except json.JSONDecodeError as exc:
-            pos = max(exc.pos, m.start() + 1)
-            continue
         except RecursionError:
-            # Nested past the decoder's limit, with no position to resume from: retrying at each inner brace would be
-            # quadratic, and nothing that deep is a call a model meant to make.
-            return False
+            return _lexical_call(text, m.start(), tool_names)
+        except json.JSONDecodeError as exc:
+            end = max(exc.pos, m.start() + 1)
+            if any(c.group(1) in tool_names for c in _LEXICAL_CALL.finditer(text, m.start(), end)):
+                return True
+            pos = end
+            continue
         except ValueError:
             pos = m.start() + 1
             continue
-        call = _as_call(obj)
-        if call is not None and call[0] in tool_names:
-            return True
+        stack = [obj]
+        while stack:
+            o = stack.pop()
+            call = _as_call(o)
+            if call is not None and call[0] in tool_names:
+                return True
+            if isinstance(o, dict):
+                stack.extend(o.values())
+            elif isinstance(o, list):
+                stack.extend(o)
     return False
 
 

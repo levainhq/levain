@@ -1142,27 +1142,37 @@ class EntitySession:
 
         events = self.conversation.state.events
         reply = latest_agent_text(events)
+        flagged, unread = self._unreadable_texts(reply, events)
+        if unread:
+            # What the model sent that is not already in the reply (a call beside a parsed finish lives only in the
+            # action's thought) goes in front of it: the surfaces show the reply as "what the model sent", and a
+            # notice above "Created x" alone would hide the call that did not run.
+            missing = [t for t in unread if t not in reply]
+            if missing:
+                reply = scan_text("\n".join([*missing, reply])).text
         return TurnResult(
             reply=reply,
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
-            unreadable_call=self._unreadable_call(reply, events),
+            unreadable_call=flagged,
         )
 
-    def _unreadable_call(self, reply: str | None, events) -> bool:
-        """:func:`unreadable_tool_call` for each agent message of this turn, never their join: a call that is the whole
-        of one message (a plan, the act-now nudge, then the call) is not the whole of the join, and the shapes that
-        need the whole text would miss it there. The text the model sent beside a structured call (the action's
-        ``thought``) is checked too: beside a parsed ``finish`` it is otherwise never shown. A classifier failure
-        fails CLOSED (the reply is shown under the notice and a headless run exits 7); the turn itself never fails."""
+    def _unreadable_texts(self, reply: str | None, events) -> tuple[bool, list[str]]:
+        """Whether the reply is flagged, and the texts of this turn that :func:`unreadable_tool_call` flags. Each agent
+        message is checked on its own, never their join: a call that is the whole of one message (a plan, the act-now
+        nudge, then the call) is not the whole of the join, and the shapes that need the whole text would miss it. The text the model sent beside a
+        structured call (the action's ``thought``) is checked too: beside a parsed ``finish`` it is otherwise never
+        shown. A classifier failure fails CLOSED (flagged, nothing to add: the reply is shown under the notice and a
+        headless run exits 7); the turn itself never fails."""
         if not reply:
-            return False
+            return False, []
         try:
             names = self._tool_names()
-            return any(unreadable_tool_call(t, names) for t in (*_agent_parts(events), *_action_thoughts(events)))
+            texts = [t for t in (*_agent_parts(events), *_action_thoughts(events)) if unreadable_tool_call(t, names)]
         except Exception:  # noqa: BLE001 — undeterminable is not "readable"
-            return True
+            return True, []
+        return bool(texts), texts
 
     def _tool_names(self) -> frozenset[str]:
         """The names of this conversation's tools, or none when they cannot be read (the shapes that name a tool are

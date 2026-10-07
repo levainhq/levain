@@ -611,7 +611,9 @@ def test_text_sent_beside_a_parsed_finish_is_checked(tmp_path):
 
     sess.conversation.run = run
     result = sess.run_turn("create x")
-    assert result.reply == "Created x" and result.unreadable_call is True and result.exit_code == 7
+    assert result.unreadable_call is True and result.exit_code == 7
+    # L3 r1 (codex HIGH): the reply, shown as "what the model sent", must carry the call, not "Created x" alone
+    assert result.reply == '{"name": "terminal", "arguments": {"command": "touch x"}}\nCreated x'
 
 
 def test_a_reply_over_the_bound_is_never_stripped():
@@ -624,3 +626,47 @@ def test_a_reply_over_the_bound_is_never_stripped():
 
     assert unreadable_tool_call(NoStrip(GLM_REAL[1] + "a" * MAX_CLASSIFIED_BYTES + "\n"), TOOLS) is True
     assert unreadable_tool_call(NoStrip("\n" + "a" * MAX_CLASSIFIED_BYTES + "\n"), TOOLS) is False
+
+
+# ---------- 0.6.10 L3 r1 ----------
+
+def test_a_large_array_of_calls_is_never_decoded_whole():
+    # codex MED: an 11M-character array of small calls peaked at 146 MB in each of humanize and the classifier
+    import tracemalloc
+
+    from levain.firing.agent_reply import humanize_finish_json
+
+    big = "[" + ",".join(['{"name":"think","arguments":{"t":1}}'] * 300_000) + "]"
+    tracemalloc.start()
+    try:
+        assert humanize_finish_json(big) is big
+        assert unreadable_tool_call(big, TOOLS)
+        assert tracemalloc.get_traced_memory()[1] < 20_000_000
+    finally:
+        tracemalloc.stop()
+
+
+@pytest.mark.parametrize("reply", [
+    # gpt-oss: the scan resumed where the outer decode failed, past the call inside it
+    '{"name": {"name": "terminal", "arguments": {}} oops',
+    # a call nested in JSON that decodes whole
+    'see {"type": "x", "calls": [{"name": "terminal", "arguments": {}}]} ok',
+    # complement + gemini: a nest past the decoder's limit ended the scan before the call after it
+    'x {"name": "a", "arguments": ' + "[" * 3000 + ' {"name": "terminal", "arguments": {}}',
+])
+def test_a_call_inside_or_after_other_json_is_found(reply):
+    assert unreadable_tool_call(reply, TOOLS)
+
+
+def test_a_deep_valid_nest_under_the_bound_is_one_pass():
+    # retrying at each inner brace was quadratic: a valid 5,000-deep nest took 6 s
+    import time
+
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
+
+    d = 5000
+    nest = '{"name": 1, "x": ' * d + '"' + "a" * (MAX_CLASSIFIED_BYTES - 30 * d) + '"' + "}" * d
+    t = time.perf_counter()
+    assert not unreadable_tool_call(nest, TOOLS)
+    assert not unreadable_tool_call(nest[:-d], TOOLS)
+    assert time.perf_counter() - t < 3
