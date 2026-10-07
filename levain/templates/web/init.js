@@ -386,7 +386,7 @@
         try { refused = await res.json(); } catch (_) { /* a plain-text 403 is not the token's */ }
         if (auth.isRefusal(res.status, refused)) {
           auth.lock(sent ? "That token was not accepted." : null, sent);
-          if (!auth.get()) statusEl.textContent = "locked: enter the token the server printed when it started";
+          if (!auth.get()) statusEl.textContent = "locked: see the form at the top of the page";
           return;
         }
       }

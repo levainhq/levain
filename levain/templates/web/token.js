@@ -70,7 +70,9 @@
       form.setAttribute("aria-label", "unlock this page");
       const p = document.createElement("p");
       p.className = "levain-lock-text";
-      p.textContent = "This page needs the token the server printed when it started.";
+      const port = (typeof location !== "undefined" && location.port) || "<port>";
+      p.textContent = "This page is locked. Open it with `levain serve --open-running --port " + port + "`, or paste " +
+        "this server's token (printed in the terminal that started it, or in ~/.levain-runtime/" + port + ".json).";
       noteEl = document.createElement("p");
       noteEl.className = "levain-lock-note";
       const input = document.createElement("input");
@@ -121,10 +123,14 @@
         if (typeof traded === "string" && /^[A-Za-z0-9_-]+$/.test(traded)) {
           token = traded; keep(traded); deferredLock = null;
           unlocked();
+        } else if (token) {
+          // A spent link reloaded from history, in a tab that still holds a token: keep it. If that token is
+          // stale too, the next refusal shows the form.
+          deferredLock = null;
+          unlocked();
         } else {
           deferredLock = null;
-          lock("That link was already used or has expired. Open a new one with `levain serve --open-running`, " +
-               "or paste the token the server printed.");
+          lock("That link was already used or has expired.");
         }
       });
   }

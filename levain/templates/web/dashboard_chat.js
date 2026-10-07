@@ -1,8 +1,8 @@
 // levain dashboard_chat.js — the cockpit's chat panel: talk to a registered entity from the browser.
 //
 // Present only when the server was started with `--chat` (GET /chat.json answers 200; a plain cockpit answers 404 and
-// nothing is added). Like every route but the page shell, the /chat routes need the launch token the server printed at
-// start. token.js holds it (the URL fragment, this tab's session storage, the unlock form); this file only sends it and,
+// nothing is added). Like every route but the page shell, the /chat routes need the server's launch token, which
+// token.js holds (a traded link code, this tab's session storage, the unlock form); this file only sends it and,
 // on a refusal, hands the page back to that one unlock form. A refusal before the token is entered adds no panel: the
 // probe re-runs on the unlock.
 //

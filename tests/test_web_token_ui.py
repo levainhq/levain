@@ -63,10 +63,12 @@ function fetch(path, init) {
   return reply(404, {});
 }
 const replaced = [], kept = new Map();
+if (MODE === "codespentstored") kept.set("levain.token", TOKEN);
 const ctx = vm.createContext({ document, fetch, JSON, Promise, Array, Object, String, Date, encodeURIComponent,
   setTimeout: (f) => setImmediate(f),
   location: { hash: (MODE === "fragment" || MODE === "hashjunk") ? "#token=" + TOKEN
-                  : (MODE === "code" || MODE === "codespent") ? "#code=C1" : "", pathname: "/", search: "" },
+                  : (MODE === "code" || MODE === "codespent" || MODE === "codespentstored") ? "#code=C1" : "",
+              pathname: "/", search: "" },
   history: { replaceState: (s, t, u) => { replaced.push(u); ctx.location.hash = ""; } },
   sessionStorage: { getItem: (k) => (kept.has(k) ? kept.get(k) : null), setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
@@ -84,6 +86,11 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
   if (MODE !== "notokenjs") vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   vm.runInContext(fs.readFileSync(process.argv[3], "utf8"), ctx);
   await sleep(30);
+  if (MODE === "codespentstored") {
+    // L1 2026-10-07: a spent link reloaded from history must not throw away the good token the tab still holds
+    ok(renders >= 1 && !lockForm() && ctx.LevainToken.get() === TOKEN, "the stored token is kept and used");
+    console.log("PASS"); return;
+  }
   if (MODE === "code" || MODE === "codespent") {
     // head ruling 2026-10-07 (L2 #2, measured): the link carries a single-use code, traded once for the token
     ok(replaced.length === 1 && ctx.location.hash === "", "the code is stripped from the address bar");
@@ -182,7 +189,7 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk", "stalesubstrate", "notokenjs", "badinput", "authheaders", "code", "codespent"])
+@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk", "stalesubstrate", "notokenjs", "badinput", "authheaders", "code", "codespent", "codespentstored"])
 def test_the_cockpit_page_sends_the_launch_token_and_unlocks_in_place(tmp_path, mode):
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)

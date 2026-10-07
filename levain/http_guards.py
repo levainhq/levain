@@ -18,6 +18,7 @@ Stdlib only; nothing here imports another Levain module, so every server can imp
 """
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -47,6 +48,7 @@ __all__ = [
     "open_unlocked",
     "publish_launch_token",
     "read_running",
+    "request_link_code",
     "runtime_dir",
     "stop_on_sigterm",
 ]
@@ -68,7 +70,17 @@ _LEGACY_TOKEN_HEADERS = ("X-Levain-Chat-Token",)
 LINK_CODE_HEADER = "X-Levain-Link-Code"
 LINK_CODE_SECONDS = 600
 UNLOCK_PATH = "/unlock"   # token-free: trades a link code for the token
-LINK_PATH = "/link"       # needs the token: mints a fresh link code (`levain serve --open-running`)
+LINK_PATH = "/link"       # mints a fresh link code (`levain serve --open-running`), for a caller that proves the token
+# /link is authenticated by proof, both ways, so the token itself never crosses the socket: the caller sends a nonce
+# and HMAC(token, request || nonce); the server answers with the code and HMAC(token, reply || nonce || code), which
+# the caller checks before it opens anything. A listener that is not the server (another user's process that took the
+# port, a proxy) learns nothing it can use and cannot hand back a code the caller will open (L2 2026-10-07).
+LINK_NONCE_HEADER = "X-Levain-Link-Nonce"
+LINK_PROOF_HEADER = "X-Levain-Link-Proof"
+
+
+def _link_proof(token: str, *parts: str) -> str:
+    return hmac.new(token.encode("utf-8"), "\x00".join(parts).encode("utf-8"), hashlib.sha256).hexdigest()
 
 # Where a running server leaves its token for the operator, one file per port: a 0700 directory of 0600
 # files in the home directory. It is a crown jewel (levain.firing.confinement denies it to an entity's hands), so a
@@ -81,6 +93,10 @@ def new_launch_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _token_shaped(value: str) -> bool:
+    return bool(value) and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
+
+
 def check_launch_token(token: "str | None") -> None:
     """Refuse a launch token the page could not carry. ``None`` means "make one up". Anything else must be
     non-empty URL-safe base64 (``secrets.token_urlsafe``'s alphabet), the only shape token.js takes from a URL
@@ -88,7 +104,7 @@ def check_launch_token(token: "str | None") -> None:
     or a symbol would print an unlocked link the page refuses (codex L3 r1)."""
     if token is None:
         return
-    if not token or not all(c.isascii() and (c.isalnum() or c in "-_") for c in token):
+    if not _token_shaped(token):
         raise ValueError("a launch token must be non-empty and use only A-Z, a-z, 0-9, '-' and '_'; "
                          "omit it to have one generated.")
 
@@ -174,7 +190,10 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        own = sorted(n for n in vars(cls) if n.startswith("do_"))
+        # Every do_* the class would dispatch to, wherever in its MRO it comes from (a mixin ahead of GuardedHandler
+        # counts as much as the class's own body), must be GuardedHandler's.
+        own = sorted(n for n in dir(cls) if n.startswith("do_")
+                     and next(k for k in cls.__mro__ if n in vars(k)) is not GuardedHandler)
         if own and (cls.__module__, cls.__qualname__) not in _DO_METHOD_EXEMPT:
             raise TypeError(f"{cls.__qualname__} defines {own}: a GuardedHandler routes through _route / _post, "
                             "so the shared guards (Host, origin, launch token) always run first.")
@@ -257,7 +276,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
     def _token_refusal_body(self) -> bytes:
         return json.dumps({
             "error": "launch_token",
-            "message": (f"this server needs the token printed when it started, sent as {LAUNCH_TOKEN_HEADER}"),
+            "message": (f"this server needs its token, sent as {LAUNCH_TOKEN_HEADER}: open the page with "
+                        f"`levain serve --open-running --port {self.server.server_address[1]}`"),
         }).encode("utf-8")
 
     def _refuse_untokened_read(self, *, head: bool) -> bool:
@@ -280,7 +300,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if not self._launch_token_required() or self._launch_token_valid():
             return False
         self._reject(403, "launch_token",
-                     f"this server needs the token printed when it started, sent as {LAUNCH_TOKEN_HEADER}")
+                     f"this server needs its token, sent as {LAUNCH_TOKEN_HEADER}: open the page with "
+                     f"`levain serve --open-running --port {self.server.server_address[1]}`")
         return True
 
     def _cross_site_read(self) -> bool:
@@ -408,12 +429,26 @@ class GuardedHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == UNLOCK_PATH and self._launch_token_required():
             return self._unlock()
+        if path == LINK_PATH and self._launch_token_required():
+            return self._link()
         if self._refuse_untokened_write():
             return
-        if path == LINK_PATH and self._launch_token_required():
-            self.close_connection = True   # any body is left unread
-            return self._send_json({"code": mint_link_code(self.server), "expires_in": LINK_CODE_SECONDS})
         self._post()
+
+    def _link(self) -> None:
+        """``POST /link``: mint a link code for a caller that proves it holds the token without sending it (see
+        ``LINK_PROOF_HEADER``). No body is read."""
+        self.close_connection = True
+        nonce = (self.headers.get(LINK_NONCE_HEADER) or "").strip()
+        proof = (self.headers.get(LINK_PROOF_HEADER) or "").strip()
+        token = self.server.launch_token
+        if (len(nonce) < 16 or not _token_shaped(nonce) or not proof
+                or not hmac.compare_digest(proof.encode("utf-8"),
+                                           _link_proof(token, "levain-link-request", nonce).encode("utf-8"))):
+            return self._send_json({"error": "link_proof", "message": "a link needs proof of this server's token"}, 403)
+        code = mint_link_code(self.server)
+        self._send_json({"code": code, "expires_in": LINK_CODE_SECONDS,
+                         "proof": _link_proof(token, "levain-link-reply", nonce, code)})
 
     def _unlock(self) -> None:
         """``POST /unlock``: trade a single-use link code (``X-Levain-Link-Code``) for the launch token. The one POST
@@ -455,11 +490,25 @@ def _link_state(server: Any) -> "tuple[dict[str, float], threading.Lock]":
     return codes, lock
 
 
+def _link_clock() -> float:
+    """Seconds on a clock that keeps running while the machine sleeps (L2 2026-10-07: macOS's time.monotonic stops
+    during sleep, so a code printed before the lid closed outlived its 10 minutes). CLOCK_MONOTONIC counts sleep on
+    macOS; elsewhere CLOCK_BOOTTIME does; wall time is the fallback."""
+    for name in ("CLOCK_BOOTTIME", "CLOCK_MONOTONIC") if sys.platform != "darwin" else ("CLOCK_MONOTONIC",):
+        clk = getattr(time, name, None)
+        if clk is not None:
+            try:
+                return time.clock_gettime(clk)
+            except OSError:
+                continue
+    return time.time()
+
+
 def mint_link_code(server: Any) -> str:
     """A fresh single-use link code for ``server`` (see ``LINK_CODE_HEADER``)."""
     codes, lock = _link_state(server)
     code = new_launch_token()
-    now = time.monotonic()
+    now = _link_clock()
     with lock:
         for c in [c for c, exp in codes.items() if exp <= now]:
             del codes[c]
@@ -471,7 +520,7 @@ def _spend_link_code(server: Any, code: str) -> bool:
     """True, once, for a code this server minted and has not seen expire. Compared in constant time against every
     live code, so the answer's timing does not depend on how much of a code matches."""
     codes, lock = _link_state(server)
-    now = time.monotonic()
+    now = _link_clock()
     supplied = code.encode("utf-8")
     with lock:
         hit = None
@@ -537,7 +586,7 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
     try:
         d = _private_runtime_dir()
         path = d / f"{int(port)}.json"
-        tmp = d / f".{int(port)}.{os.getpid()}.tmp"
+        tmp = d / f".{int(port)}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -573,12 +622,45 @@ def read_running(port: int) -> dict[str, Any]:
     except ProcessLookupError:
         raise ValueError(f"the server that wrote {path} (pid {pid}) is no longer running") from None
     except PermissionError:
-        pass  # alive, another user's process: the record cannot be ours to use, but it is not stale either
+        # This user wrote the record, so its pid now belonging to someone else means the writer is gone.
+        raise ValueError(f"the server that wrote {path} (pid {pid}) is no longer running") from None
     return rec
 
 
+def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
+    """Ask the server at ``url`` (a loopback origin from a runtime record) for a fresh link code, proving the token
+    without sending it, and check the server's proof before returning the code. No proxy is used (an
+    ``HTTP_PROXY`` in the environment would otherwise receive the request). Raises ``ValueError`` on a non-loopback
+    URL or an answer that does not prove the token, ``OSError`` on a connection failure."""
+    import ipaddress
+    import urllib.parse
+    import urllib.request
+
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if parts.scheme != "http" or not loopback or parts.port is None:
+        raise ValueError(f"refusing to ask {url!r} for a link: not an http loopback origin")
+    nonce = secrets.token_urlsafe(24)
+    req = urllib.request.Request(
+        f"http://{parts.netloc}{LINK_PATH}", data=b"", method="POST",
+        headers={LINK_NONCE_HEADER: nonce, LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce)})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
+        reply = json.loads(r.read())
+    code, proof = reply.get("code"), reply.get("proof")
+    if not (isinstance(code, str) and _token_shaped(code) and isinstance(proof, str)
+            and hmac.compare_digest(proof.encode("utf-8"),
+                                    _link_proof(token, "levain-link-reply", nonce, code).encode("utf-8"))):
+        raise ValueError("the answer on that port did not prove this server's token; not opening it")
+    return code
+
+
 def open_unlocked(url: str, unlocked: str) -> None:
-    """Open the page. ``unlocked`` (the URL with the launch token in its fragment) goes ONLY to macOS's osascript
+    """Open the page. ``unlocked`` (the URL with a single-use link code in its fragment) goes ONLY to macOS's osascript
     controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
     Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
     users can read from the process table: the very callers the token exists to keep out. So the osascript
@@ -612,4 +694,5 @@ def stop_on_sigterm() -> "Callable[[], None]":
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, _stop)
-    return lambda: signal.signal(signal.SIGTERM, previous)
+    # A handler installed from C reads back as None, which signal.signal will not take: restore the default then.
+    return lambda: signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)

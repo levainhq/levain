@@ -138,7 +138,7 @@
       })
       .then(function (data) {
         if (rendered) return;   // a late answer to an earlier load, after the manual is up
-        if (data === LOCKED) { fail("Locked: enter the token the server printed when it started."); return; }
+        if (data === LOCKED) { fail("Locked: see the form at the top of the page."); return; }
         render(data);
         rendered = true;
       })

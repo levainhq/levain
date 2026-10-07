@@ -494,10 +494,17 @@ def test_a_link_code_unlocks_once_and_the_token_never_rides_the_link(tmp_path, m
         assert unlock(code) == (200, {"token": _TOKEN})
         assert unlock(code)[0] == 403                                   # spent
         assert unlock(mint_link_code(httpd), **{"Sec-Fetch-Site": "cross-site"})[0] == 403   # write-origin first
-        # /link mints a code, and only for a caller holding the token
-        got, _h, data = _raw_post(port, "/link", {"Content-Length": "0"})
-        assert got == 200 and unlock(json.loads(data)["code"])[0] == 200
-        assert _raw_post(port, "/link", {"X-Levain-Token": "wrong", "Content-Length": "0"})[0] == 403
+        # /link mints a code only for a caller that proves the token without sending it
+        from levain.http_guards import request_link_code
+
+        code2 = request_link_code(f"http://127.0.0.1:{port}/", _TOKEN)
+        assert unlock(code2)[0] == 200
+        assert _raw_post(port, "/link", {"Content-Length": "0"})[0] == 403          # the bearer token alone is not proof
+        with pytest.raises(OSError):
+            request_link_code(f"http://127.0.0.1:{port}/", "not-the-token")     # a 403, as urllib's HTTPError
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")                  # never used for the loopback ask
+        monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+        assert unlock(request_link_code(f"http://127.0.0.1:{port}/", _TOKEN))[0] == 200
         # the startup link carries a code, and `levain serve --open-running` opens a fresh one
         pub = publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="serve", stream=io.StringIO())
         assert "#code=" in pub.unlocked and _TOKEN not in pub.unlocked
@@ -513,3 +520,95 @@ def test_a_link_code_unlocks_once_and_the_token_never_rides_the_link(tmp_path, m
         httpd.shutdown()
         httpd.server_close()
         t.join(timeout=5)
+
+
+def test_request_link_code_refuses_a_listener_that_cannot_prove_the_token(tmp_path):
+    """L2 2026-10-07: --open-running sent the bearer token to whatever answered on the port. Now the token never
+    crosses the socket, and a code from a listener that cannot prove it is refused, not opened."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from levain.http_guards import request_link_code
+
+    seen = {}
+
+    class _Squatter(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            seen.update(self.headers)
+            body = json.dumps({"code": "attacker-chosen-code", "proof": "0" * 64}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Squatter)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(ValueError, match="did not prove"):
+            request_link_code(f"http://127.0.0.1:{httpd.server_address[1]}/", _TOKEN)
+        assert _TOKEN not in json.dumps(dict(seen))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+    for bad in ("http://10.0.0.5:7420/", "https://127.0.0.1:7420/", "http://example.com:7420/", "http://127.0.0.1/"):
+        with pytest.raises(ValueError, match="not an http loopback origin"):
+            request_link_code(bad, _TOKEN)
+
+
+def test_a_link_code_expires(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import levain.http_guards as hg
+
+    now = [1000.0]
+    monkeypatch.setattr(hg, "_link_clock", lambda: now[0])
+    srv = SimpleNamespace(launch_token=_TOKEN)
+    code = hg.mint_link_code(srv)
+    now[0] += hg.LINK_CODE_SECONDS + 1
+    assert hg._spend_link_code(srv, code) is False
+
+
+def test_a_do_method_from_a_mixin_is_refused_too():
+    """L1 2026-10-07: the check read only the class body, so a mixin ahead of GuardedHandler in the MRO could put its
+    own do_POST in front of the guards."""
+    class _Mixin:
+        def do_POST(self):  # noqa: N802
+            pass
+
+    with pytest.raises(TypeError, match="do_POST"):
+        class _Sneaky(_Mixin, GuardedHandler):  # noqa: F841
+            pass
+
+
+def test_stop_on_sigterm_puts_the_previous_handler_back():
+    import signal
+
+    from levain.http_guards import stop_on_sigterm
+
+    before = signal.getsignal(signal.SIGTERM)
+    restore = stop_on_sigterm()
+    assert signal.getsignal(signal.SIGTERM) is not before
+    with pytest.raises(KeyboardInterrupt):
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+    restore()
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_a_record_whose_pid_now_belongs_to_another_user_is_stale(tmp_path, monkeypatch):
+    """L1 + L2 2026-10-07: a PermissionError from kill(pid, 0) was read as "alive". This user wrote the record, so
+    the pid belonging to another user (pid 1 here, root's) means the writer is gone."""
+    import json
+
+    from levain.http_guards import read_running
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rt = tmp_path / ".levain-runtime"
+    rt.mkdir(mode=0o700)
+    (rt / "7490.json").write_text(json.dumps({"pid": 1, "token": "t", "url": "http://127.0.0.1:7490/"}))
+    with pytest.raises(ValueError, match="no longer running"):
+        read_running(7490)

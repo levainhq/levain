@@ -44,8 +44,8 @@ Sovereignty boundary (load-bearing, not incidental):
   allowlist and anything else is a 403. The same check now also fronts the write
   route — it IS the Slice-2a write/auth boundary it was the seed of.
 - **the launch token (np-ebb8a399)** — ``levain serve`` generates a token per launch, holds it
-  only in the process, prints it once to the starting terminal and opens the browser unlocked
-  (the token in the URL fragment, on macOS). Every route except the page shell needs it
+  in the process, prints it only to a terminal, leaves it in a 0600 runtime file, and opens the
+  browser on a single-use link code (on macOS). Every route except the page shell needs it
   (``LAUNCH_TOKEN_HEADER``, enforced in ``GuardedHandler`` before any route is reached). The
   rule this replaced, no token at all because "anything that can reach loopback can already edit
   your files" (principle #6), is false for three callers: another OS user, a container reaching
@@ -94,7 +94,6 @@ from typing import Any
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import (
-    LAUNCH_TOKEN_HEADER,
     LINK_PATH,
     UNLOCK_PATH,
     GuardedHandler,
@@ -104,6 +103,7 @@ from levain.http_guards import (
     publish_launch_token,
     stop_on_sigterm,
     read_running,
+    request_link_code,
     runtime_dir,
 )
 from levain.http_guards import open_unlocked as _open_browser  # the name tests patch on this module
@@ -1266,7 +1266,7 @@ def make_server(
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
     # The launch token: the caller's, or a fresh one when a chat host needs it. The page shell is the only
-    # token-free set: the browser must load it to read the token from the fragment, and it carries no operator data.
+    # token-free set: the browser must load it to trade the link code in its fragment, and it carries no operator data.
     if token is None and chat_host is not None:
         token = new_launch_token()
     arm_launch_token(httpd, token, frozenset(_ASSETS) | frozenset(extra_assets))
@@ -1342,9 +1342,9 @@ def make_server(
 
 def open_running(port: int, *, stream: "Any | None" = None) -> int:
     """``levain serve --open-running``: open the page of the Levain server on ``port``, unlocked, from the
-    runtime file it left (:func:`levain.http_guards.publish_launch_token`). The token reaches the browser
-    only through macOS's osascript controller; it is printed only to a terminal. Returns 1 when no live
-    server left a record for that port."""
+    runtime file it left (:func:`levain.http_guards.publish_launch_token`). The browser gets a fresh
+    single-use link code, never the token (:func:`levain.http_guards.request_link_code`); the link is printed
+    only to a terminal. Returns 1 when no live server left a record for that port."""
     out = stream if stream is not None else sys.stdout
     try:
         rec = read_running(port)
@@ -1355,17 +1355,11 @@ def open_running(port: int, *, stream: "Any | None" = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"Cannot open the server on port {port}: {exc}", file=sys.stderr)
         return 1
-    # A fresh single-use link code from the server itself (POST /link, with the token): the link a browser opens,
-    # and keeps in its history, never carries the token.
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(f"http://127.0.0.1:{int(port)}/link", data=b"", method="POST",
-                                 headers={LAUNCH_TOKEN_HEADER: rec["token"]})
+    # A fresh single-use link code from the server itself (POST /link, proved without sending the token): the link a
+    # browser opens, and keeps in its history, never carries the token.
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
-            code = json.loads(r.read())["code"]
-    except (OSError, ValueError, KeyError) as exc:
+        code = request_link_code(rec["url"], rec["token"])
+    except (OSError, ValueError) as exc:
         print(f"The server on port {port} did not give a link: {exc}", file=sys.stderr)
         return 1
     unlocked = f"{rec['url']}#code={code}"
@@ -1402,8 +1396,8 @@ def run_web_server(
     ``serve`` never binds off-box — a posture that fits a network surface: read-only
     is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).
 
-    Every launch generates its own token, printed once to stdout with an unlocked link (the token
-    in the URL fragment); on macOS the browser opens on that link.
+    Every launch generates its own token. It is printed only to a terminal, always written to
+    ``~/.levain-runtime/<port>.json``, and the browser (on macOS) opens on a single-use link code.
 
     ``chat`` (``--chat``, repeatable) also serves the chat routes over those entities
     (:class:`levain.chat.ChatHost`); unlike the dashboard, that drives an agent with hands, read-only

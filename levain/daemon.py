@@ -247,7 +247,7 @@ _PRIVATE_UMASK = 0o077
 
 def _prepare_private_logs(spec: "DaemonSpec") -> None:
     """Create the log directory 0700 and both log files 0600 before the service first writes them (an append
-    keeps a file's mode). Levain's own default directory on Linux is also chmod-ed back to 0700 if it exists
+    keeps a file's mode); an existing log file this user owns is narrowed to 0600 too. Levain's own default directory on Linux is also chmod-ed back to 0700 if it exists
     wider; a directory Levain does not own (macOS's ~/Library/Logs, a caller's --log-dir) is created private when
     missing and otherwise left as it is."""
     for log in (spec.stdout_log, spec.stderr_log):
@@ -260,6 +260,8 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
         if not log.exists():
             os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
             os.chmod(log, 0o600)
+        elif not log.is_symlink() and log.stat().st_uid == os.getuid():
+            os.chmod(log, 0o600)   # a log an older unit created wider (its old token lines, since dead)
 
 
 def _default_log_dir() -> Path:

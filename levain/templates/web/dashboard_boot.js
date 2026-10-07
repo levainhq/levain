@@ -143,7 +143,7 @@
         return { ok: true, data: data };
       }
       if (launchRefused(res.status, data, sent)) {
-        return { ok: false, error: "launch_token", message: "locked: enter the token the server printed when it started" };
+        return { ok: false, error: "launch_token", message: "locked: see the form at the top of the page" };
       }
       // A token rejection (off-box only): drop the stored token so the next attempt re-prompts
       // — covers a mistyped/rotated token without wedging every future write.
@@ -188,7 +188,7 @@
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
       if (res.ok) { return { ok: true, job_id: data.job_id, status: data.status }; }
       if (launchRefused(res.status, data, sent)) {
-        return { ok: false, error: "launch_token", message: "locked: enter the token the server printed when it started" };
+        return { ok: false, error: "launch_token", message: "locked: see the form at the top of the page" };
       }
       if (res.status === 403 && writeTokenRequired && /token/i.test(data.message || "")) dropToken();
       return { ok: false, error: data.error || "HTTP " + res.status, message: data.message || "HTTP " + res.status };
@@ -217,7 +217,7 @@
     if (!res.ok) {
       let m = "HTTP " + res.status;
       try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
-      if (res.status === 403 && !sentLaunchToken()) m = "locked: enter the token the server printed when it started";
+      if (res.status === 403 && !sentLaunchToken()) m = "locked: see the form at the top of the page";
       throw new Error(m);
     }
     return res.json();
@@ -306,7 +306,7 @@
           return;
         }
       }
-      if (res.status === 403 && !sentLaunchToken()) { status("locked — enter the token the server printed"); return; }
+      if (res.status === 403 && !sentLaunchToken()) { status("locked — see the form at the top of the page"); return; }
       // Refused for a launch token the page has since replaced: the unlock's own load() was latched behind this
       // one (pendingReload) and re-reads with the new token as soon as this returns (complement L3 r1).
       if (res.status === 403 && sent !== sentLaunchToken()) return;

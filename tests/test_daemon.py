@@ -1228,10 +1228,12 @@ def test_the_log_directory_and_files_are_created_private_under_a_linux_style_pat
         assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
         for log in (spec.stdout_log, spec.stderr_log):
             assert stat.S_IMODE(log.stat().st_mode) == 0o600
-        # an existing, wider Levain-owned directory is narrowed back
+        # an existing, wider Levain-owned directory and log (an older unit's) are narrowed back
         os.chmod(spec.stdout_log.parent, 0o755)
+        os.chmod(spec.stdout_log, 0o644)
         d._prepare_private_logs(spec)
         assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(spec.stdout_log.stat().st_mode) == 0o600
     finally:
         os.umask(old)
 
