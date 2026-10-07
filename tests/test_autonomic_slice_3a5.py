@@ -365,45 +365,110 @@ def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
 
 def _raw(store):
     import json
-    return json.loads(store.path.read_text())
+    return list(json.loads(store.path.read_text()).values())
 
 
 def _write(store, records):
     import json
+    store.path.write_text(json.dumps({r["binding_id"]: r for r in records}))
+
+
+def _write_legacy(store, records):
+    """The pre-object on-disk format: a top-level JSON list (still read; rewritten on next write)."""
+    import json
     store.path.write_text(json.dumps(records))
 
 
-def test_a_valid_revoked_duplicate_cannot_be_bypassed(tmp_path):
+def test_a_legacy_duplicate_reads_inert_and_refuses_every_write(tmp_path):
     # Reproduced 2026-10-06 (S1h): with two valid same-id records [PAUSED, REVOKED], ratify acted on
-    # the first and resurrected the revoked grant. The store now collapses duplicates on every read.
+    # the first and resurrected the revoked grant. The object format cannot hold two records for one
+    # id; a LEGACY list that does is corrupt: nothing in it reads, no write touches it.
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),))
     store.add(b)
     paused = _raw(store)[0]
-    _write(store, [paused, dict(paused, status="revoked")])
-    assert store.get(b.binding_id).status is BindingStatus.REVOKED
-    with pytest.raises(ValueError):
-        store.ratify(b.binding_id)
-    with pytest.raises(ValueError):
-        store.set_status(b.binding_id, BindingStatus.ACTIVE)
-    assert store.list_active() == []
-    # duplicates are corruption: no write persists a choice between copies, the file is left as is
-    with pytest.raises(ValueError, match="duplicate"):
-        store.set_status(b.binding_id, BindingStatus.REVOKED)
-    with pytest.raises(ValueError, match="duplicate"):
-        store.add(a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED))
-    assert [r["status"] for r in _raw(store)] == ["paused", "revoked"]
+    _write_legacy(store, [paused, dict(paused, status="revoked")])
+    before = store.path.read_text()
+    assert store.get(b.binding_id) is None and store.list_all() == [] and store.list_active() == []
+    for mutate in (lambda: store.ratify(b.binding_id),
+                   lambda: store.set_status(b.binding_id, BindingStatus.REVOKED),
+                   lambda: store.add(b),
+                   lambda: store.add(a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED))):
+        with pytest.raises(ValueError, match=f"duplicate records for .*{b.binding_id}.*repaired by hand"):
+            mutate()
+    assert store.path.read_text() == before
 
 
-def test_an_unloadable_or_unparseable_duplicate_still_reads_inert(tmp_path):
+def test_add_cannot_repair_a_duplicate_whose_revoked_copy_is_malformed(tmp_path):
+    # codex S1h r2 (a), reproduced on 72902dc: read collapsed [ACTIVE, REVOKED-but-malformed] to
+    # revoked, then add() of the same id "repaired" it to ACTIVE, because the malformed copy's
+    # status was not carried. There is no repair verb now: the add refuses and the file is unchanged.
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     live = _raw(store)[0]
-    _write(store, [live, dict(live, status="revoked", goal="not-a-goal")])
+    _write_legacy(store, [live, dict(live, status="revoked", goal="not-a-goal")])
+    before = store.path.read_text()
     assert store.list_active() == []
-    _write(store, [live, dict(live, status="garbage")])
+    with pytest.raises(ValueError, match="repaired by hand"):
+        store.add(b)
+    assert store.path.read_text() == before and store.list_active() == []
+
+
+def test_an_unparseable_legacy_duplicate_still_reads_inert(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    live = _raw(store)[0]
+    _write_legacy(store, [live, dict(live, status="garbage")])
     assert store.list_active() == []
+
+
+def test_a_legacy_list_without_duplicates_reads_and_converts_on_next_write(tmp_path):
+    import json
+    store = BindingStore(tmp_path / "b.json")
+    a = a_binding(guard=(guard(),), status=BindingStatus.PAUSED)
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    store.add(a)
+    store.add(b)
+    recs = _raw(store)
+    _write_legacy(store, recs + ["not-a-record"])     # legacy: non-record elements were filtered
+    assert isinstance(json.loads(store.path.read_text()), list)
+    assert {x.binding_id for x in store.list_all()} == {a.binding_id, b.binding_id}
+    assert [x.binding_id for x in store.list_active()] == [b.binding_id]
+    assert store.ratify(a.binding_id) is not None      # the next write converts
+    on_disk = json.loads(store.path.read_text())
+    assert isinstance(on_disk, dict) and set(on_disk) == {a.binding_id, b.binding_id}
+    assert all(on_disk[k]["binding_id"] == k for k in on_disk)
+    assert {x.binding_id for x in store.list_active()} == {a.binding_id, b.binding_id}
+
+
+def test_a_legacy_record_without_an_id_refuses_conversion(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    _write_legacy(store, _raw(store) + [{"posture": "CONFIRM"}])
+    before = store.path.read_text()
+    assert [x.binding_id for x in store.list_active()] == [b.binding_id]   # still reads
+    with pytest.raises(ValueError, match="no string binding_id"):
+        store.set_status(b.binding_id, BindingStatus.PAUSED)
+    assert store.path.read_text() == before
+
+
+def test_add_validates_the_merged_record_not_only_the_incoming_binding(tmp_path):
+    # codex S1h r2 HIGH (b): the carried guard_additions were never validated, so an impure kill
+    # added on disk rode a re-add into the persisted record unchecked.
+    from levain.autonomic.kill import KillImpurityError
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    rec = _raw(store)[0]
+    bad = dict(guard().to_dict(), kill_predicate={"field": "x", "op": "regex_sub", "value": "y"})
+    _write(store, [dict(rec, guard_additions=[bad])])
+    before = store.path.read_text()
+    with pytest.raises((KillImpurityError, ValueError)):
+        store.add(b)
+    assert store.path.read_text() == before
 
 
 def test_supersede_onto_an_existing_active_new_id_is_not_stranded(tmp_path):
@@ -440,6 +505,10 @@ def test_nested_fields_this_version_does_not_know_survive(tmp_path):
     _write(store, [rec])
     store.record_fire(b.binding_id, clean=True, fired_at="2026-07-01T00:00:00")
     store.tighten_guard(b.binding_id, guard(spike_id="second"))
+    rec = _raw(store)[0]
+    assert rec["graduation"]["future_counter"] == 7 and rec["graduation"]["fire_count"] == 1
+    assert rec["guard_additions"][0]["future_safety"] is True and len(rec["guard_additions"]) == 2
+    store.add(b)                                     # a re-add carries them too (S1h r2)
     rec = _raw(store)[0]
     assert rec["graduation"]["future_counter"] == 7 and rec["graduation"]["fire_count"] == 1
     assert rec["guard_additions"][0]["future_safety"] is True and len(rec["guard_additions"]) == 2
@@ -775,7 +844,7 @@ def test_binding_liveness_flags_barred_seal_mismatch(tmp_path):
     import json
     p = tmp_path / "b.json"
     recs = json.loads(p.read_text())
-    recs[0]["guard"] = []
+    recs[b.binding_id]["guard"] = []
     p.write_text(json.dumps(recs))
     stats = binding_liveness(store)
     assert stats["barred_seal_mismatch"] == 1 and stats["fireable"] == 0
@@ -806,3 +875,30 @@ def test_gate_liveness_counts_terminal_states(tmp_path):
     assert stats["by_terminal_state"]["fired"] == 1
     assert stats["by_refuse_class"].get("kill_triggered") == 1
     assert stats["by_verdict"]["denied"] >= 2 and stats["by_verdict"]["auto"] == 1
+
+
+def test_replace_atomic_validates_the_merged_record(tmp_path):
+    # the same final-record rule on the supersede path: an impure kill already on the new id's
+    # stored record is carried into the persisted record, so it must be refused, not written
+    from levain.autonomic.kill import KillImpurityError
+    store = BindingStore(tmp_path / "b.json")
+    old = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    store.add(old)
+    store.add(new)
+    recs = {r["binding_id"]: r for r in _raw(store)}
+    bad = dict(guard().to_dict(), kill_predicate={"field": "x", "op": "regex_sub", "value": "y"})
+    recs[new.binding_id]["guard_additions"] = [bad]
+    _write(store, list(recs.values()))
+    before = store.path.read_text()
+    with pytest.raises((KillImpurityError, ValueError)):
+        store.replace_atomic(old.binding_id, new)
+    assert store.path.read_text() == before
+
+
+def test_a_null_trajectory_bound_is_descriptive_not_impure():
+    from levain.autonomic.kill import KillImpurityError
+    from levain.autonomic.monitor import assert_trajectory_pure
+    assert_trajectory_pure({"summary": "x", "bound": None})      # None = no bound: passes
+    with pytest.raises(KillImpurityError):
+        assert_trajectory_pure({"summary": "x", "bound": "field == 1"})
