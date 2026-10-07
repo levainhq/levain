@@ -13,7 +13,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 
-- **The launch banner names every credential store the floor covers.** Its "READABLE" warning listed three of the five files (it left out both git credential files); it now reads the floor's own list.
+- **The launch banner names every credential store the floor covers.** Its "READABLE" warning named three of the five stores (it left out both git credential files); it now reads the floor's own list.
 
 ## [0.6.9] — 2026-10-05
 

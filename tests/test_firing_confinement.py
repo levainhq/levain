@@ -3360,7 +3360,8 @@ def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, 
     """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives).
     Measured before the rule: from inside the confined shell `security find-generic-password -w`
     and `git credential-osxkeychain get` read secrets. Measured after, on the real provider:
-    interactive/headless read, unattended refused (rc 44, helper empty), https unaffected."""
+    interactive/headless read, unattended refused (rc 44, helper empty), https unaffected. Since
+    2026-10-07 the default is flipped: headless is refused too (expected column above)."""
     from levain.firing.drive import resolve_cred_floor
 
     deny = resolve_cred_floor(setting, mode=mode)
@@ -3403,8 +3404,9 @@ def test_cred_floor_label_names_every_store_the_floor_denies() -> None:
     "~/.pypirc", "~/.npmrc", "~/.docker/config.json", "~/.kube/config",
 ])
 def test_token_files_found_readable_by_a_headless_entity_are_standard_cred_stores(path) -> None:
-    # Each held a live token readable by a headless entity's shell under the real profile
-    # (2026-10-07). Pinned by name, so dropping one from the tuple fails here.
+    # Tool-canonical token files. On 2026-10-07 the first three were measured readable by a
+    # headless entity's shell (~/.kube/config was absent on that host). Pinned by name, so
+    # dropping one from the tuple fails here; membership is all this test checks.
     from levain.firing.confinement import _STANDARD_CRED_FILES
 
     assert path in _STANDARD_CRED_FILES

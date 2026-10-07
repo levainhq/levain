@@ -11,7 +11,7 @@ the run; no policy in this module splits on it today, and the autonomy policies 
 ===============  ==================  ==========================  ========  ===================
 mode             who invoked it      who reads the activity      gate      standard creds
 ===============  ==================  ==========================  ========  ===================
-``interactive``  a human, live       a human, AS IT HAPPENS      ungated   per config (allow)
+``interactive``  a human, live       a human, after each turn    ungated   per config (allow)
 ``headless``     a human             a human, AFTERWARDS         gated     DENIED by default
 ``unattended``   a SCHEDULER         nobody, necessarily         gated     DENIED by default
 ===============  ==================  ==========================  ========  ===================
@@ -88,7 +88,7 @@ written as a comparison rather than a table of special cases."""
 
 
 def human_present(mode: DriveMode | str) -> bool:
-    """Is a human DRIVING this session — i.e. watching the activity as it happens?
+    """Is a human DRIVING this session — at the terminal, reading each turn before typing the next?
 
     The gate's question, and the reason it is a derivation rather than a stored flag: fan-in either
     exists at the moment an action would fire, or it does not. Only ``interactive`` has it.
@@ -110,8 +110,9 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     - ``False`` → allow, always. **An explicit operator opt-IN, and it must keep working even for
       an unattended seat** — a seat whose job is "open a PR nightly" genuinely needs ``gh``. This is
       a DEFAULT being overridden, not a prohibition being defeated.
-    - ``None`` (the key is ABSENT) → derive from the drive: allow only ``interactive``, where a
-      human watches the read as it happens; deny ``headless``, ``unattended`` and any unknown mode.
+    - ``None`` (the key is ABSENT) → derive from the drive: allow only ``interactive`` (the REPL,
+      where the operator reads each completed turn at the terminal before the next and before any
+      wrap); deny ``headless``, ``unattended`` and any unknown mode.
 
     **Why absent-means-derive rather than a three-valued string** like the ``efferent_gate: "auto"``
     field one row away in the same dataclass, which solves the identical problem: changing
@@ -119,7 +120,7 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     config INVALID, and the loader is deliberately fail-closed — so a parse error does not degrade,
     it bricks ``levain run`` entirely. Absent-means-auto buys the same semantics for zero breakage,
     and it strengthens rather than breaks the meaning of an explicit ``false``: it stops being "the
-    default, restated" and becomes "I really do want this credential reachable unattended."
+    default, restated" and becomes "I really do want this credential reachable outside the REPL."
     """
     if setting is not None:
         return setting

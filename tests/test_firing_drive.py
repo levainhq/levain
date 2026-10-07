@@ -61,7 +61,8 @@ def test_absent_derives_from_the_drive() -> None:
 @pytest.mark.parametrize("mode", [*DRIVE_MODES, "garbage"])
 def test_the_absent_cred_floor_follows_the_gates_own_line(mode) -> None:
     """Since 2026-10-07 (Phill ruled the default flipped): the standard credential stores are open by
-    default only where a human watches the read as it happens, which is exactly human_present. A
+    default only at the REPL, where the operator reads each completed turn before the next, which is
+    exactly human_present. A
     headless turn (a --task run, a cockpit chat turn) is captured before anyone reads it."""
     assert resolve_cred_floor(None, mode=mode) is (not human_present(mode))
 

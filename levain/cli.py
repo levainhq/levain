@@ -467,8 +467,8 @@ def main(argv: list[str] | None = None) -> int:
             "this and nobody will necessarily read the output (what `levain daemon install-seat` "
             "emits). With --consolidate, the consolidate may metabolize but is refused from "
             "crystallizing. By "
-            "default the gate and the standard-credential denial (gh, AWS and the netrc / git "
-            "credential files; on macOS also the Keychain) already apply to any --task run; "
+            "default the gate and the standard-credential denial (the stores the launch banner "
+            "lists under the floor) already apply to any --task run; "
             "efferent_gate: \"ungated\" turns the gate off and deny_standard_creds: false lets the "
             "entity read those stores (both in .levain/confinement.json)."
         ),
