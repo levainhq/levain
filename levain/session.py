@@ -403,7 +403,8 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
 # What a shell prints when a credential it needs is unreadable: git over HTTPS reaching its prompt with no
 # credential to offer and no terminal to ask on (the confined shell has none), and git's Keychain helper
 # failing (it is silent when the item is merely absent).
-_CRED_FAILURE_LINES = re.compile(r"could not read (?:Username|Password) for 'https://|failed to get: -?\d+")
+_CRED_FAILURE_LINES = re.compile(r"could not read (?:Username|Password) for 'https://|failed to get: -\d+")
+_EPERM = re.compile(r"operation not permitted", re.IGNORECASE)
 CRED_FLOOR_NOTE = (
     "this may be the standard credential floor, which denies the standard credential stores in this "
     'drive; to allow them set "deny_standard_creds": false in .levain/confinement.json, or for git use '
@@ -411,10 +412,13 @@ CRED_FLOOR_NOTE = (
 )
 
 
-def _floor_path_forms() -> tuple[str, ...]:
-    """Each standard credential store as a shell output can name it: as written (``~/...``) and expanded."""
-    paths = (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES)
-    return tuple({form for p in paths for form in (p, os.path.expanduser(p))})
+@functools.lru_cache(maxsize=1)
+def _floor_path() -> re.Pattern[str]:
+    """Each standard credential store as a shell output can name it, as written (``~/...``) and expanded
+    (the confined shell's ``HOME`` is the host's), and not as the prefix of a longer name
+    (``~/.config/ghostty``, ``~/.netrc.bak``); a subtree also matches what is under it."""
+    forms = {form for p in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES) for form in (p, os.path.expanduser(p))}
+    return re.compile("(?:" + "|".join(re.escape(f) for f in sorted(forms)) + r")(?![\w.-])")
 
 
 def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> list[str]:
@@ -460,9 +464,12 @@ def _reads_as_cred_failure(event) -> bool:
         return False
     if _CRED_FAILURE_LINES.search(text):
         return True
-    forms = _floor_path_forms()
-    return any("operation not permitted" in line.lower() and any(f in line for f in forms)
-               for line in text.splitlines())
+    # only the lines holding an EPERM are read, so a large output is not split or copied
+    for m in _EPERM.finditer(text):
+        end = text.find("\n", m.end())
+        if _floor_path().search(text, text.rfind("\n", 0, m.start()) + 1, len(text) if end == -1 else end):
+            return True
+    return False
 
 
 def _refused_action_ids(events) -> set[str]:
@@ -1219,14 +1226,19 @@ class EntitySession:
         the act-now nudge, then the call) is not the whole of the join, and the shapes that need the whole text would
         miss it. The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
         when the finish carried no message: otherwise it is never shown. Thoughts beside other actions are not: such
-        an action ran, and its thought often restates that very call. A classifier failure fails CLOSED (flagged,
-        nothing to add: a headless run exits 7); the turn itself never fails."""
+        an action ran, and its thought often restates that very call. A classifier failure fails CLOSED: the reply
+        and every thought beside a finish count as flagged (a headless run exits 7); the turn itself never fails."""
+        try:
+            thoughts = _finish_thoughts(events)
+        except Exception:  # noqa: BLE001 — the reply's own check below still fails closed
+            thoughts = []
         try:
             names = self._tool_names()
-            beside = [t for t in _finish_thoughts(events) if unreadable_tool_call(t, names)]
+            beside = [t for t in thoughts if unreadable_tool_call(t, names)]
             parts = bool(reply) and any(unreadable_tool_call(t, names) for t in _agent_parts(events))
         except Exception:  # noqa: BLE001 — undeterminable is not "readable"
-            return bool(reply), []
+            # every thought beside a finish is unchecked, so it is flagged and shown, as a flagged one would be
+            return bool(reply) or bool(thoughts), thoughts
         return bool(beside) or parts, beside
 
     def _tool_names(self) -> frozenset[str]:

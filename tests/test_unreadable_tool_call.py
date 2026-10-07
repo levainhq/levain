@@ -237,7 +237,6 @@ def test_a_classifier_failure_never_fails_the_turn(tmp_path, monkeypatch):
     assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is True
 
 
-
 def test_unreadable_tool_names_fail_closed(tmp_path):
     # L3 r2 (complement LOW): an unreadable tools_map read as no tools, so a bare call naming one passed with exit 0
     session = _leaking_session(tmp_path, '{"name": "terminal", "arguments": {"command": "touch x"}}')
@@ -705,6 +704,14 @@ def _action(kind, tool, thought, **fields):
 def test_a_call_beside_a_finish_with_no_message_is_the_reply(tmp_path):
     # codex + gemini: with no reply the thought was never checked, so the turn exited 1 with the call hidden
     result = _session_with_events(tmp_path, [_action("FinishAction", "finish", CALL_X, message="")]).run_turn("x")
+    assert result.reply == CALL_X and result.unreadable_call is True and result.exit_code == 7
+
+
+def test_unreadable_tool_names_fail_closed_on_a_thought_with_no_reply(tmp_path):
+    # L3 (codex + complement): the failure path returned (bool(reply), []), so with no reply the thought was dropped, exit 1
+    session = _session_with_events(tmp_path, [_action("FinishAction", "finish", CALL_X, message="")])
+    session.conversation.agent = object()
+    result = session.run_turn("x")
     assert result.reply == CALL_X and result.unreadable_call is True and result.exit_code == 7
 
 

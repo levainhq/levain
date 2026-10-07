@@ -57,6 +57,16 @@ def test_no_note_without_the_floor_or_the_signature(tmp_path):
         _turn(_output(f"open {HOME}/Library/x: operation not permitted")), tmp_path, cred_floor=True)
     assert CRED_FLOOR_NOTE not in turn_tool_activity(
         _turn(_output(f"{HOME}/.netrc\nchmod: operation not permitted")), tmp_path, cred_floor=True)
+    assert CRED_FLOOR_NOTE not in turn_tool_activity(
+        _turn(_output(f"chmod: operation not permitted\n{HOME}/.netrc")), tmp_path, cred_floor=True)
+    # a longer name that starts like a store, and a non-negative "failed to get" (an HTTP status, say)
+    for text in (f"open {HOME}/.config/ghostty/config: operation not permitted",
+                 f"open {HOME}/.netrc.bak: operation not permitted", "fetch: failed to get: 404"):
+        assert CRED_FLOOR_NOTE not in turn_tool_activity(_turn(_output(text)), tmp_path, cred_floor=True)
+    # a store under a denied subtree, mid-output among long lines
+    long = "x" * 10_000
+    assert turn_tool_activity(_turn(_output(f"{long}\nopen {HOME}/.config/gh/hosts.yml: operation not permitted\n{long}")),
+                              tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
     # a failure in an earlier turn is not this turn's
     events = [_Event("user", ["a"]), _shell("git push"), _output(GIT), _Event("user", ["b"]), _shell("ls")]
     assert turn_tool_activity(events, tmp_path, cred_floor=True) == ["⚙ terminal: ls"]
