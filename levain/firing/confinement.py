@@ -3643,9 +3643,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
     # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
     # as empty JSON that the next session's ``load_confinement_config`` refuses.
-    # ⛔ IT COMES FIRST IN THE BODY, before the jewel tmpfs of step (2): a bind takes its source from
-    # the real host tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel
-    # (complement + codex, L3 r1). Emitted first, any deny inside .levain lands on top of it.
+    # ⛔ IT COMES BEFORE the jewel tmpfs of step (2): a bind takes its source from the real host
+    # tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel (complement +
+    # codex, L3 r1). Emitted before them, any deny inside .levain lands on top of it. It comes AFTER
+    # the tool-directory views below: an entity inside a tool directory (~/.kube/project) sits under
+    # a child the view binds back read-write, and that bind emitted later covered this read-only
+    # one (codex, L3 r3).
     # ⚖ STRICTER THAN macOS, STATED: on macOS the confined shell may create new files in .levain
     # other than the denied literals and edit the ones it may write; here it may do neither for a
     # top-level file. Its subdirectories stay writable.
@@ -3653,6 +3656,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     if policy.config_file is not None:
         protected.add(policy.config_file)
     ro_store_dirs: list[Path] = []
+    store_argv: list[str] = []
     for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
         if d.is_symlink() or not d.is_dir():
             # `levain run` refuses an entity with no .levain/ before it gets here; anything else
@@ -3662,7 +3666,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 f"the entity store {d} is missing or a symlink — refusing to grant bash hands "
                 "(fail-closed)."
             )
-        argv += ["--ro-bind", str(d), str(d)]
+        store_argv += ["--ro-bind", str(d), str(d)]
         ro_store_dirs.append(d)
         # Only DIRECTORIES come back read-write. A per-FILE bind pins the file's inode, so a host
         # write by rename (anneal and levain write that way) would leave the shell reading and
@@ -3674,7 +3678,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # This is the opposite case: an ordinary subdirectory the host removed between planning
             # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
-            argv += ["--bind-try", str(child), str(child)]
+            store_argv += ["--bind-try", str(child), str(child)]
     entity_store_dirs = list(ro_store_dirs)
     # The standard cred files' TOOL directories (lane P2, items 5 and 6) get a VIEW, not the host
     # directory: a read-only tmpfs holding the real directory's existing entries except the cred
@@ -3689,15 +3693,18 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # pins the inode). An absent tool directory is created first (0700, by the provider: step (1)
     # puts it in ``create_first``) and recorded in the placeholder ledger, which removes it at close
     # if it is still empty. The ops are bwrap(1)'s --tmpfs, --bind-try, --ro-bind-try, --symlink and
-    # --remount-ro, and every mountpoint inside the view is made in the tmpfs, never on the host.
+    # --remount-ro. A mountpoint inside the view is made in the tmpfs, except under a subdirectory
+    # bound back from the host (a "window", ~/.aws/sso): there it is on the host, so it is prepared,
+    # ledgered and watched like any other (:func:`_mount_plan_paths`; codex, L3 r3).
     secret_names = {_host_spelling(p) for p in (*policy.deny_files, *policy.deny_read_write,
                                                *policy.deny_write_files, *policy.sqlite_sidecars)}
     tool_views: list[Path] = []
+    tool_windows: list[Path] = []
     for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
         real = t.parent.resolve() / t.name
         if real.is_symlink():
             _refuse_replaceable_link(real, (*frozen_home, *entity_store_dirs))
-            real = real.resolve()
+            real = _link_target(real)
         if os.path.lexists(real) and not real.is_dir():
             continue   # a file where the tool's directory should be: nothing can live under it
         if real in ro_store_dirs:
@@ -3715,8 +3722,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 argv += ["--symlink", os.readlink(child), str(child)]
             elif child.is_dir():
                 argv += ["--bind-try", str(child), str(child)]
+                tool_windows.append(child)
             else:
                 argv += ["--ro-bind-try", str(child), str(child)]
+    argv += store_argv
 
     def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
@@ -4104,9 +4113,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             entry = (str(_host_spelling(d)), True)
         else:
             continue
-        if any(Path(entry[0]) != v and Path(entry[0]).is_relative_to(v) for v in tool_views):
-            # Inside a tool directory's view: the view is read-only, so nothing in it can be renamed,
-            # and a pin there would only create a directory on the host for nothing.
+        e = Path(entry[0])
+        if (any(e != v and e.is_relative_to(v) for v in tool_views)
+                and not any(e != w and e.is_relative_to(w) for w in tool_windows)):
+            # In a tool directory's view and not below a window into the host: the view is read-only
+            # and each window is itself a mountpoint, so nothing here can be renamed, and a pin would
+            # only create a directory on the host for nothing. Below a window it is pinned as usual
+            # (complement, L3 r3).
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
@@ -4123,6 +4136,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # fails inside bash.
     home_ops: list[str] = []
     home_real = home_ro
+    if home_real is not None and policy.workspace.resolve() == home_real:
+        raise ConfinementError(
+            f"the workspace is {home_real} itself, whose own entries are read-only inside bash on "
+            "Linux, so the entity could not write at its workspace root. Refusing to grant bash "
+            "hands (fail-closed). Use a subdirectory of your home as the workspace."
+        )
     if home_real is not None:
         home_ops = ["--ro-bind", str(home_real), str(home_real)]
         for child in sorted(home_real.iterdir(), key=lambda p: p.name):
@@ -4338,9 +4357,11 @@ def _mount_plan_paths(
     self-bind comes first; its source exists, so nothing is created). A path strictly inside a tmpfs
     root is left out of both, by EXACT containment: the tmpfs hides the
     host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
-    (L3 2026-10-03)."""
+    (L3 2026-10-03). Unless it is strictly inside a host directory self-bound into that tmpfs after it
+    (a tool view's window): below one the host tree is back (L3 r3)."""
     mounted: dict[str, str | None] = {}
     tmpfs: list[Path] = []
+    windows: list[Path] = []   # host directories bound back inside a tmpfs: host-backed again below
     i = 0
     while i < len(argv):
         op = argv[i]
@@ -4353,6 +4374,10 @@ def _mount_plan_paths(
             if dst != "/":
                 kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
                 mounted.setdefault(dst, kind)
+                pd = Path(dst)
+                if (src == dst and any(pd != t and pd.is_relative_to(t) for t in tmpfs)
+                        and os.path.isdir(dst)):
+                    windows.append(pd)
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
             i += 2
@@ -4362,8 +4387,11 @@ def _mount_plan_paths(
             i += 1
 
     def hidden(q: str) -> bool:
+        # Strictly inside a tmpfs, and not strictly inside a host directory bound back into it (a
+        # tool view's ~/.aws/sso: what lies below it is the host's again; codex, L3 r3).
         pq = Path(q)
-        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+        return (any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+                and not any(pq != w and pq.is_relative_to(w) for w in windows))
 
     mounted = {q: k for q, k in mounted.items() if not hidden(q)}
     unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
@@ -4425,11 +4453,20 @@ def _prepare_mountpoints(mounted: dict[str, str | None],
                              0o444)
             except FileExistsError:
                 continue
-            created.append((q, "file"))   # ledgered as soon as it exists, before anything can fail
             try:
                 os.fchmod(fd, 0o444)   # exactly 0444 whatever the umask: the ledger checks the mode
-            finally:
-                os.close(fd)
+            except OSError:
+                # Not the 0444 file the ledger knows how to remove (under umask 077 it is 0400), so it
+                # is removed now, while this call still holds it and knows it is the one it made.
+                try:
+                    st, lst = os.fstat(fd), os.lstat(p)
+                    if (st.st_dev, st.st_ino) == (lst.st_dev, lst.st_ino):
+                        os.unlink(p)
+                finally:
+                    os.close(fd)
+                raise
+            os.close(fd)
+            created.append((q, "file"))
     return created
 
 
@@ -4589,6 +4626,7 @@ class _LedgerTxn:
         self.problem: str | None = None
         self.entries: list[dict] = []
         self.removed: list[str] = []
+        self.rollback: set[str] = set()   # objects to remove at once if this commit fails
         self._lock = None
 
     def __enter__(self) -> "_LedgerTxn":
@@ -4680,6 +4718,14 @@ class _LedgerTxn:
                 os.replace(tmp, path)
             except OSError as exc:
                 self.problem = f"the ledger {path} cannot be written ({exc})"
+                # What this transaction's spawn made is in no ledger on disk and no shell will use
+                # it: removed now, still under the lock, if it is still the object made (L3 r3).
+                for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
+                    if e["path"] in self.rollback and _object_unchanged(e):
+                        try:
+                            os.rmdir(e["path"]) if e.get("kind") == "dir" else os.unlink(e["path"])
+                        except OSError:
+                            pass
         finally:
             if self._lock is not None:
                 self._lock.close()   # releases the flock
@@ -4994,19 +5040,24 @@ class BwrapProvider(ConfinementProvider):
         claim = _new_claim()
         made: list[tuple[str, str]] = []
         with _LedgerTxn() as txn:
-            if txn.ok:
-                txn.sweep()
+            if not txn.ok:
+                # Without a ledger this shell's claims cannot reach the disk, and another session
+                # that can read it later would remove what this shell's masks stand on (codex, L3 r3).
+                raise ConfinementError(
+                    f"{txn.problem} — refusing to grant bash hands (fail-closed): the floor's "
+                    "placeholder ledger is needed to keep its files in place for this shell."
+                )
+            txn.sweep()
             try:
                 argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made)
             finally:
-                if txn.ok:
-                    # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
-                    txn.record(made)
-            if txn.ok:
-                # Everything this spawn made is claimed too, parents included (an absent ~/.config
-                # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
-                txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
-        if txn.ok and txn.problem is not None:
+                # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
+                txn.record(made)
+                txn.rollback = {p for p, _ in made}
+            # Everything this spawn made is claimed too, parents included (an absent ~/.config
+            # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
+            txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
+        if txn.problem is not None:
             # The claim never reached the disk, so another session's close could remove a placeholder
             # this shell's mask would stand on, and the shell could then plant it (codex, L3 r2).
             raise ConfinementError(
@@ -5038,6 +5089,13 @@ class BwrapProvider(ConfinementProvider):
                 with _LedgerTxn() as txn:
                     if txn.ok:
                         txn.retag(claim, tagged)
+                if not txn.ok or txn.problem is not None:
+                    # Unwritten, the claim names only levain's pid: after a levain crash a sweep
+                    # would drop it while the sandbox lives on its mounts (codex, L3 r3).
+                    raise ConfinementError(
+                        f"{txn.problem} — refusing to grant bash hands (fail-closed): the shell's "
+                        "claim on the floor's files could not be recorded."
+                    )
                 shell._ledger_claim = tagged
             shell._recheck()   # whatever changed during the start closes it before any command
         except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged

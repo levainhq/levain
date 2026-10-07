@@ -478,8 +478,9 @@ def test_mountpoints_made_before_a_failure_reach_the_callers_list(home: Path) ->
     assert (str(home / ".netrc"), "file") in made
 
 
-def test_a_placeholder_whose_chmod_fails_is_still_reported(home: Path, monkeypatch) -> None:
-    """L1 r3: the file exists from the moment the create succeeds, so it is ledgered from then on."""
+def test_a_placeholder_whose_chmod_fails_is_removed_not_left(home: Path, monkeypatch) -> None:
+    """L1 then codex r3: a file whose fchmod failed is not the 0444 file the ledger knows how to
+    remove (under umask 077 it is 0400), so it is removed at once rather than recorded."""
     made: list[tuple[str, str]] = []
 
     def boom(fd, mode):
@@ -488,7 +489,7 @@ def test_a_placeholder_whose_chmod_fails_is_still_reported(home: Path, monkeypat
     monkeypatch.setattr(C.os, "fchmod", boom)
     with pytest.raises(OSError):
         C._prepare_mountpoints({str(home / ".netrc"): "file"}, made)
-    assert (str(home / ".netrc"), "file") in made
+    assert not (home / ".netrc").exists() and made == []
 
 
 # --- ruling 2026-10-07: a link directly in $HOME is masked at its target -----------------------------
@@ -645,3 +646,43 @@ def test_nothing_inside_a_tool_dir_view_is_created_on_the_host(home: Path) -> No
     mounted, _ = C._mount_plan_paths(argv, policy)
     assert not [q for q in mounted if q.startswith(aws + "/")]
     assert [aws + "/sso/cache"] in _ops(argv, "--tmpfs")
+
+
+# --- L3 r3 ------------------------------------------------------------------------------------------
+
+
+def test_an_entity_inside_a_tool_dir_keeps_its_read_only_store(home: Path) -> None:
+    """codex r3: the tool view bound ~/.kube/project back read-write AFTER the entity store's
+    read-only bind, covering it, so bash could create a confinement.json there."""
+    ent = home / ".kube" / "project"
+    (ent / ".levain").mkdir(parents=True)
+    argv, _ = C._bwrap_plan(build_policy(ent, deny_standard_creds=True))
+    lv, proj = str((ent / ".levain").resolve()), str(ent.resolve())
+    i_store = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--ro-bind", lv, lv])
+    i_child = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--bind-try", proj, proj])
+    assert i_child < i_store
+
+
+def test_a_jewel_under_a_bound_back_child_of_a_view_stays_watched(home: Path) -> None:
+    """codex r3: everything inside the ~/.aws view counted as hidden, but ~/.aws/sso is the host
+    directory bound back, so ~/.aws/sso/cache is host-backed: it must be prepared, ledgered and
+    watched like any other mountpoint."""
+    (home / ".aws" / "sso").mkdir(parents=True)
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    argv, _ = C._bwrap_plan(policy)
+    mounted, _ = C._mount_plan_paths(argv, policy)
+    assert mounted.get(str(home.resolve() / ".aws" / "sso" / "cache")) == "dir"
+    assert str(home.resolve() / ".aws" / "credentials") not in mounted
+
+
+def test_a_dangling_home_level_tool_dir_link_is_refused_with_the_reason(home: Path) -> None:
+    (home / ".kube").symlink_to(home / "nowhere")
+    with pytest.raises(ConfinementError, match="leads nowhere"):
+        C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+
+
+def test_a_workspace_that_is_home_itself_is_refused(home: Path) -> None:
+    """complement r3: $HOME's top level is read-only inside bash, so a workspace there could not be
+    written at its root."""
+    with pytest.raises(ConfinementError, match="workspace"):
+        C._bwrap_plan(build_policy(_entity(home), workspace=home))

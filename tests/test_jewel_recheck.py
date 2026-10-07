@@ -532,3 +532,70 @@ def test_a_ledger_that_cannot_be_written_refuses_before_any_start(tmp_path, monk
     with pytest.raises(ConfinementError, match="cannot be written"):
         conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
     assert not started
+
+
+def test_a_failed_ledger_commit_removes_what_the_spawn_made(tmp_path, monkeypatch):
+    """complement + codex r3: the refusal left the 0444 placeholders it had made, in no ledger."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+
+    def full_disk(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(conf.os, "replace", full_disk)
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: self)
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path), deny_standard_creds=True))
+    assert not (tmp_path / ".netrc").exists()
+
+
+def test_an_unreadable_ledger_refuses_before_anything_is_made(tmp_path, monkeypatch):
+    """codex r3: with the ledger unreadable the spawn went ahead with no claim on disk."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    d = conf._ledger_dir()
+    d.mkdir(parents=True, mode=0o700)
+    d.parent.chmod(0o700)
+    (d / conf._LEDGER_NAME).write_text("{not json")
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="cannot be read"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path), deny_standard_creds=True))
+    assert not started and not (tmp_path / ".netrc").exists()
+
+
+def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeypatch):
+    """codex r3: the process-group retag was assumed durable; unwritten, a sweep after a levain crash
+    would see only the dead parent's claim and remove a mountpoint the live sandbox stands on."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+    commits = []
+
+    def second_commit_fails(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            commits.append(1)
+            if len(commits) == 2:
+                raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    class _P:
+        pid = 4242
+
+    def start(self):
+        self._proc = _P()
+        return self
+
+    closed = []
+    monkeypatch.setattr(conf.os, "replace", second_commit_fails)
+    monkeypatch.setattr(conf._BwrapShell, "start", start)
+    monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert closed
