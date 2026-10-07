@@ -223,8 +223,8 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     with pytest.raises(ChatError):
         host.approve(sid)               # nothing is held now
 
-    _wait(host, host.turn(sid, "push again")["job_id"])
-    st = _wait(host, host.reject(sid, "open a PR instead")["job_id"])
+    again = _wait(host, host.turn(sid, "push again")["job_id"])["result"]["decision_id"]
+    st = _wait(host, host.reject(sid, "open a PR instead", expect=again)["job_id"])
     assert st["result"]["reply"] == "ok, a PR instead"
     assert f.made[0].calls[-1] == ("reject_turn", "open a PR instead")
 
@@ -1522,9 +1522,16 @@ def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp
     assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
 
 
-def test_reject_without_a_decision_id_is_allowed(tmp_path):
+def test_reject_without_a_decision_id_is_refused(tmp_path):
+    """codex release-range review (RAN): a reject by session id alone landed on a LATER halt than the one its
+    caller saw (A kept D1; B rejected D1 and the continuation halted at D2; A's id-less reject rejected D2).
+    Every decision names its halt."""
     host, sid, res, f = _gated_host(tmp_path, [_Result(reply="ok, not pushing")])
-    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not pushing"
+    with pytest.raises(ChatError) as e:
+        host.reject(sid, "no")
+    assert e.value.code == "decision_id_required" and host.session_status(sid)["state"] == "gated"
+    st = _wait(host, host.reject(sid, "no", expect=res["decision_id"])["job_id"])
+    assert st["result"]["reply"] == "ok, not pushing"
 
 
 def test_the_approve_route_refuses_a_missing_id_and_session_json_hands_it_out(tmp_path):
@@ -1613,8 +1620,9 @@ def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
 
 def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown(tmp_path):
     """The decision id names the halt; the digest names its bytes. If what the next run() would execute differs
-    from what was recorded with the shown set, approve runs NOTHING, the id is spent, and the hold stays
-    rejectable (session.json still reports it, without an id)."""
+    from what was recorded with the shown set, approve runs NOTHING, the halt becomes reject-only for good,
+    and the SAME id still names it for the reject (complement release-range review: a reject naming the id
+    the screen held was refused as stale)."""
     held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
     f = _Factory([_Result(reply=None, gated=True, pending=(held,)), _Result(reply="ok, not running it")])
     host = _host(tmp_path, f)
@@ -1627,12 +1635,13 @@ def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown
     assert e.value.code == "stale_decision" and e.value.http_status == 409
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
     view = host.session_status(sid)
-    assert view["state"] == "gated" and "decision_id" not in view and view["pending"][0]["full"] == '{"command": "ls"}'
+    assert view["state"] == "gated" and view["decision_id"] == expect and view["approvable"] is False
+    assert view["pending"][0]["full"] == '{"command": "ls"}'
     f.made[0].live = st["result"].get("held_digest") or "digest:" + repr((held,))   # even back to equal: spent
     with pytest.raises(ChatError) as e:
         host.approve(sid, expect=expect)
-    assert e.value.code == "stale_decision"
-    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not running it"
+    assert e.value.code == "undecidable"
+    assert _wait(host, host.reject(sid, "no", expect=expect)["job_id"])["result"]["reply"] == "ok, not running it"
 
 
 @pytest.mark.parametrize("recorded,live", [(None, "d"), ("d", None), (None, None)])
@@ -1647,7 +1656,8 @@ def test_an_approve_with_no_readable_digest_is_refused(tmp_path, recorded, live)
     f.made[0].live = live
     with pytest.raises(ChatError) as e:
         host.approve(sid, expect=expect)
-    assert e.value.code == "stale_decision"
+    # no recorded digest: never approvable (offered as reject-only); no live one: refused at the compare
+    assert e.value.code == ("undecidable" if recorded is None else "stale_decision")
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
 
 

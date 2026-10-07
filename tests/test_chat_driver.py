@@ -231,9 +231,10 @@ def test_a_halt_whose_digest_is_missing_can_only_be_rejected(tmp_path):
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     out = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    assert out["approvable"] is False          # offered as reject-only from the start
     with pytest.raises(ChatError) as e:
         host.approve(sid, out["decision_id"])
-    assert e.value.code == "stale_decision"
+    assert e.value.code == "undecidable"
     assert not [c for c in d.calls if c[0] == "approve"]
 
 
@@ -1896,3 +1897,39 @@ def test_a_failed_release_keeps_the_error_that_ended_the_session(tmp_path):
     _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the release")
     err = host.session_status(sid)["error"]
     assert "boom" in err and "teardown failed" in err
+
+
+# -- the release-range review's chat.py findings (queued after S1) ---------------------------------------------
+
+
+def test_a_view_cannot_change_what_the_next_viewer_is_shown(tmp_path):
+    """codex (RAN): job and session views shallow-copied the result; editing a view's pending row changed
+    what every later viewer was shown under the same decision id."""
+    d = _Fake([_halt()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    jid = host.turn(sid, "go")["job_id"]
+    st = _wait(host, jid)
+    st["result"]["pending"][0]["full"] = "echo safe"
+    view = host.session_status(sid)
+    view["pending"][0]["full"] = "echo safe"
+    view["last_job"]["result"]["pending"][0]["full"] = "echo safe"
+    assert host.job_status(jid)["result"]["pending"][0]["full"] == _HELD.full
+    again = host.session_status(sid)
+    assert again["pending"][0]["full"] == _HELD.full
+    assert again["last_job"]["result"]["pending"][0]["full"] == _HELD.full
+
+
+def test_a_reject_binds_to_the_halt_its_caller_saw(tmp_path):
+    """codex (RAN): A kept D1; B rejected D1 and the continuation halted at D2; A's reject without an id then
+    rejected D2. A reject needs the current id; A's D1 is stale."""
+    d = _Fake([_halt(), _halt(), _Out()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    d1 = _wait(host, host.turn(sid, "go")["job_id"])["result"]["decision_id"]
+    _wait(host, host.reject(sid, "no", expect=d1)["job_id"])          # B
+    for kw in ({}, {"expect": d1}):                                      # A, with nothing or with D1
+        with pytest.raises(ChatError) as e:
+            host.reject(sid, "no", **kw)
+        assert e.value.code in ("decision_id_required", "stale_decision")
+    assert [c[0] for c in d.calls].count("reject") == 1

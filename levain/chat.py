@@ -118,6 +118,7 @@ a failed start also runs one cyclic collection.
 """
 from __future__ import annotations
 
+import copy
 import functools
 import gc
 import logging
@@ -291,6 +292,7 @@ class _Session:
     state: SessionState = "opening"
     release_failed_since: str | None = None   # when its release failed (UTC, ISO 8601), for release_failed
     decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
+    approvable: bool = False         # that halt may be approved (else reject-only); the id still names it
     pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
     held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
     last_job_id: str | None = None   # the most recent job that STARTED on this session, for a page that lost it
@@ -532,9 +534,10 @@ class ChatHost:
             if rec.last_job_id is not None:
                 out["last_job"] = self._job_view(rec.last_job_id)
             if rec.state == "gated":
-                out["pending"] = [dict(p) for p in rec.pending]
+                out["pending"] = [dict(p) for p in rec.pending]   # rows of plain values: one level is a full copy
                 if rec.decision_id is not None:
                     out["decision_id"] = rec.decision_id
+                    out["approvable"] = rec.approvable
             return out
 
     def job_status(self, job_id: str) -> dict[str, Any]:
@@ -556,7 +559,10 @@ class ChatHost:
             "deadline_hit": job.deadline_hit,
         }
         if job.result is not None:
-            out["result"] = dict(job.result)
+            # A deep copy: a view's nested rows (``pending`` and its dicts) must not be the stored ones, or a
+            # consumer that edits a view changes what the next viewer is shown under the same decision id
+            # (codex release-range review, run).
+            out["result"] = copy.deepcopy(job.result)
         if job.error is not None:
             out["error"] = job.error
         return out
@@ -607,7 +613,8 @@ class ChatHost:
             reason = "the operator declined this action"
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
             raise ChatError("bad_reason", "reason must be a non-empty string under 2000 chars", 400)
-        return self._start(session_id, "reject", ("gated",), ("reject", reason), expect=expect)
+        return self._start(session_id, "reject", ("gated",), ("reject", reason), expect=expect,
+                           require_expect=True)
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
@@ -889,11 +896,12 @@ class ChatHost:
                     f"the session is {rec.state}; {kind} needs it {' or '.join(accepts)}",
                     409,
                 )
-            # ``expect`` is the decision id the operator's screen was shown. An APPROVE requires it, from
-            # every caller: approving by session id alone would run whatever is held now, which may not be
-            # what any screen showed. A REJECT may omit it (rejecting runs nothing and only tells the entity
-            # no); one that names an id still has to match. The id is per halt, never per content, so two
-            # textually identical holds cannot share one.
+            # ``expect`` is the decision id the operator's screen was shown, and EVERY decision requires it,
+            # from every caller: approving by session id alone would run whatever is held now, which may not
+            # be what any screen showed, and a reject by session id alone could land on a LATER halt than the
+            # one its caller saw, advancing the conversation past a decision nobody made (codex
+            # release-range review, run). The id is per halt, never per content, so two textually identical
+            # holds cannot share one. A halt that cannot be approved keeps its id, for the reject.
             if not expect:
                 expect = None   # "", 0, [] and the like are a missing id, not a wrong one
             if require_expect and expect is None:
@@ -910,10 +918,11 @@ class ChatHost:
                     f"the held action is not the one this {kind} was made on; read the session again",
                     409,
                 )
-            if kind == "approve" and (not rec.pending or any(not shown_in_full(p.get("full")) for p in rec.pending)):
+            if kind == "approve" and not rec.approvable:
                 raise ChatError(
                     "undecidable",
-                    "this hold cannot be shown in full, so it can only be rejected",
+                    "this hold cannot be shown in full, or what it holds no longer matches what was shown, so "
+                    "it can only be rejected (with the same decision id)",
                     409,
                 )
             if kind != "approve":
@@ -923,7 +932,7 @@ class ChatHost:
             # screen's set must equal the digest of what the next run() would execute. held_digest is driver
             # code, so it is read OUTSIDE the host lock (a driver that computes it over IPC must not stall every
             # route); meanwhile the record reads busy, so nothing else can act on it, and the id is held aside,
-            # so a second approve of the same id is stale.
+            # so a second decision on the same id is stale.
             driver, shown, held_id = rec.driver, rec.held_digest, rec.decision_id
             rec.state, rec.decision_id = "busy", None
         got = driver.call("held_digest") if driver is not None else None
@@ -936,11 +945,13 @@ class ChatHost:
                 # shutdown() skipped this record (it read busy), so it is closed here.
                 to_close, rec.driver, rec.state = rec.driver, None, "closing"
             elif not _names_bytes(shown) or not _names_bytes(live) or live != shown:
-                # Spent, never re-armed: no screen holds a set that matches, so this halt is reject-only.
+                # Never re-armed for approval: no screen holds a set that matches, so this halt is
+                # reject-only. The id still names it, so the reject that follows binds to this halt.
+                rec.decision_id, rec.approvable = held_id, False
                 raise ChatError(
                     "stale_decision",
                     "what the gate holds is not what was shown, or cannot be read; nothing ran; this hold "
-                    "can now only be rejected",
+                    "can now only be rejected, with the same decision id",
                     409,
                 )
             else:
@@ -1192,13 +1203,19 @@ class ChatHost:
                     # The result's tool_activity leaves out held and stop-skipped actions; it replaces
                     # what was streamed on every finish (module docstring).
                     job.activity, job.dropped = list(payload["tool_activity"]), cut
-                    rec.decision_id, rec.pending, rec.held_digest = None, [], None
+                    rec.decision_id, rec.pending, rec.held_digest, rec.approvable = None, [], None, False
                     if payload["gated"] and payload["error"] is None:
                         rec.state = "gated"
                         rec.decision_id = secrets.token_hex(16)
                         rec.pending = [dict(p) for p in payload["pending"]]
                         rec.held_digest = digest if isinstance(digest, str) else None
+                        # Approvable only when every held call is shown in full and the hold names its bytes; a
+                        # client offers Approve only then (complement release-range review: an id that could only
+                        # be refused offered a dead-end Approve).
+                        rec.approvable = bool(rec.pending) and _names_bytes(rec.held_digest) and all(
+                            shown_in_full(p.get("full")) for p in rec.pending)
                         payload["decision_id"] = rec.decision_id
+                        payload["approvable"] = rec.approvable
                     elif payload["error"] is not None:
                         # A turn that raised or could not read its own gate leaves the conversation in a
                         # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a
@@ -1233,7 +1250,7 @@ class ChatHost:
                     else:
                         job.status, job.result = "done", payload
                         job.activity, job.dropped = list(payload["tool_activity"]), cut
-                rec.decision_id, rec.pending, rec.held_digest = None, [], None
+                rec.decision_id, rec.pending, rec.held_digest, rec.approvable = None, [], None, False
                 if rec.job_id == job.job_id:
                     rec.job_id = None
 
