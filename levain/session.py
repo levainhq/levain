@@ -113,7 +113,7 @@ WORKSPACE_SUBDIR = "workspace"
 # the agent's own account of its work, and none ever should be.
 # ---------------------------------------------------------------------------
 EXIT_OK = 0
-"""The turn ran to completion and the agent produced a reply."""
+"""The turn ran to completion and the agent produced a reply (a readable one: see :data:`EXIT_UNREADABLE_CALL`)."""
 
 EXIT_NO_REPLY = 1
 """The turn ran to completion but the agent produced NO reply.
@@ -481,6 +481,25 @@ def latest_agent_text(events) -> str | None:
     anything else is left as it arrived. Without it the person read the damaged reply while the
     store held the repaired one (UD-1, RUN on the released 0.5.4 via ``levain serve --chat``:
     ``café —`` came back as ``cafÃ© â\\x80\\x94``)."""
+    parts = _agent_parts(events)
+    return scan_text("\n".join(parts)).text if parts else None
+
+
+def _action_thoughts(events) -> list[str]:
+    """The text a model sent beside its structured calls this turn (each agent action's ``thought``). Duck-typed."""
+    evs = list(events)
+    out: list[str] = []
+    for e in evs[turn_start(evs):]:
+        if getattr(e, "source", None) != "agent" or getattr(e, "action", None) is None:
+            continue
+        text = " ".join(t.text for t in (getattr(e, "thought", None) or ()) if isinstance(getattr(t, "text", None), str))
+        if text.strip():
+            out.append(text)
+    return out
+
+
+def _agent_parts(events) -> list[str]:
+    """The turn's agent texts, each unwrapped and deduplicated as :func:`latest_agent_text` joins them."""
     evs = list(events)
     start = turn_start(evs)
     parts: list[str] = []
@@ -492,7 +511,7 @@ def latest_agent_text(events) -> str | None:
             text = humanize_finish_json(text)  # spore-297: unwrap finish/think-as-JSON-text
             if text not in parts:  # dedup a finish echoing a prior MessageEvent
                 parts.append(text)
-    return scan_text("\n".join(parts)).text if parts else None
+    return parts
 
 
 def _one_turn(method: Callable[..., TurnResult]) -> Callable[..., TurnResult]:
@@ -1128,22 +1147,29 @@ class EntitySession:
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
-            unreadable_call=self._unreadable_call(reply),
+            unreadable_call=self._unreadable_call(reply, events),
         )
 
-    def _unreadable_call(self, reply: str | None) -> bool:
-        """:func:`unreadable_tool_call` for this turn's reply. A display aid: it never fails a turn that ran."""
-        try:
-            return unreadable_tool_call(reply, self._tool_names())
-        except Exception:  # noqa: BLE001 — the reply is then shown as it arrived
+    def _unreadable_call(self, reply: str | None, events) -> bool:
+        """:func:`unreadable_tool_call` for each agent message of this turn, never their join: a call that is the whole
+        of one message (a plan, the act-now nudge, then the call) is not the whole of the join, and the shapes that
+        need the whole text would miss it there. The text the model sent beside a structured call (the action's
+        ``thought``) is checked too: beside a parsed ``finish`` it is otherwise never shown. A classifier failure
+        fails CLOSED (the reply is shown under the notice and a headless run exits 7); the turn itself never fails."""
+        if not reply:
             return False
+        try:
+            names = self._tool_names()
+            return any(unreadable_tool_call(t, names) for t in (*_agent_parts(events), *_action_thoughts(events)))
+        except Exception:  # noqa: BLE001 — undeterminable is not "readable"
+            return True
 
     def _tool_names(self) -> frozenset[str]:
-        """The names of this conversation's tools, or none when they cannot be read (the bare-JSON shape of an
-        unreadable call is then not recognised; the markup shapes still are)."""
+        """The names of this conversation's tools, or none when they cannot be read (the shapes that name a tool are
+        then not recognised; the other markup shapes still are)."""
         try:
             return frozenset(str(n) for n in self.conversation.agent.tools_map)
-        except Exception:  # noqa: BLE001 — a display aid never fails the turn
+        except Exception:  # noqa: BLE001 — never fails the turn
             return frozenset()
 
     def request_stop(self) -> None:

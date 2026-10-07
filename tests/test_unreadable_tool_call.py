@@ -206,9 +206,9 @@ def test_the_repl_notice_after_actions_ran_does_not_say_nothing_ran(capsys):
 
 def test_deeply_nested_json_is_not_a_call_and_never_raises():
     assert unreadable_tool_call("[" * 3000 + "]" * 3000, TOOLS) is False
-    assert unreadable_tool_call("[" * 1200 + '{"name": "terminal", "arguments": {}}' + "]" * 1200, TOOLS) is False
-    # only a top-level array of call objects counts; a nested array is not the call shape
-    assert unreadable_tool_call('[[{"name": "terminal", "arguments": {}}]]', TOOLS) is False
+    # 0.6.10 (head's ruling on L2 Q1 b): a call naming an own tool inside other text counts, nesting included
+    assert unreadable_tool_call("[" * 1200 + '{"name": "terminal", "arguments": {}}' + "]" * 1200, TOOLS) is True
+    assert unreadable_tool_call('[[{"name": "terminal", "arguments": {}}]]', TOOLS) is True
 
 
 @pytest.mark.parametrize("reply", [
@@ -233,7 +233,8 @@ def test_a_classifier_failure_never_fails_the_turn(tmp_path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "unreadable_tool_call", boom)
     result = _leaking_session(tmp_path, GLM_REAL[0]).run_turn("x")
-    assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is False
+    # 0.6.10 (L1): it failed open, and with exit 7 now riding on the flag that meant exit 0 for unread markup
+    assert result.error is None and result.reply == GLM_REAL[0] and result.unreadable_call is True
 
 
 # ---------- L3 r2: fences by CommonMark 0.31.2 s4.5 ----------
@@ -288,9 +289,11 @@ def test_only_cr_lf_and_crlf_end_lines():
 
 
 def test_an_indented_block_of_call_json_is_not_a_whole_fence():
-    assert not unreadable_tool_call('    ```json\n    {"name": "terminal", "arguments": {}}\n    ```', TOOLS)
-    # r3 LOW: a leading strip made this 4-space opener a column-0 fence; it is an indented code line, not a fence
-    assert not unreadable_tool_call('    ```json\n{"name": "terminal", "arguments": {}}\n```', TOOLS)
+    # 0.6.10 (head's ruling on L2 Q3): an indented block alone is read like a lone fence, so its call is found
+    assert unreadable_tool_call('    ```json\n    {"name": "terminal", "arguments": {}}\n    ```', TOOLS)
+    # r3 LOW: a leading strip made this 4-space opener a column-0 fence; it is an indented code line, not a fence,
+    # and the call after it is prose (0.6.10: a call in prose naming an own tool counts)
+    assert unreadable_tool_call('    ```json\n{"name": "terminal", "arguments": {}}\n```', TOOLS)
     assert unreadable_tool_call('\n```json\n{"name": "terminal", "arguments": {}}\n```\n', TOOLS)
 
 
@@ -491,3 +494,133 @@ QWEN_UNWRAPPED_REAL = "```\n<function=terminal>\n<parameter=command>\ntouch x\n<
 def test_a_qwen_function_tag_without_its_wrapper_is_flagged():
     assert unreadable_tool_call(QWEN_UNWRAPPED_REAL, TOOLS)
     assert unreadable_tool_call("Creating it.\n<function=terminal>\n<parameter=command>\ntouch x", TOOLS)
+
+
+# ---------- 0.6.10 L2 (parser lens), each reproduced ----------
+
+def _multi_part_session(tmp_path, texts):
+    """A session whose turn ends with each of ``texts`` as a separate agent message."""
+    from types import SimpleNamespace
+
+    from levain.session import EntitySession
+    from tests.test_session import _Binding, _Event
+
+    class _Conv:
+        def __init__(self):
+            self.state = SimpleNamespace(events=[], execution_status="idle")
+            self.agent = SimpleNamespace(tools_map={n: object() for n in TOOLS})
+
+        def send_message(self, message):
+            self.state.events.append(_Event("user", [message]))
+
+        def run(self):
+            self.state.events.extend(_Event("agent", [t]) for t in texts)
+            self.state.execution_status = "finished"
+
+    return EntitySession(
+        entity_dir=tmp_path, binding=_Binding(), conversation=_Conv(), workspace=tmp_path / "workspace",
+        model_label="m", with_tools=False, bash_ok=False, gate_mode="ungated",
+    )
+
+
+def test_a_call_that_is_one_whole_message_after_a_plan_is_marked(tmp_path):
+    # the join ("plan\ncall") is not all JSON, so the whole-reply shapes missed the call that ended the turn
+    call = '{"name": "terminal", "arguments": {"command": "pytest"}}'
+    result = _multi_part_session(tmp_path, ["I'll run the tests and read the source.", call]).run_turn("x")
+    assert result.unreadable_call is True and result.exit_code == 7
+    fence = "```\n<function=terminal>\n<parameter=command>\npytest\n</parameter>\n</function>\n```"
+    assert _multi_part_session(tmp_path, ["I'll run the tests.", fence]).run_turn("x").unreadable_call is True
+
+
+def test_a_finish_whose_arguments_are_a_json_string_is_unwrapped_and_never_raises(tmp_path):
+    from levain.firing.agent_reply import humanize_finish_json
+
+    wire = '{"name": "finish", "arguments": "{\\"message\\": \\"The answer is 4.\\"}"}'
+    assert humanize_finish_json(wire) == "The answer is 4."
+    assert humanize_finish_json('{"name": "finish", "arguments": "not json"}') == '{"name": "finish", "arguments": "not json"}'
+    result = _leaking_session(tmp_path, wire).run_turn("x")
+    assert result.reply == "The answer is 4." and result.ok
+
+
+@pytest.mark.parametrize("reply", [
+    '{"type": "function", "function": {"name": "finish", "arguments": {"message": "The answer is 4."}}}',
+    '[{"name": "think", "arguments": {"thought": "t"}}, {"name": "finish", "arguments": {"message": "The answer is 4."}}]',
+])
+def test_the_finish_shapes_the_classifier_reads_are_unwrapped(reply):
+    from levain.firing.agent_reply import humanize_finish_json
+
+    assert humanize_finish_json(reply) == "The answer is 4."
+
+
+def test_minimax_and_bare_glm_calls_are_flagged():
+    minimax = ('<minimax:tool_call>\n<invoke name="terminal">\n<parameter name="command">ls</parameter>\n</invoke>\n'
+               '</minimax:tool_call>')
+    assert unreadable_tool_call(minimax, TOOLS)
+    assert unreadable_tool_call("<tool_call>task_tracker</tool_call>", TOOLS)
+    assert unreadable_tool_call("<tool_call>task_tracker\n</tool_call>", TOOLS)
+    assert not unreadable_tool_call("Close it with <tool_call>whatever</tool_call>.", TOOLS)
+
+
+# ---------- 0.6.10 L1 + the head's rulings on L1/L2 ----------
+
+def test_a_call_beside_prose_naming_an_own_tool_is_flagged():
+    # the head's ruling (Q1 b): the notice is true there, and the text is still shown under it
+    assert unreadable_tool_call('{"name":"terminal","arguments":{"command":"ls"}}\nI will now list the files.', TOOLS)
+    assert unreadable_tool_call('Listing: {"type": "function", "function": {"name": "terminal", "arguments": "{}"}}', TOOLS)
+    # a name that is not one of the entity's tools, or JSON in code, is an answer
+    assert not unreadable_tool_call('The record is {"name": "Ada", "arguments": ["a"]} as stored.', TOOLS)
+    assert not unreadable_tool_call('Send `{"name": "terminal", "arguments": {}}` to call it.', TOOLS)
+
+
+def test_an_unterminated_nest_of_call_starts_is_one_pass():
+    import time
+
+    t = time.perf_counter()
+    assert not unreadable_tool_call("x " + '{"name": ' * 20_000, TOOLS)
+    assert not unreadable_tool_call("x " + '{"name": 1} ' * 15_000, TOOLS)
+    assert time.perf_counter() - t < 5
+
+
+def test_an_indented_block_holding_a_call_alone_is_read_like_a_lone_fence():
+    assert unreadable_tool_call("    <tool_call>\n    <function=terminal>\n    <parameter=command>\n    ls", TOOLS)
+    assert unreadable_tool_call('    {"name": "terminal", "arguments": {"command": "ls"}}', TOOLS)
+
+
+def test_a_glm_call_cut_after_its_first_key_and_kimis_stripped_call_are_flagged():
+    assert unreadable_tool_call("terminal<arg_key>command</arg_key>", TOOLS)
+    assert unreadable_tool_call('functions.terminal:0{"command": "ls"}', TOOLS)
+    assert not unreadable_tool_call('functions.spreadsheet:0{"cell": "A1"}', TOOLS)
+
+
+def test_text_sent_beside_a_parsed_finish_is_checked(tmp_path):
+    # L1 F2: the SDK puts a response's text into the first action's `thought`; beside a parsed finish("Created x")
+    # a terminal call in that text never ran and was never shown
+    from types import SimpleNamespace
+
+    from tests.test_session import _Event
+
+    sess = _leaking_session(tmp_path, "unused")
+
+    def run():
+        sess.conversation.state.events.append(SimpleNamespace(
+            source="agent", tool_name="finish",
+            action=SimpleNamespace(kind="FinishAction", message="Created x"),
+            thought=[SimpleNamespace(text='{"name": "terminal", "arguments": {"command": "touch x"}}')],
+        ))
+        sess.conversation.state.execution_status = "finished"
+
+    sess.conversation.run = run
+    result = sess.run_turn("create x")
+    assert result.reply == "Created x" and result.unreadable_call is True and result.exit_code == 7
+
+
+def test_a_reply_over_the_bound_is_never_stripped():
+    # L1 F5: .strip() copied a reply over the bound that ended in a newline (100M characters: ~100 MB)
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
+
+    class NoStrip(str):
+        def strip(self, *a):
+            raise AssertionError("copied a reply over the bound")
+
+    assert unreadable_tool_call(NoStrip(GLM_REAL[1] + "a" * MAX_CLASSIFIED_BYTES + "\n"), TOOLS) is True
+    assert unreadable_tool_call(NoStrip("\n" + "a" * MAX_CLASSIFIED_BYTES + "\n"), TOOLS) is False

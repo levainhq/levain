@@ -158,27 +158,17 @@ def humanize_finish_json(text: str) -> str:
     call in it must be ``think`` or ``finish``: a payload that also holds any other call (``terminal``, a
     name it does not know) is kept whole, because that call did not run, and answering with the finish
     message ("Created x") would hide it from the unreadable-call check that reads this function's output."""
-    stripped = text.strip()
-    if not stripped.startswith("{"):
-        return text
-    decoder = json.JSONDecoder()
-    objs: list[dict] = []
-    idx, n = 0, len(stripped)
-    while idx < n:
-        while idx < n and stripped[idx].isspace():
-            idx += 1
-        if idx >= n:
-            break
-        try:
-            obj, idx = decoder.raw_decode(stripped, idx)
-        except ValueError:
-            return text  # not a clean, entirely-JSON tool-call payload → leave untouched
-        if not isinstance(obj, dict) or obj.get("name") not in _UNWRAPPABLE_CALLS:
-            return text
-        objs.append(obj)
-    for obj in objs:
-        if obj.get("name") == "finish":
-            message = (obj.get("arguments") or {}).get("message")
+    calls = _json_calls(text.strip())
+    if not calls or any(name not in _UNWRAPPABLE_CALLS for name, _ in calls):
+        return text  # not a clean payload of think/finish calls only → leave untouched
+    for name, args in calls:
+        if name == "finish":
+            if isinstance(args, str):  # the OpenAI wire form carries the arguments as a JSON string
+                try:
+                    args = json.loads(args)
+                except (ValueError, RecursionError):
+                    args = None
+            message = args.get("message") if isinstance(args, dict) else None
             if isinstance(message, str) and message.strip():
                 return message.strip()
     return text  # no finish message found → don't fabricate a reply from the scratchpad
@@ -214,12 +204,24 @@ _FUNCTION_CALL_OPEN = re.compile(r"<function=[A-Za-z_][\w.-]*>\s*(?:<parameter=|
 # It is still searched for markup and call JSON, with no region counted as code, so a large leak is flagged rather
 # than shown as an answer.
 MAX_CLASSIFIED_BYTES = 200_000
-_CALL_MARKUP = (_TOOL_CALL_OPEN, _FUNCTION_CALL_OPEN, _GLM_ARG_PAIR)
+# MiniMax-M2's call: plain-text tags, so a failed parse upstream leaves them verbatim.
+_INVOKE_OPEN = re.compile(r"<invoke name=\"[A-Za-z_][\w.-]*\">\s*(?:<parameter name=|</invoke>)")
+# GLM's call cut after its first key tag, before any value tag.
+_GLM_ARG_KEY = re.compile(r"<arg_key>[\w.-]+</arg_key>")
+_CALL_MARKUP = (_TOOL_CALL_OPEN, _FUNCTION_CALL_OPEN, _INVOKE_OPEN, _GLM_ARG_PAIR, _GLM_ARG_KEY)
+# Markup that names its tool, counted only when the name is one of the entity's: GLM's call of a tool with no
+# arguments (the wrapper around a bare name), and what Kimi's call leaves once its special tokens are stripped.
+_NAMED_CALL_MARKUP = (
+    re.compile(r"<tool_call>\s*([A-Za-z_][\w.-]*)\s*</tool_call>"),
+    re.compile(r"functions\.([A-Za-z_][\w.-]*):\d+\s*\{"),
+)
+# Where a function-call JSON object may start inside other text.
+_JSON_CALL_START = re.compile(r"\{\s*\"(?:name|type)\"\s*:")
 _SPACE = re.compile(r"\s*")
 
 # The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
 # heading, a list or a quote included. A model has no reason to write that markup in prose; a false flag still shows
-# the answer, under the notice; nothing runs either way. Code regions are the CommonMark parser's to decide
+# the text, under the notice, and nothing runs either way, but a headless run then exits 7 with no stdout payload. Code regions are the CommonMark parser's to decide
 # (markdown-it-py, "commonmark" preset): fenced and indented code blocks and code spans. Everything else is kept, in
 # document order, one region per line; an entity or a backslash escape ("&lt;", "\\<") and a code span become a
 # placeholder that is neither a space nor markup, so "&lt;tool_call>" and "\\<tool_call>" are not "<tool_call>".
@@ -246,8 +248,8 @@ def _inline_text(token) -> str:
 
 def _read(text: str) -> tuple[str, str | None]:
     """One parse of ``text``: (``text`` with its code regions removed, see above; the inside of ``text`` when its only
-    top-level block is one fenced code block, else ``None``). If the parser fails, all of ``text`` counts as outside
-    code and there is no fence: a display aid that cannot read the reply flags rather than hides."""
+    top-level block is one fenced or indented code block, else ``None``). If the parser fails, all of ``text`` counts as outside
+    code and there is no fence: a check that cannot read the reply flags rather than hides."""
     try:
         tokens = _MD.parse(text)
     except Exception:  # noqa: BLE001
@@ -259,29 +261,42 @@ def _read(text: str) -> tuple[str, str | None]:
         elif t.type == "html_block":
             regions.append(t.content)
     blocks = [t for t in tokens if t.level == 0 and not t.type.endswith("_close")]
-    body = blocks[0].content if len(blocks) == 1 and blocks[0].type == "fence" else None
+    body = blocks[0].content if len(blocks) == 1 and blocks[0].type in ("fence", "code_block") else None
     return "\n".join(regions), body
 
 
+def _as_call(obj: object) -> tuple[str, object] | None:
+    """``(name, arguments)`` when ``obj`` is a function-call object (see :func:`_json_calls`), else ``None``."""
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
+        obj = obj["function"]
+    name = obj.get("name")
+    if isinstance(name, str) and ("arguments" in obj or "parameters" in obj):
+        return name, obj.get("arguments", obj.get("parameters"))
+    return None
+
+
 def _json_call_names(text: str) -> list[str] | None:
-    """The tool names of ``text`` when ALL of it is one or more function-call JSON values, else ``None``.
+    """The tool names of ``text`` when ALL of it is one or more function-call JSON values, else ``None``."""
+    calls = _json_calls(text)
+    return [name for name, _ in calls] if calls else None
+
+
+def _json_calls(text: str) -> list[tuple[str, object]] | None:
+    """``(name, arguments)`` of each call when ALL of ``text`` is one or more function-call JSON values, else ``None``.
     A call is an object with a string ``name`` and an ``arguments`` or ``parameters`` key, or an OpenAI
     ``{"type": "function", "function": {...}}`` wrapper of one; a top-level JSON array of call objects counts too.
     Never raises: input the decoder cannot take (malformed, or nested past its recursion limit) is not a call."""
     decoder = json.JSONDecoder()
-    names: list[str] = []
+    calls: list[tuple[str, object]] = []
     idx, n = 0, len(text)
 
     def call(obj: object) -> bool:
-        if not isinstance(obj, dict):
-            return False
-        if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
-            obj = obj["function"]
-        name = obj.get("name")
-        if isinstance(name, str) and ("arguments" in obj or "parameters" in obj):
-            names.append(name)
-            return True
-        return False
+        c = _as_call(obj)
+        if c is not None:
+            calls.append(c)
+        return c is not None
 
     while idx < n:
         idx = _SPACE.match(text, idx).end()
@@ -294,7 +309,7 @@ def _json_call_names(text: str) -> list[str] | None:
         items = obj if isinstance(obj, list) and obj else [obj]
         if not all(call(x) for x in items):
             return None
-    return names or None
+    return calls or None
 
 
 def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]) -> bool:
@@ -303,10 +318,12 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     An open model's call that fails to parse upstream reaches levain as reply TEXT, and that call did not run.
     Three shapes are recognised. Two are markup found anywhere outside Markdown code (see :func:`_read`):
     GLM argument markup (a key tag beside a value tag), and a ``<tool_call>`` wrapper that opens a call or a
-    Qwen3-Coder ``<function=name>`` tag that opens one without it; markup
+    Qwen3-Coder ``<function=name>`` tag that opens one without it (or MiniMax's ``<invoke name=...>``, or a wrapper
+    around nothing but one of ``tool_names``); markup
     written in code is an answer, unless the reply is nothing but one fenced block, which is read as the call it
-    holds. The third is a reply that is entirely function-call JSON (bare, or as the whole of one fenced block)
-    naming only ``tool_names``, the entity's own tools; with none known, that shape is not flagged. A reply over
+    holds (an indented block likewise). The third is function-call JSON naming ``tool_names``, the entity's own tools:
+    all of the reply (bare, or the whole of one code block) when every call names one, or one such call among other
+    text outside code; with no tool names known, that shape is not flagged. A reply over
     :data:`MAX_CLASSIFIED_BYTES` is not parsed as Markdown: all of it is searched as if no part were code. It reads
     the shape only: the call is never repaired or run."""
     if not text:
@@ -317,10 +334,42 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
         prose, body = text, None
     else:
         prose, body = _read(text)
-    names = _json_call_names((body if body is not None else text).strip())
+    # No strip: it would copy a reply over the bound, and the JSON reader skips the space at either end itself.
+    names = _json_call_names(body if body is not None else text)
     if names and all(n in tool_names for n in names):
         return True
-    return any(p.search(region) for region in (prose, body) if region for p in _CALL_MARKUP)
+    regions = [r for r in (prose, body) if r]
+    return (
+        any(p.search(r) for r in regions for p in _CALL_MARKUP)
+        or any(m.group(1) in tool_names for r in regions for p in _NAMED_CALL_MARKUP for m in p.finditer(r))
+        or any(_embedded_call(r, tool_names) for r in regions)
+    )
+
+
+def _embedded_call(text: str, tool_names) -> bool:
+    """Whether ``text`` holds, among other text, a function-call JSON object naming one of ``tool_names`` (the head's
+    ruling, 2026-10-07: the notice is true then, and the text is still shown under it). Each attempt resumes where the
+    last one ended or failed, so nested or unterminated objects cost one pass, not one per brace; a call nested inside
+    another JSON value that decodes whole is therefore not looked for."""
+    decoder = json.JSONDecoder()
+    pos = 0
+    while (m := _JSON_CALL_START.search(text, pos)) is not None:
+        try:
+            obj, pos = decoder.raw_decode(text, m.start())
+        except json.JSONDecodeError as exc:
+            pos = max(exc.pos, m.start() + 1)
+            continue
+        except RecursionError:
+            # Nested past the decoder's limit, with no position to resume from: retrying at each inner brace would be
+            # quadratic, and nothing that deep is a call a model meant to make.
+            return False
+        except ValueError:
+            pos = m.start() + 1
+            continue
+        call = _as_call(obj)
+        if call is not None and call[0] in tool_names:
+            return True
+    return False
 
 
 def is_corrective_nudge(event) -> bool:
