@@ -21,6 +21,9 @@ START_MATCHER = "startup|resume|clear|compact"
 SETTINGS_REL = Path(".claude") / "settings.local.json"
 
 
+# Claude Code kills the edit hook after this many seconds (and then lets the edit through); hook.py budgets inside it.
+PRETOOLUSE_TIMEOUT = 30
+
 def command(python: str, event: str) -> str:
     return f"{shlex.quote(python)} -P -m {MARK} {event}"
 
@@ -57,7 +60,7 @@ def install(repo: Repo, python: str | None = None) -> list[str]:
     before = json.dumps(data, sort_keys=True)
     pre = _strip_ours(list(hooks.get("PreToolUse", [])))
     pre.append({"matcher": PRE_MATCHER,
-                "hooks": [{"type": "command", "command": command(python, "pretooluse"), "timeout": 30}]})
+                "hooks": [{"type": "command", "command": command(python, "pretooluse"), "timeout": PRETOOLUSE_TIMEOUT}]})
     start = _strip_ours(list(hooks.get("SessionStart", [])))
     start.append({"matcher": START_MATCHER,
                   "hooks": [{"type": "command", "command": command(python, "sessionstart"), "timeout": 60}]})

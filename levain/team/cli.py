@@ -208,7 +208,7 @@ def cmd_status(args) -> int:
     if devices:
         print("devices (attribution is by folder, authenticated by the git host's push permissions):")
         for d in devices:
-            when = "first sight" if d["first_sight"] else f"first seen {I.age(d['first_seen'])}"
+            when = "there when this clone joined" if d["first_sight"] else f"first seen {I.age(d['first_seen'])}"
             print(f"  {d['member']}: {d['device']} ({when}{', this clone' if d['own'] else ''})")
     pending = gl.unpushed()
     if pending:

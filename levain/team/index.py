@@ -204,6 +204,9 @@ class Ledger:
                 if str(e.get("pack", "")).split("@")[0] == pack and e.get("rule_id")}
 
 
+MAX_PROBLEMS = 1000
+
+
 def build(files: list[tuple[str, list[str]]], owner: str | None = None,
           problems: list[str] | None = None, *, tamper: list[str] | None = None) -> Ledger:
     """A ledger from (rel path under ledger/, lines) pairs. Callers split on "\\n" only:
@@ -239,7 +242,12 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         seen.add(e["id"])
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
-    return Ledger(uniq, problems, out_files, owner, list(tamper or []))
+    if len(problems) > MAX_PROBLEMS:     # every reader shows, caches and prints these: kept bounded, the rest counted
+        problems = problems[:MAX_PROBLEMS] + [f"and {len(problems) - MAX_PROBLEMS} more problems"]
+    tamper = list(tamper or [])
+    if len(tamper) > MAX_PROBLEMS:
+        tamper = tamper[:MAX_PROBLEMS] + [f"and {len(tamper) - MAX_PROBLEMS} more reasons"]
+    return Ledger(uniq, problems, out_files, owner, tamper)
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:

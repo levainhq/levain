@@ -18,9 +18,11 @@ extraction from shell is unreliable); that gap is documented, not hidden.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -31,7 +33,9 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
+from . import transport as T
 from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
+from .wire import PRETOOLUSE_TIMEOUT
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -158,20 +162,67 @@ def _wired_but_broken(gl: GitLedger) -> bool:
         return gl.base.is_dir()                       # git cannot answer; levain's own state says a ledger is here
 
 
+# Claude Code lets an edit through when a hook is killed at its timeout (wire.PRETOOLUSE_TIMEOUT), so a slow judgement
+# would be an allow. The whole judgement runs under ONE deadline well inside it; every git call and lock wait is clamped
+# to what is left (transport.deadline), and running out anywhere is a deny. _ALARM_AFTER is the backstop for time spent
+# outside git and locks: the process interrupts itself, which reaches the same boundary.
+_PRETOOLUSE_BUDGET = PRETOOLUSE_TIMEOUT - 10.0
+_ALARM_AFTER = PRETOOLUSE_TIMEOUT - 5.0
+
+
+class _OutOfTime(Exception):
+    pass
+
+
+def _alarm(_signum, _frame):
+    raise _OutOfTime("the ledger judgement ran out of time")
+
+
 def pretooluse(payload: dict) -> None:
-    """THE fail-closed boundary, and the only one: ANY exception while an edit is judged is a DENY when a repository
-    above the real path of the target (or of the session's cwd) holds levain team state, and silence otherwise. No
-    path inside handles its own failures."""
+    """THE fail-closed boundary, and the only one: ANY exception while an edit is judged, or a judgement that ran past
+    its one deadline, is a DENY when a repository above the real path of the target (or of the session's cwd) holds
+    levain team state, and silence otherwise. No path inside handles its own failures."""
+    answer: list[dict] = []
+    started = time.monotonic()
     try:
-        _pretooluse(payload)
+        with T.deadline(_PRETOOLUSE_BUDGET):
+            _pretooluse(payload, answer)
+            late = T.expired()
+        if late:
+            raise T.DeadlineExceeded("the ledger judgement ran out of time")
     except Exception as exc:  # noqa: BLE001 - the boundary
-        target = _target(payload) if isinstance(payload, dict) else None
-        places = [p for p in (target, payload.get("cwd") if isinstance(payload, dict) else None) if p]
-        if any(_ledger_roots(Path(p)) for p in places):
-            _out(_deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})"))
+        _disarm()
+        if any(_ledger_roots(Path(p)) for p in _places(payload)):
+            late = time.monotonic() - started >= _PRETOOLUSE_BUDGET or isinstance(exc, _OutOfTime)
+            why = "took too long" if late else \
+                f"could not be read ({type(exc).__name__}: {exc})"
+            _out(_deny(f"the team ledger judgement {why}; the edit is denied, never allowed late"))
+        return
+    _disarm()
+    for a in answer:
+        _out(a)
 
 
-def _pretooluse(payload: dict) -> None:
+def _disarm() -> None:
+    if hasattr(signal, "setitimer"):
+        with contextlib.suppress(ValueError, OSError):
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def _places(payload: dict) -> list[str]:
+    """The paths an edit is judged from: its target and the session's cwd, each only when it is a usable string."""
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd and os.path.isabs(cwd) else None
+    try:
+        target = _target({**payload, "cwd": cwd})
+    except (TypeError, ValueError, OSError):        # OSError: no cwd given and this process's own was deleted
+        target = None
+    return [p for p in (target, cwd) if p]
+
+
+def _pretooluse(payload: dict, answer: list[dict]) -> None:
+    """Judge the edit; the answer to print (if any) goes into ``answer``, printed by the boundary only when the
+    judgement finished inside its deadline."""
     if payload.get("tool_name") not in EDIT_TOOLS:
         return
     target = _target(payload)
@@ -180,7 +231,7 @@ def _pretooluse(payload: dict) -> None:
     # A path inside the ledger machinery is refused whether or not this clone has joined. It is checked BEFORE
     # repository discovery, which finds no working tree from inside .git (state.json, locks, sessions).
     if _in_ledger_machinery(target):
-        _out({"hookSpecificOutput": {
+        answer.append({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
             "permissionDecisionReason": (f"{TAG} {I.oneline(target)} is inside the team ledger's private machinery. The "
                                          "ledger is written only through `levain team record` (it validates, "
@@ -188,18 +239,19 @@ def _pretooluse(payload: dict) -> None:
         return
     # Every repository above the target that holds levain team state judges the edit, not only the one git finds
     # first: a `.git` planted in a subdirectory (a fake nested repository, or an unreadable one) must not take the
-    # edit out of the real clone's ledger. Any deny wins.
-    roots = list(dict.fromkeys(_ledger_roots(Path(target)) + _ledger_roots(Path(payload.get("cwd") or target))))
+    # edit out of the real clone's ledger. Any deny wins. (The session's cwd only widens the boundary's deny condition:
+    # an edit is judged where its target is.)
+    roots = _ledger_roots(Path(target))
     answers = []
     for start in roots or [Path(target)]:
         out = _judge_from(start, target, payload, has_ledger=bool(roots))
         if out and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
-            _out(out)
+            answer.append(out)
             return
         if out:
             answers.append(out)
     if answers:
-        _out(answers[0])
+        answer.append(answers[0])
 
 
 def _judge_from(start: Path, target: str, payload: dict, *, has_ledger: bool) -> dict | None:
@@ -290,7 +342,7 @@ def _edit_verdict(gl: GitLedger, repo: Repo, target: str, payload: dict, fetch_n
         if session and d.newly_denied:
             try:
                 gl.mark_denied(session, d.newly_denied)
-            except OSError as exc:
+            except (OSError, TeamError) as exc:          # TeamBusy included: the deny keeps its ruling text
                 # Not remembering the deny means the next attempt is denied again: never a reason to allow.
                 text += f"\n\n[team] could not record this denial ({I.oneline(str(exc))}); a retry will be denied again"
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -433,7 +485,11 @@ def sessionstart(payload: dict) -> None:
             fresh = calendar.timegm(time.strptime(d["first_seen"], "%Y-%m-%dT%H:%M:%SZ")) >= week   # UTC stamps
         except (ValueError, OverflowError):
             fresh = True
-        if fresh:
+        if fresh and d["member"].startswith("pack-"):
+            lines.append(f"[team] new pack file {I.oneline(d['member'])}/{I.oneline(d['device'])}, first seen "
+                         f"{I.oneline(d['first_seen'])}; pack rules are seeded by the team owner (`levain team "
+                         "pack-sync`)")
+        elif fresh:
             lines.append(f"[team] new device {I.oneline(d['device'])} under {I.oneline(d['member'])}, first seen "
                          f"{I.oneline(d['first_seen'])}; if {I.oneline(d['member'])} did not add it, the remote was "
                          "written by someone else")
@@ -472,6 +528,9 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             payload = {}
+        if event == "pretooluse" and hasattr(signal, "setitimer"):
+            signal.signal(signal.SIGALRM, _alarm)
+            signal.setitimer(signal.ITIMER_REAL, _ALARM_AFTER)
         (pretooluse if event == "pretooluse" else sessionstart)(payload)
     except Exception as exc:  # noqa: BLE001 - fail open, visibly
         _fail_open(name, f"{type(exc).__name__}: {exc}")
