@@ -78,9 +78,9 @@ def assert_trajectory_pure(predicted_trajectory: Any) -> None:
     bound. A descriptive-only (bound-less) trajectory passes (nothing to check). The compiler calls
     this so a binding whose monitor CANNOT evaluate its own envelope is refused, not minted with a
     silently-inert (always-diverging) monitor."""
-    if isinstance(predicted_trajectory, dict) and "bound" in predicted_trajectory \
+    if isinstance(predicted_trajectory, dict) and predicted_trajectory.get("bound") is not None \
             and not isinstance(predicted_trajectory["bound"], dict):
-        # A present but non-dict bound would read as "no bound" and leave the monitor inert while
+        # A present, non-None, non-dict bound would read as "no bound" and leave the monitor inert while
         # the configuration appears to ask for one. Refuse it rather than treat it as absent.
         raise KillImpurityError(
             f"predicted_trajectory 'bound' must be a predicate dict, got {type(predicted_trajectory['bound']).__name__}")

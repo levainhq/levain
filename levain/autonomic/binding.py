@@ -49,7 +49,7 @@ The load-bearing cuts (each one an apparatus finding made structural):
    what close the realistic in-scope (buggy-writer) resurrection paths.
 
 4. **The registry is MUTABLE standing state, not an append-only trace.** Bindings are created, paused,
-   graduated, demoted, revoked — so the store is the ``PendingActionStore`` shape (a JSON list,
+   graduated, demoted, revoked — so the store is the ``PendingActionStore`` shape (a mutable JSON file,
    sidecar-flock-serialized, atomic tmp+replace), NOT the append-only JSONL the receipt/proposal
    stores use. Revocation prefers ``set_status(REVOKED)`` (audit-preserving) over a hard ``remove``.
 
@@ -767,9 +767,19 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
 # --- the registry ------------------------------------------------------------------------
 
 
+def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads`` ``object_pairs_hook``: build the object, refusing a key that appears twice."""
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
 class BindingStore:
     """The delegated-authority registry — "the third kind of state" (standing governance: not memory
-    that accretes, not tasks that complete). A mutable JSON-list store, ``flock``-serialized + atomic
+    that accretes, not tasks that complete). A mutable JSON-object store keyed by ``binding_id``, ``flock``-serialized + atomic
     tmp+replace, the same shape as :class:`~levain.autonomic.pending.PendingActionStore` (bindings are
     created/paused/graduated/revoked, so NOT the append-only JSONL the receipt/proposal traces use).
     Every mutation is a locked read-modify-write; reads need no lock (atomic-replace means a read sees
@@ -804,17 +814,27 @@ class BindingStore:
                 os.close(fd)
 
     # --- raw IO (call under the lock for mutations) ------------------------------------
-    def _read_raw(self, *, for_mutation: bool = False, repair_id: str | None = None
-                  ) -> list[dict[str, Any]]:
-        """Load the JSON list; fail-soft on READS. A missing file → ``[]``; a corrupt file (bad JSON or
-        a non-list top level) → ``[]`` with a WARNING. Non-dict elements are pre-filtered (matching the
-        ``pending`` idiom); a dict that fails reconstruction is skipped loudly by :meth:`_load`.
+    def _read_raw(self, *, for_mutation: bool = False) -> list[dict[str, Any]]:
+        """Load the registry as a list of records (file order); fail-soft on READS, loud on MUTATIONS.
 
-        ``for_mutation=True`` (the read that opens a locked read-modify-write) RE-RAISES a transient
-        ``OSError`` instead of degrading to ``[]`` (L3 nemotron): a read that fails mid-mutation must
-        NOT proceed to ``_write_raw`` on an empty list — that would atomically REPLACE the file and
-        silently DELETE every other binding. Fail the mutation loud; the existing file is left intact.
-        (A genuinely missing file still reads ``[]`` — that is the first-write case, not a failure.)"""
+        The on-disk format is a JSON OBJECT keyed by ``binding_id``, parsed with a hook that refuses a
+        duplicate key at ANY depth, so two records for one id are UNREPRESENTABLE: there is no copy to
+        choose between, no merge, and no repair verb. (A duplicate key inside a record, e.g. ``status``
+        twice, is refused the same way, since last-wins parsing would hide the first value.) Every
+        entry must be a record whose own ``binding_id`` equals its key.
+
+        A legacy top-level LIST still reads, so a registry written before the object format is not
+        lost; it is rewritten as an object on its next write. A legacy list that holds two records
+        for one id is CORRUPT like any other ambiguous file. A record with no string ``binding_id``
+        cannot be keyed, so a legacy list holding one refuses writes (it still reads, and the record
+        is skipped loudly by :meth:`_load`).
+
+        CORRUPT (bad JSON, a duplicate key, a duplicated legacy id, a key/id mismatch, a non-record
+        entry, a top level that is neither object nor list): a READ returns ``[]`` with a WARNING, so
+        nothing in it fires; a MUTATION raises and leaves the file untouched. Repair is a manual edit
+        of the file. A missing file reads ``[]`` (the first-write case). A transient ``OSError`` is
+        re-raised on a mutation read (L3 nemotron): degrading to ``[]`` there would let the write
+        atomically REPLACE the file and silently delete every other binding."""
         try:
             text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -824,86 +844,62 @@ class BindingStore:
             if for_mutation:
                 raise
             return []
+
+        def corrupt(why: str) -> list[dict[str, Any]]:
+            _log.warning("binding store %s: %s%s", self.path, why,
+                         " — RE-RAISING (mutation)" if for_mutation else " — returning []")
+            if for_mutation:
+                raise ValueError(f"binding store {self.path}: {why}; refusing to write until the "
+                                 "file is repaired by hand")
+            return []
+
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
-            # On a MUTATION read, a corrupt file must NOT degrade to [] — that would let the
-            # read-modify-write atomically REPLACE the registry with a 1-record file, silently DELETING
-            # every other grant + revoked tombstone (codex-MED3). Fail the mutation loud; leave the
-            # file intact. (A plain READ still degrades to [] — a corrupt registry surfaces as "no
-            # bindings" to inspection, never a write.)
-            _log.warning("binding store: corrupt JSON (%s)%s", e,
-                         " — RE-RAISING (mutation)" if for_mutation else " — returning []")
-            if for_mutation:
-                raise
-            return []
-        if not isinstance(data, list):
-            _log.warning("binding store: top level is %s, not a list%s", type(data).__name__,
-                         " — RE-RAISING (mutation)" if for_mutation else " — returning []")
-            if for_mutation:
-                raise TypeError(f"binding store top level is {type(data).__name__}, not a list "
-                                "(refusing to mutate over a corrupt registry)")
-            return []
-        return self._collapse_duplicates([r for r in data if isinstance(r, dict)],
-                                         for_mutation=for_mutation, repair_id=repair_id)
-
-    @classmethod
-    def _collapse_duplicates(cls, records: list[dict[str, Any]], *, for_mutation: bool,
-                             repair_id: str | None = None) -> list[dict[str, Any]]:
-        """The store never presents two records for one ``binding_id``. Duplicates can only come from
-        an outside write (``add`` and ``replace_atomic`` dedup), so they are treated as corruption:
-
-          - a READ sees ONE record per id, inert-leaning: the base is the first copy that loads and
-            matches its seal (else the first that loads, else the first), with the MOST RESTRICTIVE
-            status across EVERY copy, and a status that does not parse counts as revoked. So a
-            REVOKED tombstone cannot be bypassed by an earlier ACTIVE or PAUSED copy, nor by being
-            malformed itself (reproduced 2026-10-06: ``ratify`` resurrected one);
-          - a MUTATION refuses (``ValueError``) while any id has duplicates, so no write ever
-            persists a choice between conflicting copies. The one exception is the repair verb:
-            ``add`` of the duplicated id itself, whose record is the INCOMING validated, seal-matching
-            binding (never a disk copy), with :meth:`_preserve_bookkeeping`'s most-restrictive status.
-
-        Earlier, choosing a merged winner and persisting it was beaten by review (a seal-broken or
-        unloadable copy, extension fields on the losing copy); refusing to write is the bounded form."""
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for r in records:
-            bid = r.get("binding_id")
-            if isinstance(bid, str):
-                groups.setdefault(bid, []).append(r)
-        dups = sorted(bid for bid, g in groups.items() if len(g) > 1)
-        if not dups or (for_mutation and dups == [repair_id]):
+            data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
+        except ValueError as e:   # JSONDecodeError or a duplicate key
+            return corrupt(f"unreadable registry ({e})")
+        if isinstance(data, dict):
+            records: list[dict[str, Any]] = []
+            for key, rec in data.items():
+                if not isinstance(rec, dict) or rec.get("binding_id") != key:
+                    return corrupt(f"entry {key!r} is not a record whose binding_id is its key")
+                records.append(rec)
             return records
-        if for_mutation and dups != [repair_id]:
-            raise ValueError(
-                f"binding store {len(dups)} id(s) have duplicate records ({', '.join(dups[:3])}); "
-                "refusing to write until the file is repaired")
-        _log.warning("binding store: duplicate records for %s; reading the most restrictive", dups)
-        out: list[dict[str, Any]] = []
-        done: set[str] = set()
-        for r in records:
-            bid = r.get("binding_id")
-            if not isinstance(bid, str) or len(groups[bid]) == 1:
-                out.append(r)
-                continue
-            if bid in done:
-                continue
-            done.add(bid)
-            group = groups[bid]
-            loaded = [(g, cls._load(g)) for g in group]
-            base = next((g for g, b in loaded if b is not None and b.seal_matches()), None) \
-                or next((g for g, b in loaded if b is not None), group[0])
-            merged = copy.deepcopy(base)
-            merged["status"] = max((_status_or_revoked(g.get("status")) for g in group),
-                                   key=lambda st: _STATUS_RESTRICTIVENESS.get(st, 0)).value
-            out.append(merged)
-        return out
+        if isinstance(data, list):
+            records = [r for r in data if isinstance(r, dict)]
+            seen: set[str] = set()
+            dups: set[str] = set()
+            for r in records:
+                bid = r.get("binding_id")
+                if isinstance(bid, str):
+                    (dups if bid in seen else seen).add(bid)
+            if dups:
+                return corrupt(f"legacy list holds duplicate records for {sorted(dups)}")
+            if for_mutation and len(seen) != len(records):
+                raise ValueError(f"binding store {self.path}: a legacy record has no string "
+                                 "binding_id, so the registry cannot be rewritten keyed by id; "
+                                 "repair the file by hand")
+            return records
+        _log.warning("binding store: top level is %s, not an object%s", type(data).__name__,
+                     " — RE-RAISING (mutation)" if for_mutation else " — returning []")
+        if for_mutation:
+            raise TypeError(f"binding store top level is {type(data).__name__}, not an object "
+                            "(refusing to mutate over a corrupt registry)")
+        return []
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
-        """Atomically replace the file with ``records`` (tmp + ``os.replace`` — never a torn read).
-        Call only under ``_locked``."""
+        """Atomically replace the file with ``records`` as a JSON object keyed by ``binding_id`` (tmp +
+        ``os.replace`` — never a torn read). Refuses a record without a string id or a second record
+        for one id, so no write can create the ambiguity the read refuses. Call only under ``_locked``."""
+        out: dict[str, dict[str, Any]] = {}
+        for r in records:
+            bid = r.get("binding_id")
+            if not isinstance(bid, str) or bid in out:
+                raise ValueError(f"binding store: refusing to write a record with binding_id {bid!r} "
+                                 "(missing, not a string, or duplicated)")
+            out[bid] = r
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
 
     @staticmethod
@@ -952,72 +948,62 @@ class BindingStore:
         records: list[dict[str, Any]], binding_id: str, record: dict[str, Any]
     ) -> dict[str, Any]:
         """Carry verb-owned bookkeeping (``status`` + ``graduation`` + ``guard_additions``) forward onto
-        ``record`` from any EXISTING same-id records, so a re-``add`` can neither resurrect a revoked
-        grant, wipe its evidence, nor strip a tightening. Only records that LOAD CLEANLY contribute
-        (L3 codex/complement/nemotron):
-          - status: the MOST-RESTRICTIVE valid status wins (a REVOKED/EXPIRED tombstone can never be
-            overridden by a duplicate ACTIVE — the resurrection-via-duplicate vector);
-          - graduation: the record with the most evidence (max ``fire_count``);
-          - guard_additions: the UNION, existing guards first, then any incoming guard not already
-            present (tightening is monotone: a stale writer re-adding the sealed grant it holds must
-            not erase a kill added since; reproduced 2026-10-06 at the fold).
-        A MALFORMED same-id record is IGNORED, not entombing-carried (carrying a bad ``status`` forward
-        would make the next read drop the binding — a silent data destructor); the caller drops all
-        same-id records, so the merged ``record`` is the single deduped survivor. If the collision is
-        ONLY with malformed records (no valid prior state), the incoming bookkeeping is used + logged."""
-        best_status: str | None = None
-        best_rank = -1
-        best_grad: dict[str, Any] | None = None
-        best_fires = -1
-        saw_same_id = False
-        saw_clean = False
-        carried_additions: list[dict[str, Any]] = []
-        for r in records:
-            if r.get("binding_id") != binding_id:
-                continue
-            saw_same_id = True
-            loaded = BindingStore._load(r)
-            if loaded is None:
-                continue
-            saw_clean = True
-            rank = _STATUS_RESTRICTIVENESS[loaded.status]
-            if rank > best_rank:
-                best_rank, best_status = rank, loaded.status.value
-            if loaded.graduation.fire_count > best_fires:
-                best_fires, best_grad = loaded.graduation.fire_count, loaded.graduation.to_dict()
-            carried_additions.extend(g.to_dict() for g in loaded.guard_additions)
-        if best_status is not None:
-            record["status"] = best_status
-        if carried_additions:
+        ``record`` from the EXISTING record for ``binding_id`` (at most one: the format cannot hold
+        two), so a re-``add`` can neither resurrect a revoked grant, wipe its evidence, nor strip a
+        tightening:
+          - status: the existing status wins (``set_status`` owns it, so a re-add never resets it);
+          - graduation: the existing evidence wins (``record_fire`` owns it), kept as stored so a
+            field this version does not know survives;
+          - guard_additions: the UNION, existing guards first (kept as stored, unknown fields
+            included), then any incoming guard not already present (tightening is monotone: a stale
+            writer re-adding the sealed grant it holds must not erase a kill added since).
+        An existing record that does not LOAD contributes nothing (carrying a bad ``status`` forward
+        would make the next read drop the binding); the incoming bookkeeping is used and logged. The
+        caller validates the RESULT, not only the incoming binding."""
+        existing = next((r for r in records if r.get("binding_id") == binding_id), None)
+        if existing is None:
+            return record
+        loaded = BindingStore._load(existing)
+        if loaded is None:
+            _log.warning("binding store: re-add of %r over a malformed record — using the incoming "
+                         "bookkeeping (no valid prior state to preserve)", binding_id)
+            return record
+        record["status"] = loaded.status.value
+        raw_grad = existing.get("graduation")
+        record["graduation"] = ({**raw_grad, **loaded.graduation.to_dict()}
+                                if isinstance(raw_grad, dict) else loaded.graduation.to_dict())
+        raw_adds = existing.get("guard_additions")
+        carried = list(raw_adds) if isinstance(raw_adds, list) else []
+        if carried:
             merged: list[dict[str, Any]] = []
             seen: set[str] = set()
-            for g in (*carried_additions, *record.get("guard_additions", [])):
-                key = json.dumps(g, sort_keys=True)
+            for g in (*carried, *record.get("guard_additions", [])):
+                # identity by the known fields, so a stored copy carrying an unknown field still
+                # matches the incoming copy of the same guard (it loaded, so every entry parses)
+                key = json.dumps(Guard.from_dict(g).to_dict(), sort_keys=True)
                 if key not in seen:
                     seen.add(key)
                     merged.append(g)
             record["guard_additions"] = merged
-        if best_grad is not None:
-            record["graduation"] = best_grad
-        if saw_same_id and not saw_clean:
-            _log.warning("binding store: re-add of %r collides ONLY with malformed record(s) — using "
-                         "the incoming bookkeeping (no valid prior state to preserve)", binding_id)
         return record
 
     # --- public API --------------------------------------------------------------------
     def add(self, binding: Binding) -> None:
         """Persist a binding. On a same-id collision the record is REPLACED but the on-disk ``status``
         + ``graduation`` + ``guard_additions`` are PRESERVED via :meth:`_preserve_bookkeeping`
-        (most-restrictive valid status + max evidence + the union of tightenings) — bookkeeping is owned by its governed verbs (``set_status`` / ``record_fire``),
-        never silently reset by ``add``. Closes: a stale re-add wiping graduation (L1-M3); the silent
-        un-revoke (re-``create`` of a revoked core → same id → default-ACTIVE → resurrection, L2-H1);
-        and a duplicate-ACTIVE overriding a REVOKED tombstone (L3). The binding's own seal must hold +
-        the injected validator (if any) must accept the predicate. Locked read-modify-write."""
-        self._validate(binding)
+        (existing status + existing evidence + the union of tightenings) — bookkeeping is owned by its
+        governed verbs (``set_status`` / ``record_fire``), never silently reset by ``add``. Closes: a
+        stale re-add wiping graduation (L1-M3) and the silent un-revoke (re-``create`` of a revoked
+        core → same id → default-ACTIVE → resurrection, L2-H1). ``add`` is not a repair verb: over a
+        registry holding duplicate ids it refuses like every other mutation. The binding's own seal
+        must hold and the injected validator (if any) must accept it, checked on the merged record
+        that will persist (it holds the whole incoming core plus the carried bookkeeping). Locked
+        read-modify-write."""
         record = binding.to_dict()
         with self._locked():
-            records = self._read_raw(for_mutation=True, repair_id=binding.binding_id)
+            records = self._read_raw(for_mutation=True)
             record = self._preserve_bookkeeping(records, binding.binding_id, record)
+            self._validate(Binding.from_dict(record))   # the record that will persist, not the input
             kept = [r for r in records if r.get("binding_id") != binding.binding_id]
             kept.append(record)
             self._write_raw(kept)
@@ -1052,7 +1038,6 @@ class BindingStore:
                 f"replace_atomic: old and new binding_id are identical ({old_binding_id!r}) — "
                 "re-ratification requires a different core (a no-op promotion is not a re-ratification)"
             )
-        self._validate(new_binding)
         record = new_binding.to_dict()
         with self._locked():
             records = self._read_raw(for_mutation=True)
@@ -1070,6 +1055,7 @@ class BindingStore:
                     return False
             incoming_status = record.get("status")
             record = self._preserve_bookkeeping(records, new_binding.binding_id, record)
+            self._validate(Binding.from_dict(record))   # the record that will persist, not the input
             if _STATUS_RESTRICTIVENESS.get(_status_or_revoked(record.get("status")), 0) > \
                     _STATUS_RESTRICTIVENESS.get(_status_or_revoked(incoming_status), 0):
                 # The new grant's id already exists as a more restrictive tombstone (re-ratifying back

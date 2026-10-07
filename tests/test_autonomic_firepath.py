@@ -270,7 +270,7 @@ def test_ratify_refuses_seal_broken(tmp_path):
     import json
     st, b = _mk_binding(tmp_path)
     raw = json.loads(st.path.read_text())
-    raw[0]["posture"] = "ABOVE_LOOP"          # tamper the sealed core, leave the id stale
+    next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core, leave the id stale
     st.path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="seal-broken"):
         st.ratify(b.binding_id)
@@ -299,7 +299,7 @@ def test_claim_one_shot_ignores_seal_broken(tmp_path):
     import json
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE, one_shot=True)
     raw = json.loads(st.path.read_text())
-    raw[0]["posture"] = "ABOVE_LOOP"
+    next(iter(raw.values()))["posture"] = "ABOVE_LOOP"
     st.path.write_text(json.dumps(raw))
     assert st.claim_one_shot(b.binding_id) is None                       # tampered → not claimable
 
@@ -497,7 +497,7 @@ def test_snapshot_if_fireable_unit(tmp_path):
     st.set_status(b.binding_id, BindingStatus.ACTIVE)
     import json
     raw = json.loads(st.path.read_text())
-    raw[0]["posture"] = "ABOVE_LOOP"                              # tamper the sealed core
+    next(iter(raw.values()))["posture"] = "ABOVE_LOOP"                              # tamper the sealed core
     st.path.write_text(json.dumps(raw))
     assert st.snapshot_if_fireable(b.binding_id) is None          # seal-broken → not fireable
     assert st.snapshot_if_fireable("bind-absent") is None
@@ -548,7 +548,7 @@ def test_ratify_refuses_seal_broken_even_when_already_active(tmp_path):
     import json
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE)
     raw = json.loads(st.path.read_text())
-    raw[0]["posture"] = "ABOVE_LOOP"          # tamper the sealed core of an ACTIVE binding
+    next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core of an ACTIVE binding
     st.path.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="seal-broken"):
         st.ratify(b.binding_id)

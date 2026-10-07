@@ -431,7 +431,7 @@ def test_list_active_excludes_seal_mismatched_binding(tmp_path, caplog):
     b = make_binding()
     s.add(b)
     raw = json.loads(s.path.read_text())
-    raw[0]["posture"] = "ON_LOOP"              # tamper on disk, leave binding_id stale
+    next(iter(raw.values()))["posture"] = "ON_LOOP"              # tamper on disk, leave binding_id stale
     s.path.write_text(json.dumps(raw))
     with caplog.at_level("WARNING"):
         assert s.list_active() == []           # fail-closed: tampered grant cannot fire
@@ -486,15 +486,31 @@ def test_corrupt_json_reads_empty(tmp_path, caplog):
     s.path.write_text("{not json")
     with caplog.at_level("WARNING"):
         assert s.list_all() == []
-    assert "corrupt JSON" in caplog.text
+    assert "unreadable registry" in caplog.text
 
 
-def test_non_list_top_level_reads_empty(tmp_path, caplog):
+def test_non_object_top_level_reads_empty(tmp_path, caplog):
     s = store(tmp_path)
-    s.path.write_text('{"binding_id": "x"}')
+    s.path.write_text('"x"')
     with caplog.at_level("WARNING"):
         assert s.list_all() == []
-    assert "not a list" in caplog.text
+    assert "not an object" in caplog.text
+
+
+def test_an_entry_whose_id_is_not_its_key_reads_empty_and_refuses_writes(tmp_path, caplog):
+    # a key/id mismatch would let two keys carry one binding_id: the duplicate by another route
+    s = store(tmp_path)
+    b = make_binding()
+    s.add(b)
+    rec = json.loads(s.path.read_text())[b.binding_id]
+    s.path.write_text(json.dumps({b.binding_id: rec, "other-key": rec}))
+    with caplog.at_level("WARNING"):
+        assert s.list_all() == []
+    assert "binding_id is its key" in caplog.text
+    before = s.path.read_text()
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.set_status(b.binding_id, BindingStatus.PAUSED)
+    assert s.path.read_text() == before
 
 
 def test_malformed_record_is_skipped_loudly(tmp_path, caplog):
@@ -502,7 +518,7 @@ def test_malformed_record_is_skipped_loudly(tmp_path, caplog):
     good = make_binding()
     s.add(good)
     raw = json.loads(s.path.read_text())
-    raw.append({"binding_id": "bind-bad", "posture": "NONSENSE"})  # malformed
+    raw["bind-bad"] = {"binding_id": "bind-bad", "posture": "NONSENSE"}  # malformed
     s.path.write_text(json.dumps(raw))
     with caplog.at_level("WARNING"):
         listed = s.list_all()
@@ -565,26 +581,48 @@ def test_record_fire_rejects_truthy_string_clean_and_empty_fired_at(tmp_path):
         s.record_fire(b.binding_id, clean=True, fired_at="")
 
 
-# --- bookkeeping-preserve: most-restrictive valid wins / malformed ignored (codex-M2/cmpl/nemo) ---
+# --- duplicates are unrepresentable; re-add over a malformed record (codex-M2/cmpl/nemo) ---
 
-def test_duplicate_active_cannot_override_a_revoked_tombstone(tmp_path):
+def test_duplicate_key_file_reads_inert_and_add_cannot_repair_it(tmp_path, caplog):
+    # A duplicated id used to collapse on read and ``add`` of that id used to repair it (S1h r2:
+    # the repair resurrected a grant whose revoked copy was malformed). Now the file is corrupt:
+    # nothing in it reads, and no mutation, ``add`` included, writes over it.
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
-    rec = json.loads(s.path.read_text())[0]
-    s.path.write_text(json.dumps([dict(rec, status="active"), dict(rec, status="revoked")]))
-    s.add(make_binding())                          # re-add the same core
-    got = s.get(b.binding_id)
-    assert got is not None and got.status is BindingStatus.REVOKED  # most-restrictive valid wins
-    assert len(s.list_all()) == 1                  # duplicates collapsed
+    rec = json.dumps(json.loads(s.path.read_text())[b.binding_id])
+    s.path.write_text("{" + f'"{b.binding_id}": {rec.replace("active", "revoked")}, '
+                      f'"{b.binding_id}": {rec}' + "}")
+    before = s.path.read_text()
+    with caplog.at_level("WARNING"):
+        assert s.list_all() == [] and s.list_active() == [] and s.get(b.binding_id) is None
+    assert "duplicate key" in caplog.text
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.add(make_binding())                      # re-add the same core: not a repair verb
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.add(make_binding(posture=Posture.ON_LOOP))   # nor is an unrelated add
+    assert s.path.read_text() == before            # untouched
+
+
+def test_a_duplicate_key_inside_a_record_is_refused(tmp_path):
+    # last-wins parsing would hide the first "status"; the hook refuses it at every depth
+    s = store(tmp_path)
+    b = make_binding()
+    s.add(b)
+    text = s.path.read_text().replace('"status": "active"', '"status": "revoked", "status": "active"')
+    assert text != s.path.read_text()
+    s.path.write_text(text)
+    assert s.list_active() == []
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.ratify(b.binding_id)
 
 
 def test_re_add_over_only_malformed_record_uses_incoming_not_entomb(tmp_path, caplog):
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
-    rec = json.loads(s.path.read_text())[0]
-    s.path.write_text(json.dumps([dict(rec, status="frozen")]))   # malformed status, same id
+    rec = json.loads(s.path.read_text())[b.binding_id]
+    s.path.write_text(json.dumps({b.binding_id: dict(rec, status="frozen")}))   # malformed status
     with caplog.at_level("WARNING"):
         s.add(make_binding())
     got = s.get(b.binding_id)

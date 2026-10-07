@@ -136,7 +136,7 @@ def test_governed_lifecycle_over_a_real_store(tmp_path):
     # a disk tamper of the promoted grant's core bars it (fail-closed), leaving an EMPTY fire-set
     import json
     raw = json.loads(store.path.read_text())
-    for rec in raw:
+    for rec in raw.values():
         if rec["binding_id"] == promoted.binding_id:
             rec["posture"] = "ABOVE_LOOP"     # widen autonomy without re-ratifying
     store.path.write_text(json.dumps(raw))
