@@ -5,6 +5,14 @@
 it: a registry of live sessions, the propose→job→poll runtime that drives their turns off the
 request thread, and the state machine that says which operations a session accepts right now.
 
+**The host talks to a** :class:`~levain.chat_driver.HarnessDriver`, **never to a harness.** Each session
+holds one driver, made by entity name (:class:`~levain.chat_driver.OpenHandsDriver` is today's
+:class:`~levain.session.EntitySession` loop behind the contract). The job runtime, the
+session cap, the deadline watcher and the decision id and digest an approval binds to stay here, because
+they are the same whatever the harness is; how a session is opened, how a turn is sent and how the
+harness's own consent surfaces are the driver's. Every outcome is checked against the contract before it
+is recorded (:func:`~levain.chat_driver.check_outcome`).
+
 **The client never supplies an agent, a tool spec, a model or a mode.** It names an entity the
 OPERATOR registered at startup, and it sends message text. Everything that shapes the agent comes
 from the operator's command line and from :meth:`EntitySession.open`, which builds the agent itself
@@ -97,6 +105,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
+from levain.chat_driver import (
+    DriverContractError,
+    DriverEvent,
+    HarnessDriver,
+    OpenHandsDriver,
+    check_outcome,
+)
 from levain.firing.gate import shown_in_full
 
 if TYPE_CHECKING:
@@ -220,10 +235,16 @@ class _Session:
     pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
     held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
     last_job_id: str | None = None   # the most recent job that STARTED on this session, for a page that lost it
-    session: Any = None          # the EntitySession once open; None before and after
+    driver: HarnessDriver | None = None   # the conversation's driver once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
     info: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def session(self) -> Any:
+        """The harness's own session object (an EntitySession for OpenHands), for tests and the
+        floor check. The host itself only ever talks to :attr:`driver`."""
+        return self.driver.native if self.driver is not None else None
 
 
 def _turn_payload(result: Any) -> dict[str, Any]:
@@ -321,7 +342,10 @@ class ChatHost:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         turn_seconds: float | None = DEFAULT_TURN_SECONDS,
         session_factory: Callable[..., Any] | None = None,
+        driver_factory: Callable[[str, Path], HarnessDriver] | None = None,
     ) -> None:
+        if session_factory is not None and driver_factory is not None:
+            raise ValueError("pass a session_factory or a driver_factory, not both")
         if not entities:
             raise ValueError("a chat host needs at least one entity")
         if max_sessions < 1:
@@ -336,9 +360,13 @@ class ChatHost:
                 "turn_seconds must be a finite number of seconds above 0 and at most "
                 f"{threading.TIMEOUT_MAX:.0f}, or None")
         self._entities = {name: Path(p) for name, p in entities.items()}
-        self._factory = session_factory or _default_factory(
+        opener = session_factory or _default_factory(
             model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations
         )
+        # One driver per (entity, conversation), made by entity name. The default is OpenHands for every
+        # entity; a constellation of mixed harnesses supplies its own mapping here.
+        self._driver_factory: Callable[[str, Path], HarnessDriver] = driver_factory or (
+            lambda name, entity_dir: OpenHandsDriver(entity_dir, opener))
         self._model = model
         self._max_sessions = max_sessions
         self._turn_seconds = turn_seconds
@@ -440,12 +468,12 @@ class ChatHost:
             raise ChatError("bad_message", "message must be a non-empty string", 400)
         if len(message) > MAX_MESSAGE_CHARS:
             raise ChatError("too_large", f"message exceeds {MAX_MESSAGE_CHARS} characters", 413)
-        return self._start(session_id, "turn", ("idle",), lambda s: s.run_turn(message))
+        return self._start(session_id, "turn", ("idle",), lambda d: d.send_turn(message))
 
     def approve(self, session_id: Any, expect: Any = None) -> dict[str, Any]:
         """Run the held actions. ``expect`` (the current decision id) is REQUIRED: an approval is bound to
         the set the operator was shown, for every caller, API included (Phill 2026-10-05)."""
-        return self._start(session_id, "approve", ("gated",), lambda s: s.resume_turn(), expect=expect,
+        return self._start(session_id, "approve", ("gated",), lambda d: d.approve(), expect=expect,
                            require_expect=True)
 
     def reject(self, session_id: Any, reason: Any = None, expect: Any = None) -> dict[str, Any]:
@@ -453,7 +481,7 @@ class ChatHost:
             reason = "the operator declined this action"
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
             raise ChatError("bad_reason", "reason must be a non-empty string under 2000 chars", 400)
-        return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason), expect=expect)
+        return self._start(session_id, "reject", ("gated",), lambda d: d.reject(reason), expect=expect)
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
@@ -464,7 +492,7 @@ class ChatHost:
             if rec.state in ("opening", "busy", "closing"):
                 raise ChatError(
                     "busy", f"the session is {rec.state}; close it when that finishes", 409)
-            session, rec.session = rec.session, None
+            session, rec.driver = rec.driver, None
             if session is None:
                 if rec.state != "failed":
                     rec.state = "closed"
@@ -486,9 +514,9 @@ class ChatHost:
             self._shut = True
             to_close = []
             for rec in self._sessions.values():
-                if rec.state not in ("opening", "busy", "closing") and rec.session is not None:
-                    to_close.append((rec, rec.session))
-                    rec.session = None
+                if rec.state not in ("opening", "busy", "closing") and rec.driver is not None:
+                    to_close.append((rec, rec.driver))
+                    rec.driver = None
                     rec.state = "closing"
         for rec, s in to_close:
             try:
@@ -549,7 +577,7 @@ class ChatHost:
                     job.status, job.error = "failed", text
                 if rec.job_id == job.job_id:
                     rec.job_id = None
-                    to_close, rec.session = rec.session, None
+                    to_close, rec.driver = rec.driver, None
                     rec.error = text
                     # Still counted while its shell is released (L2 review: publishing the ended
                     # state first let an open exceed the cap during the teardown).
@@ -611,7 +639,7 @@ class ChatHost:
                 # The approval binds to the held calls' bytes, not only to the halt: the digest recorded with
                 # the screen's set must equal the digest of what the next run() would execute, read now. The
                 # session is gated (no job drives it), so nothing can change between this read and the run.
-                live = rec.session.held_digest() if rec.session is not None else None
+                live = rec.driver.held_digest() if rec.driver is not None else None
                 if rec.held_digest is None or live is None or live != rec.held_digest:
                     # Spent, never re-armed: no screen holds a set that matches, so this halt is reject-only.
                     rec.decision_id = None
@@ -633,7 +661,7 @@ class ChatHost:
                 # Started BEFORE the worker, so a worker never runs without its bound: if the
                 # watcher cannot start, nothing has run yet and the job is refused.
                 watcher = threading.Thread(
-                    target=self._watch, args=(job, rec.session, done), daemon=True,
+                    target=self._watch, args=(job, rec.driver, done), daemon=True,
                     name="levain-chat-deadline")
                 try:
                     watcher.start()
@@ -653,7 +681,7 @@ class ChatHost:
                 raise ChatError("busy", "could not start a worker; try again", 503)
         return {"session_id": rec.session_id, "job_id": job.job_id, "state": "busy"}
 
-    def _watch(self, job: _Job, session: Any, done: threading.Event) -> None:
+    def _watch(self, job: _Job, driver: HarnessDriver | None, done: threading.Event) -> None:
         """A job's wall-clock bound: at the deadline, mark it and ask the session to stop until the
         job returns. The stop request is repeated because one that lands before the SDK's run loop
         starts is undone by it (:meth:`EntitySession.request_stop`)."""
@@ -671,7 +699,8 @@ class ChatHost:
                      job.kind, job.job_id, self._turn_seconds)
         while True:
             try:
-                session.request_stop()
+                assert driver is not None
+                driver.interrupt()
             except Exception as exc:  # noqa: BLE001 — keep asking; a dead watcher is no bound
                 _log.error("chat job %s: stop request failed: %s", job.job_id, exc)
             if done.wait(1.0):
@@ -679,9 +708,17 @@ class ChatHost:
 
     def _run_open(self, rec: _Session, job: _Job) -> None:
         error: str | None = None
-        session: Any = None
+        driver: HarnessDriver | None = None
         try:
-            session = self._factory(self._entities[rec.entity], on_event=self._route_events(rec))
+            driver = self._driver_factory(rec.entity, self._entities[rec.entity])
+            if driver.caps.approval_timing != "after_turn":
+                # Reserved in the contract, not driven here: an in-turn consent request needs the approval
+                # state machine (chat_driver module docstring, slice S10). A driver that is never opened
+                # holds nothing to release.
+                raise DriverContractError(
+                    f"{driver.harness}: this host drives only after-turn consent; "
+                    f"{driver.caps.approval_timing!r} needs the approval state machine, which is not built")
+            driver.open(self._route_events(rec))
         except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
             error = str(exc) or type(exc).__name__
         # `exc` is unbound here (Python deletes it at the end of the except clause), so nothing in
@@ -700,25 +737,31 @@ class ChatHost:
                 job.status, job.error = "failed", error
                 rec.job_id = None
             elif accepted:
-                rec.session = session
+                assert driver is not None
+                rec.driver = driver
                 rec.state = "idle"
-                rec.info = self._describe(session)
+                rec.info = driver.describe()
                 rec.job_id = None
                 job.status, job.result = "done", {"session": self._session_view(rec)}
             # else: shut while opening. shutdown() skipped this record (it was opening), so the
             # worker closes it, and the record keeps reading "opening" (counted, job running)
             # until the shell is released below.
         if error is None and not accepted:
-            session.close()
+            assert driver is not None
+            driver.close()
             with self._lock:
                 rec.state, rec.job_id = "closed", None
                 job.status, job.error = "failed", "the server shut down while the session opened"
 
-    def _route_events(self, rec: _Session) -> Callable[[str], None]:
-        """The session's ``on_event`` sink. Bound once at open, it forwards each tool-activity line
-        to whichever job is driving the session at that moment, so streaming works for every turn."""
+    def _route_events(self, rec: _Session) -> Callable[[DriverEvent], None]:
+        """The driver's event sink. Bound once at open, it forwards each tool-activity line
+        to whichever job is driving the session at that moment, so streaming works for every turn.
+        A kind of event this host does not know is ignored (the contract says a consumer must)."""
 
-        def _emit(line: str) -> None:
+        def _emit(event: DriverEvent) -> None:
+            if event.kind != "activity":
+                return
+            line = event.text
             with self._lock:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
                 if job is None or job.status != "running":
@@ -744,7 +787,10 @@ class ChatHost:
         cut = 0
         try:
             try:
-                result = call(rec.session)
+                driver = rec.driver
+                assert driver is not None
+                result = call(driver)
+                check_outcome(driver, result)
                 payload = _turn_payload(result)
                 digest = getattr(result, "held_digest", None)
                 cut = max(0, len(result.tool_activity) - MAX_ACTIVITY_LINES)
@@ -759,10 +805,10 @@ class ChatHost:
             if watcher.is_alive() and error is None:
                 payload, error = None, "the turn's deadline watcher did not exit"
         broken = payload is None or payload["error"] is not None
-        if broken and rec.session is not None:
+        if broken and rec.driver is not None:
             # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
             # so the cap can never be exceeded by a teardown still in progress (codex L3 r1).
-            dead, rec.session = rec.session, None
+            dead, rec.driver = rec.driver, None
             dead.close()
         to_close: Any = None
         with self._lock:
@@ -790,7 +836,7 @@ class ChatHost:
                 else:
                     rec.state = "idle"
             if rec.state == "broken" or self._shut:
-                to_close, rec.session = rec.session, None
+                to_close, rec.driver = rec.driver, None
                 if self._shut and to_close is not None:
                     rec.state = "closing"     # counted until the shell is released, below
                 elif self._shut:
@@ -803,21 +849,6 @@ class ChatHost:
                 if self._shut:
                     with self._lock:
                         rec.state = "closed"
-
-    @staticmethod
-    def _describe(session: Any) -> dict[str, Any]:
-        """What the operator's banner would say about this session's floor, from the session's own
-        resolved fields (never a second resolution)."""
-        out: dict[str, Any] = {}
-        for name in ("label", "model_label", "gate_mode", "bash_ok", "deny_standard_creds",
-                     "bash_offline", "ssh_mode"):
-            value = getattr(session, name, None)
-            if isinstance(value, (str, bool)):
-                out[name] = value
-        workspace = getattr(session, "workspace", None)
-        if workspace is not None:
-            out["workspace"] = str(workspace)
-        return out
 
     @staticmethod
     def _session_view(rec: _Session) -> dict[str, Any]:
