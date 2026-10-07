@@ -432,7 +432,7 @@ def test_a_legacy_list_without_duplicates_reads_and_converts_on_next_write(tmp_p
     store.add(a)
     store.add(b)
     recs = _raw(store)
-    _write_legacy(store, recs + ["not-a-record"])     # legacy: non-record elements were filtered
+    _write_legacy(store, recs)
     assert isinstance(json.loads(store.path.read_text()), list)
     assert {x.binding_id for x in store.list_all()} == {a.binding_id, b.binding_id}
     assert [x.binding_id for x in store.list_active()] == [b.binding_id]
@@ -443,14 +443,16 @@ def test_a_legacy_list_without_duplicates_reads_and_converts_on_next_write(tmp_p
     assert {x.binding_id for x in store.list_active()} == {a.binding_id, b.binding_id}
 
 
-def test_a_legacy_record_without_an_id_refuses_conversion(tmp_path):
+@pytest.mark.parametrize("extra", [{"posture": "CONFIRM"}, "not-a-record", 5, None])
+def test_a_legacy_entry_that_cannot_be_keyed_refuses_conversion(tmp_path, extra):
+    # converting would drop it from disk (L1+L2, S1h-2: a non-record entry was dropped silently)
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
-    _write_legacy(store, _raw(store) + [{"posture": "CONFIRM"}])
+    _write_legacy(store, _raw(store) + [extra])
     before = store.path.read_text()
     assert [x.binding_id for x in store.list_active()] == [b.binding_id]   # still reads
-    with pytest.raises(ValueError, match="no string binding_id"):
+    with pytest.raises(ValueError, match="cannot be rewritten keyed by id"):
         store.set_status(b.binding_id, BindingStatus.PAUSED)
     assert store.path.read_text() == before
 
@@ -902,3 +904,40 @@ def test_a_null_trajectory_bound_is_descriptive_not_impure():
     assert_trajectory_pure({"summary": "x", "bound": None})      # None = no bound: passes
     with pytest.raises(KillImpurityError):
         assert_trajectory_pure({"summary": "x", "bound": "field == 1"})
+
+
+
+def _malformed_revoked(store, binding):
+    recs = {r["binding_id"]: r for r in _raw(store)}
+    recs[binding.binding_id] = dict(recs[binding.binding_id], status="revoked", goal="not-a-goal")
+    _write(store, list(recs.values()))
+
+
+def test_add_cannot_revive_a_single_malformed_revoked_record(tmp_path):
+    # L1+L2 S1h-2, reproduced on fb93c3b: the class of S1h r2 (a) without a duplicate. A revoked
+    # grant whose one record is malformed reads inert; a re-add wrote it back ACTIVE and fireable.
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    store.set_status(b.binding_id, BindingStatus.REVOKED)
+    _malformed_revoked(store, b)
+    before = store.path.read_text()
+    assert store.list_active() == []
+    with pytest.raises(ValueError, match="malformed"):
+        store.add(b)
+    assert store.path.read_text() == before and store.list_active() == []
+
+
+def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    old = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    store.add(old)
+    store.add(new)
+    store.set_status(new.binding_id, BindingStatus.REVOKED)
+    _malformed_revoked(store, new)
+    before = store.path.read_text()
+    with pytest.raises(ValueError, match="malformed"):
+        store.replace_atomic(old.binding_id, new)
+    assert store.path.read_text() == before
+    assert [x.binding_id for x in store.list_active()] == [old.binding_id]

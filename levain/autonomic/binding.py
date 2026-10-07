@@ -825,12 +825,12 @@ class BindingStore:
 
         A legacy top-level LIST still reads, so a registry written before the object format is not
         lost; it is rewritten as an object on its next write. A legacy list that holds two records
-        for one id is CORRUPT like any other ambiguous file. A record with no string ``binding_id``
-        cannot be keyed, so a legacy list holding one refuses writes (it still reads, and the record
-        is skipped loudly by :meth:`_load`).
+        for one id is CORRUPT like any other ambiguous file. An entry that is not a record with a string
+        ``binding_id`` cannot be keyed, so a legacy list holding one refuses writes (it still reads:
+        a non-record entry is skipped, a record without an id is skipped loudly by :meth:`_load`).
 
         CORRUPT (bad JSON, a duplicate key, a duplicated legacy id, a key/id mismatch, a non-record
-        entry, a top level that is neither object nor list): a READ returns ``[]`` with a WARNING, so
+        entry in the object, a top level that is neither object nor list): a READ returns ``[]`` with a WARNING, so
         nothing in it fires; a MUTATION raises and leaves the file untouched. Repair is a manual edit
         of the file. A missing file reads ``[]`` (the first-write case). A transient ``OSError`` is
         re-raised on a mutation read (L3 nemotron): degrading to ``[]`` there would let the write
@@ -855,7 +855,7 @@ class BindingStore:
 
         try:
             data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
-        except ValueError as e:   # JSONDecodeError or a duplicate key
+        except (ValueError, RecursionError) as e:   # bad JSON, a duplicate key, or nesting too deep
             return corrupt(f"unreadable registry ({e})")
         if isinstance(data, dict):
             records: list[dict[str, Any]] = []
@@ -874,17 +874,12 @@ class BindingStore:
                     (dups if bid in seen else seen).add(bid)
             if dups:
                 return corrupt(f"legacy list holds duplicate records for {sorted(dups)}")
-            if for_mutation and len(seen) != len(records):
-                raise ValueError(f"binding store {self.path}: a legacy record has no string "
-                                 "binding_id, so the registry cannot be rewritten keyed by id; "
-                                 "repair the file by hand")
+            if for_mutation and len(seen) != len(data):
+                raise ValueError(f"binding store {self.path}: a legacy entry is not a record with a "
+                                 "string binding_id, so the registry cannot be rewritten keyed by id "
+                                 "without losing it; repair the file by hand")
             return records
-        _log.warning("binding store: top level is %s, not an object%s", type(data).__name__,
-                     " — RE-RAISING (mutation)" if for_mutation else " — returning []")
-        if for_mutation:
-            raise TypeError(f"binding store top level is {type(data).__name__}, not an object "
-                            "(refusing to mutate over a corrupt registry)")
-        return []
+        return corrupt(f"top level is {type(data).__name__}, not an object")
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
         """Atomically replace the file with ``records`` as a JSON object keyed by ``binding_id`` (tmp +
@@ -908,7 +903,7 @@ class BindingStore:
         skip-loudly path for all read methods."""
         try:
             return Binding.from_dict(rec)
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
             _log.warning("binding store: skipping malformed record (%s: %s)", type(e).__name__, e)
             return None
 
@@ -957,17 +952,18 @@ class BindingStore:
           - guard_additions: the UNION, existing guards first (kept as stored, unknown fields
             included), then any incoming guard not already present (tightening is monotone: a stale
             writer re-adding the sealed grant it holds must not erase a kill added since).
-        An existing record that does not LOAD contributes nothing (carrying a bad ``status`` forward
-        would make the next read drop the binding); the incoming bookkeeping is used and logged. The
-        caller validates the RESULT, not only the incoming binding."""
+        An existing record that does not LOAD RAISES ``ValueError``: its status cannot be read, so
+        it may be a revoked tombstone, and neither its bookkeeping nor the incoming one can be
+        trusted over it. Repair is manual. The caller validates the RESULT, not the incoming binding."""
         existing = next((r for r in records if r.get("binding_id") == binding_id), None)
         if existing is None:
             return record
         loaded = BindingStore._load(existing)
         if loaded is None:
-            _log.warning("binding store: re-add of %r over a malformed record — using the incoming "
-                         "bookkeeping (no valid prior state to preserve)", binding_id)
-            return record
+            # its status cannot be read, so it may be a revoked tombstone: writing the incoming
+            # bookkeeping over it could revive the grant (L1, S1h-2). Refuse like any corrupt file.
+            raise ValueError(f"binding store: the stored record for {binding_id!r} is malformed; "
+                             "refusing to write over it until it is repaired by hand")
         record["status"] = loaded.status.value
         raw_grad = existing.get("graduation")
         record["graduation"] = ({**raw_grad, **loaded.graduation.to_dict()}
