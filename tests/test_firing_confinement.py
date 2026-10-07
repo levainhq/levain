@@ -3425,6 +3425,18 @@ def test_the_rendered_seatbelt_profile_never_contains_a_syscall_rule(tmp_path, d
     assert "syscall-number" not in text
 
 
+@pytest.mark.parametrize("deny_creds", [False, True])
+@pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
+def test_the_rendered_seatbelt_profile_denies_other_processes_procargs(tmp_path, deny_creds, ssh_mode) -> None:
+    # KERN_PROCARGS2 hands a confined bash the argv and environment of every same-uid process
+    # (measured 2026-10-07). The deny is a sysctl NAME filter and must be exactly this rule, once,
+    # in every configuration; text only, no sandbox is started.
+    policy = build_policy(_entity(tmp_path), ssh_mode=ssh_mode, deny_standard_creds=deny_creds)
+    text = SeatbeltProvider().render_profile(policy)
+    rule = '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))'
+    assert [ln for ln in text.splitlines() if "sysctl" in ln and not ln.startswith(";;")] == [rule]
+
+
 def test_readme_names_every_store_the_cred_floor_denies() -> None:
     # The README lists the stores by hand for a reader deciding whether to set
     # deny_standard_creds; a store the floor gains must reach that list.
