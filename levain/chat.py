@@ -98,8 +98,10 @@ conversation's close fails: :meth:`EntitySession.close` never raises, and record
 **A release reported with no close in flight means the conversation ENDED on its own** (a harness that
 died, a process that exited; ruled 2026-10-07). The host detaches the driver and settles the session at
 once: ``broken`` with "the harness ended on its own" (slot freed), or ``release_failed`` when the report
-says something may still be live. A job in flight keeps the outcome of the call it is in, and the session
-takes no further turn; an open in flight fails; an approve reading the digest runs nothing.
+says something may still be live (a later ``None`` report frees it). From the report on, nothing more reaches
+the harness: a call already running keeps its own outcome, and every call queued or made later is answered
+with the end at once, so a job in flight fails or keeps its running call's outcome and the session takes no
+further turn; an open in flight fails; an approve reading the digest runs nothing.
 
 **No host thread runs driver code, and none waits on it without a deadline** (ruled 2026-10-07). The host
 holds a driver only as a :class:`_DriverProxy`, which exposes none of the driver's methods. Every
@@ -470,26 +472,33 @@ class _Lane:
         self._stuck: _Pending | None = None     # the call past its deadline that has not returned
         self._running_box: _Pending | None = None
         self._retired = False
+        self._ended: str | None = None          # why the conversation ended, once it has (end())
         self._thread = threading.Thread(target=self._run, daemon=True, name=name)
 
     def start(self) -> None:
         self._thread.start()
 
     def submit(self, what: str, fn: Callable[[], DriverCall],
-               on_done: Callable[[DriverCall], None] | None = None) -> "_Pending | DriverCall":
+               on_done: Callable[[DriverCall], None] | None = None,
+               on_late: Callable[[DriverCall], None] | None = None) -> "_Pending | DriverCall":
         with self._cond:
+            if self._ended is not None:
+                return DriverCall(False, None, f"DriverEnded: {self._ended}", self._ended)
             if self._retired:
                 return DriverCall(False, None, f"DriverClosed: {what}: the driver is closed", "the driver is closed")
             if self._stuck is not None:
                 text = f"{what}: an earlier call ({self._stuck.what}) has not returned"
                 return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True)
-            box = _Pending(on_done, what)
+            box = _Pending(on_done, what, on_late=on_late)
             self._queue.append((what, fn, box))
             self._cond.notify_all()
             return box
 
-    def call(self, what: str, fn: Callable[[], DriverCall], timeout: float | None) -> DriverCall:
-        box = self.submit(what, fn)
+    def call(self, what: str, fn: Callable[[], DriverCall], timeout: float | None,
+             on_late: Callable[[DriverCall], None] | None = None) -> DriverCall:
+        """Run ``fn`` here and wait up to ``timeout``. ``on_late`` gets a result that arrives after the
+        caller gave up (on this lane, decided under the lane's lock, so no result falls between)."""
+        box = self.submit(what, fn, on_late=on_late)
         if isinstance(box, DriverCall):
             return box
         if timeout is not None:
@@ -506,17 +515,16 @@ class _Lane:
         text = f"{what}: the driver did not answer within {timeout:g}s"
         return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True)
 
-    def fail_pending(self, reason: str) -> None:
-        """Answer every call QUEUED here with ``reason`` now (the conversation ended): it never runs. A call
-        already running keeps its own outcome, as a completed future does in a broken executor: it is
-        bounded by its deadline, and a harness that is gone answers it with an error."""
+    def end(self, reason: str) -> None:
+        """The conversation ended: every call QUEUED here is taken off and answered with ``reason`` now, and
+        every later call is answered so at once (concurrent.futures' BrokenExecutor shape): nothing more
+        reaches the harness. A call already running keeps its own outcome; it is bounded by its deadline."""
         with self._cond:
-            boxes = [b for _, _, b in self._queue]
-            for box in boxes:
-                if box.result is None:
-                    box.result = DriverCall(False, None, f"DriverEnded: {reason}", reason)
-                    box.abandoned = True
-                    box.done.set()
+            self._ended = reason
+            while self._queue:
+                _, _, box = self._queue.popleft()
+                box.result = DriverCall(False, None, f"DriverEnded: {reason}", reason)
+                box.done.set()
 
     def idle(self) -> bool:
         """Nothing is queued or running on this lane."""
@@ -545,13 +553,18 @@ class _Lane:
                 self._running_box = box
             result = fn()        # _call_driver: never raises
             with self._cond:
-                if box.result is None:     # not already answered for it (fail_pending)
-                    box.result = result
+                late = box.abandoned      # its caller gave up before this result was stored (call())
+                box.result = result
                 self._running_box = None
                 if self._stuck is box:
                     self._stuck = None
             box.done.set()
-            if box.on_done is not None and box.result is result:
+            if late and box.on_late is not None:
+                try:
+                    box.on_late(result)
+                except BaseException as exc:  # noqa: BLE001 — host code on a driver's thread
+                    _log.error("chat: disposing of a late %s failed: %s", what, _exc_line(exc))
+            if box.on_done is not None:
                 try:
                     box.on_done(result)
                 except BaseException as exc:  # noqa: BLE001 — host code on a driver's thread
@@ -565,6 +578,7 @@ class _Pending:
     done: threading.Event = field(default_factory=threading.Event)
     result: DriverCall | None = None
     abandoned: bool = False
+    on_late: Callable[[DriverCall], None] | None = None
 
 
 _ANY: tuple[type, ...] = ()
@@ -616,27 +630,26 @@ class _DriverProxy:
         self.early_report: tuple[str | None] | None = None   # a release reported before close was called
         self.rec: _Session | None = None             # the session this driver belongs to, once opening
 
-    def make(self, factory: Callable[..., Any], *args: Any, timeout: float) -> DriverCall:
-        """Build the driver (the factory is code that makes driver code), then read its name and caps."""
-        abandoned = threading.Event()
+    def make(self, factory: Callable[..., Any], *args: Any, give_up: float) -> DriverCall:
+        """Build the driver (the factory is code that makes driver code), then read its name and caps, all
+        by ``give_up`` (a ``time.monotonic()`` deadline)."""
 
-        def build() -> DriverCall:
-            got = _call_driver(factory, *args)
-            if abandoned.is_set() and got.ok and got.value is not None:
-                # It arrived after the host gave up on it: nobody holds it, so it is closed here (on this,
-                # the driver's own lane), never left holding what its factory built (L1 r5).
+        def close_late(got: DriverCall) -> None:
+            # It arrived after the host gave up on it: nobody holds it, so it is closed here (on this, the
+            # driver's own lane), never left holding what its factory built (L1 r5; the lane decides "late"
+            # under its lock, so none falls between: r6).
+            if got.ok and got.value is not None:
                 late = got.value
                 _call_driver(lambda: late.close())
-            return got
 
-        made = self._lanes["turn"].call("make", build, timeout)
-        if made.unanswered:
-            abandoned.set()
+        made = self._lanes["turn"].call("make", lambda: _call_driver(factory, *args),
+                                        max(0.0, give_up - time.monotonic()), on_late=close_late)
         if not made.ok:
             return made
         self._driver = made.value
         for name, expect in (("harness", (str,)), ("caps", (DriverCaps,))):
-            got = self.read(name, expect=expect)
+            got = self.read(name, expect=expect,
+                            timeout=min(_CALL_SECONDS, max(0.0, give_up - time.monotonic())))
             if not got.ok:
                 return got           # fail closed: a driver whose name or caps cannot be read is not opened
             setattr(self, name, got.value)
@@ -662,10 +675,11 @@ class _DriverProxy:
         return self._lanes["release"].submit(
             "close", lambda: _invoke(drv, "close", (), {}, _ANY, True, None), on_done)
 
-    def fail_pending(self, reason: str) -> None:
-        """The conversation ended: every call queued on the turn, control and stop lanes answers now."""
+    def end(self, reason: str) -> None:
+        """The conversation ended: the turn, control and stop lanes answer every queued and later call with
+        ``reason``. The release lane stays: a close may still be called."""
         for name in ("turn", "control", "stop"):
-            self._lanes[name].fail_pending(reason)
+            self._lanes[name].end(reason)
 
     def stop_idle(self) -> bool:
         """No stop request is queued or still running (one that outlived its deadline could land in the
@@ -832,7 +846,8 @@ class ChatHost:
         key): a key seen in the last :data:`_IDEM_SECONDS` returns that first call's ids unchanged, whatever
         the session's state, starting nothing, counting nothing and never refused by the cap; the same key
         for another entity is a 409 ``idem_conflict``. A refused open records nothing. At most
-        :data:`_IDEM_KEPT` keys are kept, oldest evicted."""
+        :data:`_IDEM_KEPT` keys are kept, oldest evicted, and the session and open job a kept key names are
+        not pruned."""
         if idem_key is not None and (type(idem_key) is not str or not _IDEM_KEY.fullmatch(idem_key)):
             raise ChatError("bad_request", "idem_key must be 16 to 64 characters of A-Z, a-z, 0-9, _ or -", 400)
         if not isinstance(entity, str) or entity not in self._entities:
@@ -855,7 +870,11 @@ class ChatHost:
                     f"this server holds at most {self._max_sessions} live sessions; close one first",
                     429,
                 )
-            ended = [s for s in self._sessions.values() if s.state not in _LIVE_STATES]
+            # A session a kept idempotency key names is not pruned: a retry must find what it names (codex
+            # r6). The keys are bounded (_IDEM_KEPT), so these are too.
+            named = {seen[1] for seen in self._idem.values()}
+            ended = [s for s in self._sessions.values()
+                     if s.state not in _LIVE_STATES and s.session_id not in named]
             for old in ended[: max(0, len(ended) - _ENDED_SESSIONS_KEPT)]:
                 del self._sessions[old.session_id]
             if not self._ensure_reaper():
@@ -1013,27 +1032,31 @@ class ChatHost:
         return on_released
 
     def _on_report(self, proxy: _DriverProxy, error: str | None) -> None:
+        ended = False
         with self._lock:
             item = proxy.release
             if item is None:
                 # No close in flight: the conversation ENDED on its own (a harness that died, a process that
                 # exited). Ruled 2026-10-07 (codex r5 HIGH): never left looking alive.
+                ended = True
                 proxy.early_report = (error,)
                 rec = proxy.rec
-                if rec is None or rec.driver is not proxy:
-                    return      # still opening (the open fails on it) or already being closed (close reads it)
-                if rec.job_id is not None or rec.state == "busy":
-                    detach = False      # a job or an approve is in flight: it fails with this, then closes
-                else:
-                    detach = True
-                    rec.driver = None
-        if item is None:
-            reason = _ENDED if error is None else f"{_ENDED}: {error}"
-            if not detach:
-                proxy.fail_pending(reason)
+                # Still opening (the open fails on it), already being closed (the close reads it), or a job
+                # or an approve in flight (it fails with this, then closes): that path settles it.
+                if rec is not None and rec.driver is proxy and rec.job_id is None and rec.state != "busy":
+                    item = self._detach_ended(rec, proxy)
+        if ended:
+            # Nothing more reaches the harness, from this moment: a call queued or made later is answered
+            # with this at once (codex r6: a job accepted before the report still ran its turn).
+            proxy.end(_ENDED if error is None else f"{_ENDED}: {error}")
+            if item is None:
                 return
-            self._finish_ended(rec, proxy, error)
+            self._finish_ended(proxy, item, error)
             return
+        self._settle_report(item, error)
+
+    def _settle_report(self, item: _Release, error: str | None) -> None:
+        """A release report for a driver whose release the host holds a record of."""
         with self._lock:
             if item.settled:
                 return
@@ -1054,19 +1077,32 @@ class ChatHost:
             with self._lock:
                 item.rec.release_failed_since, item.rec.released_late = None, stamp
 
-    def _finish_ended(self, rec: _Session, proxy: _DriverProxy, error: str | None) -> None:
-        """Settle a session whose conversation ended on its own (its driver, already detached, reported).
-        ``None``: released, so the session reads ``broken`` and its slot is free. Text: something may
-        still be live, so it reads ``release_failed``, counted. Nothing more is called on the driver."""
-        proxy.fail_pending(_ENDED)
+    def _detach_ended(self, rec: _Session, proxy: _DriverProxy) -> _Release:
+        """Caller holds the lock. Take an ended driver off its session in the SAME hold that saw the end: the
+        session reads ``closing`` (counted, refusing every operation) until the report settles it (complement
+        + codex r6: a separate settle left it idle with no driver, and a turn was accepted). Its release
+        record lets a later report still settle it, as for any release (codex + complement r6)."""
+        rec.driver, rec.state = None, "closing"
+        rec.decision_id, rec.pending, rec.held_digest, rec.approvable = None, [], None, False
+        item = _Release(rec, proxy, lambda: self._settle_ended(rec), None, math.inf)
+        proxy.release = item
+        return item
+
+    def _finish_ended(self, proxy: _DriverProxy, item: _Release, error: str | None) -> None:
+        """Settle a session whose conversation ended on its own (its driver detached by
+        :meth:`_detach_ended`). ``None``: released, so the session reads ``broken`` and its slot is free.
+        Text: something may still be live, so it reads ``release_failed``, counted, until a ``None`` report
+        frees it. Nothing more is called on the driver."""
         proxy.retire()
-        if error is not None:
-            self._mark_release_failed(rec, f"{_ENDED}: {error}")
-            return
+        self._settle_report(item, None if error is None else f"{_ENDED}: {error}")
+
+    def _settle_ended(self, rec: _Session) -> None:
         with self._lock:
-            rec.decision_id, rec.pending, rec.held_digest, rec.approvable = None, [], None, False
             rec.state = "broken"
-            rec.error = _ENDED if rec.error is None else f"{rec.error}; {_ENDED}"
+            if rec.error is None:
+                rec.error = _ENDED
+            elif _ENDED not in rec.error:
+                rec.error = f"{rec.error}; {_ENDED}"
             self._reap_cond.notify_all()
 
     def _release_failed(self, item: _Release, failure: str) -> None:
@@ -1192,7 +1228,8 @@ class ChatHost:
         self._jobs[job.job_id] = job
         rec.job_id = job.job_id
         rec.last_job_id = job.job_id
-        finished = [j for j in self._jobs.values() if j.status != "running"]
+        named = {seen[2] for seen in self._idem.values()}     # as for sessions (open), bounded by _IDEM_KEPT
+        finished = [j for j in self._jobs.values() if j.status != "running" and j.job_id not in named]
         for old in finished[: max(0, len(finished) - _FINISHED_JOBS_KEPT)]:
             del self._jobs[old.job_id]
         return job
@@ -1296,12 +1333,12 @@ class ChatHost:
         # unreadable, or not exactly text (a subclass could override `==`): no match
         live = got.value if got is not None and got.ok else None
         to_close: _DriverProxy | None = None
-        ended: _DriverProxy | None = None
+        ended: _Release | None = None
         with self._lock:
             rec.state = "gated"
             if driver is not None and driver.early_report is not None and rec.driver is driver:
                 # Its harness ended while the digest was read (one hold with every other outcome here).
-                ended, rec.driver, rec.state = driver, None, "closing"
+                ended = self._detach_ended(rec, driver)
             elif got is not None and got.unanswered and not self._shut:
                 # Fail closed: nothing ran. The session reads unresponsive, which close and shutdown act on.
                 rec.state, rec.decision_id, rec.approvable = "unresponsive", None, False
@@ -1326,7 +1363,8 @@ class ChatHost:
                 job = self._launch(rec, kind, call)
                 return {"session_id": rec.session_id, "job_id": job.job_id, "state": "busy"}
         if ended is not None:
-            self._finish_ended(rec, ended, ended.early_report[0] if ended.early_report else None)
+            report = ended.proxy.early_report
+            self._finish_ended(ended.proxy, ended, report[0] if report else None)
             raise ChatError("ended", f"{_ENDED}; nothing ran", 409)
         if to_close is not None:
             self._close_then(rec, to_close, lambda: self._settle(rec, "closed"))
@@ -1404,7 +1442,7 @@ class ChatHost:
             # The factory makes driver code, so it runs on the driver's lane and through the boundary too; a
             # raise from it is an ordinary failed open (its text kept, read so that it cannot raise).
             give_up = time.monotonic() + _OPEN_SECONDS      # ONE bound for make, open and describe
-            made = lanes.make(self._driver_factory, rec.entity, self._entities[rec.entity], timeout=_OPEN_SECONDS)
+            made = lanes.make(self._driver_factory, rec.entity, self._entities[rec.entity], give_up=give_up)
             if not made.ok:
                 lanes.retire()
                 raise _FailedStart(made.message or "the driver could not be made")

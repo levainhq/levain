@@ -1490,10 +1490,10 @@ def test_the_host_holds_no_driver_method():
     contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
     exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
     assert exposed == {"call", "read", "harness", "caps", "make", "submit_close", "retire", "release",
-                       "early_report", "stop_idle", "fail_pending", "rec"}
+                       "early_report", "stop_idle", "end", "rec"}
     assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
     proxy = _DriverProxy("t")
-    assert proxy.make(lambda: _Fake([]), timeout=2).ok
+    assert proxy.make(lambda: _Fake([]), give_up=time.monotonic() + 2).ok
     with pytest.raises(AttributeError):
         proxy.close  # noqa: B018
     proxy.retire()
@@ -2455,3 +2455,168 @@ def test_no_turn_runs_without_a_bound():
 
     host = ChatHost({"alpha": Path("/nonexistent")}, driver_factory=lambda n, p: _Fake([]), turn_seconds=None)
     assert host.listing()["turn_seconds"] == DEFAULT_TURN_SECONDS
+
+
+# -- L3 r6 on 5da94ec ---------------------------------------------------------------------------------------------
+
+
+def test_an_ended_session_is_never_operable_without_its_driver(tmp_path, monkeypatch):
+    """complement + codex r6 (consensus): the detach and the settle were two holds, and between them the
+    session read idle with no driver, so a turn was accepted. A client arriving in that window is refused."""
+    import levain.chat as chat
+
+    d = _Fake([_Out()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    seen: list[Any] = []
+    retire = chat._DriverProxy.retire
+
+    def probe(self, **kw):
+        if not seen and threading.current_thread().name.startswith("probe-reporter"):
+            try:
+                host.turn(sid, "now?")
+                seen.append("accepted")
+            except ChatError as exc:
+                seen.append(exc.code)
+        return retire(self, **kw)
+
+    monkeypatch.setattr(chat._DriverProxy, "retire", probe)
+    t = threading.Thread(target=d.report, name="probe-reporter")
+    t.start()
+    t.join(5)
+    assert seen == ["wrong_state"]
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the end")
+    assert not [c for c in d.calls if c[0] == "send_turn"]
+
+
+def test_a_turn_accepted_before_the_harness_ended_never_reaches_it(tmp_path, monkeypatch):
+    """codex r6 HIGH: the job was accepted, its worker had not yet called the driver, and the report came
+    then: only QUEUED calls were answered, so the worker's call ran against a harness that had ended."""
+    d = _Fake([_Out()])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    spawn = host._spawn
+
+    def spawn_after_the_end(target, *args):
+        def run(*a):
+            d.report(None)                 # the harness ends after the job was accepted, before its call
+            return target(*a)
+        return spawn(run, *args)
+
+    monkeypatch.setattr(host, "_spawn", spawn_after_the_end)
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert not [c for c in d.calls if c[0] == "send_turn"]
+    assert st["status"] == "failed" and "ended on its own" in st["error"]
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the end")
+    monkeypatch.setattr(host, "_spawn", spawn)
+    _open(host, "beta")
+
+
+def test_a_harness_that_ended_still_live_frees_its_slot_when_it_reports_the_release(tmp_path):
+    """codex + complement r6 (consensus): an idle driver reported a failed release, then a confirmed one; the
+    second report was dropped, so the session stayed counted forever."""
+    d = _Fake([])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    d.report("OSError: the shell would not stop")
+    assert host.session_status(sid)["state"] == "release_failed"
+    d.reported = False
+    d.report(None)                                     # it got the shell down after all
+    view = host.session_status(sid)
+    assert view["state"] == "broken" and view.get("released_late")
+    assert "ended on its own" in view["error"]
+    _open(host, "beta")
+
+
+def test_a_call_queued_when_the_harness_ends_reads_ended_not_unresponsive():
+    """complement r6 MED: an ended lane's queued call was answered, then the worker popped it and wrote
+    `unanswered` over that answer."""
+    from levain.chat import _Lane
+    from levain.chat_driver import DriverCall
+
+    lane = _Lane("t")
+    lane.start()
+    gate = threading.Event()
+    first = lane.submit("first", lambda: (gate.wait(5), DriverCall(True, None))[1])
+    queued = lane.submit("queued", lambda: DriverCall(True, "ran"))
+    lane.end("the harness ended on its own")
+    gate.set()
+    first.done.wait(5)
+    _until(lane.idle, what="the lane")
+    assert queued.result.error.startswith("DriverEnded") and not queued.result.unanswered
+    later = lane.submit("later", lambda: DriverCall(True, "ran"))
+    assert later.error.startswith("DriverEnded")       # nothing reaches a harness that ended
+    lane.retire()
+
+
+def test_a_driver_made_in_the_instant_the_host_gave_up_is_still_closed(tmp_path, monkeypatch):
+    """codex + complement r6 (consensus): the late driver was closed only if the host's give-up was already
+    recorded when the factory returned; one that returned in between was left holding what it built."""
+    import levain.chat as chat
+    from levain.chat_driver import DriverCall
+
+    monkeypatch.setattr(chat, "_OPEN_SECONDS", 0.2)
+    gate = threading.Event()
+    late = _Fake([])
+
+    class Gap(DriverCall):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            if self.unanswered and "make" in (self.message or "") and not gate.is_set():
+                gate.set()             # the factory returns now, before the caller records that it gave up
+                time.sleep(0.3)
+
+    monkeypatch.setattr(chat, "DriverCall", Gap)
+
+    def factory(name, path):
+        gate.wait(5)
+        return late
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=factory)
+    assert _wait(host, host.open("alpha")["job_id"])["status"] == "failed"
+    _until(lambda: late.closed, what="the late driver's close")
+
+
+def test_the_open_bound_covers_reading_the_drivers_name(tmp_path, monkeypatch):
+    """codex r6 LOW: after a slow factory, the harness name and caps were each read with their own 10 s, so
+    the one open bound could be exceeded."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_OPEN_SECONDS", 0.3)
+    hold = threading.Event()
+
+    class SlowName(_Fake):
+        @property
+        def harness(self):
+            hold.wait(30)
+            return "fake"
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=lambda n, p: SlowName([]))
+    start = time.monotonic()
+    try:
+        st = _wait(host, host.open("alpha")["job_id"], timeout=5)
+        assert st["status"] == "failed"
+        assert time.monotonic() - start < 3
+    finally:
+        hold.set()
+
+
+def test_a_kept_idem_key_never_names_a_pruned_session(tmp_path, monkeypatch):
+    """codex r6 MED: session and job pruning ignored the idempotency keys, so a retry inside the key's TTL
+    could return ids that both status routes answered `unknown`."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_ENDED_SESSIONS_KEPT", 1)
+    monkeypatch.setattr(chat, "_FINISHED_JOBS_KEPT", 1)
+    host = ChatHost({"alpha": tmp_path}, driver_factory=lambda n, p: _Fake([]), max_sessions=2)
+    key = "k" * 20
+    first = host.open("alpha", idem_key=key)
+    _wait(host, first["job_id"])
+    host.close(first["session_id"])
+    for _ in range(4):
+        sid, _ = _open(host, "alpha")
+        host.close(sid)
+    again = host.open("alpha", idem_key=key)
+    assert again["session_id"] == first["session_id"]
+    host.session_status(again["session_id"])
+    assert host.job_status(again["job_id"])["status"] == "done"
