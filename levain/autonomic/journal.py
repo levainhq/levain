@@ -10,6 +10,13 @@ journaled unit with a stable id, and resuming a run replays the recorded results
 that already ran instead of running them again. There is deliberately no mid-effect pause: a run
 suspends BEFORE an effect, never inside one, because an in-flight Python call cannot be resumed.
 
+The journal is the ONLY durable home of a decision about a run's effect. A hold is the pending
+decision itself: one appended line carries the sealed record a person is asked about and, for a
+link of a chain, the state that resumes the chain after the decision. Open pendings and paused
+chains are read from the open holds, never written anywhere else, and a decision is one write-once
+``decide`` line (a rejection's cancel of the run is in that same line). Every transition is one
+appended line, so the file's own append is the atomic commit.
+
 Identity is derived, never assigned: a run's id is a content address over the binding and the
 exact triggering event (:func:`run_id_for`), so delivering the same event again resumes the same
 run; an effect's id is its position in the run (``link-<i>``); a hold's id is derived from the
@@ -156,6 +163,7 @@ class _State:
     results: dict[tuple[str, str], dict[str, Any]]
     unknown: set[tuple[str, str]]
     holds: dict[str, dict[str, Any]]
+    by_pending: dict[str, str]
     fences: dict[str, int]
     cancelled: set[str]
     receipts: dict[tuple[str, str], str]
@@ -283,7 +291,7 @@ class RunJournal:
                 durable_fsync(f.fileno())
 
     def _state(self) -> _State:
-        st = _State({}, {}, {}, set(), {}, {}, set(), {})
+        st = _State({}, {}, {}, set(), {}, {}, {}, set(), {})
         if not self._path.exists():
             return st
         try:
@@ -317,15 +325,18 @@ class RunJournal:
         elif t == "unknown":
             st.unknown.add((r["run_id"], r["effect_id"]))
         elif t == "hold":
-            st.holds.setdefault(r["hold_id"], dict(r, decided=None, by=None))
+            if r["hold_id"] not in st.holds:
+                st.holds[r["hold_id"]] = dict(r, decided=None, by=None)
+                pending = r.get("pending")
+                if isinstance(pending, dict) and isinstance(pending.get("pending_id"), str):
+                    st.by_pending[pending["pending_id"]] = r["hold_id"]
         elif t == "decide":
-            if r["hold_id"] in st.holds and st.holds[r["hold_id"]]["decided"] is None:
-                st.holds[r["hold_id"]]["decided"] = r["approve"]
-                st.holds[r["hold_id"]]["by"] = r.get("by")
-        elif t == "withdraw":
             h = st.holds.get(r["hold_id"])
             if h is not None and h["decided"] is None:
-                del st.holds[r["hold_id"]]   # closed undecided; a later hold() opens it afresh
+                h["decided"] = bool(r["approve"])
+                h["by"] = r.get("by")
+                if not h["decided"]:
+                    st.cancelled.add(h["run_id"])   # a rejection ends its run IN THE SAME record
         elif t == "fence":
             st.fences[r["binding_id"]] = max(st.fences.get(r["binding_id"], 0), int(r["generation"]))
         elif t == "cancel":
@@ -423,16 +434,21 @@ class RunJournal:
         with self._locked():
             return self._barrier(self._state(), run_id, effect_id, current_generation, digest)
 
-    def hold(self, run_id: str, effect_id: str, *, digest: str, at: str | None = None,
+    def hold(self, run_id: str, effect_id: str, *, digest: str, pending: dict[str, Any],
+             at: str | None = None, chain: dict[str, Any] | None = None, chained: bool = False,
              current_generation: int | None = None) -> EffectOutcome:
         """Open (or find) the decision that guards ``effect_id``: the run suspends BEFORE the effect.
 
-        Returns HELD with the hold id (new, or the existing open one: proposing the same effect again
-        never opens a second decision), APPROVED if that hold was already approved (the decision was
+        The hold IS the pending decision: it carries the sealed ``pending`` record a person is asked
+        about and, for a link of a chain (``chained``), the ``chain`` continuation that resumes the
+        walk after the decision. Both are written in the same appended line as the hold, so there is
+        no second store whose copy of the decision could disagree with this one.
+
+        Returns HELD with the hold id (``new_hold`` True iff this call opened it; proposing the same
+        effect again finds the open one), APPROVED if that hold was already approved (the decision was
         made and the effect has not run: run it with :meth:`effect`), or the barrier that stops the
-        effect. A different ``digest`` from the one the open or approved hold carries means the
-        bytes changed under the decision: the run is cancelled. ``at`` (an ISO time) is recorded with a
-        new hold, so a hold whose pending never landed can be found and rejected later."""
+        effect. A different ``digest`` from the one the open or approved hold carries means the bytes
+        changed under the decision: the run is cancelled."""
         hold_id = hold_id_for(run_id, effect_id)
         with self._locked():
             st = self._state()
@@ -450,7 +466,8 @@ class RunJournal:
                     return EffectOutcome(EffectStatus.APPROVED, hold_id=hold_id, decided_by=h["by"])
                 return EffectOutcome(EffectStatus.CANCELLED)   # rejected (the run is cancelled too)
             self._append({"t": "hold", "hold_id": hold_id, "binding_id": st.runs[run_id]["binding_id"],
-                          "run_id": run_id, "effect_id": effect_id, "digest": digest, "at": at})
+                          "run_id": run_id, "effect_id": effect_id, "digest": digest, "at": at,
+                          "pending": pending, "chain": chain, "chained": bool(chained)})
             return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, new_hold=True)
 
     def effect(self, run_id: str, effect_id: str, *, digest: str,
@@ -521,8 +538,9 @@ class RunJournal:
     # --- decisions -------------------------------------------------------------------------
     def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None) -> HoldResult:
         """Resolve a hold. ``digest`` must equal the one recorded with the hold (the decision is
-        bound to what was shown). A rejection cancels the hold's run. A hold decides once. ``by``
-        names the decider for the record."""
+        bound to what was shown). A hold decides once: this write-once record IS the claim, so of any
+        number of resolvers exactly one decision counts. A rejection cancels the hold's run, in the
+        same record. ``by`` names the decider."""
         with self._locked():
             st = self._state()
             h = st.holds.get(hold_id)
@@ -533,29 +551,7 @@ class RunJournal:
             if h["digest"] != digest:
                 return HoldResult(False, "digest_mismatch")
             self._append({"t": "decide", "hold_id": hold_id, "approve": bool(approve), "by": by})
-            if not approve:
-                self._append({"t": "cancel", "run_id": h["run_id"], "reason": "rejected"})
             return HoldResult(True, "approved" if approve else "rejected")
-
-    def withdraw(self, hold_id: str) -> bool:
-        """Close an UNDECIDED hold without deciding it: the infrastructure failed (its pending could not
-        be persisted, a chain's state could not be written), which is not a "no" from anyone, so the run
-        is NOT cancelled and re-delivering the event proposes the effect again. Returns True iff an
-        open hold was closed."""
-        with self._locked():
-            h = self._state().holds.get(hold_id)
-            if h is None or h["decided"] is not None:
-                return False
-            self._append({"t": "withdraw", "hold_id": hold_id})
-            return True
-
-    def hold_state(self, hold_id: str) -> str | None:
-        """``"open"``, ``"approved"``, ``"rejected"``, or ``None`` (no such hold, or it was withdrawn)."""
-        with self._locked():
-            h = self._state().holds.get(hold_id)
-        if h is None:
-            return None
-        return "open" if h["decided"] is None else ("approved" if h["decided"] else "rejected")
 
     def max_run_generation(self, binding_id: str) -> int | None:
         """The highest generation any run of ``binding_id`` was admitted at, or ``None`` (no runs)."""
@@ -563,14 +559,30 @@ class RunJournal:
             gens = [r["generation"] for r in self._state().runs.values() if r["binding_id"] == binding_id]
         return max(gens) if gens else None
 
+    _HOLD_FIELDS = ("hold_id", "binding_id", "run_id", "effect_id", "digest", "at", "pending", "chain",
+                    "chained", "decided", "by")
+
     def open_holds(self) -> list[dict[str, Any]]:
-        """Every undecided hold (``hold_id``, ``binding_id``, ``run_id``, ``effect_id``, ``digest``,
-        ``at``):
-        each one is stopping its binding's undecided effects until someone decides it."""
+        """Every undecided hold, with its pending record and chain continuation: the OPEN DECISIONS.
+        This is the only list of pending decisions for journaled runs; each one is also stopping its
+        binding's undecided effects until someone decides it."""
         with self._locked():
             st = self._state()
-        return [{k: h.get(k) for k in ("hold_id", "binding_id", "run_id", "effect_id", "digest", "at")}
-                for h in st.holds.values() if h["decided"] is None]
+        return [{k: h.get(k) for k in self._HOLD_FIELDS} for h in st.holds.values() if h["decided"] is None]
+
+    def get_hold(self, hold_id: str) -> dict[str, Any] | None:
+        """The hold record (open or decided), or ``None``."""
+        with self._locked():
+            h = self._state().holds.get(hold_id)
+            return {k: h.get(k) for k in self._HOLD_FIELDS} if h is not None else None
+
+    def find_pending(self, pending_id: str) -> dict[str, Any] | None:
+        """The hold whose pending record has ``pending_id`` (open or decided), or ``None``."""
+        with self._locked():
+            st = self._state()
+            hold_id = st.by_pending.get(pending_id)
+            h = st.holds.get(hold_id) if hold_id is not None else None
+            return {k: h.get(k) for k in self._HOLD_FIELDS} if h is not None else None
 
     def poisoned(self) -> list[tuple[str, str]]:
         """Every effect whose outcome is unknown and whose owner is gone: the list a human must look

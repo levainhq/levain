@@ -1026,7 +1026,10 @@ class BindingStore:
 
         A legacy top-level LIST still reads, so a registry written before the object format is not
         lost; it is rewritten as an object on its next write. Every entry of a legacy list is held to
-        the same rule, and two entries for one id are a duplicate."""
+        the same rule, and two entries for one id are a duplicate. MIGRATION DIRECTION: a registry
+        written by the vagus package's store converts forward into this format on its first write here,
+        and the vagus store reads the converted file as empty. One writer owns a registry at a time: cut
+        a deployment over by stopping the vagus writers first, then letting this store write."""
         try:
             text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:

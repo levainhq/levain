@@ -57,7 +57,8 @@ Architecture:
   The run journal (S8):
   - ``RunJournal`` / ``RunRef`` — a binding fire's effects, each at most once: held while a decision on
     the binding is open, cancelled by a rejection, fenced by a pause/revoke/tighten, poisoned (never
-    retried) when the outcome is unknown, replayed (never re-run) when delivered again.
+    retried) when the outcome is unknown, replayed (never re-run) when delivered again. The journal is
+    the only durable home of a journaled decision: open pendings and paused chains are read from it.
 """
 from __future__ import annotations
 

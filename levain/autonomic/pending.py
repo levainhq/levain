@@ -40,7 +40,6 @@ def seal_pending_id(
     *, created_at: str, context_id: str, action_name: str, payload: str, proposal_id: str | None,
     posture: str, fail_open: bool, requires_typed: bool, expires_at: str | None,
     authority: dict[str, Any], query_text: str, query_date: str, producers: tuple[str, ...],
-    run_id: str | None = None, effect_id: str | None = None, chained: bool = False,
 ) -> str:
     """The content-FINGERPRINT pending id: ``pend-<created_at>-<16hex>`` over EVERY governance-relevant
     field of a pending record (L3 codex HIGH-1/2 + complement MED-1 — the cross-substrate consensus).
@@ -69,11 +68,6 @@ def seal_pending_id(
         "expires_at": expires_at, "authority": authority,
         "query_text": query_text, "query_date": query_date, "producers": list(producers),
     }
-    # The journaled run this pending decides (S8). OMITTED when absent, so a pending minted before the
-    # journal existed seals exactly as it did; present, it is sealed, so a pending cannot be re-pointed
-    # at another run's decision.
-    if run_id is not None or effect_id is not None:
-        body["run"] = {"run_id": run_id, "effect_id": effect_id, "chained": bool(chained)}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"pend-{created_at}-{h}"
@@ -136,30 +130,12 @@ class PendingAction:
     producers: tuple[str, ...] = ()
     proposal_id: str | None = None
     expires_at: str | None = None
-    # The journaled run + effect this pending decides (both or neither): set when a binding's run
-    # proposes; ``resolve`` decides that run's hold and fires the effect through the run journal.
-    run_id: str | None = None
-    effect_id: str | None = None
-    # True iff the effect is a link of a multi-link chain: only the chain executor may resolve it (a
-    # plain resolve would fire the link standalone and skip the rest of the chain). Sealed with the run.
-    chained: bool = False
-
-    def __post_init__(self) -> None:
-        if (self.run_id is None) != (self.effect_id is None):
-            raise ValueError("PendingAction.run_id and effect_id travel together")
-        if not isinstance(self.chained, bool) or (self.chained and self.run_id is None):
-            raise ValueError("PendingAction.chained must be a bool, and True only with a run")
-        for name in ("run_id", "effect_id"):
-            v = getattr(self, name)
-            if v is not None and (not isinstance(v, str) or not v):
-                raise ValueError(f"PendingAction.{name} must be a non-empty string or None")
 
     @classmethod
     def create(
         cls, *, created_at: str, action_name: str, payload: str, context_id: str, query_text: str,
         query_date: str, posture: str, fail_open: bool, requires_typed: bool, authority: dict[str, Any],
         producers: tuple[str, ...] = (), proposal_id: str | None = None, expires_at: str | None = None,
-        run_id: str | None = None, effect_id: str | None = None, chained: bool = False,
     ) -> "PendingAction":
         """Build a SEALED pending action — the ``pending_id`` is the content fingerprint over all the
         governance fields (:func:`seal_pending_id`), so any later alteration is detectable via
@@ -170,14 +146,13 @@ class PendingAction:
             created_at=created_at, context_id=context_id, action_name=action_name, payload=payload,
             proposal_id=proposal_id, posture=posture, fail_open=fail_open, requires_typed=requires_typed,
             expires_at=expires_at, authority=authority, query_text=query_text, query_date=query_date,
-            producers=producers, run_id=run_id, effect_id=effect_id, chained=chained,
+            producers=producers,
         )
         return cls(
             pending_id=pid, created_at=created_at, action_name=action_name, payload=payload,
             context_id=context_id, query_text=query_text, query_date=query_date, posture=posture,
             fail_open=fail_open, requires_typed=requires_typed, authority=authority,
             producers=producers, proposal_id=proposal_id, expires_at=expires_at,
-            run_id=run_id, effect_id=effect_id, chained=chained,
         )
 
     def seal_matches(self) -> bool:
@@ -189,7 +164,7 @@ class PendingAction:
             payload=self.payload, proposal_id=self.proposal_id, posture=self.posture,
             fail_open=self.fail_open, requires_typed=self.requires_typed, expires_at=self.expires_at,
             authority=self.authority, query_text=self.query_text, query_date=self.query_date,
-            producers=self.producers, run_id=self.run_id, effect_id=self.effect_id, chained=self.chained,
+            producers=self.producers,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -208,9 +183,6 @@ class PendingAction:
             "producers": list(self.producers),
             "proposal_id": self.proposal_id,
             "expires_at": self.expires_at,
-            "run_id": self.run_id,
-            "effect_id": self.effect_id,
-            "chained": self.chained,
         }
 
     @classmethod
@@ -240,9 +212,6 @@ class PendingAction:
             producers=_producer_tuple(d.get("producers") or ()),
             proposal_id=d.get("proposal_id"),
             expires_at=d.get("expires_at"),
-            run_id=d.get("run_id"),
-            effect_id=d.get("effect_id"),
-            chained=d.get("chained", False),
         )
 
 
@@ -312,24 +281,6 @@ class PendingActionStore:
             records.append(pending.to_dict())
             self._write_raw(records)
 
-    def add_for_run(self, pending: PendingAction) -> tuple[PendingAction, bool]:
-        """Persist ``pending`` unless an open pending for the same journaled run and effect exists, in
-        one locked step: returns ``(the open pending, True iff it is the one just written)``. Two
-        concurrent proposals of one effect therefore surface ONE pending, so there is one decision."""
-        if pending.run_id is None:
-            raise ValueError("add_for_run needs a pending with a run")
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
-            for r in records:
-                if r.get("run_id") == pending.run_id and r.get("effect_id") == pending.effect_id:
-                    try:
-                        return PendingAction.from_dict(r), False
-                    except (KeyError, TypeError, ValueError):
-                        continue   # an unreadable record for it never decides it: write a good one
-            records.append(pending.to_dict())
-            self._write_raw(records)
-            return pending, True
-
     def get(self, pending_id: str) -> PendingAction | None:
         """Return the pending action by id, or ``None``. A read needs no lock (atomic-replace writes
         mean a read sees a whole old-or-new file); a malformed matching record → ``None`` (logged)."""
@@ -337,7 +288,7 @@ class PendingActionStore:
             if r.get("pending_id") == pending_id:
                 try:
                     return PendingAction.from_dict(r)
-                except (KeyError, TypeError, ValueError) as e:
+                except (KeyError, TypeError) as e:
                     _log.warning("pending store: malformed record %r (%s) — treating as absent",
                                  pending_id, type(e).__name__)
                     return None
@@ -350,7 +301,7 @@ class PendingActionStore:
         for r in self._read_raw():
             try:
                 out.append(PendingAction.from_dict(r))
-            except (KeyError, TypeError, ValueError) as e:
+            except (KeyError, TypeError) as e:
                 _log.warning("pending store: skipping malformed record (%s)", type(e).__name__)
         return out
 
@@ -390,7 +341,7 @@ class PendingActionStore:
             rec = matches[0]
             try:
                 pending = PendingAction.from_dict(rec)
-            except (KeyError, TypeError, ValueError) as e:
+            except (KeyError, TypeError) as e:
                 pending = None   # malformed — drop it (it can never be resolved), don't return it
                 _log.warning("pending store: claimed a malformed record %r (%s) — dropped, NOT fired",
                              pending_id, type(e).__name__)

@@ -85,9 +85,6 @@ class ConfirmDecision:
       demands — the gate REFUSES an approved-elevated resolve without it (the stronger affordance the
       rung promises, enforced not just rendered). ``None`` for the one-tap ``confirm`` rung.
     - ``reason`` is a short human/audit string (e.g. ``"cooling_off_window_elapsed"``).
-    - ``withdraw`` (only with ``approved=False``) marks a drop caused by an infrastructure fault, not by
-      a decider: the pending is consumed, but a journaled run is NOT cancelled (its hold is withdrawn),
-      so re-delivering the event proposes the effect again.
     """
 
     approved: bool
@@ -95,19 +92,13 @@ class ConfirmDecision:
     first_estimate: Any | None = None
     typed_proof: str | None = None
     reason: str = ""
-    withdraw: bool = False
 
     def __post_init__(self) -> None:
         # A decision is an authority boundary: a truthy string ("false") must never read as approval.
-        for name in ("approved", "withdraw"):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"ConfirmDecision.{name} must be a bool, got {type(getattr(self, name)).__name__}")
+        if not isinstance(self.approved, bool):
+            raise TypeError(f"ConfirmDecision.approved must be a bool, got {type(self.approved).__name__}")
         if self.by not in ("human", "on-loop"):
             raise ValueError(f"ConfirmDecision.by must be 'human' or 'on-loop', got {self.by!r}")
-        if self.withdraw and (self.approved or self.by != "on-loop"):
-            # a withdraw leaves the run open; a person's "no" must cancel it, so only the system's own
-            # infrastructure path may withdraw
-            raise ValueError("ConfirmDecision.withdraw is an on-loop drop: not approved, not by a human")
         if self.typed_proof is not None and not isinstance(self.typed_proof, str):
             raise TypeError("ConfirmDecision.typed_proof must be a string or None")
         if not isinstance(self.reason, str):

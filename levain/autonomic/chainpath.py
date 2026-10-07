@@ -61,7 +61,10 @@ evolution (flagged, not built).
 
 **The run journal (S8).** With a journal on the gate, a chain is ONE journaled run (the dispatcher
 admits it; its id is :func:`~levain.autonomic.journal.run_id_for` over the binding and the trigger
-event, so a resume and a re-delivery address the same run) and link ``i`` is its effect ``link-<i>``.
+event, so a resume and a re-delivery address the same run) and link ``i`` is its effect ``link-<i>``. A pausing link's chain state is written INTO the link's
+hold with its pending (the request's ``continuation``); resuming reads it from there, so for a
+journaled chain the :class:`ChainStateStore` is not written and a chain state cannot be lost apart
+from its decision.
 A re-delivered event walks the chain again: links that already ran replay their recorded output into
 the data flow without running, and the first link that has not run continues the chain. A link HELD by
 an open decision on the binding ends this walk in state ``held`` (re-deliver after the decision).
@@ -87,7 +90,7 @@ from typing import Any, Iterator
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
-from levain.autonomic.journal import RunRef, durable_replace, run_id_for
+from levain.autonomic.journal import RunRef, durable_replace, hold_id_for, run_id_for
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.transport import ConfirmDecision
 from levain.autonomic.trust import TrustContext
@@ -748,8 +751,22 @@ class ChainExecutor:
                 return ChainOutcome(binding_id=binding.binding_id, state="held", links=tuple(results),
                                     paused_at=i, reason=outcome.reason)
 
+            if outcome.pending and request.run is not None:
+                # PAUSE, journaled: the chain state to resume from went INTO the run's hold with the
+                # pending (the request's continuation), so there is nothing to write here and no second
+                # store to disagree. Report the chain the journal holds (the first proposal's, when this
+                # is a re-delivery reaching an already-open hold).
+                hold = self._gate.journal.get_hold(hold_id_for(request.run.run_id, request.run.effect_id))  # type: ignore[union-attr]
+                chain = hold.get("chain") if hold is not None else None
+                chain_id = chain.get("chain_id") if isinstance(chain, dict) else None
+                _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
+                          binding.binding_id, i, outcome.posture.name, outcome.pending_id, chain_id)
+                return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
+                                    paused_at=i, pending_id=outcome.pending_id, chain_id=chain_id,
+                                    reason=outcome.reason)
+
             if outcome.pending:
-                # PAUSE — persist the in-flight chain state for the operator's resolve. Both the seal
+                # PAUSE (unjournaled) — persist the in-flight chain state for the operator's resolve. Both the seal
                 # (``ChainState.create`` → ``seal_chain_id`` can raise on a non-canonical trigger event,
                 # e.g. a non-finite float) AND the store ``add`` are INSIDE the try (L1): on ANY persist
                 # failure, the gate already created a pending for this link → CONSUME it (deny) so the
@@ -767,8 +784,7 @@ class ChainExecutor:
                     _log.error("chainpath: chain-state persist FAILED for %s (%s): %s — consuming the "
                                "just-proposed pending %s + aborting (no orphaned fireable pending)",
                                binding.binding_id, type(e).__name__, e, pending_id)
-                    self._consume_pending(pending_id, f"chain_state_persist_failed:{type(e).__name__}",
-                                          withdraw=True)
+                    self._consume_pending(pending_id, f"chain_state_persist_failed:{type(e).__name__}")
                     return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
                                         paused_at=i, reason=f"chain_state_persist_failed:{type(e).__name__}")
                 _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
@@ -833,6 +849,16 @@ class ChainExecutor:
         on-loop links fire). The middle-link drift residual remains (per-link sealed postures = 4c)."""
         base = self._request_builder(binding, ctx, i)
         is_terminal = i == len(binding.goal) - 1
+        run = (RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
+               if self._gate.journal is not None else None)
+        continuation = None
+        if run is not None:
+            # the state this chain resumes from if THIS link pauses: written into the link's hold
+            continuation = ChainState.create(
+                created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
+                completed=ctx.completed, paused_at_link=i, paused_payload=base.payload,
+                pending_id=hold_id_for(run.run_id, run.effect_id),
+            ).to_dict()
         request = dataclasses.replace(
             base,
             risk=self._risk_resolver(binding, i),
@@ -842,8 +868,8 @@ class ChainExecutor:
             predicted_trajectory=_predicted_trajectory(binding),
             trigger_event=event,
             ratified_posture=(binding.posture if is_terminal else None),
-            run=(RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
-                 if self._gate.journal is not None else None),
+            run=run,
+            continuation=continuation,
         )
         return request, self._gate.gate(request)
 
@@ -865,6 +891,81 @@ class ChainExecutor:
                                 reason=f"resume_error:{type(e).__name__}")
 
     def _resume(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
+        journal = self._gate.journal
+        hold = journal.find_pending(pending_id) if journal is not None else None
+        if hold is not None:
+            if not hold.get("chained"):
+                return None   # a single-link journaled pending: the caller's plain resolve
+            return self._resume_journaled(pending_id, hold, decision)
+        return self._resume_unjournaled(pending_id, decision)
+
+    def _resume_journaled(self, pending_id: str, hold: dict[str, Any],
+                          decision: ConfirmDecision) -> ChainOutcome:
+        """Resume a journaled chain from the hold that paused it. The chain state is READ from the hold
+        (written with the pending, in one record); nothing is claimed or removed. The decision is the
+        gate's one write-once ``decide``; a second resumer finds it, and the walk it continues is
+        journaled effect by effect, so it can never run a link twice. A paused or revoked grant is
+        stopped by its governance generation at the next effect (no separate registry re-check)."""
+        binding_id = str(hold.get("binding_id") or "?")
+        try:
+            state = ChainState.from_dict(hold["chain"])
+            binding = state.binding_obj()
+            completed = state.completed_links()
+            bad = None if state.seal_matches() else "integrity:seal_mismatch"
+            bad = bad or state.validate_against_binding(binding)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            bad, state = f"chain_state_malformed:{type(e).__name__}", None
+        if bad is not None:
+            # the continuation is unreadable or altered: the link must not fire without its chain
+            _log.error("chainpath resume: chain continuation of %s unusable (%s) — rejecting", pending_id, bad)
+            self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
+                                                           reason=f"chain_aborted:{bad}"), chain_owned=True)
+            return ChainOutcome(binding_id=binding_id, state="aborted", links=(),
+                                paused_at=state.paused_at_link if state is not None else None, reason=bad)
+        assert state is not None
+        link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
+        results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
+        if not link_outcome.fired:
+            return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
+                                paused_at=state.paused_at_link,
+                                reason=link_outcome.reason or "paused_link_not_fired")
+        ctx = ChainContext(trigger_event=state.trigger_event, completed=completed)
+        ctx = ctx.with_link(CompletedLink.of(
+            state.paused_at_link, binding.goal[state.paused_at_link], state.paused_payload,
+            link_outcome.execution))
+        return self._walk(binding, state.trigger_event, start=state.paused_at_link + 1, ctx=ctx,
+                          prior=tuple(results))
+
+    def sweep_timeouts(self, now: _dt.datetime | None = None) -> list[ChainOutcome]:
+        """The silence default for journaled chain links: every open chained hold whose pending has
+        expired is resumed with the gate's silence decision (an allowlisted cooling-off link approves
+        and the chain continues; anything else rejects and the chain ends). Fail-soft per hold."""
+        journal = self._gate.journal
+        if journal is None:
+            return []
+        try:
+            now = now or self._clock()
+            holds = journal.open_holds()
+        except Exception as e:  # noqa: BLE001
+            _log.error("chainpath sweep: FAILED (%s): %s", type(e).__name__, e)
+            return []
+        out: list[ChainOutcome] = []
+        for h in holds:
+            if not h.get("chained") or not isinstance(h.get("pending"), dict):
+                continue
+            try:
+                decision = self._gate.silence_decision(h, now)
+                if decision is None:
+                    continue
+                result = self.resume(str(h["pending"].get("pending_id")), decision)
+            except Exception as e:  # noqa: BLE001 — one bad hold never stops the sweep
+                _log.error("chainpath sweep: hold %s FAILED (%s): %s", h.get("hold_id"), type(e).__name__, e)
+                continue
+            if result is not None:
+                out.append(result)
+        return out
+
+    def _resume_unjournaled(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
         # ATOMICALLY claim the chain (removes + owns) — at-most-once advance. A concurrent CLI/sweep loses.
         # A MalformedChainStateError = a chain OWNED this pending but its state was unparseable + dropped:
         # CONSUME the orphaned pending (deny) so a plain resolve/sweep can't fire it — the two-resource
@@ -884,16 +985,6 @@ class ChainExecutor:
                        "not falling through (retry)", pending_id, e)
             return ChainOutcome(binding_id="?", state="aborted", links=(), reason="chain_store_unavailable")
         if state is None:
-            pending = self._gate.get_pending(pending_id)
-            if pending is not None and pending.chained:
-                # A chain link's pending whose chain state is gone (the process stopped after claiming
-                # it, or it was never written): never fall back to a plain resolve, which would fire the
-                # link alone. Re-delivering the event re-walks the chain (done links replay), finds this
-                # same pending for the paused link, and writes its chain state again.
-                _log.warning("chainpath resume: chain state for pending %s is lost — re-deliver the event",
-                             pending_id)
-                return ChainOutcome(binding_id=str(pending.authority.get("binding_id") or "?"),
-                                    state="aborted", links=(), reason="chain_state_lost")
             return None  # genuinely no chain owns this pending → the caller's 4a single-link fallback
 
         # Every abort path BELOW claims-out the chain state, leaving the gate pending live — so each one
@@ -940,9 +1031,7 @@ class ChainExecutor:
                 _log.warning("chainpath resume: STANDING binding %s not confirmed ACTIVE in the registry "
                              "(absent/inactive/unreadable) — cannot confirm continued authority; ABORTING",
                              binding.binding_id)
-                # withdraw, not reject: an unreadable registry is not a revoke (a real revoke has fenced
-                # the run already), so a re-delivery after recovery may propose the link again
-                self._consume_pending(pending_id, "standing_grant_unconfirmed", withdraw=True)
+                self._consume_pending(pending_id, "standing_grant_unconfirmed")
                 return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=(),
                                     paused_at=state.paused_at_link, reason="standing_grant_unconfirmed")
 
@@ -950,17 +1039,6 @@ class ChainExecutor:
         # re-screens §1.5, claims the pending). The gate writes the link's receipt.
         link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
-        if link_outcome.refused and link_outcome.reason.startswith("journal_error:"):
-            # the decision did not land, so the pending is still open: put the chain state back so a
-            # retry of this resolve finds its chain (best effort; a re-delivery rebuilds it otherwise)
-            try:
-                self._chain_store.add(state)
-            except Exception as e:  # noqa: BLE001
-                _log.error("chainpath resume: could not restore chain %s after a journal fault (%s): %s",
-                           state.chain_id, type(e).__name__, e)
-            return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
-                                paused_at=state.paused_at_link, reason=link_outcome.reason)
-
         if not link_outcome.fired:
             # denied / dropped / effect-failed → the chain ENDS here (no continuation). The chain state
             # is already claimed-out (removed), so it cannot be re-resumed.
@@ -993,12 +1071,11 @@ class ChainExecutor:
                          "unconfirmed (fail-closed abort for a standing grant)", binding_id, type(e).__name__, e)
             return None
 
-    def _consume_pending(self, pending_id: str, reason: str, *, withdraw: bool = False) -> None:
+    def _consume_pending(self, pending_id: str, reason: str) -> None:
         """DENY + consume an orphaned gate pending whose chain ABORTED, so a plain ``gate.resolve`` /
         sweep can never fire the link the chain decided to abort (the two-resource invariant: a pending
         owned by a chain is consumed when the chain aborts — codex HIGH). Fail-soft: a gate fault here
-        must not crash the resume (the chain is already aborted). ``withdraw`` marks an
-        infrastructure-fault abort: the pending is consumed but the journaled run is not cancelled.
+        must not crash the resume (the chain is already aborted).
 
         The deny SHOULD claim+remove the pending. If ``gate.resolve`` returns ``unknown_pending`` (the
         pending-store claim itself faulted → the record SURVIVES) the consume did NOT actually happen —
@@ -1007,8 +1084,7 @@ class ChainExecutor:
         never an outbound; a non-deliver allowlisted link would need this closed first)."""
         try:
             outcome = self._gate.resolve(pending_id, chain_owned=True, decision=ConfirmDecision(approved=False, by="on-loop",
-                                                                     reason=f"chain_aborted:{reason}",
-                                                                     withdraw=withdraw))
+                                                                     reason=f"chain_aborted:{reason}"))
         except Exception as e:  # noqa: BLE001 — the chain is already aborted; a consume fault is not fatal
             _log.error("chainpath: failed to consume orphaned pending %s (%s): %s — it MAY remain resolvable",
                        pending_id, type(e).__name__, e)

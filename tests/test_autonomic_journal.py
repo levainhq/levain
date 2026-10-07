@@ -214,8 +214,8 @@ def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_o
     # a person approved exactly these bytes; only UNDECIDED effects wait on a sibling's open decision
     j.start("r1", binding_id="b", generation=1)
     j.start("r2", binding_id="b", generation=1)
-    h1 = j.hold("r1", "pay", digest="p1")
-    h2 = j.hold("r2", "pay", digest="p2")
+    h1 = j.hold("r1", "pay", digest="p1", pending={})
+    h2 = j.hold("r2", "pay", digest="p2", pending={})
     assert j.decide(h2.hold_id, approve=True, digest="p2").ok
     pay = Effect()
     assert j.effect("r2", "pay", digest="p2", fn=pay, needs_decision=True).status is EffectStatus.DONE
@@ -225,19 +225,19 @@ def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_o
 
 def test_proposing_the_same_effect_again_finds_the_same_decision(j):
     j.start("r1", binding_id="b", generation=0)
-    first = j.hold("r1", "send", digest="d")
-    again = j.hold("r1", "send", digest="d")
+    first = j.hold("r1", "send", digest="d", pending={})
+    again = j.hold("r1", "send", digest="d", pending={})
     assert first.new_hold and not again.new_hold and first.hold_id == again.hold_id
     assert len(j.open_holds()) == 1
     j.decide(first.hold_id, approve=True, digest="d", by="human")
-    approved = j.hold("r1", "send", digest="d")
+    approved = j.hold("r1", "send", digest="d", pending={})
     assert approved.status is EffectStatus.APPROVED and approved.decided_by == "human"
 
 
 def test_proposing_different_bytes_under_an_open_decision_cancels_the_run(j):
     j.start("r1", binding_id="b", generation=0)
-    j.hold("r1", "send", digest="d1")
-    assert j.hold("r1", "send", digest="d2").status is EffectStatus.CANCELLED
+    j.hold("r1", "send", digest="d1", pending={})
+    assert j.hold("r1", "send", digest="d2", pending={}).status is EffectStatus.CANCELLED
     assert j.effect("r1", "send", digest="d1", fn=Effect()).status is EffectStatus.CANCELLED
 
 
@@ -281,3 +281,14 @@ def test_a_malformed_record_fails_closed(j, tmp_path):
         f.write('{"t":"result","run_id":"r1"}\n')     # parses, but is missing effect_id
     with pytest.raises(JournalCorruptError):
         j.effect("r1", "x", digest="d", fn=Effect())
+
+
+def test_a_rejection_cancels_its_run_in_the_same_record(j, tmp_path):
+    j.start("r1", binding_id="b", generation=0)
+    h = j.hold("r1", "send", digest="d", pending={"pending_id": "p1"})
+    before = len((tmp_path / "journal.jsonl").read_text().splitlines())
+    assert j.decide(h.hold_id, approve=False, digest="d").ok
+    lines = (tmp_path / "journal.jsonl").read_text().splitlines()
+    assert len(lines) == before + 1                                   # one record: decided AND cancelled
+    assert j.effect("r1", "later", digest="x", fn=Effect()).status is EffectStatus.CANCELLED
+    assert j.find_pending("p1")["decided"] is False
