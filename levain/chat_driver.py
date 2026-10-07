@@ -33,10 +33,34 @@ concurrently with the turn. That state machine (``active`` to ``awaiting_approva
 denied, with a one-shot request id, refusal of stale responses and reap on timeout, disconnect and
 shutdown) is slice S10 of the chat-to-primary build. The type reserves it; the host REFUSES a driver
 that declares ``in_turn`` rather than driving it through a path that cannot carry it.
+
+**What S10 adds, written down now so the S1 signatures do not have to move** (L2 review, 1006+18):
+the in-turn answer path is NEW members beside :meth:`~HarnessDriver.approve` / :meth:`~HarnessDriver.reject`
+(which stay the after-turn path): a request object carrying a one-shot request id, the raw call and its
+digest; an event that delivers it while the turn runs; an answer method that takes the request id and
+the digest the human saw; a stale-answer refusal. The driver owns the native request id, its one-shot
+consumption and the response write; the host owns its decision id, the digest the human saw, human
+authority and the timeouts. Rules S10 must keep: :meth:`~HarnessDriver.interrupt` and
+:meth:`~HarnessDriver.close` resolve every outstanding request as denied before they return, and a late
+answer to a reaped request never runs; the decision vocabulary is closed to one-shot forms (a cockpit
+approval of one raw call must never become a standing rule such as Codex's execpolicy amendment or an
+"always allow"); the host's deadline must not run while a turn is parked on a human; the digest is
+per request. Never emulate in-turn consent as after-turn (deny, record, rerun on approve): the model
+re-issues the call, so the bytes that run would not be the bytes approved.
+
+**Driver-author rules.** The host reads :meth:`~HarnessDriver.held_digest` and :attr:`~HarnessDriver.state`
+while holding its own lock, and its event sink takes that lock: a driver must never call ``on_event``
+while holding a lock that ``held_digest`` or ``state`` also takes, and neither may block on a reader
+loop. :meth:`~HarnessDriver.interrupt` is repeated about once a second until the job ends, so it must
+be idempotent. :meth:`~HarnessDriver.set_model` and :meth:`~HarnessDriver.set_effort` apply to the NEXT
+turn and are for an idle driver; per-turn choices travel in :class:`TurnOptions`. ``exit_code``,
+``nudged`` and ``tool_activity`` come from the OpenHands loop: a driver with no meaning for one reports
+the neutral value (``0`` or ``3`` by ``ok``, ``False``, an empty list), never an invented one.
 """
 from __future__ import annotations
 
 import abc
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, Sequence, runtime_checkable
@@ -50,6 +74,7 @@ __all__ = [
     "DriverUnsupported",
     "HarnessDriver",
     "OpenHandsDriver",
+    "TurnOptions",
     "TurnOutcome",
     "check_outcome",
 ]
@@ -93,6 +118,16 @@ class DriverCaps:
     can_list_models: bool = False
 
 
+@dataclass(frozen=True)
+class TurnOptions:
+    """Per-turn choices. Codex takes model and effort on each turn and Claude Code per process (per turn
+    under process-per-turn), so they travel with the turn rather than as racing session state. ``None``
+    leaves the harness default or the last :meth:`~HarnessDriver.set_model`."""
+
+    model: str | None = None
+    effort: str | None = None
+
+
 @runtime_checkable
 class TurnOutcome(Protocol):
     """What a driver returns from a turn, an approval or a refusal. :class:`levain.session.TurnResult`
@@ -106,6 +141,7 @@ class TurnOutcome(Protocol):
     gated: bool
     timed_out: bool
     pending: Sequence[Any]
+    held_digest: str | None
 
     @property
     def ok(self) -> bool: ...
@@ -118,10 +154,15 @@ def check_outcome(driver: "HarnessDriver", outcome: Any) -> None:
     """Raise :class:`DriverContractError` unless ``outcome`` keeps the contract's guarantees about a
     hold (module docstring). An outcome that already failed (``error`` set) is not checked: the host
     breaks that session and decides nothing on it."""
-    if getattr(outcome, "error", None) is not None:
+    if not isinstance(outcome, TurnOutcome):
+        raise DriverContractError(
+            "the driver's outcome does not carry the fields the host reads (reply, tool_activity, error, "
+            "nudged, gated, timed_out, pending, held_digest, ok, exit_code); a missing `gated` or "
+            "`pending` would read as 'nothing held'")
+    if outcome.error is not None:
         return
-    pending = tuple(getattr(outcome, "pending", ()) or ())
-    gated = bool(getattr(outcome, "gated", False))
+    pending = tuple(outcome.pending or ())
+    gated = bool(outcome.gated)
     if gated and not pending:
         raise DriverContractError(
             "the driver reported a halted turn with no held action: there is no consent row to show")
@@ -171,18 +212,21 @@ class HarnessDriver(abc.ABC):
     # -- turns and consent -------------------------------------------------------
 
     @abc.abstractmethod
-    def send_turn(self, message: str) -> TurnOutcome:
+    def send_turn(self, message: str, *, options: TurnOptions | None = None) -> TurnOutcome:
         """Send one operator message and run it to a result. A held action comes back as a halted
-        outcome carrying the raw calls (``after_turn``), never as an executed action."""
+        outcome carrying the raw calls (``after_turn``), never as an executed action. ``options`` a
+        driver's :attr:`caps` do not allow raise :class:`DriverUnsupported`."""
 
-    @abc.abstractmethod
     def approve(self) -> TurnOutcome:
-        """Run what the last halted outcome held. The host has already bound this to the digest it
-        showed; a driver that cannot run exactly that raises."""
+        """AFTER-TURN path: run what the last halted outcome held. The host has already bound this to the
+        digest it showed; a driver that cannot run exactly that raises. An ``in_turn`` driver never
+        gets this call."""
+        raise DriverUnsupported(f"{self.harness} has no after-turn approval")
 
-    @abc.abstractmethod
     def reject(self, reason: str) -> TurnOutcome:
-        """Refuse what the last halted outcome held, telling the entity ``reason``; nothing runs."""
+        """AFTER-TURN path: refuse what the last halted outcome held, telling the entity ``reason``;
+        nothing runs."""
+        raise DriverUnsupported(f"{self.harness} has no after-turn refusal")
 
     @abc.abstractmethod
     def held_digest(self) -> str | None:
@@ -191,7 +235,8 @@ class HarnessDriver(abc.ABC):
 
     @abc.abstractmethod
     def interrupt(self) -> None:
-        """Ask the running turn to stop. Called repeatedly, from another thread, until the job ends."""
+        """Ask the running turn to stop. Called repeatedly, from another thread, until the job ends, so
+        it is idempotent and tolerates a closed driver."""
 
     # -- optional, by capability -------------------------------------------------
 
@@ -230,6 +275,7 @@ class OpenHandsDriver(HarnessDriver):
     caps: DriverCaps = field(default=DriverCaps(), init=False)
     _session: Any = field(default=None, init=False, repr=False)
     _state: DriverState = field(default="closed", init=False, repr=False)
+    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
 
     def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
         if resume is not None:
@@ -239,8 +285,10 @@ class OpenHandsDriver(HarnessDriver):
         def _sink(line: str) -> None:
             on_event(DriverEvent("activity", line))
 
-        self._session = self.opener(self.entity_dir, on_event=_sink)
-        self._state = "idle"
+        session = self.opener(self.entity_dir, on_event=_sink)
+        with self._lock:
+            self._session = session
+            self._state = "idle"
 
     @property
     def native(self) -> Any:
@@ -251,17 +299,22 @@ class OpenHandsDriver(HarnessDriver):
         return self._state
 
     def _run(self, call: Callable[[Any], Any]) -> Any:
-        self._state = "active"
+        with self._lock:
+            self._state = "active"
+            session = self._session
         result: Any = None
         try:
-            result = call(self._session)
+            result = call(session)
             return result
         finally:
             gated = bool(getattr(result, "gated", False)) and getattr(result, "error", None) is None
-            if self._state == "active":
-                self._state = "awaiting_approval" if gated else "idle"
+            with self._lock:
+                if self._state == "active":
+                    self._state = "awaiting_approval" if gated else "idle"
 
-    def send_turn(self, message: str) -> TurnOutcome:
+    def send_turn(self, message: str, *, options: TurnOptions | None = None) -> TurnOutcome:
+        if options is not None and (options.model is not None or options.effort is not None):
+            raise DriverUnsupported("openhands takes its model from the operator's command line, per server")
         return self._run(lambda s: s.run_turn(message))
 
     def approve(self) -> TurnOutcome:
@@ -275,11 +328,14 @@ class OpenHandsDriver(HarnessDriver):
         return s.held_digest() if s is not None else None
 
     def interrupt(self) -> None:
-        self._session.request_stop()
+        s = self._session
+        if s is not None:
+            s.request_stop()
 
     def close(self) -> None:
-        s, self._session = self._session, None
-        self._state = "closed"
+        with self._lock:
+            s, self._session = self._session, None
+            self._state = "closed"
         if s is not None:
             s.close()
 

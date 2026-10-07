@@ -335,3 +335,33 @@ def test_a_real_turn_result_satisfies_the_outcome_protocol_the_host_reads():
 
     assert isinstance(TurnResult(reply="hi"), TurnOutcome)
     assert not isinstance(object(), TurnOutcome)
+
+
+def test_an_outcome_missing_the_fields_the_host_reads_is_refused(tmp_path):
+    """L2: a driver that omits `gated` or `pending` would read as 'nothing held', which is fail-open on
+    exactly the property check_outcome exists for."""
+    class Bare:
+        reply, tool_activity, error, nudged, timed_out, ok, exit_code = "x", [], None, False, False, True, 0
+
+    class Raw(_Fake):
+        def send_turn(self, message, *, options=None):
+            return Bare()   # type: ignore[return-value]
+
+    d = Raw([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "failed" and "fields the host reads" in st["error"]
+
+
+def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
+    from levain.chat_driver import TurnOptions
+
+    oh = OpenHandsDriver(tmp_path, lambda p, on_event: None)
+    with pytest.raises(DriverUnsupported):
+        oh.send_turn("x", options=TurnOptions(model="m"))
+    d = _Fake([])
+    with pytest.raises(DriverUnsupported):
+        HarnessDriver.approve(d)      # the base default, not the fake's override
+    with pytest.raises(DriverUnsupported):
+        HarnessDriver.reject(d, "no")
