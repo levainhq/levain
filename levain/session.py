@@ -49,6 +49,7 @@ from typing import Any, Callable
 
 from levain.firing.encoding import scan_text
 from levain.firing.agent_reply import (
+    FINISH_ACTION_KIND,
     LEVAIN_ACT_NUDGE,
     finish_message,
     humanize_finish_json,
@@ -485,12 +486,14 @@ def latest_agent_text(events) -> str | None:
     return scan_text("\n".join(parts)).text if parts else None
 
 
-def _action_thoughts(events) -> list[str]:
-    """The text a model sent beside its structured calls this turn (each agent action's ``thought``). Duck-typed."""
+def _finish_thoughts(events) -> list[str]:
+    """The text a model sent beside a parsed ``finish`` this turn (that action's ``thought``). Duck-typed."""
     evs = list(events)
     out: list[str] = []
     for e in evs[turn_start(evs):]:
-        if getattr(e, "source", None) != "agent" or getattr(e, "action", None) is None:
+        if getattr(e, "source", None) != "agent":
+            continue
+        if getattr(getattr(e, "action", None), "kind", None) != FINISH_ACTION_KIND:
             continue
         text = " ".join(t.text for t in (getattr(e, "thought", None) or ()) if isinstance(getattr(t, "text", None), str))
         if text.strip():
@@ -1142,14 +1145,13 @@ class EntitySession:
 
         events = self.conversation.state.events
         reply = latest_agent_text(events)
-        flagged, unread = self._unreadable_texts(reply, events)
-        if unread:
-            # What the model sent that is not already in the reply (a call beside a parsed finish lives only in the
-            # action's thought) goes in front of it: the surfaces show the reply as "what the model sent", and a
-            # notice above "Created x" alone would hide the call that did not run.
-            missing = [t for t in unread if t not in reply]
-            if missing:
-                reply = scan_text("\n".join([*missing, reply])).text
+        flagged, beside = self._unreadable_texts(reply, events)
+        # A flagged text sent beside a parsed finish lives only in that action's thought. It goes in front of the reply
+        # (or is the reply, when the finish carried none): the surfaces show the reply as "what the model sent", and a
+        # notice above "Created x" alone would hide the call that did not run.
+        missing = [t for t in (scan_text(b).text for b in beside) if not reply or t not in reply]
+        if missing:
+            reply = "\n".join([*missing, reply] if reply else missing)
         return TurnResult(
             reply=reply,
             tool_activity=turn_tool_activity(events, self.workspace),
@@ -1159,20 +1161,21 @@ class EntitySession:
         )
 
     def _unreadable_texts(self, reply: str | None, events) -> tuple[bool, list[str]]:
-        """Whether the reply is flagged, and the texts of this turn that :func:`unreadable_tool_call` flags. Each agent
-        message is checked on its own, never their join: a call that is the whole of one message (a plan, the act-now
-        nudge, then the call) is not the whole of the join, and the shapes that need the whole text would miss it. The text the model sent beside a
-        structured call (the action's ``thought``) is checked too: beside a parsed ``finish`` it is otherwise never
-        shown. A classifier failure fails CLOSED (flagged, nothing to add: the reply is shown under the notice and a
-        headless run exits 7); the turn itself never fails."""
-        if not reply:
-            return False, []
+        """Whether the turn's reply is flagged, and the flagged texts sent beside a parsed ``finish``.
+
+        Each agent message is checked on its own, never their join: a call that is the whole of one message (a plan,
+        the act-now nudge, then the call) is not the whole of the join, and the shapes that need the whole text would
+        miss it. The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
+        when the finish carried no message: otherwise it is never shown. Thoughts beside other actions are not: such
+        an action ran, and its thought often restates that very call. A classifier failure fails CLOSED (flagged,
+        nothing to add: a headless run exits 7); the turn itself never fails."""
         try:
             names = self._tool_names()
-            texts = [t for t in (*_agent_parts(events), *_action_thoughts(events)) if unreadable_tool_call(t, names)]
+            beside = [t for t in _finish_thoughts(events) if unreadable_tool_call(t, names)]
+            parts = bool(reply) and any(unreadable_tool_call(t, names) for t in _agent_parts(events))
         except Exception:  # noqa: BLE001 — undeterminable is not "readable"
-            return True, []
-        return bool(texts), texts
+            return bool(reply), []
+        return bool(beside) or parts, beside
 
     def _tool_names(self) -> frozenset[str]:
         """The names of this conversation's tools, or none when they cannot be read (the shapes that name a tool are

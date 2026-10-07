@@ -158,7 +158,7 @@ def humanize_finish_json(text: str) -> str:
     call in it must be ``think`` or ``finish``: a payload that also holds any other call (``terminal``, a
     name it does not know) is kept whole, because that call did not run, and answering with the finish
     message ("Created x") would hide it from the unreadable-call check that reads this function's output."""
-    if len(text) > MAX_CLASSIFIED_BYTES:
+    if _over_bound(text):
         return text  # never decoded whole: a large array of calls would expand to many times its size in memory
     calls = _json_calls(text.strip())
     if not calls or any(name not in _UNWRAPPABLE_CALLS for name, _ in calls):
@@ -217,11 +217,12 @@ _NAMED_CALL_MARKUP = (
     re.compile(r"<tool_call>\s*([A-Za-z_][\w.-]*)\s*</tool_call>"),
     re.compile(r"functions\.([A-Za-z_][\w.-]*):\d+\s*\{"),
 )
-# Where a function-call JSON object may start inside other text.
-_JSON_CALL_START = re.compile(r"\{\s*\"(?:name|type)\"\s*:")
-# A call's name and the key of its arguments, read without decoding: for text the decoder is not given (over the
-# bound, or nested past its limit).
-_LEXICAL_CALL = re.compile(r"\"name\"\s*:\s*\"([A-Za-z_][\w.-]*)\"\s*,\s*\"(?:arguments|parameters)\"\s*:")
+# Where a JSON object may start inside other text: a brace and a string key, any key, since key order means nothing.
+_JSON_CALL_START = re.compile(r"\{\s*\"")
+# Read without decoding, for text the decoder is not given (over the bound, or nested past its limit): a call's name,
+# and an arguments key anywhere in that text. Order-free, and looser than a decode, so it errs toward flagging.
+_LEXICAL_NAME = re.compile(r"\"name\"\s*:\s*\"([A-Za-z_][\w.-]*)\"")
+_LEXICAL_ARGS = re.compile(r"\"(?:arguments|parameters)\"\s*:")
 _SPACE = re.compile(r"\s*")
 
 # The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
@@ -330,13 +331,11 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     all of the reply (bare, or the whole of one code block) when every call names one, or one such call among other
     text outside code; with no tool names known, that shape is not flagged. A reply over
     :data:`MAX_CLASSIFIED_BYTES` is neither parsed as Markdown nor decoded: all of it is searched as if no part were
-    code, and a JSON call in it is read by its name and arguments key. It reads
+    code, and a JSON call in it is read by a tool's name and an arguments key appearing in it. It reads
     the shape only: the call is never repaired or run."""
     if not text:
         return False
-    # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
-    # bytes, and a reply that size is never encoded just to be measured (codex L3 r7).
-    if len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
+    if _over_bound(text):
         # Over the bound nothing is decoded either: a large array of calls would expand to many times its size.
         regions = [text]
         found_json = _lexical_call(text, 0, tool_names)
@@ -354,15 +353,24 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
     )
 
 
-def _lexical_call(text: str, pos: int, tool_names) -> bool:
-    return any(m.group(1) in tool_names for m in _LEXICAL_CALL.finditer(text, pos))
+def _lexical_call(text: str, pos: int, tool_names, end: int | None = None) -> bool:
+    end = len(text) if end is None else end
+    return _LEXICAL_ARGS.search(text, pos, end) is not None and any(
+        m.group(1) in tool_names for m in _LEXICAL_NAME.finditer(text, pos, end))
+
+
+def _over_bound(text: str) -> bool:
+    """Whether ``text`` is over :data:`MAX_CLASSIFIED_BYTES` in UTF-8. Characters first: UTF-8 spends at least one byte
+    per character, so more characters than the bound means more bytes, and that text is never encoded just to be
+    measured (codex L3 r7)."""
+    return len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES
 
 
 def _embedded_call(text: str, tool_names) -> bool:
     """Whether ``text`` holds, among other text, a function-call JSON object naming one of ``tool_names`` (the head's
     ruling, 2026-10-07: the notice is true then, and the text is still shown under it). Each character is read once:
     a value that decodes is searched whole for a call nested in it and the scan resumes after it; the span a failed
-    decode read is searched lexically (:data:`_LEXICAL_CALL`) and the scan resumes where it failed; text nested past
+    decode read is searched lexically (:func:`_lexical_call`) and the scan resumes where it failed; text nested past
     the decoder's limit is read lexically from there on. Retrying at each inner brace instead was quadratic (a valid
     5,000-deep nest under the bound took 6 s). Called only under :data:`MAX_CLASSIFIED_BYTES`."""
     decoder = json.JSONDecoder()
@@ -374,7 +382,7 @@ def _embedded_call(text: str, tool_names) -> bool:
             return _lexical_call(text, m.start(), tool_names)
         except json.JSONDecodeError as exc:
             end = max(exc.pos, m.start() + 1)
-            if any(c.group(1) in tool_names for c in _LEXICAL_CALL.finditer(text, m.start(), end)):
+            if _lexical_call(text, m.start(), tool_names, end):
                 return True
             pos = end
             continue

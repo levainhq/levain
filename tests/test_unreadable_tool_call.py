@@ -670,3 +670,76 @@ def test_a_deep_valid_nest_under_the_bound_is_one_pass():
     assert not unreadable_tool_call(nest, TOOLS)
     assert not unreadable_tool_call(nest[:-d], TOOLS)
     assert time.perf_counter() - t < 3
+
+
+# ---------- 0.6.10 L3 r2 ----------
+
+CALL_X = '{"name": "terminal", "arguments": {"command": "touch x"}}'
+
+
+def _session_with_events(tmp_path, events):
+    sess = _leaking_session(tmp_path, "unused")
+
+    def run():
+        sess.conversation.state.events.extend(events)
+        sess.conversation.state.execution_status = "finished"
+
+    sess.conversation.run = run
+    return sess
+
+
+def _action(kind, tool, thought, **fields):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(source="agent", tool_name=tool, action=SimpleNamespace(kind=kind, **fields),
+                           thought=[SimpleNamespace(text=thought)] if thought else [])
+
+
+def test_a_call_beside_a_finish_with_no_message_is_the_reply(tmp_path):
+    # codex + gemini: with no reply the thought was never checked, so the turn exited 1 with the call hidden
+    result = _session_with_events(tmp_path, [_action("FinishAction", "finish", CALL_X, message="")]).run_turn("x")
+    assert result.reply == CALL_X and result.unreadable_call is True and result.exit_code == 7
+
+
+def test_a_thought_restating_a_call_that_ran_is_not_flagged(tmp_path):
+    # complement + codex: the thought beside an executed terminal call restated it, and the turn exited 7
+    events = [_action("TerminalAction", "terminal", CALL_X, command="touch x"),
+              _action("FinishAction", "finish", None, message="done")]
+    result = _session_with_events(tmp_path, events).run_turn("x")
+    assert result.reply == "done" and result.unreadable_call is False and result.exit_code == 0
+
+
+def test_a_flagged_message_is_not_repeated_when_its_text_was_repaired(tmp_path):
+    # complement + glm: the repaired reply did not contain the raw part, so the part was prepended a second time
+    from types import SimpleNamespace
+
+    from tests.test_session import _Event
+
+    events = [_Event("agent", ["cafÃ© " + CALL_X]), _action("FinishAction", "finish", None, message="ok")]
+    result = _session_with_events(tmp_path, events).run_turn("x")
+    assert result.unreadable_call is True and result.reply.count(CALL_X) == 1
+
+
+@pytest.mark.parametrize("reply", [
+    # codex + glm: detection depended on "name" coming first
+    'prefix {"arguments": {"command": "ls"}, "name": "terminal"} suffix',
+    '{"id": "1", "name": "terminal", "arguments": {}} and more',
+])
+def test_a_call_is_found_whatever_its_key_order(reply):
+    assert unreadable_tool_call(reply, TOOLS)
+
+
+def test_over_the_bound_key_order_and_extra_keys_do_not_hide_a_call():
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
+
+    pad = " x" * MAX_CLASSIFIED_BYTES
+    assert unreadable_tool_call('{"arguments": {}, "name": "terminal"}' + pad, TOOLS)
+    assert unreadable_tool_call('{"name": "terminal", "id": "1", "arguments": {}}' + pad, TOOLS)
+
+
+def test_humanize_measures_its_bound_in_bytes():
+    # codex LOW: 190,044 characters of emoji (760,044 bytes) were under the character bound and decoded whole
+    from levain.firing.agent_reply import humanize_finish_json
+
+    emoji = '{"name": "finish", "arguments": {"message": "' + "\U0001F600" * 190_000 + '"}}'
+    assert humanize_finish_json(emoji) == emoji
