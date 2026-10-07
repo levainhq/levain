@@ -294,7 +294,7 @@ class GitLedger:
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return {}
 
     def save_state(self, **changes) -> None:
@@ -654,7 +654,9 @@ class GitLedger:
         try:
             with self.lock(name="pins.lock", timeout=5.0):
                 stored, bad = self._pins()
-                if bad or self._pin_violations(stored, datas):
+                if bad:
+                    raise LedgerReadError(bad)
+                if self._pin_violations(stored, datas):
                     raise _PinRace()
                 text = json.dumps(new, sort_keys=True)
                 digest = self._pins_digest()
