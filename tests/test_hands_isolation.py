@@ -136,12 +136,10 @@ def test_the_workspace_acl_names_both_users_not_a_group(tmp_path: Path, host) ->
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_the_operator_gets_no_safe_directory_entry_and_the_hands_trust_all(tmp_path: Path, host) -> None:
-    # A repo the hands user controls must never be trusted by the operator's git (its config and
-    # hooks would run as the operator). The hands user's git runs only in its confined shell.
-    plan = _setup(tmp_path, host=host)
-    safe = [a for a in _argvs(plan) if "safe.directory" in a]
-    assert len(safe) == 1 and safe[0][2] == plan.hands_user and safe[0][-1] == "*"
+def test_setup_writes_no_safe_directory_on_either_side(tmp_path: Path, host) -> None:
+    # Phill 2026-10-07, "go with H": every workspace repository belongs to the hands user, so neither
+    # side needs an exception, and the operator's git refuses them by its own ownership check.
+    assert "safe.directory" not in _joined(_setup(tmp_path, host=host))
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
@@ -493,3 +491,15 @@ def test_the_warn_badge_prints_its_hint(capsys) -> None:
     doctor._emit(doctor.CheckResult("x", True, "detail", hint="do this", warn=True))
     out = capsys.readouterr().out
     assert "do this" in out and "[OK]" not in out
+
+
+def test_undo_gives_files_back_to_the_operator_but_the_entitys_repositories_to_root(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: calls.append(argv) or (True, ""))
+    monkeypatch.setattr(hands.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
+    assert hands._chown_back(tmp_path, 499, "alice:20") == (True, "")
+    to_root, to_op = calls
+    assert to_root[to_root.index("-name") + 1] == ".git" and "0:0" in to_root and "-R" in to_root
+    assert to_root.index("-uid") < to_root.index("-exec")
+    assert to_op[to_op.index("-name") + 1] == ".git" and "-prune" in to_op and "-o" in to_op
+    assert "alice:20" in to_op and "0:0" not in to_op

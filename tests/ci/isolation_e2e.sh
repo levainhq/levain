@@ -87,16 +87,46 @@ check "operator appends to it" bash -c "echo o >> '$WS/from-hands'"
 check "operator creates a file" bash -c "echo o > '$WS/from-op'"
 check "hands appends to it" as_hands bash -c "cd '$WS' && echo h >> from-op"
 as_hands /usr/bin/python3 -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')" 2>/dev/null
-if bash -c "echo o >> '$WS/atomic-0600'" 2>/dev/null; then info "operator can append to a 0600 file the hands wrote atomically"; else info "operator cannot append to a 0600 file the hands wrote atomically (ACL mask follows the file mode)"; fi
-check "operator git repo" bash -c "cd '$WS' && git init -q repo && cd repo && git commit -q --allow-empty -m init"
-check "hands git status in the operator's repo" as_hands bash -c "cd '$WS/repo' && git status --short"
-check "hands git commit in it, with the operator's git identity" as_hands bash -c "cd '$WS/repo' && echo x > f && git add f && git commit -q -m h && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
-check "operator git log sees it" bash -c "cd '$WS/repo' && test \"\$(git log --oneline | wc -l)\" -eq 2"
-as_hands bash -c "cd '$WS' && git init -q repo-h && cd repo-h && git commit -q --allow-empty -m h" >/dev/null 2>&1
-# Without the runner image's own system/global entries, so this measures git's ownership check and
-# Levain's part in it (no operator entry), not the image's defaults.
+if bash -c "echo o >> '$WS/atomic-0600'" 2>/dev/null; then info "operator can append to a 0600 file the hands wrote atomically"; else
+  info "operator cannot append to a 0600 file the hands wrote atomically (ACL mask follows the file mode)"
+  "$PY" -c 'import json,subprocess,sys; from levain.firing import ws_git; h=ws_git.load_hands(sys.argv[1]); sys.exit(subprocess.run(ws_git.mask_repair_argv(h)).returncode)' "$E" >/dev/null 2>&1
+  check "after the mask repair the operator can append to it" bash -c "echo o >> '$WS/atomic-0600'"
+fi
+echo "== git: every repository is the hands user's (H)"
+CANARY_LOG=/tmp/levain-iso-canary; : > "$CANARY_LOG"; chmod 666 "$CANARY_LOG"
+PLANT="/usr/bin/id -un >> $CANARY_LOG"
 printf '[user]\n\tname = CI Operator\n\temail = ci-operator@invalid\n' > /tmp/levain-iso-clean-gitconfig
-refused "operator git trusts a repository the hands user created" env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/levain-iso-clean-gitconfig bash -c "cd '$WS/repo-h' && git status --short"
+opgit() { env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/levain-iso-clean-gitconfig git "$@"; }
+export -f opgit
+check "hands creates and commits a repository" as_hands bash -c "cd '$WS' && git init -q repo-h && cd repo-h && echo a > a && git add a && git commit -q -m one"
+check "hands commits again, branches and runs gc" as_hands bash -c "cd '$WS/repo-h' && echo b > b && git add b && git commit -q -m two && git checkout -q -b side && git gc -q"
+check "the entity's commit carries the operator's git identity" as_hands bash -c "cd '$WS/repo-h' && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
+as_hands bash -c "cd '$WS/repo-h' && for h in pre-commit post-checkout post-commit; do printf '#!/bin/sh\n$PLANT\n' > .git/hooks/\$h; chmod +x .git/hooks/\$h; done"
+refused "operator git reads a repository the hands user owns" opgit -C "$WS/repo-h" status --short
+refused "operator git log in it" opgit -C "$WS/repo-h" log -1
+check "ws-git status works on the hands repository" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+check "ws-git log works" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" log -1 --oneline
+check "ws-git checkout (would fire post-checkout) works" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" checkout -q -
+as_hands bash -c "cd '$WS' && git init -q repo-p && cd repo-p && git config core.fsmonitor '$PLANT' && git config alias.st '!$PLANT'"
+refused "ws-git on a repository whose config names a program" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-p" status
+as_hands bash -c "cd '$WS' && git init -q repo-i && cd repo-i && printf '[core]\n\tfsmonitor = $PLANT\n' > /tmp/levain-iso-evil.cfg && git config include.path /tmp/levain-iso-evil.cfg"
+refused "ws-git on a repository that includes another config" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-i" status
+opgit -C "$WS/repo-h" status >/dev/null 2>&1; opgit -C "$WS/repo-p" status >/dev/null 2>&1
+if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator"; else pass "no entity-planted code ran as the operator"; fi
+if grep -qx "$H" "$CANARY_LOG"; then info "planted code ran as the hands user under ws-git"; else pass "no planted code ran at all under ws-git"; fi
+check "doctor warns that the runner's git trusts every repository" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'EVERY repository'"
+
+echo "== an operator-created repository: doctor fails, ws-adopt hands it over"
+check "operator creates a repository in the workspace" bash -c "cd '$WS' && opgit init -q repo-op && cd repo-op && echo o > o && opgit add o && opgit commit -q -m op"
+refused "doctor passes with it there" "$LEVAIN" doctor --path "$E"
+check "doctor names it" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'belong to you'"
+check "ws-adopt hands it over" "$LEVAIN" ws-adopt --path "$E" "$WS/repo-op"
+check "it now belongs to the hands user" test "$(stat -c %u "$WS/repo-op/.git" 2>/dev/null || stat -f %u "$WS/repo-op/.git")" = "$HID"
+refused "operator git reads it after adoption" opgit -C "$WS/repo-op" status --short
+check "the entity commits in it" as_hands bash -c "cd '$WS/repo-op' && echo e > e && git add e && git commit -q -m entity"
+check "its history came across" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-op" log --oneline -2
+if "$LEVAIN" doctor --path "$E" | grep -q 'belong to you'; then fail "doctor still reports an operator repository"; else pass "doctor no longer reports one"; fi
+rm -rf "$WS"/repo-op.operator-*
 
 echo "== undo, with a hands process still running"
 sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &
@@ -111,9 +141,12 @@ if [ -e "$CRON_DENY" ]; then refused "hands user still in $CRON_DENY" grep -qx "
 if [ -n "$(cfgval hands_user)$(cfgval hands_uid)$(cfgval hands_workspace)" ]; then fail "hands keys still recorded"; else pass "hands keys removed from confinement.json"; fi
 check "the non-empty workspace is kept" test -d "$WS"
 check "operator owns the files the hands created" test -O "$WS/from-hands"
-if [ -n "$(find "$(dirname "$WS")" -uid "$HID" -print -quit 2>/dev/null)" ]; then fail "files still owned by the dead uid"; else pass "no file left owned by the dead uid"; fi
+if [ -n "$(sudo find "$(dirname "$WS")" -uid "$HID" -print -quit 2>/dev/null)" ]; then fail "files still owned by the dead uid"; else pass "no file left owned by the dead uid"; fi
 check "operator creates a file in the workspace after undo" bash -c "echo z > '$WS/after-undo'"
-check "operator can still commit in the repo the hands wrote to" bash -c "cd '$WS/repo' && echo y > g && git add g && git commit -q -m y"
+check "the entity's repository went to root, not to the operator" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = 0
+refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
+check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
+if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator after undo"; else pass "no entity-planted code ran as the operator after undo"; fi
 if [ "$(uname)" = Darwin ]; then
   if ls -leR "$(dirname "$WS")" 2>/dev/null | grep -qE '^ [0-9]+: '; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
 else

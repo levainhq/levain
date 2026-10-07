@@ -997,6 +997,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     iso_p.set_defaults(func=_cmd_setup_isolation)
 
+    wsg_p = subparsers.add_parser(
+        "ws-git",
+        help="Run git in the entity's workspace as the entity's user, with hooks and the like off.",
+        description=(
+            "Every repository in the workspace `levain setup-isolation` created belongs to the "
+            "entity's user, and your own git refuses them. This runs git as that user, without "
+            "hooks or any program a repository's config could name, and refuses a repository "
+            "whose config sets anything beyond remotes, branches and core basics."
+        ),
+    )
+    wsg_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsg_p.add_argument("-C", dest="repo", type=Path, default=Path.cwd(),
+                       help="Repository inside the workspace (default: cwd).")
+    wsg_p.add_argument("git_args", nargs=argparse.REMAINDER, help="Arguments for git, e.g. status, log -5.")
+    wsg_p.set_defaults(func=_cmd_ws_git)
+
+    wsa_p = subparsers.add_parser(
+        "ws-adopt",
+        help="Hand a repository you created in the entity's workspace over to the entity's user.",
+        description=(
+            "A repository you created inside the workspace is one your git trusts and the "
+            "entity can write to. This moves it aside and replaces it with a clone owned by the "
+            "entity's user. Committed history and branches come across; your original stays at "
+            "<repo>.operator-<time>."
+        ),
+    )
+    wsa_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsa_p.add_argument("repo", type=Path, help="The repository to adopt.")
+    wsa_p.set_defaults(func=_cmd_ws_adopt)
+
     from levain.team.cli import register as _register_team
 
     _register_team(subparsers)
@@ -1808,6 +1838,19 @@ def _cmd_setup_isolation(args: argparse.Namespace) -> int:
     from levain.firing.hands import cmd_setup_isolation
 
     return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run)
+
+
+def _cmd_ws_git(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_git
+
+    git_args = args.git_args[1:] if args.git_args[:1] == ["--"] else args.git_args
+    return cmd_ws_git(args.path, args.repo, git_args)
+
+
+def _cmd_ws_adopt(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_adopt
+
+    return cmd_ws_adopt(args.path, args.repo)
 
 
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:

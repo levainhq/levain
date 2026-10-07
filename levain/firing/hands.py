@@ -268,12 +268,10 @@ def plan_setup(
     as_hands = ("/usr/bin/sudo", "-u", hands, "/usr/bin/env", "-i", f"HOME={home}", f"PATH={SECURE_PATH}")
     git, keygen = _abs("git"), _abs("ssh-keygen")
     key = deploy_key_path(home)
+    # No safe.directory on either side (Phill, 2026-10-07: "go with H"): every repository in the
+    # workspace belongs to the hands user, so the hands user's git needs no exception and the
+    # operator's git refuses them by its own ownership check.
     steps += [
-        # The hands user's git runs only inside its confined shell, so trusting every repository
-        # costs nothing a hook could not already do there; it works on any git version (the
-        # `<dir>/*` form needs git 2.46). The OPERATOR gets no safe.directory entry.
-        Step("let the hands user's git use repositories it does not own",
-             (*as_hands, git, "config", "--global", "safe.directory", "*")),
         Step("create the hands user's .ssh", (*as_hands, "/bin/mkdir", "-p", "-m", "700", str(key.parent))),
         Step("generate the entity's own ssh key (register it as a deploy key)",
              (*as_hands, keygen, "-q", "-t", "ed25519", "-N", "", "-C", f"levain {hands}", "-f", str(key)),
@@ -388,11 +386,30 @@ def _kill_all(uid: int, *, attempts: int = 20) -> tuple[bool, str]:
 
 
 def _chown_back(tree: Path, uid: int, owner: str) -> tuple[bool, str]:
-    """Hand every file ``uid`` owns under ``tree`` to ``owner`` (user:group). Runs only after
-    :func:`_kill_all` succeeded, so nothing can swap a directory for a symlink under it."""
+    """Hand every file ``uid`` owns under ``tree`` to ``owner`` (user:group), EXCEPT the entity's
+    repositories: each ``.git`` it owns goes to root. A ``.git`` given to the operator would carry
+    whatever config and hooks the entity wrote into it, and the operator's git would then run them;
+    a root-owned one the operator's git refuses, and root's id, unlike a retired one, is never
+    reused. Runs only after :func:`_kill_all` succeeded, so nothing can swap a directory for a
+    symlink under it."""
     if not tree.exists():
         return True, "no workspace"
-    return _run_ok((_abs("find"), str(tree), "-uid", str(uid), "-exec", _abs("chown"), "-h", owner, "{}", "+"))
+    find, chown = _abs("find"), _abs("chown")
+    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-uid", str(uid), "-prune",
+                       "-exec", chown, "-R", "-h", "0:0", "{}", "+"))
+    if not ok:
+        return ok, why
+    ok, why = _run_ok((find, str(tree), "-name", ".git", "-prune", "-o", "-uid", str(uid),
+                       "-exec", chown, "-h", owner, "{}", "+"))
+    if not ok:
+        return ok, why
+    repos = sorted(str(Path(p).parent) for p in subprocess.run(
+        [find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune"],
+        capture_output=True, text=True, cwd="/").stdout.split())
+    if repos:
+        return True, ("the entity's repositories are now root's, so your git will not run anything "
+                      "it wrote into them; clone what you want to keep: " + ", ".join(repos))
+    return True, ""
 
 
 def _remove_if_empty(ws: Path) -> tuple[bool, str]:

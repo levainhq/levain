@@ -931,13 +931,35 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     if not ok:
         return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
                             f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
+    from levain.firing.ws_git import operator_owned_gitdirs, wildcard_safe_directory
+
+    extra: list[CheckResult] = []
+    wildcard = wildcard_safe_directory()
+    if wildcard:
+        extra.append(CheckResult(
+            "git trust", True,
+            "your git trusts EVERY repository (safe.directory = * in " + ", ".join(wildcard) + "). That "
+            "switches off the check that keeps your git from running code the entity writes into a "
+            "repository in its workspace.",
+            hint="remove the `safe.directory = *` line, or replace it with the specific paths you need",
+            warn=True,
+        ))
+    owned = operator_owned_gitdirs(cfg.hands_workspace, cfg.hands_uid)
+    if owned:
+        return [CheckResult(
+            name, False,
+            f"{len(owned)} repository(ies) in the workspace belong to you, not the entity's user: "
+            + ", ".join(str(g.parent) for g in owned[:3]) + ". Your git trusts them and the entity "
+            "can write their config and hooks, which your git would then run as you.",
+            hint="levain ws-adopt <repository>, or move it out of the workspace",
+        ), *extra]
     return [CheckResult(
         name, True,
         f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but this version of "
         "levain still runs the entity's bash as you",
         hint="the change that starts bash as the hands user is not in this build yet",
         warn=True,
-    )]
+    ), *extra]
 
 
 def _check_store(install: Path) -> list[CheckResult]:
