@@ -556,3 +556,75 @@ def test_the_host_ignores_a_driver_event_that_is_not_a_driver_event(tmp_path):
     d.sink("a plain string, not a DriverEvent")            # type: ignore[misc]
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "done"
+
+
+def test_a_pending_row_attribute_is_read_once_and_validated_from_that_read():
+    class Shifty:
+        detail, reason, recognized = "d", "r", True
+
+        def __init__(self):
+            self.n = 0
+
+        @property
+        def tool_name(self):
+            self.n += 1
+            return "terminal" if self.n == 1 else 12345
+
+        @property
+        def full(self):
+            self.n += 1
+            return "{}" if self.n % 2 else ["not", "a", "str"]
+
+    d = _Fake([])
+    d._state = "awaiting_approval"
+    snap = snapshot_outcome(d, _Out(reply=None, gated=True, pending=(Shifty(),), held_digest="d"))
+    assert snap.pending[0].tool_name == "terminal" and isinstance(snap.pending[0].full, str)
+
+
+def test_a_result_that_cannot_report_gated_still_releases_the_turn_and_close_returns(tmp_path):
+    class Odd:
+        @property
+        def gated(self):
+            raise ValueError("boom")
+
+    class Sess:
+        def run_turn(self, m):
+            return Odd()
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess())
+    d.open(lambda e: None)
+    d.send_turn("x")
+    assert d.state == "awaiting_approval"        # unreadable reads as held: fail closed
+    t = threading.Thread(target=d.close)
+    t.start()
+    t.join(5)
+    assert not t.is_alive() and d.state == "closed"
+
+
+def test_a_turn_is_refused_and_state_reads_active_while_close_waits_for_it(tmp_path):
+    hands = _Hands()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"))
+    t.start()
+    assert hands.entered.wait(5)
+    hands.stop.clear()
+    orig = hands.request_stop
+    hands.request_stop = lambda: hands.log.append("stop-held")   # the turn ignores stop until released
+    c = threading.Thread(target=d.close)
+    c.start()
+    deadline = time.monotonic() + 5
+    while "stop-held" not in hands.log and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert d.state == "active"
+    with pytest.raises(RuntimeError, match="not open"):
+        d.send_turn("y")
+    orig()
+    c.join(5), t.join(5)
+    assert d.state == "closed"

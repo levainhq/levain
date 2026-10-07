@@ -172,8 +172,8 @@ class PendingApproval:
 class TurnSnapshot:
     """A turn's outcome read ONCE, into plain immutable values. The host validates this object and then
     serialises this same object, so what was checked is what is recorded: nothing is read from the
-    driver's live result a second time (a result that changed between the check and the record, or whose
-    fields are computed, could otherwise pass one and differ at the other)."""
+    driver's live result a second time (a result that changed between the check and the record could otherwise pass one and differ at the other;
+    ``ok`` and ``exit_code`` are the result's own derived values, read once with the rest and not re-derived here)."""
 
     reply: str | None
     tool_activity: tuple[Any, ...]
@@ -191,6 +191,19 @@ class TurnSnapshot:
 _ABSENT = object()
 _OUTCOME_FIELDS = ("reply", "tool_activity", "error", "nudged", "gated", "timed_out", "pending",
                    "held_digest", "ok", "exit_code")
+
+
+def _pending_row(p: Any) -> PendingApproval:
+    """One held call, each attribute read ONCE into a local and validated from that local."""
+    name, detail, full = getattr(p, "tool_name", None), getattr(p, "detail", ""), getattr(p, "full", "")
+    reason, recognized = getattr(p, "reason", ""), getattr(p, "recognized", False)
+    return PendingApproval(
+        tool_name=name if isinstance(name, str) else "",
+        detail=str(detail),
+        full=full if isinstance(full, str) else "",
+        reason=str(reason),
+        recognized=bool(recognized),
+    )
 
 
 def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
@@ -212,16 +225,7 @@ def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
             "(a method where a value was meant)")
     if error is not None and not isinstance(error, str):
         raise DriverContractError("the driver's outcome reports `error` as something other than text")
-    pending = tuple(
-        PendingApproval(
-            tool_name=p.tool_name if isinstance(getattr(p, "tool_name", None), str) else "",
-            detail=str(getattr(p, "detail", "")),
-            full=getattr(p, "full", "") if isinstance(getattr(p, "full", ""), str) else "",
-            reason=str(getattr(p, "reason", "")),
-            recognized=bool(getattr(p, "recognized", False)),
-        )
-        for p in (got["pending"] or ())
-    )
+    pending = tuple(_pending_row(p) for p in (got["pending"] or ()))
     return TurnSnapshot(
         reply=got["reply"],
         tool_activity=tuple(got["tool_activity"] or ()),
@@ -365,7 +369,7 @@ class OpenHandsDriver(HarnessDriver):
 
     **Life cycle is a forward-only state machine, and the phase is the guard** (LSP's
     initialize/shutdown/exit, ACP's cancel-ends-the-turn): ``new -> opening -> open -> closing -> closed``,
-    every transition made once under one condition lock, nothing checked and then acted on outside it.
+    every phase transition made once under one condition lock, and a turn's start or refusal decided in the same hold.
     :meth:`open` is accepted only from ``new``; it publishes the session it built only if the phase is
     still ``opening`` when it arrives, otherwise a :meth:`close` won and the session is released there.
     A turn starts only from ``open`` and at most one runs. :meth:`close` never releases a session under a
@@ -422,6 +426,8 @@ class OpenHandsDriver(HarnessDriver):
     @property
     def state(self) -> DriverState:
         with self._cond:
+            if self._phase in ("open", "closing") and self._running:
+                return "active"     # a turn being ended by close() is still a turn
             if self._phase != "open":
                 return "closed"
             return "active" if self._running else ("awaiting_approval" if self._halted else "idle")
@@ -439,8 +445,11 @@ class OpenHandsDriver(HarnessDriver):
             result = call(session)
             return result
         finally:
-            gated = bool(getattr(result, "gated", False))   # an errored halt still holds its actions
-            with self._cond:
+            try:
+                gated = bool(getattr(result, "gated", False))   # an errored halt still holds its actions
+            except Exception:  # noqa: BLE001 — a result that cannot say reads as held: fail closed
+                gated = True
+            with self._cond:    # nothing above can keep the guard from being released
                 self._running, self._halted = False, gated
                 self._cond.notify_all()
 
