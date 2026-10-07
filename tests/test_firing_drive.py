@@ -1,10 +1,10 @@
 """Tests for levain.firing.drive — the single drive-mode authority (K4a).
 
-The three-rung mode replaced a ``human_present`` bool that had been an UNDER-MODELED AXIS: the
-gate is right to collapse ``headless`` and ``unattended`` (neither has anyone to fan an action in
-to), and the crown-jewels cred floor is wrong to (only the unattended one compounds unsupervised).
-These pin BOTH halves of that asymmetry — the collapse and the distinction — because a change that
-loses either one is a security regression that no other test would catch.
+The three-rung mode replaced a ``human_present`` bool. The gate collapses ``headless`` and
+``unattended`` (neither has anyone to fan an action in to), and since 2026-10-07 the cred floor's
+default draws the same line (closed everywhere but the interactive REPL). These pin that line, and
+that an explicit setting still overrides it, because a change to either is a security regression
+no other test would catch.
 """
 
 from __future__ import annotations
@@ -54,15 +54,17 @@ def test_explicit_false_allows_in_every_mode(mode: str) -> None:
 
 def test_absent_derives_from_the_drive() -> None:
     assert resolve_cred_floor(None, mode="interactive") is False
-    assert resolve_cred_floor(None, mode="headless") is False
+    assert resolve_cred_floor(None, mode="headless") is True    # flipped 2026-10-07 (cockpit chat)
     assert resolve_cred_floor(None, mode="unattended") is True
 
 
-def test_the_floor_does_NOT_collapse_headless_and_unattended() -> None:
-    """The counterpart to the gate test above, and the whole reason this module exists: a human
-    typing `--task "open a PR"` legitimately needs gh, while a scheduled seat's silent credential
-    read can compound into always-loaded memory with nobody in the loop."""
-    assert resolve_cred_floor(None, mode="headless") != resolve_cred_floor(None, mode="unattended")
+@pytest.mark.parametrize("mode", [*DRIVE_MODES, "garbage"])
+def test_the_absent_cred_floor_follows_the_gates_own_line(mode) -> None:
+    """Since 2026-10-07 (Phill ruled the default flipped): the standard credential stores are open by
+    default only at the REPL, where the operator reads each completed turn before the next, which is
+    exactly human_present. A
+    headless turn (a --task run, a cockpit chat turn) is captured before anyone reads it."""
+    assert resolve_cred_floor(None, mode=mode) is (not human_present(mode))
 
 
 def test_garbage_mode_denies_on_BOTH_halves_of_the_authority() -> None:

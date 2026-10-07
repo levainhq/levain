@@ -163,8 +163,8 @@ class TurnOptions:
 @runtime_checkable
 class TurnOutcome(Protocol):
     """The shape :func:`read_outcome` reads a harness's result from. :class:`levain.session.TurnResult`
-    satisfies it as it stands, and so does a plain dataclass. ``unreadable_call`` is read where present;
-    the attributes listed are the ones it requires."""
+    satisfies it as it stands, and so does a plain dataclass. ``unreadable_call`` and ``unreadable_unchecked``
+    are read where present; the attributes listed are the ones it requires."""
 
     reply: str | None
     tool_activity: Sequence[Any]
@@ -230,12 +230,15 @@ class TurnSnapshot:
     unreadable_call: bool
     ok: bool
     exit_code: int
+    unreadable_unchecked: bool = False
+    """The harness could not check whether ``reply`` is an unreadable tool call (it fails closed with
+    ``unreadable_call`` set too); a client shows its own notice for it."""
 
     def __post_init__(self) -> None:
         for name in ("reply", "error", "held_digest"):
             if getattr(self, name) is not None and not _is_text(getattr(self, name)):
                 raise DriverContractError(f"the outcome's `{name}` is neither text nor None")
-        for name in ("nudged", "gated", "timed_out", "unreadable_call", "ok"):
+        for name in ("nudged", "gated", "timed_out", "unreadable_call", "unreadable_unchecked", "ok"):
             if not isinstance(getattr(self, name), bool):
                 raise DriverContractError(
                     f"the outcome's `{name}` is not a bool (a method or a value where a flag was meant)")
@@ -359,6 +362,7 @@ def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
         pending=tuple(_pending_row(p) for p in _lines(got["pending"], "pending")),
         held_digest=None if got["held_digest"] is _ABSENT else got["held_digest"],
         unreadable_call=getattr(outcome, "unreadable_call", False),
+        unreadable_unchecked=getattr(outcome, "unreadable_unchecked", False),
         ok=got["ok"],
         exit_code=got["exit_code"],
     )

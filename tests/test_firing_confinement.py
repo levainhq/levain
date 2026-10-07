@@ -3352,7 +3352,7 @@ def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tm
 
 
 @pytest.mark.parametrize("mode,setting,expected", [
-    ("interactive", None, False), ("headless", None, False), ("unattended", None, True),
+    ("interactive", None, False), ("headless", None, True), ("unattended", None, True),
     ("unattended", False, False),   # the per-entity opt-out keeps the Keychain for that seat
     ("interactive", True, True),    # and an operator can pin it on while driving
 ])
@@ -3360,7 +3360,8 @@ def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, 
     """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives).
     Measured before the rule: from inside the confined shell `security find-generic-password -w`
     and `git credential-osxkeychain get` read secrets. Measured after, on the real provider:
-    interactive/headless read, unattended refused (rc 44, helper empty), https unaffected."""
+    interactive/headless read, unattended refused (rc 44, helper empty), https unaffected. Since
+    2026-10-07 the default is flipped: headless is refused too (expected column above)."""
     from levain.firing.drive import resolve_cred_floor
 
     deny = resolve_cred_floor(setting, mode=mode)
@@ -3385,6 +3386,55 @@ def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypat
     # through the serialized form the tool spec carries, not just the in-memory object
     carried = ConversationBinding.from_params(binding.to_params())
     assert carried.floor.deny_keychain is expected
+
+
+def test_cred_floor_label_names_every_store_the_floor_denies() -> None:
+    # The banner once named 3 of the 5 stores, so its READABLE warning left out the git
+    # credential files.
+    from levain.firing.confinement import (
+        _STANDARD_CRED_FILES, _STANDARD_CRED_SUBTREES, cred_floor_label,
+    )
+
+    label = cred_floor_label("Linux")
+    for path in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES):
+        assert path in label, path
+
+
+@pytest.mark.parametrize("path", [
+    "~/.pypirc", "~/.npmrc", "~/.docker/config.json", "~/.kube/config",
+])
+def test_token_files_found_readable_by_a_headless_entity_are_standard_cred_stores(path) -> None:
+    # Tool-canonical token files. On 2026-10-07 the first three were measured readable by a
+    # headless entity's shell (~/.kube/config was absent on that host). Pinned by name, so
+    # dropping one from the tuple fails here; membership is all this test checks.
+    from levain.firing.confinement import _STANDARD_CRED_FILES
+
+    assert path in _STANDARD_CRED_FILES
+
+
+@pytest.mark.parametrize("deny_creds", [False, True])
+@pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
+def test_the_rendered_seatbelt_profile_never_contains_a_syscall_rule(tmp_path, deny_creds, ssh_mode) -> None:
+    # A Seatbelt `syscall-unix` / `syscall-number` rule makes XNU build a syscall mask, and a
+    # malformed one panicked the kernel on 2026-10-07 (a hand-written experiment, not levain's
+    # profile). Levain's own profile must never contain one; this renders the text only and
+    # starts no sandbox.
+    policy = build_policy(_entity(tmp_path), ssh_mode=ssh_mode, deny_standard_creds=deny_creds)
+    text = SeatbeltProvider().render_profile(policy)
+    assert "syscall-unix" not in text
+    assert "syscall-number" not in text
+
+
+def test_readme_names_every_store_the_cred_floor_denies() -> None:
+    # The README lists the stores by hand for a reader deciding whether to set
+    # deny_standard_creds; a store the floor gains must reach that list.
+    from pathlib import Path
+
+    from levain.firing.confinement import _STANDARD_CRED_FILES, _STANDARD_CRED_SUBTREES
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    for path in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES):
+        assert f"`{path}`" in readme, path
 
 
 def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:

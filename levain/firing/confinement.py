@@ -35,8 +35,9 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
     PRE-EXISTING ~/.ssh symlink can't be re-pointed — is pinned in ``deny_write_dirs`` so it can't be
     RELOCATED to dodge the literal (apparatus L3 codex, TWO rounds — a raw-mode ``mv ~/.ssh`` /
     symlink-anchor bypass, VERIFIED LIVE). The standard cred stores (``~/.config/gh`` / ``~/.aws/
-    credentials`` / ``~/.netrc`` / ``~/.git-credentials``) are an OPT-IN (``deny_standard_creds``,
-    default OFF — denying their read would break the entity's own gh/aws/curl use).
+    credentials`` / ``~/.netrc`` / ``~/.git-credentials``) are folded in by ``build_policy``'s
+    ``deny_standard_creds`` switch; :func:`levain.firing.drive.resolve_cred_floor` sets it, denying them in
+    every drive except the interactive REPL unless the entity declares ``deny_standard_creds: false``).
   - **ancestor-write-deny (apparatus L2 CRITICAL):** each crown jewel is pinned to an ABSOLUTE path,
     so under ``(allow default)`` the entity could ``mv`` a non-denied ANCESTOR directory of a jewel
     to relocate it out from under its deny string, then read it. So every ancestor dir of every jewel
@@ -177,10 +178,11 @@ is tabulated above :func:`_bwrap_argv`.
   - FLOOR-EXPANSION (spore-322, Phill-ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
     the UNIVERSAL floor (:data:`_SSH_AUTHORIZED_KEYS`, both ssh_modes — a persistence backdoor with zero
     legit use, so it is folded unconditionally). The other default-allow-readable standard cred stores
-    — ``~/.config/gh`` (a GitHub token = repo push/admin), ``~/.aws/credentials``, ``~/.netrc`` — are ≥
-    the ssh key in impact, but denying their READ breaks the entity's own gh/aws/curl use, so they are
-    an explicit OPT-IN (``deny_standard_creds`` in confinement.json, default OFF; :data:`_STANDARD_CRED_
-    SUBTREES` / :data:`_STANDARD_CRED_FILES`) rather than always-on — operational-fit over purity. A
+    — :data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES` (a GitHub token = repo push/admin) — are ≥
+    the ssh key in impact. They are not universal: ``build_policy`` folds them in on its
+    ``deny_standard_creds`` switch, which :func:`levain.firing.drive.resolve_cred_floor` turns on in every
+    drive except the interactive REPL; an entity that needs gh/aws there declares
+    ``deny_standard_creds: false`` in confinement.json (operational-fit over purity). A
     caller can still pin any of them ad-hoc via ``deny_files`` / ``extra_deny_read_write``.
 
 **Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** This
@@ -324,13 +326,14 @@ _OWN_MEMORY_FILENAMES = (
 )
 
 # Standard, tool-CANONICAL credential locations. Folding these into the floor is an OPT-IN
-# (``deny_standard_creds`` in ``confinement.json``, default OFF), never automatic, for two reasons:
+# (``deny_standard_creds`` in ``confinement.json``) at THIS layer; the drive layer
+# (levain.firing.drive.resolve_cred_floor) turns it on unless a human drives the session. Two reasons:
 # (1) unlike an app secret (``.env.flow``), these ARE structurally knowable — gh / aws / curl look
 # here BY DEFINITION, so naming them is not the FALSE-SECURITY guessing the module otherwise refuses;
-# (2) denying their READ breaks the entity's OWN legitimate ``gh`` / ``aws`` / netrc-``curl`` use, so a
-# CC-replacement's hands must not lose them by default (operational-fit). They are >= the ssh key in
-# impact under default-allow (a gh token = repo push/admin; aws creds = infra/$), so the operator who
-# does NOT need those tools flips ONE config line to fold them in. ``~/.config/gh`` is a DIR (the token
+# (2) denying their READ breaks the entity's OWN legitimate ``gh`` / ``aws`` / netrc-``curl`` use, so the
+# switch stays per-entity: an entity that needs those tools outside the REPL declares
+# ``deny_standard_creds: false``. They are >= the ssh key in impact (a gh token = repo push/admin; aws
+# creds = infra/$), which is why the drive layer denies them by default wherever no human watches. ``~/.config/gh`` is a DIR (the token
 # lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
 # The Keychain's mach services (spore-1245). SecurityServer + securityd.xpc were MEASURED to carry the
 # reads (denying them refused `security -w` and the osxkeychain helper); systemkeychain is Apple's
@@ -347,7 +350,9 @@ def cred_floor_label(system: str | None = None) -> str:
     by the Seatbelt profile (``CrownJewelsPolicy.deny_keychain``); Linux has no counterpart."""
     import platform as _platform
 
-    base = "~/.config/gh · ~/.aws/credentials · ~/.netrc"
+    # Derived from the two tuples the floor enforces, so the banner cannot name fewer stores than
+    # the floor denies (it once omitted both git credential files).
+    base = " · ".join((*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES))
     return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
 
 
@@ -359,6 +364,10 @@ _STANDARD_CRED_FILES = (
     "~/.netrc",                     # netrc PAT / http creds (git-https, curl)
     "~/.git-credentials",           # git HTTPS PAT store (same class as ~/.netrc — apparatus L1)
     "~/.config/git/credentials",    # XDG-path git credential store
+    "~/.pypirc",                    # PyPI upload password/token: publish rights (supply-chain grade)
+    "~/.npmrc",                     # npm registry _authToken / _auth: publish rights
+    "~/.docker/config.json",        # registry `auths` when no credsStore helper holds them
+    "~/.kube/config",               # cluster credentials (client certs, bearer tokens, exec plugins)
 )
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
@@ -611,9 +620,9 @@ class CrownJewelsPolicy:
     # not an `allow_network`-style promise, and off by default so the connect-to-self side-channel
     # is closed only where a drive-layer caller opts in.
     deny_keychain: bool = False   # macOS: deny the Keychain services (spore-1245), set from the SAME
-    # resolved switch as the standard cred stores (``deny_standard_creds``: denied by default for an
-    # UNATTENDED drive only, per-entity overridable), so it is never on while a human drives at the REPL
-    # unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
+    # resolved switch as the standard cred stores (``deny_standard_creds``: denied by default in every
+    # drive except the interactive REPL, per-entity overridable), so it is never on while a human drives
+    # at the REPL unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
     # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
     # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
     deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
@@ -986,11 +995,11 @@ def build_policy(
         subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
         expanded), so raw-mode keeps ~/.ssh otherwise writable.
 
-    **Operator OPT-IN (``deny_standard_creds=True``):** fold the standard tool-canonical cred stores
-    (``~/.config/gh`` subtree, ``~/.aws/credentials``, ``~/.netrc``) into the floor. These are knowable
-    locations (not the false-security guessing the module refuses), but denying their READ breaks the
-    entity's own gh/aws/curl use, so it is OFF by default — the operator enables it when the entity
-    does not need those tools. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
+    **``deny_standard_creds=True``:** fold the standard tool-canonical cred stores
+    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor. These are knowable
+    locations (not the false-security guessing the module refuses). This parameter's own default is
+    False; the product default comes from :func:`levain.firing.drive.resolve_cred_floor`, which passes
+    True in every drive except the interactive REPL unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
     **Operator-declared crown jewels (the caller MUST pass — this generic, operator-neutral module
     deliberately does NOT guess where an operator's app-specific secrets live):**
@@ -1053,10 +1062,9 @@ def build_policy(
         subtrees.append(Path(extra).expanduser().resolve())
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
-    # OPT-IN (default OFF): fold the standard tool-canonical cred stores into the floor. Knowable
-    # locations, not a guess — but denying their READ breaks the entity's own gh/aws/curl hands, so the
-    # operator enables this only when the entity does not need those tools (``deny_standard_creds`` in
-    # confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
+    # The standard tool-canonical cred stores, folded in when the caller passes deny_standard_creds
+    # (resolved by levain.firing.drive.resolve_cred_floor: True except at the interactive REPL, unless
+    # the entity declares ``deny_standard_creds: false`` in confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
     # write-deny), so no separate rendering path is needed.
     if deny_standard_creds:
         subtrees.extend(Path(s).expanduser().resolve() for s in _STANDARD_CRED_SUBTREES)
@@ -1706,11 +1714,11 @@ class ConfinementConfig:
     deny_subtrees: tuple[Path, ...] = ()   # additional crown-jewel SUBTREES: a secrets dir, another store
     ssh_mode: SshMode = "agent"
     deny_standard_creds: bool | None = None
-    # TRI-STATE (K4a, 2026-07-29): fold ~/.config/gh + ~/.aws/credentials + ~/.netrc into the floor?
+    # TRI-STATE (K4a, 2026-07-29): fold _STANDARD_CRED_SUBTREES + _STANDARD_CRED_FILES into the floor?
     #   True  → deny ALWAYS (an explicit operator pin; the drive mode does not soften it)
     #   False → allow ALWAYS (an explicit operator OPT-IN that deliberately survives an unattended
     #           seat — a seat whose job is "open a PR nightly" genuinely needs gh)
-    #   None  → ABSENT: derive from the DRIVE MODE (deny for an unattended seat, allow otherwise)
+    #   None  → ABSENT: derive from the DRIVE MODE (allow only interactive, deny otherwise)
     # It was a plain `bool = False` until an unattended seat existed to distinguish, at which point
     # ABSENT and EXPLICIT-FALSE being indistinguishable made the new default either un-overridable
     # or defeated by every config already on disk. The reason this is not the `efferent_gate: "auto"`
@@ -1830,8 +1838,8 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
     if "deny_standard_creds" in data and data["deny_standard_creds"] is None:
         raise ConfinementError(
             f"{base}: deny_standard_creds is present but null. Omit the key entirely to let the "
-            f"drive mode decide (denied for an unattended seat, allowed otherwise), or set it to "
-            f"true/false to pin it — fail-closed."
+            f"drive mode decide (allowed only at the interactive REPL, denied in every other drive), "
+            f"or set it to true/false to pin it (false lets the entity read them) — fail-closed."
         )
 
     efferent_gate = data.get("efferent_gate", "auto")
@@ -2588,7 +2596,7 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append("")
 
         if policy.deny_keychain:
-            lines.append(";; THE KEYCHAIN (spore-1245) — on with the standard cred floor (unattended by")
+            lines.append(";; THE KEYCHAIN (spore-1245) — on with the standard cred floor (any non-interactive drive by")
             lines.append(";; default). Without it, `security find-generic-password -w` and every")
             lines.append(";; credential helper (`git credential-osxkeychain`, gh's stored token) read")
             lines.append(";; the operator's secrets from inside this sandbox (measured 2026-10-01).")

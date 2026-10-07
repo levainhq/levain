@@ -191,8 +191,9 @@ def _drain_gate(
     while result.gated:
         print("\n  ⛔ \033[1mheld at the efferent gate\033[0m — this changes the world:")
         _print_pending(result.pending)
-        if not all(item.decidable for item in result.pending):
-            # An approval runs the whole action; one that could not be shown whole cannot be approved.
+        if not result.pending or not all(item.decidable for item in result.pending):
+            # An approval runs the whole action; one that could not be shown whole cannot be approved, and a halt that
+            # shows nothing at all (all() of an empty list is True) is the same case.
             print("  → this hold cannot be shown in full, so it can only be rejected.")
             result = session.reject_turn("the held action could not be shown in full, so it was not approved")
             if result.error is not None:
@@ -263,6 +264,9 @@ def run_task(
       - ``5`` the turn EXCEEDED ITS WALL-CLOCK BOUND and was terminated (K4a ⑥, ``spore-434``).
         An ENVIRONMENT stall, not a broken task — retry on the cadence; if it repeats, the model
         endpoint is sick.
+      - ``7`` the turn completed, but its reply is the model's raw tool-call syntax: the call
+        failed to parse upstream and did not run. stdout stays empty; the notice and the text
+        go to stderr. Ask again, or switch models.
 
     A headless run is ``human_present=False``, so with the default ``efferent_gate: "auto"`` it
     is GATED. That is the whole reason K3 exists: this is the driver a scheduler and an
@@ -620,13 +624,10 @@ def _drive_task(
             on_event=None if quiet else _emit_activity,
             max_iterations=max_iterations,
             # No human is driving. With `efferent_gate: "auto"` BOTH modes below resolve GATED —
-            # the fan-in a watching operator supplies at the REPL has to come from the gate here.
-            #
-            # The two are NOT interchangeable for the crown-jewels CRED floor, which is the whole
-            # reason this is a three-valued mode rather than the old `human_present` bool:
-            # `headless` is a human who typed this and will read the output (they may legitimately
-            # need `gh`), while `unattended` is a scheduler with nobody in the loop at all, where a
-            # silent credential read can compound into always-loaded memory. See
+            # the fan-in a watching operator supplies at the REPL has to come from the gate here —
+            # and both deny the standard credential stores unless confinement.json sets
+            # `deny_standard_creds` to false: the output is read after the turn was captured. `unattended`
+            # still records that a scheduler, not a person, invoked the run. See
             # `levain.firing.drive`.
             mode="unattended" if unattended else "headless",
         )
@@ -691,13 +692,12 @@ def _drive_task(
 
         # The reply goes to STDOUT as the payload — activity already streamed above, so it is
         # NOT reprinted here (printing `result.tool_activity` too would double every line). A reply that
-        # is an unreadable tool call is not a reply: without --quiet it goes to stderr with the notice.
+        # is an unreadable tool call is not a reply.
         if result.reply and result.unreadable_call:
-            # Not the entity's reply: the model's call failed to parse and nothing ran. The notice and the text go to
-            # STDERR; --quiet's stdout payload stays the text as it arrived, so a pipeline's contract is unchanged.
-            print(_unreadable_call_lines(result.reply, result.tool_activity), file=sys.stderr, flush=True)
-            if quiet:
-                print(result.reply, flush=True)
+            # Not the entity's reply: the model's call failed to parse and did not run. The notice and the text go to
+            # STDERR in both modes, and stdout stays empty: --quiet's payload is an answer, and this is not one.
+            print(_unreadable_call_lines(result.reply, result.tool_activity, result.unreadable_unchecked),
+                  file=sys.stderr, flush=True)
         elif result.reply:
             if not quiet:
                 print(f"\n\033[1m{session.label} ›\033[0m {result.reply}", flush=True)
@@ -739,16 +739,16 @@ def _render_turn(session: EntitySession, result: TurnResult) -> None:
     for line in result.tool_activity:
         print(f"  \033[2m{line}\033[0m")  # dim — activity is context, the reply is the message
     if result.reply and result.unreadable_call:
-        print(_unreadable_call_lines(result.reply, result.tool_activity))
+        print(_unreadable_call_lines(result.reply, result.tool_activity, result.unreadable_unchecked))
         return
     print(f"\n\033[1m{session.label} ›\033[0m {result.reply or '(no reply)'}")
 
 
-def _unreadable_call_lines(text: str, tool_activity) -> str:
+def _unreadable_call_lines(text: str, tool_activity, unchecked: bool = False) -> str:
     """The notice for a reply that is an unreadable tool call, with the text beneath it, dim and escaped by the
     consent surface's allowlist (:func:`levain.firing.gate.visible`): it is the model's markup, not a message."""
     raw = "\n".join("    " + line for line in visible(text, keep_newline=True).split("\n"))
-    return f"\n  ! {unreadable_call_notice(tool_activity)}\n  \033[2mwhat the model sent:\n{raw}\033[0m"
+    return f"\n  ! {unreadable_call_notice(tool_activity, unchecked=unchecked)}\n  \033[2mwhat the model sent:\n{raw}\033[0m"
 
 
 def _entity_label(binding) -> str:
@@ -824,6 +824,7 @@ def _print_banner(
 
         if deny_standard_creds:
             print(f"             standard cred stores {cred_floor_label()}")
+            print("               (set deny_standard_creds false to allow)")
         else:
             print(f"             ⚠ standard cred stores {cred_floor_label()}")
             print("               are READABLE by this entity (deny_standard_creds is off)")
@@ -884,7 +885,8 @@ def _print_banner(
         print("  Running ONE task, then exiting. Exit code reports what the HARNESS saw:")
         print("    0 replied · 1 no reply · 2 startup error · 3 the turn raised ·")
         print("    4 held at the efferent gate (a decision for you, NOT a failure) ·")
-        print("    5 the wall-clock bound was exceeded (an ENVIRONMENT stall, not a bad task)")
+        print("    5 the wall-clock bound was exceeded (an ENVIRONMENT stall, not a bad task) ·")
+        print("    7 the reply was an unreadable tool call (it did not run; ask again, or switch models)")
         print("  It does NOT assert the task succeeded — verify that against the world.")
     else:
         print("  Talk to it. It recalls its OWN memory and captures each turn there.")

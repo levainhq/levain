@@ -381,6 +381,7 @@ def _snapshot_payload(snap: TurnSnapshot) -> dict[str, Any]:
     return {
         "reply": snap.reply,
         "unreadable_call": snap.unreadable_call,
+        "unreadable_unchecked": snap.unreadable_unchecked,
         "tool_activity": activity[-MAX_ACTIVITY_LINES:],
         "error": snap.error,
         "nudged": snap.nudged,

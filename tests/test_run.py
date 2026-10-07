@@ -994,6 +994,7 @@ def test_banner_names_readable_standard_creds(capsys) -> None:
     )
     out2 = capsys.readouterr().out
     assert "READABLE by this entity" not in out2   # and honest in the other direction
+    assert "(set deny_standard_creds false to allow)" in out2 and "to allow" not in out
 
 
 # ---------- the banner states the TIME BOUND, and its absence (K4a ⑥, `spore-434`) ----------
