@@ -186,19 +186,6 @@ def test_hand_forged_retire_is_ignored_and_reported(two):
     assert team("verify", repo=ben) == 1
 
 
-def test_entry_filed_under_someone_else_is_not_enforced_and_verify_names_the_committer(two, capsys):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ben))
-    fake = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/**"],
-                          words="Dana: nobody but ben edits src"), "")
-    p = gl.wt / "ledger" / "ana" / "ffffffff.jsonl"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(fake) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "impersonate", cwd=gl.wt)
-    assert team("verify", repo=ben) == 1
-    out = capsys.readouterr().out
-    assert "added by ben@ex.com (ben), who is not ana" in out
 
 
 def test_tampered_line_fails_verify(two):
@@ -210,9 +197,9 @@ def test_tampered_line_fails_verify(two):
     line["words"] = "round once"
     f.write_text(json.dumps(line) + "\n")
     git("commit", "-qam", "rewrite", cwd=gl.wt)
-    assert team("verify", repo=ana) == 1   # the rewrite is reported, and the original line still counts
-    assert "Per-line rounding stays." in [e.get("words") for e in gl.ledger().in_force]
-    assert all(e.get("words") != "round once" for e in gl.ledger().in_force)
+    assert team("verify", repo=ana) == 3   # the rewrite of a pinned file refuses the ledger
+    assert any("rewritten or removed" in t for t in gl.ledger().tamper)
+    assert not gl.ledger().in_force
 
 
 # ---- the hook ---------------------------------------------------------------------------------------------
@@ -429,23 +416,414 @@ def test_the_export_is_framed_exactly_as_the_contract_says(two, capsys):
     assert not capsys.readouterr().out.startswith('{"anneal_team_stream"')    # the convenience view stays unframed
 
 
-def test_a_ledger_file_with_an_unframeable_path_is_still_exported(two, capsys):
-    import re
+def test_a_ledger_file_levain_never_writes_is_refused_as_tamper_not_read(two, capsys):
+    # The quotepath redesign (Phill, 2026-10-05): levain owns the ledger namespace, so a file under ledger/ that is
+    # not <handle>/<16 hex>.jsonl is not decoded or read; the whole ledger is refused, loudly, by every reader.
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    # control: a canonical ledger is enforced
+    assert edit(ben, "src/a.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "a stays" in edit(ben, "src/a.py", session="s9")["hookSpecificOutput"]["permissionDecisionReason"]
     gl = GitLedger(Repo.discover(ana))
     root = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/odd.py"],
                           words="odd name stays"), "")
-    odd = gl.wt / "ledger" / "ana" / "device!.jsonl"
-    odd.write_text(json.dumps(root, ensure_ascii=False, sort_keys=True) + "\n")
+    (gl.wt / "ledger" / "ana" / "my file.jsonl").write_text(json.dumps(root, sort_keys=True) + "\n")
     git("add", ".", cwd=gl.wt)
     git("commit", "-qm", "an odd file name", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    # the teammate's hook denies ANY edit, naming the file and the commit author
+    reason = edit(ben, "src/unrelated.py", session="s2")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "my file.jsonl" in reason and "ana@ex.com" in reason
     capsys.readouterr()
-    assert team("export", "--jsonl", repo=ana) == 0
-    envs = [json.loads(r) for r in capsys.readouterr().out.splitlines()[1:]]
-    assert any("odd name stays" in e["line"] for e in envs) and any("a stays" in e["line"] for e in envs)   # nothing withheld
-    assert all(re.fullmatch(r"[A-Za-z0-9._@:+/=-]{1,200}", e["frame"]) for e in envs)
-    assert any(e["frame"].startswith("unnamed-") for e in envs)
+    assert team("export", "--jsonl", repo=ben) == 3            # export refuses
+    assert "my file.jsonl" in capsys.readouterr().err
+    team("doctor", repo=ben)                                   # doctor flags it
+    assert "FAIL  the team ledger is REFUSED as tampered" in capsys.readouterr().out
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    ctx = hook("sessionstart", payload)["hookSpecificOutput"]["additionalContext"]
+    assert "REFUSED as tampered" in ctx and "odd name stays" not in ctx
+
+
+def test_the_tamper_refusal_clears_when_the_bad_file_is_deleted(two):
+    # Tamper is judged from the tip tree, not accumulated from history: once the file is gone nothing is refused.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    gl = GitLedger(Repo.discover(ana))
+    bad = gl.wt / "ledger" / "ana" / "notes.txt"
+    bad.write_text("not a ledger file\n")
+    git("add", ".", cwd=gl.wt)
+    git("commit", "-qm", "a planted name", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    reason = edit(ben, "src/unrelated.py", session="t1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "notes.txt" in reason
+    bad.unlink()
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "the owner deletes it", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 0
+    after = edit(ben, "src/unrelated.py", session="t2")
+    assert "REFUSED as tampered" not in json.dumps(after)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "blob"])
+def test_a_ledger_entry_that_is_not_a_directory_is_tamper_and_nothing_is_written_through_it(two, kind):
+    # `ledger` itself as a symlink or a plain file is invisible to a `ledger/` pathspec; it must still be refused,
+    # and levain's own write must never follow it out of the worktree.
+    tmp, ana, ben = two
+    outside = tmp / "outside"
+    outside.mkdir()
+    gl = GitLedger(Repo.discover(ana))
+    git("rm", "-rq", "ledger", cwd=gl.wt)
+    shutil.rmtree(gl.wt / "ledger", ignore_errors=True)
+    if kind == "symlink":
+        (gl.wt / "ledger").symlink_to(outside)
+    else:
+        (gl.wt / "ledger").write_text("not a directory\n")
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "ledger is not a directory", cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    reason = edit(ben, "src/unrelated.py", session="n1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "'ledger'" in reason and "ana@ex.com" in reason
+    assert team("status", "--path", "src/a.py", repo=ben) == 3
+    try:
+        rc = record_ruling(ben, "src/a.py", "must not land")
+    except Exception:
+        rc = 1
+    assert rc != 0
+    assert list(outside.iterdir()) == []                               # nothing was written through the link
+
+
+def _push_wt(gl, msg, *, add="-A"):
+    git("add", add, ".", cwd=gl.wt)
+    git("commit", "-qm", msg, cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+
+
+def _own_file(gl):
+    return next((gl.wt / "ledger" / "ana").glob("*.jsonl"))
+
+
+def test_a_reorder_of_an_append_only_file_is_a_rewrite_problem_and_not_accepted(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    before = len(ledger(ben).entries)                # ben reads, and so pins, ana's file
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    lines = f.read_text().splitlines()
+    assert len(lines) >= 2
+    f.write_text("\n".join(reversed(lines)) + "\n")
+    _push_wt(gl, "reorder")
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    led = ledger(ben)
+    assert any("rewritten or removed" in t for t in led.tamper), led.tamper
+    assert before and not led.entries
+
+
+def _plumb(gl, parts, entry):
+    """Commit on top of HEAD with `entry` (mode, type, sha) at the nested path `parts`, built with mktree only."""
+    def tree_of(prefix, rest):
+        listing = git("ls-tree", "-z", f"HEAD:{prefix}" if prefix else "HEAD", cwd=gl.wt)
+        ents = [e for e in listing.split("\0") if e]
+        head = rest[0]
+        ents = [e for e in ents if e.split("\t", 1)[1] != head]
+        if len(rest) == 1:
+            ents.append(f"{entry[0]} {entry[1]} {entry[2]}\t{head}")
+        else:
+            sub = tree_of(f"{prefix}/{head}" if prefix else head, rest[1:])
+            ents.append(f"040000 tree {sub}\t{head}")
+        out = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(ents) + "\0", check=True,
+                             capture_output=True, text=True).stdout.strip()
+        return out
+    root = tree_of("", parts)
+    c = git("commit-tree", root, "-p", "HEAD", "-m", "plumbed", cwd=gl.wt).strip()
+    git("update-ref", "refs/heads/levain-ledger", c, cwd=gl.wt)
+    git("reset", "-q", "--hard", c, cwd=gl.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+
+
+def test_a_force_push_that_rewrites_a_pinned_file_is_a_rewrite_problem(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    before = {e["id"] for e in ledger(ben).entries}  # ben reads, and so pins, ana's file
+    gl = GitLedger(Repo.discover(ana))
+    git("reset", "-q", "--hard", "HEAD~1", cwd=gl.wt)
+    f = _own_file(gl)
+    root = json.loads(f.read_text().splitlines()[-1])
+    forged = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/z.py"],
+                            words="forged"), root["hash"])
+    with open(f, "a") as fh:
+        fh.write(json.dumps(forged, sort_keys=True) + "\n")
+    git("commit", "-qam", "rewritten history", cwd=gl.wt)
+    git("push", "-qf", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+    # `levain team sync` cannot replay ben's old tip onto a force-pushed remote (it errors and keeps the old tip), so
+    # the clone is moved onto the rewritten tip the way an operator would: fetch, then reset the ledger worktree.
+    gb = GitLedger(Repo.discover(ben))
+    git("fetch", "-q", "origin", "+levain-ledger:refs/remotes/origin/levain-ledger", cwd=gb.wt)
+    git("reset", "-q", "--hard", "refs/remotes/origin/levain-ledger", cwd=gb.wt)
+    led = ledger(ben)
+    assert before and any("rewritten or removed" in t for t in led.tamper), led.tamper
+    assert not led.entries                           # refused as a whole until the owner restores it or ben repins
+
+
+def _pins_file(repo):
+    return GitLedger(Repo.discover(repo)).base / "pins.json"
+
+
+def test_a_duplicate_id_in_another_file_is_tamper_not_a_shadow(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    shadow = f.with_name("0000000000000000.jsonl")                    # sorts first, right member folder
+    shadow.write_text(f.read_text())
+    _push_wt(gl, "a copy that sorts first")
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    tamper = ledger(ben).tamper
+    assert any("0000000000000000.jsonl" in t and f.name in t and "twice" in t for t in tamper), tamper
+
+
+def test_a_tampered_read_does_not_advance_the_pins(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    assert not ledger(ben).tamper
+    pins = _pins_file(ben)
+    before = pins.read_bytes()
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "a new entry and a stray file together")
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    assert ledger(ben).tamper
+    assert pins.read_bytes() == before
+
+
+
+
+def test_a_corrupt_pins_file_refuses_until_repin(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    for bad in ("{not json", "[]", json.dumps({"ana/x.jsonl": {"sha256": "zz", "length": 1}}),
+                json.dumps({"ana/x.jsonl": {"sha256": "0" * 64, "length": -1}})):
+        _pins_file(ben).write_text(bad)
+        assert any("pins.json" in t and "repin" in t for t in ledger(ben).tamper), bad
+    assert team("repin", repo=ben) == 0
+    assert not ledger(ben).tamper and _pins_file(ben).exists()      # a missing file is the start; the read re-pins
+
+
+def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    key = next(k for k in json.loads(_pins_file(ben).read_text()) if k.startswith("ana/"))
+    capsys.readouterr()
+    assert team("repin", "--file", key, repo=ben) == 0
+    assert "dropped 1 pin" in capsys.readouterr().out
+    assert key not in json.loads(_pins_file(ben).read_text())
+    assert not ledger(ben).tamper
+    ledger(ben)                                                      # the next read trusts what it sees and pins again
+    assert key in json.loads(_pins_file(ben).read_text())
+    assert team("repin", repo=ben) == 0
+    assert not _pins_file(ben).exists()
+
+
+def test_session_start_on_a_tampered_ledger_emits_only_the_refusal(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays visible") == 0
+    assert team("sync", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    ctx = hook("sessionstart", payload)["hookSpecificOutput"]["additionalContext"]
+    assert "REFUSED as tampered" in ctx
+    assert "a stays visible" not in ctx and "ruling(s)" not in ctx
+
+
+
+
+def test_two_tree_entries_with_one_path_are_tamper(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    f = _own_file(gl)
+    listing = git("ls-tree", "-z", "HEAD:ledger/ana", cwd=gl.wt).split("\0")
+    ents = [e.split("\t", 1) for e in listing if e]
+    mode, _t, sha = ents[0][0].split(" ")
+    other = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=gl.wt, input="something else\n", check=True,
+                           capture_output=True, text=True).stdout.strip()
+    raw = b""
+    for meta, name in ents + [[f"{mode} blob {other}", f.name]]:
+        m, _k, h = meta.split(" ")
+        raw += m.encode() + b" " + name.encode() + b"\0" + bytes.fromhex(h)
+    tree = subprocess.run(["git", "hash-object", "-t", "tree", "-w", "--literally", "--stdin"], cwd=gl.wt, input=raw,
+                          check=True, capture_output=True).stdout.decode().strip()
+    root_ents = [e for e in git("ls-tree", "-z", "HEAD:ledger", cwd=gl.wt).split("\0") if e]
+    root_ents = [e for e in root_ents if e.split("\t", 1)[1] != "ana"] + [f"040000 tree {tree}\tana"]
+    ledger_tree = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(root_ents) + "\0", check=True,
+                                 capture_output=True, text=True).stdout.strip()
+    top = [e for e in git("ls-tree", "-z", "HEAD", cwd=gl.wt).split("\0") if e]
+    top = [e for e in top if e.split("\t", 1)[1] != "ledger"] + [f"040000 tree {ledger_tree}\tledger"]
+    root = subprocess.run(["git", "mktree", "-z"], cwd=gl.wt, input="\0".join(top) + "\0", check=True,
+                          capture_output=True, text=True).stdout.strip()
+    c = git("commit-tree", root, "-p", "HEAD", "-m", "dup path", cwd=gl.wt).strip()
+    git("update-ref", "refs/heads/levain-ledger", c, cwd=gl.wt)
+    assert any(f.name in t for t in ledger(ana).tamper), ledger(ana).tamper
+
+
+def _plant(gl):
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+
+
+def test_verify_on_a_tampered_ledger_is_refused_with_no_counts(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    _plant(GitLedger(Repo.discover(ana)))
+    capsys.readouterr()
+    assert team("verify", repo=ana) == 3
+    out = capsys.readouterr().out
+    assert "REFUSED as tampered" in out and "entries in" not in out
+    team("doctor", repo=ana)
+    out = capsys.readouterr().out
+    assert "FAIL  the team ledger is REFUSED as tampered" in out and "chains intact" not in out
+
+
+def test_sync_never_replays_onto_or_pushes_over_a_tampered_remote(two):
+    tmp, ana, ben = two
+    assert team("sync", repo=ben) == 0
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/b.py",
+                "--words", "ben unpushed", "--no-push", repo=ben) == 0
+    gl = GitLedger(Repo.discover(ana))
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    _plant(gl)
+    remote_tip = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
+    assert team("sync", repo=ben) != 0
+    assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == remote_tip     # nothing was pushed
+    assert subprocess.run(["git", "grep", "-q", "ben unpushed", "levain-ledger"], cwd=tmp / "origin.git").returncode == 1
+    reason = edit(ben, "src/unrelated.py", session="r1")["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "REFUSED as tampered" in reason and "REMOTE" in reason and "notes.txt" in reason  # recorded, denied
+    assert "ben unpushed" in git("grep", "-h", "ben unpushed", "levain-ledger", cwd=ben)        # kept, not installed over
+    (gl.wt / "ledger" / "ana" / "notes.txt").unlink()                                         # the owner's repair ...
+    _push_wt(gl, "the owner removes it")
+    assert team("sync", repo=ben) == 0                                                        # ... clears it, and the
+    assert "ben unpushed" in git("grep", "-h", "ben unpushed", "levain-ledger", cwd=tmp / "origin.git")  # entry goes out
+    assert "REFUSED" not in json.dumps(edit(ben, "src/unrelated.py", session="r2"))
+
+
+def test_update_team_and_write_canon_refuse_on_a_tampered_tip(two):
+    from levain.team.transport import TeamError
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    _plant(gl)
+    with pytest.raises(TeamError, match="tampered"):
+        gl.update_team(lambda t: None, "no", push=False)
+    with pytest.raises(TeamError, match="tampered"):
+        gl.write_canon("x\n", push=False)
+
+
+def test_a_structurally_tampered_tip_caches_no_entry_content(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "secret words in an entry") == 0
+    gl = GitLedger(Repo.discover(ana))
+    _plant(gl)
+    assert ledger(ana).tamper
+    cache = gl.base / "history.json"
+    assert not cache.exists() or "secret words" not in cache.read_text()
+
+
+def test_an_unreadable_tree_record_denies_in_the_hook(two, monkeypatch, capsys):
+    from levain.team import hook as H, transport as T
+    tmp, ana, ben = two
+    real = T.git
+
+    def fake(args, cwd, **kw):
+        if args and args[0] == "ls-tree":
+            cp = subprocess.CompletedProcess(args, 0, "", "")
+            cp.stdout_bytes = b"a record with no tab\0"
+            return cp
+        return real(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", fake)
+    H.pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+                  "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "a.py")}, "tool_use_id": "t"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "could not be read" in out["permissionDecisionReason"]
+
+
+def test_an_empty_tree_at_a_leaf_path_is_tamper(two):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    empty = subprocess.run(["git", "mktree"], cwd=gl.wt, input="", check=True, capture_output=True, text=True).stdout.strip()
+    _plumb(gl, ["ledger", "ana", "0123456789abcdef.jsonl"], ("040000", "tree", empty))
+    assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
+    assert any("0123456789abcdef.jsonl" in t for t in ledger(ben).tamper)
+
+
+
+
+def test_consolidate_on_a_tampered_ledger_refuses_and_commits_nothing(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    head = git("rev-parse", "HEAD", cwd=gl.wt)
+    capsys.readouterr()
+    assert team("consolidate", "--dry-run", repo=ana) != 0
+    assert capsys.readouterr().out == ""
+    assert team("consolidate", repo=ana) != 0
+    assert git("rev-parse", "HEAD", cwd=gl.wt) == head
+    assert git("ls-tree", "--name-only", "HEAD", cwd=gl.wt).split().count("PROJECT.md") == 0
+
+
+def test_plain_status_on_a_tampered_ledger_is_refused_with_no_entries(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays visible") == 0
+    gl = GitLedger(Repo.discover(ana))
+    (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
+    _push_wt(gl, "plant")
+    capsys.readouterr()
+    assert team("status", repo=ana) == 3
+    out = capsys.readouterr().out
+    assert "REFUSED as tampered" in out and "a stays visible" not in out
+    assert team("status", "--json", repo=ana) == 3
+    assert json.loads(capsys.readouterr().out)["entries"] == []
+
+
+def test_a_device_id_that_is_not_16_hex_is_refused(two):
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ben))
+    gl.save_state(device="../x")
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/a.py",
+                "--words", "must not land", repo=ben) != 0
+    assert not (gl.wt / "ledger" / "x.jsonl").exists()
+
+
+def test_an_append_onto_a_hard_linked_ledger_file_is_refused(two):
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gl = GitLedger(Repo.discover(ben))
+    mine = next((gl.wt / "ledger" / "ben").glob("*.jsonl"))
+    outside = tmp / "outside.jsonl"
+    os.link(mine, outside)
+    before = outside.read_bytes()
+    assert record_ruling(ben, "src/b.py", "second") != 0
+    assert outside.read_bytes() == before
 
 
 def test_frame_labels_are_unique_and_a_literal_unnamed_path_cannot_shadow_an_opaque_one():
@@ -601,22 +979,6 @@ def test_a_directory_path_governs_its_tree_and_paths_are_cwd_relative(two, monke
     assert "Decimal only" in edit(ana, "src/billing.py")["hookSpecificOutput"]["additionalContext"]
 
 
-def test_retire_forged_under_the_owners_name_is_not_enforced(two):
-    """ben writes a retire that claims to be ana's (the owner) into ana's folder and commits it as himself."""
-    tmp, ana, ben = two
-    assert record_ruling(ana) == 0
-    assert team("sync", repo=ben) == 0
-    gl = GitLedger(Repo.discover(ben))
-    rid = next(e["id"] for e in gl.ledger().in_force if e.get("words") == "Per-line rounding stays.")
-    forged = E.seal(E.build("ana", "retire", supersedes=[rid], words="Dana: drop it"), "")
-    p = gl.wt / "ledger" / "ana" / "0000beef.jsonl"
-    p.write_text(json.dumps(forged) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "as ana", cwd=gl.wt)
-    led = gl.ledger()
-    assert rid in {e["id"] for e in led.in_force}
-    assert any("added by ben@ex.com" in p for p in led.problems)
-    assert edit(ben, "src/billing.py")["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 # ---- regressions from L3 round 1 ---------------------------------------------------------------------------
@@ -633,14 +995,16 @@ def test_deleting_a_members_file_does_not_silence_their_rulings(two):
     tmp, ana, ben = two
     assert record_ruling(ana) == 0
     assert team("sync", repo=ben) == 0
+    assert ledger(ben).in_force                      # ben has read (and so pinned) ana's file before it is dropped
     gl = GitLedger(Repo.discover(ben))
     for f in (gl.wt / "ledger" / "ana").glob("*.jsonl"):
         f.unlink()
     _push_as(ben, "drop ana")
-    assert team("sync", repo=ana) == 0
+    assert team("sync", repo=ana) == 2               # ana's own file is gone on the remote: refused, recorded
     for r in (ana, ben):
         assert edit(r, "src/billing.py", session="del")["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert team("verify", repo=ana) == 1
+    assert any("rewritten or removed" in t for t in ledger(ben).tamper)     # a removed pinned file refuses
+    assert team("verify", repo=ana) == 3
 
 
 def test_one_stranger_line_does_not_silence_a_members_file(two):
@@ -677,8 +1041,7 @@ def test_two_clones_sharing_a_device_abort_instead_of_dropping_entries(two, caps
     capsys.readouterr()
     assert team("sync", repo=ana2) == 2
     assert "--new-device" in capsys.readouterr().err
-    words = [e.get("words") for e in GitLedger(Repo.discover(ana2)).ledger().entries]
-    assert "b stays" in words   # still there locally, not resolved away
+    assert "b stays" in git("grep", "-h", "b stays", "levain-ledger", cwd=ana2)   # still there locally, not resolved away
 
 
 def test_ledger_content_shaped_like_a_diff_header_cannot_redirect_attribution(two):
@@ -723,19 +1086,6 @@ def test_owner_config_conflict_discards_only_config_commits_and_keeps_entries(tw
     assert "x stays" in [e.get("words") for e in led.in_force]
 
 
-def test_a_merge_commit_in_the_ledger_is_reported(two):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ana))
-    git("checkout", "-q", "-b", "side", cwd=gl.wt)
-    (gl.wt / "ledger" / "x.txt").write_text("x")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "side", cwd=gl.wt)
-    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
-    (gl.wt / "ledger" / "y.txt").write_text("y")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "main", cwd=gl.wt)
-    git("merge", "-q", "--no-edit", "side", cwd=gl.wt)
-    assert any("merge commit" in p for p in gl.ledger().problems)
 
 
 def test_join_new_device_in_a_copied_clone_never_touches_the_original(two):
@@ -795,20 +1145,6 @@ def test_an_interrupted_replay_is_rolled_back_without_loss(two):
     assert "k stays" in words and "l stays" in words
 
 
-def test_a_merge_resolved_to_its_first_parent_cannot_hide_side_lines(two):
-    tmp, ana, ben = two
-    gl = GitLedger(Repo.discover(ana))
-    git("checkout", "-q", "-b", "side", cwd=gl.wt)
-    e = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/s.py"], words="s stays"), "")
-    gl.file_for("ana").parent.mkdir(parents=True, exist_ok=True)
-    gl.file_for("ana").write_text(json.dumps(e) + "\n")
-    git("add", ".", cwd=gl.wt)
-    git("commit", "-qm", "side entry", cwd=gl.wt)
-    git("checkout", "-q", "levain-ledger", cwd=gl.wt)
-    git("merge", "-q", "-s", "ours", "--no-edit", "side", cwd=gl.wt)     # TREESAME to the first parent
-    led = gl.ledger()
-    assert "s stays" in [e.get("words") for e in led.in_force]
-    assert any("merge commit" in p for p in led.problems)
 
 
 # ---- 0.6.1 replay hardening ------------------------------------------------------------------------------------
@@ -964,6 +1300,25 @@ def test_levains_hook_isolation_does_not_reach_the_remotes_own_server_hooks(two)
     before = git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip()
     assert record_ruling(ana, "src/z.py", "z stays") != 0                      # the push is refused ...
     assert git("rev-parse", "levain-ledger", cwd=tmp / "origin.git").strip() == before   # ... and the remote is unchanged
+
+
+def test_a_repository_path_holding_a_line_break_is_still_discovered(tmp_path):
+    # rev-parse printed two paths and the reader split them into lines, so a clone at "proj<LF>x" read as no
+    # repository and both hooks went silent (quotepath L3 r5, RUN).
+    for name in ("proj\nx", "proj x", "proj\rx"):
+        d = tmp_path / name
+        d.mkdir()
+        git("init", "-q", cwd=d)
+        repo = Repo.discover(d / "sub" / "file.py")
+        assert repo is not None and os.path.realpath(repo.toplevel) == os.path.realpath(d), name
+
+
+def test_a_joined_clone_without_git_on_path_says_so_instead_of_going_silent(two):
+    # discover read "git is not on PATH" as "no repository", so both hooks returned with no output (L3 r6).
+    tmp, ana, ben = two
+    payload = {"session_id": "s", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"}
+    out = hook("sessionstart", payload, env={"PATH": str(tmp / "no-git-here")})
+    assert "ledger unavailable" in out.get("systemMessage", "") and "git" in out["systemMessage"], out
 
 
 def test_a_file_name_holding_a_line_break_cannot_forge_a_team_line_in_the_deny(two):

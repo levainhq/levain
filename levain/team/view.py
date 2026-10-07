@@ -9,10 +9,11 @@ own memory), and ack counts are per PATH, never per person, so the page cannot a
 Denies are not in the ledger (the hook keeps them in a per-clone session file), so pane 2 counts the
 acknowledgements, which are. The page is rendered on the server from one ledger snapshot per request;
 the stylesheet is a second GET route because the shared CSP forbids inline styles. When the clone has a remote,
-that snapshot is the remote-tracking ref (what the team has pushed), refreshed by a git fetch when one is due. A
-fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch, and it shows how far
-that branch differs from the remote instead of reconciling them. The only things a GET may write are that
-remote-tracking ref and the clone's record of when it last fetched.
+that snapshot is the remote's ledger tip as this clone last accepted it (what the team has pushed), refreshed by a
+fetch when one is due. A fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch,
+and it shows how far that branch differs from the remote instead of reconciling them. The only things a GET may
+write are the fetched refs (quarantine, and the remote-tracking ref when the tip is accepted) and the clone's record
+of when it last fetched.
 
 Stdlib only; the guards are the same ``levain.http_guards`` the cockpit and the docs server ride.
 """
@@ -36,7 +37,7 @@ from . import canon as C
 from . import index as I
 from . import roles as R
 from . import verify as VF
-from .transport import BRANCH, REF, GitLedger, git
+from .transport import REF, GitLedger, git, require_untampered
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
@@ -221,7 +222,9 @@ def _fetch_status(f: dict | None) -> str:
         return ('<span class="stamp fetch">this clone only: no remote</span>'
                 '<button id="refresh" type="button" data-fetch="0">⟳ reload</button>')
     if f.get("source") == "remote":
-        parts = [f"remote, fetched {_e(f['last_ok'])}" if f.get("last_ok") else "remote"]
+        # "fetched T" only when the last fetch brought its tip in; after a failure the panes are an older copy
+        parts = ["remote, as last accepted" if f.get("error") else
+                 f"remote, fetched {_e(f['last_ok'])}" if f.get("last_ok") else "remote"]
     else:
         parts = ["this clone's copy: the remote ledger has not been fetched"]
     out = f'<span class="stamp fetch">{" · ".join(parts)}</span>'
@@ -475,6 +478,7 @@ class _ViewHandler(GuardedHandler):
         try:
             fetch = self._fetch(gl, fetch_now)
             sha, team, ledger, source = self._snapshot(gl, fetch)
+            require_untampered(ledger)   # the refusal is served (503, no entries), never a model
             self.server.fetch_interval = float(team.fetch_interval)
             m = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
                             recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
@@ -489,17 +493,17 @@ class _ViewHandler(GuardedHandler):
             self.server.model_lock.release()
 
     def _snapshot(self, gl: GitLedger, fetch: dict) -> tuple[str, R.Team, I.Ledger, dict]:
-        """(sha, team, ledger) from ONE commit, plus where it came from. With a fetched remote ledger, that commit is
-        the remote-tracking ref: what the team has pushed, as of the last fetch. This clone's own branch is never
-        moved here; how far it differs from the remote is counted and shown instead."""
-        rref = fetch.get("ref")
-        rsha = _rev(gl, rref) if rref else None
+        """(sha, team, ledger) from ONE commit, plus where it came from. With a remote, that commit is the remote's
+        ledger tip as this clone last ACCEPTED it (``remote_ref``; a refused fetch never moves it), read through
+        ``judge_remote``, which pins and caches nothing. This clone's own branch is never moved here; how far it
+        differs from the remote is counted and shown instead. Without an accepted remote tip, this clone's own copy."""
+        rsha = gl.remote_ref() if fetch.get("remote") else None
         if rsha is None:
             sha, team, ledger = gl.snapshot()
             return sha, team, ledger, {"source": "local", "unpushed": 0, "unfetched": 0}
         team = gl.team(rsha)
-        ledger = gl.ledger(team, rsha)
-        unpushed, unfetched = _divergence(gl, rref)
+        ledger = gl.judge_remote(rsha).ledger
+        unpushed, unfetched = _divergence(gl, rsha)
         return rsha, team, ledger, {"source": "remote", "unpushed": unpushed, "unfetched": unfetched}
 
     def _problems(self, gl: GitLedger, sha: str, team: R.Team, ledger: I.Ledger) -> list[str]:
@@ -511,26 +515,32 @@ class _ViewHandler(GuardedHandler):
         return cached[1]
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
-        """Fetch the remote's ledger into this clone's remote-tracking ref when one is due: a fetch only, never a
-        rebase, a merge or a push, so this clone's branch and worktree are untouched. Paced by team.toml's
+        """Fetch the remote's ledger when one is due, through ``fetch_only``: into quarantine, judged, and only an
+        accepted tip moves the remote-tracking ref. A fetch only, never a rebase, a merge or a push, so this clone's
+        branch and worktree are untouched. Paced by team.toml's
         fetch_interval (as of the last page) and never more often than FETCH_FLOOR; the button asks for the floor.
         The page shows the clone's own record of its last fetch, so a fetch the hook made counts too. Never raises: a
         failure here is shown on the page and the panes still draw. A failure's detail goes to this server's terminal,
         never to the page (git's message can carry a remote URL with credentials, or local paths)."""
-        out: dict = {"remote": False, "ref": None, "last_ok": None, "error": ""}
+        out: dict = {"remote": False, "last_ok": None, "error": "", "refused": False}
         try:
             remote = gl.remote
             if not remote:
                 return out
-            out.update(remote=True, ref=f"refs/remotes/{remote}/{BRANCH}")
+            out["remote"] = True
             interval = FETCH_FLOOR if now else max(self.server.fetch_interval, FETCH_FLOOR)
-            note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)      # PENDING: transport API (head)
+            note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)
             st = gl.state()
             out["last_ok"] = _iso(st.get("last_fetch_ok"))
             detail = note or st.get("last_fetch_error") or ""
             if detail:
                 _log(f"fetch from {remote!r} failed: {detail!r}")
-                out["error"] = "the last fetch from the remote failed (the detail is in the terminal running the view)"
+                # A refused tip (judged tampered) stays in quarantine and the panes keep the last accepted one; that
+                # is said plainly. Any other failure gets a fixed sentence: git's words stay in the terminal.
+                out["refused"] = "is refused" in detail
+                out["error"] = ("the remote's ledger was refused as tampered; showing the last copy this clone "
+                                "accepted (the detail is in the terminal running the view)" if out["refused"] else
+                                "the last fetch from the remote failed (the detail is in the terminal running the view)")
         except Exception as exc:  # noqa: BLE001 - the fetch's own state is unreadable: the page says so and draws
             _log(f"fetch state unavailable: {exc!r}")
             out["error"] = "could not fetch from the remote (the detail is in the terminal running the view)"
@@ -617,18 +627,10 @@ def _iso(ts: object) -> str | None:
         return None
 
 
-def _rev(gl: GitLedger, ref: str) -> str | None:
-    """The commit ``ref`` names in this clone, or None when it does not exist (never fetched, or the remote has no
-    ledger branch yet)."""
-    cp = git(["rev-parse", "-q", "--verify", f"{ref}^{{commit}}"], gl.repo.toplevel, check=False, timeout=10)
-    sha = cp.stdout.strip() if cp.returncode == 0 else ""
-    return sha or None
-
-
-def _divergence(gl: GitLedger, rref: str) -> tuple[int | None, int | None]:
+def _divergence(gl: GitLedger, rsha: str) -> tuple[int | None, int | None]:
     """(commits on this clone's ledger branch not on the remote, commits on the remote not yet on the branch); None
     for each when git cannot say, which the page shows as unknown, never as zero."""
-    cp = git(["rev-list", "--left-right", "--count", f"{REF}...{rref}"], gl.repo.toplevel, check=False, timeout=10)
+    cp = git(["rev-list", "--left-right", "--count", f"{REF}...{rsha}"], gl.repo.toplevel, check=False, timeout=10)
     try:
         a, b = cp.stdout.split()
         return int(a), int(b)

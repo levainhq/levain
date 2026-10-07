@@ -538,7 +538,6 @@ def _local_tip(clone):
     return _git("rev-parse", "refs/heads/levain-ledger", cwd=clone).strip()
 
 
-@pytest.mark.xfail(strict=True, reason="needs GitLedger.fetch_only (lane C)")
 def test_the_fetch_button_brings_in_a_ruling_another_clone_pushed_without_moving_this_clone(two_clone_view):
     # codex 10-07: the server never fetched, so the "sync" button reloaded an unchanged local ref. L1/L2 10-07 + the
     # head's ruling: the fix may only FETCH. The panes come from the fetched remote-tracking ref; this clone's branch
@@ -574,7 +573,6 @@ def test_an_unpushed_local_entry_is_counted_not_hidden_or_pushed(two_clone_view,
     assert "1 commit not pushed" in _req(port, "GET", "/")[1].decode()
 
 
-@pytest.mark.xfail(strict=True, reason="needs GitLedger.fetch_only (lane C)")
 def test_a_failed_fetch_is_shown_on_the_page_without_git_detail(two_clone_view, tmp_path, capfd):
     ana, _ben, port = two_clone_view
     gone = tmp_path / "gone-remote.git"
@@ -584,7 +582,7 @@ def test_a_failed_fetch_is_shown_on_the_page_without_git_detail(two_clone_view, 
     page = _req(port, "GET", "/")[1].decode()
     assert 'class="warn fetch-error">⚠ the last fetch from the remote failed' in page
     assert "gone-remote" not in page and "gone-remote" not in json.dumps(m)
-    assert "gone-remote" in capfd.readouterr().err                     # the detail is in the terminal
+    assert "git fetch failed" in capfd.readouterr().err                # the detail is in the terminal
 
 
 def test_with_no_remote_the_button_only_redraws_and_says_so(server):
@@ -592,38 +590,47 @@ def test_with_no_remote_the_button_only_redraws_and_says_so(server):
     assert "this clone only: no remote" in page and 'data-fetch="0">⟳ reload<' in page and "fetch now" not in page
 
 
-def test_the_integrity_warning_counts_what_team_verify_counts(server):
-    # codex 10-07: the view counted only ledger.problems, so a hash-valid ack naming an id the ledger does not hold
-    # showed no warning while `levain team verify` failed. Both now read verify.problems.
+def test_the_integrity_warning_counts_what_team_verify_counts(two_clone_view):
+    # codex 10-07: the view counted only what the ledger build found, so a hash-valid ack naming an id the ledger does
+    # not hold showed no warning while `levain team verify` failed. Both now read verify.problems. The write path
+    # refuses such an ack, so it is planted the way a buggy or hostile clone would: a sealed line, committed, pushed.
+    import io
+    import contextlib
+    from levain.team import cli as team_cli
+    from levain.team import entry as E
     from levain.team import verify as VF
-    chains: dict = {}
-    ts = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    ruling = _seal(chains, "ana", ts, "decision", kind="ruling", owner="ana", paths=["a.py"], words="Keep it.")
-    stray = _seal(chains, "ben", ts, "ack", refs=["d-000000000000"], session="s1")
-    gone = _seal(chains, "ana", ts, "question", owner="zed", paths=["b.py"], summary="who?")
-    ledger = I.build([("ana/a.jsonl", [json.dumps(e, sort_keys=True) for e in (ruling, gone)]),
-                      ("ben/b.jsonl", [json.dumps(stray, sort_keys=True)])], owner="ana")
-    assert ledger.problems == []                                   # the build alone sees nothing wrong
-
-    class Planted(_Stub):
-        def snapshot(self):
-            return "sha2", TEAM, ledger
-    found = VF.problems(Planted(), "sha2", TEAM, ledger)
-    assert len(found) == 2 and any("d-000000000000" in p for p in found) and any("'zed'" in p for p in found)
-    httpd = V.make_view_server(Planted(), port=0)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    try:
-        port = httpd.server_address[1]
-        assert json.loads(_req(port, "GET", "/view.json")[1])["problems"] == 2
-        assert b"2 integrity problem(s): run levain team verify" in _req(port, "GET")[1]
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+    from levain.team.transport import GitLedger, Repo
+    ana, ben, port = two_clone_view
+    gl = GitLedger(Repo.discover(ben))
+    f = gl.file_for("ben")
+    f.parent.mkdir(parents=True, exist_ok=True)
+    lines = f.read_text().splitlines() if f.exists() else []
+    sealed = E.seal(E.build("ben", "ack", refs=["d-000000000000"], session="planted"),
+                    json.loads(lines[-1])["hash"] if lines else "")
+    with f.open("a") as fh:
+        fh.write(json.dumps(sealed, sort_keys=True) + "\n")
+    toml = gl.wt / "team.toml"                                         # and a team.toml change by a non-owner,
+    toml.write_text(toml.read_text().replace('mode = "ask-once"', 'mode = "surface"'))   # which only history shows
+    _git("add", "-A", cwd=gl.wt)
+    _git("commit", "-qm", "planted", cwd=gl.wt)
+    _git("push", "-q", "origin", "levain-ledger", cwd=gl.wt)
+    m, _ = _words(port, "/view.json?fetch=1")
+    assert m["fetch"]["source"] == "remote" and m["fetch"]["error"] == ""
+    ga = GitLedger(Repo.discover(ana))
+    rsha = ga.remote_ref()
+    want = VF.problems(ga, rsha, ga.team(rsha), ga.judge_remote(rsha).ledger)
+    assert any("d-000000000000" in p for p in want) and any("not the owner" in p for p in want)
+    assert m["problems"] == len(want) >= 1
+    assert f"{len(want)} integrity problem(s): run levain team verify".encode() in _req(port, "GET")[1]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert team_cli.cmd_verify(type("A", (), {"repo": str(ben)})()) == 1   # verify fails on the same ledger
+    assert "d-000000000000" in buf.getvalue()
 
 
 class _RemoteStub(_Stub):
-    """A clone with a remote whose fetch is recorded, not run; the panes come from the local snapshot because the
-    remote-tracking ref does not exist in this stub."""
+    """A clone with a remote whose fetch is recorded, not run; the panes come from the local snapshot because this
+    stub has no accepted remote tip."""
     remote = "origin"
 
     def __init__(self, state=None, note=None):
@@ -636,6 +643,9 @@ class _RemoteStub(_Stub):
     def fetch_only(self, *, interval, timeout):
         self.calls.append(interval)
         return self._note
+
+    def remote_ref(self):
+        return None                     # no accepted remote tip: the panes come from this clone's copy
 
     def state(self):
         if isinstance(self._state, Exception):
@@ -654,7 +664,6 @@ def test_no_request_fetches_more_often_than_the_floor_even_when_team_toml_says_a
     # L1/L2 10-07: min(fetch_interval, floor) let fetch_interval = 0 fetch on every request, the 2 s busy retries
     # included, and the button's "at most every 10 s" was false.
     stub = _RemoteStub()
-    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
     httpd = _serve(stub)
     httpd.fetch_interval = 0.0
     try:
@@ -675,7 +684,6 @@ def test_no_request_fetches_more_often_than_the_floor_even_when_team_toml_says_a
 def test_a_broken_fetch_record_is_shown_and_the_panes_still_draw(monkeypatch, state, capfd):
     # L1 10-07: an unguarded fetch path turned an unreadable state.json (or one holding Infinity) into a whole-page
     # 503 "ledger unavailable" while the ledger itself was fine.
-    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
     httpd = _serve(_RemoteStub(state=state))
     try:
         r, body = _req(httpd.server_address[1], "GET")
@@ -690,7 +698,6 @@ def test_a_broken_fetch_record_is_shown_and_the_panes_still_draw(monkeypatch, st
 def test_a_failed_fetch_shows_a_fixed_message_and_keeps_git_detail_in_the_terminal(monkeypatch, capfd):
     # L1 10-07: git's stderr reached the page and /view.json; it can carry a remote URL with credentials.
     secret = "fatal: unable to access 'https://ana:hunter2@git.example/x.git/': /home/ana/.netrc"
-    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
     httpd = _serve(_RemoteStub(note=secret))
     try:
         port = httpd.server_address[1]
