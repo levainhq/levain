@@ -37,8 +37,13 @@ def main() -> int:
         "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--include-hook-events",
         "--permission-prompt-tool", "stdio",
-        "--permission-mode", "default",
     ]
+    if os.environ.get("S2_CC_PMODE", "default") != "none":  # "none" = pass no flag, so the entity's own defaultMode applies
+        cmd += ["--permission-mode", os.environ.get("S2_CC_PMODE", "default")]
+    if os.environ.get("S2_CC_SETTINGS"):  # S2 probes: extra --settings file; S2_CC_SOURCES narrows setting sources
+        cmd += ["--settings", os.environ["S2_CC_SETTINGS"]]
+    if os.environ.get("S2_CC_SOURCES"):
+        cmd += ["--setting-sources", os.environ["S2_CC_SOURCES"]]
     if a.model:
         cmd += ["--model", a.model]
     if a.effort:
