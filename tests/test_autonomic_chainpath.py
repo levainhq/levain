@@ -296,7 +296,10 @@ def _on_loop_chain(*, one_shot=False):
 
 
 def _on_loop_executor(tmp_path, reg=None, *, executor=None):
+    # every link's tools are low-risk, and the manifest agrees (a manifest that declared a link higher
+    # would raise its rung at propose, as the resolve would)
     return _executor(tmp_path, executor=executor or RecordingExecutor(), binding_store=reg,
+                     manifest=ActionManifest({"link0": LOW_INTERNAL, "link1": LOW_INTERNAL}),
                      risk_resolver=lambda b, i: LOW_INTERNAL,
                      trust_resolver=lambda b, i: TrustContext(signal_auth=SignalAuth.STRONG,
                                                               intent_provenance=IntentProvenance.INTENT_FREE,

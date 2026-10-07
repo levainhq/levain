@@ -55,9 +55,9 @@ wrapper's guard with the inner binding's guard stripped). A future delegation sl
 inner binding's ``effective_guard`` onto that link's kill set — never defang it.
 
 Carve-outs (the May-3 cut-at-seams): NO graduation (4c — incl. the carried cooling-off/confirm
-sweep-evidence ``record_fire`` gap), NO staleness (4d). The per-link ``predicted_trajectory`` stays
-4a-equivalent (the binding's first guard's envelope) — link-indexed trajectories need a guard-schema
-evolution (flagged, not built).
+sweep-evidence ``record_fire`` gap), NO staleness (4d). Every link carries the binding's one
+prediction envelope (:func:`~levain.autonomic.monitor.guard_trajectory`: every declared bound in its
+guards, joined); link-indexed trajectories need a guard-schema evolution (flagged, not built).
 
 **The run journal (S8).** The gate must carry a run journal (:class:`ChainExecutor` refuses one without):
 a chain is ONE journaled run (the dispatcher
@@ -111,7 +111,7 @@ _log = logging.getLogger("levain.autonomic.chainpath")
 # Gate refusals of a journaled link's resolve that RECORD NOTHING: the hold is still open, so the chain
 # is still paused at that link (a typed proof or a person may still come).
 _STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_typed_proof",
-                         "run_not_admitted"})
+                         "run_not_admitted", "journal:barred"})
 
 
 # The seams the adapter injects (per-link variants of the 4a single-link seams).
@@ -272,9 +272,9 @@ def seal_chain_id(
 ) -> str:
     """The content-FINGERPRINT chain id: ``chain-<created_at>-<16hex>`` over the full in-flight state —
     the PRE-CLAIM binding snapshot, the trigger event, the completed-link outputs, the paused link +
-    its proposed payload, and the gate's pending_id. Recomputing it (:meth:`ChainState.seal_matches`)
+    its proposed payload, and the id of the hold it belongs to. Recomputing it (:meth:`ChainState.seal_matches`)
     detects ANY post-pause alteration: a re-ordered chain, a skipped confirm, an injected payload, a
-    swapped binding. A mismatch ⇒ the resume DROPS (never continues a tampered chain). Structurally-
+    swapped binding. A mismatch ⇒ the resume rejects the hold (never continues a tampered chain). Structurally-
     encoded canonical JSON (NOT a delimiter-join — a delimiter-bearing field could reshuffle into an
     equal hash for a different tuple), mirroring ``pending.seal_pending_id``. KEYLESS (the pending /
     binding seal boundary): defends accidental corruption / drift / a buggy writer, not a malicious
@@ -640,11 +640,11 @@ class ChainExecutor:
     # ---------------------------------------------------------------------------------------------
     def resume(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
         """Resume a paused chain from the operator's resolve of its paused link's ``pending_id``. Returns
-        ``None`` iff no open chain owns that pending (the caller falls back to a 4a single-link
-        ``gate.resolve``). Otherwise: ATOMICALLY claim the chain state (at-most-once advance) → seal-check
-        → ``gate.resolve`` fires the paused link (at-most-once for the LINK) → on fired, append its output
-        + CONTINUE from the next link (which may pause again → a NEW chain state, or COMPLETE). A denied/
-        dropped resolve ENDS the chain. NEVER raises (the contract)."""
+        ``None`` iff the pending is not a chain link's hold (the caller resolves it with a plain
+        ``gate.resolve``). Otherwise: read the chain state from the hold → seal-check → ``gate.resolve``
+        makes the one write-once decision and fires the paused link through the run journal (at most
+        once) → on fired, append its output + CONTINUE from the next link (which may pause again, into
+        that link's hold, or COMPLETE). A denied or dropped resolve ENDS the chain. NEVER raises."""
         try:
             return self._resume(pending_id, decision)
         except Exception as e:  # noqa: BLE001 — resume, like the gate, never raises into the caller

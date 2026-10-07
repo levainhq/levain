@@ -68,6 +68,7 @@ from levain.autonomic.db import AutonomicDB
 
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
+    "JournalConflictError",
     "run_id_for", "hold_id_for", "effect_digest",
 ]
 
@@ -77,6 +78,12 @@ _log = logging.getLogger(__name__)
 class JournalCorruptError(RuntimeError):
     """The store cannot be read or written (damaged, or locked past the busy timeout). Fail closed: a
     journal that cannot be read cannot prove an effect has not already run, so nothing proceeds."""
+
+
+class JournalConflictError(JournalCorruptError):
+    """A write the store's constraints refuse (a second hold with a pending id another hold has). A
+    :class:`JournalCorruptError`, so every caller that fails closed on one fails closed on this; the
+    name says what happened."""
 
 
 class EffectStatus(str, enum.Enum):
@@ -273,6 +280,9 @@ class RunJournal:
         try:
             with self.db.write() as conn:
                 yield conn
+        except sqlite3.IntegrityError as exc:
+            # a write the store's constraints refuse (two holds with one pending id): fail closed, named
+            raise JournalConflictError(f"run journal {self.db.path}: {exc}") from exc
         except sqlite3.DatabaseError as exc:
             # an unreadable or damaged store cannot prove an effect has not run: fail closed
             raise JournalCorruptError(f"run journal {self.db.path}: {exc}") from exc

@@ -41,8 +41,8 @@ Architecture:
   - ``Executor`` (Protocol) / ``ActionRequest`` / ``ExecutionResult`` — the trusted action seam.
   - ``ConfirmTransport`` (Protocol) / ``ConfirmProposal`` / ``ConfirmDecision`` — the confirm-rung
     propose→reply seam (the human gate, injected; the decision returns out-of-band via ``resolve``).
-  - ``PendingAction`` / ``PendingActionStore`` — the durable pending-action queue (the confirm-map's
-    record that survives the propose→reply gap).
+  - ``PendingAction`` / ``PendingActionStore`` — the sealed record a person is asked about, and the
+    durable queue of MANUAL (human-authority) pendings; a binding's pending lives in its run's hold.
   - ``build_gate_face`` / ``build_gate_verdict`` — FILL the frozen receipt's efferent fields.
   - ``GateReceiptStore`` / ``StoredGateReceipt`` — the append-only efferent decision trace.
   - ``EfferentGate`` / ``GateOutcome`` — the orchestrator (risk → §1.5 → policy → route → receipt;

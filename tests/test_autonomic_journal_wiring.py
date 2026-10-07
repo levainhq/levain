@@ -1208,12 +1208,14 @@ def test_an_effect_stops_when_its_binding_is_no_longer_fireable(tmp_path):
     assert out.refused and out.reason == "journal:barred" and w.outbox() == []
 
 
-def test_an_approval_barred_at_its_effect_gets_a_receipt(tmp_path):
-    # the registry stopped granting the run after the resolve's own checks: the effect's barrier stops
-    # it, and the stop is receipted like a fence's
+def test_an_approval_barred_at_its_effect_stays_approved_and_runs_after_the_repair(tmp_path):
+    # the registry stopped granting the run after the resolve's own checks: the effect's barrier stops it.
+    # BARRED is a condition a repair can clear (slice L3 r2, L1 3 / L2 3): the approval stands, it is
+    # held, not receipted as a denial, and it runs once the registry grants the run again
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("g2")                                               # link1 pending
+    good = registry_of(w.store)
 
     def pause_without_fence(bid):
         reg = registry_of(w.store)
@@ -1222,9 +1224,13 @@ def test_an_approval_barred_at_its_effect_gets_a_receipt(tmp_path):
 
     _before_effect(w, pause_without_fence)
     out = w.resolve_open(approve=True)
-    assert out.reason == "journal:barred" and out.links[-1].outcome.receipt_id is not None
-    assert sorted(r.fired for r in w.receipts.read()) == [False, True]
-    assert w.outbox() == [("link0", "g2-0")]
+    assert out.held and out.reason.startswith("approved_not_yet_run:journal:barred")
+    assert [r.fired for r in w.receipts.read()] == [True]          # link0's only: no denial for link1
+    assert len(w.journal.approved_unrun()) == 1
+    w.journal.effect = RunJournal.effect.__get__(w.journal)
+    write_raw(w.store, good)
+    assert w.dispatch("g2").chain.completed
+    assert w.outbox() == [("link0", "g2-0"), ("link1", "g2-1")]
 
 
 @pytest.mark.parametrize("change,why", [
@@ -1277,7 +1283,8 @@ def test_an_approval_met_by_an_unreadable_registry_leaves_the_decision_open(tmp_
     good = registry_of(w.store)
     write_raw(w.store, {**good, "x": "not json"})
     first = w.resolve_open(approve=True)
-    assert not first.links or not first.links[-1].outcome.fired
+    assert first.paused and first.reason == "journal:barred"       # the chain is still waiting on it
+    assert not first.links[-1].outcome.fired
     assert len(w.journal.open_holds()) == 1                        # nothing was decided
     write_raw(w.store, good)
     again = w.resolve_open(approve=True)
@@ -1359,14 +1366,14 @@ def test_an_approved_effect_that_failed_is_not_reported_as_not_yet_run(tmp_path)
 def test_two_holds_cannot_share_a_pending_id(tmp_path):
     # complement LOW 8: find_pending returns one row, so a second hold with the same pending id could
     # never be resolved by id and blocked its binding; the store refuses the second one
-    from levain.autonomic.journal import JournalCorruptError
+    from levain.autonomic.journal import JournalConflictError
     w = World(tmp_path)
     b = w.mint(chain=False)
     for run in ("r1", "r2"):
         assert w.store.admit(b.binding_id, run) is not None
     pending = {"pending_id": "pend-same"}
     w.journal.hold("r1", "e", digest="d", pending=pending)
-    with pytest.raises(JournalCorruptError, match="UNIQUE"):
+    with pytest.raises(JournalConflictError, match="UNIQUE"):
         w.journal.hold("r2", "e", digest="d", pending=pending)
 
 
@@ -1489,3 +1496,88 @@ def test_a_bindings_pending_found_in_the_manual_store_is_refused(tmp_path):
     out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
     assert out.refused and out.reason == "integrity:binding_pending_outside_journal"
     assert w.outbox() == [] and w.pending.get(p.pending_id) is None   # claimed out: it cannot fire later
+
+
+
+# --- L1 + L2 on 08cd826 (the r1 fixes), each reproduced by their probes first -------------------------
+
+def _approved_unrun(w, eid):
+    w.dispatch(eid)
+    real = w.journal.effect
+    w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    assert _approve(w).held                                        # approved, the effect not run
+    w.journal.effect = real
+
+
+def test_a_redelivery_does_not_fire_an_approval_given_before_the_risk_rose(tmp_path):
+    # L1 1 / L2 1: _propose's APPROVED branch fired a standing approval at the old rung, so re-delivering
+    # the event bypassed the resolve's re-validation. Every approved hold now fires through one path.
+    w = World(tmp_path)
+    w.mint(chain=True)
+    _approved_unrun(w, "d1")
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    out = w.dispatch("d1")
+    assert out.chain.aborted and out.chain.reason == "revalidate:risk_floor_rose"
+    assert ("link1", "d1-1") not in w.outbox() and w.journal.approved_unrun() == []
+
+
+def test_a_redelivery_runs_an_approval_whose_rung_did_not_rise(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=True)
+    _approved_unrun(w, "d2")
+    assert w.dispatch("d2").chain.completed and ("link1", "d2-1") in w.outbox()
+    [fired] = [r for r in w.receipts.read() if r.action_face["context_id"] == "d2-1"]
+    assert fired.fired and fired.action_face["gate"]["by"] == "human"   # the person who approved it
+
+
+def test_a_rise_after_the_effect_ran_cancels_nothing(tmp_path):
+    # L1 2: the decided-and-raised branch cancelled a completed run and receipted a denial of an effect
+    # that had already been sent
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c9")
+    [p] = w.gate.open_pendings()
+    assert w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human")).completed
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    again = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))   # a duplicate reply
+    assert not again.aborted
+    with w.journal.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
+    assert [r.fired for r in w.receipts.read() if r.action_face["context_id"] == "c9-1"] == [True]
+
+
+def test_silence_on_a_raised_rung_applies_that_rungs_default(tmp_path):
+    # L1 4 / L2 2: a cooling-off hold whose floor rose to CONFIRM was approved by silence, refused as
+    # unattended at the raised rung, left open, and re-refused on every sweep while it held its binding
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00co",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="summarize", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=Posture.COOLING_OFF,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    w.gate._auto_fire_actions = frozenset({"link0"})
+    w.dispatch("co1")
+    [p] = w.gate.open_pendings()
+    assert p.posture == "COOLING_OFF"
+    w.gate._manifest = ActionManifest({"link0": HIGH, "link1": HIGH})          # now CONFIRM
+    later = FIXED + _dt.timedelta(days=30)
+    [out] = w.gate.sweep_timeouts(later)
+    assert out.refused and not out.fired and out.reason == "denied:revalidate:risk_floor_rose"
+    assert w.gate.open_pendings() == [] and w.outbox() == []
+    assert w.gate.sweep_timeouts(later) == []
+
+
+def test_a_new_proposal_is_made_at_the_raised_rung(tmp_path):
+    # L1 6: propose sealed the rung from the binding's tools alone and the resolve raised it at once; the
+    # same max now applies at propose, so the person is asked at the rung the resolve will require
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    w.dispatch("n7")
+    [p] = w.gate.open_pendings()
+    assert p.posture == "CONFIRM_ELEVATED" and p.requires_typed

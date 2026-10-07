@@ -192,7 +192,8 @@ class EfferentGate:
         journal: RunJournal | None = None,
     ) -> None:
         self._manifest = manifest
-        # The run journal (S8). None ⇒ nothing is journaled (a request carrying a ``run`` is refused).
+        # The run journal (S8). None ⇒ a manual-only gate: a request carrying a ``run`` is refused, and
+        # so is every binding fire (a binding fire is always a journaled run).
         # It shares one database with the binding registry, so every journal check reads the binding's
         # fence in the same transaction as the decision or effect it guards.
         self._journal = journal
@@ -278,7 +279,7 @@ class EfferentGate:
         net (→ refuse); the post-execute paths catch their own faults to preserve the fired state."""
         created_at = self._clock().isoformat()
 
-        # 00. the run journal (S8). A binding fire must be a journaled effect once a journal is wired,
+        # 00. the run journal (S8). A binding fire must be a journaled effect (there is no other mode),
         # and a journaled effect that already ran, was cancelled or fenced, or is poisoned or in flight
         # stops HERE, before any decision is made again: a replay re-decides nothing.
         stop = self._journal_entry(request, created_at)
@@ -357,6 +358,14 @@ class EfferentGate:
         posture = policy(risk, request.trust)
         if request.ratified_posture is not None:
             posture = max(risk_floor(risk), request.ratified_posture)
+        if request.risk is not None:
+            # a binding's risk comes from its sealed tools; the manifest's current floor for the action
+            # name, where it declares one, raises it too, as the resolve will (``_resolve_posture``), so
+            # a proposal is made at the rung its approval must meet
+            try:
+                posture = max(posture, risk_floor(self._manifest.risk_of(request.action_name)))
+            except UnknownAction:
+                pass
 
         # 3. the KNOWN-danger kill (Slice 4 — the first runtime consumer of the 3a.5 kill substrate,
         # closing codex's 3a.5 L3 finding #1) — evaluated BEFORE the §1.5 screen (complement L3): a
@@ -467,12 +476,14 @@ class EfferentGate:
                 )
             if h.status is EffectStatus.APPROVED:
                 # Decided and approved before (the process stopped between the decision and the
-                # effect): run it now under that approval instead of asking again.
-                by = h.decided_by if h.decided_by == "human" else (
-                    "binding" if request.authority.grantor == "binding" else "on-loop")
-                return self._fire(request=request, created_at=created_at, posture=posture,
-                                  verdict="approved" if by == "human" else "auto", by=by,
-                                  actor_first_estimate=request.actor_first_estimate, decided=True)
+                # effect): run it now under that approval instead of asking again. It goes through
+                # the resolve, the one path that fires an approved hold, so it is re-validated there
+                # (an approval given before the risk rose does not fire at the old rung).
+                hold = self._journal.get_hold(h.hold_id or "")
+                if hold is None:
+                    return self._refuse_open("journal:hold_missing", request.authority.binding_id)
+                decider = h.decided_by if h.decided_by in ("human", "on-loop") else "on-loop"
+                return self._resolve_hold(hold, ConfirmDecision(approved=True, by=decider), chain_owned=True)
             if h.status is EffectStatus.REPLAYED:
                 return self._replayed(request, h, created_at)
             if h.status is not EffectStatus.HELD:
@@ -601,24 +612,36 @@ class EfferentGate:
             return reject(posture, f"denied:{decision.reason or decision.by}", terminal=deny_terminal)
 
         # The rung the approval must meet NOW: the sealed posture, raised by the risk floor the proposal
-        # was sealed at and by the manifest's current floor for the action. A raised rung re-asks: its
-        # typed-proof and unattended checks below leave the decision open for a person.
+        # was sealed at and by the manifest's current floor for the action. At a raised rung a reply must
+        # meet that rung (its typed-proof and unattended checks below leave the decision open), and
+        # silence takes that rung's default (``silence_decision``).
         effective, bad = self._resolve_posture(pending, posture)
         if bad is not None:
             return reject(posture, bad)
         if effective is Posture.REFUSE_ESCALATE:
             return reject(posture, "revalidate:risk_floor_rose")
         if effective > posture and hold.get("decided") is True:
-            # approved at the lower rung, and a decision is write-once, so it cannot be asked again at
-            # the raised one: the run ends instead, with a receipt
+            # Approved at the lower rung, and a decision is write-once, so it cannot be asked again at
+            # the raised one: the run ends instead, with a receipt. Only while the effect has not
+            # started: one that ran (or is running, or was stopped since) is the journal's to report.
             try:
-                self._journal.cancel(hold["run_id"], reason="revalidate:risk_floor_rose")
-            except Exception as e:  # noqa: BLE001
-                _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
-                           type(e).__name__, e)
-                return self._refuse_open("cancel_unrecorded:revalidate:risk_floor_rose", binding_id)
-            return deny(effective, "revalidate:risk_floor_rose", by="on-loop")
-        posture = effective
+                started = self._journal.peek(hold["run_id"], hold["effect_id"], digest=hold["digest"])
+            except KeyError:
+                return self._refuse_open("run_not_admitted", binding_id)
+            if started is None:
+                try:
+                    self._journal.cancel(hold["run_id"], reason="revalidate:risk_floor_rose")
+                except Exception as e:  # noqa: BLE001
+                    _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
+                               type(e).__name__, e)
+                    return GateOutcome(
+                        posture=effective, fired=False, refused=False, deferred=False, held=True,
+                        reason="cancel_unrecorded:revalidate:risk_floor_rose", receipt_id=None,
+                        execution=None, binding_id=binding_id,
+                    )
+                return deny(effective, "revalidate:risk_floor_rose", by="on-loop")
+        else:
+            posture = effective
 
         guard = self._guard_resolve_fire(pending, posture, decision)
         if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
@@ -678,12 +701,12 @@ class EfferentGate:
         )
         if fired.fired or fired.replayed or fired.receipt_id is not None or fired.execution is not None:
             return fired   # (an execution without a receipt: the effect ran and failed, the receipt did not land)
-        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned",
-                                              "journal:barred"):
+        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned"):
             # an approval the journal stopped for good (fenced or cancelled since the decision, or an
             # outcome already unknown): a terminal end, so it gets a receipt like every other one
             return deny(posture, fired.reason, by="on-loop")
-        # APPROVED, effect not yet run (a fault, an unreadable registry, the effect in flight elsewhere):
+        # APPROVED, effect not yet run (a fault, a registry that cannot be read or does not grant the run
+        # now, the effect in flight elsewhere):
         # the decision stands, so this is not a refusal. The approval runs once on a later delivery or
         # resolve, and RunJournal.approved_unrun lists it meanwhile.
         return GateOutcome(
@@ -992,6 +1015,12 @@ class EfferentGate:
         if not self._expired(pending, now):
             return None
         posture = self._posture_of(pending)
+        if posture is not None and pending.seal_matches():
+            effective, bad = self._resolve_posture(pending, posture)
+            if bad is not None or effective > posture:
+                # the rung rose since the proposal: silence takes the RAISED rung's default, and a rung
+                # above cooling-off never fires on silence
+                return ConfirmDecision(approved=False, by="on-loop", reason=bad or "revalidate:risk_floor_rose")
         if (not pending.seal_matches() or posture is None or pending.fail_open != posture.fail_open
                 or not posture.fail_open or pending.action_name not in self._auto_fire_actions):
             reason = "cooling_off_not_allowlisted" if (posture is not None and posture.fail_open) else "confirm_window_elapsed"

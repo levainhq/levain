@@ -1280,8 +1280,8 @@ class BindingStore:
 
     @staticmethod
     def is_fireable(b: Binding) -> bool:
-        """The single canonical FIRE-VIEW predicate (shared by :meth:`list_active` +
-        :meth:`snapshot_if_fireable` + the Slice-4c graduation-apply's in-memory pre-persist check):
+        """The single canonical FIRE-VIEW predicate (shared by :meth:`list_active` + :meth:`admit` + the
+        Slice-4c graduation-apply's in-memory pre-persist check):
         True iff ``b`` may fire NOW — ACTIVE status AND a valid seal AND (not confirm-class OR a
         kill-bearing SEALED-floor guard). A mandatory kill is checked on the sealed ``guard`` ONLY
         (never ``effective_guard``) — an unsealed addition can never satisfy the confirm-class mandate.
@@ -1317,7 +1317,7 @@ class BindingStore:
             if trigger_type is not None and b.trigger.type != trigger_type:
                 continue
             # the fire-view filter (:meth:`is_fireable`), the one canonical predicate so the fire-view and
-            # the per-id snapshot_if_fireable can never drift apart. Active and identity-checked here, so
+            # the admission (:meth:`admit`) can never drift apart. Active and identity-checked here, so
             # a non-fireable record is the confirm-class kill-mandate gap: the mandatory kill is checked
             # on the SEALED floor ``guard`` ONLY (an unsealed addition can be stripped without tripping
             # the seal, so it can ADD kills the runtime honors but never satisfy the mandate).
@@ -1330,21 +1330,6 @@ class BindingStore:
                 continue
             out.append(b)
         return out
-
-    def snapshot_if_fireable(self, binding_id: str) -> Binding | None:
-        """A FRESH re-read returning the binding iff it is currently FIREABLE (the same canonical
-        :meth:`is_fireable` filter ``list_active`` applies), else ``None``. The STANDING-binding
-        counterpart to :meth:`claim_one_shot` (which is the one-shot's atomic claim): the fire-path
-        re-acquires a fresh fireable snapshot IMMEDIATELY before firing so a concurrent
-        pause/revoke/seal-break/tighten committed SINCE the (lockless, possibly-stale) ``list_active``
-        is caught here — a revoked grant does not fire (the unsafe direction the fire-path must close),
-        and a freshly-tightened guard's NEW kill IS evaluated (the dispatcher rebuilds the kill set from
-        THIS snapshot). NO mutation (a standing grant fires repeatedly, it is never claimed). Returns
-        ``None`` for absent / malformed / not-currently-fireable. The residual window (this read → the
-        gate fire) is irreducible — the lock cannot be held across the gate's I/O — but it is the same
-        immediately-before-fire re-acquire the ``pending.claim`` precedent uses."""
-        b = self.get(binding_id)
-        return b if (b is not None and self.is_fireable(b)) else None
 
     def set_status(self, binding_id: str, status: BindingStatus) -> bool:
         """Change a binding's LIFECYCLE state — a GOVERNED verb with a transition policy
@@ -1465,48 +1450,6 @@ class BindingStore:
                                          else grad.to_dict())
                     self._write_raw(records, conn)
                     return updated
-            return None
-
-    def claim_one_shot(self, binding_id: str) -> Binding | None:
-        """ATOMICALLY claim a ONE-SHOT binding for a SINGLE fire (the ``pending.claim`` precedent, one
-        layer up). Under the lock: iff the binding is currently FIREABLE (:meth:`is_fireable`: ACTIVE
-        status + valid seal + the confirm-class sealed-kill mandate) AND ``one_shot``, set it ``REVOKED`` and return the PRE-CLAIM (still-ACTIVE)
-        snapshot; else return ``None``.
-
-        At-MOST-once: two concurrent dispatches can never both claim — the first flips it ``REVOKED``
-        under the lock, the second sees a non-active record → ``None`` → it does not fire. The CLAIM
-        happens BEFORE the fire (the dispatcher fires the returned snapshot), so a crash mid-fire DROPS
-        the binding (already revoked, not re-fireable) rather than leaving it re-fireable — fail-CLOSED
-        (at-most-once over at-least-once; a failed effect does NOT retry a one-shot). The returned
-        snapshot carries its pre-claim ACTIVE status so the caller can still mint authority
-        (:func:`binding_invocation` REFUSES a non-active binding) for the fire it was claimed for; the
-        STORE record is now ``REVOKED`` (spent). NOT for a standing binding (returns ``None`` — a
-        standing grant fires repeatedly, it is never claimed/spent). Locked read-modify-write.
-
-        ATTEMPTED-once, not fired-once (L3 review — the one-shot+gate-outcome semantic): the dispatcher
-        claims BEFORE the gate rules, so the grant is spent by the dispatch ATTEMPT — including a gate
-        KILL (a known-danger trigger), a §1.5 REFUSE (a tampered/injection payload), or a DEFER. A
-        one-shot whose FIRST matching event is dangerous is therefore disarmed without ever performing X
-        (an availability/DoS surface: a spoofed kill-tripping event permanently defuses the grant). This
-        is the safe direction (it never fires when it should not), and the claim-before-gate ordering is
-        load-bearing for at-most-once across the cooling-off PROPOSE path too (else N matching events →
-        N pendings → N fires). The "re-arm a one-shot the gate refused to even attempt" refinement is a
-        deferred lifecycle decision (Slice 4d), not a 4a behavior."""
-        with self._locked() as conn:
-            records = self._read_raw(for_mutation=True, conn=conn)
-            for rec in records:
-                if rec.get("binding_id") != binding_id:
-                    continue
-                b = self._load(rec)
-                # The canonical fire-view predicate, not bare is_active: a tampered/paused/spent
-                # one-shot is NOT claimable (fail-closed), and neither is a confirm-class one-shot
-                # with no sealed kill, which list_active already excludes (reproduced 2026-10-06:
-                # is_active let it through). A standing (non-one_shot) binding is never claimed.
-                if b is None or not b.one_shot or not self.is_fireable(b):
-                    return None
-                rec["status"] = BindingStatus.REVOKED.value
-                self._write_raw(records, conn)
-                return b   # the pre-claim ACTIVE snapshot (the on-disk record is now REVOKED)
             return None
 
     def tighten_guard(self, binding_id: str, *new_guards: Guard) -> Binding | None:

@@ -358,15 +358,16 @@ def test_a_re_add_carrying_tightenings_refuses_rather_than_dropping_them(tmp_pat
     assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["on-disk"]
 
 
-def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
+def test_admit_refuses_what_is_fireable_refuses(tmp_path):
     # Reproduced 2026-10-06 (codex, code L3 r1 of the fold): an ACTIVE confirm-class one-shot with no
-    # sealed kill is excluded by list_active, yet claim_one_shot returned it, and that snapshot could
-    # mint authority. The claim must use the same fire-view predicate.
-    store = BindingStore(tmp_path / "b")
+    # sealed kill is excluded by list_active, yet the one-shot claim returned it, and that snapshot could
+    # mint authority. The claim (now admit's) must use the same fire-view predicate.
+    from levain.autonomic import RunJournal
+    store = BindingStore(tmp_path / "b", journal=RunJournal(tmp_path / "b"))
     b = a_binding(posture=Posture.CONFIRM, one_shot=True, guard=(), status=BindingStatus.ACTIVE)
     store.add(b)
     assert not BindingStore.is_fireable(store.get(b.binding_id))
-    assert store.claim_one_shot(b.binding_id) is None
+    assert store.admit(b.binding_id, "run-1") is None
     assert store.get(b.binding_id).status is BindingStatus.ACTIVE   # not spent by a refused claim
 
 

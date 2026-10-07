@@ -6,7 +6,8 @@ monitor, the receipt.
 Three blocks:
   1. the GATE fire-path changes (seam #1 risk-threading, seam #2 ratified-posture fail-up, the
      known-danger KILL wiring closing codex's 3a.5 finding #1, ``by=binding``);
-  2. the two new ``BindingStore`` verbs (``ratify`` PAUSED→ACTIVE, ``claim_one_shot`` atomic);
+  2. the ``BindingStore`` verbs the fire path uses (``ratify`` PAUSED→ACTIVE, ``admit`` with a one-shot's
+     atomic claim);
   3. the ``FireDispatcher`` end-to-end (match/skip, single-link cut, one-shot, kill, bookkeeping).
 """
 from __future__ import annotations
@@ -232,7 +233,7 @@ def test_prediction_monitor_lights_up_via_threaded_trajectory(tmp_path):
 
 
 # =====================================================================================
-# Block 2 — the new BindingStore verbs (ratify + claim_one_shot)
+# Block 2 — the BindingStore verbs the fire path uses (ratify + admit's one-shot claim)
 # =====================================================================================
 
 def _mk_binding(tmp_path, *, posture=Posture.ON_LOOP, status=BindingStatus.PAUSED, one_shot=False,
@@ -303,28 +304,29 @@ def test_ratify_absent_returns_none(tmp_path):
     assert st.ratify("bind-nope") is None
 
 
-def test_claim_one_shot_claims_then_blocks_second(tmp_path):
+def test_admit_claims_a_one_shot_for_one_run(tmp_path):
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE, one_shot=True)
-    snap = st.claim_one_shot(b.binding_id)
+    snap = st.admit(b.binding_id, "run-1")
     assert snap is not None and snap.status is BindingStatus.ACTIVE     # the pre-claim snapshot
     assert st.get(b.binding_id).status is BindingStatus.REVOKED          # the store record is spent
-    assert st.claim_one_shot(b.binding_id) is None                       # at-most-once
+    assert st.claimed_run(b.binding_id) == "run-1"
+    assert st.admit(b.binding_id, "run-2") is None                       # at-most-once: another run
+    assert st.admit(b.binding_id, "run-1") is not None                   # its own run, re-delivered
 
 
-def test_claim_one_shot_ignores_standing_binding(tmp_path):
+def test_admit_does_not_claim_a_standing_binding(tmp_path):
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE, one_shot=False)
-    assert st.claim_one_shot(b.binding_id) is None
-    assert st.get(b.binding_id).status is BindingStatus.ACTIVE           # untouched
+    assert st.admit(b.binding_id, "run-1") is not None and st.admit(b.binding_id, "run-2") is not None
+    assert st.get(b.binding_id).status is BindingStatus.ACTIVE           # never spent
 
 
-def test_claim_one_shot_ignores_seal_broken(tmp_path):
-    import json
+def test_admit_refuses_a_seal_broken_one_shot(tmp_path):
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE, one_shot=True)
     raw = registry_of(st)
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"
     write_raw(st, raw)
     with pytest.raises(ValueError, match="seals to"):                     # tampered → not claimable
-        st.claim_one_shot(b.binding_id)
+        st.admit(b.binding_id, "run-1")
     assert st.list_active() == []
 
 
@@ -512,21 +514,6 @@ def test_risk_resolver_raise_skips_the_binding_fail_closed(tmp_path):
                         request_builder=_builder(), risk_resolver=_boom, clock=lambda: FIXED)
     out = fd.dispatch({"type": "time", "fields": {"tick": "1"}})
     assert out == [] and ex.calls == []
-
-
-def test_snapshot_if_fireable_unit(tmp_path):
-    """The new standing-binding fresh re-read: returns the binding iff currently fireable."""
-    st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE)
-    assert st.snapshot_if_fireable(b.binding_id) is not None
-    st.set_status(b.binding_id, BindingStatus.PAUSED)
-    assert st.snapshot_if_fireable(b.binding_id) is None          # not active
-    st.set_status(b.binding_id, BindingStatus.ACTIVE)
-    import json
-    raw = registry_of(st)
-    next(iter(raw.values()))["posture"] = "ABOVE_LOOP"                              # tamper the sealed core
-    write_raw(st, raw)
-    assert st.snapshot_if_fireable(b.binding_id) is None          # seal-broken → not fireable
-    assert st.snapshot_if_fireable("bind-absent") is None
 
 
 def test_dispatch_skips_standing_binding_revoked_after_list_active(tmp_path):
