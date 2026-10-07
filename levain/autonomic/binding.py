@@ -940,8 +940,8 @@ class BindingStore:
     # --- public API --------------------------------------------------------------------
     def add(self, binding: Binding) -> None:
         """Persist a binding. On a same-id collision the record is REPLACED but the on-disk ``status``
-        + ``graduation`` are PRESERVED via :meth:`_preserve_bookkeeping` (most-restrictive valid status
-        + max evidence) — bookkeeping is owned by its governed verbs (``set_status`` / ``record_fire``),
+        + ``graduation`` + ``guard_additions`` are PRESERVED via :meth:`_preserve_bookkeeping`
+        (most-restrictive valid status + max evidence + the union of tightenings) — bookkeeping is owned by its governed verbs (``set_status`` / ``record_fire``),
         never silently reset by ``add``. Closes: a stale re-add wiping graduation (L1-M3); the silent
         un-revoke (re-``create`` of a revoked core → same id → default-ACTIVE → resurrection, L2-H1);
         and a duplicate-ACTIVE overriding a REVOKED tombstone (L3). The binding's own seal must hold +
@@ -1266,9 +1266,11 @@ class BindingStore:
                 if rec.get("binding_id") != binding_id:
                     continue
                 b = self._load(rec)
-                # is_active = ACTIVE status AND a valid seal → a tampered/paused/spent one-shot is NOT
-                # claimable (fail-closed); a standing (non-one_shot) binding is never claimed.
-                if b is None or not b.one_shot or not b.is_active:
+                # The canonical fire-view predicate, not bare is_active: a tampered/paused/spent
+                # one-shot is NOT claimable (fail-closed), and neither is a confirm-class one-shot
+                # with no sealed kill, which list_active already excludes (reproduced 2026-10-06:
+                # is_active let it through). A standing (non-one_shot) binding is never claimed.
+                if b is None or not b.one_shot or not self.is_fireable(b):
                     return None
                 rec["status"] = BindingStatus.REVOKED.value
                 self._write_raw(records)

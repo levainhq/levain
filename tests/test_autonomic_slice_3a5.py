@@ -351,6 +351,18 @@ def test_readd_unions_incoming_and_existing_tightenings(tmp_path):
     assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["on-disk", "incoming"]
 
 
+def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
+    # Reproduced 2026-10-06 (codex, code L3 r1 of the fold): an ACTIVE confirm-class one-shot with no
+    # sealed kill is excluded by list_active, yet claim_one_shot returned it, and that snapshot could
+    # mint authority. The claim must use the same fire-view predicate.
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(posture=Posture.CONFIRM, one_shot=True, guard=(), status=BindingStatus.ACTIVE)
+    store.add(b)
+    assert not BindingStore.is_fireable(store.get(b.binding_id))
+    assert store.claim_one_shot(b.binding_id) is None
+    assert store.get(b.binding_id).status is BindingStatus.ACTIVE   # not spent by a refused claim
+
+
 def test_tighten_guard_rejects_untripping_drill(tmp_path):
     # complement L3 MED-1: the tighten path is NOT a second-class compile citizen — a tightening kill
     # whose drill does NOT trip it is refused (the drill-trip gate, parity with compile_binding).
