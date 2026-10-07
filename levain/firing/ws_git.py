@@ -179,6 +179,8 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str) -> int:
         aside.rename(src)
         print(f"ws-adopt: the clone failed, nothing changed: {r.stderr.strip()}")
         return 1
+    # The clone's own remote points at the moved-aside path, a URL ws-git itself refuses: drop it.
+    subprocess.run(ws_git_argv(hands, src, ["remote", "remove", "operator-copy"]), capture_output=True, cwd="/")
     for name, url in remotes.items():
         subprocess.run(ws_git_argv(hands, src, ["remote", "add", name, url]), capture_output=True, cwd="/")
     print(f"Adopted {src}: it now belongs to the hands user. Your original is at {aside}; delete it "

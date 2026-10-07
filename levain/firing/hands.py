@@ -395,8 +395,15 @@ def _chown_back(tree: Path, uid: int, owner: str) -> tuple[bool, str]:
     if not tree.exists():
         return True, "no workspace"
     find, chown = _abs("find"), _abs("chown")
+    op_gid = owner.split(":", 1)[1]
+    # root owns them; the operator's group may READ them (not write), so the work can be cloned:
+    # under the workspace's default ACL new files have no "other" bits (measured in CI on Linux).
     ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-uid", str(uid), "-prune",
-                       "-exec", chown, "-R", "-h", "0:0", "{}", "+"))
+                       "-exec", chown, "-R", "-h", f"0:{op_gid}", "{}", "+"))
+    if not ok:
+        return ok, why
+    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune",
+                       "-exec", _abs("chmod"), "-R", "g+rX,g-w", "{}", "+"))
     if not ok:
         return ok, why
     ok, why = _run_ok((find, str(tree), "-name", ".git", "-prune", "-o", "-uid", str(uid),

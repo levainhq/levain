@@ -503,8 +503,9 @@ def test_undo_gives_files_back_to_the_operator_but_the_entitys_repositories_to_r
     monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: calls.append(argv) or (True, ""))
     monkeypatch.setattr(hands.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
     assert hands._chown_back(tmp_path, 499, "alice:20") == (True, "")
-    to_root, to_op = calls
-    assert to_root[to_root.index("-name") + 1] == ".git" and "0:0" in to_root and "-R" in to_root
+    to_root, readable, to_op = calls
+    assert to_root[to_root.index("-name") + 1] == ".git" and "0:20" in to_root and "-R" in to_root
+    assert readable[-4:] == ("-R", "g+rX,g-w", "{}", "+")
     assert to_root.index("-uid") < to_root.index("-exec")
     assert to_op[to_op.index("-name") + 1] == ".git" and "-prune" in to_op and "-o" in to_op
-    assert "alice:20" in to_op and "0:0" not in to_op
+    assert "alice:20" in to_op and "0:20" not in to_op
