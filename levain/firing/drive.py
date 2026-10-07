@@ -93,8 +93,8 @@ def human_present(mode: DriveMode | str) -> bool:
 
 
 def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
-    """Should the STANDARD credential stores (``~/.config/gh`` · ``~/.aws/credentials`` ·
-    ``~/.netrc``) be folded into the crown-jewels floor for this session?
+    """Should the STANDARD credential stores (the paths
+    :func:`levain.firing.confinement.cred_floor_label` names) be folded into the crown-jewels floor for this session?
 
     ``setting`` is the entity's ``deny_standard_creds`` declaration from ``confinement.json``:
 

@@ -29,8 +29,8 @@ moat in file terms), sibling entities' ``.levain/`` stores, ``~/.ssh`` key mater
 "agent"`` — the entity authenticates via the agent socket but can't read/exfil raw keys),
 ``~/.ssh/authorized_keys`` WRITE (both ssh_modes — no key can be planted as a persistence backdoor),
 plus the operator-declared credential files/subtrees from ``confinement.json`` and — when the operator
-opts in (``deny_standard_creds``) — the standard cred stores (``~/.config/gh`` / ``~/.aws/credentials``
-/ ``~/.netrc``). The entity's OWN ``<entity>/.levain/`` is its working space, NOT a jewel — readable,
+opts in (``deny_standard_creds``) — the standard cred stores (``confinement._STANDARD_CRED_SUBTREES`` /
+``_STANDARD_CRED_FILES``). The entity's OWN ``<entity>/.levain/`` is its working space, NOT a jewel — readable,
 and its non-store files are writable — EXCEPT its own memory STORE files (``memory.{continuity.md,
 crystal.json,db}`` + the SQLite sidecars), which are WRITE-denied to the hands (``own_memory_files``,
 spore-359): spore-359 folds the neocortex into the always-loaded frame, so only the host-process wrap

@@ -3387,6 +3387,30 @@ def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypat
     assert carried.floor.deny_keychain is expected
 
 
+def test_cred_floor_label_names_every_store_the_floor_denies() -> None:
+    # The banner once named 3 of the 5 stores, so its READABLE warning left out the git
+    # credential files.
+    from levain.firing.confinement import (
+        _STANDARD_CRED_FILES, _STANDARD_CRED_SUBTREES, cred_floor_label,
+    )
+
+    label = cred_floor_label("Linux")
+    for path in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES):
+        assert path in label, path
+
+
+def test_readme_names_every_store_the_cred_floor_denies() -> None:
+    # The README lists the stores by hand for a reader deciding whether to set
+    # deny_standard_creds; a store the floor gains must reach that list.
+    from pathlib import Path
+
+    from levain.firing.confinement import _STANDARD_CRED_FILES, _STANDARD_CRED_SUBTREES
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    for path in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES):
+        assert f"`{path}`" in readme, path
+
+
 def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
     from levain.firing.confinement import cred_floor_label
 

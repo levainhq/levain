@@ -177,7 +177,7 @@ is tabulated above :func:`_bwrap_argv`.
   - FLOOR-EXPANSION (spore-322, Phill-ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
     the UNIVERSAL floor (:data:`_SSH_AUTHORIZED_KEYS`, both ssh_modes — a persistence backdoor with zero
     legit use, so it is folded unconditionally). The other default-allow-readable standard cred stores
-    — ``~/.config/gh`` (a GitHub token = repo push/admin), ``~/.aws/credentials``, ``~/.netrc`` — are ≥
+    — :data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES` (a GitHub token = repo push/admin) — are ≥
     the ssh key in impact, but denying their READ breaks the entity's own gh/aws/curl use, so they are
     an explicit OPT-IN (``deny_standard_creds`` in confinement.json, default OFF; :data:`_STANDARD_CRED_
     SUBTREES` / :data:`_STANDARD_CRED_FILES`) rather than always-on — operational-fit over purity. A
@@ -347,7 +347,9 @@ def cred_floor_label(system: str | None = None) -> str:
     by the Seatbelt profile (``CrownJewelsPolicy.deny_keychain``); Linux has no counterpart."""
     import platform as _platform
 
-    base = "~/.config/gh · ~/.aws/credentials · ~/.netrc"
+    # Derived from the two tuples the floor enforces, so the banner cannot name fewer stores than
+    # the floor denies (it once omitted both git credential files).
+    base = " · ".join((*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES))
     return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
 
 
@@ -987,7 +989,7 @@ def build_policy(
         expanded), so raw-mode keeps ~/.ssh otherwise writable.
 
     **Operator OPT-IN (``deny_standard_creds=True``):** fold the standard tool-canonical cred stores
-    (``~/.config/gh`` subtree, ``~/.aws/credentials``, ``~/.netrc``) into the floor. These are knowable
+    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor. These are knowable
     locations (not the false-security guessing the module refuses), but denying their READ breaks the
     entity's own gh/aws/curl use, so it is OFF by default — the operator enables it when the entity
     does not need those tools. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
@@ -1706,7 +1708,7 @@ class ConfinementConfig:
     deny_subtrees: tuple[Path, ...] = ()   # additional crown-jewel SUBTREES: a secrets dir, another store
     ssh_mode: SshMode = "agent"
     deny_standard_creds: bool | None = None
-    # TRI-STATE (K4a, 2026-07-29): fold ~/.config/gh + ~/.aws/credentials + ~/.netrc into the floor?
+    # TRI-STATE (K4a, 2026-07-29): fold _STANDARD_CRED_SUBTREES + _STANDARD_CRED_FILES into the floor?
     #   True  → deny ALWAYS (an explicit operator pin; the drive mode does not soften it)
     #   False → allow ALWAYS (an explicit operator OPT-IN that deliberately survives an unattended
     #           seat — a seat whose job is "open a PR nightly" genuinely needs gh)
