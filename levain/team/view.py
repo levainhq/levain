@@ -224,7 +224,8 @@ JS = r"""(function () {
   var auth = window.LevainToken;
   var app = document.getElementById("app"), status = document.getElementById("status");
   var seq = 0;                 // a response is drawn only if no later request has been made
-  var retry = null;            // the timer of a busy answer's retry
+  var retry = null;            // the timer of a busy answer's or a failed request's retry
+  var failWait = 0;            // seconds before the next retry of a failed request; reset by any answer
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -472,6 +473,7 @@ JS = r"""(function () {
       })
       .then(function (a) {
         if (mine !== seq) return;                  // a later request was made: its answer is the one to draw
+        failWait = 0;
         if (a.locked) { say("Locked: this page needs its token."); return; }
         if (a.unavailable === "busy") {
           // The server is reading the ledger for another request: ask again after the wait it named.
@@ -489,7 +491,12 @@ JS = r"""(function () {
       })
       .catch(function (e) {
         if (mine !== seq) return;
-        say("Could not load the team view: " + (e && e.message ? e.message : e));
+        // A connection the server closed unanswered (every slot taken) or a server that is gone: ask again, backing
+        // off to a minute, so a page opened during a burst draws itself once a slot is free.
+        failWait = Math.min(failWait ? failWait * 2 : 2, 60);
+        say("Could not load the team view: " + (e && e.message ? e.message : e) + ". Trying again in " +
+            failWait + " seconds.");
+        retry = setTimeout(load, failWait * 1000);
       });
   }
 
@@ -810,15 +817,16 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
     url = f"http://{bh}:{bp}/"
     print(f"Levain team view -> {url}")
     print("  loopback-only · read-only (GET and HEAD only) · Ctrl+C to stop", flush=True)
-    try:
-        published = publish_launch_token(httpd, url, port=bp, kind="team-view")
-    except OSError as exc:
-        print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
-              "other place to hand it over; not serving.", file=sys.stderr)
-        httpd.server_close()
-        return 1
+    published = None
     restore_sigterm = SigtermStop()
     try:
+        # Publication is inside the try, so an interrupt between it and the SIGTERM handler still runs the cleanup.
+        try:
+            published = publish_launch_token(httpd, url, port=bp, kind="team-view")
+        except OSError as exc:
+            print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
+                  "other place to hand it over; not serving.", file=sys.stderr)
+            return 1                          # the finally closes the socket
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
         # written costs the cockpit's Team tab, never the view. Pruning and registering are separate steps, so a prune
@@ -843,7 +851,8 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
         # The token's runtime file; then unpublish, release the registry lock, close the socket, each in its own
         # finally so a failure in one never skips the next. This order keeps "lock held implies socket held" true.
         try:
-            published.close()
+            if published is not None:
+                published.close()
         finally:
             try:
                 if httpd.registration is not None:

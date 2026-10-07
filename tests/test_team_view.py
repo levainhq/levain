@@ -1086,3 +1086,48 @@ def test_a_503_that_is_not_json_says_unavailable_and_draws_nothing(monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_an_interrupt_right_after_the_token_is_published_still_removes_it(monkeypatch):
+    # L3 r3 10-07 (glm HIGH, codex MED): publication sat outside the cleanup's try, so a SIGTERM (raised as
+    # KeyboardInterrupt) landing just after it left the runtime file and the socket behind.
+    calls, state = [], {"published": False}
+
+    class Published:
+        unlocked = None
+
+        def close(self):
+            calls.append("runtime file")
+
+    def publish(*a, **k):
+        state["published"] = True
+        return Published()
+
+    def interrupt_after_publication(*a, **k):
+        if state["published"]:
+            raise KeyboardInterrupt          # the signal, landing on the first step after publication
+        return SigtermStop_real(*a, **k)
+    from levain.http_guards import SigtermStop as SigtermStop_real
+    monkeypatch.setattr(V, "publish_launch_token", publish)
+    monkeypatch.setattr(V, "SigtermStop", interrupt_after_publication)
+    monkeypatch.setattr(V, "stop_on_sigterm", lambda: interrupt_after_publication())
+    closed = []
+    real_close = V._ViewServer.server_close
+    monkeypatch.setattr(V._ViewServer, "server_close", lambda self: (closed.append(True), real_close(self)))
+    try:
+        V.serve(_Stub(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
+    except KeyboardInterrupt:
+        pass
+    assert calls == ["runtime file"] and closed == [True]
+
+
+def test_a_request_that_fails_is_asked_again_with_backoff():
+    # L3 r3 10-07 (codex MED): a connection closed unanswered (every slot taken) left a newly opened page empty for
+    # good; only a busy answer was retried.
+    s = __import__("socket").socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()                                  # nothing listens here: every request fails
+    page = _page(port)
+    assert "Could not load the team view" in page and "Trying again in 2 seconds." in page
+    assert "failWait = Math.min(failWait ? failWait * 2 : 2, 60);" in V.JS
