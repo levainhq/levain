@@ -94,7 +94,7 @@ from typing import Any
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import LAUNCH_TOKEN_HEADER, GuardedHandler
+from levain.http_guards import LAUNCH_TOKEN_HEADER, GuardedHandler, check_launch_token
 from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -588,6 +588,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         """The name the token had when only the chat routes took it."""
         return self.launch_token
 
+    @chat_token.setter
+    def chat_token(self, value: str | None) -> None:
+        check_launch_token(value)
+        self.launch_token = value
+
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
 
@@ -1067,14 +1072,13 @@ def make_server(
     ``launch_token`` turns on the launch-token gate: every route except the page shell (the built-in
     assets and any ``extra_assets``) then refuses a request without it. A ``chat_host`` turns the gate
     on too, with a fresh token if none was given. ``chat_token`` is the parameter's older name. With
-    neither, the server is ungated, as before. An empty token is refused rather than read as "none".
+    neither, the server is ungated, as before. A token that is empty or not URL-safe base64 is refused.
 
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
     if launch_token is not None and chat_token is not None and launch_token != chat_token:
         raise ValueError("launch_token and chat_token name one token; pass one of them.")
     token = launch_token if launch_token is not None else chat_token
-    if token is not None and not token:
-        raise ValueError("an empty launch token would let every request through; omit it or pass a real one.")
+    check_launch_token(token)
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)

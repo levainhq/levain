@@ -289,5 +289,28 @@ def test_init_and_docs_always_run_with_a_fresh_launch_token(tmp_path, kind):
         finally:
             httpd.server_close()
     assert all(t and len(t) >= 32 for t in tokens) and tokens[0] != tokens[1]
-    with pytest.raises(ValueError, match="empty launch token"):
-        make(arg, port=0, launch_token="")
+    for bad in ("", " secret ", "tok/en", "tökén"):   # codex L3 r1: a token the page cannot carry is refused
+        with pytest.raises(ValueError, match="launch token must be"):
+            make(arg, port=0, launch_token=bad)
+
+
+@pytest.mark.parametrize("bad", ["", " secret ", "tok/en"])
+def test_make_server_refuses_a_token_the_page_cannot_carry(tmp_path, bad):
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    from levain.web_server import make_server
+
+    src = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db"))
+    with pytest.raises(ValueError, match="launch token must be"):
+        make_server(src, host="127.0.0.1", port=0, launch_token=bad)
+
+
+def test_the_old_chat_token_attribute_can_still_be_set(tmp_path):
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    from levain.web_server import make_server
+
+    httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0)
+    try:
+        httpd.chat_token = "set-the-old-way"
+        assert httpd.launch_token == "set-the-old-way"
+    finally:
+        httpd.server_close()

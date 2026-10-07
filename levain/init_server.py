@@ -53,7 +53,7 @@ from levain.install import (
 from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
-from levain.http_guards import GuardedHandler
+from levain.http_guards import GuardedHandler, check_launch_token
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
@@ -578,8 +578,7 @@ def make_init_server(
         )
     if adapter is not None and adapter not in _ADAPTERS:
         raise ValueError(f"unknown adapter {adapter!r}: must be one of {list(_ADAPTERS)}")
-    if launch_token is not None and not launch_token:
-        raise ValueError("an empty launch token would let every request through; omit it or pass a real one.")
+    check_launch_token(launch_token)
 
     # Resolve + validate the pack set BEFORE binding. `--path` expansion semantics
     # (argparse does not expand `~`), then a full compose (manifests + seed rosters

@@ -27,6 +27,7 @@ from typing import Any
 __all__ = [
     "LAUNCH_TOKEN_HEADER",
     "GuardedHandler",
+    "check_launch_token",
     "host_header_allowed",
 ]
 
@@ -39,6 +40,18 @@ __all__ = [
 # covered every route; it is still accepted so a script written against it keeps working.
 LAUNCH_TOKEN_HEADER = "X-Levain-Token"
 _LEGACY_TOKEN_HEADERS = ("X-Levain-Chat-Token",)
+
+
+def check_launch_token(token: "str | None") -> None:
+    """Refuse a launch token the page could not carry. ``None`` means "make one up". Anything else must be
+    non-empty URL-safe base64 (``secrets.token_urlsafe``'s alphabet), the only shape token.js takes from a URL
+    fragment and the form keeps intact: an empty token would let every request through, and a token with a space
+    or a symbol would print an unlocked link the page refuses (codex L3 r1)."""
+    if token is None:
+        return
+    if not token or not all(c.isascii() and (c.isalnum() or c in "-_") for c in token):
+        raise ValueError("a launch token must be non-empty and use only A-Z, a-z, 0-9, '-' and '_'; "
+                         "omit it to have one generated.")
 
 # A write only ever legitimately originates from our own dashboard page (which sends
 # ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-

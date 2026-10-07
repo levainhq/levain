@@ -113,6 +113,12 @@ const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
   calls.push({ path: path.split("?")[0], url: path, method: init.method, token: hdr["X-Levain-Token"], body: init.body });
+  if (hdr["X-Levain-Token"] !== TOKEN && process.argv[3] === "stalelisting" && !globalThis.__staleSent) {
+    // the page's first, untokened probe stalls; its refusal arrives only when the test releases it
+    globalThis.__staleSent = true;
+    return new Promise((res) => { globalThis.__releaseStale = () => res(null); })
+      .then(() => reply(403, { error: "launch_token", message: "needs token" }));
+  }
   if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
@@ -210,6 +216,20 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
     byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
     ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
     ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
+    console.log("PASS"); return;
+  }
+  if (MODE === "stalelisting") {
+    // codex L3 r1 HIGH: an untokened probe stalls, the operator unlocks (the form here is boot's, raised by its own
+    // refused read) and opens a session, then the old refusal lands. The session must survive it.
+    ok(!chatPanel() && !lockForm(), "the probe is still in flight");
+    ctx.LevainToken.lock(null, null);
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    let p = chatPanel();
+    byText(p, "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(byText(chatPanel(), "Send"), "a session is open");
+    globalThis.__releaseStale(); await sleep(40);
+    ok(byText(chatPanel(), "Send") && !lockForm(), "the late refusal of the replaced token changes nothing");
+    ok(ctx.LevainToken.get() === TOKEN, "and the held token is kept");
     console.log("PASS"); return;
   }
   // Without a usable token the chat panel adds nothing: the page's one unlock form (token.js) asks.
@@ -469,7 +489,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "stalelisting", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities",
                                   "leakafterapprove", "leaklastjob",

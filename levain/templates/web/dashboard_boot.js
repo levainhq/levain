@@ -205,6 +205,11 @@
       if (promptForToken()) res = await fetch(url, { cache: "no-store", headers: readHeaders() });
       if (res.status === 403) { dropToken(); throw new Error("off-box token missing or invalid"); }
     }
+    // A refusal of a launch token the page has since replaced (an unlock while this was in flight): ask once
+    // more with the token held now, rather than report a 403 for a token that is gone (complement L3 r1).
+    if (res.status === 403 && sentLaunchToken() && sent !== sentLaunchToken()) {
+      res = await fetch(url, { cache: "no-store", headers: readHeaders() });
+    }
     if (!res.ok) {
       let m = "HTTP " + res.status;
       try { const d = await res.json(); m = d.message || d.error || m; } catch (_) { /* ignore */ }
@@ -298,6 +303,9 @@
         }
       }
       if (res.status === 403 && !sentLaunchToken()) { status("locked — enter the token the server printed"); return; }
+      // Refused for a launch token the page has since replaced: the unlock's own load() was latched behind this
+      // one (pendingReload) and re-reads with the new token as soon as this returns (complement L3 r1).
+      if (res.status === 403 && sent !== sentLaunchToken()) return;
       if (!res.ok) throw new Error("HTTP " + res.status);
       const view = await res.json();
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then

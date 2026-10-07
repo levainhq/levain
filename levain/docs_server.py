@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.docs import DocsError, chapters_payload
-from levain.http_guards import GuardedHandler
+from levain.http_guards import GuardedHandler, check_launch_token
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
@@ -136,8 +136,7 @@ def make_docs_server(
             "(127.0.0.1 / localhost). The operator manual is a local read surface; "
             "there is no off-box docs server."
         )
-    if launch_token is not None and not launch_token:
-        raise ValueError("an empty launch token would let every request through; omit it or pass a real one.")
+    check_launch_token(launch_token)
     # Build the payload + assets BEFORE binding — a corrupt wheel should fail with a
     # clear message, not a bind error (mirrors init's asset-load-before-bind).
     docs_json = json.dumps(chapters_payload(install)).encode("utf-8")

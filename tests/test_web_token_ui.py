@@ -33,6 +33,8 @@ class N {
 }
 const find = (n, pred) => { if (pred(n)) return n; for (const c of n.children) { const r = find(c, pred); if (r) return r; } return null; };
 const body = new N("body"), store = new N("p"), stamp = new N("span"), refresh = new N("button");
+const stamps = [];
+Object.defineProperty(stamp, "textContent", { set(v) { stamps.push(String(v)); this._text = String(v); }, get() { return this._text; } });
 body.appendChild(store);
 const byId = { store: store, stamp: stamp, refresh: refresh };
 const document = { body: body, visibilityState: "visible", createElement: (t) => new N(t),
@@ -46,6 +48,11 @@ const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
   calls.push({ path: path, method: init.method || "GET", token: hdr["X-Levain-Token"], url: path, body: init.body });
+  if (MODE === "stalesubstrate" && !hdr["X-Levain-Token"] && !globalThis.__staleSent) {
+    globalThis.__staleSent = true;
+    return new Promise((res) => { globalThis.__releaseStale = () => res(null); })
+      .then(() => reply(403, { error: "launch_token", message: "needs token" }));
+  }
   if (hdr["X-Levain-Token"] !== serverToken) return reply(403, { error: "launch_token", message: "this server needs the token printed when it started, sent as X-Levain-Token" });
   if (path === "/substrate.json") return reply(200, { writable: true, paths: {} });
   if (path === "/edit") return reply(200, { ok: true });
@@ -72,6 +79,16 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
   vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   vm.runInContext(fs.readFileSync(process.argv[3], "utf8"), ctx);
   await sleep(30);
+  if (MODE === "stalesubstrate") {
+    // complement L3 r1: the first, untokened read stalls; the operator unlocks; then that read's refusal lands. The
+    // page must render with the new token and never report the stale 403 as a failure.
+    ctx.LevainToken.lock(null, null);
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(20);
+    globalThis.__releaseStale(); await sleep(60);
+    ok(renders === 1 && !lockForm(), "the board renders with the new token");
+    ok(!stamps.some((t) => /failed|403/.test(t)), "no stale failure was shown: " + JSON.stringify(stamps));
+    console.log("PASS"); return;
+  }
   if (MODE === "hashjunk") {
     // L1 2026-10-07: a page holding a reference to this tab can change its fragment. An unlocked page keeps its token.
     ctx.location.hash = "#token=junk"; (winLs.hashchange || []).forEach((f) => f({})); await sleep(30);
@@ -123,7 +140,7 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk"])
+@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk", "stalesubstrate"])
 def test_the_cockpit_page_sends_the_launch_token_and_unlocks_in_place(tmp_path, mode):
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)

@@ -350,9 +350,12 @@
   function tokenHeaders(h) { return auth ? auth.headers(h) : h; }
 
   // ---- load ----
-  var loaded = false, loading = false;
+  // One plan render. An unlock that arrives while a load is in flight is latched and re-run when that load settles
+  // (codex L3 r1: dropping it left a page that held the right token showing "locked").
+  var loaded = false, loading = false, again = false;
   async function load() {
-    if (loaded || loading) return;   // one plan render: the first load and an unlock can overlap
+    if (loaded) return;
+    if (loading) { again = true; return; }
     loading = true;
     try {
       var sent = auth ? auth.get() : null;
@@ -362,7 +365,7 @@
         try { refused = await res.json(); } catch (_) { /* a plain-text 403 is not the token's */ }
         if (auth.isRefusal(res.status, refused)) {
           auth.lock(sent ? "That token was not accepted." : null, sent);
-          statusEl.textContent = "locked: enter the token the server printed when it started";
+          if (!auth.get()) statusEl.textContent = "locked: enter the token the server printed when it started";
           return;
         }
       }
@@ -379,6 +382,7 @@
       statusEl.textContent = "could not load the interview: " + (e && e.message ? e.message : e);
     } finally {
       loading = false;
+      if (again && !loaded) { again = false; load(); }
     }
   }
 

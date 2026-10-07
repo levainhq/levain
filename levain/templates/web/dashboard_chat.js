@@ -76,13 +76,14 @@
   // Whatever token led here is not used again: the session is let go (nothing more can be decided from it), the
   // panel says why when there is something to say, and token.js shows the one unlock form. `r` is the refused answer.
   // The message is also kept for the picker the unlock brings back, so entering the token does not erase the word
-  // that the last request's outcome is unknown. A refusal of a token the page has already replaced (an unlock
-  // happened while it was in flight) shows no form: the picker comes back at once, with the message.
+  // that the last request's outcome is unknown. A refusal of a token the page has already replaced is late news and
+  // changes nothing (codex L3 r1 HIGH): the replaced token was already refused, so it says nothing about a session
+  // opened since with the new one, and letting go of that session would strand it on the server.
   let lostNote = null;
   function showTokenPrompt(message, r) {
+    if (r && auth && auth.get() && r.sent !== auth.get()) return;
     session = null; run++; deciding = false;
     lostNote = message || null;
-    if (r && auth && auth.get() && r.sent !== auth.get()) { loadListing(false); return; }
     if (message) { ensurePanel(); clear(body); note("chat-err", message); }
     else if (panel) { panel.remove(); panel = null; }
     if (auth) auth.lock(null, r ? r.sent : undefined);
