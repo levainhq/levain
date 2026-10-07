@@ -318,11 +318,11 @@ def plan_undo(
     """The reverse of :func:`plan_setup`, ordered so nothing acts on the tree while the hands user
     can still change it: the sudoers rule goes first (no new processes), the id is retired, cron and
     at jobs are removed, and every process of the hands user is killed and the kill verified. Only
-    then are files re-owned and the account deleted. A step that fails stops the undo.
+    then are files given the operator's group and the account deleted. A step that fails stops the undo.
 
     ``hands_id`` is the id the DIRECTORY SERVICE gives the user (never the config's, which the
     operator account can write); ``None`` when the user is already gone, and then nothing is killed
-    and only files with no owner left are re-owned. The workspace is always the derived one."""
+    and only files with no owner left are touched. The workspace is always the derived one."""
     if not HANDS_USER_RE.match(hands_user):
         raise HandsSetupError(f"refusing to remove {hands_user!r}: not a Levain hands user name")
     ed = Path(entity_dir).expanduser().resolve()
@@ -340,13 +340,13 @@ def plan_undo(
             Step("stop every process of the hands user, and check they are gone", call=lambda: _kill_all(hands_id)),
         ]
     steps += [
-        Step(f"hand what the hands user owned to root, readable by your group (never to you)",
-             call=lambda: _to_root(tree, hands_id, operator_gid)),
+        Step("give what the hands user owned your group (its owner stays its old id: never you, never root)",
+             call=lambda: _to_operator_group(tree, hands_id, operator_gid)),
         Step("remove the workspace ACLs",
              call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(tree)) if host == "darwin"
                                   else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)),
         Step("let your group read it, and empty the hooks and settings of the entity's repositories",
-             call=lambda: _readable_and_sanitised(tree, operator_gid)),
+             call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
     if host == "darwin":
         steps += [
@@ -401,34 +401,50 @@ def _remove_owned(spool: Path, uid: int) -> tuple[bool, str]:
 def _owned_selector(uid: int | None) -> tuple[str, ...]:
     """``find`` predicates for "what the hands user owned": by numeric uid, or (user already gone)
     by having no owner at all. Directories, and files with a single link only: a hard link the
-    entity made to someone else's file is never re-owned or re-moded (it is not the entity's)."""
+    entity made to someone else's file is never re-grouped or re-moded (it is not the entity's)."""
     who = ("-nouser",) if uid is None else ("-uid", str(uid))
     return ("(", "-type", "d", "-o", "-links", "1", ")", *who)
 
 
-def _to_root(tree: Path, uid: int | None, operator_gid: int) -> tuple[bool, str]:
-    """Re-own everything the hands user owned under ``tree`` to root, group = the operator's group.
-    Nothing goes to the operator: a directory the entity filled (a repository under any name, a
-    bare one included) would be trusted by the operator's git if the operator owned it. Runs only
-    after :func:`_kill_all`, so nothing can swap a directory for a symlink under it."""
+def _to_operator_group(tree: Path, uid: int | None, operator_gid: int) -> tuple[bool, str]:
+    """Give everything the hands user owned under ``tree`` the operator's group, and leave its owner
+    the hands user's numeric id, which is retired (never given to a later user). Nothing goes to the
+    operator: a directory the entity filled (a repository under any name, a bare one included) would
+    be trusted by the operator's git if the operator owned it. Nothing goes to root either: root's
+    git trusts a root-owned repository, so a later ``sudo git`` there would run what the entity
+    planted. An id with no account behind it is trusted by nobody's git. Runs only after
+    :func:`_kill_all`, so nothing can swap a directory for a symlink under it."""
     if not tree.exists():
         return True, "no workspace"
     return _run_ok((_abs("find"), str(tree), *_owned_selector(uid),
-                    "-exec", _abs("chown"), "-h", f"0:{operator_gid}", "{}", "+"))
+                    "-exec", _abs("chgrp"), "-h", str(operator_gid), "{}", "+"))
+
+
+def _owned_by(path: Path, uid: int | None) -> bool:
+    """``path`` belongs to ``uid``, or (``None``) to an id with no account."""
+    owner = path.lstat().st_uid
+    if uid is not None:
+        return owner == uid
+    try:
+        pwd.getpwuid(owner)
+        return False
+    except KeyError:
+        return True
 
 
 def _git_dir_shaped(path: Path) -> bool:
     return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
 
 
-def _readable_and_sanitised(tree: Path, operator_gid: int, *, root_uid: int = 0) -> tuple[bool, str]:
+def _readable_and_sanitised(tree: Path, operator_gid: int, *, owner_uid: int | None) -> tuple[bool, str]:
     """After the ACLs are cleared (a group chmod on a file with a Linux ACL edits the mask, which
-    clearing discards, measured in CI): let the operator's group read what root now owns, and, in
-    every directory shaped like a git directory, empty ``hooks/`` and cut ``config`` to the keys
-    ``ws-git`` accepts, because root's own git trusts a root-owned repository."""
+    clearing discards, measured in CI): let the operator's group read what the retired id still owns
+    (``owner_uid``; ``None`` = the account is already gone, so: files with no owner), and, in every
+    directory shaped like a git directory, empty ``hooks/`` and cut ``config`` to the keys ``ws-git``
+    accepts. No git trusts those repositories any more; this is belt and braces."""
     if not tree.exists():
         return True, "no workspace"
-    ok, why = _run_ok((_abs("find"), str(tree), "(", "-type", "d", "-o", "-links", "1", ")", "-uid", "0",
+    ok, why = _run_ok((_abs("find"), str(tree), *_owned_selector(owner_uid),
                        "-gid", str(operator_gid), "-exec", _abs("chmod"), "g+rX,g-w", "{}", "+"))
     if not ok:
         return ok, why
@@ -437,7 +453,7 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, root_uid: int = 0)
     repos: list[str] = []
     for root, dirs, _files in os.walk(tree):
         here = Path(root)
-        if not _git_dir_shaped(here) or here.lstat().st_uid != root_uid:
+        if not _git_dir_shaped(here) or not _owned_by(here, owner_uid):
             continue
         hooks = here / "hooks"
         if hooks.is_dir() and not hooks.is_symlink():
@@ -446,6 +462,7 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, root_uid: int = 0)
                     h.unlink()
         cfg = here / "config"
         if cfg.is_file() and not cfg.is_symlink():
+            cfg_uid = cfg.lstat().st_uid
             r = subprocess.run([_abs("git"), "config", "--file", str(cfg), "--list"], capture_output=True, text=True,
                                cwd="/", env={"PATH": SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
                                              "GIT_CONFIG_GLOBAL": "/dev/null"})
@@ -455,14 +472,15 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, root_uid: int = 0)
             for k, v in kept:
                 subprocess.run([_abs("git"), "config", "--file", str(cfg), "--add", k, v], capture_output=True, cwd="/")
             if cfg.exists():
-                os.chown(cfg, root_uid, operator_gid)
+                os.chown(cfg, cfg_uid, operator_gid)
                 os.chmod(cfg, 0o640)
         repos.append(str(here.parent if here.name == ".git" else here))
         dirs[:] = []
     if repos:
         first = repos[0]
-        return True, ("the entity's repositories are now root's, with no hooks and only basic settings; "
-                      "your git will not use them directly. To keep the work: git -c safe.directory="
+        return True, ("the entity's repositories keep its retired id as owner, with no hooks and only basic "
+                      "settings; no git (yours or root's) will use them directly. To keep the work: git -c "
+                      "safe.directory="
                       f"{first} -c core.hooksPath=/dev/null clone --no-local {first} <destination>   "
                       f"(repositories: {', '.join(repos)})")
     return True, ""
@@ -476,7 +494,8 @@ def _remove_if_empty(ws: Path) -> tuple[bool, str]:
         ws.parent.rmdir()
     except OSError as exc:
         if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-            return True, (f"kept: {ws} has files in it, now root's and readable by you; remove it with "
+            return True, (f"kept: {ws} has files in it, still owned by the retired id and readable by you; "
+                          "remove it with "
                           f"`sudo rm -rf {ws.parent}` when you no longer need them")
         raise
     return True, ""

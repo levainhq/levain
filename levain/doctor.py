@@ -954,12 +954,17 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
             hint="git config --global safe.bareRepository explicit",
             warn=True,
         ))
-    foreign = foreign_entries(cfg.hands_workspace, cfg.hands_uid)
+    from levain.firing.ws_git import Hands, WsGitError
+
+    try:
+        foreign = foreign_entries(Hands(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace))
+    except WsGitError as exc:
+        return [CheckResult(name, False, str(exc), hint=redo), *extra]
     if foreign:
         return [CheckResult(
             name, False,
-            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, are writable by "
-            "you, or could not be read: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must "
+            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, or are writable by "
+            "you: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must "
             "be the entity's and read-only to you: a folder of yours that the entity can write is one it can "
             "turn into a repository your git trusts and runs code from, as you.",
             hint="remove what is yours with `sudo rm -r`, take write away from you (`sudo chmod o-w`, or the "

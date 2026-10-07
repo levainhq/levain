@@ -95,10 +95,11 @@ refused "operator renames the entity's file" mv "$WS/from-hands" "$WS/renamed"
 refused "operator deletes the entity's file" rm -f "$WS/from-hands"
 check "hands creates a folder" as_hands mkdir "$WS/hands-folder"
 refused "operator creates a file in the entity's folder" bash -c "echo o > '$WS/hands-folder/x'"
-check "hands writes a 0600 file atomically" as_hands /usr/bin/python3 -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')"
+HPY="$("$PY" -c 'import os,sys; print(os.path.realpath(sys.executable))')"   # the interpreter ws-put finds
+check "hands writes a 0600 file atomically" as_hands "$HPY" -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')"
 info "its permissions: $(ls -le "$WS/atomic-0600" 2>&1 | tr '\n' ' ')$(getfacl -p "$WS/atomic-0600" 2>/dev/null | tr '\n' ' ')"
 if /bin/cat "$WS/atomic-0600" >/dev/null 2>&1; then pass "operator reads a 0600 file the hands wrote atomically"; else
-  info "operator cannot read a 0600 file the hands wrote atomically (ACL mask follows the file mode)"
+  info "operator cannot read a 0600 file the hands wrote atomically (Linux: the ACL mask follows the file mode)"
   "$PY" -c 'import json,subprocess,sys; from levain.firing import ws_git; h=ws_git.load_hands(sys.argv[1]); sys.exit(subprocess.run(ws_git.mask_repair_argv(h)).returncode)' "$E" >/dev/null 2>&1
   check "after the mask repair the operator reads it" /bin/cat "$WS/atomic-0600"
 fi
@@ -160,9 +161,13 @@ printf '[safe]\n\tbareRepository = explicit\n' > /tmp/levain-iso-explicit-gitcon
 if GIT_CONFIG_GLOBAL=/tmp/levain-iso-explicit-gitconfig "$LEVAIN" doctor --path "$E" | grep -q 'safe.bareRepository is not'; then fail "doctor warns although it is explicit"; else pass "doctor does not warn once it is explicit"; fi
 
 echo "== the entity opens a folder up to the operator: doctor fails"
-as_hands chmod 777 "$WS/hands-folder"
-check "doctor names the folder the operator can now write" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'writable by'"
-as_hands chmod 755 "$WS/hands-folder"
+# macOS: the mode bits decide what the operator's read-only ACL entry leaves open. Linux: a named
+# ACL entry wins over the other bits, so the entity has to grant the operator by name.
+if [ "$(uname)" = Darwin ]; then as_hands chmod 777 "$WS/hands-folder"; else as_hands setfacl -m "u:$ME:rwx" "$WS/hands-folder"; fi
+check "the operator can now create a folder there" mkdir "$WS/hands-folder/by-op"
+check "doctor names what the operator can write, and what it owns" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'writable by'"
+rmdir "$WS/hands-folder/by-op"
+if [ "$(uname)" = Darwin ]; then as_hands chmod 755 "$WS/hands-folder"; else as_hands setfacl -m "u:$ME:rx" "$WS/hands-folder"; fi
 if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports it once closed"; else pass "doctor no longer reports it once closed"; fi
 
 echo "== a folder force-created as the operator: doctor fails"
@@ -208,12 +213,16 @@ refused "sshd drop-in still exists" sudo test -e "/etc/ssh/sshd_config.d/levain-
 if [ -e "$CRON_DENY" ]; then refused "hands user still in $CRON_DENY" grep -qx "$H" "$CRON_DENY"; fi
 if [ -n "$(cfgval hands_user)$(cfgval hands_uid)$(cfgval hands_workspace)" ]; then fail "hands keys still recorded"; else pass "hands keys removed from confinement.json"; fi
 check "the non-empty workspace is kept" test -d "$WS"
-check "the files the hands created are now root's, not the operator's" test "$(stat -c %u "$WS/from-hands" 2>/dev/null || stat -f %u "$WS/from-hands")" = 0
+OPGID="$(id -g)"
+check "the files the hands created keep the retired id as owner (never the operator's, never root's)" test "$(stat -c %u "$WS/from-hands" 2>/dev/null || stat -f %u "$WS/from-hands")" = "$HID"
+check "and have the operator's group" test "$(stat -c %g "$WS/from-hands" 2>/dev/null || stat -f %g "$WS/from-hands")" = "$OPGID"
 check "and the operator can read them" /bin/cat "$WS/from-hands"
-if [ -n "$(sudo find "$(dirname "$WS")" -uid "$HID" -print -quit 2>/dev/null)" ]; then fail "files still owned by the dead uid"; else pass "no file left owned by the dead uid"; fi
+if [ -n "$(sudo find "$WS" \( -user 0 -o -user "$ME" \) -print -quit 2>/dev/null)" ]; then fail "undo gave something in the workspace to root or the operator"; else pass "nothing in the workspace is root's or the operator's"; fi
 check "operator still reads the workspace after undo" /bin/ls "$WS"
-check "the entity's repository went to root, not to the operator" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = 0
+check "the entity's repository keeps the retired id as owner" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = "$HID"
 refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
+refused "sudo git reads it after undo (git checks SUDO_UID, the operator)" sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
+refused "root's own git reads it after undo" sudo env -u SUDO_UID GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
 check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
 if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator after undo"; else pass "no entity-planted code ran as the operator after undo"; fi
 if [ "$(uname)" = Darwin ]; then

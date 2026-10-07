@@ -17,7 +17,7 @@ The operator changes the workspace through the entity, or through four doors, no
 anything the entity wrote as the operator:
   - the remote: the entity pushes with its deploy key;
   - ``levain ws-git``: git AS THE HANDS USER, the repository's executable config switched off, and
-    refused while the entity's user has a process running;
+    refused while a session of the entity is open (the hands lock) or its user has a process running;
   - ``levain ws-put``: one file copied in as data, written by the hands user;
   - ``levain ws-adopt``: a repository of the operator's imported from where it sits, outside the
     workspace, as a new repository the hands user owns.
@@ -189,11 +189,10 @@ def _run_relayed(argv: list[str]) -> int:
     return proc.wait()
 
 
-#: macOS per-user agents launchd starts for a uid on its own (parent pid 1). Exact paths only.
-_DARWIN_USER_AGENTS = frozenset({
-    "/usr/sbin/cfprefsd", "/usr/sbin/distnoted", "/usr/libexec/trustd", "/usr/libexec/secinitd",
-    "/usr/libexec/lsd", "/usr/libexec/containermanagerd", "/usr/libexec/UserEventAgent",
-})
+#: Where macOS keeps the per-user agents launchd starts for a uid on its own (cfprefsd, distnoted,
+#: lsd, trustd, secd, containermanagerd and XPC services were measured on a CI runner, 2026-10-07):
+#: the sealed system volume, which no user can write.
+_DARWIN_AGENT_DIRS = ("/usr/sbin/", "/usr/libexec/", "/System/Library/")
 
 
 def proc_hides_processes(mountinfo: str) -> bool:
@@ -231,13 +230,75 @@ def entity_session_live(hands_uid: int) -> bool:
         return True
     # macOS starts per-user system agents for any uid that has run Apple code (git and python3 in
     # /usr/bin are xcrun shims): launchd's children, from the sealed system volume, which the entity
-    # does not drive. Anything else, an orphan of the entity's included, is a live session.
+    # does not drive. Anything else, an orphan of the entity's included (/bin and /usr/bin are not on
+    # the list), is a live session.
     pids = r.stdout.split()
     ps = subprocess.run(["/bin/ps", "-o", "ppid=,comm=", "-p", ",".join(pids)], capture_output=True, text=True, cwd="/")
     rows = [ln.split(None, 1) for ln in ps.stdout.splitlines() if ln.strip()]
     if ps.returncode not in (0, 1) or not rows:
         raise WsGitError("cannot tell whether the entity is running (ps failed); refusing")
-    return any(len(row) != 2 or row[0] != "1" or row[1].strip() not in _DARWIN_USER_AGENTS for row in rows)
+    return any(len(row) != 2 or row[0] != "1" or not row[1].strip().startswith(_DARWIN_AGENT_DIRS) for row in rows)
+
+
+#: Per entity, in the operator's tree (out of the hands user's reach). A session of a hands entity
+#: holds it SHARED for its whole life (several chat sessions may run at once); ws-git and ws-adopt
+#: hold it EXCLUSIVE for their whole run. So no session starts while they work, and they never start
+#: while a session is open. Busy is a refusal on both sides, never a wait without end.
+HANDS_LOCK = "hands.lock"
+
+
+def _open_lock(entity_dir: Path | str) -> int:
+    return os.open(Path(entity_dir) / ".levain" / HANDS_LOCK,
+                   os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+
+
+def hold_session_lock(entity_dir: Path | str, *, wait: float = 10.0) -> int:
+    """Take the shared hands lock for a session; returns the fd, which the session closes when it
+    ends. Waits up to ``wait`` seconds for a running ws-git or ws-adopt, then refuses."""
+    import fcntl
+    import time
+
+    fd = _open_lock(entity_dir)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise WsGitError("levain ws-git or ws-adopt is working in this entity's workspace; "
+                                 "start the session when it finishes") from None
+            time.sleep(0.2)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+class _exclusive:
+    """ws-git / ws-adopt: the hands lock, exclusive, for the whole run, or a refusal at once."""
+
+    def __init__(self, entity_dir: Path | str) -> None:
+        self.entity_dir = entity_dir
+        self.fd: int | None = None
+
+    def __enter__(self) -> "_exclusive":
+        import fcntl
+
+        self.fd = _open_lock(self.entity_dir)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            raise WsGitError("a session of this entity is open; this waits until it ends") from None
+        except BaseException:
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
 
 
 def _refuse_while_live(hands: Hands, what: str) -> None:
@@ -250,13 +311,14 @@ def _refuse_while_live(hands: Hands, what: str) -> None:
 def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int:
     try:
         hands = load_hands(entity_dir)
-        _refuse_while_live(hands, "ws-git")
-        gitdir = find_gitdir(Path(repo), hands.workspace)
-        check_repo(gitdir, hands.uid)
+        with _exclusive(entity_dir):
+            _refuse_while_live(hands, "ws-git")
+            gitdir = find_gitdir(Path(repo), hands.workspace)
+            check_repo(gitdir, hands.uid)
+            return _run_relayed(ws_git_argv(hands, gitdir, args))
     except (WsGitError, OSError) as exc:
         print(f"ws-git: {exc}")
         return 1
-    return _run_relayed(ws_git_argv(hands, gitdir, args))
 
 
 def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = ()) -> list[str]:
@@ -397,15 +459,16 @@ def cmd_ws_put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int
 # --- ws-adopt: an import ------------------------------------------------------------------------
 
 #: Run by the hands user: the bundle arrives on stdin, is fetched into a new repository with every
-#: branch and tag, and checked out. argv: git, the destination, the branch HEAD names, then the
-#: settings that switch hooks and the like off. The repository starts with no template (no hooks).
+#: branch and tag, and checked out. argv: git, the destination, the branch HEAD names, the object
+#: format, then the settings that switch hooks and the like off. The repository starts with no
+#: template (no hooks).
 _IMPORT_SCRIPT = r"""
 set -eu
-g="$1"; dest="$2"; head="$3"; shift 3
+g="$1"; dest="$2"; head="$3"; fmt="$4"; shift 4
 t="$(mktemp -d)"
 trap 'rm -rf "$t"' EXIT
 cat > "$t/bundle"
-"$g" "$@" init -q --template= "$dest"
+"$g" "$@" init -q --template= --object-format="$fmt" "$dest"
 "$g" "$@" -C "$dest" fetch -q --update-head-ok --no-tags "$t/bundle" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
 "$g" "$@" -C "$dest" symbolic-ref HEAD "refs/heads/$head"
 "$g" "$@" -C "$dest" reset -q --hard
@@ -425,8 +488,18 @@ def _heads(lines: str) -> dict[str, str]:
 
 def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = None) -> int:
     """Import a repository of the operator's into the workspace: the hands user builds a new
-    repository from a bundle of every branch and tag, and the branch list is checked against the
-    original's. The original is not moved or changed. Uncommitted changes and stashes are not copied."""
+    repository from a bundle of every branch and tag, and the branch and tag lists are checked
+    against the original's. The original is not moved or changed. Uncommitted changes and stashes
+    are not copied. Runs under the exclusive hands lock."""
+    try:
+        with _exclusive(entity_dir):
+            return _adopt(entity_dir, repo, name)
+    except (WsGitError, OSError) as exc:
+        print(f"ws-adopt: {exc}")
+        return 1
+
+
+def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
     try:
         hands = load_hands(entity_dir)
         _refuse_while_live(hands, "ws-adopt")
@@ -448,9 +521,13 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         if head.returncode != 0 or not head.stdout.startswith("refs/heads/"):
             raise WsGitError(f"{src} has no branch checked out (a detached HEAD); check one out first")
         head_branch = head.stdout.strip()[len("refs/heads/"):]
-        want = _heads(_operator_git(src, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads").stdout)
-        if not want:
+        want = _heads(_operator_git(src, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads",
+                                    "refs/tags").stdout)
+        if not any(r.startswith("refs/heads/") for r in want):
             raise WsGitError(f"{src} has no branches to import")
+        fmt = _operator_git(src, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
+        if fmt not in ("sha1", "sha256"):
+            raise WsGitError(f"{src} uses the object format {fmt!r}, which ws-adopt does not know")
         remotes, dropped = {}, []
         for line in _operator_git(src, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
             key, _, url = line.partition(" ")
@@ -471,7 +548,7 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
                                    "--tags"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=bundle_err, cwd="/")
         assert bundle.stdout is not None
         imp = subprocess.run(
-            _as_hands(hands, "/bin/sh", "-c", _IMPORT_SCRIPT, "sh", _real_git(), str(dest), head_branch,
+            _as_hands(hands, "/bin/sh", "-c", _IMPORT_SCRIPT, "sh", _real_git(), str(dest), head_branch, fmt,
                       *_NEUTRALISE, env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")),
             stdin=bundle.stdout, capture_output=True, start_new_session=True, cwd="/")
         bundle.stdout.close()
@@ -487,12 +564,12 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         try:
             check_repo(dest / ".git", hands.uid)
             got = subprocess.run(ws_git_argv(hands, dest / ".git", ["for-each-ref", "--format=%(objectname) %(refname)",
-                                                                   "refs/heads"]),
+                                                                   "refs/heads", "refs/tags"]),
                                  capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
             have = _heads(got.stdout)
             if got.returncode != 0 or have != want:
                 missing = sorted(set(want) - set(have)) or sorted(r for r in want if want[r] != have.get(r))
-                problem = f"the branches did not all come across ({', '.join(missing) or got.stderr.strip()})"
+                problem = f"the branches and tags did not all come across ({', '.join(missing) or got.stderr.strip()})"
         except (WsGitError, OSError) as exc:
             problem = str(exc)
     if problem:
@@ -503,42 +580,38 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
         if subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
                           stdin=subprocess.DEVNULL, cwd="/").returncode != 0:
             dropped.append(rname)
-    print(f"Imported {src} as {dest} ({len(want)} branch(es)), owned by the entity's user. Your repository is "
+    n_heads = sum(r.startswith("refs/heads/") for r in want)
+    print(f"Imported {src} as {dest} ({n_heads} branch(es), {len(want) - n_heads} tag(s)), owned by the entity's user. Your repository is "
           "unchanged where it is; uncommitted changes and stashes were not copied.")
     if dropped:
         print(f"Remotes not copied (not an https or ssh URL, or one carrying a login): {', '.join(sorted(dropped))}.")
     return 0
 
 
-def foreign_entries(workspace: Path, hands_uid: int) -> list[Path]:
+def foreign_entries(hands: Hands) -> list[Path]:
     """Everything in the workspace (the workspace itself included, any type, no depth limit) that the
     hands user does not own, or that the operator running this can write. Under ruling A there should
     be none: an operator-owned directory the hands user can write is one the entity could fill with a
     repository the operator's git trusts, and an entry the operator can write (the hands user, as
-    owner, can open one up) is where the operator's own tools would create one. ``access(W_OK)``
-    answers for the mode bits and any ACL alike. An entry that cannot be read or stat'ed is reported
-    too, never assumed clean."""
-    found: list[Path] = []
+    owner, can open one up) is where the operator's own tools would create one.
 
-    def unreadable(err: OSError) -> None:
-        found.append(Path(err.filename or workspace))
+    The walk runs AS THE HANDS USER (system ``find``, nothing from the workspace executed), which
+    can read its own tree however the entity set its modes; the writability is judged as the
+    operator, with ``access(W_OK)``, which answers for mode bits and ACLs alike. Raises when the walk
+    itself fails, so the caller fails closed."""
+    find = _abs("find")
 
-    def judge(p: Path) -> None:
-        try:
-            st = p.lstat()
-        except OSError:
-            found.append(p)
-            return
-        if st.st_uid != hands_uid or (not stat.S_ISLNK(st.st_mode) and os.access(p, os.W_OK)):
-            found.append(p)
+    def walk(*predicate: str) -> list[Path]:
+        r = subprocess.run(_as_hands(hands, find, str(hands.workspace), *predicate, "-print0"),
+                           capture_output=True, stdin=subprocess.DEVNULL, cwd="/")
+        if r.returncode != 0:
+            why = _sanitise(r.stderr).decode("utf-8", "replace").strip().splitlines()[-1:] or [str(r.returncode)]
+            raise WsGitError(f"the scan of the workspace as {hands.user} failed: {why[0]}")
+        return [Path(os.fsdecode(x)) for x in r.stdout.split(b"\0") if x]
 
-    judge(workspace)
-    if found:
-        return found
-    for root, dirs, files in os.walk(workspace, onerror=unreadable):
-        for name in (*dirs, *files):
-            judge(Path(root) / name)
-    return sorted(set(found))
+    found = set(walk("!", "-user", str(hands.uid)))
+    found.update(p for p in walk("!", "-type", "l") if os.access(p, os.W_OK))
+    return sorted(found)
 
 
 def bare_repository_explicit() -> bool:

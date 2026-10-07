@@ -77,6 +77,7 @@ from levain.firing.gate import (
     resolve_gate_mode,
 )
 from levain.firing.binding import BindingError, ConversationBinding, mark_entity_process
+from levain.firing.ws_git import WsGitError, hold_session_lock
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -546,6 +547,9 @@ class EntitySession:
     # be unanswered, and every turn method's `run()` would execute them, so the session refuses
     # every further turn instead of trusting each driver to stop.
     _refusal_unconfirmed: bool = field(default=False, init=False, repr=False, compare=False)
+    # A hands entity's session holds the hands lock SHARED for its whole life, so `levain ws-git` and
+    # `ws-adopt` (which take it exclusive) never run while it is open (levain.firing.ws_git).
+    hands_lock_fd: int | None = field(default=None, repr=False, compare=False)
 
     # -- construction --------------------------------------------------------
 
@@ -673,6 +677,7 @@ class EntitySession:
         # under-declares the concrete `send_message` / `state` surface.
         conversation: Any = None
         started = False
+        hands_lock_fd: int | None = None
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -688,6 +693,9 @@ class EntitySession:
             # read the floor-shaping fields so an honesty-floor banner reflects the ACTUAL
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
+            # Only a session with tools can act in the workspace, so only it needs the hands lock.
+            if cfg is not None and cfg.hands_user is not None:
+                hands_lock_fd = hold_session_lock(entity_dir)
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
@@ -810,6 +818,8 @@ class EntitySession:
                 f"the confinement config is invalid — fix it and retry:\n  {exc}\n"
                 f"  ({entity_dir / ENTITY_STORE_SUBDIR / 'confinement.json'})"
             ) from exc
+        except WsGitError as exc:
+            raise SessionStartError(f"refusing to start: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 — a bad model/endpoint config is a usage error
             raise SessionStartError(
                 f"could not start the entity ({exc}).\n"
@@ -819,6 +829,8 @@ class EntitySession:
             # A start that failed AFTER the conversation was built must not abandon it: the SDK
             # registers each conversation's close() with atexit, so a refused open would otherwise
             # live until process exit (L3 2026-10-02, three seats). Best-effort; the start error wins.
+            if not started and hands_lock_fd is not None:
+                os.close(hands_lock_fd)
             if not started and conversation is not None:
                 try:
                     conversation.close()
@@ -841,6 +853,7 @@ class EntitySession:
             gate_mode=gate_mode,
             bash_refusal=bash_refusal if with_tools else None,
             bash_offline=with_tools and bash_ok and bash_offline,
+            hands_lock_fd=hands_lock_fd,
         )
 
     # -- the one operation ---------------------------------------------------
@@ -1397,6 +1410,15 @@ class EntitySession:
             self.conversation.close()
         except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
             pass
+        finally:
+            # After the conversation (and its shell): ws-git may run once nothing of this session can
+            # still act in the workspace.
+            if self.hands_lock_fd is not None:
+                try:
+                    os.close(self.hands_lock_fd)
+                except OSError:
+                    pass
+                self.hands_lock_fd = None
 
     @property
     def closed(self) -> bool:

@@ -153,54 +153,60 @@ def _writable(tree: Path) -> None:
                 (Path(root) / d).chmod(0o755)
 
 
+def _scan(tmp_path: Path, monkeypatch, uid: int) -> list[Path]:
+    _no_sudo(monkeypatch)                      # the walk runs "as the hands user": here, as me
+    return foreign_entries(_hands(tmp_path, uid=uid))
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write anything")
-def test_the_scan_reports_every_entry_the_hands_user_does_not_own_at_any_depth(tmp_path: Path) -> None:
+def test_the_scan_reports_every_entry_the_hands_user_does_not_own_or_the_operator_can_write(tmp_path: Path, monkeypatch) -> None:
     ws = tmp_path / "ws"
     deep = ws / "d1" / "d2" / "d3" / "d4" / "d5" / "d6"
     deep.mkdir(parents=True)                                   # no depth limit
     (deep / "f").write_text("x")
     (ws / "bare").mkdir()                                     # an empty folder: where a bare repo would go
-    (ws / "link").symlink_to("/etc")                           # a link: judged by its own owner, never followed
-    all_entries = {ws, deep / "f", ws / "bare", ws / "link", *[ws.joinpath(*["d1", "d2", "d3", "d4", "d5", "d6"][:i])
-                                                               for i in range(1, 7)]}
+    (ws / "link").symlink_to("/etc")                           # a link: judged by its owner, never followed
+    dirs = [ws.joinpath(*["d1", "d2", "d3", "d4", "d5", "d6"][:i]) for i in range(1, 7)]
+    everything = {ws, deep / "f", ws / "bare", ws / "link", *dirs}
     _read_only(ws)
     try:
-        assert foreign_entries(ws, ME) == []
-        found = set(foreign_entries(ws, ME + 1))
-        assert found == {ws}                                   # the workspace itself not the entity's: stop there
-        ws.chmod(0o555)
-    finally:
-        _writable(ws)
-    _read_only(ws)
-    try:
-        # everything owned by the right user, but a folder deep down was opened up to the operator
-        deep.chmod(0o755)
-        assert foreign_entries(ws, ME) == [deep]
+        assert _scan(tmp_path, monkeypatch, ME) == []          # all the "hands user's", none writable to me
+        assert set(_scan(tmp_path, monkeypatch, ME + 1)) == everything   # none of it the hands user's
+        deep.chmod(0o755)                                      # a folder deep down opened up to the operator
+        assert _scan(tmp_path, monkeypatch, ME) == [deep]
         deep.chmod(0o555)
         (ws / "bare").chmod(0o777)
-        assert foreign_entries(ws, ME) == [ws / "bare"]
+        assert _scan(tmp_path, monkeypatch, ME) == [ws / "bare"]
     finally:
         _writable(ws)
-    assert foreign_entries(ws, ME) == [ws]                     # the workspace itself opened up: that is the finding
-    ws.chmod(0o555)
-    try:
-        found = set(foreign_entries(ws, ME))                   # everything below it writable
-    finally:
-        ws.chmod(0o755)
-    assert found == all_entries - {ws, ws / "link", deep / "f"}  # f stayed 0444; a link is judged by owner only
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
-def test_the_scan_reports_a_folder_it_cannot_read_as_a_finding(tmp_path: Path) -> None:
+def test_a_scan_that_cannot_walk_the_tree_fails_closed(tmp_path: Path, monkeypatch) -> None:
     ws = tmp_path / "ws"
     (ws / "locked" / "inner").mkdir(parents=True)
-    (ws / "locked").chmod(0)
-    ws.chmod(0o555)
+    (ws / "locked").chmod(0)                   # the owner itself shut out: the walk errors
     try:
-        assert foreign_entries(ws, ME) == [ws / "locked"]
+        with pytest.raises(WsGitError, match="scan of the workspace"):
+            _scan(tmp_path, monkeypatch, ME)
     finally:
-        ws.chmod(0o755)
         (ws / "locked").chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+def test_a_file_only_its_owner_can_read_is_no_finding(tmp_path: Path, monkeypatch) -> None:
+    # Linux: the operator's named entry is cut by the mask on a 0600 file; the hands-side walk
+    # still sees it, so ordinary entity work is not a standing FAIL.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "private").write_text("x")
+    (ws / "private").chmod(0o400)
+    (ws / "closed").mkdir(mode=0o500)
+    _read_only(ws)
+    try:
+        assert _scan(tmp_path, monkeypatch, ME) == []
+    finally:
+        _writable(ws)
 
 
 def test_the_bare_repository_setting_is_read_from_the_operators_git(tmp_path: Path, monkeypatch) -> None:
@@ -238,9 +244,11 @@ def test_on_macos_only_launchds_own_per_user_agents_do_not_count_as_live(monkeyp
         return subprocess.CompletedProcess(argv, 0, ps_out["value"], "")
 
     monkeypatch.setattr(ws_git.subprocess, "run", fake_run)
-    ps_out["value"] = "    1 /usr/sbin/cfprefsd\n    1 /usr/sbin/distnoted\n"
+    ps_out["value"] = ("    1 /usr/sbin/cfprefsd\n    1 /usr/libexec/secd\n    1 /System/Library/Frameworks/NetFS.framework"
+                       "/Versions/A/XPCServices/PlugInLibraryService.xpc/Contents/MacOS/PlugInLibraryService\n")
     assert ws_git.entity_session_live(4_000_017) is False
     for rows in ("    1 /usr/sbin/cfprefsd\n    1 /bin/sh\n",           # an orphan of the entity's
+                 "    1 /usr/bin/python3\n",                            # /usr/bin is not on the list
                  "  555 /usr/sbin/cfprefsd\n",                          # not launchd's child
                  "    1 /tmp/usr/sbin/cfprefsd\n",                      # not the system's binary
                  ""):                                                    # cannot tell
@@ -262,6 +270,7 @@ def test_a_proc_mounted_hidepid_means_liveness_cannot_be_told() -> None:
 def _hands(tmp_path: Path, uid: int = ME) -> ws_git.Hands:
     ws = tmp_path / "ws"
     ws.mkdir(exist_ok=True)
+    (tmp_path / ".levain").mkdir(exist_ok=True)   # tmp_path doubles as the entity: the hands lock lives here
     return ws_git.Hands("_levain_x_abcdef", uid, str(tmp_path), ws)
 
 
@@ -501,7 +510,7 @@ def _doctor_env(tmp_path: Path, monkeypatch):
 
 def test_doctor_fails_on_anything_in_the_workspace_the_entity_does_not_own(tmp_path: Path, monkeypatch) -> None:
     doctor, ed = _doctor_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [w / "folder"])
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda h: [h.workspace / "folder"])
     monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): ["file:/etc/gitconfig"])
     results = doctor._check_hands_isolation(ed)
     assert not results[0].ok and "do not belong to the entity" in results[0].detail
@@ -510,8 +519,74 @@ def test_doctor_fails_on_anything_in_the_workspace_the_entity_does_not_own(tmp_p
 
 def test_doctor_warns_unless_the_operators_git_takes_bare_repositories_only_explicitly(tmp_path: Path, monkeypatch) -> None:
     doctor, ed = _doctor_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [])
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda h: [])
     assert [r.name for r in doctor._check_hands_isolation(ed)] == ["hands isolation"]
     monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: False)
     main, bare = doctor._check_hands_isolation(ed)
     assert main.ok and bare.ok and bare.warn and bare.hint == "git config --global safe.bareRepository explicit"
+
+
+# --- the hands lock: no session starts mid-ws-git, no ws-git mid-session ---------------------------
+
+
+def test_ws_git_and_a_session_exclude_each_other_through_the_hands_lock(tmp_path: Path) -> None:
+    (tmp_path / ".levain").mkdir()
+    fd = ws_git.hold_session_lock(tmp_path)
+    fd2 = ws_git.hold_session_lock(tmp_path, wait=0)           # several sessions at once: shared
+    try:
+        with pytest.raises(WsGitError, match="session of this entity is open"):
+            with ws_git._exclusive(tmp_path):
+                pass
+    finally:
+        os.close(fd)
+        os.close(fd2)
+    with ws_git._exclusive(tmp_path):
+        with pytest.raises(WsGitError, match="working in this entity's workspace"):
+            ws_git.hold_session_lock(tmp_path, wait=0.3)
+    os.close(ws_git.hold_session_lock(tmp_path, wait=0))       # free again once ws-git is done
+
+
+def test_ws_git_refuses_while_a_session_holds_the_lock_and_runs_nothing(tmp_path: Path, monkeypatch, capsys) -> None:
+    h = _hands(tmp_path, uid=4_000_017)
+    _repo(h.workspace / "r")
+    ran = []
+    monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
+    monkeypatch.setattr(ws_git, "_run_relayed", lambda argv: ran.append(argv) or 0)
+    fd = ws_git.hold_session_lock(tmp_path)
+    try:
+        assert ws_git.cmd_ws_git(tmp_path, h.workspace / "r", ["status"]) == 1
+        assert "session of this entity is open" in capsys.readouterr().out and ran == []
+    finally:
+        os.close(fd)
+
+
+def test_a_hands_entitys_session_holds_the_lock_from_open_to_close(tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    import functools
+
+    from levain import session as session_mod
+    from levain.firing.hands import hands_user_name, hands_workspace, host_os
+    from levain.session import EntitySession, SessionStartError
+
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
+    ent = tmp_path / "e"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    rec = {"hands_user": hands_user_name(ent), "hands_uid": 499,
+           "hands_workspace": str(hands_workspace(host_os(), hands_user_name(ent)))}
+    (ent / ".levain" / "confinement.json").write_text(json.dumps(rec))
+    monkeypatch.setattr(session_mod, "hold_session_lock", functools.partial(ws_git.hold_session_lock, wait=0.3))
+    with ws_git._exclusive(ent):                                # ws-git running: the session refuses
+        with pytest.raises(SessionStartError, match="working in this entity's workspace"):
+            EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
+    s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
+    try:
+        with pytest.raises(WsGitError, match="session of this entity is open"):
+            with ws_git._exclusive(ent):
+                pass
+    finally:
+        s.close()
+    with ws_git._exclusive(ent):                                # closed: ws-git may run
+        pass

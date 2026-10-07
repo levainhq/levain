@@ -255,7 +255,7 @@ def test_undo_order_rule_retire_jobs_kill_then_files_then_account(tmp_path: Path
     why = [s.why for s in plan.steps]
     first = lambda text: next(i for i, w in enumerate(why) if text in w)  # noqa: E731
     assert first("sudoers") == 0
-    order = ["sudoers", "retire the user id", "cron jobs", "at jobs", "stop every process", "to root",
+    order = ["sudoers", "retire the user id", "cron jobs", "at jobs", "stop every process", "your group (its owner stays",
              "remove the workspace ACLs", "let your group read", "delete the hands user"]
     assert [first(t) for t in order] == sorted(first(t) for t in order)
 
@@ -495,7 +495,7 @@ def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path:
 
     # pinned: a runner image's own safe.directory=* would add a second (correct) warning
     monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): [])
-    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [])
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda h: [])
     monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: True)
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
@@ -512,12 +512,15 @@ def test_the_warn_badge_prints_its_hint(capsys) -> None:
     assert "do this" in out and "[OK]" not in out
 
 
-def test_undo_gives_nothing_to_the_operator_and_never_follows_a_hard_link(tmp_path: Path, monkeypatch) -> None:
+def test_undo_gives_nothing_to_the_operator_or_root_and_never_follows_a_hard_link(tmp_path: Path, monkeypatch) -> None:
+    # Head ruling, 2026-10-07: nothing to root (root's git trusts a root-owned repository, so a later
+    # `sudo git` would run what the entity planted). The owner stays the retired id; only the group moves.
     calls = []
     monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: calls.append(argv) or (True, ""))
-    assert hands._to_root(tmp_path, 499, 20) == (True, "")
+    assert hands._to_operator_group(tmp_path, 499, 20) == (True, "")
     (argv,) = calls
-    assert "0:20" in argv and "alice" not in " ".join(argv)
+    assert argv[argv.index("-exec") + 1].endswith("chgrp") and argv[argv.index("-exec") + 2:-2] == ("-h", "20")
+    assert not any("chown" in a for a in argv) and "alice" not in " ".join(argv)
     assert ("-links", "1") == argv[argv.index("-links"):argv.index("-links") + 2]
     assert argv[argv.index("-uid") + 1] == "499"
 
@@ -543,8 +546,8 @@ def test_undo_empties_the_hooks_and_cuts_the_config_of_the_entitys_repositories(
         (g / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
         sp.run(["git", "config", "--file", str(g / "config"), "core.fsmonitor", "evil"], check=True)
         sp.run(["git", "config", "--file", str(g / "config"), "remote.origin.url", "git@h:o/r.git"], check=True)
-    ok, why = hands._readable_and_sanitised(tree, os.getgid(), root_uid=os.getuid())
-    assert ok and "repositories are now root's" in why
+    ok, why = hands._readable_and_sanitised(tree, os.getgid(), owner_uid=os.getuid())
+    assert ok and "retired id as owner" in why
     for g in (tree / "workspace" / "r" / ".git", tree / "workspace" / "bare.d"):
         assert list((g / "hooks").iterdir()) == []
         text = (g / "config").read_text()
