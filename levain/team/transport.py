@@ -289,8 +289,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
                                      raw.stderr.decode("utf-8", "replace"))
     cp.stdout_bytes = raw.stdout
     if check and cp.returncode != 0:
-        msg = (cp.stderr or cp.stdout).strip().splitlines()
-        raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
+        raise TeamError(f"git {' '.join(args[:2])} failed: {_tail(cp)}")
     return cp
 
 
@@ -343,9 +342,16 @@ def require_untampered(ledger) -> None:
         raise TeamError(f"the team ledger is REFUSED as tampered: {shown}. Nothing was read or written.")
 
 
+_URL_CREDENTIALS = re.compile(r"(://)[^/@\s'\"]+@")
+
+
 def _tail(cp: subprocess.CompletedProcess) -> str:
-    lines = (cp.stderr or cp.stdout or "").strip().splitlines()
-    return lines[-1] if lines else f"exit {cp.returncode}"
+    """git's own reason for a failure, for a person: its first fatal/error line (the lines after it are advice, such
+    as "and the repository exists."), else its first line; a credential in a URL is never repeated."""
+    lines = [l.strip() for l in (cp.stderr or cp.stdout or "").splitlines() if l.strip()]
+    lines = [l for l in lines if not l.startswith("hint:")] or lines
+    pick = next((l for l in lines if l.startswith(("fatal:", "error:"))), lines[0] if lines else "")
+    return _URL_CREDENTIALS.sub(r"\1***@", pick) if pick else f"exit {cp.returncode}"
 
 
 def _existing_dir(start: Path) -> Path:
@@ -1731,6 +1737,16 @@ class GitLedger:
                 time.sleep(random.uniform(0.05, 0.4) * (attempt + 1))
         raise TeamError(f"push still rejected after {retries} fetch+rebase rounds")
 
+    def _due(self, interval: float) -> bool:
+        """Is a fetch due: the last attempt is ``interval`` seconds old, or stamped in the future (a clock that went
+        back), which would otherwise hold every fetch off until then."""
+        try:
+            last = float(self.state().get("last_fetch_attempt") or 0)
+        except (TypeError, ValueError):
+            return True
+        now = time.time()
+        return last > now or now - last >= interval
+
     def fetch_only(self, *, interval: float, timeout: float) -> str | None:
         """Fetch and judge the remote (``_fetch_quarantined``) WITHOUT replaying anything onto the local branch:
         what a read-only surface (the team view) runs. No-op without a remote or when the last attempt is younger
@@ -1741,13 +1757,15 @@ class GitLedger:
             remote = self.remote
             if not remote:
                 return None
-            if time.time() - float(self.state().get("last_fetch_attempt") or 0) < interval:
+            if not self._due(interval):
                 return None
             with contextlib.ExitStack() as held:
                 try:
                     held.enter_context(self.lock(name="net", timeout=0.5))
                 except TeamBusy:                      # only the network lock is "another sync"
                     return "busy: another sync is running"
+                if not self._due(interval):           # judged again under the lock: a sync that held it just fetched
+                    return None
                 if self._fetch_quarantined(remote, timeout) is None:
                     return "remote has no ledger branch"
             return None
@@ -1799,8 +1817,7 @@ class GitLedger:
         try:
             if not self.remote:
                 return None
-            last = float(self.state().get("last_fetch_attempt") or 0)
-            if time.time() - last < interval:
+            if not self._due(interval):
                 return None
             self.save_state(last_fetch_attempt=time.time())
             try:

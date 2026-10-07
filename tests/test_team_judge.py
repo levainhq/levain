@@ -1471,3 +1471,65 @@ def test_a_record_that_cannot_be_written_during_a_fetch_is_saved_as_the_fetch_er
     note = gb.fetch_only(interval=0, timeout=30)
     assert note and "could not be recorded" in note
     assert "could not be recorded" in gb.state().get("last_fetch_error", "")
+
+
+def test_a_rejoin_with_an_unrelated_local_branch_says_so(two, capsys):
+    # L1 r3 LOW 6: the re-join's floor came from a blind merge-base; with no shared history it gets its own message.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    tree = git("rev-parse", "levain-ledger^{tree}", cwd=ben).strip()
+    orphan = git("commit-tree", tree, "-m", "unrelated", cwd=ben).strip()
+    git("update-ref", "refs/heads/levain-ledger", orphan, cwd=ben)
+    _pins_file(ben).unlink()
+    capsys.readouterr()
+    assert team("join", "--no-install", repo=ben) == 2
+    assert "shares no history" in capsys.readouterr().err
+
+
+def test_two_fetch_only_calls_at_once_fetch_once(two, monkeypatch):
+    # E2 L3 (codex MED on 40a838c): the interval was checked before the net lock and never again, so a second process
+    # that waited for the lock fetched again inside the interval.
+    import threading
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    gb.save_state(last_fetch_attempt=0)
+    real, fetches = T.git, []
+
+    def slow(args, *a, **k):
+        if "fetch" in args:
+            fetches.append(1)
+            time.sleep(0.3)
+        return real(args, *a, **k)
+    monkeypatch.setattr(T, "git", slow)
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(_gl(ben).fetch_only(interval=60, timeout=30))) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(fetches) == 1, (fetches, out)
+
+
+def test_a_last_fetch_in_the_future_is_due(two):
+    # E2 residue: after a clock rollback a future last_fetch_attempt made every fetch a silent no-op until then.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    gb.save_state(last_fetch_attempt=time.time() + 3600)
+    before = gb.accepted_tip()
+    assert gb.fetch_only(interval=60, timeout=30) is None
+    assert gb.accepted_tip() != before
+    assert gb.state()["last_fetch_attempt"] <= time.time()
+
+
+def test_a_failed_fetch_says_what_git_said_first_and_never_a_credential(two):
+    # E2 residue: _tail reported "git fetch failed: and the repository exists." (git's LAST line) for a missing repo.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    git("remote", "set-url", "origin", str(tmp / "nope.git"), cwd=ben)
+    note = _gl(ben).fetch_only(interval=0, timeout=30)
+    assert note and "does not appear to be a git repository" in note and "and the repository exists" not in note
+    cp = subprocess.CompletedProcess([], 128, "", "hint: x\nfatal: unable to access 'https://bob:s3cret@host/r.git/': "
+                                                  "403\n")
+    assert T._tail(cp) == "fatal: unable to access 'https://***@host/r.git/': 403"
