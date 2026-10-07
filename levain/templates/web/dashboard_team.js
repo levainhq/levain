@@ -83,6 +83,6 @@
   load();
   document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
   // The first load can run before the page has traded its one-time link code for the cockpit's token, and be
-  // refused; load again once it has (window.LevainToken exists only where the cockpit uses a token).
+  // refused; load again once it has (the guard keeps the tab working on a page that loads no token.js).
   if (window.LevainToken) window.LevainToken.onUnlock(load);
 })();
