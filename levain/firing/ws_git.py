@@ -183,8 +183,8 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str) -> int:
     subprocess.run(ws_git_argv(hands, src, ["remote", "remove", "operator-copy"]), capture_output=True, cwd="/")
     for name, url in remotes.items():
         subprocess.run(ws_git_argv(hands, src, ["remote", "add", name, url]), capture_output=True, cwd="/")
-    print(f"Adopted {src}: it now belongs to the hands user. Your original is at {aside}; delete it "
-          "when you no longer need it (uncommitted changes and stashes are only there).")
+    print(f"Adopted {src}: it now belongs to the hands user. Your original is at {aside}. Check the "
+          "clone, then delete the original yourself; uncommitted changes and stashes exist only there.")
     return 0
 
 
