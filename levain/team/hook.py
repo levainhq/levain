@@ -392,13 +392,16 @@ def sessionstart(payload: dict) -> None:
     # One budget for the whole hook: the flush gets what the fetch left of _SESSIONSTART_BUDGET, and none when the
     # fetch already failed (the remote is not answering).
     left = _SESSIONSTART_BUDGET - (time.monotonic() - started)
-    push_note = gl.flush_unpushed(timeout=left / 3) if left > 3 and not fetch_note else (fetch_note or None)
-    pending = 0
-    if push_note:
-        try:
-            pending = gl.unpushed() or 0
-        except TeamError:
-            pending = 0
+    if fetch_note:
+        push_note = fetch_note
+    elif left > 6:
+        push_note = gl.flush_unpushed(timeout=left / 6)   # ~5 git calls in a sync round, each bounded by this
+    else:
+        push_note = "no time left in the session start to push"
+    try:
+        pending = gl.unpushed() or 0                       # counted after every attempt, whatever it reported
+    except TeamError:
+        pending = 0
     live = ledger.in_force
     rulings = [e for e in live if e.get("kind") == "ruling"]
     newest = max((e.get("ts", "") for e in ledger.entries), default="")
@@ -411,8 +414,8 @@ def sessionstart(payload: dict) -> None:
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
     lines += [f"[team] {w}" for w in dict.fromkeys(WARNINGS)]
     if pending:
-        lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet "
-                     f"({I.oneline(push_note)}); run `levain team sync`")
+        lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet"
+                     + (f" ({I.oneline(push_note)})" if push_note else "") + "; run `levain team sync`")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.

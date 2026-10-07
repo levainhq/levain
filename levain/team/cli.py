@@ -225,7 +225,8 @@ def cmd_repin(args) -> int:
     if not dropped:
         print("no pins to drop" + (f" for {args.file}" if args.file else ""))
         return 0
-    gl.save_state(first_sight=True)
+    if args.file is None:                    # all pins gone: the next read is a first sight again
+        gl.save_state(first_sight=True)
     print(f"dropped {len(dropped)} pin(s): " + ", ".join(dropped))
     print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then. "
           "If a sync refused the remote, run `levain team sync` to judge it again.")
@@ -260,6 +261,9 @@ def cmd_consolidate(args) -> int:
                         "(This is the team's convention plus a git user.email check, not cryptography.)")
     if gl.remote and not args.no_push:
         gl.sync(push=False)
+        team, handle = _actor(gl)            # the team of the tip the sync brought, the one the ledger is read from
+        if handle != team.owner:
+            raise TeamError(f"only the canon owner ({team.owner}) consolidates; you are {handle}")
     ledger = gl.ledger(team)
     require_untampered(ledger)        # before rendering, --dry-run included: nothing is committed or pushed
     text = C.render(team, ledger, tree=gl.state_hash(ledger, team), by=handle, ts=E.now_iso())

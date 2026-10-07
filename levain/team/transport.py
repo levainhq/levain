@@ -534,16 +534,16 @@ class GitLedger:
             if cut < len(data):
                 problems.append(f"ledger/{rel}: the last line has no line break, so it is not read (a write was "
                                 "cut off, or the file was edited by hand)")
-            folder = rel.split("/", 1)[0]
-            if team is not None and folder not in by_safe and not folder.startswith("pack-"):
-                problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
-                continue
             lines = [_text(l) for l in _blob_lines(datas[rel])]
-            for e in E.verify_lines(lines)[0]:
+            for e in E.verify_lines(lines)[0]:              # every canonical file, member folder or not
                 other = seen_ids.setdefault(str(e.get("id")), rel)
                 if other != rel:
                     tamper.append(f"ledger/{rel} and ledger/{other} both hold entry id {e.get('id')}; levain never "
                                   "writes an id twice (the owner removes the copy)")
+            folder = rel.split("/", 1)[0]
+            if team is not None and folder not in by_safe and not folder.startswith("pack-"):
+                problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
+                continue
             files.append((rel, lines))
         if tamper:
             return Judgement(I.build([], owner, problems, tamper=tamper))
@@ -896,6 +896,11 @@ class GitLedger:
                  f"+refs/heads/{BRANCH}:{_INCOMING}"], self.repo.toplevel, timeout=120)
             tip = self._ref_sha(_INCOMING)
         # First sight: the namespace is judged (and, seeded, the teammate's pins) before anything is created.
+        try:
+            self.team(tip)
+        except R.RolesError as exc:
+            raise TeamError(f"the team ledger on the remote has no usable team.toml ({exc}), so this clone did not "
+                            "join") from None
         bad = self.judge(tip, self._team_or_none(tip), seed or {}).ledger.tamper
         if bad:
             what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" if seed is not None \
@@ -909,8 +914,9 @@ class GitLedger:
             self.base.mkdir(parents=True, exist_ok=True)
             with self.lock(name="pins.lock", timeout=10.0):
                 _atomic_write(self.base / "pins.json", json.dumps(seed, sort_keys=True), sync_dir=True)
+        first = seed is None and not (self.base / "pins.json").exists()   # a re-join keeps the clone's own record
         self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "",
-                        first_sight=seed is None)
+                        **({"first_sight": first} if seed is not None or first else {}))
         self._attach_worktree()
         team = self.team()
         handle = team.handle_for_email(email)
@@ -1160,7 +1166,10 @@ class GitLedger:
                 return Judgement(I.build([], None, [], tamper=[f"team.toml does not parse ({exc}); the team owner "
                                                                   "fixes it"]))
             local = self.head()
-            handle = self.handle(self.team(local))
+            try:
+                handle = self.handle(self.team(local))
+            except R.RolesError:
+                handle = None                         # own files then judged by pins like every other file
             own = lambda rel: self._own_rel(rel, handle)  # noqa: E731
             pins, problem = self._pins()
             j = self.judge(rev, team, {r: p for r, p in pins.items() if not own(r)}, problem)
@@ -1374,12 +1383,13 @@ class GitLedger:
                 return None
             if time.time() - float(self.state().get("last_fetch_attempt") or 0) < interval:
                 return None
-            try:
-                with self.lock(name="net", timeout=0.5):
-                    if self._fetch_quarantined(remote, timeout) is None:
-                        return "remote has no ledger branch"
-            except TeamBusy:
-                return "busy: another sync is running"
+            with contextlib.ExitStack() as held:
+                try:
+                    held.enter_context(self.lock(name="net", timeout=0.5))
+                except TeamBusy:                      # only the network lock is "another sync"
+                    return "busy: another sync is running"
+                if self._fetch_quarantined(remote, timeout) is None:
+                    return "remote has no ledger branch"
             return None
         except TeamError as exc:
             return str(exc)
@@ -1413,7 +1423,7 @@ class GitLedger:
             self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1)
             return None
         except TeamBusy:
-            return None
+            return "busy: another sync is running"
         except TeamError as exc:
             return str(exc)
         except Exception as exc:  # noqa: BLE001 - a hook path: report, never raise
@@ -1566,7 +1576,6 @@ class GitLedger:
     def mark_denied(self, session: str, ids: set[str]) -> None:
         p = self._session_path(session)
         p.parent.mkdir(parents=True, exist_ok=True)
-        data = {"denied": sorted(self.session_denied(session) | ids), "ts": E.now_iso()}
-        tmp = p.with_suffix(f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(data), encoding="utf-8")
-        os.replace(tmp, p)
+        with self.lock(name="sessions.lock", timeout=3.0):   # concurrent hooks of one session must not drop ids
+            data = {"denied": sorted(self.session_denied(session) | ids), "ts": E.now_iso()}
+            _atomic_write(p, json.dumps(data))

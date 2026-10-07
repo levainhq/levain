@@ -765,3 +765,33 @@ def test_the_size_limit_counts_a_blob_once_per_path_that_holds_it(two, monkeypat
     monkeypatch.setattr(T, "_MAX_LEDGER_LEAVES", 1)
     with pytest.raises(T.LedgerReadError, match="files, past levain's limit"):
         ga.judge(ga.head(), ga.team(), {})
+
+
+def test_a_join_whose_remote_team_toml_never_parses_changes_nothing(two, capsys):
+    # L3 r2 codex MED 5, RUN: the branch, accepted ref, state and worktree were created before the failure.
+    tmp, ana, ben = two
+    raw = tmp / "raw.git"
+    git("clone", "-q", "--bare", str(tmp / "origin.git"), str(raw), cwd=tmp)
+    # make every version unparseable: an orphan commit with only the broken team.toml
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=raw, input="not = [toml", text=True,
+                          capture_output=True, check=True).stdout.strip()
+    tree = subprocess.run(["git", "mktree"], cwd=raw, input=f"100644 blob {blob}\tteam.toml\n", text=True,
+                          capture_output=True, check=True).stdout.strip()
+    commit = git("commit-tree", tree, "-m", "orphan", cwd=raw).strip()
+    git("push", "-qf", str(tmp / "origin.git"), f"{commit}:refs/heads/levain-ledger", cwd=raw)
+    cat = clone(tmp, "cat", "ben@ex.com")
+    assert team("join", "--no-install", repo=cat) == 2
+    gc = _gl(cat)
+    assert not gc.joined() and not gc._local_branch_exists() and gc.remote_ref() is None
+
+
+def test_a_duplicate_id_under_a_non_member_folder_is_still_tamper(two):
+    # L3 r2 codex LOW 7: the cross-file duplicate check skipped folders of non-members.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    ga = _gl(ana)
+    f = _own_file(ga)
+    (ga.wt / "ledger" / "eve").mkdir()
+    (ga.wt / "ledger" / "eve" / "0123456789abcdef.jsonl").write_bytes(f.read_bytes())
+    _push_wt(ga, "a copy under a non-member")
+    assert any("both hold entry id" in t for t in ga.ledger().tamper)
