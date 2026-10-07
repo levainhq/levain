@@ -1,18 +1,21 @@
-"""M2 option H: `levain ws-git`'s repository checks, the doctor's workspace scan, the wildcard
-safe.directory warning and the Linux mask repair command. Real git on temporary repositories; no
-sudo, no sandbox."""
+"""M2 options H and A: `levain ws-git`'s repository checks and its liveness gate, `ws-put`,
+`ws-adopt` as an import, the doctor's ownership scan and git warnings, and the Linux mask repair
+command. Real git on temporary repositories, and the hands-side scripts run as the current user (the
+sudo prefix is the only thing replaced); no sudo, no sandbox. The cross-user behaviour runs in CI
+(tests/ci/isolation_e2e.sh)."""
 from __future__ import annotations
 
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from levain.firing import hands, ws_git
-from levain.firing.ws_git import WsGitError, check_repo, find_gitdir, operator_owned_gitdirs
+from levain.firing.ws_git import WsGitError, check_repo, find_gitdir, foreign_entries
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 ME = os.getuid()
@@ -131,16 +134,219 @@ def test_the_neutralised_settings_really_switch_hooks_off(tmp_path: Path) -> Non
     assert canary.exists()  # control: without the settings the hook fires
 
 
-def test_the_scan_finds_repositories_of_any_shape_the_hands_user_does_not_own(tmp_path: Path) -> None:
+def test_the_scan_reports_every_entry_the_hands_user_does_not_own_at_any_depth(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
-    g1, g2 = _repo(ws / "a"), _repo(ws / "d1" / "d2" / "d3" / "d4" / "d5" / "deep")  # no depth limit
-    bare = ws / "notes"
-    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)         # bare, any name
-    (ws / "f").mkdir()
-    (ws / "f" / ".git").write_text("gitdir: /elsewhere\n")                        # a gitfile
-    found = operator_owned_gitdirs(ws, ME + 1)
-    assert {g1, g2, bare, ws / "f" / ".git"} <= set(found)
-    assert operator_owned_gitdirs(ws, ME) == []
+    deep = ws / "d1" / "d2" / "d3" / "d4" / "d5" / "d6"
+    deep.mkdir(parents=True)                                   # no depth limit
+    (deep / "f").write_text("x")
+    (ws / "bare").mkdir()                                     # an empty folder: where a bare repo would go
+    (ws / "link").symlink_to("/etc")                           # a link: judged by its own owner, never followed
+    all_entries = {ws, deep / "f", ws / "bare", ws / "link", *[ws.joinpath(*["d1", "d2", "d3", "d4", "d5", "d6"][:i])
+                                                               for i in range(1, 7)]}
+    assert set(foreign_entries(ws, ME + 1)) == all_entries
+    assert foreign_entries(ws, ME) == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+def test_the_scan_reports_a_folder_it_cannot_read_as_a_finding(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    (ws / "locked" / "inner").mkdir(parents=True)
+    (ws / "locked").chmod(0)
+    try:
+        assert foreign_entries(ws, ME) == [ws / "locked"]
+    finally:
+        (ws / "locked").chmod(0o755)
+
+
+def test_the_bare_repository_setting_is_read_from_the_operators_git(tmp_path: Path, monkeypatch) -> None:
+    cfg = tmp_path / "gitconfig"
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    cfg.write_text("")
+    assert ws_git.bare_repository_explicit() is False
+    cfg.write_text("[safe]\n\tbareRepository = explicit\n")
+    assert ws_git.bare_repository_explicit() is True
+
+
+# --- the liveness gate --------------------------------------------------------------------------
+
+
+def test_a_user_with_a_process_running_is_live_and_one_without_is_not() -> None:
+    assert ws_git.entity_session_live(ME) is True              # this test runs as ME
+    assert ws_git.entity_session_live(4_000_017) is False      # no such user
+
+
+def test_liveness_fails_closed_when_the_process_table_cannot_be_read(monkeypatch) -> None:
+    monkeypatch.setattr(ws_git.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 3, "", "pgrep: cannot read"))
+    with pytest.raises(WsGitError, match="cannot tell"):
+        ws_git.entity_session_live(4_000_017)
+
+
+def test_a_proc_mounted_hidepid_means_liveness_cannot_be_told() -> None:
+    base = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw"
+    assert ws_git.proc_hides_processes(base + ",hidepid=invisible\n") is True
+    assert ws_git.proc_hides_processes(base + ",hidepid=2\n") is True
+    assert ws_git.proc_hides_processes(base + ",hidepid=0\n") is False
+    assert ws_git.proc_hides_processes(base + "\n") is False
+
+
+def _hands(tmp_path: Path, uid: int = ME) -> ws_git.Hands:
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    return ws_git.Hands("_levain_x_abcdef", uid, str(tmp_path), ws)
+
+
+def _no_sudo(monkeypatch) -> None:
+    """Run the hands side as the current user: only the sudo prefix changes."""
+    monkeypatch.setattr(ws_git, "_as_hands", lambda h, *argv, env=(): [
+        "/usr/bin/env", "-i", f"HOME={h.home}", f"PATH={ws_git.SECURE_PATH}", *env, *argv])
+
+
+def test_ws_git_refuses_while_the_entitys_user_runs_anything(tmp_path: Path, monkeypatch, capsys) -> None:
+    h = _hands(tmp_path)                       # uid = this test's own, so a process is running
+    _repo(h.workspace / "r")
+    ran = []
+    monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
+    monkeypatch.setattr(ws_git, "_run_relayed", lambda argv: ran.append(argv) or 0)
+    assert ws_git.cmd_ws_git(tmp_path, h.workspace / "r", ["status"]) == 1
+    assert "processes running" in capsys.readouterr().out and ran == []
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    assert ws_git.cmd_ws_git(tmp_path, h.workspace / "r", ["status"]) == 0 and len(ran) == 1
+
+
+# --- ws-put -------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dest", ["../x", "a/../../x", "/etc/passwd", "", "a//b", "./x", "a/."])
+def test_ws_put_refuses_a_destination_that_could_leave_the_workspace(tmp_path: Path, dest) -> None:
+    with pytest.raises(WsGitError):
+        ws_git.put_parts(tmp_path / "ws", dest)
+
+
+def test_ws_put_names_a_destination_relative_to_the_workspace_or_absolute_inside_it(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    assert ws_git.put_parts(ws, "a/b.txt") == ["a", "b.txt"]
+    assert ws_git.put_parts(ws, str(ws / "a" / "b.txt")) == ["a", "b.txt"]
+    with pytest.raises(WsGitError, match="not inside"):
+        ws_git.put_parts(ws, str(tmp_path / "wsx" / "b.txt"))
+
+
+def _put(h: ws_git.Hands, src: Path, dest: str) -> int:
+    return ws_git.cmd_ws_put(h.home, src, dest)
+
+
+@pytest.fixture
+def put_env(tmp_path: Path, monkeypatch):
+    h = _hands(tmp_path)
+    _no_sudo(monkeypatch)
+    monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
+    src = tmp_path / "src.sh"
+    src.write_text("#!/bin/sh\necho hi\n")
+    src.chmod(0o755)
+    return h, src
+
+
+def test_ws_put_writes_data_never_a_program_and_creates_missing_folders(put_env) -> None:
+    h, src = put_env
+    assert _put(h, src, "new/dir/run.sh") == 0
+    out = h.workspace / "new" / "dir" / "run.sh"
+    assert out.read_text() == src.read_text() and out.stat().st_mode & 0o777 == 0o644
+    assert [p.name for p in out.parent.iterdir()] == ["run.sh"]              # no temp file left
+
+
+def test_ws_put_stops_at_a_symlinked_folder_and_writes_nothing_through_it(put_env, tmp_path: Path, capsys) -> None:
+    h, src = put_env
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (h.workspace / "a").mkdir()
+    (h.workspace / "a" / "link").symlink_to(outside)
+    assert _put(h, src, "a/link/x") == 1
+    assert list(outside.iterdir()) == [] and "could not write" in capsys.readouterr().out
+    h.workspace.joinpath("top").symlink_to(outside)
+    assert _put(h, src, "top/x") == 1 and list(outside.iterdir()) == []
+
+
+def test_ws_put_replaces_a_symlink_at_the_destination_instead_of_writing_through_it(put_env, tmp_path: Path) -> None:
+    h, src = put_env
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    (h.workspace / "f").symlink_to(target)
+    assert _put(h, src, "f") == 0
+    assert target.read_text() == "keep"
+    assert not (h.workspace / "f").is_symlink() and (h.workspace / "f").read_text() == src.read_text()
+
+
+def test_ws_put_refuses_a_source_inside_a_workspace_and_a_non_file(put_env, tmp_path: Path, monkeypatch) -> None:
+    h, src = put_env
+    monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", h.workspace)
+    (h.workspace / "planted").symlink_to(src)       # the entity's link to a file of yours
+    assert _put(h, h.workspace / "planted", "copy") == 1 and not (h.workspace / "copy").exists()
+    assert _put(h, tmp_path, "dir-copy") == 1 and not (h.workspace / "dir-copy").exists()
+
+
+# --- ws-adopt: an import ------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture
+def adopt_env(tmp_path: Path, monkeypatch):
+    h = _hands(tmp_path)
+    _no_sudo(monkeypatch)
+    monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    src = tmp_path / "mine"
+    _repo(src)
+    _git(src, "checkout", "-q", "-b", "main")
+    (src / "a").write_text("a")
+    _git(src, "add", "a")
+    _git(src, "commit", "-q", "-m", "one")
+    for b in ("side", "feature/x"):
+        _git(src, "checkout", "-q", "-b", b)
+        (src / b.replace("/", "_")).write_text(b)
+        _git(src, "add", ".")
+        _git(src, "commit", "-q", "-m", b)
+    _git(src, "checkout", "-q", "main")
+    _git(src, "tag", "v1")
+    _git(src, "remote", "add", "origin", "git@github.com:o/r.git")
+    _git(src, "remote", "add", "local", "/some/path")
+    (src / ".git" / "hooks" / "post-checkout").write_text("#!/bin/sh\ntouch /tmp/never\n")
+    return h, src
+
+
+def test_ws_adopt_imports_every_branch_and_tag_and_leaves_the_original_alone(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    before = _git(src, "for-each-ref")
+    assert ws_git.cmd_ws_adopt(h.home, src) == 0, capsys.readouterr().out
+    dest = h.workspace / "mine"
+    assert _git(dest, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags") == \
+        _git(src, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags")
+    assert _git(dest, "symbolic-ref", "HEAD") == "refs/heads/main" and (dest / "a").read_text() == "a"
+    assert _git(dest, "remote") == "origin"                                   # a local-path remote is dropped
+    assert not (dest / ".git" / "hooks").exists()                             # no hooks, not even samples
+    assert _git(src, "for-each-ref") == before and (src / ".git").is_dir()    # the original is untouched
+
+
+def test_ws_adopt_refuses_when_a_branch_did_not_come_across_and_keeps_nothing(adopt_env, monkeypatch, capsys) -> None:
+    h, src = adopt_env
+    monkeypatch.setattr(ws_git, "_IMPORT_SCRIPT", ws_git._IMPORT_SCRIPT.replace("'+refs/heads/*:refs/heads/*'",
+                                                                              "'+refs/heads/main:refs/heads/main'"))
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1
+    assert "did not all come across" in capsys.readouterr().out and not (h.workspace / "mine").exists()
+
+
+def test_ws_adopt_refuses_a_repository_inside_a_workspace_and_while_live(adopt_env, monkeypatch, capsys) -> None:
+    h, src = adopt_env
+    monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", src.parent)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "inside an entity's workspace" in capsys.readouterr().out
+    monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", Path("/Users/Shared/levain"))
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "processes running" in capsys.readouterr().out
+    assert not (h.workspace / "mine").exists()
 
 
 @pytest.mark.parametrize("entry,hit", [
@@ -165,10 +371,10 @@ def test_the_mask_repair_runs_as_the_owner_on_its_own_files_only(tmp_path: Path)
     h = ws_git.Hands("_levain_x_abcdef", 950, "/var/lib/levain-hands/_levain_x_abcdef", tmp_path)
     argv = ws_git.mask_repair_argv(h)
     assert argv[:4] == ["/usr/bin/sudo", "-n", "-u", h.user]
-    assert argv[argv.index("-user") + 1] == h.user and "m::rwX" in argv
+    assert argv[argv.index("-user") + 1] == h.user and "m::rX" in argv
 
 
-def test_doctor_fails_on_an_operator_owned_repo_in_the_workspace(tmp_path: Path, monkeypatch) -> None:
+def _doctor_env(tmp_path: Path, monkeypatch):
     from levain import doctor
 
     ed = tmp_path / "e"
@@ -181,8 +387,24 @@ def test_doctor_fails_on_an_operator_owned_repo_in_the_workspace(tmp_path: Path,
     monkeypatch.setattr(doctor, "_probe", lambda cmd: (True, ""))
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
-    monkeypatch.setattr(ws_git, "operator_owned_gitdirs", lambda w, uid: [w / "repo" / ".git"])
+    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): [])
+    monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: True)
+    return doctor, ed
+
+
+def test_doctor_fails_on_anything_in_the_workspace_the_entity_does_not_own(tmp_path: Path, monkeypatch) -> None:
+    doctor, ed = _doctor_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [w / "folder"])
     monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): ["file:/etc/gitconfig"])
     results = doctor._check_hands_isolation(ed)
-    assert not results[0].ok and "do not belong to the entity" in results[0].detail and "ws-adopt" in results[0].hint
+    assert not results[0].ok and "do not belong to the entity" in results[0].detail
     assert results[1].ok and results[1].warn and "EVERY repository" in results[1].detail
+
+
+def test_doctor_warns_unless_the_operators_git_takes_bare_repositories_only_explicitly(tmp_path: Path, monkeypatch) -> None:
+    doctor, ed = _doctor_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [])
+    assert [r.name for r in doctor._check_hands_isolation(ed)] == ["hands isolation"]
+    monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: False)
+    main, bare = doctor._check_hands_isolation(ed)
+    assert main.ok and bare.ok and bare.warn and bare.hint == "git config --global safe.bareRepository explicit"

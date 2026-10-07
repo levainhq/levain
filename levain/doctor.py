@@ -926,16 +926,15 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
                             f"recorded {cfg.hands_uid}", hint=redo)]
     # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
     # operator cannot see it. Writing to the workspace AS the hands user tests the rule, the account
-    # and the workspace ACL in one step.
+    # and its ownership of the workspace in one step.
     ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
     if not ok:
         return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
                             f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
-    from levain.firing.ws_git import operator_owned_gitdirs, wildcard_safe_directory
+    from levain.firing.hands import WORKSPACE_ROOT
+    from levain.firing.ws_git import bare_repository_explicit, foreign_entries, wildcard_safe_directory
 
     extra: list[CheckResult] = []
-    from levain.firing.hands import WORKSPACE_ROOT
-
     wildcard = wildcard_safe_directory(tuple(WORKSPACE_ROOT.values()))
     if wildcard:
         extra.append(CheckResult(
@@ -946,14 +945,24 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
             hint="remove that safe.directory line, or narrow it to paths outside the entity's workspace",
             warn=True,
         ))
-    owned = operator_owned_gitdirs(cfg.hands_workspace, cfg.hands_uid)
-    if owned:
+    if not bare_repository_explicit():
+        extra.append(CheckResult(
+            "git bare repositories", True,
+            "your git will use a bare repository it finds in a folder by itself (safe.bareRepository is not "
+            "explicit). Nothing in the entity's workspace is yours, so there is no folder of yours it could "
+            "plant one in, but with this setting your git never picks one up unasked.",
+            hint="git config --global safe.bareRepository explicit",
+            warn=True,
+        ))
+    foreign = foreign_entries(cfg.hands_workspace, cfg.hands_uid)
+    if foreign:
         return [CheckResult(
             name, False,
-            f"{len(owned)} repository(ies) in the workspace do not belong to the entity's user (or could "
-            "not be read): " + ", ".join(str(g) for g in owned[:3]) + ". Your git trusts one you own, and "
-            "the entity can write its config and hooks, which your git would then run as you.",
-            hint="levain ws-adopt <repository>, or move it out of the workspace",
+            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, or could not be "
+            "read: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must be the entity's: a "
+            "folder of yours that the entity can write is one it can turn into a repository your git trusts "
+            "and runs code from, as you.",
+            hint="move it out of the workspace (`sudo mv`), or import a repository with `levain ws-adopt`",
         ), *extra]
     return [CheckResult(
         name, True,

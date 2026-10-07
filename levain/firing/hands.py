@@ -27,10 +27,15 @@ The hands user:
 
 Its workspace is NOT ``<entity>/workspace``: that sits under the operator's home, which the hands
 user cannot enter. Setup creates ``/Users/Shared/levain/<hands>/workspace`` (macOS) or
-``/var/lib/levain/<hands>/workspace`` (Linux), owned by the operator with an inherited ACL naming the
-two users (named users, not a shared group: a group added to the operator's account reaches its
-running processes only after a new login on Linux, measured in CI), and records the path in
-``confinement.json``. A recorded path, never a symlink.
+``/var/lib/levain/<hands>/workspace`` (Linux) and records the path in ``confinement.json`` (a
+recorded path, never a symlink). The workspace and everything in it belong to the hands user. The
+operator gets an inherited ACL that allows reading and listing only, never writing, creating or
+deleting (Phill, 2026-10-07, ruling A: the operator edits the entity's workspace through the
+entity). The reason: git's ownership check for a BARE repository looks only at that directory, so
+any operator-owned directory the hands user could write would be one the operator's git trusts and
+the entity could fill with a repository whose config runs code as the operator. With nothing in the
+workspace owned by the operator, there is no such directory. The operator's other ways in are the
+remote, ``levain ws-git``, ``levain ws-put`` (a file, as data) and ``levain ws-adopt`` (an import).
 
 The privilege it gives the operator is one sudoers line, ``<operator> ALL=(<hands>) NOPASSWD: ALL``:
 the operator may run commands AS the hands user. That is no escalation for the operator (the hands
@@ -92,11 +97,9 @@ _AT_SPOOL = {"darwin": Path("/usr/lib/cron/jobs"), "linux": Path("/var/spool/cro
 _CRON_DENY = {"darwin": (Path("/usr/lib/cron/cron.deny"), Path("/usr/lib/cron/at.deny")),
               "linux": (Path("/etc/cron.deny"), Path("/etc/at.deny"))}
 
-#: The inherited ACL that lets the operator and the hands user both edit the workspace (macOS).
-_DARWIN_ACL_PERMS = (
-    "list,add_file,search,add_subdirectory,delete_child,readattr,writeattr,readextattr,"
-    "writeextattr,readsecurity,read,write,append,execute,delete,file_inherit,directory_inherit"
-)
+#: The inherited ACL that lets the operator read the hands user's workspace (macOS): list, search
+#: and read, and nothing that writes, creates or deletes.
+_DARWIN_OPERATOR_READ = "list,search,readattr,readextattr,readsecurity,read,file_inherit,directory_inherit"
 
 
 class HandsSetupError(RuntimeError):
@@ -208,7 +211,6 @@ def plan_setup(
     ws = hands_workspace(host, hands)
     ws_parent = ws.parent
     root = WORKSPACE_ROOT[host]
-    opg = f"{operator}:{operator_gid}"
     steps: list[Step] = []
     if host == "darwin":
         home = Path("/Users") / hands
@@ -232,15 +234,11 @@ def plan_setup(
             Step("make the home private", ("/bin/chmod", "700", str(home))),
             Step("hide the home in Finder", ("/usr/bin/chflags", "hidden", str(home))),
             Step("create the shared workspace root", ("/bin/mkdir", "-p", "-m", "755", str(root))),
-            Step("create the entity's workspace directory, yours", ("/bin/mkdir", "-m", "700", str(ws_parent))),
-            Step("create the workspace, yours", ("/bin/mkdir", "-m", "700", str(ws))),
-            Step("own them as you", ("/usr/sbin/chown", opg, str(ws_parent), str(ws))),
-            Step("let the hands user pass through to the workspace",
-                 ("/bin/chmod", "+a", f"user:{hands} allow search", str(ws_parent))),
-            Step("let the hands user edit the workspace (inherited ACL)",
-                 ("/bin/chmod", "+a", f"user:{hands} allow {_DARWIN_ACL_PERMS}", str(ws))),
-            Step(f"let {operator} edit what the hands user creates there (inherited ACL)",
-                 ("/bin/chmod", "+a", f"user:{operator} allow {_DARWIN_ACL_PERMS}", str(ws))),
+            Step("create the entity's directory (root's)", ("/bin/mkdir", "-m", "755", str(ws_parent))),
+            Step("create the workspace", ("/bin/mkdir", "-m", "700", str(ws))),
+            Step("give the workspace to the hands user", ("/usr/sbin/chown", f"{hands}:{hands_id}", str(ws))),
+            Step(f"let {operator} read the workspace, and nothing more (inherited ACL)",
+                 ("/bin/chmod", "+a", f"user:{operator} allow {_DARWIN_OPERATOR_READ}", str(ws))),
         ]
     elif host == "linux":
         home = _LINUX_HANDS_HOME_ROOT / hands
@@ -253,15 +251,13 @@ def plan_setup(
                   "--comment", HANDS_MARKER, hands)),
             Step("make the home private", (_abs("chmod"), "700", str(home))),
             Step("create the shared workspace root", (_abs("mkdir"), "-p", "-m", "755", str(root))),
-            Step("create the entity's workspace directory, yours", (_abs("mkdir"), "-m", "700", str(ws_parent))),
-            Step("create the workspace, yours", (_abs("mkdir"), "-m", "700", str(ws))),
-            Step("own them as you", (_abs("chown"), opg, str(ws_parent), str(ws))),
-            Step("let the hands user pass through to the workspace",
-                 (_abs("setfacl"), "-m", f"u:{hands_id}:x", str(ws_parent))),
-            Step("let both users edit the workspace (ACL)",
-                 (_abs("setfacl"), "-m", f"u:{hands_id}:rwX,u:{operator}:rwX", str(ws))),
+            Step("create the entity's directory (root's)", (_abs("mkdir"), "-m", "755", str(ws_parent))),
+            Step("create the workspace", (_abs("mkdir"), "-m", "700", str(ws))),
+            Step("give the workspace to the hands user", (_abs("chown"), f"{hands}:{hands_id}", str(ws))),
+            Step(f"let {operator} read the workspace, and nothing more (ACL)",
+                 (_abs("setfacl"), "-m", f"u:{operator}:rX", str(ws))),
             Step("make new files in the workspace inherit it (default ACL)",
-                 (_abs("setfacl"), "-d", "-m", f"u:{hands_id}:rwX,u:{operator}:rwX", str(ws))),
+                 (_abs("setfacl"), "-d", "-m", f"u:{operator}:rX", str(ws))),
         ]
     else:  # pragma: no cover - guarded by the caller
         raise HandsSetupError(f"unsupported host {host!r}")

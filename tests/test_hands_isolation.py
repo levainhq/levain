@@ -111,28 +111,39 @@ def test_linux_plan_makes_a_system_user_with_explicit_ids_and_no_login(tmp_path:
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_the_workspace_is_outside_home_owned_by_the_operator_and_never_entity_workspace(tmp_path: Path, host) -> None:
+def test_the_workspace_is_outside_home_owned_by_the_hands_user_and_never_entity_workspace(tmp_path: Path, host) -> None:
+    # Ruling A (Phill, 2026-10-07): the workspace and everything in it belong to the hands user.
     plan = _setup(tmp_path, host=host)
     assert plan.workspace == hands_workspace(host, plan.hands_user)
     assert plan.workspace.is_relative_to(hands.WORKSPACE_ROOT[host])
     assert str(plan.entity_dir / "workspace") not in _joined(plan)
-    chown = next(a for a in _argvs(plan) if a[0].endswith("chown") and str(plan.workspace) in a)
-    assert chown[1] == "alice:20"
-    mkdirs = [a for a in _argvs(plan) if a[0].endswith("mkdir") and a[-1] in (str(plan.workspace), str(plan.workspace.parent))]
-    assert all("-p" not in a and a[a.index("-m") + 1] == "700" for a in mkdirs) and len(mkdirs) == 2
+    chowns = [a for a in _argvs(plan) if a[0].endswith("chown") and str(plan.workspace) in a[-1]]
+    assert chowns == [(chowns[0][0], f"{plan.hands_user}:{plan.hands_id}", str(plan.workspace))]
+    # the entity's directory above it stays root's: the hands user cannot swap the workspace out
+    assert not any(a[0].endswith("chown") and a[-1] == str(plan.workspace.parent) for a in _argvs(plan))
+    assert "alice:20" not in _joined(plan) and not any(a[0].endswith("chown") and "alice" in a[1] for a in _argvs(plan))
+    mkdirs = {a[-1]: a[a.index("-m") + 1] for a in _argvs(plan) if a[0].endswith("mkdir")
+              and a[-1] in (str(plan.workspace), str(plan.workspace.parent))}
+    assert mkdirs == {str(plan.workspace.parent): "755", str(plan.workspace): "700"}
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_the_workspace_acl_names_both_users_not_a_group(tmp_path: Path, host) -> None:
-    # A group added to the operator reaches its running processes only after a new login on Linux
-    # (measured in CI: the operator could not append to a file the hands user created).
+def test_the_operators_acl_on_the_workspace_reads_and_never_writes(tmp_path: Path, host) -> None:
     plan = _setup(tmp_path, host=host)
-    acl = "\n".join(" ".join(a) for a in _argvs(plan) if str(plan.workspace) in a and ("chmod" in a[0] or "setfacl" in a[0]))
+    acls = [a for a in _argvs(plan) if "chmod" in a[0] and "+a" in a or "setfacl" in a[0]]
+    assert acls and all(a[-1] == str(plan.workspace) for a in acls)
+    text = "\n".join(" ".join(a[:-1]) for a in acls)                       # the specs, not the path
+    assert plan.hands_user not in text and f"u:{plan.hands_id}" not in text   # the owner needs no entry
     if host == "darwin":
-        assert f"user:{plan.hands_user} allow" in acl and "user:alice allow" in acl
+        (spec,) = [a[a.index("+a") + 1] for a in acls]
+        who, _, perms = spec.partition(" allow ")
+        assert who == "user:alice"
+        assert set(perms.split(",")) == {"list", "search", "readattr", "readextattr", "readsecurity", "read",
+                                         "file_inherit", "directory_inherit"}
     else:
-        assert f"u:{plan.hands_id}:rwX" in acl and "u:alice:rwX" in acl and " -d " in acl
-    assert "group:" not in acl and "g:" not in acl
+        assert [a[-2] for a in acls] == ["u:alice:rX", "u:alice:rX"] and any("-d" in a for a in acls)
+    for word in ("write", "add_file", "add_subdirectory", "delete", "append", "rw"):
+        assert word not in text, word
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
@@ -484,7 +495,8 @@ def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path:
 
     # pinned: a runner image's own safe.directory=* would add a second (correct) warning
     monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): [])
-    monkeypatch.setattr(ws_git, "operator_owned_gitdirs", lambda w, uid: [])
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda w, uid: [])
+    monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: True)
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
     (r,) = doctor._check_hands_isolation(ed)

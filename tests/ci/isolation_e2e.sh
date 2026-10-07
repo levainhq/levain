@@ -82,17 +82,37 @@ PYEOF
 fi
 kill "$CPID" 2>/dev/null
 
-echo "== workspace and git"
+echo "== workspace: the entity's; the operator reads it (ruling A)"
+check "the workspace belongs to the hands user" test "$(stat -c %u "$WS" 2>/dev/null || stat -f %u "$WS")" = "$HID"
+if [ -n "$(sudo find "$WS" ! -user "$HID" -print -quit)" ]; then fail "setup left something in the workspace that is not the hands user's"; else pass "setup left nothing in the workspace that is not the hands user's"; fi
 check "hands creates a file" as_hands bash -c "cd '$WS' && echo h > from-hands"
-check "operator appends to it" bash -c "echo o >> '$WS/from-hands'"
-check "operator creates a file" bash -c "echo o > '$WS/from-op'"
-check "hands appends to it" as_hands bash -c "cd '$WS' && echo h >> from-op"
+check "operator reads it" /bin/cat "$WS/from-hands"
+check "operator lists the workspace" /bin/ls "$WS"
+refused "operator appends to it" bash -c "echo o >> '$WS/from-hands'"
+refused "operator creates a file" bash -c "echo o > '$WS/from-op'"
+refused "operator creates a folder" mkdir "$WS/op-folder"
+refused "operator renames the entity's file" mv "$WS/from-hands" "$WS/renamed"
+refused "operator deletes the entity's file" rm -f "$WS/from-hands"
+check "hands creates a folder" as_hands mkdir "$WS/hands-folder"
+refused "operator creates a file in the entity's folder" bash -c "echo o > '$WS/hands-folder/x'"
 as_hands /usr/bin/python3 -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')" 2>/dev/null
-if bash -c "echo o >> '$WS/atomic-0600'" 2>/dev/null; then info "operator can append to a 0600 file the hands wrote atomically"; else
-  info "operator cannot append to a 0600 file the hands wrote atomically (ACL mask follows the file mode)"
+if /bin/cat "$WS/atomic-0600" >/dev/null 2>&1; then pass "operator reads a 0600 file the hands wrote atomically"; else
+  info "operator cannot read a 0600 file the hands wrote atomically (ACL mask follows the file mode)"
   "$PY" -c 'import json,subprocess,sys; from levain.firing import ws_git; h=ws_git.load_hands(sys.argv[1]); sys.exit(subprocess.run(ws_git.mask_repair_argv(h)).returncode)' "$E" >/dev/null 2>&1
-  check "after the mask repair the operator can append to it" bash -c "echo o >> '$WS/atomic-0600'"
+  check "after the mask repair the operator reads it" /bin/cat "$WS/atomic-0600"
 fi
+
+echo "== ws-put: a file of the operator's, written by the entity's user as data"
+printf '#!/bin/sh\necho hi\n' > /tmp/levain-iso-put.sh; chmod 755 /tmp/levain-iso-put.sh
+check "ws-put into a new folder" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh notes/run.sh
+check "it belongs to the hands user" test "$(stat -c %u "$WS/notes/run.sh" 2>/dev/null || stat -f %u "$WS/notes/run.sh")" = "$HID"
+check "it is not executable" test "$(stat -c %a "$WS/notes/run.sh" 2>/dev/null || stat -f %Lp "$WS/notes/run.sh")" = 644
+OUT=/tmp/levain-iso-out; rm -rf "$OUT"; mkdir -m 777 "$OUT"
+as_hands ln -s "$OUT" "$WS/lnk"
+refused "ws-put through a symlinked folder" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh lnk/x
+check "nothing was written through it" test -z "$(ls -A "$OUT")"
+refused "ws-put out of the workspace" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh ../escaped
+refused "ws-put of a file inside the workspace (a link the entity left)" "$LEVAIN" ws-put --path "$E" "$WS/lnk" copied
 echo "== git: every repository is the hands user's (H)"
 CANARY_LOG=/tmp/levain-iso-canary; : > "$CANARY_LOG"; chmod 666 "$CANARY_LOG"
 PLANT="/usr/bin/id -un >> $CANARY_LOG"
@@ -113,21 +133,54 @@ refused "ws-git on a repository whose config names a program" "$LEVAIN" ws-git -
 as_hands bash -c "cd '$WS' && git init -q repo-i && cd repo-i && printf '[core]\n\tfsmonitor = $PLANT\n' > /tmp/levain-iso-evil.cfg && git config include.path /tmp/levain-iso-evil.cfg"
 refused "ws-git on a repository that includes another config" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-i" status
 opgit -C "$WS/repo-h" status >/dev/null 2>&1; opgit -C "$WS/repo-p" status >/dev/null 2>&1
+
+echo "== the bare-repository attack: no folder of the operator's to plant one in"
+as_hands bash -c "cd '$WS' && git init -q --bare plant && git --git-dir=plant config core.fsmonitor '$PLANT'"
+as_hands bash -c "mkdir -p '$WS/proj' && cd '$WS/proj' && git init -q --bare .git && git --git-dir=.git config core.fsmonitor '$PLANT' && git --git-dir=.git config core.bare false"
+refused "operator git inside a planted bare repository" bash -c "cd '$WS/plant' && opgit status"
+refused "operator git in a folder whose .git is a planted repository (the rename variant)" opgit -C "$WS/proj" status
+git init -q --bare /tmp/levain-iso-opbare
+check "control: operator git uses a bare repository of its own, found by discovery" bash -c "cd /tmp/levain-iso-opbare && opgit rev-parse --git-dir"
+refused "with safe.bareRepository=explicit it does not" bash -c "cd /tmp/levain-iso-opbare && opgit -c safe.bareRepository=explicit rev-parse --git-dir"
+rm -rf /tmp/levain-iso-opbare
+if [ -n "$(sudo find "$WS" ! -user "$HID" -print -quit)" ]; then fail "something in the workspace is not the hands user's"; else pass "still nothing in the workspace that is not the hands user's"; fi
 if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator"; else pass "no entity-planted code ran as the operator"; fi
 if grep -qx "$H" "$CANARY_LOG"; then info "planted code ran as the hands user under ws-git"; else pass "no planted code ran at all under ws-git"; fi
 check "doctor warns that the runner's git trusts every repository" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'EVERY repository'"
+check "doctor warns while safe.bareRepository is not explicit" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'safe.bareRepository is not'"
+printf '[safe]\n\tbareRepository = explicit\n' > /tmp/levain-iso-explicit-gitconfig
+if GIT_CONFIG_GLOBAL=/tmp/levain-iso-explicit-gitconfig "$LEVAIN" doctor --path "$E" | grep -q 'safe.bareRepository is not'; then fail "doctor warns although it is explicit"; else pass "doctor does not warn once it is explicit"; fi
 
-echo "== an operator-created repository: doctor fails, ws-adopt hands it over"
-check "operator creates a repository in the workspace" bash -c "cd '$WS' && opgit init -q repo-op && cd repo-op && echo o > o && opgit add o && opgit commit -q -m op"
+echo "== a folder force-created as the operator: doctor fails"
+sudo mkdir "$WS/forced" && sudo chown "$(id -u)" "$WS/forced"
 refused "doctor passes with it there" "$LEVAIN" doctor --path "$E"
 check "doctor names it" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'do not belong to the entity'"
-check "ws-adopt hands it over" "$LEVAIN" ws-adopt --path "$E" "$WS/repo-op"
-check "it now belongs to the hands user" test "$(stat -c %u "$WS/repo-op/.git" 2>/dev/null || stat -f %u "$WS/repo-op/.git")" = "$HID"
-refused "operator git reads it after adoption" opgit -C "$WS/repo-op" status --short
-check "the entity commits in it" as_hands bash -c "cd '$WS/repo-op' && echo e > e && git add e && git commit -q -m entity"
-check "its history came across" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-op" log --oneline -2
-if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports an operator repository"; else pass "doctor no longer reports one"; fi
-rm -rf "$WS"/repo-op.operator-*
+sudo rmdir "$WS/forced"
+if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports it"; else pass "doctor no longer reports it"; fi
+
+echo "== ws-git waits while the entity's user runs anything"
+sudo -n -u "$H" /bin/sleep 120 >/dev/null 2>&1 &
+sleep 1
+refused "ws-git while a hands process runs" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+check "and it says why" bash -c "\"$LEVAIN\" ws-git --path \"$E\" -C \"$WS/repo-h\" status | grep -q 'processes running'"
+check "ws-adopt refuses too" bash -c "\"$LEVAIN\" ws-adopt --path \"$E\" \"$HOME\" --as never | grep -q 'processes running'"
+sudo -n -u "$H" /usr/bin/pkill -U "$HID" sleep; sleep 1
+check "ws-git once it stopped" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+
+echo "== ws-adopt imports a repository of the operator's, from where it is"
+MINE="$HOME/levain-iso-mine"; rm -rf "$MINE"
+git init -q "$MINE" && git -C "$MINE" checkout -q -b main && echo m > "$MINE/m" && git -C "$MINE" add m && git -C "$MINE" commit -q -m one
+git -C "$MINE" checkout -q -b side && echo s > "$MINE/s" && git -C "$MINE" add s && git -C "$MINE" commit -q -m two
+git -C "$MINE" checkout -q -b feature/x && git -C "$MINE" commit -q --allow-empty -m three && git -C "$MINE" checkout -q main && git -C "$MINE" tag v1
+BEFORE="$(git -C "$MINE" for-each-ref)"
+check "ws-adopt imports it" "$LEVAIN" ws-adopt --path "$E" "$MINE"
+check "the import belongs to the hands user" test "$(stat -c %u "$WS/levain-iso-mine/.git" 2>/dev/null || stat -f %u "$WS/levain-iso-mine/.git")" = "$HID"
+check "every branch and tag came across" bash -c "test \"\$(git -C '$MINE' for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags)\" = \"\$('$LEVAIN' ws-git --path '$E' -C '$WS/levain-iso-mine' for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags)\""
+check "the original is where it was, unchanged" test "$(git -C "$MINE" for-each-ref)" = "$BEFORE"
+refused "operator git reads the import" opgit -C "$WS/levain-iso-mine" status --short
+check "the entity commits in it" as_hands bash -c "cd '$WS/levain-iso-mine' && echo e > e && git add e && git commit -q -m entity"
+refused "ws-adopt of a repository inside the workspace" "$LEVAIN" ws-adopt --path "$E" "$WS/repo-h" --as again
+rm -rf "$MINE"
 
 echo "== undo, with a hands process still running"
 sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &
@@ -144,7 +197,7 @@ check "the non-empty workspace is kept" test -d "$WS"
 check "the files the hands created are now root's, not the operator's" test "$(stat -c %u "$WS/from-hands" 2>/dev/null || stat -f %u "$WS/from-hands")" = 0
 check "and the operator can read them" /bin/cat "$WS/from-hands"
 if [ -n "$(sudo find "$(dirname "$WS")" -uid "$HID" -print -quit 2>/dev/null)" ]; then fail "files still owned by the dead uid"; else pass "no file left owned by the dead uid"; fi
-check "operator creates a file in the workspace after undo" bash -c "echo z > '$WS/after-undo'"
+check "operator still reads the workspace after undo" /bin/ls "$WS"
 check "the entity's repository went to root, not to the operator" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = 0
 refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
 check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"

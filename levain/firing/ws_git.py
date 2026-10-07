@@ -1,30 +1,38 @@
-"""levain.firing.ws_git — the operator's access to the repositories in a hands workspace (M2, H).
+"""levain.firing.ws_git — the operator's ways into a hands workspace (M2, H then A).
 
-THE RULE (Phill, 2026-10-07: "go with H"). Every repository in the hands workspace belongs to the
-hands user. Git refuses to read the config of, or run the hooks of, a repository its user does not
-own ("By default, Git will refuse to even parse a Git config of a repository owned by someone else,
-let alone run its hooks", git-config(1), safe.directory). So the operator's own git refuses all of
-them, by git's own check, and nothing the entity writes into a repository can run as the operator.
-Setup writes no safe.directory entry on either side.
+THE RULE (Phill, 2026-10-07: "go with H", then (A): "technically the best way for an augmentation
+operator to be editing these files is through their entity anyways"). The workspace and everything
+in it belong to the hands user; the operator can read it and nothing more. Git refuses to read the
+config of, or run the hooks of, a repository its user does not own ("By default, Git will refuse to
+even parse a Git config of a repository owned by someone else, let alone run its hooks",
+git-config(1), safe.directory), so the operator's own git refuses every repository there. And
+because the operator owns no directory there, the entity has nowhere to build a repository the
+operator's git WOULD trust: git checks a bare repository's ownership on that directory alone, so an
+operator-owned folder the entity could write was enough for one.
 
-The operator reaches those repositories through the remote (the entity pushes with its deploy key)
-or through ``levain ws-git``, which runs git AS THE HANDS USER with the repository's executable
-config switched off, and refuses a repository whose config holds anything outside a short allowlist.
-A repository the operator created in the workspace (which the operator's git WOULD trust, and the
-hands user could write) is a doctor failure; ``levain ws-adopt`` replaces it with a clone owned by
-the hands user.
+The operator changes the workspace through the entity, or through four doors, none of which runs
+anything the entity wrote as the operator:
+  - the remote: the entity pushes with its deploy key;
+  - ``levain ws-git``: git AS THE HANDS USER, the repository's executable config switched off, and
+    refused while the entity's user has a process running;
+  - ``levain ws-put``: one file copied in as data, written by the hands user;
+  - ``levain ws-adopt``: a repository of the operator's imported from where it sits, outside the
+    workspace, as a new repository the hands user owns.
 """
 from __future__ import annotations
 
 import os
+import platform
 import pwd
 import re
+import stat
 import subprocess
-import time
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from levain.firing.hands import SECURE_PATH, _abs
+from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
 
 #: The only config keys ``ws-git`` accepts in a repository's own config. Every other key (fsmonitor,
 #: hooksPath, pager, editor, sshCommand, alias.*, filter.*, diff.*, include*, credential.*, ...) can
@@ -114,7 +122,8 @@ def check_repo(gitdir: Path, hands_uid: int) -> None:
     Read with ``git config --file``, which parses the file and executes nothing."""
     st = gitdir.lstat()
     if st.st_uid != hands_uid:
-        raise WsGitError(f"{gitdir} does not belong to the hands user (run `levain ws-adopt` on it)")
+        raise WsGitError(f"{gitdir} does not belong to the hands user; nothing in the workspace should be yours "
+                         "(`levain doctor` lists it)")
     for name in ("commondir", "worktrees", "modules"):
         if os.path.lexists(gitdir / name):
             raise WsGitError(f"{gitdir}/{name} present (linked worktrees and submodules are not supported)")
@@ -146,13 +155,12 @@ def ws_git_argv(hands: Hands, gitdir: Path, args: list[str]) -> list[str]:
     ``--work-tree``: no discovery, so git cannot fall through to another one), with no system or
     global config (the hands user writes its own ~/.gitconfig), the program-naming keys switched
     off, and a clean environment."""
-    return [
-        "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i",
-        f"HOME={hands.home}", f"PATH={SECURE_PATH}", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
-        "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "LANG=" + os.environ.get("LANG", "en_US.UTF-8"),
-        _real_git(), *_NEUTRALISE, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
+    return _as_hands(
+        hands, _real_git(), *_NEUTRALISE, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
         "-C", str(gitdir.parent), *args,
-    ]
+        env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0",
+             "LANG=" + os.environ.get("LANG", "en_US.UTF-8")),
+    )
 
 
 _KEEP = {9, 10}
@@ -178,9 +186,49 @@ def _run_relayed(argv: list[str]) -> int:
     return proc.wait()
 
 
+def proc_hides_processes(mountinfo: str) -> bool:
+    """Whether ``/proc`` is mounted with ``hidepid`` (other users' processes invisible), from
+    ``/proc/self/mountinfo`` text."""
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        if len(fields) > 4 and fields[4] == "/proc" and re.search(r"hidepid=(?!0\b|off\b)", line):
+            return True
+    return False
+
+
+def entity_session_live(hands_uid: int) -> bool:
+    """Whether anything runs as the hands user right now. The workspace is the hands user's and the
+    operator can only read it, so whatever can change it while ws-git works (an entity session's
+    bash, anything it left running) runs as that user: this is the session's liveness measured where
+    it cannot be missed, an orphaned background job included. Raises when it cannot tell (a process
+    table the operator cannot see all of), so callers fail closed."""
+    if platform.system() == "Linux":
+        try:
+            mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        except OSError as exc:
+            raise WsGitError(f"cannot tell whether the entity is running ({exc}); refusing") from None
+        if proc_hides_processes(mounts):
+            raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
+                             "processes); refusing")
+    r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/")
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
+        return False
+    raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); refusing")
+
+
+def _refuse_while_live(hands: Hands, what: str) -> None:
+    if entity_session_live(hands.uid):
+        raise WsGitError(
+            f"the entity's user {hands.user} has processes running (a session is live, or something it "
+            f"left running); {what} waits until it stops, so the entity cannot rewrite what was checked")
+
+
 def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int:
     try:
         hands = load_hands(entity_dir)
+        _refuse_while_live(hands, "ws-git")
         gitdir = find_gitdir(Path(repo), hands.workspace)
         check_repo(gitdir, hands.uid)
     except (WsGitError, OSError) as exc:
@@ -189,75 +237,263 @@ def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int
     return _run_relayed(ws_git_argv(hands, gitdir, args))
 
 
-def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str) -> int:
-    """Replace an operator-owned repository in the workspace with a clone owned by the hands user.
-    The original is moved aside (``<repo>.operator-<time>``), not deleted. Committed history and
-    branches come across; uncommitted changes and stashes stay in the moved-aside copy."""
+def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = ()) -> list[str]:
+    """``argv`` run as the hands user with a clean environment."""
+    return ["/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"HOME={hands.home}",
+            f"PATH={SECURE_PATH}", *env, *argv]
+
+
+def _under_a_workspace_root(path: Path) -> bool:
+    for root in WORKSPACE_ROOT.values():
+        for p in (Path(os.path.abspath(path)), path.resolve()):
+            if p == root or root in p.parents:
+                return True
+    return False
+
+
+# --- ws-put ---------------------------------------------------------------------------------------
+
+#: Run by the hands user's Python with -I -S (no site, no environment, nothing imported from the
+#: workspace). argv: the workspace, then the destination's components. The data arrives on stdin.
+#: Every directory is opened with O_NOFOLLOW from the one before it, so a symlink anywhere on the
+#: path stops the write instead of redirecting it; the file is written beside its destination and
+#: renamed over it, so a symlink at the destination is replaced, never written through.
+_PUT_SCRIPT = r"""
+import os, sys
+F = os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+ws, parts = sys.argv[1], sys.argv[2:]
+d = os.open(ws, os.O_RDONLY | os.O_DIRECTORY | F)
+for name in parts[:-1]:
+    try:
+        nd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | F, dir_fd=d)
+    except FileNotFoundError:
+        os.mkdir(name, 0o755, dir_fd=d)
+        nd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | F, dir_fd=d)
+    os.close(d)
+    d = nd
+leaf = parts[-1]
+tmp = "." + leaf[:100] + ".levain-put-" + str(os.getpid())
+w = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | F, 0o644, dir_fd=d)
+try:
+    while True:
+        chunk = os.read(0, 1 << 16)
+        if not chunk:
+            break
+        while chunk:
+            chunk = chunk[os.write(w, chunk):]
+    os.fchmod(w, 0o644)
+    os.close(w)
+    os.rename(tmp, leaf, src_dir_fd=d, dst_dir_fd=d)
+except BaseException:
+    os.unlink(tmp, dir_fd=d)
+    raise
+"""
+
+
+def put_parts(workspace: Path, dest: Path | str) -> list[str]:
+    """The destination's components below the workspace: ``dest`` is relative to it, or an absolute
+    path inside it. Checked by name only (the hands user's write checks every component on disk)."""
+    d = str(dest)
+    ws = str(workspace)
+    if os.path.isabs(d):
+        if not d.startswith(ws.rstrip("/") + "/"):
+            raise WsGitError(f"{dest} is not inside the workspace {workspace}")
+        d = d[len(ws.rstrip("/")) + 1:]
+    parts = d.split("/")
+    if not d or any(p in ("", ".", "..") or "\0" in p for p in parts):
+        raise WsGitError(f"refusing the destination {dest!r}: give a file path inside the workspace, "
+                         "with no '.', '..' or empty parts")
+    return parts
+
+
+def _hands_python(hands: Hands) -> str:
+    """A Python the hands user can run (the operator's own environment is usually under the
+    operator's home, which the hands user cannot enter)."""
+    for cand in dict.fromkeys((os.path.realpath(sys.executable), "/usr/bin/python3")):
+        if _under_a_workspace_root(Path(cand)):
+            continue
+        r = subprocess.run(_as_hands(hands, cand, "-I", "-S", "-c", ""), capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/")
+        if r.returncode == 0:
+            return cand
+    raise WsGitError(f"no Python that the entity's user {hands.user} can run was found")
+
+
+def cmd_ws_put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int:
+    """Copy one regular file of the operator's into the workspace, written by the hands user as plain
+    data (mode 0644, never executable). Nothing is run from the workspace and no terminal is given."""
     try:
         hands = load_hands(entity_dir)
-        src = Path(repo).resolve()
-        gitdir = find_gitdir(src, hands.workspace)
-        if gitdir.parent != src:
+        parts = put_parts(hands.workspace, dest)
+        src = Path(src).expanduser()
+        if _under_a_workspace_root(src):
+            # The entity could have left a link there to a file of yours.
+            raise WsGitError(f"{src} is in an entity's workspace; ws-put copies files of yours into it")
+        fd = os.open(src, os.O_RDONLY)
+    except (WsGitError, OSError) as exc:
+        print(f"ws-put: {exc}")
+        return 1
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            print(f"ws-put: {src} is not a regular file")
+            return 1
+        try:
+            py = _hands_python(hands)
+        except WsGitError as exc:
+            print(f"ws-put: {exc}")
+            return 1
+        r = subprocess.run(_as_hands(hands, py, "-I", "-S", "-c", _PUT_SCRIPT, str(hands.workspace), *parts),
+                           stdin=fd, capture_output=True, start_new_session=True, cwd="/")
+    finally:
+        os.close(fd)
+    if r.returncode != 0:
+        last = _sanitise(r.stderr).decode("utf-8", "replace").strip().splitlines()[-1:] or ["failed"]
+        print(f"ws-put: the entity's user could not write {'/'.join(parts)}: {last[0]}")
+        return 1
+    print(f"Copied {src} to {hands.workspace / '/'.join(parts)}, as the entity's user.")
+    return 0
+
+
+# --- ws-adopt: an import ------------------------------------------------------------------------
+
+#: Run by the hands user: the bundle arrives on stdin, is fetched into a new repository with every
+#: branch and tag, and checked out. argv: git, the destination, the branch HEAD names, then the
+#: settings that switch hooks and the like off. The repository starts with no template (no hooks).
+_IMPORT_SCRIPT = r"""
+set -eu
+g="$1"; dest="$2"; head="$3"; shift 3
+t="$(mktemp -d)"
+trap 'rm -rf "$t"' EXIT
+cat > "$t/bundle"
+"$g" "$@" init -q --template= "$dest"
+"$g" "$@" -C "$dest" fetch -q --update-head-ok --no-tags "$t/bundle" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+"$g" "$@" -C "$dest" symbolic-ref HEAD "refs/heads/$head"
+"$g" "$@" -C "$dest" reset -q --hard
+"""
+
+
+def _operator_git(src: Path, *args: str) -> subprocess.CompletedProcess:
+    """The operator's git on the operator's own repository (outside every workspace)."""
+    return subprocess.run([_abs("git"), *_NEUTRALISE, "-C", str(src), *args], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, cwd="/")
+
+
+def _heads(lines: str) -> dict[str, str]:
+    """``<sha> <ref>`` lines -> {ref: sha}."""
+    return {ref: sha for sha, _, ref in (ln.partition(" ") for ln in lines.splitlines()) if ref}
+
+
+def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = None) -> int:
+    """Import a repository of the operator's into the workspace: the hands user builds a new
+    repository from a bundle of every branch and tag, and the branch list is checked against the
+    original's. The original is not moved or changed. Uncommitted changes and stashes are not copied."""
+    try:
+        hands = load_hands(entity_dir)
+        _refuse_while_live(hands, "ws-adopt")
+        src = Path(repo).expanduser()
+        if _under_a_workspace_root(src):
+            raise WsGitError(f"{src} is inside an entity's workspace; ws-adopt imports a repository of yours "
+                             "from outside it")
+        top = _operator_git(src, "rev-parse", "--show-toplevel")
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != src.resolve():
             raise WsGitError(f"{src} is not the top of a repository")
-        if gitdir.lstat().st_uid == hands.uid:
-            print(f"{src} already belongs to the hands user.")
-            return 0
-        if gitdir.lstat().st_uid != os.getuid():
-            raise WsGitError(f"{gitdir} belongs to neither you nor the hands user")
+        name = name or src.resolve().name
+        if name in ("", ".", "..") or "/" in name or "\0" in name:
+            raise WsGitError(f"refusing the name {name!r}")
+        dest = hands.workspace / name
+        if os.path.lexists(dest):
+            raise WsGitError(f"{dest} already exists")
+        head = _operator_git(src, "symbolic-ref", "-q", "HEAD")
+        if head.returncode != 0 or not head.stdout.startswith("refs/heads/"):
+            raise WsGitError(f"{src} has no branch checked out (a detached HEAD); check one out first")
+        head_branch = head.stdout.strip()[len("refs/heads/"):]
+        want = _heads(_operator_git(src, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads").stdout)
+        if not want:
+            raise WsGitError(f"{src} has no branches to import")
         remotes = {}
-        for line in _config_lines(gitdir / "config", "--get-regexp", r"^remote\..*\.url$"):
-            key, url = line.split(" ", 1)
+        for line in _operator_git(src, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
+            key, _, url = line.partition(" ")
             if _URL_OK.match(url):
                 remotes[key.split(".", 1)[1].rsplit(".", 1)[0]] = url
     except (WsGitError, OSError) as exc:
         print(f"ws-adopt: {exc}")
         return 1
-    aside = src.with_name(f"{src.name}.operator-{time.strftime('%Y%m%d-%H%M%S')}")
-    src.rename(aside)
-    # Cloned BY the hands user, reading the operator's repository: the hands user trusting the
-    # operator's config is no escalation, and hooks/fsmonitor are off anyway.
-    clone = [
-        "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"HOME={hands.home}", f"PATH={SECURE_PATH}",
-        "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
-        _abs("git"), "-c", f"safe.directory={aside}", *_NEUTRALISE,
-        "clone", "--no-local", "--quiet", "--origin", "operator-copy", str(aside), str(src),
-    ]
-    r = subprocess.run(clone, capture_output=True, text=True, cwd="/")
-    if r.returncode != 0:
-        aside.rename(src)
-        print(f"ws-adopt: the clone failed, nothing changed: {r.stderr.strip()}")
+
+    # The bundle's stderr goes to a file, not a pipe: nothing reads a pipe until the import ends,
+    # and a full one would stall the bundle, and the import waiting on it, for good.
+    with tempfile.TemporaryFile() as bundle_err:
+        bundle = subprocess.Popen([_abs("git"), *_NEUTRALISE, "-C", str(src), "bundle", "create", "-", "--branches",
+                                   "--tags"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=bundle_err, cwd="/")
+        assert bundle.stdout is not None
+        imp = subprocess.run(
+            _as_hands(hands, "/bin/sh", "-c", _IMPORT_SCRIPT, "sh", _real_git(), str(dest), head_branch,
+                      *_NEUTRALISE, env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")),
+            stdin=bundle.stdout, capture_output=True, start_new_session=True, cwd="/")
+        bundle.stdout.close()
+        bundle_rc = bundle.wait()
+        bundle_err.seek(0)
+        bundle_msg = bundle_err.read().decode("utf-8", "replace").strip()
+    problem = None
+    if bundle_rc != 0:
+        problem = f"git bundle failed: {bundle_msg}"
+    elif imp.returncode != 0:
+        problem = "the import failed: " + _sanitise(imp.stderr).decode("utf-8", "replace").strip()
+    else:
+        try:
+            check_repo(dest / ".git", hands.uid)
+            got = subprocess.run(ws_git_argv(hands, dest / ".git", ["for-each-ref", "--format=%(objectname) %(refname)",
+                                                                   "refs/heads"]),
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
+            have = _heads(got.stdout)
+            if got.returncode != 0 or have != want:
+                missing = sorted(set(want) - set(have)) or sorted(r for r in want if want[r] != have.get(r))
+                problem = f"the branches did not all come across ({', '.join(missing) or got.stderr.strip()})"
+        except (WsGitError, OSError) as exc:
+            problem = str(exc)
+    if problem:
+        subprocess.run(_as_hands(hands, "/bin/rm", "-rf", "--", str(dest)), capture_output=True, cwd="/")
+        print(f"ws-adopt: {problem}. Nothing was kept in the workspace; your repository is unchanged.")
         return 1
-    # The clone's own remote points at the moved-aside path, a URL ws-git itself refuses: drop it.
-    subprocess.run(ws_git_argv(hands, src / ".git", ["remote", "remove", "operator-copy"]), capture_output=True, cwd="/")
-    for name, url in remotes.items():
-        subprocess.run(ws_git_argv(hands, src / ".git", ["remote", "add", "--", name, url]), capture_output=True, cwd="/")
-    print(f"Adopted {src}: it now belongs to the hands user. Your original is at {aside}. Check the "
-          "clone, then delete the original yourself; uncommitted changes and stashes exist only there.")
+    for rname, url in remotes.items():
+        subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
+                       stdin=subprocess.DEVNULL, cwd="/")
+    print(f"Imported {src} as {dest} ({len(want)} branch(es)), owned by the entity's user. Your repository is "
+          "unchanged where it is; uncommitted changes and stashes were not copied.")
     return 0
 
 
-def operator_owned_gitdirs(workspace: Path, hands_uid: int) -> list[Path]:
-    """Every git directory under the workspace (``.git`` directories and files, and directories
-    shaped like one under any name, bare repositories included) that the hands user does not own.
-    The operator's git trusts such a repository while the hands user can write into it. No depth
-    limit; a directory that cannot be read is reported too, never assumed clean."""
+def foreign_entries(workspace: Path, hands_uid: int) -> list[Path]:
+    """Everything in the workspace (the workspace itself included, any type, no depth limit) that the
+    hands user does not own. Under ruling A there should be none: an operator-owned directory the
+    hands user can write is one the entity could fill with a repository the operator's git trusts.
+    An entry that cannot be read or stat'ed is reported too, never assumed clean."""
     found: list[Path] = []
 
     def unreadable(err: OSError) -> None:
         found.append(Path(err.filename or workspace))
 
+    try:
+        if workspace.lstat().st_uid != hands_uid:
+            found.append(workspace)
+    except OSError:
+        return [workspace]
     for root, dirs, files in os.walk(workspace, onerror=unreadable):
-        here = Path(root)
-        candidates = [here / ".git"] if (".git" in dirs or ".git" in files) else []
-        if (here / "HEAD").is_file() and (here / "objects").is_dir() and (here / "refs").is_dir():
-            candidates.append(here)
-        for g in candidates:
+        for name in (*dirs, *files):
+            p = Path(root) / name
             try:
-                if g.lstat().st_uid != hands_uid:
-                    found.append(g)
+                if p.lstat().st_uid != hands_uid:
+                    found.append(p)
             except OSError:
-                found.append(g)
+                found.append(p)
     return sorted(set(found))
+
+
+def bare_repository_explicit() -> bool:
+    """Whether the operator's git uses a bare repository only when told to (``safe.bareRepository =
+    explicit``), so a bare repository planted anywhere is never picked up by discovery. Read only."""
+    r = subprocess.run([_abs("git"), "config", "--get", "safe.bareRepository"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, cwd="/")
+    return r.stdout.strip().lower() == "explicit"
 
 
 def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
@@ -284,9 +520,9 @@ def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
 
 def mask_repair_argv(hands: Hands) -> list[str]:
     """Linux: restore the ACL mask on files the hands user owns in its workspace. A file created with
-    mode 0600 (an atomic write) gets a mask of ---, which cancels the operator's named entry (measured
-    in CI). Run as the hands user, the owner, at the end of each turn."""
+    mode 0600 (an atomic write) gets a mask of ---, which cancels the operator's named read entry
+    (measured in CI). Run as the hands user, the owner, at the end of each turn."""
     return [
         "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}",
-        _abs("find"), str(hands.workspace), "-user", hands.user, "-exec", _abs("setfacl"), "-m", "m::rwX", "{}", "+",
+        _abs("find"), str(hands.workspace), "-user", hands.user, "-exec", _abs("setfacl"), "-m", "m::rX", "{}", "+",
     ]

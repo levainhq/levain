@@ -968,11 +968,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo).",
         description=(
             "Create a dedicated user for this entity's bash, with no password and no login shell, "
-            "a workspace for it outside your home directory (/Users/Shared/levain on macOS, "
-            "/var/lib/levain on Linux) that you can both edit, an ssh key of its own, and one "
-            "sudoers rule that lets your account start commands as that user. A process running "
-            "as that user cannot read the environment of your processes or files only you can "
-            "read. Needs root once: run it with sudo. --undo removes what it created."
+            "a workspace of its own outside your home directory (/Users/Shared/levain on macOS, "
+            "/var/lib/levain on Linux) that you can read and that you change through the entity "
+            "(or ws-git, ws-put and ws-adopt), an ssh key of its own, and one sudoers rule that "
+            "lets your account start commands as that user. A process running as that user cannot "
+            "read the environment of your processes or files only you can read. Needs root once: "
+            "run it with sudo. --undo removes what it created."
         ),
     )
     iso_p.add_argument(
@@ -1005,7 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
             "Every repository in the workspace `levain setup-isolation` created belongs to the "
             "entity's user, and your own git refuses them. This runs git as that user, without "
             "hooks or any program a repository's config could name, and refuses a repository "
-            "whose config sets anything beyond remotes, branches and core basics."
+            "whose config sets anything beyond remotes, branches and core basics. It waits for "
+            "the entity: while anything runs as the entity's user, it refuses."
         ),
     )
     wsg_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
@@ -1016,17 +1018,35 @@ def main(argv: list[str] | None = None) -> int:
 
     wsa_p = subparsers.add_parser(
         "ws-adopt",
-        help="Hand a repository you created in the entity's workspace over to the entity's user.",
+        help="Import one of your repositories into the entity's workspace, owned by the entity's user.",
         description=(
-            "A repository you created inside the workspace is one your git trusts and the "
-            "entity can write to. This moves it aside and replaces it with a clone owned by the "
-            "entity's user. Committed history and branches come across; your original stays at "
-            "<repo>.operator-<time>."
+            "Copies a repository of yours, from where it is, into the entity's workspace as a new "
+            "repository that belongs to the entity's user. Every branch and tag comes across, and "
+            "the branch list is checked against yours; remotes with an https or ssh URL are kept. "
+            "Hooks are not copied. Your repository is not moved or changed; uncommitted changes "
+            "and stashes stay only there."
         ),
     )
     wsa_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
-    wsa_p.add_argument("repo", type=Path, help="The repository to adopt.")
+    wsa_p.add_argument("repo", type=Path, help="Your repository (outside the workspace).")
+    wsa_p.add_argument("--as", dest="name", default=None,
+                       help="Its folder name in the workspace (default: the repository's folder name).")
     wsa_p.set_defaults(func=_cmd_ws_adopt)
+
+    wsp_p = subparsers.add_parser(
+        "ws-put",
+        help="Copy one file of yours into the entity's workspace, written by the entity's user.",
+        description=(
+            "Copies a regular file into the entity's workspace as plain data: the entity's user "
+            "writes it, never as a program (mode 0644), and a link anywhere on the way stops the "
+            "copy instead of redirecting it. Missing folders are created. Nothing in the workspace "
+            "is run."
+        ),
+    )
+    wsp_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsp_p.add_argument("src", type=Path, help="Your file.")
+    wsp_p.add_argument("dest", help="Where it goes: a path inside the workspace, or relative to it.")
+    wsp_p.set_defaults(func=_cmd_ws_put)
 
     from levain.team.cli import register as _register_team
 
@@ -1851,7 +1871,13 @@ def _cmd_ws_git(args: argparse.Namespace) -> int:
 def _cmd_ws_adopt(args: argparse.Namespace) -> int:
     from levain.firing.ws_git import cmd_ws_adopt
 
-    return cmd_ws_adopt(args.path, args.repo)
+    return cmd_ws_adopt(args.path, args.repo, args.name)
+
+
+def _cmd_ws_put(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_put
+
+    return cmd_ws_put(args.path, args.src, args.dest)
 
 
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:
