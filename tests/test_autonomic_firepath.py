@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from tests.test_autonomic_rawstore import dump, registry_of, write_raw
+from tests.test_autonomic_rawstore import admit_binding_run, dump, registry_of, rig, write_raw
 
 from levain.autonomic import (
     ActionManifest,
@@ -71,6 +71,11 @@ class EchoObserver:
         return dict(self.actual)
 
 
+def _store(tmp_path) -> BindingStore:
+    """The binding registry over the same store as every gate's run journal in this test."""
+    return rig(tmp_path / "store")[1]
+
+
 def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None):
     return EfferentGate(
         manifest=ActionManifest({}),                  # binding fires thread risk → manifest unused
@@ -79,6 +84,7 @@ def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None):
         clock=lambda: FIXED,
         trajectory_observer=observer,
         auto_fire_actions=auto_fire,
+        journal=rig(tmp_path / "store")[0],
     )
 
 
@@ -86,15 +92,25 @@ def _binding_authority(binding_id="bind-x"):
     return AuthorityScope(grantor="binding", grant="binding:time@on_loop", binding_id=binding_id, hops=0)
 
 
-def _fire_request(*, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=None,
-                  signal=SignalAuth.STRONG, authority=None, predicted_trajectory=None, action="deliver"):
-    """An autonomous binding fire request: intent-free, human-absent (STRONG+INTENT_FREE → ON_LOOP)."""
+def _bound(gate):
+    """``(authority, run)`` for a gate-level binding fire: a real binding and an admitted run of it in the
+    gate's journal (every binding fire is a journaled run)."""
+    binding_id, run = admit_binding_run(gate.journal)
+    return _binding_authority(binding_id), run
+
+
+def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(), trigger_event=None,
+                  signal=SignalAuth.STRONG, predicted_trajectory=None, action="deliver",
+                  confidence=1.0):
+    """An autonomous binding fire request on an admitted run: intent-free, human-absent
+    (STRONG+INTENT_FREE → ON_LOOP)."""
+    authority, run = _bound(gate)
     return ActionRequest(
         action_name=action, payload="do it", context_id="ctx-1", query_text="q", query_date="2026-06-30",
         trust=TrustContext(signal_auth=signal, intent_provenance=IntentProvenance.INTENT_FREE,
                            hops=0, human_present=False),
-        grounded=True, authority=authority or _binding_authority(),
-        overall_confidence=1.0, directive_confidence=1.0,
+        grounded=True, authority=authority, run=run,
+        overall_confidence=confidence, directive_confidence=confidence,
         risk=risk, ratified_posture=ratified, kill_predicates=kill_predicates,
         trigger_event=trigger_event, predicted_trajectory=predicted_trajectory,
     )
@@ -108,7 +124,8 @@ def test_binding_fire_resolves_against_threaded_risk_not_manifest(tmp_path):
     """Seam #1: the gate resolves against ``request.risk`` (the sealed-tool risk), NOT the (empty)
     manifest — an action the manifest never declared still fires because the binding supplied its risk."""
     ex = RecordingExecutor()
-    out = _gate(tmp_path, executor=ex).gate(_fire_request(risk=LOW_INTERNAL, action="never_declared"))
+    g = _gate(tmp_path, executor=ex)
+    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, action="never_declared"))
     assert out.fired and out.posture is Posture.ON_LOOP
     assert ex.calls == [("never_declared", "do it", "ctx-1")]
 
@@ -117,11 +134,12 @@ def test_binding_fire_records_by_binding(tmp_path):
     """``by`` is derived from authority.grantor — a standing binding fire records ``by=binding`` (the 3a
     integration-test contract), with the binding_id, NOT ``by=on-loop``."""
     store = GateReceiptStore(tmp_path / "r.jsonl")
-    g = EfferentGate(manifest=ActionManifest({}), store=store, executor=RecordingExecutor(), clock=lambda: FIXED)
-    out = g.gate(_fire_request(authority=_binding_authority("bind-77")))
+    g = _gate(tmp_path)
+    req = _fire_request(g)
+    out = g.gate(req)
     assert out.fired
     face = store.read()[0].action_face
-    assert face["gate"] == {"verdict": "auto", "by": "binding", "binding_id": "bind-77"}
+    assert face["gate"] == {"verdict": "auto", "by": "binding", "binding_id": req.authority.binding_id}
 
 
 def test_manual_on_loop_fire_still_by_on_loop(tmp_path):
@@ -146,7 +164,7 @@ def test_ratified_posture_floors_up_a_lowered_risk(tmp_path):
     g = _gate(tmp_path, auto_fire=None)
     # risk re-resolves to ON_LOOP (fires immediately), but the binding was ratified at CONFIRM →
     # max(ON_LOOP, CONFIRM) = CONFIRM → needs the confirm transport (none wired) → DEFER, never fire.
-    out = g.gate(_fire_request(risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    out = g.gate(_fire_request(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
     assert not out.fired and out.deferred and out.posture is Posture.CONFIRM
 
 
@@ -155,7 +173,7 @@ def test_ratified_posture_does_not_lower_a_higher_reresolve(tmp_path):
     direction holds both ways)."""
     g = _gate(tmp_path)
     # external/irreversible risk floors at CONFIRM regardless; a stale ON_LOOP ratified floor can't lower it.
-    out = g.gate(_fire_request(risk=HIGH_EXTERNAL, ratified=Posture.ON_LOOP))
+    out = g.gate(_fire_request(g, risk=HIGH_EXTERNAL, ratified=Posture.ON_LOOP))
     assert out.posture is Posture.CONFIRM and not out.fired and out.deferred
 
 
@@ -165,9 +183,9 @@ def test_known_danger_kill_trips_and_records_killed_receipt(tmp_path):
     receipt, by=binding."""
     ex = RecordingExecutor()
     store = GateReceiptStore(tmp_path / "r.jsonl")
-    g = EfferentGate(manifest=ActionManifest({}), store=store, executor=ex, clock=lambda: FIXED)
+    g = _gate(tmp_path, executor=ex)
     kill = {"op": "not", "clause": {"op": "==", "field": "dmarc", "value": "pass"}}
-    out = g.gate(_fire_request(kill_predicates=(kill,), trigger_event={"fields": {"dmarc": "fail"}}))
+    out = g.gate(_fire_request(g, kill_predicates=(kill,), trigger_event={"fields": {"dmarc": "fail"}}))
     assert out.killed and not out.fired and not out.refused
     assert ex.calls == []                                  # the effect never ran
     face = store.read()[0].action_face
@@ -180,7 +198,7 @@ def test_known_danger_kill_fail_safe_on_absent_field(tmp_path):
     (UNKNOWN→trip) — the common-mode absent-field footgun the 3a.5 substrate exists to invert."""
     g = _gate(tmp_path)
     kill = {"op": "!=", "field": "dmarc", "value": "pass"}
-    out = g.gate(_fire_request(kill_predicates=(kill,), trigger_event={"fields": {"from_domain": "x.example"}}))
+    out = g.gate(_fire_request(g, kill_predicates=(kill,), trigger_event={"fields": {"from_domain": "x.example"}}))
     assert out.killed
 
 
@@ -188,15 +206,17 @@ def test_known_danger_kill_does_not_trip_lets_fire(tmp_path):
     """A kill that is confidently FALSE (dmarc==pass, so ``dmarc != pass`` is False) does NOT trip — the
     binding fires normally."""
     ex = RecordingExecutor()
-    out = _gate(tmp_path, executor=ex).gate(_fire_request(
-        kill_predicates=({"op": "!=", "field": "dmarc", "value": "pass"},),
+    g = _gate(tmp_path, executor=ex)
+    out = g.gate(_fire_request(
+        g, kill_predicates=({"op": "!=", "field": "dmarc", "value": "pass"},),
         trigger_event={"fields": {"dmarc": "pass"}}))
     assert out.fired and ex.calls
 
 
 def test_known_danger_kill_inert_for_manual_fire(tmp_path):
     """No kill_predicates / no trigger_event ⇒ the kill check is inert (a manual fire is unaffected)."""
-    out = _gate(tmp_path).gate(_fire_request(kill_predicates=(), trigger_event=None))
+    g = _gate(tmp_path)
+    out = g.gate(_fire_request(g, kill_predicates=(), trigger_event=None))
     assert out.fired and not out.killed
 
 
@@ -207,7 +227,7 @@ def test_prediction_monitor_lights_up_via_threaded_trajectory(tmp_path):
     obs = EchoObserver(actual={"status": "drifted"})
     g = _gate(tmp_path, executor=ex, observer=obs)
     traj = {"bound": {"op": "==", "field": "status", "value": "nominal"}}
-    out = g.gate(_fire_request(predicted_trajectory=traj))
+    out = g.gate(_fire_request(g, predicted_trajectory=traj))
     assert out.killed and ex.calls == []                  # diverged → killed pre-execute
 
 
@@ -224,7 +244,7 @@ def _mk_binding(tmp_path, *, posture=Posture.ON_LOOP, status=BindingStatus.PAUSE
         tightness=TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9),
         posture=posture, status=status, one_shot=one_shot, guard=guard,
     )
-    st = store or BindingStore(tmp_path / "b")
+    st = store or _store(tmp_path)
     st.add(b)
     return st, b
 
@@ -338,7 +358,7 @@ def _builder(*, signal=SignalAuth.STRONG, action="deliver", builder_risk=None):
 
 def _active_binding(tmp_path, *, pattern, posture=Posture.ON_LOOP, one_shot=False, guard=(),
                     goal=None, store=None):
-    st = store or BindingStore(tmp_path / "b")
+    st = store or _store(tmp_path)
     b = Binding.create(
         created_by="phill", created_at="2026-06-30T12:00:00",
         trigger=TriggerSpec(type="time", pattern=pattern),
@@ -404,8 +424,10 @@ def test_dispatch_one_shot_fires_once_then_revoked(tmp_path):
     first = fd.dispatch(ev)
     assert first[0].outcome.fired
     assert st.get(b.binding_id).status is BindingStatus.REVOKED          # spent (claimed atomically)
-    second = fd.dispatch(ev)                                             # no re-fire
-    assert second == [] and len(ex.calls) == 1
+    again = fd.dispatch(ev)                                              # the same event: its run replays
+    assert again[0].outcome.replayed and len(ex.calls) == 1
+    other = fd.dispatch({"type": "time", "id": "e2", "fields": {"tick": "1"}})   # another event: spent
+    assert other == [] and len(ex.calls) == 1
 
 
 def test_dispatch_known_danger_kill_via_effective_guard(tmp_path):
@@ -433,7 +455,7 @@ def test_dispatch_records_fire_bookkeeping_for_standing_binding(tmp_path):
 def test_dispatch_ignores_paused_binding(tmp_path):
     """Only ACTIVE bindings fire — a PAUSED candidate is not in list_active, so dispatch never fires it."""
     ex = RecordingExecutor()
-    st = BindingStore(tmp_path / "b")
+    st = _store(tmp_path)
     b = Binding.create(
         created_by="phill", created_at="2026-06-30T12:00:00",
         trigger=TriggerSpec(type="time", pattern={"op": "==", "field": "tick", "value": "1"}),
@@ -515,13 +537,18 @@ def test_dispatch_skips_standing_binding_revoked_after_list_active(tmp_path):
     st, b = _active_binding(tmp_path, pattern={"op": "==", "field": "tick", "value": "1"})
 
     class _RevokedAfterList:
-        """list_active returns the (stale) binding; the fresh re-acquire reflects the concurrent revoke."""
+        """list_active returns the (stale) binding; the admission reflects the concurrent revoke."""
+        journal = st.journal
+
         def list_active(self, **kw):
             return st.list_active(**kw)
-        def snapshot_if_fireable(self, bid):
+
+        def list_all(self, **kw):
+            return st.list_all(**kw)
+
+        def admit(self, bid, run_id):
             return None                                          # the revoke landed since list_active
-        def claim_one_shot(self, bid):
-            return None
+
         def record_fire(self, *a, **k):
             return st.record_fire(*a, **k)
     fd = FireDispatcher(store=_RevokedAfterList(), gate=_gate(tmp_path, executor=ex),
@@ -563,16 +590,10 @@ def test_known_danger_kill_preempts_a_low_confidence_screen(tmp_path):
     An autonomous fire with a tripping kill AND a below-floor confidence is KILLED (kill before screen),
     not refused — so the operator's specific danger signal is never masked by the generic screen."""
     store = GateReceiptStore(tmp_path / "r.jsonl")
-    g = EfferentGate(manifest=ActionManifest({}), store=store, executor=RecordingExecutor(), clock=lambda: FIXED)
+    g = _gate(tmp_path)
     kill = {"op": "==", "field": "danger", "value": True}
-    req = ActionRequest(
-        action_name="deliver", payload="p", context_id="c", query_text="q", query_date="2026-06-30",
-        trust=TrustContext(signal_auth=SignalAuth.STRONG, intent_provenance=IntentProvenance.INTENT_FREE,
-                           hops=0, human_present=False),
-        grounded=True, authority=_binding_authority(),
-        overall_confidence=0.1, directive_confidence=0.1,        # WELL below the §1.5 floor
-        risk=LOW_INTERNAL, kill_predicates=(kill,), trigger_event={"fields": {"danger": True}},
-    )
+    req = _fire_request(g, confidence=0.1,                      # WELL below the §1.5 floor
+                        kill_predicates=(kill,), trigger_event={"fields": {"danger": True}})
     out = g.gate(req)
     assert out.killed and not out.refused
     face = store.read()[0].action_face
@@ -582,12 +603,6 @@ def test_known_danger_kill_preempts_a_low_confidence_screen(tmp_path):
 def test_low_confidence_without_kill_still_refused(tmp_path):
     """The reorder does not weaken the screen: a non-killed low-confidence autonomous fire still REFUSES."""
     g = _gate(tmp_path)
-    req = ActionRequest(
-        action_name="deliver", payload="p", context_id="c", query_text="q", query_date="2026-06-30",
-        trust=TrustContext(signal_auth=SignalAuth.STRONG, intent_provenance=IntentProvenance.INTENT_FREE,
-                           hops=0, human_present=False),
-        grounded=True, authority=_binding_authority(),
-        overall_confidence=0.1, directive_confidence=0.1, risk=LOW_INTERNAL,
-    )
+    req = _fire_request(g, confidence=0.1)
     out = g.gate(req)
     assert out.refused and not out.killed and out.reason.startswith("screen:")

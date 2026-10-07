@@ -40,10 +40,10 @@ The seams (committed in ``projects/vagus/slice4_scope.md`` § "4b — the chain 
      completed link's ``{payload, downstream_id, detail}`` forward; the adapter's ``request_builder``
      reads what link i needs (the OUTPUT-routing is the adapter's fossil; the core threads it opaque).
   4. **Pause/resume persistence** — :class:`ChainState` (the PRE-CLAIM ACTIVE binding snapshot + the
-     completed outputs + the paused link + the gate's pending_id), content-SEALED + flock-stored in
-     :class:`ChainStateStore`. ``resume`` mirrors the ``pending.claim`` precedent ONE LAYER UP:
-     ``claim_by_pending`` (atomic remove-and-own) → ``gate.resolve`` (at-most-once for the LINK fire) →
-     continue from ``paused_at+1``. A completed link is NEVER re-run; a tampered state DROPS.
+     completed outputs + the paused link + the hold it belongs to), content-SEALED and written INTO the
+     pausing link's hold in the run journal (see below). ``resume`` reads it from the hold →
+     ``gate.resolve`` (one write-once decision) → continue from ``paused_at+1``. A completed link is
+     NEVER re-run; a tampered state rejects the hold.
   5. **hops per link** — an injected ``trust_resolver(binding, link_index)`` carries ``hops=link_index``
      (§B); authority per link = ``binding_invocation(snapshot, hops=link_index)``.
 
@@ -59,12 +59,12 @@ sweep-evidence ``record_fire`` gap), NO staleness (4d). The per-link ``predicted
 4a-equivalent (the binding's first guard's envelope) — link-indexed trajectories need a guard-schema
 evolution (flagged, not built).
 
-**The run journal (S8).** With a journal on the gate, a chain is ONE journaled run (the dispatcher
+**The run journal (S8).** The gate must carry a run journal (:class:`ChainExecutor` refuses one without):
+a chain is ONE journaled run (the dispatcher
 admits it; its id is :func:`~levain.autonomic.journal.run_id_for` over the binding and the trigger
 event, so a resume and a re-delivery address the same run) and link ``i`` is its effect ``link-<i>``. A pausing link's chain state is written INTO the link's
-hold with its pending (the request's ``continuation``); resuming reads it from there, so for a
-journaled chain the :class:`ChainStateStore` is not written and a chain state cannot be lost apart
-from its decision.
+hold with its pending (the request's ``continuation``); resuming reads it from there, so a chain state
+cannot be lost apart from its decision.
 A re-delivered event walks the chain again: links that already ran replay their recorded output into
 the data flow without running, and the first link that has not run continues the chain. A link HELD by
 an open decision on the binding ends this walk in state ``held`` (re-deliver after the decision).
@@ -76,21 +76,17 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
-import fcntl
 import hashlib
 import json
 import logging
-import os
 from collections.abc import Callable
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Iterator
+from dataclasses import dataclass
+from typing import Any
 
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
-from levain.autonomic.journal import RunRef, durable_replace, hold_id_for, run_id_for
+from levain.autonomic.journal import RunRef, hold_id_for, run_id_for
 from levain.autonomic.monitor import guard_trajectory
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.transport import ConfirmDecision
@@ -102,10 +98,7 @@ __all__ = [
     "ChainLinkResult",
     "ChainOutcome",
     "ChainState",
-    "ChainStateStore",
     "ChainExecutor",
-    "MalformedChainStateError",
-    "ChainStoreUnavailableError",
     "seal_chain_id",
     # the injected seams (the adapter wires them)
     "ChainRequestBuilder",
@@ -120,30 +113,6 @@ _log = logging.getLogger("levain.autonomic.chainpath")
 _STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_typed_proof",
                          "run_not_admitted"})
 
-
-class MalformedChainStateError(Exception):
-    """Raised by :meth:`ChainStateStore.claim_by_pending` when a chain DID own the pending but its
-    persisted state was UNPARSEABLE (and was dropped). The caller (``ChainExecutor.resume``) catches
-    this to CONSUME the now-orphaned gate pending (deny it) rather than leaving it fireable by a plain
-    resolve / sweep — closing the fail-OPEN inversion where a MORE-corrupt chain state (unparseable →
-    fall-through fires) is more permissive than a less-corrupt one (seal-mismatch → blocks). Carries the
-    ``pending_id`` so the caller knows which pending to consume."""
-
-    def __init__(self, pending_id: str) -> None:
-        super().__init__(f"malformed chain state dropped for pending {pending_id!r}")
-        self.pending_id = pending_id
-
-
-class ChainStoreUnavailableError(Exception):
-    """Raised by the chain store's ADVANCE-path reads/writes (``claim_by_pending`` / ``list_open(
-    for_advance=True)``) when an I/O or corruption FAULT means the store could not be authoritatively
-    read or durably written — the chain state SURVIVES (retriable). The advance path MUST NOT collapse
-    this to the "absent" sentinel (``None`` / ``[]``): treating an unconfirmable store as "no chain
-    here" lets a plain ``gate.resolve`` / sweep fire a still-live chain-owned pending standalone +
-    strand the chain (codex/complement re-review CONSENSUS). The rule: **a store read/write fault on the
-    advance path is ABORT-AND-RETRY, never proceed-as-if-absent.** (The non-mutating inspection reads —
-    ``get`` / ``find_by_pending`` / plain ``list_open`` — keep the fail-soft ``[]``, which is correct for
-    inspection.)"""
 
 # The seams the adapter injects (per-link variants of the 4a single-link seams).
 #   ChainRequestBuilder: (binding, chain_context, link_index) -> ActionRequest. Builds link i's
@@ -462,177 +431,6 @@ class ChainState:
         )
 
 
-class ChainStateStore:
-    """The pause/resume registry — a mutable JSON-list store of in-flight chains, ``flock``-serialized +
-    atomically written (the same shape as :class:`~levain.autonomic.pending.PendingActionStore`). A chain
-    is added on pause, claimed-and-removed on resume, removed on completion. Reads need no lock
-    (atomic-replace means a read sees a whole old-or-new file); a malformed record is skipped LOUDLY."""
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-        self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
-
-    # --- locking -----------------------------------------------------------------------
-    @contextmanager
-    def _locked(self) -> Iterator[None]:
-        """Hold an exclusive ``flock`` on a sidecar lockfile for a read-modify-write. A sidecar (not the
-        data file) so the lock survives the ``os.replace`` swap. Created on first use; never removed."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
-
-    # --- raw IO (call under the lock for mutations) ------------------------------------
-    def _read_raw(self, *, for_advance: bool = False) -> list[dict[str, Any]]:
-        """Load the JSON list. A MISSING file → ``[]`` (the first-write/empty case, NOT a fault — even on
-        the advance path). For a genuine I/O or corruption FAULT (an OSError that is not
-        FileNotFound, bad JSON, a non-list top level): an INSPECTION read (``for_advance=False``) fails
-        soft to ``[]`` with a WARNING (correct for ``get``/``find``/plain ``list_open``); an ADVANCE read
-        (``for_advance=True``) RE-RAISES as :class:`ChainStoreUnavailableError` (the advance path must not
-        treat an unconfirmable store as "no chain here" — codex/complement). Non-dict elements pre-filtered."""
-        try:
-            text = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return []  # genuinely empty (first write) — not a fault, even for the advance path
-        except OSError as e:
-            _log.warning("chain store: read failed (%s): %s%s", type(e).__name__, e,
-                         " — RE-RAISING (advance)" if for_advance else " — returning []")
-            if for_advance:
-                raise ChainStoreUnavailableError(f"chain store read failed: {type(e).__name__}: {e}") from e
-            return []
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as e:
-            _log.warning("chain store: corrupt JSON (%s)%s", e,
-                         " — RE-RAISING (advance)" if for_advance else " — returning []")
-            if for_advance:
-                raise ChainStoreUnavailableError(f"chain store corrupt JSON: {e}") from e
-            return []
-        if not isinstance(data, list):
-            _log.warning("chain store: top level is %s, not a list%s", type(data).__name__,
-                         " — RE-RAISING (advance)" if for_advance else " — returning []")
-            if for_advance:
-                raise ChainStoreUnavailableError(f"chain store top level is {type(data).__name__}, not a list")
-            return []
-        return [r for r in data if isinstance(r, dict)]
-
-    def _write_raw(self, records: list[dict[str, Any]]) -> None:
-        """Atomically replace the file (tmp + ``os.replace`` — never a torn read). Call under ``_locked``."""
-        durable_replace(self.path, json.dumps(records, ensure_ascii=False, indent=2))
-
-    # --- public API --------------------------------------------------------------------
-    def add(self, state: ChainState) -> str:
-        """Persist a chain state. A duplicate ``chain_id`` is REPLACED (idempotent re-pause). Locked. A
-        store that cannot be read RAISES (:class:`ChainStoreUnavailableError`) instead of being
-        rewritten as if it held only this state. Returns the ``chain_id`` that OWNS the paused link: this
-        state's, or the one an earlier delivery already wrote for the same pending."""
-        with self._locked():
-            records = self._read_raw(for_advance=True)
-            for r in records:
-                if r.get("pending_id") == state.pending_id and r.get("chain_id") != state.chain_id:
-                    return str(r.get("chain_id"))   # another delivery already owns this paused link
-            records = [r for r in records if r.get("chain_id") != state.chain_id]
-            records.append(state.to_dict())
-            self._write_raw(records)
-            return state.chain_id
-
-    def get(self, chain_id: str) -> ChainState | None:
-        """Return the chain state by id, or ``None`` (absent or malformed). The inspection path."""
-        for r in self._read_raw():
-            if r.get("chain_id") == chain_id:
-                return self._load(r)
-        return None
-
-    @staticmethod
-    def _load(rec: dict[str, Any]) -> ChainState | None:
-        try:
-            return ChainState.from_dict(rec)
-        except (KeyError, TypeError, ValueError) as e:
-            _log.warning("chain store: skipping malformed record (%s: %s)", type(e).__name__, e)
-            return None
-
-    def list_open(self, *, for_advance: bool = False) -> list[ChainState]:
-        """All open chain states (file order). Malformed records skipped loudly. ``for_advance=True``
-        (the sweep's chain-advance read) RE-RAISES a store I/O/corruption fault as
-        :class:`ChainStoreUnavailableError` instead of degrading to ``[]`` — so a read fault can't make
-        the sweep silently see "no chains" and then let the chain-unaware PASS-2 plain-fire chain-owned
-        pendings (codex/complement). Plain inspection (default) keeps the fail-soft ``[]``."""
-        out: list[ChainState] = []
-        for r in self._read_raw(for_advance=for_advance):
-            s = self._load(r)
-            if s is not None:
-                out.append(s)
-        return out
-
-    def find_by_pending(self, pending_id: str) -> ChainState | None:
-        """Return the open chain state whose paused link's ``pending_id`` matches, or ``None``. The
-        reverse-lookup the adapter uses to route a pending-keyed resolve to its chain (vs a 4a
-        single-link resolve). A NON-claiming read (use :meth:`claim_by_pending` to resume atomically)."""
-        for r in self._read_raw():
-            if r.get("pending_id") == pending_id:
-                return self._load(r)
-        return None
-
-    def claim_by_pending(self, pending_id: str) -> ChainState | None:
-        """ATOMICALLY remove-and-return the chain state whose paused link's ``pending_id`` matches — the
-        at-most-once gate for a chain ADVANCE (the ``pending.claim`` precedent, one layer up). Under the
-        lock, in ONE read-modify-write: if a matching open chain exists, REMOVE it + RETURN it (the
-        resumer now exclusively OWNS the advance); else ``None``. So a CLI ``resume`` racing the
-        cooling-off sweep (or two resumes) can never both advance the same chain.
-
-        FAULT DISTINCTION (codex/complement re-review consensus): the three non-success outcomes are kept
-        DISTINCT so the caller never plain-fires a chain-owned pending on a transient glitch — ``None``
-        means EXACTLY "no open chain owns this pending" (genuine absence → the caller's 4a fallback);
-        :class:`MalformedChainStateError` means "a chain owned it but its record was unparseable + dropped"
-        (→ consume the orphan); :class:`ChainStoreUnavailableError` means "an I/O/corrupt fault — the chain
-        SURVIVES" (→ abort-and-retry, never fall through). The advance read uses ``for_advance=True`` (an
-        I/O fault RAISES); a write fault BEFORE ``os.replace`` leaves the record intact + RAISES."""
-        with self._locked():
-            records = self._read_raw(for_advance=True)   # an I/O/corrupt fault RAISES (not "absent")
-            idx = next((i for i, r in enumerate(records) if r.get("pending_id") == pending_id), None)
-            if idx is None:
-                return None   # genuine absence — no open chain owns this pending
-            rec = records.pop(idx)
-            try:
-                self._write_raw(records)   # commit the removal FIRST (atomic tmp+replace)
-            except OSError as e:
-                # the write failed BEFORE os.replace → the file is unchanged → the record SURVIVES + is
-                # retriable. RAISE (not None) so the caller aborts-and-retries rather than plain-firing
-                # the chain-owned pending standalone (never an advance we couldn't durably commit).
-                _log.error("chain store: claim write FAILED for pending %r (%s): %s — RE-RAISING (survives)",
-                           pending_id, type(e).__name__, e)
-                raise ChainStoreUnavailableError(f"chain store claim write failed: {type(e).__name__}: {e}") from e
-            state = self._load(rec)
-            if state is None:
-                # the record was matched + DROPPED but is unparseable → SIGNAL the caller (vs collapsing
-                # to None like "absent") so it CONSUMES the orphaned pending instead of letting a plain
-                # resolve fall-through fire it (the fail-OPEN inversion — codex/L1 HIGH).
-                _log.warning("chain store: claimed a MALFORMED chain for pending %r — dropped; signaling so "
-                             "the caller consumes the orphaned pending (fail-closed)", pending_id)
-                raise MalformedChainStateError(pending_id)
-            return state
-
-    def remove(self, chain_id: str) -> bool:
-        """Delete one chain state. Returns True iff present. Locked read-modify-write; an unreadable
-        store RAISES rather than being rewritten empty."""
-        with self._locked():
-            records = self._read_raw(for_advance=True)
-            kept = [r for r in records if r.get("chain_id") != chain_id]
-            if len(kept) == len(records):
-                return False
-            self._write_raw(kept)
-            return True
-
-
-# =================================================================================================
-# The chain executor — the per-link walk + the pause/resume continuation.
-# =================================================================================================
 def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
     """Every KNOWN-danger kill the runtime evaluates per link: the binding's ``effective_guard`` (sealed
     floor + tightening additions) kill predicates, evaluated against the IMMUTABLE original trigger
@@ -643,8 +441,8 @@ def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
 class ChainExecutor:
     """Walk a multi-link binding's goal chain with the gate travelling with it (Slice 4b). Construct
     with the wired efferent gate, the injected per-link ``request_builder`` / ``risk_resolver`` /
-    ``trust_resolver`` (the adapter's seams), a :class:`ChainStateStore` (the pause/resume registry), and
-    a ``clock``."""
+    ``trust_resolver`` (the adapter's seams), and a ``clock``. The gate must carry a run journal: a chain
+    is a journaled run, and its pause/resume state lives in the run's holds."""
 
     def __init__(
         self,
@@ -653,7 +451,6 @@ class ChainExecutor:
         request_builder: ChainRequestBuilder,
         risk_resolver: ChainRiskResolver,
         trust_resolver: ChainTrustResolver,
-        chain_store: ChainStateStore,
         clock: Callable[[], _dt.datetime],
         binding_store: BindingStore | None = None,
     ) -> None:
@@ -661,12 +458,11 @@ class ChainExecutor:
         self._request_builder = request_builder
         self._risk_resolver = risk_resolver
         self._trust_resolver = trust_resolver
-        self._chain_store = chain_store
         self._clock = clock
-        # The registry, injected ONLY for the standing-binding kill-switch re-check on resume (read-only;
-        # the snapshot in the ChainState is the authority of record). None ⇒ no live re-check (a paused
-        # STANDING chain resumes on its snapshot); wired ⇒ a human revoke/pause/seal-break of a standing
-        # grant mid-chain ABORTS the in-flight chain.
+        if gate.journal is None:
+            raise ValueError("ChainExecutor: the gate must carry a run journal (a binding fire is journaled)")
+        # The registry, for the §2.6 graduation evidence of a completed chain (``record_fire``) only. A
+        # revoke or pause of the grant mid-chain is stopped by the run journal's fence at the next link.
         self._binding_store = binding_store
 
     @property
@@ -748,7 +544,7 @@ class ChainExecutor:
                 return ChainOutcome(binding_id=binding.binding_id, state="held", links=tuple(results),
                                     paused_at=i, reason=outcome.reason)
 
-            if outcome.pending and request.run is not None:
+            if outcome.pending:
                 # PAUSE, journaled: the chain state to resume from went INTO the run's hold with the
                 # pending (the request's continuation), so there is nothing to write here and no second
                 # store to disagree. Report the chain the journal holds (the first proposal's, when this
@@ -756,34 +552,6 @@ class ChainExecutor:
                 hold = self._gate.journal.get_hold(hold_id_for(request.run.run_id, request.run.effect_id))  # type: ignore[union-attr]
                 chain = hold.get("chain") if hold is not None else None
                 chain_id = chain.get("chain_id") if isinstance(chain, dict) else None
-                _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
-                          binding.binding_id, i, outcome.posture.name, outcome.pending_id, chain_id)
-                return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
-                                    paused_at=i, pending_id=outcome.pending_id, chain_id=chain_id,
-                                    reason=outcome.reason)
-
-            if outcome.pending:
-                # PAUSE (unjournaled) — persist the in-flight chain state for the operator's resolve. Both the seal
-                # (``ChainState.create`` → ``seal_chain_id`` can raise on a non-canonical trigger event,
-                # e.g. a non-finite float) AND the store ``add`` are INSIDE the try (L1): on ANY persist
-                # failure, the gate already created a pending for this link → CONSUME it (deny) so the
-                # chain that can't persist its resume state leaves NO orphaned fireable pending (the
-                # two-resource invariant — codex/L1 HIGH).
-                pending_id = outcome.pending_id or ""
-                try:
-                    state = ChainState.create(
-                        created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
-                        completed=ctx.completed, paused_at_link=i, paused_payload=request.payload,
-                        pending_id=pending_id,
-                    )
-                    chain_id = self._chain_store.add(state)
-                except Exception as e:  # noqa: BLE001 — can't persist the chain → consume its pending + abort
-                    _log.error("chainpath: chain-state persist FAILED for %s (%s): %s — consuming the "
-                               "just-proposed pending %s + aborting (no orphaned fireable pending)",
-                               binding.binding_id, type(e).__name__, e, pending_id)
-                    self._consume_pending(pending_id, f"chain_state_persist_failed:{type(e).__name__}")
-                    return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
-                                        paused_at=i, reason=f"chain_state_persist_failed:{type(e).__name__}")
                 _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
                           binding.binding_id, i, outcome.posture.name, outcome.pending_id, chain_id)
                 return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
@@ -846,16 +614,13 @@ class ChainExecutor:
         on-loop links fire). The middle-link drift residual remains (per-link sealed postures = 4c)."""
         base = self._request_builder(binding, ctx, i)
         is_terminal = i == len(binding.goal) - 1
-        run = (RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
-               if self._gate.journal is not None else None)
-        continuation = None
-        if run is not None:
-            # the state this chain resumes from if THIS link pauses: written into the link's hold
-            continuation = ChainState.create(
-                created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
-                completed=ctx.completed, paused_at_link=i, paused_payload=base.payload,
-                pending_id=hold_id_for(run.run_id, run.effect_id),
-            ).to_dict()
+        run = RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
+        # the state this chain resumes from if THIS link pauses: written into the link's hold
+        continuation = ChainState.create(
+            created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
+            completed=ctx.completed, paused_at_link=i, paused_payload=base.payload,
+            pending_id=hold_id_for(run.run_id, run.effect_id),
+        ).to_dict()
         request = dataclasses.replace(
             base,
             risk=self._risk_resolver(binding, i),
@@ -888,13 +653,10 @@ class ChainExecutor:
                                 reason=f"resume_error:{type(e).__name__}")
 
     def _resume(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
-        journal = self._gate.journal
-        hold = journal.find_pending(pending_id) if journal is not None else None
-        if hold is not None:
-            if not (hold.get("chained") or hold.get("chain") is not None):
-                return None   # a single-link journaled pending: the caller's plain resolve
-            return self._resume_journaled(pending_id, hold, decision)
-        return self._resume_unjournaled(pending_id, decision)
+        hold = self._gate.journal.find_pending(pending_id)  # type: ignore[union-attr]
+        if hold is None or not (hold.get("chained") or hold.get("chain") is not None):
+            return None   # not a chain link's pending: the caller's plain resolve
+        return self._resume_journaled(pending_id, hold, decision)
 
     def _resume_journaled(self, pending_id: str, hold: dict[str, Any],
                           decision: ConfirmDecision) -> ChainOutcome:
@@ -957,11 +719,9 @@ class ChainExecutor:
         expired is resumed with the gate's silence decision (an allowlisted cooling-off link approves
         and the chain continues; anything else rejects and the chain ends). Fail-soft per hold."""
         journal = self._gate.journal
-        if journal is None:
-            return []
         try:
             now = now or self._clock()
-            holds = journal.open_holds()
+            holds = journal.open_holds()  # type: ignore[union-attr]
         except Exception as e:  # noqa: BLE001
             _log.error("chainpath sweep: FAILED (%s): %s", type(e).__name__, e)
             return []
@@ -980,132 +740,3 @@ class ChainExecutor:
             if result is not None and result.reason != "journal:already_decided":
                 out.append(result)   # (a resolver that lost the race to a person changed nothing)
         return out
-
-    def _resume_unjournaled(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
-        # ATOMICALLY claim the chain (removes + owns) — at-most-once advance. A concurrent CLI/sweep loses.
-        # A MalformedChainStateError = a chain OWNED this pending but its state was unparseable + dropped:
-        # CONSUME the orphaned pending (deny) so a plain resolve/sweep can't fire it — the two-resource
-        # invariant + the fail-OPEN-inversion fix (codex/L1 HIGH).
-        try:
-            state = self._chain_store.claim_by_pending(pending_id)
-        except MalformedChainStateError:
-            self._consume_pending(pending_id, "chain_state_malformed_dropped")
-            return ChainOutcome(binding_id="?", state="aborted", links=(),
-                                reason="chain_state_malformed_dropped")
-        except ChainStoreUnavailableError as e:
-            # the chain store could not be authoritatively read / durably written → the chain SURVIVES
-            # (retriable). Do NOT consume the pending (the chain still owns it) and do NOT return None
-            # (the caller would plain-fire it standalone). Return a RETRIABLE aborted so the operator
-            # retries instead of stranding the chain (codex/complement consensus — fault ≠ absence).
-            _log.error("chainpath resume: chain store UNAVAILABLE for pending %s (%s) — not advancing, "
-                       "not falling through (retry)", pending_id, e)
-            return ChainOutcome(binding_id="?", state="aborted", links=(), reason="chain_store_unavailable")
-        if state is None:
-            return None  # genuinely no chain owns this pending → the caller's 4a single-link fallback
-
-        # Every abort path BELOW claims-out the chain state, leaving the gate pending live — so each one
-        # CONSUMES the pending (deny) before returning aborted, or the orphan is fireable by a plain
-        # resolve/sweep (the two-resource transaction: a chain-owned pending is consumed when the chain
-        # aborts; codex HIGH).
-
-        # INTEGRITY: a tampered/corrupt in-flight state is claimed-out + DROPPED, never resumed.
-        if not state.seal_matches():
-            _log.error("chainpath resume: INTEGRITY mismatch on chain %s — DROPPED, not resumed", state.chain_id)
-            self._consume_pending(pending_id, "integrity:seal_mismatch")
-            return ChainOutcome(binding_id=state.binding_id, state="aborted", links=(),
-                                paused_at=state.paused_at_link, reason="integrity:seal_mismatch")
-
-        try:
-            binding = state.binding_obj()
-            completed = state.completed_links()
-        except (KeyError, TypeError, ValueError) as e:
-            _log.error("chainpath resume: chain %s snapshot unreconstructable (%s) — DROPPED", state.chain_id, e)
-            self._consume_pending(pending_id, f"snapshot_malformed:{type(e).__name__}")
-            return ChainOutcome(binding_id=state.binding_id, state="aborted", links=(),
-                                paused_at=state.paused_at_link, reason=f"snapshot_malformed:{type(e).__name__}")
-
-        # CHAIN-SEMANTIC validation (beyond the seal's shape check): completed must be exactly indices
-        # 0..paused_at-1 + match the binding's sealed goal; paused_at in range. A buggy writer can mint a
-        # self-consistent SEALED-but-invalid state (codex LOW/MED).
-        sem = state.validate_against_binding(binding)
-        if sem is not None:
-            _log.error("chainpath resume: chain %s failed semantic validation (%s) — DROPPED", state.chain_id, sem)
-            self._consume_pending(pending_id, sem)
-            return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=(),
-                                paused_at=state.paused_at_link, reason=sem)
-
-        # STANDING-binding kill-switch — FAIL-CLOSED when the registry is wired: continue ONLY if it
-        # CONFIRMS the standing grant is still ACTIVE+sealed. Absence (hard-delete), inactive
-        # (revoke/pause/expire), malformed, or an unreadable registry → ABORT — for a standing grant,
-        # "I cannot confirm it is still active" is NOT proof of authority (codex/nemotron MED; the
-        # diverse-kill philosophy applied to the grant). A ONE-SHOT continues on the snapshot (its
-        # claim-revoke at chain-start is expected). With NO binding_store injected (a bare executor), the
-        # snapshot stands (no re-check seam wired) — production always injects it (build_chain_executor).
-        if not binding.one_shot and self._binding_store is not None:
-            current = self._current_binding(binding.binding_id)
-            if current is None or not current.is_active:
-                _log.warning("chainpath resume: STANDING binding %s not confirmed ACTIVE in the registry "
-                             "(absent/inactive/unreadable) — cannot confirm continued authority; ABORTING",
-                             binding.binding_id)
-                self._consume_pending(pending_id, "standing_grant_unconfirmed")
-                return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=(),
-                                    paused_at=state.paused_at_link, reason="standing_grant_unconfirmed")
-
-        # fire the paused link via the gate's resolve (at-most-once for the LINK; re-validates the seal,
-        # re-screens §1.5, claims the pending). The gate writes the link's receipt.
-        link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
-        results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
-        if not link_outcome.fired:
-            # denied / dropped / effect-failed → the chain ENDS here (no continuation). The chain state
-            # is already claimed-out (removed), so it cannot be re-resumed.
-            _log.info("chainpath resume: chain %s paused link %d did NOT fire (%s) — chain ends",
-                      state.chain_id, state.paused_at_link, link_outcome.reason)
-            return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
-                                paused_at=state.paused_at_link,
-                                reason=link_outcome.reason or "paused_link_not_fired")
-
-        # the paused link FIRED — record it + continue the chain from the next link over the rebuilt ctx.
-        ctx = ChainContext(trigger_event=state.trigger_event, completed=completed)
-        ctx = ctx.with_link(CompletedLink.of(
-            state.paused_at_link, binding.goal[state.paused_at_link], state.paused_payload,
-            link_outcome.execution))
-        return self._walk(binding, state.trigger_event, start=state.paused_at_link + 1, ctx=ctx,
-                          prior=tuple(results))
-
-    def _current_binding(self, binding_id: str) -> Binding | None:
-        """Read the CURRENT registry binding for the standing kill-switch re-check, or ``None`` (absent /
-        malformed / unreadable). Called ONLY when ``_binding_store`` is wired (the caller gates on that),
-        and the caller treats ``None`` as FAIL-CLOSED for a standing grant (abort — cannot confirm
-        continued authority). A store fault returns ``None`` (→ abort) rather than crashing the resume:
-        for a standing grant, an unconfirmable registry is treated as a pulled grant, not resumed-anyway."""
-        if self._binding_store is None:
-            return None
-        try:
-            return self._binding_store.get(binding_id)
-        except Exception as e:  # noqa: BLE001 — a registry read fault must not crash the resume → None → abort
-            _log.warning("chainpath resume: registry re-check read FAILED for %s (%s): %s — treating as "
-                         "unconfirmed (fail-closed abort for a standing grant)", binding_id, type(e).__name__, e)
-            return None
-
-    def _consume_pending(self, pending_id: str, reason: str) -> None:
-        """DENY + consume an orphaned gate pending whose chain ABORTED, so a plain ``gate.resolve`` /
-        sweep can never fire the link the chain decided to abort (the two-resource invariant: a pending
-        owned by a chain is consumed when the chain aborts — codex HIGH). Fail-soft: a gate fault here
-        must not crash the resume (the chain is already aborted).
-
-        The deny SHOULD claim+remove the pending. If ``gate.resolve`` returns ``unknown_pending`` (the
-        pending-store claim itself faulted → the record SURVIVES) the consume did NOT actually happen —
-        log it LOUDLY (complement Finding 2): the orphan may remain auto-fireable on a later sweep (today
-        bounded by the auto-fire allowlist — only a benign local ``deliver_as_document`` could misfire,
-        never an outbound; a non-deliver allowlisted link would need this closed first)."""
-        try:
-            outcome = self._gate.resolve(pending_id, chain_owned=True, decision=ConfirmDecision(approved=False, by="on-loop",
-                                                                     reason=f"chain_aborted:{reason}"))
-        except Exception as e:  # noqa: BLE001 — the chain is already aborted; a consume fault is not fatal
-            _log.error("chainpath: failed to consume orphaned pending %s (%s): %s — it MAY remain resolvable",
-                       pending_id, type(e).__name__, e)
-            return
-        if outcome.reason == "unknown_pending":
-            _log.error("chainpath: _consume_pending could NOT consume %s (unknown_pending — the pending "
-                       "store may have faulted); the ORPHAN MAY REMAIN AUTO-FIREABLE on a later sweep "
-                       "(allowlist-masked to deliver_as_document today)", pending_id)

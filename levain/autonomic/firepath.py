@@ -40,8 +40,8 @@ The four design seams (resolved at the 4a build, `projects/vagus/slice4_scope.md
      ``EfferentGate`` + a ``clock`` are all injected; the live event SOURCE (Argus's stream) is an
      adapter/adoption concern — 4a dispatches a single supplied event.
 
-**The run journal (S8).** When the gate carries a :class:`~levain.autonomic.journal.RunJournal`, every
-dispatch of a binding on an event is a journaled RUN: its id is a content address over the binding and
+**The run journal (S8).** The gate must carry a :class:`~levain.autonomic.journal.RunJournal`, the
+binding store's own (:class:`FireDispatcher` refuses anything else): every dispatch of a binding on an event is a journaled RUN: its id is a content address over the binding and
 the exact event (:func:`~levain.autonomic.journal.run_id_for`), it is ADMITTED by
 :meth:`~levain.autonomic.binding.BindingStore.admit` (the fireability check, the admission under the
 binding's current generation and a one-shot's claim, in one step under the store lock that every fencing
@@ -147,11 +147,11 @@ class FireDispatcher:
         # one fire). None ⇒ multi-link bindings are SKIPPED + logged (a 4a-only wiring) — never
         # half-fired (the May-3 cut-at-seams: 4a fires only single-link).
         self._chain_executor = chain_executor
-        # A journaled gate fences and admits through the store: both must use the SAME journal, or a
-        # pause would fence a journal the runs are not admitted into.
-        if getattr(store, "journal", None) is not gate.journal:
-            raise ValueError("FireDispatcher: the gate's run journal must be the binding store's journal "
-                             "(both, or neither)")
+        # A binding fire is journaled, and the gate fences and admits through the store: both must use
+        # the SAME journal, or a pause would fence a journal the runs are not admitted into.
+        if gate.journal is None or getattr(store, "journal", None) is not gate.journal:
+            raise ValueError("FireDispatcher: the gate needs a run journal, and it must be the binding "
+                             "store's journal")
         if chain_executor is not None and chain_executor.gate is not gate:
             raise ValueError("FireDispatcher: the chain executor must fire through the same gate")
 
@@ -194,13 +194,10 @@ class FireDispatcher:
         return results
 
     def _resumable_one_shots(self, event: dict[str, Any], event_type: str) -> list[Binding]:
-        """One-shots already CLAIMED for a run of THIS event (journaled only): ``list_active`` leaves
+        """One-shots already CLAIMED for a run of THIS event: ``list_active`` leaves
         them out (a claimed one-shot is REVOKED), but a re-delivery must reach them so the run can
         finish (done effects replay; an approved effect runs once). Admission re-checks everything
         (:meth:`BindingStore.admit`); a person's revoke after the claim fences the run."""
-        journal = self._gate.journal
-        if journal is None:
-            return []
         out: list[Binding] = []
         try:
             for b in self._store.list_all(trigger_type=event_type):
@@ -253,22 +250,13 @@ class FireDispatcher:
         # claim happen in one step under the store lock, which every fencing verb also holds, so a
         # pause or tighten is ordered entirely before the admission or entirely after it.
         one_shot = binding.one_shot
-        run_id: str | None = None
-        if self._gate.journal is not None:
-            try:
-                run_id = run_id_for(binding.binding_id, event)
-            except ValueError as e:
-                _log.warning("firepath: binding %s — the event is not canonical JSON (%s); a run cannot be "
-                             "addressed, so it does not fire", binding.binding_id, e)
-                return None
-            fresh = self._store.admit(binding.binding_id, run_id)
-        elif one_shot:
-            # the one-shot's atomic claim IS the fresh fireable snapshot (it re-reads + flips REVOKED
-            # under the lock); a lost claim (spent / another dispatch won / no longer fireable) → skip.
-            fresh = self._store.claim_one_shot(binding.binding_id)
-        else:
-            # a standing grant fires repeatedly (never claimed) — re-read its current fireable snapshot.
-            fresh = self._store.snapshot_if_fireable(binding.binding_id)
+        try:
+            run_id = run_id_for(binding.binding_id, event)
+        except ValueError as e:
+            _log.warning("firepath: binding %s — the event is not canonical JSON (%s); a run cannot be "
+                         "addressed, so it does not fire", binding.binding_id, e)
+            return None
+        fresh = self._store.admit(binding.binding_id, run_id)
         if fresh is None:
             _log.info("firepath: binding %s no longer fireable at fire-time (revoked/paused/seal-broken/"
                       "spent since list_active) — not firing", binding.binding_id)
@@ -281,7 +269,7 @@ class FireDispatcher:
         return self._dispatch_single_link(fresh, event, one_shot=one_shot, run_id=run_id)
 
     def _dispatch_single_link(self, fresh: Binding, event: dict[str, Any], *, one_shot: bool,
-                              run_id: str | None = None) -> FireDispatch:
+                              run_id: str) -> FireDispatch:
         """The Slice-4a single-link fire-path: build the ACTION-specific request (adapter), OVERLAY the
         governance-critical fields from the FRESH SEALED binding so the adapter cannot forge them
         (``risk`` seam #1, the authority, the effective_guard kills, the prediction trajectory, the
@@ -298,7 +286,7 @@ class FireDispatcher:
             predicted_trajectory=guard_trajectory(fresh.effective_guard),
             ratified_posture=fresh.posture,
             trigger_event=event,
-            run=RunRef(run_id, "link-0") if run_id is not None else None,
+            run=RunRef(run_id, "link-0"),
         )
 
         # fire the gate (it decides FIRE / KILL / PROPOSE / REFUSE and writes the receipt; it never

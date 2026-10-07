@@ -1,9 +1,10 @@
 """levain.autonomic.pending — the pending action (the sealed record a person is asked about) and
 the store for MANUAL pendings.
 
-For a journaled binding run, the sealed :class:`PendingAction` is written INTO the run's hold in the
-run journal, which is then its only durable home (``levain.autonomic.journal``); the store below is not
-used for it. What follows describes the store, which holds manual (unjournaled) pendings.
+For a binding (every binding fire is a journaled run), the sealed :class:`PendingAction` is written
+INTO the run's hold in the run journal, which is its only durable home (``levain.autonomic.journal``);
+the store below is never used for it, and the gate refuses a binding's pending found there. What
+follows describes the store, which holds manual (human-authority) pendings.
 
 A confirm-class posture (cooling-off / confirm / confirm-elevated) does NOT fire at the gate; it
 PROPOSES (surfaces via the :class:`~levain.autonomic.transport.ConfirmTransport`) and persists a
@@ -45,6 +46,7 @@ def seal_pending_id(
     *, created_at: str, context_id: str, action_name: str, payload: str, proposal_id: str | None,
     posture: str, fail_open: bool, requires_typed: bool, expires_at: str | None,
     authority: dict[str, Any], query_text: str, query_date: str, producers: tuple[str, ...],
+    risk_floor: str | None = None,
 ) -> str:
     """The content-FINGERPRINT pending id: ``pend-<created_at>-<16hex>`` over EVERY governance-relevant
     field of a pending record (L3 codex HIGH-1/2 + complement MED-1 — the cross-substrate consensus).
@@ -73,6 +75,8 @@ def seal_pending_id(
         "expires_at": expires_at, "authority": authority,
         "query_text": query_text, "query_date": query_date, "producers": list(producers),
     }
+    if risk_floor is not None:   # only a binding's pending carries one; a manual pending's id is unchanged
+        body["risk_floor"] = risk_floor
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"pend-{created_at}-{h}"
@@ -94,6 +98,14 @@ def _authority_dict(v: Any) -> dict[str, Any]:
     if not isinstance(v, dict):
         raise TypeError(f"authority must be a dict, got {type(v).__name__}")
     return dict(v)
+
+
+def _opt_str(d: dict[str, Any], key: str) -> str | None:
+    """An optional string field: absent or ``None`` is ``None``; anything else must be a string."""
+    v = d.get(key)
+    if v is not None and not isinstance(v, str):
+        raise TypeError(f"{key} must be a string, got {type(v).__name__}")
+    return v
 
 
 def _producer_tuple(v: Any) -> tuple[str, ...]:
@@ -119,7 +131,9 @@ class PendingAction:
     (links back to the afferent proposal). Governance fields: ``posture`` (the resolved rung name) +
     ``fail_open`` + ``requires_typed`` (the two knobs, frozen at propose time so the sweep resolves
     by the posture the human SAW). ``expires_at`` (None ⇒ wait indefinitely) is when the silence
-    default fires."""
+    default fires. ``risk_floor`` (a binding's pending only) is the posture name of the risk floor the
+    proposal was made at, derived from the binding's sealed tools: the resolve re-validates against it,
+    since the manifest's entry for the action name is not where a binding's risk comes from."""
 
     pending_id: str
     created_at: str
@@ -135,12 +149,14 @@ class PendingAction:
     producers: tuple[str, ...] = ()
     proposal_id: str | None = None
     expires_at: str | None = None
+    risk_floor: str | None = None
 
     @classmethod
     def create(
         cls, *, created_at: str, action_name: str, payload: str, context_id: str, query_text: str,
         query_date: str, posture: str, fail_open: bool, requires_typed: bool, authority: dict[str, Any],
         producers: tuple[str, ...] = (), proposal_id: str | None = None, expires_at: str | None = None,
+        risk_floor: str | None = None,
     ) -> "PendingAction":
         """Build a SEALED pending action — the ``pending_id`` is the content fingerprint over all the
         governance fields (:func:`seal_pending_id`), so any later alteration is detectable via
@@ -151,13 +167,13 @@ class PendingAction:
             created_at=created_at, context_id=context_id, action_name=action_name, payload=payload,
             proposal_id=proposal_id, posture=posture, fail_open=fail_open, requires_typed=requires_typed,
             expires_at=expires_at, authority=authority, query_text=query_text, query_date=query_date,
-            producers=producers,
+            producers=producers, risk_floor=risk_floor,
         )
         return cls(
             pending_id=pid, created_at=created_at, action_name=action_name, payload=payload,
             context_id=context_id, query_text=query_text, query_date=query_date, posture=posture,
             fail_open=fail_open, requires_typed=requires_typed, authority=authority,
-            producers=producers, proposal_id=proposal_id, expires_at=expires_at,
+            producers=producers, proposal_id=proposal_id, expires_at=expires_at, risk_floor=risk_floor,
         )
 
     def seal_matches(self) -> bool:
@@ -169,7 +185,7 @@ class PendingAction:
             payload=self.payload, proposal_id=self.proposal_id, posture=self.posture,
             fail_open=self.fail_open, requires_typed=self.requires_typed, expires_at=self.expires_at,
             authority=self.authority, query_text=self.query_text, query_date=self.query_date,
-            producers=self.producers,
+            producers=self.producers, risk_floor=self.risk_floor,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -188,6 +204,7 @@ class PendingAction:
             "producers": list(self.producers),
             "proposal_id": self.proposal_id,
             "expires_at": self.expires_at,
+            **({"risk_floor": self.risk_floor} if self.risk_floor is not None else {}),
         }
 
     @classmethod
@@ -216,6 +233,7 @@ class PendingAction:
             producers=_producer_tuple(d.get("producers") or ()),
             proposal_id=d.get("proposal_id"),
             expires_at=d.get("expires_at"),
+            risk_floor=_opt_str(d, "risk_floor"),
         )
 
 

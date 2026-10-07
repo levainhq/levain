@@ -25,7 +25,7 @@ import pytest
 
 from levain.autonomic import (
     ActionManifest, ActionRequest, ActionRisk, AuthorityScope, Binding, BindingStatus, BindingStore,
-    ChainExecutor, ChainStateStore, ConfirmDecision, EfferentGate, ExecutionResult, FireDispatcher,
+    ChainExecutor, ConfirmDecision, EfferentGate, ExecutionResult, FireDispatcher,
     GateReceiptStore, Guard, IntentProvenance, PendingActionStore, Posture, RiskClass, RunJournal, RunRef,
     SignalAuth, SubGoal, TightnessVector, TriggerSpec, TrustContext, hold_id_for, manual_invocation,
     run_id_for,
@@ -102,7 +102,7 @@ class World:
         )
         self.chains = ChainExecutor(gate=self.gate, request_builder=_chain_builder,
                                     risk_resolver=lambda b, i: [LOW, HIGH][i], trust_resolver=_trust,
-                                    chain_store=ChainStateStore(work / "chains.json"), clock=lambda: FIXED,
+                                    clock=lambda: FIXED,
                                     binding_store=self.store)
         self.dispatcher = FireDispatcher(
             store=self.store, gate=self.gate,
@@ -650,7 +650,6 @@ def test_a_chain_link_never_fires_standalone_and_its_state_cannot_be_lost(tmp_pa
     plain = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
     assert plain.refused and plain.reason == "chained_pending_resolves_through_its_chain"
     assert w.outbox() == [("link0", "c1-0")] and len(w.gate.open_pendings()) == 1
-    assert not w.chains._chain_store.path.exists()                # the chain store is never written
     assert w.resolve_open(approve=True).completed
     assert w.outbox() == [("link0", "c1-0"), ("link1", "c1-1")]
 
@@ -667,17 +666,12 @@ def test_a_redelivered_pause_reports_the_one_chain_the_journal_holds(tmp_path):
 
 def test_stores_refuse_to_overwrite_a_file_they_cannot_read(tmp_path):
     # codex MED 9 / glm: a mutation that read an unreadable store as empty rewrote it with one record
-    from levain.autonomic import ChainStateStore as CSS, ChainStoreUnavailableError, PendingActionStore
+    from levain.autonomic import PendingActionStore
     pend = PendingActionStore(tmp_path / "p.json")
     pend.path.write_text("{not json")
     with pytest.raises(OSError):
         pend.remove("anything")
     assert pend.path.read_text() == "{not json"
-    chains = CSS(tmp_path / "c.json")
-    chains.path.write_text("{not json")
-    with pytest.raises(ChainStoreUnavailableError):
-        chains.remove("anything")
-    assert chains.path.read_text() == "{not json"
 
 
 def test_a_pending_that_cannot_be_built_records_nothing(tmp_path):
@@ -801,9 +795,13 @@ def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_pa
     with pytest.raises(ValueError):
         FireDispatcher(store=w.store, gate=bare_gate, predicate_match=lambda p, e: True,
                        request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED)
-    other = ChainExecutor(gate=bare_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
-                          trust_resolver=_trust, chain_store=ChainStateStore(tmp_path / "c2.json"),
-                          clock=lambda: FIXED)
+    with pytest.raises(ValueError):                                # a chain is a journaled run
+        ChainExecutor(gate=bare_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+                      trust_resolver=_trust, clock=lambda: FIXED)
+    other_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
+                              executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=w.journal)
+    other = ChainExecutor(gate=other_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+                          trust_resolver=_trust, clock=lambda: FIXED)
     with pytest.raises(ValueError):
         FireDispatcher(store=w.store, gate=w.gate, predicate_match=lambda p, e: True,
                        request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED,
@@ -922,16 +920,16 @@ def test_the_chain_sweep_resumes_an_expired_link_by_its_silence_default(tmp_path
     assert w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []         # the gate leaves chain links
 
 
-def test_a_journaled_run_never_writes_the_pending_or_chain_store(tmp_path):
+def test_a_journaled_run_never_writes_the_pending_store(tmp_path):
     # the journal is the only durable home of a decision: open pendings and chain state are read from it
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("c1")
     w.dispatch("c2")
     assert len(w.gate.open_pendings()) == 1                         # c2 is held behind c1's decision
-    assert not w.pending.path.exists() and not w.chains._chain_store.path.exists()
+    assert not w.pending.path.exists()
     assert w.resolve_open(approve=True).completed
-    assert not w.pending.path.exists() and not w.chains._chain_store.path.exists()
+    assert not w.pending.path.exists()
 
 
 def test_a_hold_whose_pending_was_altered_on_disk_never_fires(tmp_path):
@@ -970,20 +968,6 @@ def test_an_approval_racing_a_rejection_fires_nothing(tmp_path):
     out = w.gate._resolve_hold(stale, ConfirmDecision(approved=True, by="human"), chain_owned=True)
     assert out.refused and out.reason == "journal:already_decided"
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
-
-
-def test_the_unjournaled_chain_store_keeps_one_state_per_paused_link(tmp_path):
-    from levain.autonomic import ChainState, ChainStateStore as CSS
-    w = World(tmp_path)
-    b = w.mint(chain=True)
-    store = CSS(tmp_path / "legacy-chains.json")
-    mk = lambda at: ChainState.create(created_at=at, binding=b, trigger_event={"id": "e"}, completed=(),  # noqa: E731
-                                      paused_at_link=1, paused_payload="p", pending_id="pend-1")
-    first, twin = mk("2026-10-07T12:00:00"), mk("2026-10-07T13:00:00")
-    assert first.chain_id != twin.chain_id
-    assert store.add(first) == first.chain_id and store.add(twin) == first.chain_id
-    assert [s.chain_id for s in store.list_open()] == [first.chain_id]
-
 
 
 # --- L1+L2 on the single-store commit (20ff4ca), each reproduced by a probe first ------------
@@ -1422,3 +1406,86 @@ def test_every_declared_bound_must_hold():
     assert guard_trajectory([_watch(ok, "a"), _watch(broken, "x")]) is broken       # fails closed
     assert guard_trajectory([_watch({"step": 1}, "d")]) == {"step": 1}             # descriptive: inert
     assert guard_trajectory([]) is None
+
+
+# --- the head's ruling on the resolve-time risk source (codex HIGH 4 / complement LOW 5) -----------------
+
+FINANCIAL = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial=True)
+
+
+def _approve(w, **kw):
+    [p] = w.gate.open_pendings()
+    return w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human", **kw))
+
+
+def test_a_bindings_pending_carries_the_risk_floor_it_was_proposed_at(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("s1")
+    [p] = w.gate.open_pendings()
+    assert p.risk_floor == "CONFIRM" and p.seal_matches()          # link1's sealed-tool risk: external
+    import dataclasses as dc
+    assert not dc.replace(p, risk_floor="ON_LOOP").seal_matches()  # the floor is inside the seal
+
+
+def test_an_undeclared_action_name_resolves_on_the_sealed_floor(tmp_path):
+    # complement LOW 5: a binding's link whose action name the manifest does not declare was rejected at
+    # resolve as unknown_action, though its risk came from its sealed tools
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("u1")
+    w.gate._manifest = ActionManifest({"link0": LOW})
+    out = _approve(w)
+    assert out.completed and ("link1", "u1-1") in w.outbox()
+
+
+def test_a_risk_that_rose_since_the_proposal_asks_again_at_the_raised_rung(tmp_path):
+    # codex HIGH 4: the resolve checked only the manifest's entry for the action name. Now the rung is
+    # max(sealed posture, sealed floor, the manifest's current floor): a rise to the elevated rung
+    # leaves the decision open until it is given with a typed proof
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("r1")
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})   # now CONFIRM_ELEVATED
+    plain = _approve(w)
+    assert plain.paused and plain.reason == "elevated_requires_typed_proof"
+    assert len(w.gate.open_pendings()) == 1 and ("link1", "r1-1") not in w.outbox()
+    typed = _approve(w, typed_proof="I approve r1")
+    assert typed.completed and ("link1", "r1-1") in w.outbox()
+    [fired] = [r for r in w.receipts.read() if r.fired and r.action_face["context_id"] == "r1-1"]
+    assert fired.posture == "CONFIRM_ELEVATED"                     # fired at the raised rung
+
+
+def test_an_approval_recorded_before_the_risk_rose_ends_its_run(tmp_path):
+    # the decision is write-once, so an approval given at the lower rung cannot be asked again: the run
+    # is cancelled, with a receipt, and the effect never runs
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("a1")
+    real = w.journal.effect
+    w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    held = _approve(w)
+    assert held.held                                               # approved, not yet run
+    w.journal.effect = real
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    [h] = w.journal.approved_unrun()
+    out = w.chains.resume(h["pending"]["pending_id"], ConfirmDecision(approved=True, by="human"))
+    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+    assert ("link1", "a1-1") not in w.outbox() and w.journal.approved_unrun() == []
+    [stop] = [r for r in w.receipts.read() if r.action_face["context_id"] == "a1-1"]
+    assert not stop.fired and stop.action_face["gate"]["verdict"] == "denied"
+
+
+def test_a_bindings_pending_found_in_the_manual_store_is_refused(tmp_path):
+    # codex HIGH 1, the other half: the manual path fired a binding-authored pending from the record alone
+    from levain.autonomic import PendingAction
+    w = World(tmp_path)
+    b = w.mint(chain=False)
+    p = PendingAction.create(
+        created_at=FIXED.isoformat(), action_name="link0", payload="x", context_id="m1", query_text="q",
+        query_date="2026-10-07", posture="CONFIRM", fail_open=False, requires_typed=False,
+        authority={"grantor": "binding", "grant": "g", "binding_id": b.binding_id, "hops": 0})
+    w.pending.add(p)
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert out.refused and out.reason == "integrity:binding_pending_outside_journal"
+    assert w.outbox() == [] and w.pending.get(p.pending_id) is None   # claimed out: it cannot fire later

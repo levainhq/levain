@@ -18,15 +18,15 @@ Ties the governance core into one decision: an :class:`ActionRequest` →
      writes NO receipt (no decision yet — the pending record carries the proposed action), and the
      receipt lands at ``resolve``.
 
-With a :class:`~levain.autonomic.journal.RunJournal` wired, every BINDING fire is a journaled effect
-(its request carries a ``run``): the executor runs inside ``RunJournal.effect``, so it runs at most
-once per run and effect, never while another decision on the binding is open, and never after a fence
-or a cancel. The journal is the ONLY durable home of a journaled decision: a confirm-class proposal
-records its pending AS the run's hold (one row, with a chain link's continuation), the
-open pendings are read from the open holds, and ``resolve`` is one write-once ``decide``. A binding
-fire without a run is refused once a journal is wired. A manual fire (human authority, no run) is
-not journaled and keeps the pending store; a gate without a journal is the unjournaled (pre-S8)
-mode, where those guarantees do not apply.
+Every BINDING fire is a journaled effect: its request carries a ``run``, and the gate must carry the
+:class:`~levain.autonomic.journal.RunJournal` it runs in. A binding fire without a run, or a run on a
+gate without a journal, is refused; there is no unjournaled mode for a binding. The executor runs
+inside ``RunJournal.effect``, so it runs at most once per run and effect, never while another decision
+on the binding is open, and never after a fence or a cancel. The journal is the ONLY durable home of a
+binding's decision: a confirm-class proposal records its pending AS the run's hold (one row, with a
+chain link's continuation and the risk floor it was proposed at), the open pendings are read from the
+open holds, and ``resolve`` is one write-once ``decide``. A manual fire (human authority, no run) is
+not journaled and keeps the pending store; a binding's pending found there is refused.
 
 The anti-cycle rule, held by construction: this module imports anneal-free vagus internals + the
 injected Executor/ConfirmTransport/Store seams ONLY — never a control-plane surface (Levain/Bridge).
@@ -52,7 +52,7 @@ from levain.autonomic.pending import PendingAction, PendingActionStore
 from levain.autonomic.policy import policy, risk_floor
 from levain.autonomic.posture import Posture
 from levain.autonomic.receipt import build_gate_face, build_gate_verdict
-from levain.autonomic.risk import ActionManifest, UnknownAction
+from levain.autonomic.risk import ActionManifest, ActionRisk, UnknownAction
 from levain.autonomic.store import GateReceiptStore
 from levain.autonomic.transport import ConfirmDecision, ConfirmProposal, ConfirmTransport
 from levain.autonomic.trust import IntentProvenance, SignalAuth, TrustContext
@@ -416,12 +416,13 @@ class EfferentGate:
                 reason=f"posture {posture.name} requires a confirm transport (none wired)",
                 receipt_id=None, execution=None, binding_id=request.authority.binding_id,
             )
-        return self._propose(request, created_at, posture)
+        return self._propose(request, created_at, posture, risk)
 
     # =================================================================================================
     # The confirm round-trip: propose → (out-of-band) resolve → fire-or-drop.
     # =================================================================================================
-    def _propose(self, request: ActionRequest, created_at: str, posture: Posture) -> GateOutcome:
+    def _propose(self, request: ActionRequest, created_at: str, posture: Posture,
+                 risk: ActionRisk) -> GateOutcome:
         """Record the decision a person is asked for + surface it via the transport. Returns PENDING (no
         receipt — no decision yet); the push is best-effort notification.
 
@@ -447,6 +448,9 @@ class EfferentGate:
             posture=posture.name, fail_open=posture.fail_open, requires_typed=posture.requires_typed,
             authority=request.authority.to_dict(), producers=tuple(request.producers),
             proposal_id=request.proposal_id, expires_at=expires_at,
+            # a binding's risk came from its sealed tools, not from the manifest's entry for the action
+            # name: seal the floor it was proposed at, for the resolve to re-validate against
+            risk_floor=risk_floor(risk).name if run is not None else None,
         )
         if run is not None:
             assert self._journal is not None   # _journal_entry refused a run without a journal
@@ -596,6 +600,26 @@ class EfferentGate:
             deny_terminal = "timed_out" if decision.by == "on-loop" else "refused"
             return reject(posture, f"denied:{decision.reason or decision.by}", terminal=deny_terminal)
 
+        # The rung the approval must meet NOW: the sealed posture, raised by the risk floor the proposal
+        # was sealed at and by the manifest's current floor for the action. A raised rung re-asks: its
+        # typed-proof and unattended checks below leave the decision open for a person.
+        effective, bad = self._resolve_posture(pending, posture)
+        if bad is not None:
+            return reject(posture, bad)
+        if effective is Posture.REFUSE_ESCALATE:
+            return reject(posture, "revalidate:risk_floor_rose")
+        if effective > posture and hold.get("decided") is True:
+            # approved at the lower rung, and a decision is write-once, so it cannot be asked again at
+            # the raised one: the run ends instead, with a receipt
+            try:
+                self._journal.cancel(hold["run_id"], reason="revalidate:risk_floor_rose")
+            except Exception as e:  # noqa: BLE001
+                _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
+                           type(e).__name__, e)
+                return self._refuse_open("cancel_unrecorded:revalidate:risk_floor_rose", binding_id)
+            return deny(effective, "revalidate:risk_floor_rose", by="on-loop")
+        posture = effective
+
         guard = self._guard_resolve_fire(pending, posture, decision)
         if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
             guard = "unattended_approval_not_allowed"
@@ -614,6 +638,10 @@ class EfferentGate:
         by = decider if decider == "human" else (
             "binding" if authority.grantor == "binding" else "on-loop")
         run = RunRef(hold["run_id"], hold["effect_id"], chained=_is_chained(hold))
+        # No kill predicates or trigger event on the resolve-fire: a binding's known-danger kills were
+        # evaluated when this effect was proposed, and they are deterministic over the immutable trigger
+        # event, so evaluating them again would give the same verdict. A kill grammar that read fire-time
+        # world state would have to be evaluated again here.
         request = ActionRequest(
             action_name=pending.action_name, payload=pending.payload, context_id=pending.context_id,
             query_text=pending.query_text, query_date=pending.query_date,
@@ -709,15 +737,19 @@ class EfferentGate:
         # INTEGRITY: the claimed record must still match its content-fingerprint id (L3 codex H1/H2 +
         # complement MED-1). A mismatch ⇒ a field was altered after propose (tampered/corrupt/drifted) ⇒
         # REFUSE + record a denied receipt; the record is already claimed-out, so it cannot re-fire.
-        if not pending.seal_matches():
-            _log.error("efferent gate resolve: INTEGRITY mismatch on %s — record altered since propose; "
-                       "REFUSED (no fire)", pending_id)
+        integrity = None if pending.seal_matches() else "integrity:seal_mismatch"
+        if integrity is None and pending.authority.get("grantor") == "binding":
+            # a binding's pending lives only in the run journal: one in the pending store was not written
+            # by this gate, and a binding fire is never made without its run
+            integrity = "integrity:binding_pending_outside_journal"
+        if integrity is not None:
+            _log.error("efferent gate resolve: %s on %s — REFUSED (no fire)", integrity, pending_id)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
                 producers=pending.producers, authority=self._authority_of(pending),
                 posture=Posture.REFUSE_ESCALATE, verdict="denied", by=decision.by,
-                reason="integrity:seal_mismatch", actor_first_estimate=decision.first_estimate,
+                reason=integrity, actor_first_estimate=decision.first_estimate,
             )
 
         posture = self._posture_of(pending)
@@ -762,20 +794,10 @@ class EfferentGate:
                 actor_first_estimate=decision.first_estimate,
             )
         verdict = "approved" if decision.by == "human" else "auto"  # human reply vs timeout auto-fire
-        # ``by`` names the decider/actor: a human reply = "human"; a silence-timeout auto-fire of a
-        # BINDING-authored cooling-off action records "binding" (the standing grant is the autonomous
-        # actor — the cooling-off cancel window is its posture, not a separate human-in-loop decider),
-        # mirroring the immediate-fire derivation so ANY binding-authored fire reads as by=binding, never
-        # by=on-loop (L3 review — the receipt's `by` was inconsistent between a binding's immediate fire
-        # and its cooling-off sweep fire). A human-authored cooling-off sweep stays by=on-loop.
-        by = decision.by if decision.by == "human" else (
-            "binding" if authority.grantor == "binding" else "on-loop")
-        # The resolve-fire request carries NO kill_predicates/trigger_event (a binding's known-danger
-        # kill was a PROPOSE-time gate, evaluated once at gate(): the §2.1 dispatch-time kill — Slice 4).
-        # This is sound ONLY because the known-danger kill is DETERMINISTIC over the IMMUTABLE trigger
-        # event — re-evaluating it at the sweep would yield the same verdict (L2-L3 invariant). If a
-        # future kill grammar ever referenced fire-time/world state, the cooling-off auto-fire would
-        # need to re-evaluate it here.
+        # ``by`` names the decider: a human reply = "human"; a silence-timeout auto-fire of a manual
+        # cooling-off action = "on-loop". (A binding's pending never reaches here: it is a journaled hold.)
+        by = decision.by if decision.by == "human" else "on-loop"
+        # (a manual request carries no kill predicates: known-danger kills are a binding's)
         request = ActionRequest(
             action_name=pending.action_name, payload=pending.payload, context_id=pending.context_id,
             query_text=pending.query_text, query_date=pending.query_date,
@@ -787,6 +809,23 @@ class EfferentGate:
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate,
         )
+
+    def _resolve_posture(self, pending: PendingAction, posture: Posture) -> tuple[Posture, str | None]:
+        """The rung a binding's pending must be approved at now, and ``None``; or the sealed posture and
+        why the pending cannot be re-validated. A manual pending (no sealed floor) keeps its posture; its
+        manifest check is in :meth:`_guard_resolve_fire`. For a binding's: ``max(posture, the sealed
+        floor, the manifest's current floor for the action if it declares one)``."""
+        if pending.risk_floor is None:
+            return posture, None
+        try:
+            floor = Posture[pending.risk_floor]
+        except KeyError:
+            return posture, "revalidate:corrupt_risk_floor"
+        try:
+            floor = max(floor, risk_floor(self._manifest.risk_of(pending.action_name)))
+        except UnknownAction:
+            pass   # the action name is not declared: the floor sealed from the binding's tools stands
+        return max(posture, floor), None
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
@@ -809,36 +848,37 @@ class EfferentGate:
 
         - MED-7: an elevated rung (``requires_typed``) needs a typed / re-auth proof — the gate
           ENFORCES the stronger affordance it promises, not just renders it.
-        - HIGH-4: the action must still be DECLARED (a manifest that dropped it → refuse); its risk
-          floor must not have RISEN above the posture the human approved (a manifest tightening must
-          not let a stale, less-involved approval through); and the payload must still pass the §1.5
-          injection/grounding screen (an injection smuggled into a tampered payload fires NOTHING)."""
+        - HIGH-4: a MANUAL pending's action must still be DECLARED (a manifest that dropped it →
+          refuse) and its risk floor must not have RISEN above the posture the human approved (a
+          manifest tightening must not let a stale, less-involved approval through); a binding's pending
+          is re-validated against its sealed floor by :meth:`_resolve_posture` instead. Every pending's
+          payload must still pass the §1.5 injection/grounding screen (an injection smuggled into a
+          tampered payload fires NOTHING)."""
         if posture.requires_typed and not decision.typed_proof:
             return "elevated_requires_typed_proof"
-        try:
-            risk = self._manifest.risk_of(pending.action_name)
-        except UnknownAction:
-            return "revalidate:unknown_action"
-        if risk_floor(risk) > posture:
-            return "revalidate:risk_floor_rose"
+        if pending.risk_floor is None:
+            # a manual pending's risk came from the manifest: it must still be declared, at no higher
+            # floor (a binding's is re-validated by ``_resolve_posture`` against its sealed floor)
+            try:
+                risk = self._manifest.risk_of(pending.action_name)
+            except UnknownAction:
+                return "revalidate:unknown_action"
+            if risk_floor(risk) > posture:
+                return "revalidate:risk_floor_rose"
         v = screen(payload=f"{pending.payload}\n{pending.query_text}", grounded=True,
                    require_confidence=False)  # human/binding is the anchor at resolve; re-scan injection
         if not v.passed:
             return f"revalidate:{v.reason}"
         return None
 
-    def sweep_timeouts(self, now: _dt.datetime | None = None,
-                       *, skip: Callable[[PendingAction], bool] | None = None) -> list[GateOutcome]:
+    def sweep_timeouts(self, now: _dt.datetime | None = None) -> list[GateOutcome]:
         """Resolve every pending action past its ``expires_at`` by the silence default: cooling-off
         (``fail_open``) AUTO-FIRES (verdict ``auto``, by ``on-loop``); confirm / confirm-elevated DROP
         (verdict ``denied``, by ``on-loop``). Idempotent + fail-soft per item (one bad pending never
         stops the sweep). Returns the resolved outcomes. NEVER raises.
 
         JOURNALED pendings (open holds) are swept first (:meth:`_sweep_holds`); a chain link's hold is
-        left to ``ChainExecutor.sweep_timeouts``. ``skip`` applies to MANUAL (unjournaled) pendings only:
-        an optional caller-supplied predicate; a pending for which ``skip(pending)`` is True is LEFT
-        UNTOUCHED. An unjournaled chain's adapter passes one to keep this sweep from plain-firing a
-        chain-shaped pending standalone. A ``skip`` fault on one item is fail-soft (treated as SKIPPED)."""
+        left to ``ChainExecutor.sweep_timeouts``. Manual pendings are swept from the pending store."""
         # NEVER raises (L3 codex ship-gate MED): the clock + EACH item body are fail-soft, so a raising
         # clock or one malformed-but-loaded record can't crash the sweep (resolve has its own net; the
         # sweep's per-item work — seal_matches / _posture_of / claim — runs OUTSIDE resolve and so needs
@@ -857,14 +897,6 @@ class EfferentGate:
             _log.error("efferent gate sweep: list_open FAILED (%s): %s", type(e).__name__, e)
             return outcomes   # the journaled decisions this sweep already made stay reported
         for pending in pendings:
-            if skip is not None:
-                try:
-                    if skip(pending):
-                        continue   # the caller owns this pending (a chain-shaped one) — don't plain-fire it
-                except Exception as e:  # noqa: BLE001 — a skip-predicate fault fails toward NOT firing (safe)
-                    _log.error("efferent gate sweep: skip predicate FAILED on %s (%s): %s — skipping (safe)",
-                               getattr(pending, "pending_id", "?"), type(e).__name__, e)
-                    continue
             try:
                 outcome = self._sweep_one(pending, now)
             except Exception as e:  # noqa: BLE001 — one bad item never stops the sweep
@@ -1194,11 +1226,11 @@ class EfferentGate:
                              context_id=request.context_id)
 
     def _journal_bar(self, run: RunRef | None, authority: AuthorityScope) -> str | None:
-        """Why a request or pending may not proceed at all given the journal wiring, or ``None``: a
-        binding fire must be journaled once a journal is wired, and a run cannot be journaled without
-        one."""
+        """Why a request may not proceed at all given the journal wiring, or ``None``: a binding fire
+        must be a journaled run (there is no binding fire without a journal), and a run cannot be
+        journaled without one."""
         if run is None:
-            if self._journal is not None and authority.grantor == "binding":
+            if authority.grantor == "binding":
                 return "unjournaled_binding_fire"
             return None
         if self._journal is None:

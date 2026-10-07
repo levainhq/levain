@@ -48,3 +48,40 @@ def rewrite_holds(journal, fn) -> None:
                          (json.dumps(h["pending"]) if h["pending"] is not None else None,
                           json.dumps(h["chain"]) if h["chain"] is not None else None,
                           1 if h["chained"] else 0, hold_id))
+
+
+# --- a journaled rig for tests that fire a binding (every binding fire is a journaled run) --------------
+
+_RIGS: dict[str, tuple[Any, Any]] = {}
+_SEQ = iter(range(10**6))
+
+
+def rig(path) -> tuple[Any, Any]:
+    """``(journal, registry)`` over one store at ``path``, the same objects every call (a dispatcher
+    requires the gate's journal to BE the registry's)."""
+    from levain.autonomic import BindingStore, RunJournal
+    key = str(path)
+    if key not in _RIGS:
+        journal = RunJournal(path)
+        _RIGS[key] = (journal, BindingStore(path, journal=journal))
+    return _RIGS[key]
+
+
+def admit_binding_run(journal) -> tuple[str, Any]:
+    """A real, fireable binding in ``journal``'s store and an admitted run of it: ``(binding_id, RunRef)``,
+    what a gate-level binding fire request carries. The gate's own posture logic reads the request's
+    risk and ratified posture, not this binding's."""
+    from levain.autonomic import (Binding, BindingStatus, BindingStore, Posture, RunRef, SubGoal,
+                                  TightnessVector, TriggerSpec)
+    store = BindingStore(journal.db.directory, journal=journal)
+    n = next(_SEQ)
+    b = Binding.create(
+        created_by="test", created_at=f"2026-10-07T{n // 3600:02d}:{n // 60 % 60:02d}:{n % 60:02d}",
+        trigger=TriggerSpec(type="email", pattern={"op": "exists", "field": "from"}),
+        goal=(SubGoal(goal="g", tools=("t",), output="o"),),
+        tightness=TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9),
+        posture=Posture.ON_LOOP, guard=(), status=BindingStatus.ACTIVE)
+    store.add(b)
+    run = f"run-test-{n}"
+    assert store.admit(b.binding_id, run) is not None
+    return b.binding_id, RunRef(run, "link-0")

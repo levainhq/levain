@@ -827,7 +827,12 @@ def registry_bars(conn: sqlite3.Connection, binding_id: str, run_id: str) -> str
     transaction, or ``None`` if it does: the registry must read clean (a corrupt registry fires
     nothing), the binding must be present and load, and it must be fireable (a claimed one-shot counts
     as live for the one run it was claimed for). Called by the run journal's barrier before every effect
-    of a store that holds a registry."""
+    of a store that holds a registry.
+
+    It reads and identity-checks the WHOLE registry, not just this binding's row, on purpose: the safety
+    property is that a corrupt registry fires nothing, and only a full scan can see a corrupt record that
+    is not this one (a tampered neighbour, a row that is not JSON). The cost grows with
+    the number of bindings, inside the write transaction."""
     records, problem = _scan_in(conn)
     if problem is not None:
         return "registry_corrupt"

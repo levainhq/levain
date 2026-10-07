@@ -94,10 +94,7 @@ from levain.autonomic.chainpath import (
     ChainLinkResult,
     ChainOutcome,
     ChainState,
-    ChainStateStore,
-    ChainStoreUnavailableError,
     CompletedLink,
-    MalformedChainStateError,
     seal_chain_id,
 )
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
@@ -241,9 +238,6 @@ __all__ = [
     "ChainLinkResult",
     "ChainOutcome",
     "ChainState",
-    "ChainStateStore",
-    "ChainStoreUnavailableError",
-    "MalformedChainStateError",
     "seal_chain_id",
     # graduation (§2.6 the meta-loop — Slice 4c)
     "GraduationProposal",

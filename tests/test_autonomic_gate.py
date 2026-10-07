@@ -300,11 +300,33 @@ def test_raising_clock_fails_closed_no_raise(tmp_path):
 
 def test_human_present_with_nonhuman_authority_refuses(tmp_path):
     # codex L3 MED-5 + complement MED-2: human_present is structurally tied to a human grant
+    import dataclasses
     from levain.autonomic import AuthorityScope
-    gate, ex, store = make_gate(tmp_path)
-    out = gate.gate(make_request(authority=AuthorityScope(grantor="binding", grant="auto")))
+    from tests.test_autonomic_rawstore import admit_binding_run, rig
+    ex = RecordingExecutor()
+    gate = EfferentGate(manifest=MANIFEST, store=GateReceiptStore(tmp_path / "r.jsonl"), executor=ex,
+                        clock=fixed_clock, journal=rig(tmp_path / "store")[0])
+    binding_id, run = admit_binding_run(gate.journal)
+    req = make_request(authority=AuthorityScope(grantor="binding", grant="auto", binding_id=binding_id))
+    out = gate.gate(dataclasses.replace(req, run=run))
     assert out.refused and out.reason == "human_present_without_human_authority"
     assert ex.calls == []
+
+
+def test_a_binding_fire_without_a_run_is_refused_with_or_without_a_journal(tmp_path):
+    # the slice L3 r1 (codex HIGH 1): a gate without a journal let a binding fire, and its pending
+    # fire at resolve with no registry check. There is no unjournaled binding fire any more.
+    from levain.autonomic import AuthorityScope
+    from tests.test_autonomic_rawstore import rig
+    authority = AuthorityScope(grantor="binding", grant="auto", binding_id="bind-x")
+    for journal in (None, rig(tmp_path / "store")[0]):
+        ex = RecordingExecutor()
+        gate = EfferentGate(manifest=MANIFEST, store=GateReceiptStore(tmp_path / "r.jsonl"), executor=ex,
+                            clock=fixed_clock, journal=journal)
+        out = gate.gate(make_request(authority=authority, trust=TrustContext(
+            signal_auth=SignalAuth.STRONG, intent_provenance=IntentProvenance.INTENT_FREE,
+            human_present=False)))
+        assert out.refused and out.reason == "unjournaled_binding_fire" and ex.calls == []
 
 
 def test_executor_returning_non_result_is_coerced(tmp_path):

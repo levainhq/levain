@@ -253,46 +253,54 @@ class _Exec:
 
 
 def _gate(tmp_path):
+    from tests.test_autonomic_rawstore import rig
     return EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
-                        executor=_Exec(), clock=lambda: FIXED)
+                        executor=_Exec(), clock=lambda: FIXED, journal=rig(tmp_path / "store")[0])
 
 
-def _req(*, risk, ratified):
+def _req(gate, *, risk, ratified):
     # AUTHENTICATED + INTENT_FREE → earned_posture = COOLING_OFF (ON_LOOP base + intent-free +1).
+    # A binding fire is a journaled run: a real binding and an admitted run of it in the gate's journal.
+    from tests.test_autonomic_rawstore import admit_binding_run
+    binding_id, run = admit_binding_run(gate.journal)
     return ActionRequest(
         action_name="deliver", payload="x", context_id="c", query_text="q", query_date="2026-06-30",
         trust=TrustContext(signal_auth=SignalAuth.AUTHENTICATED, intent_provenance=IntentProvenance.INTENT_FREE,
                            hops=0, human_present=False),
-        grounded=True, authority=AuthorityScope(grantor="binding", grant="g", binding_id="bind-x", hops=0),
-        overall_confidence=1.0, directive_confidence=1.0, risk=risk, ratified_posture=ratified,
+        grounded=True, authority=AuthorityScope(grantor="binding", grant="g", binding_id=binding_id, hops=0),
+        overall_confidence=1.0, directive_confidence=1.0, risk=risk, ratified_posture=ratified, run=run,
     )
 
 
 def test_graduated_binding_fires_looser_not_refloored(tmp_path):
     # the CRUX: ratified=ON_LOOP (graduated) below earned=COOLING_OFF. Old max(policy,ratified) would
     # re-floor to COOLING_OFF (propose/defer); 4c max(risk_floor=ON_LOOP, ratified=ON_LOOP) FIRES on_loop.
-    o = _gate(tmp_path).gate(_req(risk=LOW_INTERNAL, ratified=Posture.ON_LOOP))
+    g = _gate(tmp_path)
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.ON_LOOP))
     assert o.fired is True and o.posture is Posture.ON_LOOP
 
 
 def test_non_graduated_binding_behavior_identical(tmp_path):
     # ratified == earned (COOLING_OFF) — max(risk_floor=ON_LOOP, COOLING_OFF) == COOLING_OFF (the old
     # max(policy, ratified) too). NOT fired; confirm-class (no transport → DEFER) at COOLING_OFF.
-    o = _gate(tmp_path).gate(_req(risk=LOW_INTERNAL, ratified=Posture.COOLING_OFF))
+    g = _gate(tmp_path)
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.COOLING_OFF))
     assert o.fired is False and o.posture is Posture.COOLING_OFF
 
 
 def test_risk_rose_climbs_above_graduated_rung(tmp_path):
     # a graduated ON_LOOP rung, but the risk DECLARATION rose to EXTERNAL (floor=CONFIRM) → the floor
     # climbs UP and overrides the looser graduated rung (the critical safety case).
-    o = _gate(tmp_path).gate(_req(risk=EXTERNAL, ratified=Posture.ON_LOOP))
+    g = _gate(tmp_path)
+    o = g.gate(_req(g, risk=EXTERNAL, ratified=Posture.ON_LOOP))
     assert o.fired is False and o.posture is Posture.CONFIRM
 
 
 def test_requested_upgrade_still_honored(tmp_path):
     # a requested-UPGRADE binding (ratified=CONFIRM, above earned=COOLING_OFF) still pauses at CONFIRM —
     # max(risk_floor=ON_LOOP, CONFIRM) == CONFIRM (ratified dominates; behavior-identical to the old form).
-    o = _gate(tmp_path).gate(_req(risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
+    g = _gate(tmp_path)
+    o = g.gate(_req(g, risk=LOW_INTERNAL, ratified=Posture.CONFIRM))
     assert o.fired is False and o.posture is Posture.CONFIRM
 
 
@@ -302,18 +310,20 @@ def test_requested_upgrade_still_honored(tmp_path):
 def test_ratified_posture_refused_for_non_binding_authority(tmp_path):
     # codex L3 HIGH-1: the loosening lever (ratified_posture below earned) must be tied to a binding
     # authority. A non-binding/forged request that sets it fails CLOSED (REFUSE), never fires looser.
-    req = _req(risk=LOW_INTERNAL, ratified=Posture.ON_LOOP)
+    g = _gate(tmp_path)
+    req = _req(g, risk=LOW_INTERNAL, ratified=Posture.ON_LOOP)
     from dataclasses import replace
     forged = replace(req, authority=AuthorityScope(grantor="human", grant="manual", binding_id=None, hops=0))
-    o = _gate(tmp_path).gate(forged)
+    o = g.gate(forged)
     assert o.refused and not o.fired and o.reason == "ratified_posture_without_binding_authority"
 
 
 def test_ratified_posture_refused_for_binding_without_id(tmp_path):
-    req = _req(risk=LOW_INTERNAL, ratified=Posture.ON_LOOP)
+    g = _gate(tmp_path)
+    req = _req(g, risk=LOW_INTERNAL, ratified=Posture.ON_LOOP)
     from dataclasses import replace
     forged = replace(req, authority=AuthorityScope(grantor="binding", grant="g", binding_id=None, hops=0))
-    o = _gate(tmp_path).gate(forged)
+    o = g.gate(forged)
     assert o.refused and o.reason == "ratified_posture_without_binding_authority"
 
 
