@@ -1648,3 +1648,40 @@ def test_a_branch_behind_the_remote_must_be_a_prefix_of_what_was_accepted(two):
     assert len(f.read_bytes()) < gb.trust_record().remote[f"ana/{f.name}"]["length"]
     led = ledger(ben)
     assert led.tamper and "forged" not in [x.get("words") for x in led.entries]
+
+
+def test_a_fetch_publishes_its_quarantine_only_with_its_judgement(two, monkeypatch):
+    # Head ruling (C)2 on L3 r3, codex HIGH: the fetch wrote the quarantine ref before it took pins.lock and judged.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    _forge_last_line(_gl(ana), "FORGED")
+    gb = _gl(ben)
+    seen = []
+    real = GitLedger.judge_remote
+
+    def spy(self, rev, rec=None):
+        seen.append(self._ref_sha("refs/levain/incoming/levain-ledger"))
+        return real(self, rev, rec)
+    monkeypatch.setattr(GitLedger, "judge_remote", spy)
+    assert "refused" in (gb.fetch_only(interval=0, timeout=30) or "")
+    assert seen and seen[0] is None
+    assert gb.incoming_refusal()                                     # published with the judgement
+
+
+def test_a_read_served_from_the_cache_still_checks_the_quarantine_under_the_lock(two):
+    # Head ruling (C)2: every read, cache hits included, checks the quarantine under pins.lock.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    ledger(ben)
+    ledger(ben)                                                      # the cache is warm
+    fd = os.open(gb.base / "pins.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        from levain.team import transport as T
+        with T.deadline(1.0), pytest.raises(T.TeamError):           # waits for the lock; never served unlocked
+            gb.ledger()
+    finally:
+        os.close(fd)
