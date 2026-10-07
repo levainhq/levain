@@ -283,6 +283,8 @@ def test_a_fork_right_after_the_lock_fd_is_opened_does_not_leak_the_lock(monkeyp
     # the child closes the fd; without that lock, the child inherits an fd nobody tracks.
     import os as real_os
     paused, go = threading.Event(), threading.Event()
+    creating = getattr(real_os, "O_EXLOCK", 0) or real_os.O_TMPFILE   # the flag the entry's own open carries
+    made = []
 
     class OsShim:
         def __getattr__(self, name):
@@ -291,9 +293,11 @@ def test_a_fork_right_after_the_lock_fd_is_opened_does_not_leak_the_lock(monkeyp
         @staticmethod
         def open(path, flags, *a, **k):
             fd = real_os.open(path, flags, *a, **k)
-            if str(path).startswith(".lock1-") and str(path).endswith(".tmp"):
-                paused.set()
-                go.wait(1.0)                        # fixed code holds the fork lock here, so the fork waits this out
+            if flags & creating == creating:
+                made.append(path)
+                if len(made) == 2:                  # the self-test's file first, then the entry's lock fd
+                    paused.set()
+                    go.wait(1.0)                    # fixed code holds the fork lock here, so the fork waits this out
             return fd
     monkeypatch.setattr(R, "os", OsShim())
     out = {}
