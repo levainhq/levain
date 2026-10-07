@@ -918,6 +918,22 @@ class BindingStore:
             if g.predicted_trajectory is not None:
                 assert_trajectory_pure(g.predicted_trajectory)
 
+    def _persistable(self, binding: Binding) -> dict[str, Any]:
+        """The record to write for ``binding``: serialize it, rebuild it with ``Binding.from_dict``
+        (the reader's own parser) and validate the REBUILT binding, so what is written is exactly
+        what a read will accept. The constructor does not run every check the reader runs (a
+        negative ``Graduation`` count constructs, seals, and then reads as malformed; L3 S1h-3
+        codex), and a record no read can load would sit on disk inert or, via ``replace_atomic``,
+        revoke a good grant for nothing. Raises ``ValueError`` (or the validator's error)."""
+        record = binding.to_dict()
+        try:
+            rebuilt = Binding.from_dict(record)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise ValueError(f"refusing to persist binding {binding.binding_id!r}: its record "
+                             f"would not read back ({type(e).__name__}: {e})") from e
+        self._validate(rebuilt)
+        return rebuilt.to_dict()
+
     # --- public API --------------------------------------------------------------------
     def add(self, binding: Binding) -> bool:
         """CREATE a binding. Returns True iff it was written; False iff its ``binding_id`` already
@@ -934,11 +950,9 @@ class BindingStore:
         binding carries ``guard_additions``: then it RAISES, because a tightening must never be
         dropped silently (use :meth:`tighten_guard`).
 
-        The binding's own seal must hold and the injected validator (if any) must accept it,
-        checked before the lock; the record written is exactly ``binding.to_dict()``. Locked
-        read-modify-write."""
-        self._validate(binding)
-        record = binding.to_dict()
+        The record must read back (:meth:`_persistable`), its seal must hold and the injected
+        validator (if any) must accept it, all checked before the lock. Locked read-modify-write."""
+        record = self._persistable(binding)
         with self._locked():
             records = self._read_raw(for_mutation=True)
             if any(r.get("binding_id") == binding.binding_id for r in records):
@@ -968,7 +982,7 @@ class BindingStore:
         with no revoke). If ``new_binding``'s id ALREADY exists (a live grant, a paused candidate, or
         a tombstone), the call also writes nothing and returns ``False``: superseding onto it would
         mean choosing between two sets of bookkeeping, which this store no longer does. Returns True
-        iff the old grant was found + revoked and the new one written as given.
+        iff the old grant was found + revoked and the new one written.
 
         ``precondition`` (Slice 4c — codex L3 HIGH-2 / L1 TOCTOU) is a COMPARE-AND-SWAP guard: the caller
         builds ``new_binding`` from a LOCKLESS read of the old grant, so between that read and this locked
@@ -984,8 +998,7 @@ class BindingStore:
                 f"replace_atomic: old and new binding_id are identical ({old_binding_id!r}) — "
                 "re-ratification requires a different core (a no-op promotion is not a re-ratification)"
             )
-        self._validate(new_binding)
-        record = new_binding.to_dict()
+        record = self._persistable(new_binding)
         with self._locked():
             records = self._read_raw(for_mutation=True)
             if any(r.get("binding_id") == new_binding.binding_id for r in records):
