@@ -384,9 +384,13 @@ JS = r"""(function () {
     var foot = el("footer", "deck-foot", "owners rule, everyone sees, nobody is watched · read-only: change " +
                   "anything with levain team record");
 
+    var typed = document.getElementById("inforce-q");   // what a person typed in the In Force filter survives a redraw
+    typed = typed ? typed.value : "";
     clear(app);
     add(app, head, line, tabs, pathfilter, pathbar, board, foot);
     wire();
+    var q = document.getElementById("inforce-q");
+    if (typed && q) { q.value = typed; q.dispatchEvent(new Event("input")); }
   }
 
   // measureOverflow, as in the cockpit: a focusable scroll region plus the "more below" chevron cue.
@@ -817,17 +821,18 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
     url = f"http://{bh}:{bp}/"
     print(f"Levain team view -> {url}")
     print("  loopback-only · read-only (GET and HEAD only) · Ctrl+C to stop", flush=True)
-    published = None
     restore_sigterm = SigtermStop()
+    published = None
     try:
-        # Publication is inside the try, so an interrupt between it and the SIGTERM handler still runs the cleanup.
+        # The order every server keeps: SIGTERM armed first, then the runtime file, both inside the try, so a
+        # SIGTERM at any point still runs the cleanup.
+        restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         try:
             published = publish_launch_token(httpd, url, port=bp, kind="team-view")
         except OSError as exc:
             print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
                   "other place to hand it over; not serving.", file=sys.stderr)
             return 1                          # the finally closes the socket
-        restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
         # written costs the cockpit's Team tab, never the view. Pruning and registering are separate steps, so a prune
         # failure cannot skip the registration; both are inside the try, so a Ctrl+C during either still runs the

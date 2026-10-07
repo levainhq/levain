@@ -57,23 +57,29 @@ global.fetch = (url, opts) => {
 };
 %(js)s
 (async () => {
-  const t0 = Date.now();
-  await new Promise((r) => setTimeout(r, 30));
-  while (inflight > 0 && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 20));
+  const settle = async () => {
+    const t0 = Date.now();
+    await new Promise((r) => setTimeout(r, 30));
+    while (inflight > 0 && Date.now() - t0 < 15000) await new Promise((r) => setTimeout(r, 20));
+  };
+  await settle();
+  const THEN = %(then)s;              // what a person does once the page has drawn, if anything
+  if (THEN) { eval(THEN); await settle(); }
   console.log(JSON.stringify({ html: document.deck.outerHTML, title: document.title, locks, created }));
   process.exit(0);
 })();
 """
 
 
-def _page_full(port, path="/", token=TOKEN, model=None):
+def _page_full(port, path="/", token=TOKEN, model=None, then=None):
     """Run the page's own script under node against the live server, as a browser holding ``token`` would, and return
     what it drew: the deck's HTML (every text escaped by the serializer), the title, the unlock-form calls and the
     tags it created."""
     if shutil.which("node") is None:
         pytest.skip("node not installed")
     harness = _HARNESS % {"dom": json.dumps(str(_DOM)), "port": port, "token": json.dumps(token),
-                          "path": json.dumps(path), "js": V.JS, "model": json.dumps(model)}
+                          "path": json.dumps(path), "js": V.JS, "model": json.dumps(model),
+                          "then": json.dumps(then)}
     out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
@@ -1088,37 +1094,37 @@ def test_a_503_that_is_not_json_says_unavailable_and_draws_nothing(monkeypatch):
         httpd.server_close()
 
 
-def test_an_interrupt_right_after_the_token_is_published_still_removes_it(monkeypatch):
-    # L3 r3 10-07 (glm HIGH, codex MED): publication sat outside the cleanup's try, so a SIGTERM (raised as
-    # KeyboardInterrupt) landing just after it left the runtime file and the socket behind.
-    calls, state = [], {"published": False}
+def test_sigterm_is_armed_before_the_token_is_published_and_an_interrupt_after_it_removes_it(monkeypatch):
+    # L3 r3 10-07 (glm HIGH, codex MED), then the head's ruling with lane T3's follow-up: every server arms SIGTERM
+    # first and publishes inside the cleanup's try, so a SIGTERM (raised as KeyboardInterrupt) at any point after
+    # publication still removes the runtime file and closes the socket.
+    from levain.http_guards import SigtermStop
+    from levain.team import registry
+    order = []
 
     class Published:
         unlocked = None
 
         def close(self):
-            calls.append("runtime file")
+            order.append("runtime file removed")
 
     def publish(*a, **k):
-        state["published"] = True
+        order.append("published")
         return Published()
 
-    def interrupt_after_publication(*a, **k):
-        if state["published"]:
-            raise KeyboardInterrupt          # the signal, landing on the first step after publication
-        return SigtermStop_real(*a, **k)
-    from levain.http_guards import SigtermStop as SigtermStop_real
+    def arm():
+        order.append("sigterm armed")
+        return SigtermStop()
+
+    def interrupt():
+        raise KeyboardInterrupt              # the signal, landing on the first step after publication
     monkeypatch.setattr(V, "publish_launch_token", publish)
-    monkeypatch.setattr(V, "SigtermStop", interrupt_after_publication)
-    monkeypatch.setattr(V, "stop_on_sigterm", lambda: interrupt_after_publication())
-    closed = []
+    monkeypatch.setattr(V, "stop_on_sigterm", arm)
+    monkeypatch.setattr(registry, "prune_dead", interrupt)
     real_close = V._ViewServer.server_close
-    monkeypatch.setattr(V._ViewServer, "server_close", lambda self: (closed.append(True), real_close(self)))
-    try:
-        V.serve(_Stub(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
-    except KeyboardInterrupt:
-        pass
-    assert calls == ["runtime file"] and closed == [True]
+    monkeypatch.setattr(V._ViewServer, "server_close", lambda self: (order.append("socket closed"), real_close(self)))
+    V.serve(_Stub(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
+    assert order == ["sigterm armed", "published", "runtime file removed", "socket closed"]
 
 
 def test_a_request_that_fails_is_asked_again_with_backoff():
@@ -1131,3 +1137,22 @@ def test_a_request_that_fails_is_asked_again_with_backoff():
     page = _page(port)
     assert "Could not load the team view" in page and "Trying again in 2 seconds." in page
     assert "failWait = Math.min(failWait ? failWait * 2 : 2, 60);" in V.JS
+
+
+def test_a_typed_in_force_filter_survives_a_reload():
+    # L3 r1-r3 10-07 (complement), the head's ruling: a reload rebuilt the page and dropped what a person had typed
+    # in the In Force filter (only a #q= link came back).
+    ledger, _ = _ledger()
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
+    groups = [g["path"] for g in m["in_force"]]
+    assert len(groups) >= 2
+    m["cockpit_url"], m["warning_count"] = V.DEFAULT_COCKPIT_URL, 0
+    keep = groups[0]
+    then = ('var q = document.getElementById("inforce-q"); q.value = %s; q.dispatchEvent(new Event("input"));'
+            'document.getElementById("refresh").click();') % json.dumps(keep)
+    html = _page_full(0, model=m, then=then)["html"]
+    status = html.split('id="inforce-q-status"')[1].split("</span>")[0]
+    assert "match" in status                                   # the filter is applied again after the redraw
+    for g in groups[1:]:
+        if keep.lower() not in g.lower():
+            assert ('data-g="%s" hidden' % g.lower()) in html or ('hidden' in html.split('data-g="%s"' % g.lower())[1][:80])
