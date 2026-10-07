@@ -103,6 +103,11 @@ def test_page_escapes_recorded_text():
 
 
 class _Stub:
+    remote = None           # a clone with no remote: the view has nothing to fetch
+
+    def __init__(self):
+        self.warnings: list[str] = []
+
     def snapshot(self):
         ledger, _ = _ledger()
         return "sha", TEAM, ledger
@@ -115,6 +120,9 @@ class _Stub:
 
     def state_hash(self, ledger, team):
         return "x"
+
+    def team_history_problems(self, team, rev=None):
+        return []
 
 
 @pytest.fixture
@@ -273,6 +281,7 @@ def test_cli_reports_bad_host_and_port_without_a_traceback(capsys, tmp_path):
 
 class _SlowStub(_Stub):
     def __init__(self):
+        super().__init__()
         self.active = 0
         self.peak = 0
         self.entered = threading.Event()
@@ -303,11 +312,11 @@ def test_model_generation_is_serialized_and_assets_are_not_gated():
         ts[0].start()
         assert stub.entered.wait(5)
         ts[1].start()
+        ts[1].join(10)                                                 # answered while the first is still reading
         assert _req(port, "GET", "/team_view.css")[0].status == 200   # an asset is not queued behind the ledger read
         stub.release.set()
-        for t in ts:
-            t.join(10)
-        assert results == [200, 200]
+        ts[0].join(10)
+        assert results == [503, 200]
         assert stub.peak == 1                                          # never two snapshots at once
     finally:
         stub.release.set()
@@ -371,7 +380,6 @@ def test_pane_one_is_exactly_the_questions_and_tensions_the_viewer_owns():
 
 def test_a_busy_ledger_answers_503_instead_of_hanging():
     httpd = V.make_view_server(_Stub(), port=0)
-    httpd.model_lock_timeout = 0.3
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         httpd.model_lock.acquire()          # a cold history read is holding the lock
@@ -442,3 +450,310 @@ def test_a_held_entry_appears_once_with_both_reasons_and_paths_are_deduped():
     assert [(g["path"], len(g["entries"])) for g in m["in_force"]] == [("x/**", 1)]
     assert m["in_force"][0]["entries"][0]["paths"] == ["x/**"]
     assert m["in_force_count"] == 1
+
+
+def test_a_request_during_a_cold_read_is_answered_503_at_once_and_the_page_asks_again():
+    # codex 10-07: a 10 s timed wait parked one handler thread per request behind a cold history read. Nobody waits
+    # now: the answer is immediate, says when to retry, and a browser on the page retries by itself.
+    import time
+    httpd = V.make_view_server(_Stub(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        httpd.model_lock.acquire()          # a cold history read is holding the lock
+        t0 = time.monotonic()
+        r, body = _req(port, "GET")
+        assert time.monotonic() - t0 < 1.0
+        assert r.status == 503 and r.getheader("Retry-After") == str(V.BUSY_RETRY)
+        assert r.getheader("Content-Type").startswith("text/html")
+        assert f'http-equiv="refresh" content="{V.BUSY_RETRY}"'.encode() in body and b"<script" not in body
+        assert "frame-ancestors" in (r.getheader("Content-Security-Policy") or "")
+        r, body = _req(port, "GET", "/view.json")
+        assert r.status == 503 and r.getheader("Retry-After") and b"busy" in body and b"<html" not in body
+    finally:
+        httpd.model_lock.release()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_path_filter_never_matches_the_project_wide_label():
+    # codex + glm 10-07: pane 2 tested the "(project-wide)" label against the filter, so ?path=project showed a
+    # project-wide ruling's acks while every other pane dropped the ruling.
+    chains: dict = {}
+    ts = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ruling = _seal(chains, "ana", ts, "decision", kind="ruling", owner="ana", words="Everywhere: no floats.")
+    ack = _seal(chains, "ben", ts, "ack", refs=[ruling["id"]], session="s1")
+    ledger = I.build([("ana/a.jsonl", [json.dumps(ruling, sort_keys=True)]),
+                      ("ben/b.jsonl", [json.dumps(ack, sort_keys=True)])], owner="ana")
+    for pf in ("project", "project-wide", "(project-wide)", "wide"):
+        m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW, path_filter=pf)
+        assert m["stopped"] == [] and m["ack_total"] == 0 and m["in_force"] == [], pf
+    m = V.build_model(TEAM, ledger, "ana", None, "x", now=NOW)
+    assert [(r["path"], r["acks"]) for r in m["stopped"]] == [("(project-wide)", 1)]   # unfiltered, it still shows
+
+
+def _git(*args, cwd):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def _two_clones(tmp_path):
+    """Two real clones of one team ledger: ana's (where the view runs) and ben's (who pushes)."""
+    from levain.cli import main as levain_main
+    _git("init", "-q", "--bare", "--initial-branch=main", "origin.git", cwd=tmp_path)
+    clones = {}
+    for who in ("ana", "ben"):
+        _git("clone", "-q", str(tmp_path / "origin.git"), who, cwd=tmp_path)
+        _git("config", "user.email", f"{who}@ex.com", cwd=tmp_path / who)
+        _git("config", "user.name", who, cwd=tmp_path / who)
+        clones[who] = tmp_path / who
+    (clones["ana"] / "a.txt").write_text("x\n")
+    _git("add", ".", cwd=clones["ana"])
+    _git("commit", "-qm", "init", cwd=clones["ana"])
+    _git("push", "-q", "origin", "HEAD:main", cwd=clones["ana"])
+    assert levain_main(["team", "init", "--project", "ledgerline", "--owner", "ana", "--member", "ana=ana@ex.com",
+                        "--member", "ben=ben@ex.com", "--repo", str(clones["ana"]), "--no-install"]) == 0
+    assert levain_main(["team", "join", "--repo", str(clones["ben"]), "--no-install"]) == 0
+    return clones["ana"], clones["ben"]
+
+
+@pytest.fixture
+def two_clone_view(tmp_path, monkeypatch):
+    from levain.team.transport import GitLedger, Repo
+    monkeypatch.setattr(V, "FETCH_FLOOR", 0.0, raising=False)   # the button's pace floor, so the test need not wait it out
+    ana, ben = _two_clones(tmp_path)
+    httpd = V.make_view_server(GitLedger(Repo.discover(ana)), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield ana, ben, httpd.server_address[1]
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def _words(port, path):
+    m = json.loads(_req(port, "GET", path)[1])
+    return m, [e["words"] for g in m["in_force"] for e in g["entries"]]
+
+
+def _local_tip(clone):
+    return _git("rev-parse", "refs/heads/levain-ledger", cwd=clone).strip()
+
+
+@pytest.mark.xfail(strict=True, reason="needs GitLedger.fetch_only (lane C)")
+def test_the_fetch_button_brings_in_a_ruling_another_clone_pushed_without_moving_this_clone(two_clone_view):
+    # codex 10-07: the server never fetched, so the "sync" button reloaded an unchanged local ref. L1/L2 10-07 + the
+    # head's ruling: the fix may only FETCH. The panes come from the fetched remote-tracking ref; this clone's branch
+    # is never rebased or moved by a GET, and how it differs is shown instead.
+    from levain.cli import main as levain_main
+    ana, ben, port = two_clone_view
+    before = _local_tip(ana)
+    assert levain_main(["team", "record", "decision", "--kind", "ruling", "--owner", "ben", "--paths", "tax/**",
+                        "--words", "VAT rounds half-even.", "--repo", str(ben)]) == 0
+    m, words = _words(port, "/view.json")
+    assert words == []                     # within team.toml's fetch_interval of the last fetch: not fetched yet
+    m, words = _words(port, "/view.json?fetch=1")
+    assert words == ["VAT rounds half-even."]
+    assert m["fetch"]["source"] == "remote" and m["fetch"]["error"] == "" and m["fetch"]["last_ok"]
+    assert (m["fetch"]["unpushed"], m["fetch"]["unfetched"]) == (0, 1)
+    assert _local_tip(ana) == before                                   # the GET moved nothing of ana's
+    page = _req(port, "GET", "/")[1].decode()
+    assert "fetch now" in page and f"remote, fetched {m['fetch']['last_ok']}" in page
+    assert "1 from the remote not yet in it" in page and "fetch-error" not in page
+
+
+def test_an_unpushed_local_entry_is_counted_not_hidden_or_pushed(two_clone_view, tmp_path):
+    from levain.cli import main as levain_main
+    ana, _ben, port = two_clone_view
+    assert levain_main(["team", "record", "finding", "--summary", "local only", "--paths", "x.py", "--no-push",
+                        "--repo", str(ana)]) == 0
+    tip = _local_tip(ana)
+    m, words = _words(port, "/view.json?fetch=1")
+    assert m["fetch"]["source"] == "remote" and m["fetch"]["unpushed"] == 1
+    assert _local_tip(ana) == tip
+    remote_tip = _git("rev-parse", "refs/heads/levain-ledger", cwd=tmp_path / "origin.git").strip()
+    assert remote_tip != tip                                            # and nothing was pushed
+    assert "1 commit not pushed" in _req(port, "GET", "/")[1].decode()
+
+
+@pytest.mark.xfail(strict=True, reason="needs GitLedger.fetch_only (lane C)")
+def test_a_failed_fetch_is_shown_on_the_page_without_git_detail(two_clone_view, tmp_path, capfd):
+    ana, _ben, port = two_clone_view
+    gone = tmp_path / "gone-remote.git"
+    _git("remote", "set-url", "origin", str(gone), cwd=ana)
+    m, _ = _words(port, "/view.json?fetch=1")
+    assert m["fetch"]["error"].startswith("the last fetch from the remote failed")
+    page = _req(port, "GET", "/")[1].decode()
+    assert 'class="warn fetch-error">⚠ the last fetch from the remote failed' in page
+    assert "gone-remote" not in page and "gone-remote" not in json.dumps(m)
+    assert "gone-remote" in capfd.readouterr().err                     # the detail is in the terminal
+
+
+def test_with_no_remote_the_button_only_redraws_and_says_so(server):
+    page = _req(server, "GET")[1].decode()
+    assert "this clone only: no remote" in page and 'data-fetch="0">⟳ reload<' in page and "fetch now" not in page
+
+
+def test_the_integrity_warning_counts_what_team_verify_counts(server):
+    # codex 10-07: the view counted only ledger.problems, so a hash-valid ack naming an id the ledger does not hold
+    # showed no warning while `levain team verify` failed. Both now read verify.problems.
+    from levain.team import verify as VF
+    chains: dict = {}
+    ts = (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ruling = _seal(chains, "ana", ts, "decision", kind="ruling", owner="ana", paths=["a.py"], words="Keep it.")
+    stray = _seal(chains, "ben", ts, "ack", refs=["d-000000000000"], session="s1")
+    gone = _seal(chains, "ana", ts, "question", owner="zed", paths=["b.py"], summary="who?")
+    ledger = I.build([("ana/a.jsonl", [json.dumps(e, sort_keys=True) for e in (ruling, gone)]),
+                      ("ben/b.jsonl", [json.dumps(stray, sort_keys=True)])], owner="ana")
+    assert ledger.problems == []                                   # the build alone sees nothing wrong
+
+    class Planted(_Stub):
+        def snapshot(self):
+            return "sha2", TEAM, ledger
+    found = VF.problems(Planted(), "sha2", TEAM, ledger)
+    assert len(found) == 2 and any("d-000000000000" in p for p in found) and any("'zed'" in p for p in found)
+    httpd = V.make_view_server(Planted(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        port = httpd.server_address[1]
+        assert json.loads(_req(port, "GET", "/view.json")[1])["problems"] == 2
+        assert b"2 integrity problem(s): run levain team verify" in _req(port, "GET")[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+class _RemoteStub(_Stub):
+    """A clone with a remote whose fetch is recorded, not run; the panes come from the local snapshot because the
+    remote-tracking ref does not exist in this stub."""
+    remote = "origin"
+
+    def __init__(self, state=None, note=None):
+        super().__init__()
+        self.calls: list[float] = []
+        self._state = state if state is not None else {"last_fetch_ok": 1.0e9}
+        self._note = note
+        self.repo = type("Repo", (), {"toplevel": "/nonexistent"})()
+
+    def fetch_only(self, *, interval, timeout):
+        self.calls.append(interval)
+        return self._note
+
+    def state(self):
+        if isinstance(self._state, Exception):
+            raise self._state
+        return self._state
+
+
+def _serve(stub):
+    httpd = V.make_view_server(_Stub(), port=0)
+    httpd.ledger_reader = stub
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def test_no_request_fetches_more_often_than_the_floor_even_when_team_toml_says_always(monkeypatch):
+    # L1/L2 10-07: min(fetch_interval, floor) let fetch_interval = 0 fetch on every request, the 2 s busy retries
+    # included, and the button's "at most every 10 s" was false.
+    stub = _RemoteStub()
+    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
+    httpd = _serve(stub)
+    httpd.fetch_interval = 0.0
+    try:
+        port = httpd.server_address[1]
+        _req(port, "GET", "/view.json")
+        _req(port, "GET", "/view.json?fetch=1")
+        httpd.fetch_interval = 600.0
+        _req(port, "GET", "/view.json")
+        _req(port, "GET", "/view.json?fetch=1")
+        assert stub.calls == [V.FETCH_FLOOR, V.FETCH_FLOOR, 600.0, V.FETCH_FLOOR]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.parametrize("state", [OSError("read-only .git"), {"last_fetch_ok": float("inf")},
+                                   {"last_fetch_ok": 1e20}, {"last_fetch_ok": "x"}])
+def test_a_broken_fetch_record_is_shown_and_the_panes_still_draw(monkeypatch, state, capfd):
+    # L1 10-07: an unguarded fetch path turned an unreadable state.json (or one holding Infinity) into a whole-page
+    # 503 "ledger unavailable" while the ledger itself was fine.
+    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
+    httpd = _serve(_RemoteStub(state=state))
+    try:
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 200 and b"Waiting on you" in body
+        if isinstance(state, Exception):
+            assert b"could not fetch from the remote" in body and "read-only .git" in capfd.readouterr().err
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_failed_fetch_shows_a_fixed_message_and_keeps_git_detail_in_the_terminal(monkeypatch, capfd):
+    # L1 10-07: git's stderr reached the page and /view.json; it can carry a remote URL with credentials.
+    secret = "fatal: unable to access 'https://ana:hunter2@git.example/x.git/': /home/ana/.netrc"
+    monkeypatch.setattr(V, "_rev", lambda gl, ref: None)
+    httpd = _serve(_RemoteStub(note=secret))
+    try:
+        port = httpd.server_address[1]
+        page = _req(port, "GET", "/?fetch=1")[1].decode()
+        js = _req(port, "GET", "/view.json")[1].decode()
+        for out in (page, js):
+            assert "hunter2" not in out and "netrc" not in out and "git.example" not in out
+        assert "the last fetch from the remote failed" in page and "hunter2" in capfd.readouterr().err
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_transport_warnings_are_shown_once_and_taken_off_the_process_list():
+    # L1/L2 10-07: the view never showed transport.WARNINGS, and in a long-lived view the list only grew.
+    class Warns(_Stub):
+        def snapshot(self):
+            self.warnings.append("team.toml at the tip is unusable; using an older one")
+            self.warnings.append("team.toml at the tip is unusable; using an older one")
+            return super().snapshot()
+    stub = Warns()
+    httpd = _serve(stub)
+    try:
+        port = httpd.server_address[1]
+        for _ in range(3):
+            page = _req(port, "GET")[1].decode()
+            assert page.count("team.toml at the tip is unusable") == 1
+        assert stub.warnings == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_connections_past_the_worker_bound_are_closed_without_a_thread():
+    # codex 10-07 + L2: ThreadingHTTPServer starts a thread per connection; an idle keep-alive connection keeps its
+    # thread for the 30 s socket timeout, so threads grew with connections. They are bounded now.
+    import socket
+    httpd = V.make_view_server(_Stub(), port=0)
+    httpd.workers = threading.BoundedSemaphore(1)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    idle = socket.create_connection(("127.0.0.1", port))          # holds the one slot, sends nothing
+    try:
+        import time
+        time.sleep(0.2)
+        extra = socket.create_connection(("127.0.0.1", port), timeout=5)
+        extra.sendall(b"GET /team_view.css HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        try:
+            got = extra.recv(100)
+        except ConnectionResetError:                               # macOS reports the unanswered close as a reset
+            got = b""
+        assert got == b""                                          # closed unanswered: no slot, no thread
+        extra.close()
+        idle.close()
+        for _ in range(50):                                        # the slot comes back when its thread ends
+            try:
+                if _req(port, "GET", "/team_view.css")[0].status == 200:
+                    break
+            except (ConnectionError, OSError):
+                time.sleep(0.1)
+        else:
+            raise AssertionError("the slot never came back")
+    finally:
+        idle.close()
+        httpd.shutdown()
+        httpd.server_close()

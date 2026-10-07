@@ -4,6 +4,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Fixed
+
+- **The team view shows what the team has pushed, says how this clone differs, warns on every integrity problem `levain team verify` finds, and never piles up requests; the cockpit's list of views no longer goes stale.**
+  - The view's server never fetched. Its "⟳ sync" button only re-read the same local ledger, so an entry another clone pushed stayed invisible for as long as the page was open.
+  - With a remote, the panes now come from the remote-tracking ledger: what the team has pushed, as of the last fetch. A page load fetches when team.toml's `fetch_interval` says one is due. A fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch.
+  - The page shows when the remote was fetched and how many of this clone's commits are not pushed, or not yet merged in (`levain team sync` reconciles them).
+  - The button is now "⟳ fetch now". No request fetches more often than once every 10 seconds.
+  - A failed fetch shows a fixed message. git's own words, which can carry a remote URL or local paths, go to the terminal running the view.
+  - The integrity warning counts what `levain team verify` counts, through one shared check, `levain.team.verify.problems`. It used to miss an entry naming an id the ledger does not hold, and an owner team.toml does not allow.
+  - A request that arrives while the ledger is being read gets a 503 at once, with `Retry-After`. It used to wait up to 10 seconds, holding a server thread per request; a browser on the page now asks again by itself.
+  - The server serves at most 32 connections at once.
+  - Under a path filter, pane 2 no longer shows a project-wide ruling's acknowledgements. A filter such as `project` matched the "(project-wide)" label.
+  - In the view registry, a fork at the moment a view opened or closed its lock file could leave the child holding the lock. A dead view then stayed listed in the cockpit for as long as the child lived. Opening, closing and forking are now serialised.
+  - Temp files left by a view killed mid-start are swept once they are a minute old and nobody holds them.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.

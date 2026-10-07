@@ -8,7 +8,11 @@ own memory), and ack counts are per PATH, never per person, so the page cannot a
 
 Denies are not in the ledger (the hook keeps them in a per-clone session file), so pane 2 counts the
 acknowledgements, which are. The page is rendered on the server from one ledger snapshot per request;
-the stylesheet is a second GET route because the shared CSP forbids inline styles.
+the stylesheet is a second GET route because the shared CSP forbids inline styles. When the clone has a remote,
+that snapshot is the remote-tracking ref (what the team has pushed), refreshed by a git fetch when one is due. A
+fetch only: the view never rebases, merges, pushes or moves this clone's own ledger branch, and it shows how far
+that branch differs from the remote instead of reconciling them. The only things a GET may write are that
+remote-tracking ref and the clone's record of when it last fetched.
 
 Stdlib only; the guards are the same ``levain.http_guards`` the cockpit and the docs server ride.
 """
@@ -31,12 +35,17 @@ from levain.web_server import load_web_asset
 from . import canon as C
 from . import index as I
 from . import roles as R
-from .transport import GitLedger
+from . import verify as VF
+from .transport import BRANCH, REF, GitLedger, git
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
 DEFAULT_RECHECK_DAYS = 30   # a recheck has no due date in the schema: an entry carrying one is overdue past this age
 DEFAULT_ACK_FLAG = 3        # acks on one path before the page suggests its ruling may be stale or too broad
+FETCH_FLOOR = 10.0          # seconds: no request, the button's included, fetches more often than this
+FETCH_TIMEOUT = 8.0         # seconds: the bound on the one git fetch a page load may run
+BUSY_RETRY = 2              # seconds: what a busy answer tells the browser to wait before asking again
+MAX_WORKERS = 32            # connections served at once (a browser keeps about 6 per host open); more are closed
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -60,8 +69,11 @@ def _card(e: dict, now: datetime) -> dict:
 
 def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: str | None, state: str, *,
                 now: datetime | None = None, recheck_days: int = DEFAULT_RECHECK_DAYS,
-                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "") -> dict:
+                ack_flag: int = DEFAULT_ACK_FLAG, path_filter: str = "", problems: list[str] | None = None) -> dict:
     """The four panes as plain data, from one ledger snapshot. Pure: no I/O.
+
+    ``problems`` is the snapshot's integrity problems as ``verify.problems`` reports them (the server passes it, so the
+    page's warning counts what ``levain team verify`` counts); without it only the ledger build's own are counted.
 
     ``path_filter`` narrows all four panes to what governs one path: an entry stays when one of its globs matches the
     path (``index.matches``) or contains it as text (so ``src/tax`` finds ``src/tax/**``). Project-wide entries carry
@@ -98,6 +110,10 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
         for rid in dict.fromkeys(e.get("refs", [])):
             r = ledger.by_id.get(rid)
             if r is None or r.get("kind") != "ruling":
+                continue
+            # Under a filter a project-wide ruling drops out, as in every other pane: test its real paths, never the
+            # "(project-wide)" label, which a filter like "project" would match as text.
+            if pf and not keep(r):
                 continue
             for g in dict.fromkeys(r.get("paths") or ["(project-wide)"]):
                 if pf and not hit(g):
@@ -139,7 +155,8 @@ def build_model(team: R.Team, ledger: I.Ledger, handle: str | None, canon_text: 
     canon = [{"path": g, "entries": paths[g]} for g in sorted(paths)]
 
     return {"project": team.project, "owner": team.owner, "mode": team.mode, "you": handle,
-            "canon_status": C.staleness(canon_text, state), "problems": len(ledger.problems),
+            "canon_status": C.staleness(canon_text, state),
+            "problems": len(ledger.problems if problems is None else problems),
             "recheck_days": recheck_days, "ack_flag": ack_flag,
             "waiting": waiting, "stopped": stopped,
             "ack_total": ack_total, "held": held, "held_count": len(held), "in_force": canon,
@@ -195,6 +212,31 @@ def _search_bar(placeholder: str, label: str, input_id: str) -> str:
     return (f'<div class="ep-search"><input class="ep-search-input" id="{input_id}" type="search" '
             f'placeholder="{_e(placeholder)}" aria-label="{_e(label)}"><span class="ep-search-status" '
             f'id="{input_id}-status"></span></div>')
+
+
+def _fetch_status(f: dict | None) -> str:
+    """Which ledger the panes show, when it was fetched, how this clone's own copy differs, and the button. With a
+    remote the button fetches (never more often than FETCH_FLOOR) and redraws; with none it only redraws."""
+    if not f or not f.get("remote"):
+        return ('<span class="stamp fetch">this clone only: no remote</span>'
+                '<button id="refresh" type="button" data-fetch="0">⟳ reload</button>')
+    if f.get("source") == "remote":
+        parts = [f"remote, fetched {_e(f['last_ok'])}" if f.get("last_ok") else "remote"]
+    else:
+        parts = ["this clone's copy: the remote ledger has not been fetched"]
+    out = f'<span class="stamp fetch">{" · ".join(parts)}</span>'
+    if f.get("source") == "remote":
+        up, down = f.get("unpushed"), f.get("unfetched")
+        if up is None:
+            out += '<span class="warn fetch-local">this clone\'s own copy: could not compare</span>'
+        elif up or down:
+            bits = ([f"{up} commit{'s' if up != 1 else ''} not pushed"] if up else []) + \
+                   ([f"{down} from the remote not yet in it"] if down else [])
+            out += (f'<span class="warn fetch-local">this clone\'s own copy: {", ".join(bits)} '
+                    f'(<code>levain team sync</code>)</span>')
+    if f.get("error"):
+        out += f'<span class="warn fetch-error">⚠ {_e(f["error"])}</span>'
+    return out + '<button id="refresh" type="button" data-fetch="1">⟳ fetch now</button>'
 
 
 def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
@@ -260,12 +302,13 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             "<div class=\"model\">the team's shared decisions, from outside the session</div></div>"
             f"<div class=\"readout\"><div class=\"unit\"><span class=\"unit-label\">Team</span>"
             f"<span class=\"entity\">{_e(m['project'])}</span></div><div class=\"indicators\">"
-            f"<span class=\"stamp\">{_e(m['generated'])}</span><button id=\"refresh\" type=\"button\">⟳ sync</button>"
+            f"<span class=\"stamp\">{_e(m['generated'])}</span>{_fetch_status(m.get('fetch'))}"
             "</div></div></header>"
             f"<p class=\"sub teamline\">{who} · canon owner {_e(m['owner'])} · mode {_e(m['mode'])} · "
             f"{_e(m['canon_status'])}"
             + (f" · <span class=\"warn\">{m['problems']} integrity problem(s): run levain team verify</span>"
-               if m["problems"] else "") + "</p>"
+               if m["problems"] else "")
+            + "".join(f" · <span class=\"warn\">{_e(w)}</span>" for w in m.get("warnings") or []) + "</p>"
             f"<nav class=\"tabs\"><a class=\"tab\" href=\"{_e(cockpit_url)}\">◍ Cockpit</a>"
             "<a class=\"tab active\" href=\"/\">▣ Team view</a></nav>"
             + pathfilter + pathbar
@@ -280,6 +323,7 @@ CSS = """\
 .sub.teamline::before { content: "◇ team "; }
 .sub.teamline { word-break: normal; }
 .warn { color: var(--hot); }
+.indicators .fetch-error, .indicators .fetch-local { font-size: 11px; max-width: 28em; overflow-wrap: anywhere; }
 .grid.team { grid-template-columns: minmax(0, 1fr); }
 @media (min-width: 760px) { .grid.team { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
 @media (min-width: 1180px) { .grid.team { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
@@ -351,8 +395,17 @@ JS = """\
     var v = pq.value.trim();
     location.href = v ? "/?path=" + encodeURIComponent(v) : "/";
   });
+  // The button: fetch=1 asks the server to fetch from the remote first (it holds the pace); the flag is dropped from
+  // the address bar at once, so a later reload or a shared link does not ask again.
+  var u = new URL(location.href);
+  if (u.searchParams.has("fetch")) { u.searchParams.delete("fetch"); history.replaceState(null, "", u.pathname + u.search + u.hash); }
   var rf = document.getElementById("refresh");
-  if (rf) rf.addEventListener("click", function () { location.reload(); });
+  if (rf) rf.addEventListener("click", function () {
+    if (rf.getAttribute("data-fetch") !== "1") { location.reload(); return; }
+    var t = new URL(location.href);
+    t.searchParams.set("fetch", "1");
+    location.href = t.pathname + t.search + t.hash;
+  });
 })();
 """
 
@@ -369,13 +422,35 @@ class _ViewServer(ThreadingHTTPServer):
     cockpit_url: str
     assets: dict
     model_lock: threading.Lock
-    model_lock_timeout: float
+    fetch_interval: float       # team.toml's fetch_interval as of the last snapshot; read and set under model_lock
+    workers: threading.BoundedSemaphore
+    problems_cache: tuple[str, list[str]] | None = None   # (ledger commit, verify.problems); read and set under model_lock
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
             return
         super().handle_error(request, client_address)
+
+    # ThreadingHTTPServer starts a thread per CONNECTION, and an idle keep-alive connection keeps its thread until the
+    # handler's socket timeout. The slot is taken before the thread exists and given back when the thread ends, so
+    # no burst of connections can grow the thread count past MAX_WORKERS; a connection over the bound is closed at
+    # once, unanswered (writing a 503 from this accepting thread could block it on a slow client).
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.workers.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.workers.release()             # no thread was started, so nothing else will give the slot back
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.workers.release()
 
 
 class _Busy(Exception):
@@ -388,20 +463,78 @@ class _ViewHandler(GuardedHandler):
     server_version = "levain-team-view"
     server: _ViewServer
 
-    def _model(self, path_filter: str = "") -> dict:
+    def _model(self, path_filter: str = "", fetch_now: bool = False) -> dict:
         gl: GitLedger = self.server.ledger_reader
         # Serializes model generation WITHIN this process only (it says nothing about other processes' git use).
-        # A cold history read can take a minute, so a waiter gives up after model_lock_timeout and the caller
-        # answers 503 "busy" rather than piling up handler threads. Static assets never come through here.
-        if not self.server.model_lock.acquire(timeout=self.server.model_lock_timeout):
+        # A cold history read can take a minute, so nobody waits for the lock: a second request answers 503 "busy"
+        # at once and its thread ends, instead of parking a handler thread per request. Static assets never come
+        # through here.
+        if not self.server.model_lock.acquire(blocking=False):
             raise _Busy()
+        mark = len(gl.warnings)
         try:
-            sha, team, ledger = gl.snapshot()
-            return build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
-                               recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
-                               path_filter=path_filter)
+            fetch = self._fetch(gl, fetch_now)
+            sha, team, ledger, source = self._snapshot(gl, fetch)
+            self.server.fetch_interval = float(team.fetch_interval)
+            m = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
+                            recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
+                            path_filter=path_filter, problems=self._problems(gl, sha, team, ledger))
+            m["fetch"] = dict(fetch, **source)
+            # What the transport wanted a person to hear (a team.toml it had to fall back from, say) is shown here
+            # and taken off the process-wide list, which would otherwise grow with every request this server answers.
+            m["warnings"] = list(dict.fromkeys(gl.warnings[mark:]))
+            return m
         finally:
+            del gl.warnings[mark:]
             self.server.model_lock.release()
+
+    def _snapshot(self, gl: GitLedger, fetch: dict) -> tuple[str, R.Team, I.Ledger, dict]:
+        """(sha, team, ledger) from ONE commit, plus where it came from. With a fetched remote ledger, that commit is
+        the remote-tracking ref: what the team has pushed, as of the last fetch. This clone's own branch is never
+        moved here; how far it differs from the remote is counted and shown instead."""
+        rref = fetch.get("ref")
+        rsha = _rev(gl, rref) if rref else None
+        if rsha is None:
+            sha, team, ledger = gl.snapshot()
+            return sha, team, ledger, {"source": "local", "unpushed": 0, "unfetched": 0}
+        team = gl.team(rsha)
+        ledger = gl.ledger(team, rsha)
+        unpushed, unfetched = _divergence(gl, rref)
+        return rsha, team, ledger, {"source": "remote", "unpushed": unpushed, "unfetched": unfetched}
+
+    def _problems(self, gl: GitLedger, sha: str, team: R.Team, ledger: I.Ledger) -> list[str]:
+        """verify.problems for this ledger commit, kept for the next request on the same commit: it walks team.toml's
+        history with git, and the model lock (held by the caller) makes the one-entry cache safe."""
+        cached = self.server.problems_cache
+        if cached is None or cached[0] != sha:
+            cached = self.server.problems_cache = (sha, VF.problems(gl, sha, team, ledger))
+        return cached[1]
+
+    def _fetch(self, gl: GitLedger, now: bool) -> dict:
+        """Fetch the remote's ledger into this clone's remote-tracking ref when one is due: a fetch only, never a
+        rebase, a merge or a push, so this clone's branch and worktree are untouched. Paced by team.toml's
+        fetch_interval (as of the last page) and never more often than FETCH_FLOOR; the button asks for the floor.
+        The page shows the clone's own record of its last fetch, so a fetch the hook made counts too. Never raises: a
+        failure here is shown on the page and the panes still draw. A failure's detail goes to this server's terminal,
+        never to the page (git's message can carry a remote URL with credentials, or local paths)."""
+        out: dict = {"remote": False, "ref": None, "last_ok": None, "error": ""}
+        try:
+            remote = gl.remote
+            if not remote:
+                return out
+            out.update(remote=True, ref=f"refs/remotes/{remote}/{BRANCH}")
+            interval = FETCH_FLOOR if now else max(self.server.fetch_interval, FETCH_FLOOR)
+            note = gl.fetch_only(interval=interval, timeout=FETCH_TIMEOUT)      # PENDING: transport API (head)
+            st = gl.state()
+            out["last_ok"] = _iso(st.get("last_fetch_ok"))
+            detail = note or st.get("last_fetch_error") or ""
+            if detail:
+                _log(f"fetch from {remote!r} failed: {detail!r}")
+                out["error"] = "the last fetch from the remote failed (the detail is in the terminal running the view)"
+        except Exception as exc:  # noqa: BLE001 - the fetch's own state is unreadable: the page says so and draws
+            _log(f"fetch state unavailable: {exc!r}")
+            out["error"] = "could not fetch from the remote (the detail is in the terminal running the view)"
+        return out
 
     def do_GET(self) -> None:
         if self._refuse_read(head=False):
@@ -411,16 +544,14 @@ class _ViewHandler(GuardedHandler):
             body, ctype = self.server.assets[path]
             return self._send(body, ctype)
         if path in ("/", "/view.json"):
-            pf = (parse_qs(query).get("path") or [""])[0][:300]
+            qs = parse_qs(query)
+            pf = (qs.get("path") or [""])[0][:300]
             try:
-                model = self._model(pf)
+                model = self._model(pf, fetch_now=(qs.get("fetch") or [""])[0] == "1")
             except _Busy:
-                return self._send(b"busy, retry in a moment\n", "text/plain; charset=utf-8", status=503)
+                return self._send_busy(html_page=path == "/")
             except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
-                try:  # best effort: a closed stderr must not stop the 503, and repr() keeps it one unforgeable line
-                    print(f"levain team view: ledger unavailable: {exc!r}"[:600], file=sys.stderr, flush=True)
-                except Exception:  # noqa: BLE001 — no stream at all (pythonw, a closed pipe) is not a reason to drop the 503
-                    pass
+                _log(f"ledger unavailable: {exc!r}")
                 return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
                                   "text/plain; charset=utf-8", status=503)
             if path == "/view.json":
@@ -428,6 +559,24 @@ class _ViewHandler(GuardedHandler):
                                   "application/json; charset=utf-8")
             return self._send(render_html(model, self.server.cockpit_url).encode("utf-8"), "text/html; charset=utf-8")
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404)
+
+    def _send_busy(self, *, html_page: bool) -> None:
+        """503 at once, with Retry-After. The page is rendered on the server, so a browser that asked for it gets a
+        small page that asks again by itself (a meta refresh: the CSP governs scripts, not that)."""
+        if html_page:
+            body = (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+                    f'<meta http-equiv="refresh" content="{BUSY_RETRY}"><title>team view: busy</title></head>'
+                    f'<body><p>The team view is reading the ledger. This page asks again in {BUSY_RETRY} seconds.</p>'
+                    f'</body></html>').encode("utf-8")
+            ctype = "text/html; charset=utf-8"
+        else:
+            body, ctype = b"busy, retry in a moment\n", "text/plain; charset=utf-8"
+        self.send_response(503)
+        self.send_header("Retry-After", str(BUSY_RETRY))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
         if code == 501:  # the stdlib's answer to a method with no do_ handler: here every other method is a 405
@@ -450,6 +599,43 @@ class _ViewHandler(GuardedHandler):
     do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _not_allowed
 
 
+def _log(msg: str) -> None:
+    """One line to this server's terminal. Best effort: a closed stderr must not stop the answer, and callers pass
+    repr() so a message is always one unforgeable line."""
+    try:
+        print(f"levain team view: {msg}"[:600], file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — no stream at all (pythonw, a closed pipe) is not a reason to drop the answer
+        pass
+
+
+def _iso(ts: object) -> str | None:
+    """A stored epoch time as the page shows it; None for a missing or unusable value (state.json is a file anyone
+    can edit, and json reads Infinity)."""
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _rev(gl: GitLedger, ref: str) -> str | None:
+    """The commit ``ref`` names in this clone, or None when it does not exist (never fetched, or the remote has no
+    ledger branch yet)."""
+    cp = git(["rev-parse", "-q", "--verify", f"{ref}^{{commit}}"], gl.repo.toplevel, check=False, timeout=10)
+    sha = cp.stdout.strip() if cp.returncode == 0 else ""
+    return sha or None
+
+
+def _divergence(gl: GitLedger, rref: str) -> tuple[int | None, int | None]:
+    """(commits on this clone's ledger branch not on the remote, commits on the remote not yet on the branch); None
+    for each when git cannot say, which the page shows as unknown, never as zero."""
+    cp = git(["rev-list", "--left-right", "--count", f"{REF}...{rref}"], gl.repo.toplevel, check=False, timeout=10)
+    try:
+        a, b = cp.stdout.split()
+        return int(a), int(b)
+    except ValueError:
+        return None, None
+
+
 def _ipv4_loopback(host: str) -> bool:
     """127.0.0.1, any 127.x.y.z, or ``localhost``. IPv6 is refused: the server is AF_INET and would die in bind."""
     if host.lower() == "localhost":
@@ -470,7 +656,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
                          "(127.0.0.1 or localhost)")
     if not isinstance(port, int) or not 0 <= port <= 65535:
         raise ValueError(f"port must be 0..65535, got {port!r}")
-    gl.snapshot()  # fail now, with the ledger's own message, if this clone has no ledger
+    _sha, team, _ledger = gl.snapshot()  # fail now, with the ledger's own message, if this clone has no ledger
     httpd = _ViewServer((host, port), _ViewHandler)
     bound = str(httpd.server_address[0])
     if not _ipv4_loopback(bound):
@@ -479,7 +665,8 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     httpd.allowed_hosts = _LOOPBACK | {bound.lower()}
     httpd.ledger_reader = gl
     httpd.model_lock = threading.Lock()
-    httpd.model_lock_timeout = 10.0
+    httpd.fetch_interval = float(team.fetch_interval)
+    httpd.workers = threading.BoundedSemaphore(MAX_WORKERS)
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag
     httpd.cockpit_url = cockpit_url if cockpit_url.startswith(("http://", "https://")) else DEFAULT_COCKPIT_URL
