@@ -1,12 +1,13 @@
 // levain token.js — the launch token, shared by every Levain page (`levain serve`, `levain init --web`, `levain docs`).
 //
-// Each server generates a token when it starts and refuses every request without it, except this page shell. It opens
-// the page with the token in the URL FRAGMENT (#token=..., which a browser never sends to a server, so it reaches no
-// server log and no Referer; the browser's own history may still record the link as it was opened); this file reads it, keeps it in this tab's sessionStorage, and strips it from the address bar at
-// once. A token is used only once that strip succeeded: a token still showing in the address bar is not taken. The
-// token printed in the terminal, typed into the unlock form, is the fallback (a headless box, a second browser, a
-// platform where the page was opened without it). It is never put in a cookie, storage that outlives the browser
-// session, or a request URL; a duplicated or restored tab keeps its sessionStorage, as browsers do.
+// Each server generates a token when it starts and refuses every request without it, except this page shell. The link
+// it opens (or prints) carries a single-use CODE in the URL fragment (#code=...): this file strips it from the address
+// bar at once and trades it, by one POST /unlock, for the token, which it keeps in this tab's sessionStorage; a
+// browser never sends a fragment to a server, so the code reaches no server log and no Referer; the browser's own
+// history does keep it, and there it is a code that has already been spent. The token printed in a terminal, typed
+// into the unlock form, is the fallback (a headless box, a second browser, a spent or expired link). An old
+// #token= / #chat_token= link still works when the page loads. The token is never put in a cookie, storage that
+// outlives the browser session, or a request URL; a duplicated or restored tab keeps its sessionStorage, as browsers do.
 //
 // Loaded before every other script on the page. The other scripts send `LevainToken.headers()` with each request, and
 // on a 403 whose JSON says `error: "launch_token"` they call `LevainToken.lock(message, sent)`, which drops the token and
@@ -16,6 +17,9 @@
   const HEADER = "X-Levain-Token";
   const KEY = "levain.token";
   const listeners = [];
+  let pendingCode = null;    // a single-use link code from the fragment, traded once for the token
+  let exchanging = false;    // that trade is in flight: a refusal meanwhile waits for its answer
+  let deferredLock = null;   // the message such a refusal brought
   let token = take();
   let form = null;
   let noteEl = null;
@@ -26,10 +30,17 @@
   function take() {
     let t = null;
     try {
-      const m = /^#(?:chat_)?token=(.*)$/.exec(location.hash);
+      const frag = location.hash;
+      const c = /^#code=(.*)$/.exec(frag);
+      const m = /^#(chat_)?token=(.*)$/.exec(frag);
+      if (c || m) history.replaceState(null, "", location.pathname + location.search);
+      if (c && /^[A-Za-z0-9_-]+$/.test(c[1])) pendingCode = c[1];
       if (m) {
-        history.replaceState(null, "", location.pathname + location.search);
-        if (/^[A-Za-z0-9_-]+$/.test(m[1])) t = m[1];
+        if (/^[A-Za-z0-9_-]+$/.test(m[2])) t = m[2];
+        if (m[1]) {
+          try { console.warn("levain: the #chat_token= link is deprecated; the server now prints a single-use #code= link."); }
+          catch (e) { /* no console */ }
+        }
       }
     } catch (e) { t = null; /* no location or history, or the strip failed: the form still works */ }
     if (t) { keep(t); return t; }
@@ -50,6 +61,7 @@
   // (`get()` when it was sent): a refusal of a token this page has since replaced is late news and changes nothing.
   function lock(message, sent) {
     if (sent !== undefined && sent !== token) return;
+    if (exchanging) { deferredLock = message || ""; return; }   // the link's code may still unlock the page
     drop();
     if (!document.body) return;
     if (!form) {
@@ -84,8 +96,9 @@
       });
       document.body.insertBefore(form, document.body.firstChild);
     }
-    noteEl.textContent = message || "";
-    noteEl.hidden = !message;
+    // A refusal that brings no message of its own leaves the form's current one (why the last link failed) in place.
+    if (message) noteEl.textContent = message;
+    noteEl.hidden = !noteEl.textContent;
   }
   function onUnlock(fn) { if (typeof fn === "function") listeners.push(fn); }
   function unlocked() {
@@ -93,22 +106,40 @@
     listeners.slice().forEach((fn) => { try { fn(); } catch (e) { /* one listener's fault is its own */ } });
   }
 
-  // The unlocked link opened in a tab already showing this page changes only the fragment, and a browser does not
-  // reload for that: the page is still the locked one. Take the token from the new fragment the same way, but only
-  // while the page is locked: a page that holds a window reference to this one can change its fragment, and an
-  // unlocked page must not let that swap its token for junk.
+  // The server's links carry a single-use code, never the token (a browser's history keeps the link as opened, and
+  // Chrome's did, fragment included, measured 2026-10-07). Trade it once for the token. Until the answer comes, a
+  // refusal elsewhere on the page does not show the form; a failed trade shows it, saying why.
+  if (pendingCode) {
+    exchanging = true;
+    let traded = null;
+    fetch("/unlock", { method: "POST", cache: "no-store", headers: { "X-Levain-Link-Code": pendingCode } })
+      .then((r) => r.json().catch(() => ({})).then((j) => { if (r.status === 200) traded = j && j.token; }))
+      .catch(() => {})
+      .then(() => {
+        exchanging = false;
+        pendingCode = null;
+        if (typeof traded === "string" && /^[A-Za-z0-9_-]+$/.test(traded)) {
+          token = traded; keep(traded); deferredLock = null;
+          unlocked();
+        } else {
+          deferredLock = null;
+          lock("That link was already used or has expired. Open a new one with `levain serve --open-running`, " +
+               "or paste the token the server printed.");
+        }
+      });
+  }
+
+  // A token is taken from the fragment only when the page loads, never from a later change of it (head ruling
+  // 2026-10-07, L1/L2): a page that holds a window reference to this one, or a page on another localhost port, can
+  // change its fragment, and must not be able to swap the token. A #token= fragment that arrives later is removed
+  // from the address bar and ignored; to use a new link, open it in a new tab or reload.
   try {
     window.addEventListener("hashchange", () => {
-      if (token && !form) {   // unlocked: drop the fragment from the address bar, keep the token held
-        try {
-          if (/^#(?:chat_)?token=/.test(location.hash)) history.replaceState(null, "", location.pathname + location.search);
-        } catch (e) { /* nothing to strip with */ }
-        return;
-      }
-      const t = take();
-      if (t && t !== token) { token = t; unlocked(); }
+      try {
+        if (/^#(?:(?:chat_)?token|code)=/.test(location.hash)) history.replaceState(null, "", location.pathname + location.search);
+      } catch (e) { /* nothing to strip with */ }
     });
-  } catch (e) { /* no window events: the form still works */ }
+  } catch (e) { /* no window events */ }
 
   window.LevainToken = Object.freeze({
     HEADER: HEADER,

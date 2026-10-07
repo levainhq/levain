@@ -23,20 +23,25 @@ docs) fails at startup with a clear message, never as a silent empty page.
 from __future__ import annotations
 
 import json
-import secrets
 import sys
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from levain.docs import DocsError, chapters_payload
-from levain.http_guards import GuardedHandler, check_launch_token
+from levain.http_guards import (
+    GuardedHandler,
+    arm_launch_token,
+    check_launch_token,
+    new_launch_token,
+    open_unlocked,
+    publish_launch_token,
+    stop_on_sigterm,
+)
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
-    _open_browser,
     load_web_asset,
-    print_launch_token,
 )
 
 __all__ = ["DEFAULT_DOCS_HOST", "DEFAULT_DOCS_PORT", "make_docs_server", "run_docs_web"]
@@ -136,7 +141,7 @@ def make_docs_server(
             "(127.0.0.1 / localhost). The operator manual is a local read surface; "
             "there is no off-box docs server."
         )
-    check_launch_token(launch_token)
+    check_launch_token(launch_token)   # before the bind, so a bad token leaves no socket behind
     # Build the payload + assets BEFORE binding — a corrupt wheel should fail with a
     # clear message, not a bind error (mirrors init's asset-load-before-bind).
     docs_json = json.dumps(chapters_payload(install)).encode("utf-8")
@@ -157,8 +162,7 @@ def make_docs_server(
     # Allow the canonical loopback names + the exact bound address (covers a
     # 127.0.0.x bind), lowercased to match the Host check; any other Host → 403.
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {bound.lower()}
-    httpd.launch_token = launch_token or secrets.token_urlsafe(32)
-    httpd.token_free_paths = frozenset(_ASSETS)
+    arm_launch_token(httpd, new_launch_token() if launch_token is None else launch_token, frozenset(_ASSETS))
     return httpd
 
 
@@ -208,15 +212,24 @@ def run_docs_web(
     print(f"Levain docs → {url}")
     print(f"  {n_chapters} chapter(s) · install: {install}")
     print("  loopback-only · read-only · Ctrl+C to stop")
-    unlocked = print_launch_token(url, httpd.launch_token)
+    try:
+        published = publish_launch_token(httpd, url, port=bound_port, kind="docs")
+    except OSError as exc:
+        print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
+              "other place to hand it over; not serving.", file=sys.stderr)
+        httpd.server_close()
+        return 1
 
     if open_browser:
-        _open_browser(url, unlocked)
+        open_unlocked(url, published.unlocked)
 
+    restore_sigterm = stop_on_sigterm()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm()
+        published.close()
         httpd.server_close()
     return 0

@@ -88,7 +88,10 @@
     else if (panel) { panel.remove(); panel = null; }
     if (auth) auth.lock(null, r ? r.sent : undefined);
   }
-  if (auth) auth.onUnlock(() => loadListing(true));
+  // An unlock that another part of the page asked for (the board's own read was refused) leaves an open session as
+  // it is: its next request carries the new token, and if the server no longer has it, that request says so. Only a
+  // panel with no session (the picker, or nothing yet) reloads the listing.
+  if (auth) auth.onUnlock(() => { if (!session) loadListing(true); });
 
   // ---- entity picker -----------------------------------------------------------------------------------------
   function loadListing(afterToken) {

@@ -657,7 +657,7 @@ def _source(tmp_path):
 def _serving(source, chat_host):
     from levain.web_server import make_server
 
-    httpd = make_server(source, host="127.0.0.1", port=0, chat_host=chat_host, chat_token=_TOKEN)
+    httpd = make_server(source, host="127.0.0.1", port=0, chat_host=chat_host, read_token=_TOKEN)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
@@ -748,14 +748,14 @@ def test_a_chat_server_refuses_any_non_loopback_bind(tmp_path, host_arg):
     from levain.web_server import make_server
 
     with pytest.raises(ValueError, match="--chat is loopback-only"):
-        make_server(_source(tmp_path), host=host_arg, port=0, chat_host=_host(tmp_path, _Factory([])))
+        make_server(_source(tmp_path), host=host_arg, port=0, chat_host=_host(tmp_path, _Factory([])), read_token=None)
 
 
 def test_downstream_routes_cannot_claim_a_chat_path(tmp_path):
     from levain.web_server import make_server
 
     with pytest.raises(ValueError, match="collides"):
-        make_server(_source(tmp_path), port=0, extra_json={"/chat.json": lambda: b"{}"})
+        make_server(_source(tmp_path), port=0, extra_json={"/chat.json": lambda: b"{}"}, read_token=None)
 
 
 def test_serve_refuses_a_chat_dir_that_is_not_an_openhands_entity(tmp_path, capsys):
@@ -1410,20 +1410,27 @@ def test_the_token_gates_the_substrate_routes_too(tmp_path):
         assert code == 200
 
 
-def test_serve_publishes_the_chat_token_on_piped_stdout_before_it_blocks(tmp_path):
-    """L1 LOW-B: the token line is the only place the token is published, and a piped stdout is
-    block-buffered, so without its flush it would sit in the buffer while the server blocks."""
+def test_serve_never_prints_the_token_to_a_pipe_and_leaves_it_in_a_0600_runtime_file(tmp_path):
+    """Head ruling 2026-10-07 (L2 MED): a token printed to a non-terminal stdout lands in whatever is behind it (a
+    launchd or systemd log, a pipe, a file), where an entity, a backup or another user may read it. The earlier
+    test here required the token on piped stdout (L1 LOW-B, flushed so it showed); now a pipe gets only where the
+    token is, flushed before the server blocks, and the token goes to ~/.levain-runtime/<port>.json, 0600."""
+    import re
     import selectors
+    import stat
     import subprocess
     import sys
 
     from anneal_memory import Store
 
+    home = tmp_path / "home"
+    home.mkdir()
     (tmp_path / "inst" / ".levain").mkdir(parents=True)
     with Store(tmp_path / "inst" / ".levain" / "memory.db"):
         pass
     ent = _entity(tmp_path, "ent")
     env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    env["HOME"] = str(home)
     proc = subprocess.Popen(
         [sys.executable, "-m", "levain", "serve", "--path", str(tmp_path / "inst"), "--port", "0",
          "--no-open", "--chat", str(ent)],
@@ -1432,16 +1439,21 @@ def test_serve_publishes_the_chat_token_on_piped_stdout_before_it_blocks(tmp_pat
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ)
         out, deadline = b"", time.monotonic() + 30
-        while b"valid until this server stops" not in out and time.monotonic() < deadline:
+        while b"--open-running" not in out and time.monotonic() < deadline:
             if sel.select(timeout=0.5):
                 chunk = os.read(proc.stdout.fileno(), 65536)
                 if not chunk:
                     break
                 out += chunk
         assert proc.poll() is None, proc.stderr.read().decode()   # still serving, i.e. blocked
-        line = next((x for x in out.decode().splitlines() if "valid until this server stops" in x), None)
-        assert line is not None, f"no token line on stdout while serving: {out!r}"
-        assert len(line.rsplit(": ", 1)[1].strip()) >= 32
+        m = re.search(rb"--open-running --port (\d+)", out)
+        assert m, f"no runtime-file line on stdout while serving: {out!r}"
+        rec_path = home / ".levain-runtime" / f"{m.group(1).decode()}.json"
+        rec = json.loads(rec_path.read_text())
+        token = rec["token"]
+        assert len(token) >= 32 and token.encode() not in out
+        assert stat.S_IMODE(rec_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE((home / ".levain-runtime").stat().st_mode) == 0o700
     finally:
         proc.kill()
         proc.wait(timeout=10)
@@ -1452,13 +1464,13 @@ def test_each_launch_gets_its_own_token(tmp_path):
     tokens = []
     for _ in range(2):
         httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0,
-                            chat_host=_host(tmp_path, _Factory([])))
+                            chat_host=_host(tmp_path, _Factory([])), read_token=None)
         try:
             tokens.append(httpd.launch_token)
         finally:
             httpd.server_close()
     assert all(t and len(t) >= 32 for t in tokens) and tokens[0] != tokens[1]
-    httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0)
+    httpd = make_server(_source(tmp_path), host="127.0.0.1", port=0, read_token=None)
     try:
         assert httpd.launch_token is None            # make_server alone: no chat, no token, ungated
     finally:
@@ -1675,6 +1687,7 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
 
     db = tmp_path / "memory.db"
     db.write_bytes(b"")
+    monkeypatch.setenv("HOME", str(tmp_path))   # the runtime file goes under the test's home
     monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
     fake_host = SimpleNamespace(listing=lambda: {"entities": ["ent"]}, shutdown=lambda: None)
     monkeypatch.setattr(ws, "_build_chat_host", lambda *a, **k: (fake_host, None))
@@ -1692,12 +1705,21 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
     monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
     opened = []
     calls = []
-    monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
+    rt = tmp_path / ".levain-runtime" / "7462.json"
+    seen = []
+
+    def opened(url, unlocked):
+        calls.append((url, unlocked))
+        seen.append(json.loads(rt.read_text()))   # while serving: the link the operator can open later
+
+    monkeypatch.setattr(ws, "_open_browser", opened)
     assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
     out = capsys.readouterr().out
-    assert calls == [("http://127.0.0.1:7462/", "http://127.0.0.1:7462/#token=tok_-AZ09")]
-    assert "open it unlocked: http://127.0.0.1:7462/#token=tok_-AZ09" in out
-    assert "valid until this server stops): tok_-AZ09" in out          # the printed fallback stays
+    assert len(calls) == 1 and calls[0][0] == "http://127.0.0.1:7462/"
+    assert calls[0][1].startswith("http://127.0.0.1:7462/#code=")   # a single-use code, never the token
+    assert "tok_-AZ09" not in calls[0][1] and "tok_-AZ09" not in out   # stdout is not a terminal: no token in it
+    assert seen[0]["token"] == "tok_-AZ09"                            # the token is in the runtime file
+    assert not rt.exists()                           # removed when the server stopped
     assert "?" not in calls[0][1]
 
 
@@ -1707,6 +1729,7 @@ def test_serve_without_chat_still_runs_with_a_launch_token_and_opens_unlocked(tm
     import levain.web_server as ws
 
     (tmp_path / "memory.db").write_bytes(b"")
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
     asked = {}
 
@@ -1723,17 +1746,17 @@ def test_serve_without_chat_still_runs_with_a_launch_token_and_opens_unlocked(tm
     def fake_make_server(*a, **k):
         asked.update(k)
         h = _Httpd()
-        h.launch_token = k.get("launch_token")
+        h.launch_token = k["read_token"]   # required: a call without it is a TypeError
         return h
 
     monkeypatch.setattr(ws, "make_server", fake_make_server)
     calls = []
     monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
     assert ws.run_web_server(tmp_path) == 0
-    tok = asked.get("launch_token")
+    tok = asked.get("read_token")
     assert tok and len(tok) >= 32
-    assert calls == [("http://127.0.0.1:7463/", f"http://127.0.0.1:7463/#token={tok}")]
-    assert f"valid until this server stops): {tok}" in capsys.readouterr().out
+    assert calls[0][0] == "http://127.0.0.1:7463/" and calls[0][1].startswith("http://127.0.0.1:7463/#code=")
+    assert tok not in calls[0][1] and tok not in capsys.readouterr().out
 
 
 

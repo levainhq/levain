@@ -37,7 +37,7 @@ SECURITY_HEADERS = ("Content-Security-Policy", "X-Content-Type-Options", "X-Fram
 
 # The team view's handler still routes its own do_GET (the launch token for `levain team view` lands with the team
 # lane, after this one). Strict, so the day it moves onto `_route` this marker fails and has to be removed.
-_NOT_YET_ON_THE_SHARED_GUARDS = {"_ViewHandler": "levain team view: launch token pending (np-ebb8a399, team half)"}
+_NOT_YET_ON_THE_SHARED_GUARDS = {"_ViewHandler": "team view gate lands with seat/1007-5-teamview"}
 
 
 def _handlers():
@@ -81,7 +81,7 @@ def _server(kind: str, tmp_path: Path):
         from levain.web_server import make_server
 
         httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")),
-                            host="127.0.0.1", port=0, launch_token=_TOKEN)
+                            host="127.0.0.1", port=0, read_token=_TOKEN)
     elif kind == "init":
         from levain.init_server import make_init_server
 
@@ -304,14 +304,14 @@ def test_make_server_refuses_a_token_the_page_cannot_carry(tmp_path, bad):
 
     src = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db"))
     with pytest.raises(ValueError, match="launch token must be"):
-        make_server(src, host="127.0.0.1", port=0, launch_token=bad)
+        make_server(src, host="127.0.0.1", port=0, read_token=bad)
 
 
 def test_the_old_chat_token_attribute_can_still_be_set(tmp_path):
     from levain.dashboard import AnnealPaths, SubstrateSource
     from levain.web_server import make_server
 
-    httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0)
+    httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0, read_token=None)
     try:
         httpd.chat_token = "set-the-old-way"
         assert httpd.launch_token == "set-the-old-way"
@@ -325,7 +325,7 @@ def test_the_old_chat_token_attribute_cannot_remove_the_token(tmp_path):
     from levain.web_server import make_server
 
     httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
-                        launch_token=_TOKEN)
+                        read_token=_TOKEN)
     try:
         with pytest.raises(ValueError):
             httpd.chat_token = None
@@ -357,6 +357,158 @@ def test_a_server_that_never_says_launch_token_serves_nothing(tmp_path):
         except (http.client.HTTPException, OSError):
             status = None
         assert status != 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+# --- head rulings 2026-10-07 ----------------------------------------------------------------------------------
+
+
+def test_a_handler_that_defines_its_own_do_method_is_refused_when_its_class_is_made():
+    """L2: the no-do_* rule is structural, not a convention a test checks afterwards."""
+    with pytest.raises(TypeError, match="do_GET"):
+        class _Bypass(GuardedHandler):  # noqa: F841 — the class statement itself must raise
+            def do_GET(self):  # noqa: N802
+                pass
+    with pytest.raises(TypeError, match="do_PUT"):
+        class _Other(GuardedHandler):  # noqa: F841
+            def do_PUT(self):  # noqa: N802
+                pass
+
+
+def test_the_do_method_exemption_is_exactly_the_team_view_and_cannot_grow():
+    from levain.http_guards import _DO_METHOD_EXEMPT
+
+    assert _DO_METHOD_EXEMPT == {("levain.team.view", "_ViewHandler")}
+
+
+def test_make_server_requires_an_explicit_read_token_choice(tmp_path):
+    """Head ruling: a security API whose silent default is ungated is the shape we delete. Omitting read_token is a
+    TypeError; None is the visible opt-out."""
+    import inspect
+
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    from levain.web_server import make_server
+
+    p = inspect.signature(make_server).parameters["read_token"]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="read_token"):
+        make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0)
+
+
+def test_a_header_with_surrounding_whitespace_still_matches(tmp_path):
+    with _server("serve", tmp_path) as port:
+        assert _request(port, "GET", "/substrate.json", token=f"  {_TOKEN} ")[0] == 200
+
+
+def test_the_old_header_works_and_is_reported_as_deprecated_once(tmp_path, capfd):
+    import levain.http_guards as hg
+
+    hg._warned_legacy.clear()
+    with _server("serve", tmp_path) as port:
+        for _ in range(2):
+            assert _request(port, "GET", "/substrate.json", token=None,
+                            headers={"X-Levain-Chat-Token": _TOKEN})[0] == 200
+    err = capfd.readouterr().err
+    assert err.count("X-Levain-Chat-Token, which is deprecated") == 1
+
+
+def test_publish_prints_the_token_only_to_a_terminal_and_always_leaves_a_0600_file(tmp_path, monkeypatch):
+    import io
+    import json
+    import os
+    import stat
+    from types import SimpleNamespace
+
+    from levain.http_guards import publish_launch_token, read_running
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    tok = "abcDEF123_-xyz"
+    srv = SimpleNamespace(launch_token=tok)
+    pipe, tty = io.StringIO(), _Tty()
+    pub = publish_launch_token(srv, "http://127.0.0.1:7499/", port=7499, kind="serve", stream=pipe)
+    assert tok not in pipe.getvalue() and "--open-running --port 7499" in pipe.getvalue()
+    assert pub.unlocked.startswith("http://127.0.0.1:7499/#code=") and tok not in pub.unlocked
+    rt = tmp_path / ".levain-runtime"
+    assert stat.S_IMODE(rt.stat().st_mode) == 0o700
+    assert stat.S_IMODE((rt / "7499.json").stat().st_mode) == 0o600
+    assert read_running(7499)["token"] == tok
+    pub.close()
+    assert not (rt / "7499.json").exists()
+    publish_launch_token(srv, "http://127.0.0.1:7498/", port=7498, kind="serve", stream=tty).close()
+    assert tok in tty.getvalue()
+    # a record whose writer is gone is refused, not opened
+    (rt / "7497.json").write_text(json.dumps({"pid": 2**22 + 12345, "token": "t", "url": "http://x/"}))
+    os.chmod(rt / "7497.json", 0o600)
+    with pytest.raises(ValueError, match="no longer running"):
+        read_running(7497)
+
+
+def test_publish_refuses_to_serve_silently_when_the_token_has_nowhere_to_go(tmp_path, monkeypatch):
+    """Not a terminal and the runtime file cannot be written: raise, so the server refuses to start instead of
+    running with a token nobody can get."""
+    import io
+    from types import SimpleNamespace
+
+    from levain.http_guards import publish_launch_token
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".levain-runtime").write_text("not a directory")
+    with pytest.raises(OSError):
+        publish_launch_token(SimpleNamespace(launch_token="tok"), "http://127.0.0.1:7496/", port=7496, kind="serve",
+                             stream=io.StringIO())
+
+
+def test_a_link_code_unlocks_once_and_the_token_never_rides_the_link(tmp_path, monkeypatch):
+    """Head ruling 2026-10-07 (L2 #2), after a measured run: Chrome's History kept every #token= link opened, fragment
+    included. The link now carries a single-use code that /unlock trades for the token, once."""
+    import io
+    import json
+
+    import levain.web_server as ws
+    from levain.http_guards import mint_link_code, publish_launch_token
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from levain.dashboard import AnnealPaths, SubstrateSource
+
+    httpd = ws.make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
+                           read_token=_TOKEN)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = httpd.server_address[1]
+        code = mint_link_code(httpd)
+
+        def unlock(c, **hdr):
+            got, _h, data = _raw_post(port, "/unlock", {"X-Levain-Token": "", "X-Levain-Link-Code": c, **hdr})
+            return got, json.loads(data)
+
+        assert unlock("not-a-code") == (403, {"error": "link_code", "message": "that link was already used or has expired"})
+        assert unlock(code) == (200, {"token": _TOKEN})
+        assert unlock(code)[0] == 403                                   # spent
+        assert unlock(mint_link_code(httpd), **{"Sec-Fetch-Site": "cross-site"})[0] == 403   # write-origin first
+        # /link mints a code, and only for a caller holding the token
+        got, _h, data = _raw_post(port, "/link", {"Content-Length": "0"})
+        assert got == 200 and unlock(json.loads(data)["code"])[0] == 200
+        assert _raw_post(port, "/link", {"X-Levain-Token": "wrong", "Content-Length": "0"})[0] == 403
+        # the startup link carries a code, and `levain serve --open-running` opens a fresh one
+        pub = publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="serve", stream=io.StringIO())
+        assert "#code=" in pub.unlocked and _TOKEN not in pub.unlocked
+        opened = []
+        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: opened.append(unlocked))
+        out = io.StringIO()
+        assert ws.open_running(port, stream=out) == 0
+        assert opened[0].startswith(f"http://127.0.0.1:{port}/#code=") and _TOKEN not in opened[0] + out.getvalue()
+        assert unlock(opened[0].split("#code=", 1)[1])[0] == 200
+        pub.close()
+        assert ws.open_running(port, stream=out) == 1
     finally:
         httpd.shutdown()
         httpd.server_close()

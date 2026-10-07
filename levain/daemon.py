@@ -16,9 +16,11 @@ LOAD-BEARING INVARIANT — per-user, NO admin/root. A launchd *user* agent
 ``schtasks`` task WITHOUT ``/RU SYSTEM`` — never a system LaunchDaemon / service. This keeps the
 install sovereign + sudo-free, and is exactly what rejects the Windows-*Service* path.
 
-THREAT-MODEL (M2): always-on means a 24/7 token-free loopback-LOCAL write window — any *local*
-process can POST to the cockpit. That is the same posture as any localhost dev server;
-browser/cross-origin attacks stay kernel-blocked (Host allowlist + CSRF + the loopback bind).
+THREAT-MODEL (M2): always-on means a 24/7 loopback-LOCAL cockpit behind a per-launch token. The
+daemon-run server never prints the token (its stdout is a log file); it leaves the unlocked link in
+``~/.levain-runtime/<port>.json`` (0600, in a 0700 directory an entity's floor denies), and the
+operator opens the page with ``levain serve --open-running``. Every restart mints a new token.
+Browser/cross-origin attacks stay blocked (Host allowlist + CSRF + the loopback bind).
 Off-box (``--host <mesh>``) is deliberately NOT daemonized here — an install-bearing serve is
 loopback-only by construction (its seed/config is operator-private).
 """
@@ -237,6 +239,27 @@ def _daemon_env(invocation: list[str]) -> dict[str, str]:
     pkg_parent = str(Path(__file__).resolve().parent.parent)
     return {"PATH": path, "PYTHONPATH": pkg_parent, "HOME": str(Path.home()),
             "PYTHONUNBUFFERED": "1"}
+
+
+# The umask every unit runs under (launchd ``Umask``, systemd ``UMask=``): files it creates are 0600, dirs 0700.
+_PRIVATE_UMASK = 0o077
+
+
+def _prepare_private_logs(spec: "DaemonSpec") -> None:
+    """Create the log directory 0700 and both log files 0600 before the service first writes them (an append
+    keeps a file's mode). Levain's own default directory on Linux is also chmod-ed back to 0700 if it exists
+    wider; a directory Levain does not own (macOS's ~/Library/Logs, a caller's --log-dir) is created private when
+    missing and otherwise left as it is."""
+    for log in (spec.stdout_log, spec.stderr_log):
+        d = log.parent
+        if not d.exists():
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
+        elif platform.system() != "Darwin" and d == _default_log_dir().expanduser().resolve():
+            os.chmod(d, 0o700)
+        if not log.exists():
+            os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+            os.chmod(log, 0o600)
 
 
 def _default_log_dir() -> Path:
@@ -467,6 +490,9 @@ class LaunchdProvider(DaemonProvider):
             "KeepAlive": spec.keep_alive,
             "StandardOutPath": str(spec.stdout_log),
             "StandardErrorPath": str(spec.stderr_log),
+            # Files the job creates (its logs among them) are this user's alone. Belt and braces: no
+            # Levain server prints its launch token to a non-terminal stdout (levain.http_guards).
+            "Umask": _PRIVATE_UMASK,
         }
         if spec.start_interval is not None:
             # A PERIODIC seat (K4a): launchd re-runs the job every N seconds and the process is
@@ -514,8 +540,7 @@ class LaunchdProvider(DaemonProvider):
     def install(self, spec: DaemonSpec) -> str:
         _refuse_root()
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_logs(spec)
         plist_path = self._plist_path(spec.label)
         domain = self._domain()
         # TRANSACTIONAL + ATOMIC (the install-honesty floor): a failed bootstrap must neither DESTROY a
@@ -832,6 +857,8 @@ class SystemdUserProvider(DaemonProvider):
             # untested by us — the distinction matters because the failure would be at unit LOAD.
             f"StandardOutput=append:{_systemd_specifiers(stdout_log)}",
             f"StandardError=append:{_systemd_specifiers(stderr_log)}",
+            # The launchd Umask analogue: what the unit creates is this user's alone.
+            f"UMask={_PRIVATE_UMASK:04o}",
         ]
         if not periodic and spec.keep_alive:
             # The launchd KeepAlive analogue: survive a crash. Deliberately NOT set for a seat —
@@ -963,8 +990,7 @@ class SystemdUserProvider(DaemonProvider):
                 "(StandardOutput=append:). Nothing was written."
             )
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_logs(spec)
 
         service_path = self._service_path(spec.label)
         timer_path = self._timer_path(spec.label)
@@ -1222,8 +1248,9 @@ def select_provider(system: str | None = None) -> DaemonProvider:
 
 
 THREAT_MODEL_NOTE = (
-    "An always-on serve is a 24/7 loopback-LOCAL write window: any LOCAL process on this "
-    "machine can write to the cockpit (no token — the localhost bind + Host/CSRF guards are "
-    "the auth, same as any localhost dev server). Cross-origin/browser attacks stay blocked. "
+    "An always-on serve is a 24/7 loopback-LOCAL write window behind a per-launch token. The "
+    "token is never written to the log: open the cockpit with `levain serve --open-running "
+    "--port <port>`, which reads it from ~/.levain-runtime/ (yours only, denied to entities). "
+    "Each restart mints a new token. Cross-origin/browser attacks stay blocked. "
     "Off-box (--host <mesh>) is NOT daemonized — an install-bearing serve is loopback-only."
 )

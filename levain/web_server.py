@@ -81,7 +81,6 @@ from __future__ import annotations
 
 import dataclasses
 import hmac
-import secrets
 import ipaddress
 import json
 import sys
@@ -94,7 +93,20 @@ from typing import Any
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
-from levain.http_guards import LAUNCH_TOKEN_HEADER, GuardedHandler, check_launch_token
+from levain.http_guards import (
+    LAUNCH_TOKEN_HEADER,
+    LINK_PATH,
+    UNLOCK_PATH,
+    GuardedHandler,
+    arm_launch_token,
+    check_launch_token,
+    new_launch_token,
+    publish_launch_token,
+    stop_on_sigterm,
+    read_running,
+    runtime_dir,
+)
+from levain.http_guards import open_unlocked as _open_browser  # the name tests patch on this module
 from levain.http_guards import host_header_allowed  # noqa: F401 — kept importable from its pre-2026-10-03 home
 from levain.jobs import JobRuntime, JobStore, JobStoreCorruptError
 from levain.writes import (
@@ -113,6 +125,7 @@ __all__ = [
     "build_substrate_json",
     "load_web_asset",
     "make_server",
+    "open_running",
     "run_web_server",
 ]
 
@@ -269,6 +282,8 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
+    UNLOCK_PATH,
+    LINK_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
@@ -1027,8 +1042,7 @@ def make_server(
     write_token: str | None = None,
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
-    chat_token: str | None = None,
-    launch_token: str | None = None,
+    read_token: str | None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1073,16 +1087,15 @@ def make_server(
       loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
-    ``launch_token`` turns on the launch-token gate: every route except the page shell (the built-in
-    assets and any ``extra_assets``) then refuses a request without it. A ``chat_host`` turns the gate
-    on too, with a fresh token if none was given. ``chat_token`` is the parameter's older name. With
-    neither, the server is ungated, as before. A token that is empty or not URL-safe base64 is refused.
+    ``read_token`` is REQUIRED, with no default, so every caller states its choice: a token turns on the
+    launch-token gate (every route except the page shell, the built-in assets and any ``extra_assets``,
+    then refuses a request without it), and ``None`` is the explicit, visible opt-out for an embedder
+    that runs its own auth. A ``chat_host`` always runs gated: with ``None`` it gets a fresh token. A
+    token that is empty or not URL-safe base64 is refused.
 
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
-    if launch_token is not None and chat_token is not None and launch_token != chat_token:
-        raise ValueError("launch_token and chat_token name one token; pass one of them.")
-    token = launch_token if launch_token is not None else chat_token
-    check_launch_token(token)
+    check_launch_token(read_token)
+    token = read_token
     # Wildcard / public binds are refused for ANY source — a non-loopback bind is for
     # ONE specific private/mesh interface, never every interface or the internet.
     reason = _rejected_bind_host(host)
@@ -1255,9 +1268,8 @@ def make_server(
     # The launch token: the caller's, or a fresh one when a chat host needs it. The page shell is the only
     # token-free set: the browser must load it to read the token from the fragment, and it carries no operator data.
     if token is None and chat_host is not None:
-        token = secrets.token_urlsafe(32)
-    httpd.launch_token = token
-    httpd.token_free_paths = frozenset(_ASSETS) | frozenset(extra_assets)
+        token = new_launch_token()
+    arm_launch_token(httpd, token, frozenset(_ASSETS) | frozenset(extra_assets))
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
     # server skips the POST /edit token check (the write-token-free localhost path is
@@ -1328,42 +1340,40 @@ def make_server(
     return httpd
 
 
-def print_launch_token(url: str, token: str | None) -> str:
-    """Publish the launch token on stdout and return the unlocked URL (``url`` itself when there is no token).
-
-    Flushed: this terminal is where the token is published (and, on macOS, the browser it opens), and stdout is
-    block-buffered when it is not a terminal (a supervisor, a log file), where it would otherwise not appear until
-    the buffer filled. RUN 2026-10-03: piped to a file, the token never showed. The link carries the token in the
-    URL FRAGMENT, which a browser keeps to itself: it is never sent to a server, so it reaches no access log and no
-    Referer. The page reads it and strips it from the address bar."""
-    if not token:
-        return url
-    print(f"  token (send as {LAUNCH_TOKEN_HEADER}; valid until this server stops): {token}", flush=True)
-    unlocked = f"{url}#token={token}"
-    print(f"  open it unlocked: {unlocked}", flush=True)
-    return unlocked
-
-
-def _open_browser(url: str, unlocked: str) -> None:
-    """Open the page. ``unlocked`` (the URL with the launch token in its fragment) goes ONLY to macOS's osascript
-    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
-    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
-    users can read from the process table: the very callers the token exists to keep out. So the osascript
-    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
-    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
-    and the token field asks."""
-    import webbrowser
-
+def open_running(port: int, *, stream: "Any | None" = None) -> int:
+    """``levain serve --open-running``: open the page of the Levain server on ``port``, unlocked, from the
+    runtime file it left (:func:`levain.http_guards.publish_launch_token`). The token reaches the browser
+    only through macOS's osascript controller; it is printed only to a terminal. Returns 1 when no live
+    server left a record for that port."""
+    out = stream if stream is not None else sys.stdout
     try:
-        ctl = webbrowser.get()
-        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
-            return
-    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
-        pass
+        rec = read_running(port)
+    except FileNotFoundError:
+        print(f"No running Levain server left a link for port {port} (looked in {runtime_dir()}).",
+              file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"Cannot open the server on port {port}: {exc}", file=sys.stderr)
+        return 1
+    # A fresh single-use link code from the server itself (POST /link, with the token): the link a browser opens,
+    # and keeps in its history, never carries the token.
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(f"http://127.0.0.1:{int(port)}/link", data=b"", method="POST",
+                                 headers={LAUNCH_TOKEN_HEADER: rec["token"]})
     try:
-        webbrowser.open(url)
-    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-        pass
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310 — loopback only
+            code = json.loads(r.read())["code"]
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"The server on port {port} did not give a link: {exc}", file=sys.stderr)
+        return 1
+    unlocked = f"{rec['url']}#code={code}"
+    _open_browser(rec["url"], unlocked)
+    print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}).", file=out, flush=True)
+    if bool(getattr(out, "isatty", lambda: False)()):
+        print(f"  if it opened locked, this link works once: {unlocked}", file=out, flush=True)
+    return 0
 
 
 def run_web_server(
@@ -1437,7 +1447,7 @@ def run_web_server(
 
     try:
         httpd = make_server(source, host=host, port=port, chat_host=chat_host,
-                            launch_token=secrets.token_urlsafe(32))
+                            read_token=new_launch_token())
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1
@@ -1464,7 +1474,17 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-    unlocked = print_launch_token(url, httpd.launch_token)
+    try:
+        published = publish_launch_token(httpd, url, port=bound_port, kind="serve")
+    except OSError as exc:
+        print(f"Could not write the launch token to {exc.filename or 'the runtime directory'}: {exc}.\n"
+              "This output is not a terminal, so there is no other place to hand it over; not serving.",
+              file=sys.stderr)
+        httpd.server_close()
+        if chat_host is not None:
+            chat_host.shutdown()
+        return 1
+    unlocked = published.unlocked
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
@@ -1472,11 +1492,14 @@ def run_web_server(
         # accepts it — opening before the blocking call is correct.
         _open_browser(url, unlocked)
 
+    restore_sigterm = stop_on_sigterm()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm()
+        published.close()
         httpd.server_close()
         if chat_host is not None:
             chat_host.shutdown()

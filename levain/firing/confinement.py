@@ -18,6 +18,7 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
 
 **The crown-jewels denylist (structural, never — the Phill-ratified starting set):**
   - flow's store ``~/.anneal-memory/`` (the identity moat, in file terms);
+  - the operator's Levain launch tokens ``~/.levain-runtime/`` (a running server's unlocked link);
   - credential files (declared by the caller — this module does NOT guess where secrets live);
   - sibling entities' ``<other>/.levain/`` stores (one entity can't read another's memory);
   - the ``~/.ssh`` key material (``ssh_mode="agent"``): the entity may USE keys via the agent socket
@@ -241,6 +242,7 @@ from typing import IO, Literal, NoReturn
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
 # are stdlib-only leaves, so this adds no dependency weight.
 from levain.firing.gate import GATE_SETTINGS, GateSetting
+from levain.http_guards import RUNTIME_DIR_NAME
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -968,6 +970,8 @@ def build_policy(
       - the operator-laptop memory store ``~/.anneal-memory/`` (subtree) — the identity moat in file
         terms (mirrors :func:`levain.firing.isolation.flow_store_dir`); a sovereign entity must never
         read the operator's own memory;
+      - the operator's Levain launch tokens ``~/.levain-runtime/`` (subtree) — a running server's
+        unlocked link, which would let an entity read that memory over loopback instead;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
@@ -1044,6 +1048,10 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
+    # The operator's Levain launch tokens (``~/.levain-runtime/<port>.json``, levain.http_guards): with one, an
+    # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
+    runtime = (home / RUNTIME_DIR_NAME).resolve()
+    subtrees.append(runtime)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1234,7 +1242,7 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs and not jewel.is_file():
+        if (jewel in listed_dirs or jewel == runtime) and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).

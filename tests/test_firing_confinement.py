@@ -3392,3 +3392,21 @@ def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
 
     assert cred_floor_label("Darwin").endswith("· the Keychain")
     assert "Keychain" not in cred_floor_label("Linux")
+
+
+def test_the_launch_token_runtime_dir_is_a_crown_jewel(tmp_path: Path, monkeypatch) -> None:
+    """Head ruling 2026-10-07: a running Levain server leaves its unlocked link in ~/.levain-runtime/<port>.json.
+    An entity holding it could read the operator's memory over loopback and drive chat, so both hands deny it:
+    the in-process check (file editor) and the rendered Seatbelt profile (bash)."""
+    from levain.firing.confinement import SeatbeltProvider, crown_jewel_reason
+    from levain.http_guards import RUNTIME_DIR_NAME
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rt = tmp_path / RUNTIME_DIR_NAME
+    rt.mkdir(mode=0o700)
+    (rt / "7420.json").write_text("{}")
+    policy = build_policy(_entity(tmp_path))
+    assert rt.resolve() in policy.deny_read_write
+    assert crown_jewel_reason(policy, rt / "7420.json") is not None
+    assert crown_jewel_reason(policy, rt) is not None
+    assert str(rt.resolve()) in SeatbeltProvider().render_profile(policy)

@@ -68,7 +68,7 @@ def _noinstall_writable_source(tmp_path: Path) -> SubstrateSource:
 
 @contextmanager
 def _serving_verbs(source: SubstrateSource, verbs: dict):
-    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs)
+    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs, read_token=None)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -358,17 +358,17 @@ class TestActionRegistration:
         # (so the off-box write-token governance, keyed on write_scope, always covers /action).
         with pytest.raises(ValueError, match="WRITABLE"):
             make_server(_readonly_source(tmp_path), port=0,
-                        extra_verbs={"send": ActionVerb(handler=lambda p: {})})
+                        extra_verbs={"send": ActionVerb(handler=lambda p: {})}, read_token=None)
 
     def test_refuses_non_actionverb_spec(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="ActionVerb"):
             make_server(_writable_source(tmp_path), port=0,
-                        extra_verbs={"send": (lambda p: {})})  # a bare callable, not an ActionVerb
+                        extra_verbs={"send": (lambda p: {})}, read_token=None)  # a bare callable, not an ActionVerb
 
     def test_refuses_empty_verb_name(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="non-empty"):
             make_server(_writable_source(tmp_path), port=0,
-                        extra_verbs={"": ActionVerb(handler=lambda p: {})})
+                        extra_verbs={"": ActionVerb(handler=lambda p: {})}, read_token=None)
 
     def test_refuses_bad_actionverb_field_types(self, tmp_path: Path) -> None:
         # codex L3: an ActionVerb whose runtime fields are the wrong type passes the isinstance
@@ -378,19 +378,19 @@ class TestActionRegistration:
         src = _writable_source(tmp_path)
         with pytest.raises(ValueError, match="label must be a string"):
             make_server(src, port=0,
-                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, label=object())})  # type: ignore[arg-type]
+                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, label=object())}, read_token=None)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="confirm_required must be a bool"):
             make_server(src, port=0,
-                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, confirm_required="yes")})  # type: ignore[arg-type]
+                        extra_verbs={"v": ActionVerb(handler=lambda p: {}, confirm_required="yes")}, read_token=None)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="handler must be callable"):
             make_server(src, port=0,
-                        extra_verbs={"v": ActionVerb(handler="nope")})  # type: ignore[arg-type]
+                        extra_verbs={"v": ActionVerb(handler="nope")}, read_token=None)  # type: ignore[arg-type]
 
     def test_action_is_a_reserved_route(self, tmp_path: Path) -> None:
         # /action can't be shadowed by a downstream extra_json route (it's a write route).
         with pytest.raises(ValueError, match="built-in route"):
             make_server(_writable_source(tmp_path), port=0,
-                        extra_json={"/action": lambda: b"{}"})
+                        extra_json={"/action": lambda: b"{}"}, read_token=None)
 
     def test_offbox_writable_with_verbs_needs_token(self, tmp_path: Path) -> None:
         # the security claim: extra_verbs ⟹ write_scope ⟹ the existing off-box refusal covers
@@ -400,7 +400,7 @@ class TestActionRegistration:
         # install-bearing source is loopback-only unconditionally — a stronger, separate rule.)
         with pytest.raises(ValueError, match="write_token"):
             make_server(_noinstall_writable_source(tmp_path), host="10.0.0.5", port=0,
-                        extra_verbs={"send": ActionVerb(handler=lambda p: {})})
+                        extra_verbs={"send": ActionVerb(handler=lambda p: {})}, read_token=None)
 
     def test_offbox_writable_empty_token_refused_not_bricked(self, tmp_path: Path) -> None:
         # an EMPTY-string write_token must REFUSE the off-box bind (not bind-then-403-every-write):
@@ -408,7 +408,7 @@ class TestActionRegistration:
         # — a clean refusal beats a silently bricked write surface [L2 LOW].
         with pytest.raises(ValueError, match="write_token"):
             make_server(_noinstall_writable_source(tmp_path), host="10.0.0.5", port=0,
-                        write_token="", extra_verbs={"send": ActionVerb(handler=lambda p: {})})
+                        write_token="", extra_verbs={"send": ActionVerb(handler=lambda p: {})}, read_token=None)
 
 
 class TestActionRoute:

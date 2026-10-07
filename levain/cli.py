@@ -619,6 +619,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Do not open a browser tab on startup.",
     )
     web_p.add_argument(
+        "--open-running",
+        action="store_true",
+        dest="open_running",
+        help=(
+            "Do not start a server: open the page of the Levain server already running on --port "
+            "(a `levain daemon` cockpit, or any serve, init --web or docs started elsewhere), unlocked. "
+            "It reads the link from ~/.levain-runtime/<port>.json, which only you can read."
+        ),
+    )
+    web_p.add_argument(
         "--write",
         action="store_true",
         help=(
@@ -1272,7 +1282,10 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from levain.web_server import run_web_server
+    from levain.web_server import open_running, run_web_server
+
+    if args.open_running:
+        return open_running(args.port)
 
     return run_web_server(
         path=args.path,
@@ -1331,6 +1344,7 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
         return 1
     print(result)
     print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
+    print(f"  open it: levain serve --open-running --port {args.port}")
     print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
     return 0
 

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import secrets
 import sys
 import threading
 from collections.abc import Sequence
@@ -53,13 +52,19 @@ from levain.install import (
 from levain.answers import validate_answers
 from levain.interview import build_field_plan
 from levain.packs import PackError, load_pack_manifest, order_activation_roots
-from levain.http_guards import GuardedHandler, check_launch_token
+from levain.http_guards import (
+    GuardedHandler,
+    arm_launch_token,
+    check_launch_token,
+    new_launch_token,
+    open_unlocked,
+    publish_launch_token,
+    stop_on_sigterm,
+)
 from levain.web_server import (
     _LOOPBACK_HOSTS,
     _is_loopback_host,
-    _open_browser,
     load_web_asset,
-    print_launch_token,
 )
 
 __all__ = ["DEFAULT_INIT_HOST", "DEFAULT_INIT_PORT", "make_init_server", "run_init_web"]
@@ -578,7 +583,7 @@ def make_init_server(
         )
     if adapter is not None and adapter not in _ADAPTERS:
         raise ValueError(f"unknown adapter {adapter!r}: must be one of {list(_ADAPTERS)}")
-    check_launch_token(launch_token)
+    check_launch_token(launch_token)   # before the bind, so a bad token leaves no socket behind
 
     # Resolve + validate the pack set BEFORE binding. `--path` expansion semantics
     # (argparse does not expand `~`), then a full compose (manifests + seed rosters
@@ -628,8 +633,7 @@ def make_init_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {bound.lower()}
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     httpd.install_lock = threading.Lock()
-    httpd.launch_token = launch_token or secrets.token_urlsafe(32)
-    httpd.token_free_paths = frozenset(_ASSETS)
+    arm_launch_token(httpd, new_launch_token() if launch_token is None else launch_token, frozenset(_ASSETS))
     return httpd
 
 
@@ -695,15 +699,24 @@ def run_init_web(
     if httpd.pack_names:
         print(f"  composing packs: {', '.join(httpd.pack_names)}")
     print("  loopback-only · governed · Ctrl+C to stop")
-    unlocked = print_launch_token(url, httpd.launch_token)
+    try:
+        published = publish_launch_token(httpd, url, port=bound_port, kind="init")
+    except OSError as exc:
+        print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
+              "other place to hand it over; not serving.", file=sys.stderr)
+        httpd.server_close()
+        return 1
 
     if open_browser:
-        _open_browser(url, unlocked)
+        open_unlocked(url, published.unlocked)
 
+    restore_sigterm = stop_on_sigterm()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm()
+        published.close()
         httpd.server_close()
     return 0

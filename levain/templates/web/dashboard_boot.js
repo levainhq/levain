@@ -73,6 +73,9 @@
   function launchHeaders(h) {
     return window.LevainToken ? window.LevainToken.headers(h) : h;
   }
+  // For the page's other scripts (dashboard_team.js): the launch-token header as a plain object, {} without a
+  // token. No arguments; a fresh object each call.
+  window.levainAuthHeaders = function () { return launchHeaders({}); };
   function readHeaders() {
     const h = launchHeaders({});
     const tok = storedToken();

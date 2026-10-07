@@ -1201,3 +1201,42 @@ def test_systemd_reinstall_during_a_turn_reads_a_shebang_cmdline(systemd, tmp_pa
     assert "PREVIOUS definition" not in systemd.install(seat)
     changed = replace(seat, argv=[*seat.argv[:-1], "a different task"])
     assert "PREVIOUS definition" in systemd.install(changed)
+
+
+# --- head ruling 2026-10-07 (L2 MED): a daemon's logs are private, and hold no token ----------------------------
+
+
+def test_every_unit_runs_with_a_private_umask():
+    spec = build_spec(install_path=Path("/tmp/inst"), port=7420, label="com.levainhq.t")
+    assert plistlib.loads(LaunchdProvider().render_unit(spec).encode())["Umask"] == 0o077
+    assert "UMask=0077" in SystemdUserProvider().render_unit(spec).splitlines()
+
+
+def test_the_log_directory_and_files_are_created_private_under_a_linux_style_path(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    import levain.daemon as d
+
+    monkeypatch.setattr(d.platform, "system", lambda: "Linux")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old = os.umask(0o022)   # the wide default a login shell hands a user unit
+    try:
+        spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t")
+        assert spec.stdout_log.parent == tmp_path / ".local" / "state" / "levain"
+        d._prepare_private_logs(spec)
+        assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
+        for log in (spec.stdout_log, spec.stderr_log):
+            assert stat.S_IMODE(log.stat().st_mode) == 0o600
+        # an existing, wider Levain-owned directory is narrowed back
+        os.chmod(spec.stdout_log.parent, 0o755)
+        d._prepare_private_logs(spec)
+        assert stat.S_IMODE(spec.stdout_log.parent.stat().st_mode) == 0o700
+    finally:
+        os.umask(old)
+
+
+def test_the_threat_model_note_no_longer_says_there_is_no_token():
+    from levain.daemon import THREAT_MODEL_NOTE
+
+    assert "no token" not in THREAT_MODEL_NOTE and "--open-running" in THREAT_MODEL_NOTE

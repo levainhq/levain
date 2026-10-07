@@ -21,14 +21,34 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import secrets
+import stat
+import sys
+import threading
+import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, TextIO
 
 __all__ = [
     "LAUNCH_TOKEN_HEADER",
+    "LINK_CODE_HEADER",
+    "LINK_PATH",
+    "RUNTIME_DIR_NAME",
+    "UNLOCK_PATH",
     "GuardedHandler",
+    "PublishedToken",
+    "arm_launch_token",
     "check_launch_token",
     "host_header_allowed",
+    "mint_link_code",
+    "new_launch_token",
+    "open_unlocked",
+    "publish_launch_token",
+    "read_running",
+    "runtime_dir",
+    "stop_on_sigterm",
 ]
 
 # The LAUNCH TOKEN (np-ebb8a399, codex HIGH f5d5e483a0c7e3a8). Loopback reachability is not file access: another OS
@@ -40,6 +60,25 @@ __all__ = [
 # covered every route; it is still accepted so a script written against it keeps working.
 LAUNCH_TOKEN_HEADER = "X-Levain-Token"
 _LEGACY_TOKEN_HEADERS = ("X-Levain-Chat-Token",)
+
+# The link a browser opens never carries the token. It carries a single-use LINK CODE (``#code=...``) that the page
+# trades once, by ``POST /unlock``, for the token. Measured 2026-10-07: Chrome's History database kept every
+# ``#token=`` link this lane opened, fragment included, after the page had stripped it from the address bar; a spent
+# code is all such a record can hold now. A code expires unused after LINK_CODE_SECONDS.
+LINK_CODE_HEADER = "X-Levain-Link-Code"
+LINK_CODE_SECONDS = 600
+UNLOCK_PATH = "/unlock"   # token-free: trades a link code for the token
+LINK_PATH = "/link"       # needs the token: mints a fresh link code (`levain serve --open-running`)
+
+# Where a running server leaves its token for the operator, one file per port: a 0700 directory of 0600
+# files in the home directory. It is a crown jewel (levain.firing.confinement denies it to an entity's hands), so a
+# server's token reaches the operator's terminal or this directory and nothing else: never a log, never a pipe.
+RUNTIME_DIR_NAME = ".levain-runtime"
+
+
+def new_launch_token() -> str:
+    """A fresh launch token: 256 bits, URL-safe base64 (43 characters)."""
+    return secrets.token_urlsafe(32)
 
 
 def check_launch_token(token: "str | None") -> None:
@@ -109,9 +148,36 @@ def host_header_allowed(
     return hostname in allowed_hosts
 
 
+_warned_legacy: set[str] = set()
+
+
+def _warn_legacy_header(name: str) -> None:
+    """Once per process, on stderr: a client sent the token in a deprecated header."""
+    if name in _warned_legacy:
+        return
+    _warned_legacy.add(name)
+    print(f"levain: a client sent the token as {name}, which is deprecated; send {LAUNCH_TOKEN_HEADER}.",
+          file=sys.stderr, flush=True)
+
+
+# The one handler allowed to define its own do_* methods, named so the set can only shrink: the team view routes its
+# own do_GET until its launch-token gate lands (seat/1007-5-teamview), and that commit deletes this entry.
+_DO_METHOD_EXEMPT = frozenset({("levain.team.view", "_ViewHandler")})
+
+
 class GuardedHandler(BaseHTTPRequestHandler):
     """The shared guard surface. A subclass sets ``server_version``, and its server instance must
-    carry ``allowed_hosts`` (the loopback names plus the bound address)."""
+    carry ``allowed_hosts`` (the loopback names plus the bound address) and ``launch_token`` (see
+    :func:`arm_launch_token`). A subclass defines ``_route`` (and ``_post`` if it has a write route), never a
+    ``do_*`` method: defining one raises ``TypeError`` when the class is created, because it would run before, and
+    instead of, the guards in :meth:`do_GET` / :meth:`do_HEAD` / :meth:`do_POST`."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        own = sorted(n for n in vars(cls) if n.startswith("do_"))
+        if own and (cls.__module__, cls.__qualname__) not in _DO_METHOD_EXEMPT:
+            raise TypeError(f"{cls.__qualname__} defines {own}: a GuardedHandler routes through _route / _post, "
+                            "so the shared guards (Host, origin, launch token) always run first.")
 
     # A tidy, modern protocol version (enables keep-alive + proper 1.1 behavior).
     protocol_version = "HTTP/1.1"
@@ -181,8 +247,10 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if not expected:
             return False
         for name in (LAUNCH_TOKEN_HEADER, *_LEGACY_TOKEN_HEADERS):
-            supplied = self.headers.get(name)
+            supplied = (self.headers.get(name) or "").strip()
             if supplied and hmac.compare_digest(supplied.encode("utf-8"), expected):
+                if name != LAUNCH_TOKEN_HEADER:
+                    _warn_legacy_header(name)
                 return True
         return False
 
@@ -335,12 +403,213 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self._route(head=True)
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
-        if self._refuse_write_origin() or self._refuse_untokened_write():
+        if self._refuse_write_origin():
             return
+        path = self.path.split("?", 1)[0]
+        if path == UNLOCK_PATH and self._launch_token_required():
+            return self._unlock()
+        if self._refuse_untokened_write():
+            return
+        if path == LINK_PATH and self._launch_token_required():
+            self.close_connection = True   # any body is left unread
+            return self._send_json({"code": mint_link_code(self.server), "expires_in": LINK_CODE_SECONDS})
         self._post()
+
+    def _unlock(self) -> None:
+        """``POST /unlock``: trade a single-use link code (``X-Levain-Link-Code``) for the launch token. The one POST
+        that needs no token, so it is refused unless the code is one this server minted, unused and unexpired; the
+        code is spent by the attempt that matches it. Reached only after the Host and write-origin checks, so a
+        cross-site page cannot call it, and a caller that never saw the link has nothing to send. No body is read."""
+        self.close_connection = True
+        code = (self.headers.get(LINK_CODE_HEADER) or "").strip()
+        if code and _spend_link_code(self.server, code):
+            return self._send_json({"token": self.server.launch_token})
+        self._send_json({"error": "link_code", "message": "that link was already used or has expired"}, 403)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Quiet by default: each server prints its own startup line, and a per-request access log
         is noise in an interactive terminal. ``LEVAIN_SERVE_VERBOSE`` restores it on stderr."""
         if os.environ.get("LEVAIN_SERVE_VERBOSE"):
             super().log_message(fmt, *args)
+
+
+# -- the launch token's lifecycle, for every server ----------------------------------------------------------------
+
+
+def arm_launch_token(server: Any, token: "str | None", token_free_paths: "frozenset[str] | set[str]") -> None:
+    """Set a server's gate: ``token`` (None: ungated, an explicit choice) and the paths that skip it (the page shell,
+    which must carry no operator data). The one place a server's gate is configured."""
+    check_launch_token(token)
+    server.launch_token = token
+    server.token_free_paths = frozenset(token_free_paths)
+    server.link_codes = {}
+    server.link_codes_lock = threading.Lock()
+
+
+def _link_state(server: Any) -> "tuple[dict[str, float], threading.Lock]":
+    codes = getattr(server, "link_codes", None)
+    lock = getattr(server, "link_codes_lock", None)
+    if codes is None or lock is None:
+        codes, lock = {}, threading.Lock()
+        server.link_codes, server.link_codes_lock = codes, lock
+    return codes, lock
+
+
+def mint_link_code(server: Any) -> str:
+    """A fresh single-use link code for ``server`` (see ``LINK_CODE_HEADER``)."""
+    codes, lock = _link_state(server)
+    code = new_launch_token()
+    now = time.monotonic()
+    with lock:
+        for c in [c for c, exp in codes.items() if exp <= now]:
+            del codes[c]
+        codes[code] = now + LINK_CODE_SECONDS
+    return code
+
+
+def _spend_link_code(server: Any, code: str) -> bool:
+    """True, once, for a code this server minted and has not seen expire. Compared in constant time against every
+    live code, so the answer's timing does not depend on how much of a code matches."""
+    codes, lock = _link_state(server)
+    now = time.monotonic()
+    supplied = code.encode("utf-8")
+    with lock:
+        hit = None
+        for c, exp in list(codes.items()):
+            if hmac.compare_digest(c.encode("utf-8"), supplied) and exp > now:
+                hit = c
+        if hit is None:
+            return False
+        del codes[hit]
+        return True
+
+
+def runtime_dir() -> Path:
+    return Path.home() / RUNTIME_DIR_NAME
+
+
+def _private_runtime_dir() -> Path:
+    """The runtime directory, created 0700 and refused if it is a symlink or not this user's."""
+    d = runtime_dir()
+    d.mkdir(mode=0o700, exist_ok=True)
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+        raise OSError(f"{d} is not a directory this user owns; refusing to write a launch token there")
+    os.chmod(d, 0o700)
+    return d
+
+
+@dataclass
+class PublishedToken:
+    """What :func:`publish_launch_token` did: the unlocked URL, and the runtime file to remove at shutdown."""
+
+    unlocked: str
+    path: "Path | None"
+
+    def close(self) -> None:
+        """Remove this server's runtime file, if it is still ours (a later server on the port may have replaced it)."""
+        if self.path is None:
+            return
+        try:
+            if json.loads(self.path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+                self.path.unlink()
+        except (OSError, ValueError):
+            pass
+
+
+def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
+                         stream: "TextIO | None" = None) -> PublishedToken:
+    """Hand the operator the server's token, and nobody else.
+
+    The token goes to ``~/.levain-runtime/<port>.json`` (0600, in a 0700 directory an entity's hands are denied),
+    where ``levain serve --open-running --port <port>`` reads it to open the page. It is printed only when ``stream``
+    (stdout by default) is a terminal; when it is not (launchd, systemd, a pipe, a log file) only the file's path is
+    printed, because a log is a file an entity, a backup or another reader may see. The returned ``unlocked`` link
+    carries a single-use link code, never the token (see ``LINK_CODE_HEADER``). If the file cannot be written and
+    the stream is not a terminal, this raises ``OSError``: the operator would have no way to get the token."""
+    token = getattr(server, "launch_token", None)
+    if not token:
+        return PublishedToken(url, None)
+    out = stream if stream is not None else sys.stdout
+    unlocked = f"{url}#code={mint_link_code(server)}"
+    path: "Path | None" = None
+    err: "OSError | None" = None
+    try:
+        d = _private_runtime_dir()
+        path = d / f"{int(port)}.json"
+        tmp = d / f".{int(port)}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid()}, fh)
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        err, path = exc, None
+    tty = bool(getattr(out, "isatty", lambda: False)())
+    if tty:
+        print(f"  token (send as {LAUNCH_TOKEN_HEADER}; valid until this server stops): {token}", file=out, flush=True)
+        print(f"  open it unlocked (the link works once): {unlocked}", file=out, flush=True)
+    elif err is not None:
+        raise err
+    else:
+        print(f"  token: not printed here (this output is not a terminal); it is in {path} (0600). "
+              f"Open the page with: levain serve --open-running --port {int(port)}", file=out, flush=True)
+    return PublishedToken(unlocked, path)
+
+
+def read_running(port: int) -> dict[str, Any]:
+    """The runtime record a live server on ``port`` left, or ``OSError`` / ``ValueError`` saying why there is none
+    (no file, unreadable, or the process that wrote it is gone)."""
+    path = runtime_dir() / f"{int(port)}.json"
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or not isinstance(rec.get("token"), str) or not isinstance(rec.get("url"), str):
+        raise ValueError(f"{path} is not a Levain runtime record")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise ValueError(f"the server that wrote {path} (pid {pid}) is no longer running") from None
+    except PermissionError:
+        pass  # alive, another user's process: the record cannot be ours to use, but it is not stale either
+    return rec
+
+
+def open_unlocked(url: str, unlocked: str) -> None:
+    """Open the page. ``unlocked`` (the URL with the launch token in its fragment) goes ONLY to macOS's osascript
+    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
+    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
+    users can read from the process table: the very callers the token exists to keep out. So the osascript
+    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
+    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
+    and the page's unlock form asks."""
+    import webbrowser
+
+    try:
+        ctl = webbrowser.get()
+        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
+            return
+    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
+        pass
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
+        pass
+
+
+def stop_on_sigterm() -> "Callable[[], None]":
+    """Make SIGTERM (what launchd and systemd send to stop a unit) stop ``serve_forever`` the way Ctrl+C does, so a
+    server's ``finally`` runs and its runtime file is removed. Only from the main thread, where Python allows it.
+    Returns the call that puts the previous handler back."""
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    def _stop(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, _stop)
+    return lambda: signal.signal(signal.SIGTERM, previous)

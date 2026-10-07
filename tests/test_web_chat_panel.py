@@ -25,7 +25,7 @@ def test_the_chat_script_is_served_and_the_page_loads_it(tmp_path):
     from levain.web_server import make_server
 
     source = SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "memory.db"))
-    httpd = make_server(source, host="127.0.0.1", port=0)
+    httpd = make_server(source, host="127.0.0.1", port=0, read_token=None)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
@@ -216,6 +216,17 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
     byText(panel, "Start session").fire("click", { isTrusted: true }); await sleep(60);
     ok(calls.some((c) => c.path === "/chat/open"), "one click starts a session on the only entity");
     ok(calls.every((c) => !c.url.includes(TOKEN) && !String(c.body || "").includes(TOKEN)), "the token is never in a request URL or body");
+    console.log("PASS"); return;
+  }
+  if (MODE === "unlockkeeps") {
+    // head ruling 2026-10-07 (second L1 (c)): an unlock the board asked for must not drop an open chat session.
+    ctx.LevainToken.lock(null, null);
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(byText(chatPanel(), "Send"), "a session is open");
+    ctx.LevainToken.lock(null, TOKEN);   // the board's read was refused: the form comes back
+    find(lockForm(), (n) => n.tagName === "input").value = TOKEN; lockForm().fire("submit", {}); await sleep(40);
+    ok(byText(chatPanel(), "Send") && !byText(chatPanel(), "Start session"), "the session is still open after the unlock");
     console.log("PASS"); return;
   }
   if (MODE === "stalelisting") {
@@ -489,7 +500,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
-                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "stalelisting", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
+                                  "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "turn403unlock", "stalelisting", "unlockkeeps", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities",
                                   "leakafterapprove", "leaklastjob",
