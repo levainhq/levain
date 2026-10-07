@@ -510,3 +510,25 @@ def test_live_a_hostile_env_runs_nothing_and_the_shell_still_works(tmp_path, mon
         r = sh.run("printf 'ok\\n'", timeout=20)
         assert "ok" in r.output
         assert "HOSTILE" not in r.output
+
+
+def test_a_ledger_that_cannot_be_written_refuses_before_any_start(tmp_path, monkeypatch):
+    """codex (L3 r2 frozen tip): the claim commit failing (ENOSPC, say) was ignored and the shell
+    started, while the ledger on disk did not carry its claim; another session's close could then
+    remove a placeholder this shell's mask stands on."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+
+    def full_disk(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(conf.os, "replace", full_disk)
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert not started

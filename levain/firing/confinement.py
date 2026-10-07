@@ -11,7 +11,9 @@ confinement CORE (the policy + the profile + the persistent sandboxed shell), be
 allow the workspace`` — a JAIL. A CC replacement inverts it: ``(allow default) → DENY the crown
 jewels``. The OS sandbox stops being a jail and becomes a **structural FLOOR** that keeps the
 (less-trusted, open-model) entity out of the sovereignty crown jewels no matter what it is told to
-do, while it otherwise works like CC on real repos. This inversion also DISSOLVES the hardest part
+do, while it otherwise works like CC on real repos (one stated exception, Linux only: inside bash
+the entries directly in ``$HOME`` are read-only; see step (0) of :func:`_bwrap_plan_impl`). This
+inversion also DISSOLVES the hardest part
 of the old design — a default-DENY profile blocked ``cat``/``python`` from loading their own libs, so
 it needed an empirically-hunted "system allow-set"; a default-ALLOW profile needs NO allow-set at all
 (every tool loads its libs freely), so the profile is JUST the denylist.
@@ -1818,9 +1820,27 @@ def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
     except OSError as exc:
         return f"the opened file could not be identified ({exc}) — refused (fail-closed)"
     reason = crown_jewel_reason(policy, path)
-    if reason is None and st.st_nlink > 1:
-        reason = linked_jewel_reason(policy, path)
-    return reason
+    if reason is not None:
+        return reason
+    # The opened object's own identity, never a second stat of its name: the shell can unlink or
+    # replace that name between the open and this check (codex, L3 r2), and then the name leads to
+    # another file. The jewel walk runs when the object has other names or its name no longer leads
+    # to it; a single-name file still at its name is judged by the name, as above.
+    try:
+        named = os.stat(path)
+        moved = (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino)
+    except (OSError, ValueError):
+        moved = True
+    if st.st_nlink < 2 and not moved:
+        return None
+    try:
+        jewels = _jewel_inodes(policy)
+    except ConfinementError as exc:
+        return f"the opened file could not be checked against the crown jewels: {exc}"
+    hit = jewels.get((st.st_dev, st.st_ino))
+    if hit is not None:
+        return f"the opened file is another name for the crown jewel {hit[1]}, which the floor denies"
+    return None
 
 
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
@@ -3432,7 +3452,21 @@ def _bwrap_file_target(f: Path, frozen: tuple[Path, ...] = ()) -> Path:
     if not f.is_symlink():
         return _host_spelling(f)
     _refuse_replaceable_link(f, frozen)
-    return f.resolve()
+    return _link_target(f)
+
+
+def _link_target(f: Path) -> Path:
+    """The real path of the link ``f``, refusing one that leads nowhere. ``resolve()`` alone returns
+    a loop's own path on Python 3.13 (it raised on 3.12), and a mask aimed there, or at a dangling
+    link's absent target, would make bwrap abort or create the target on the host."""
+    try:
+        return f.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ConfinementError(
+            f"{f} is a symlink that leads nowhere (dangling, or a loop). The Linux floor masks a "
+            "link at its target, and this one has none. Refusing to grant bash hands (fail-closed). "
+            "Remove or fix the link."
+        ) from None
 
 
 def _refuse_replaceable_link(f: Path, frozen: tuple[Path, ...] = ()) -> None:
@@ -4060,7 +4094,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                     "the link could be swapped for a planted directory. Refusing to grant bash "
                     "hands (fail-closed). Replace the symlink with the real directory to use bash."
                 )
-            entry = (str(d.resolve()), False)
+            entry = (str(_link_target(d)), False)
         elif d.is_dir():
             entry = (str(d.resolve()), False)
         elif any(c == str(_host_spelling(d)) or c.startswith(str(_host_spelling(d)) + "/")
@@ -4970,6 +5004,13 @@ class BwrapProvider(ConfinementProvider):
                 # Everything this spawn made is claimed too, parents included (an absent ~/.config
                 # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
                 txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
+        if txn.ok and txn.problem is not None:
+            # The claim never reached the disk, so another session's close could remove a placeholder
+            # this shell's mask would stand on, and the shell could then plant it (codex, L3 r2).
+            raise ConfinementError(
+                f"{txn.problem} — refusing to grant bash hands (fail-closed): without its claim on "
+                "disk, another session could remove a file this shell's floor relies on."
+            )
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).

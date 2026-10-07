@@ -377,3 +377,25 @@ def test_a_file_another_process_creates_between_the_two_opens_is_opened(tmp_path
     finally:
         T._EDITOR_FLOOR.reset(token)
     assert raced and f.read_text() == "ok"
+
+
+def test_a_jewel_opened_through_a_name_swapped_away_before_the_check_is_refused(
+    policy, tmp_path: Path, monkeypatch
+) -> None:
+    """codex (L3 r2 frozen tip): the editor opened a hardlink to a jewel, the shell then replaced that
+    name with a benign file, and the check re-stat'ed the NAME, so the opened jewel passed. The opened
+    object's own identity decides now."""
+    jewel = tmp_path / ".anneal-memory" / "m.db"
+    jewel.parent.mkdir(exist_ok=True)
+    jewel.write_text("SECRET")
+    pol = build_policy(tmp_path / "ent")
+    work = tmp_path / "work"
+    work.mkdir()
+    x = work / "x"
+    os.link(jewel, x)
+    with open(x) as fh:
+        x.unlink()
+        x.write_text("benign")                 # the name now leads to another file
+        # How Linux names it (/proc/self/fd/N); macOS's F_GETPATH may name the jewel's other path.
+        monkeypatch.setattr(C, "opened_file_path", lambda fd: f"{x} (deleted)")
+        assert C.opened_file_reason(pol, fh.fileno()) is not None

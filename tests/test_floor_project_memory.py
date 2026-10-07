@@ -243,17 +243,14 @@ def test_live_a_symlinked_store_cannot_be_swapped_for_a_planted_tree(
     home: Path, tmp_path: Path, store: str
 ) -> None:
     """L2 MED (run on macOS before the fix: rm of the link, then a planted trust file and continuity).
-    macOS refuses the unlink; Linux refuses to start bash while the store is a symlink."""
+    Both platforms refuse the unlink and the rename: macOS by its rule on the link, Linux because
+    $HOME's own entries are read-only inside bash (ruling 2026-10-07; it refused bash before)."""
     real = _project_home(tmp_path / f"real{store}")
     link = home / store
     link.symlink_to(real)
     policy = build_policy(_entity(home))
-    if _LINUX:
-        with pytest.raises(ConfinementError, match="symlink"):
-            select_provider().spawn_shell(policy)
-        return
     with select_provider().spawn_shell(policy) as sh:
-        _ok(sh, f"touch '{home}/control'")
+        _ok(sh, f"touch '{policy.workspace}/control'")
         _refused(sh, f"rm '{link}'")
         _refused(sh, f"mv '{link}' '{home}/moved'")
     assert link.is_symlink() and (real / "derive-trust.json").exists()
