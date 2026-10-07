@@ -244,10 +244,11 @@ class TurnResult:
     pending: tuple[PendingEfferent, ...] = ()
     """What the gate is holding, for the human to judge.
 
-    May be empty even when :attr:`gated` is ``True`` (see above) — an anomaly the report itself
-    surfaces rather than hides. Each entry carries what the entity proposed and why that
-    classification fanned in, because an operator deciding on ``git push --force`` needs the
-    command, not the tool's name."""
+    Never empty when :attr:`gated` is ``True``: a halt the report cannot describe carries one loud
+    ``<unreported>`` placeholder instead (:meth:`EntitySession._gate_report`), because "held,
+    contents unknown" and "nothing held" must not look alike. Each entry carries what the entity
+    proposed and why that classification fanned in, because an operator deciding on
+    ``git push --force`` needs the command, not the tool's name."""
 
     unreadable_call: bool = False
     """:attr:`reply` is the model's raw tool-call syntax, not an answer (:func:`levain.firing.agent_reply.unreadable_tool_call`):

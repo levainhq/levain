@@ -140,6 +140,14 @@ def _open(host, name):
     return out["session_id"], st
 
 
+def _until(pred, timeout: float = 5.0, what: str = "") -> None:
+    end = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.01)
+
+
 def _halt() -> _Out:
     return _Out(reply=None, gated=True, pending=(_HELD,), held_digest="d1")
 
@@ -1107,7 +1115,9 @@ def test_a_broken_turn_whose_teardown_raises_still_publishes_its_result(tmp_path
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "done" and st["result"]["error"] == "boom"
-    assert host.session_status(sid)["state"] == "broken"
+    # a close that raised is not a release (ruled 2026-10-07): counted, and it says why
+    view = host.session_status(sid)
+    assert view["state"] == "release_failed" and "teardown failed" in view["error"]
 
 
 # -- L1 on 3331e91..3328b56 -----------------------------------------------------------------------------------
@@ -1144,7 +1154,9 @@ def test_a_reaper_whose_driver_cannot_say_does_not_spin(tmp_path, monkeypatch):
     sid, _ = _open(host, "alpha")
     host.close(sid)
     time.sleep(1.0)
-    assert d.asks < 20 and host.session_status(sid)["state"] == "closing"   # counted, and not spinning
+    # a driver that cannot say whether it released is recorded, not polled forever (ruled 2026-10-07)
+    assert d.asks < 20 and host.session_status(sid)["state"] == "release_failed"
+    assert "cannot tell" in host.session_status(sid)["error"]
 
 
 def test_shutdown_closes_sessions_side_by_side(tmp_path):
@@ -1179,7 +1191,7 @@ def test_a_settle_that_fails_after_a_late_release_still_ends_the_record(tmp_path
     def settle():
         raise RuntimeError("publish failed")
 
-    host._close_then(rec, d, settle)
+    host._close_then(rec, rec.driver, settle)
     d.done.set()
     end = time.monotonic() + 5
     while host.session_status(sid)["state"] == "busy" and time.monotonic() < end:
@@ -1191,46 +1203,37 @@ def test_a_settle_that_fails_after_a_late_release_still_ends_the_record(tmp_path
 
 
 class _Forcing(_Fake):
-    """A driver whose graceful release fails; `force_ok` says whether its force release confirms one."""
+    """A driver whose graceful release fails and that offers a force release."""
 
-    def __init__(self, force_ok: bool):
+    def __init__(self):
         super().__init__([])
         self.caps = DriverCaps(can_force_release=True)
-        self.force_ok, self.forced, self.released = force_ok, 0, False
-
-    def close(self):
-        self.closed = True
+        self.forced = 0
 
     def wait_closed(self, timeout):
-        return self.released
+        return False
 
     def release_error(self):
-        return None if self.released else "OSError: the shell would not stop"
+        return "OSError: the shell would not stop"
 
-    def force_release(self):
+    def force_release(self, native):
         self.forced += 1
-        if not self.force_ok:
-            raise OSError("kill failed")
-        self.released = True
 
 
-@pytest.mark.parametrize("force_ok", [True, False])
-def test_a_failed_release_is_forced_once_where_offered_and_otherwise_stays_counted(tmp_path, force_ok):
-    """Ruling 2026-10-07 (codex r2 HIGH): a release that failed is not a release. The driver's force release
-    runs once; only a confirmed one frees the slot; otherwise the session reads release_failed, counted."""
-    d = _Forcing(force_ok)
+def test_a_failed_release_stays_counted_and_the_host_never_forces_it(tmp_path):
+    """Ruling 2026-10-07 (codex r2 HIGH; r3 ruling (b), complement r3 MED): a release that failed is not a
+    release, and the host never calls force_release (a blocking one would hold the reaper every session
+    shares); an escalation is the driver's own, on its release worker."""
+    d = _Forcing()
     host = _host(tmp_path, {"alpha": d}, max_sessions=1)
     sid, _ = _open(host, "alpha")
     view = host.close(sid)
-    assert d.forced == 1
-    if force_ok:
-        assert view["state"] == "closed"
-    else:
-        assert view["state"] == "release_failed" and "kill failed" in view["error"]
-        assert "release_failed_since" in view
-        with pytest.raises(ChatError) as e:
-            host.open("alpha")
-        assert e.value.code == "too_many_sessions"
+    assert d.forced == 0
+    assert view["state"] == "release_failed" and "would not stop" in view["error"]
+    assert "release_failed_since" in view
+    with pytest.raises(ChatError) as e:
+        host.open("alpha")
+    assert e.value.code == "too_many_sessions"
 
 
 def test_the_reaper_does_not_spin_on_a_driver_that_answers_at_once(tmp_path):
@@ -1349,3 +1352,277 @@ def test_shutdown_is_bounded_even_by_a_driver_that_breaks_its_close_bound(tmp_pa
     host.shutdown()
     assert time.monotonic() - started < 2 and host.session_status(sid)["state"] == "closing"
     gate.set()
+
+
+# -- L3 r3 (input e37c5536d052c9b5) and the 2026-10-07 ruling: ONE boundary into driver code ----------------
+
+
+class _Escape(BaseException):
+    """Not an Exception: what a TurnTimeout, a KeyboardInterrupt or a SystemExit looks like to a catcher."""
+
+
+@pytest.fixture
+def escaped(monkeypatch):
+    """Every exception that leaves a thread, of any class (the boundary's whole claim is that none does)."""
+    seen: list[str] = []
+    monkeypatch.setattr(threading, "excepthook", lambda args: seen.append(
+        f"{args.thread.name if args.thread else '?'}: {args.exc_type.__name__}"))
+    return seen
+
+
+def _raising(method: str, base: type[_Fake] = _Fake, **kw):
+    class Raises(base):  # type: ignore[valid-type,misc]
+        pass
+
+    def boom(self, *a, **k):
+        raise _Escape(f"{method} escaped")
+
+    setattr(Raises, method, boom)
+    return Raises(**kw) if kw else Raises([])
+
+
+@pytest.mark.parametrize("method", ["close", "wait_closed", "release_error"])
+def test_nothing_a_release_probe_raises_escapes_and_the_record_stays_counted(tmp_path, escaped, method):
+    """codex r3 HIGH (RAN): `wait_closed` raising a BaseException escaped `_released()`, so `_close_then` never
+    queued the driver, the record stayed closing for good and, on the reaper, the one reaper thread died.
+    Through the boundary every such raise ends the record release_failed, with the error's class."""
+    if method == "release_error":
+        class Late(_Fake):
+            def wait_closed(self, timeout):
+                return False
+
+        d = _raising(method, Late)
+    else:
+        d = _raising(method)
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=2)
+    sid, _ = _open(host, "alpha")
+    host.close(sid)
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the failed release")
+    assert "_Escape" in host.session_status(sid)["error"]
+    assert host._reaper_thread.is_alive()
+    _open(host, "beta")                    # the host still works, and the failed slot is still counted
+    with pytest.raises(ChatError) as e:
+        host.open("beta")
+    assert e.value.code == "too_many_sessions"
+    assert escaped == []
+
+
+def test_a_release_failing_on_the_reaper_does_not_strand_the_others(tmp_path, escaped):
+    """codex r3 HIGH, the reaper half: a probe raising on the reaper killed it, stranding every pending release."""
+    class Raises(_LateRelease):
+        def release_error(self):
+            raise _Escape("release_error escaped")
+
+    bad, good = Raises(), _LateRelease()
+    host = _host(tmp_path, {"bad": bad, "good": good})
+    s_bad, _ = _open(host, "bad")
+    s_good, _ = _open(host, "good")
+    host.close(s_bad)
+    host.close(s_good)
+    _until(lambda: host.session_status(s_bad)["state"] == "release_failed", what="the bad release")
+    good.done.set()
+    _until(lambda: host.session_status(s_good)["state"] == "closed", what="the good release")
+    assert escaped == []
+
+
+def test_nothing_describe_or_a_turn_raises_escapes(tmp_path, escaped):
+    """The same boundary for the other calls: describe() at open, send_turn, held_digest at approve."""
+    host = _host(tmp_path, {"a": _raising("describe"), "b": _raising("send_turn"), "c": _raising("held_digest")})
+    out = host.open("a")
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and "describe escaped" in st["error"]
+    sid, _ = _open(host, "b")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "failed" and "_Escape" in st["error"]
+    c = host._sessions[_open(host, "c")[0]]
+    c.driver._driver.script.append(_halt())
+    st = _wait(host, host.turn(c.session_id, "go")["job_id"])
+    with pytest.raises(ChatError) as e:
+        host.approve(c.session_id, expect=st["result"]["decision_id"])
+    assert e.value.code == "stale_decision" and host.session_status(c.session_id)["state"] == "gated"
+    assert escaped == []
+
+
+def test_a_stop_request_that_raises_does_not_end_the_deadline_watcher(tmp_path, escaped):
+    """request_stop through the boundary: a watcher whose interrupt raised a BaseException died, and the turn
+    lost its bound. It keeps asking until the job ends."""
+    gate = threading.Event()
+
+    class Stuck(_Fake):
+        stops = 0
+
+        def send_turn(self, message):
+            assert gate.wait(10)
+            return read_outcome(_Out())
+
+        def interrupt(self):
+            Stuck.stops += 1
+            if Stuck.stops >= 2:
+                gate.set()
+            raise _Escape("interrupt escaped")
+
+    host = _host(tmp_path, {"alpha": Stuck([])}, turn_seconds=0.1)
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"], timeout=10)
+    assert st["deadline_hit"] and Stuck.stops >= 2
+    assert escaped == []
+
+
+def test_the_host_holds_no_driver_method():
+    """The proof that no host call site bypasses the boundary: the proxy the host holds has none of the
+    contract's methods, so a direct call is an AttributeError, not a raise that escapes."""
+    from levain.chat import _DriverProxy
+
+    contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
+    exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
+    assert exposed == {"call", "read", "harness", "caps"}
+    assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
+    proxy = _DriverProxy(_Fake([]))
+    with pytest.raises(AttributeError):
+        proxy.close  # noqa: B018
+
+
+def test_a_probe_that_blocks_past_its_bound_is_not_asked_again(tmp_path, monkeypatch):
+    """A release probe the contract says does not block, blocking, holds the reaper every session shares:
+    its release counts as unconfirmed and it is not asked again."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_PROBE_SECONDS", 0.05)
+
+    class Slow(_Fake):
+        asks = 0
+
+        def wait_closed(self, timeout):
+            Slow.asks += 1
+            time.sleep(0.2)
+            return False
+
+    host = _host(tmp_path, {"alpha": Slow([])})
+    sid, _ = _open(host, "alpha")
+    view = host.close(sid)
+    assert view["state"] == "release_failed" and "past its bound" in view["error"]
+    time.sleep(0.5)
+    assert Slow.asks == 1
+
+
+def test_the_reaper_exits_once_the_host_is_shut_and_nothing_is_pending(tmp_path):
+    """codex r3 MED + complement r3 LOW (ruling (a)): every host kept a reaper thread, and the host graph,
+    forever. It exits once shut with nothing queued; a release in flight at shutdown is finished first."""
+    host = _host(tmp_path, {"alpha": _Fake([])})
+    _open(host, "alpha")
+    host.shutdown()
+    host._reaper_thread.join(2)
+    assert not host._reaper_thread.is_alive()
+
+    late = _LateRelease()
+    host = _host(tmp_path, {"alpha": late})
+    sid, _ = _open(host, "alpha")
+    host.shutdown()
+    time.sleep(0.3)
+    assert host._reaper_thread.is_alive() and host.session_status(sid)["state"] == "closing"
+    late.done.set()
+    host._reaper_thread.join(2)
+    assert not host._reaper_thread.is_alive() and host.session_status(sid)["state"] == "closed"
+
+
+def test_shutdown_never_runs_a_close_in_place_of_a_closer_that_could_not_start(tmp_path, monkeypatch):
+    """codex r3 MED (ruling (c)): under thread exhaustion shutdown ran each close inline, serially and
+    unbounded. The record is left counted, release_failed, and says the closer could not start."""
+    d = _Fake([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+
+    def no_threads(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_threads)
+    host.shutdown()
+    monkeypatch.undo()
+    view = host.session_status(sid)
+    assert not d.closed
+    assert view["state"] == "release_failed" and "closer could not start" in view["error"]
+
+
+class _NativeRaises:
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+    def run_turn(self, message):
+        return _Out()
+
+    def request_stop(self):
+        pass
+
+    def close(self):
+        raise self.exc
+
+
+def test_a_native_close_that_raises_any_baseexception_is_not_a_release(tmp_path):
+    """codex r3 HIGH: a TurnTimeout (a BaseException) from the native close skipped recording the failure,
+    and the phase still went to closed, so wait_closed() read True for a shell that may be live."""
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: _NativeRaises(_Escape("mid-teardown")), close_wait=2)
+    d.open(lambda e: None)
+    with pytest.raises(RuntimeError, match="release failed"):
+        d.close()
+    assert not d.wait_closed(0) and "_Escape" in d.release_error()
+
+
+@pytest.mark.parametrize("force_ok", [True, False])
+def test_the_driver_escalates_on_its_own_release_worker(tmp_path, force_ok):
+    """Ruling (b): a force release is bounded like close and runs on the driver's own release worker, once;
+    only a confirmed one is a release."""
+    ran: list[str] = []
+
+    class Forcing(OpenHandsDriver):
+        def force_release(self, native):
+            ran.append(threading.current_thread().name)
+            if not force_ok:
+                raise OSError("kill failed")
+
+    d = Forcing(tmp_path, lambda p, on_event: _NativeRaises(OSError("would not stop")), close_wait=2)
+    d.caps = DriverCaps(can_force_release=True)
+    d.open(lambda e: None)
+    if force_ok:
+        d.close()
+        assert d.wait_closed(0) and d.release_error() is None
+    else:
+        with pytest.raises(RuntimeError, match="kill failed"):
+            d.close()
+        assert not d.wait_closed(0)
+        assert "would not stop" in d.release_error() and "kill failed" in d.release_error()
+    assert ran == ["levain-driver-release"]
+
+
+def test_the_release_worker_exits_when_the_phase_reaches_closed(tmp_path):
+    """Ruling (d) + complement r3 LOW: the worker exits after its release, and when the driver closes with
+    nothing handed to it."""
+    class Sess:
+        def close(self):
+            pass
+
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(), close_wait=2)
+    d.open(lambda e: None)
+    d.close()
+    d._worker.join(2)
+    assert not d._worker.is_alive()
+
+    def opener(p, on_event):
+        raise OSError("no entity")
+
+    d = OpenHandsDriver(tmp_path, opener, close_wait=2)
+    with pytest.raises(OSError):
+        d.open(lambda e: None)
+    d._worker.join(2)
+    assert not d._worker.is_alive() and d.wait_closed(0)
+
+
+def test_a_worker_whose_driver_closed_with_nothing_handed_exits(tmp_path):
+    """Ruling (d), the path only an asynchronous raise reaches (between the worker's start and open()
+    recording it): the driver is marked closed inline, with nothing handed, and the worker must not wait
+    forever for a hand-off that will never come."""
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: None, close_wait=2)
+    worker = threading.Thread(target=d._release_worker, daemon=True)
+    worker.start()
+    d._release(None)            # what _hand_release does when no worker was recorded
+    worker.join(2)
+    assert not worker.is_alive() and d.wait_closed(0)

@@ -1159,8 +1159,7 @@ def test_a_close_whose_teardown_raises_does_not_leave_the_session_closing(tmp_pa
     host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
                     session_factory=factory, max_sessions=1)
     sid = _opened(host)
-    with pytest.raises(RuntimeError):
-        host.close(sid)
+    assert host.close(sid)["state"] == "release_failed"   # reported, never raised (the driver boundary)
     view = host.session_status(sid)
     assert view["state"] == "release_failed" and "teardown failed" in view["error"]
     assert view["release_failed_since"]
@@ -1253,8 +1252,7 @@ def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
 
 def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_released(tmp_path):
     """`_run_open`'s shut path: the session it opened is torn down while the record still reads
-    `opening` (counted), and only then published `closed`. The job's outcome is published at once
-    (L3 r2, glm: a client polling the job must not wait on the teardown)."""
+    `opening` (counted, job running), and only then published `closed`."""
     gate = threading.Event()
     made: list[_HeldClose] = []
 
@@ -1270,9 +1268,10 @@ def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_releas
     _until(lambda: made, what="the open")
     assert made[0].closing.wait(5)
     assert host.session_status(out["session_id"])["state"] == "opening"
-    assert host.job_status(out["job_id"])["status"] == "failed"
+    assert host.job_status(out["job_id"])["status"] == "running"
     made[0].release.set()
-    _until(lambda: host.session_status(out["session_id"])["state"] == "closed", what="the release")
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and host.session_status(out["session_id"])["state"] == "closed"
 
 
 def test_shutdown_publishes_closed_only_after_each_shell_is_released(tmp_path):
