@@ -1728,3 +1728,33 @@ def test_a_seed_carries_what_the_teammate_accepted_from_the_remote(two):
     _forge_last_line(_gl(ana), "FORGED")                            # the remote rewrites B
     cat = clone(tmp, "cat", "ben@ex.com")
     assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 2
+
+
+def test_a_reader_sweeping_the_quarantine_cannot_lose_a_fetch(two, monkeypatch):
+    # RAN on CI (run 37671919223, test_concurrent_writers_in_both_clones_converge): a reader swept the shared quarantine
+    # ref (it equalled the accepted tip) between a concurrent fetch's write and its read-back, and the fetch crashed on
+    # a None sha. A fetch now lands in its own staging ref, which no reader touches.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    gb = _gl(ben)
+    real = T.git
+
+    def fetch_then_sweep(args, cwd, **k):
+        out = real(args, cwd, **k)
+        if "fetch" in args:
+            real(["update-ref", "-d", "refs/levain/incoming/levain-ledger"], cwd, check=False)
+        return out
+    monkeypatch.setattr(T, "git", fetch_then_sweep)
+    assert gb.sync() in ("fetched", "up to date", "pushed")
+
+
+def test_problems_are_counted_past_the_cap_never_held(monkeypatch):
+    # codex HIGH on L3 r3: problems were all materialized before the cap (refs x entries), and _links was uncapped.
+    from levain.team import index as I
+    c = I.Capped((f"p{i}" for i in range(10 ** 6)), limit=3)
+    assert list.__len__(c) == 3 and c.more == 10 ** 6 - 3 and c.done()[-1] == f"and {10 ** 6 - 3} more problems"
+    monkeypatch.setattr(I, "MAX_PROBLEMS", 2)
+    entries = [{"id": f"x-{i}", "type": "decision", "supersedes": [f"gone-{i}"]} for i in range(5)]
+    led = I.Ledger(entries, [], [], None, [])
+    assert led._links[1][-1] == "and 3 more refused links"

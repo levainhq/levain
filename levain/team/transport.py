@@ -684,12 +684,13 @@ class GitLedger:
             raise LedgerReadError(f"the ledger holds {lines_in_tree} lines, past levain's limit of "
                                   f"{_MAX_LEDGER_LINES}; the team owner removes the extra files")
         whole = {path[len(b"ledger/"):].decode("ascii"): blobs[sha] for path, sha in leaves}
+        tamper = I.Capped(tamper)
         tamper += self._pin_violations(pins, whole)
         if lagging is not None:
             tamper += self._lag_violations(lagging, {r: d[:d.rfind(b"\n") + 1] for r, d in whole.items()})
         datas: dict[str, bytes] = {}
         files: list[tuple[str, list[str]]] = []
-        problems: list[str] = []
+        problems = I.Capped()
         by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
         folded_members = {_fold(h.encode()) for h in by_safe}
         seen_ids: dict[str, str] = {}
@@ -716,20 +717,20 @@ class GitLedger:
                 continue
             files.append((rel, lines))
         if tamper:
-            return Judgement(I.build([], owner, problems, tamper=tamper))
-        led = I.build(files, owner, problems)
+            return Judgement(I.build([], owner, problems.done(), tamper=tamper.done("reasons")))
+        led = I.build(files, owner, problems.done())
         # The cross-entry checks `levain team verify` has always made, here so every reader reports them (a
         # `supersedes` to a missing id is already one of the build's link problems).
-        extra = []
+        extra = I.Capped()
         for e in led.entries:
-            extra += [f"{e['id']}: names {r}, which is not in the ledger" for r in e.get("refs", [])
-                      if r not in led.by_id]
+            extra += (f"{e['id']}: names {r}, which is not in the ledger" for r in e.get("refs", [])
+                      if r not in led.by_id)
             if team is not None and e.get("owner") and not team.owner_ok(e["owner"]):
                 extra.append(f"{e['id']}: owner {e['owner']!r} is not allowed by team.toml")
         if extra:
-            problems += extra
-            led = I.build(files, owner, problems)
-        return Judgement(led, datas, files, problems)
+            problems += extra.done()
+            led = I.build(files, owner, problems.done())
+        return Judgement(led, datas, files, problems.done())
 
     def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]], set[bytes]]:
         """(bad_paths, leaves, aliased) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree,
@@ -1607,6 +1608,8 @@ class GitLedger:
                 return None
             raise TeamError(f"git fetch failed: {_tail(cp)}")
         sha = self._ref_sha(_STAGING)
+        if sha is None:
+            raise TeamError("the fetched remote tip could not be read back; run `levain team sync` again")
         try:
             with self.lock(name="pins.lock", timeout=30.0):
                 rec, problem = self._trust()
