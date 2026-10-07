@@ -186,9 +186,8 @@ def _warn_legacy_header(name: str) -> None:
           file=sys.stderr, flush=True)
 
 
-# The one handler allowed to define its own do_* methods, named so the set can only shrink: the team view routes its
-# own do_GET until its launch-token gate lands (seat/1007-5-teamview), and that commit deletes this entry.
-_DO_METHOD_EXEMPT = frozenset({("levain.team.view", "_ViewHandler")})
+# Handlers allowed to define their own do_* methods: none. The set can only shrink, and it is empty.
+_DO_METHOD_EXEMPT: frozenset[tuple[str, str]] = frozenset()
 
 
 class GuardedHandler(BaseHTTPRequestHandler):
