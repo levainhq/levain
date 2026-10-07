@@ -3414,6 +3414,17 @@ def test_token_files_found_readable_by_a_headless_entity_are_standard_cred_store
 
 @pytest.mark.parametrize("deny_creds", [False, True])
 @pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
+def test_the_rendered_seatbelt_profile_denies_sysmond(tmp_path, deny_creds, ssh_mode) -> None:
+    # pgrep -fl / pkill -f get every process's argv from the root daemon sysmond, across uids
+    # (measured 2026-10-07). The deny is one mach-lookup name rule, in every configuration; text only.
+    policy = build_policy(_entity(tmp_path), ssh_mode=ssh_mode, deny_standard_creds=deny_creds)
+    text = SeatbeltProvider().render_profile(policy)
+    rules = [ln for ln in text.splitlines() if "sysmond" in ln and not ln.startswith(";;")]
+    assert rules == ['(deny mach-lookup (global-name "com.apple.sysmond"))']
+
+
+@pytest.mark.parametrize("deny_creds", [False, True])
+@pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
 def test_the_rendered_seatbelt_profile_never_contains_a_syscall_rule(tmp_path, deny_creds, ssh_mode) -> None:
     # A Seatbelt `syscall-unix` / `syscall-number` rule makes XNU build a syscall mask, and a
     # malformed one panicked the kernel on 2026-10-07 (a hand-written experiment, not levain's

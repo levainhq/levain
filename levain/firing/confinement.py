@@ -343,6 +343,9 @@ _KEYCHAIN_MACH_SERVICES = (
     "com.apple.securityd.xpc",
     "com.apple.securityd.systemkeychain",
 )
+# sysmond, the root daemon behind pgrep/pkill -f and top, hands out every process's argv; see
+# render_profile.
+_SYSMOND_MACH_SERVICE = "com.apple.sysmond"
 
 
 def cred_floor_label(system: str | None = None) -> str:
@@ -2606,6 +2609,14 @@ class SeatbeltProvider(ConfinementProvider):
             for svc in _KEYCHAIN_MACH_SERVICES:
                 lines.append(f'(deny mach-lookup (global-name "{svc}"))')
             lines.append("")
+
+        lines.append(";; OTHER PROCESSES' COMMAND LINES THROUGH sysmond — `pgrep -fl` and `pkill -f` ask the")
+        lines.append(";; root daemon sysmond for every process's argv, so they show the command line of")
+        lines.append(";; processes run by ANY user, a different uid included (measured 2026-10-07).")
+        lines.append(";; Denying the lookup of its mach service closes that path. A name filter on")
+        lines.append(";; mach-lookup, the same kind as the Keychain rules above.")
+        lines.append(f'(deny mach-lookup (global-name "{_SYSMOND_MACH_SERVICE}"))')
+        lines.append("")
 
         if policy.config_file is not None:
             lines.append(";; the confinement CONFIG that defines the floor is floor-protected (read+")
