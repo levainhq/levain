@@ -735,7 +735,8 @@ def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(
     from levain.session import _apply_drive_policy as fresh
 
     assert fresh(_Cfg(None), "unattended") is True     # absent + seat → DENY
-    assert fresh(_Cfg(None), "headless") is False      # absent + human → allow
+    assert fresh(_Cfg(None), "headless") is True       # absent + headless → DENY (flipped 2026-10-07)
+    assert fresh(_Cfg(None), "interactive") is False   # absent + a human driving → allow
     assert fresh(_Cfg(False), "unattended") is False   # explicit opt-IN survives
     assert fresh(_Cfg(True), "interactive") is True    # explicit pin survives
 
