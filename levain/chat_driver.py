@@ -140,6 +140,15 @@ class DriverCaps:
     can_set_effort: bool = False
     can_list_models: bool = False
 
+    def __post_init__(self) -> None:
+        # Exact types (codex r5, RAN): a str subclass naming "in_turn" whose `!=` lies would be opened as an
+        # after-turn driver, and its first consent request would wait on a path the host does not have.
+        if type(self.approval_timing) is not str or self.approval_timing not in ("after_turn", "in_turn"):
+            raise DriverContractError("approval_timing is not exactly 'after_turn' or 'in_turn'")
+        for name in ("can_resume", "can_set_model", "can_set_effort", "can_list_models"):
+            if type(getattr(self, name)) is not bool:
+                raise DriverContractError(f"the capability `{name}` is not a bool")
+
 
 @dataclass(frozen=True)
 class TurnOptions:

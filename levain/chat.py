@@ -249,6 +249,12 @@ _REAP_IDLE_SECONDS = 1.0
 """How often the reaper re-checks whether it is still needed when no deadline is pending."""
 
 
+def _exc_line(exc: BaseException) -> str:
+    """``"<class>: <text>"``, or just the class when it has no text (``_exc_text`` cannot raise)."""
+    name, text = _exc_text(exc)
+    return f"{name}: {text}" if text else name
+
+
 class _FailedStart(Exception):
     """A failed open whose text is already plain (read through the boundary)."""
 
@@ -519,7 +525,7 @@ class _Lane:
                 try:
                     box.on_done(result)
                 except BaseException as exc:  # noqa: BLE001 — host code on a driver's thread
-                    _log.error("chat: handling %s failed: %s", what, ": ".join(_exc_text(exc)))
+                    _log.error("chat: handling %s failed: %s", what, _exc_line(exc))
 
 
 @dataclass(eq=False)
@@ -585,13 +591,12 @@ class _DriverProxy:
         if not made.ok:
             return made
         self._driver = made.value
-        harness = self.read("harness", expect=(str,))
-        caps = self.read("caps", expect=(DriverCaps,))
-        if harness.ok:
-            self.harness = harness.value
-        if caps.ok:
-            self.caps = caps.value
-        return caps if not caps.ok else made
+        for name, expect in (("harness", (str,)), ("caps", (DriverCaps,))):
+            got = self.read(name, expect=expect)
+            if not got.ok:
+                return got           # fail closed: a driver whose name or caps cannot be read is not opened
+            setattr(self, name, got.value)
+        return made
 
     def call(self, method: str, *args: Any, lane: str = "control", timeout: float | None = _CALL_SECONDS,
              expect: tuple[type, ...] = _ANY, convert: Callable[[Any], Any] | None = None,
@@ -879,7 +884,7 @@ class ChatHost:
                 publish_job()         # idempotent: the settle that ends the record runs it again, harmlessly
             except BaseException as exc:  # noqa: BLE001 — the driver is still closed below
                 _log.error("chat session %s: publishing the job failed: %s", rec.session_id,
-                           ": ".join(_exc_text(exc)))
+                           _exc_line(exc))
         try:
             item = _Release(rec, driver, settle, publish_job, time.monotonic() + _REPORT_SECONDS)
             with self._lock:
@@ -904,7 +909,8 @@ class ChatHost:
                 _closed(submitted)
             return item.closed
         except BaseException as exc:  # noqa: BLE001 — host code; a fault here must still end the record
-            self._mark_release_failed(rec, f"closing failed: {': '.join(_exc_text(exc))}", publish_job)
+            self._mark_release_failed(rec, f"closing failed: {_exc_line(exc)}", publish_job,
+                                      driver.release)
             done = threading.Event()
             done.set()
             return done
@@ -921,7 +927,7 @@ class ChatHost:
                              "not text or None")
                 self._on_report(proxy, error)
             except BaseException as exc:  # noqa: BLE001
-                _log.error("chat: handling a release report failed: %s", ": ".join(_exc_text(exc)))
+                _log.error("chat: handling a release report failed: %s", _exc_line(exc))
 
         return on_released
 
@@ -991,7 +997,7 @@ class ChatHost:
                 publish_job()
             settle()
         except BaseException as exc:  # noqa: BLE001 — no worker may be left to settle this record
-            text = ": ".join(_exc_text(exc))
+            text = _exc_line(exc)
             _log.error("chat session %s: settling after its release failed: %s", rec.session_id, text)
             with self._lock:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
@@ -1048,7 +1054,7 @@ class ChatHost:
                     self._release_failed(item, failure)
                 except BaseException as exc:  # noqa: BLE001 — host code; one bad record must not stop the reaper
                     _log.error("chat session %s: reaping failed: %s", item.rec.session_id,
-                               ": ".join(_exc_text(exc)))
+                               _exc_line(exc))
                     try:
                         self._mark_release_failed(item.rec, f"{failure} (and handling it failed)", item=item)
                     except BaseException:  # noqa: BLE001
@@ -1093,7 +1099,7 @@ class ChatHost:
         try:
             target(rec, job, *args)
         except BaseException as exc:  # noqa: BLE001 — a worker must always settle its records
-            text = ": ".join(_exc_text(exc))
+            text = _exc_line(exc)
             _log.error("chat %s job %s escaped its worker: %s", job.kind, job.job_id, text)
             to_close: Any = None
             ended: SessionState = "failed" if job.kind == "open" else "broken"
@@ -1314,6 +1320,7 @@ class ChatHost:
             gc.collect()      # see _settle_open
             with self._lock:
                 rec.state = "closing"     # still counted while its shell is released
+                rec.error = failed        # kept if its release then fails too
 
             def _job_failed() -> None:
                 with self._lock:
@@ -1421,7 +1428,7 @@ class ChatHost:
                     digest = snap.held_digest
                     cut = max(0, len(snap.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
-                error = ": ".join(_exc_text(exc))
+                error = _exc_line(exc)
         finally:
             done.set()
         if watcher is not None:
@@ -1431,11 +1438,13 @@ class ChatHost:
             if watcher.is_alive() and error is None:
                 payload, error = None, "the turn's deadline watcher did not exit"
         stopping = rec.driver
-        if stopping is not None and not stopping.stop_idle() and error is None:
+        stop_left: str | None = None
+        if stopping is not None and not stopping.stop_idle():
             # A stop request that outlived its deadline is still with the driver: it would land in the NEXT
-            # turn (L1 r5, RAN). The same rule as a watcher that did not exit.
-            payload, error = None, "the driver did not answer a stop request"
-        broken = payload is None or payload["error"] is not None
+            # turn (L1 r5, RAN). The session is broken for that reason; the job keeps its own result (a turn
+            # that finished, or was stopped, as the slow stop came back is still that turn: complement r5).
+            stop_left = "the driver did not answer a stop request in time, so the session takes no further turn"
+        broken = payload is None or payload["error"] is not None or stop_left is not None
         dead: _DriverProxy | None = None
         if broken:
             # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
@@ -1445,7 +1454,7 @@ class ChatHost:
                 dead, rec.driver = rec.driver, None
                 if dead is not None:
                     # why it broke, kept if its release then fails too (complement r4)
-                    rec.error = error if payload is None else payload["error"]
+                    rec.error = (error if payload is None else payload["error"]) or stop_left
 
         def _publish() -> None:
             to_close: _DriverProxy | None = None
@@ -1496,7 +1505,7 @@ class ChatHost:
             return
         # The job's outcome is published before the close (a client polling it does not wait on a teardown); the record
         # reads busy, counted, until the release is confirmed, then broken (closed if the server shut).
-        text = error if payload is None else payload["error"]
+        text = (error if payload is None else payload["error"]) or stop_left
 
         def _job_ended() -> None:
             with self._lock:
@@ -1529,8 +1538,10 @@ class ChatHost:
         out.update((k, v) for k, v in rec.info.items() if k not in _HOST_VIEW_KEYS)
         if rec.error is not None:
             out["error"] = rec.error
-        if rec.release_failed_since is not None:
+        # Read with the state, so the two halves of a late release (the settle, then its stamp) never show a
+        # released session as still failing (complement r5).
+        if rec.state == "release_failed" and rec.release_failed_since is not None:
             out["release_failed_since"] = rec.release_failed_since
-        if rec.released_late is not None:
+        if rec.state != "release_failed" and rec.released_late is not None:
             out["released_late"] = rec.released_late
         return out

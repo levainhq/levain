@@ -2041,8 +2041,9 @@ def test_a_stop_request_the_driver_never_answers_breaks_the_session(tmp_path, mo
     time.sleep(0.5)
     stop.set()
     st = _wait(host, job)
-    assert st["status"] == "failed" and "stop request" in st["error"]
+    assert st["status"] == "done"            # the job keeps its own result (complement r5) ...
     _until(lambda: host.session_status(sid)["state"] == "broken", what="the release")
+    assert "stop request" in host.session_status(sid)["error"]   # ... and the session takes no further turn
     gate.set()
 
 
@@ -2180,3 +2181,47 @@ def test_an_abandoned_call_never_runs_and_does_not_hold_the_lane(tmp_path):
     _until(lambda: lane.idle(), what="the stuck call")  # ... until it returns
     assert lane.call("e", lambda: _call_driver(lambda: 7), 1).value == 7
     lane.retire()
+
+
+# -- L3 r5 (input 977c005f89ca632a) -------------------------------------------------------------------------------
+
+
+def test_caps_are_exact_types():
+    """codex r5 MED (RAN): a str subclass naming "in_turn" whose `!=` lies passed as after-turn."""
+    class Lying(str):
+        def __ne__(self, other):
+            return False
+
+    with pytest.raises(DriverContractError):
+        DriverCaps(approval_timing=Lying("in_turn"))   # type: ignore[arg-type]
+    with pytest.raises(DriverContractError):
+        DriverCaps(can_resume=1)                        # type: ignore[arg-type]
+
+
+def test_a_driver_whose_name_cannot_be_read_is_not_opened(tmp_path):
+    """codex r5 LOW: a harness read that failed was ignored when caps read fine."""
+    class Nameless(_Fake):
+        @property
+        def harness(self):
+            raise RuntimeError("no name")
+
+    host = _host(tmp_path, {"alpha": Nameless([])})
+    sid, st = _open(host, "alpha")
+    assert st["status"] == "failed" and "no name" in st["error"]
+
+
+def test_a_failed_open_whose_teardown_fails_keeps_both_errors(tmp_path):
+    """codex r5 LOW: the open's own error was lost from the session when its teardown failed too."""
+    class Bad(_Fake):
+        def open(self, on_event, *, on_released, resume=None):
+            super().open(on_event, on_released=on_released)
+            raise RuntimeError("bad model")
+
+        def close(self):
+            raise RuntimeError("teardown failed")
+
+    host = _host(tmp_path, {"alpha": Bad([])})
+    sid, st = _open(host, "alpha")
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the release")
+    err = host.session_status(sid)["error"]
+    assert "bad model" in err and "teardown failed" in err
