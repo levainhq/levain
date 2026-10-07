@@ -222,6 +222,7 @@ is allowed to land).
 from __future__ import annotations
 
 import errno
+import fnmatch
 import json
 import os
 import platform
@@ -804,6 +805,7 @@ class _BrowserRoot:
     path: Path                 # a profile root as denied: resolved, or on macOS also its literal spelling
     globs: tuple[str, ...]     # its page storage, walked for other names
     loop: bool = False         # its path does not resolve (a symlink loop): not denied, refuses bash
+    stat_errno: int = 0        # its stat failed otherwise (a parent this user cannot search): the same
 
 
 def _browser_roots(home: Path) -> list[_BrowserRoot]:
@@ -816,17 +818,22 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
         cands = ([base / rel[len(".config/"):] for base in _linux_config_homes(home)]
                  if not darwin and rel.startswith(".config/") else [home / rel])
         for c in cands:
+            looped, failed = False, 0
             try:
                 os.stat(c)
-                looped = False
+            except (FileNotFoundError, NotADirectoryError):
+                pass       # absent
             except OSError as exc:
                 looped = exc.errno == errno.ELOOP
+                failed = 0 if looped else (exc.errno or errno.EACCES)
             try:
                 target = c.resolve()   # a loop raises RuntimeError on Python 3.12 and resolves quietly on 3.13 (L1)
             except (OSError, RuntimeError):
                 looped = True
-            if looped:
-                out.append(_BrowserRoot(c, globs, loop=True))
+            if looped or failed:
+                # codex + glm L3 r3: a parent this user cannot search hid the root (not denied on Linux, its storage
+                # unwalked on both) while the entity, which can chmod it back, kept a link into it
+                out.append(_BrowserRoot(c, globs, loop=looped, stat_errno=0 if looped else failed))
                 continue
             if darwin:
                 out.append(_BrowserRoot(target, globs))
@@ -839,17 +846,51 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
 
 def browser_profile_roots(home: Path) -> list[Path]:
     """The browser profile paths denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
-    return list(_dedup_paths([r.path for r in _browser_roots(home) if not r.loop]))
+    return list(_dedup_paths([r.path for r in _browser_roots(home) if not (r.loop or r.stat_errno)]))
 
 
 def _refuse_unresolvable_browser_roots(policy: CrownJewelsPolicy) -> None:
     """Refuse bash when a browser profile root's path is a symlink loop: it cannot be resolved, so it cannot be denied
-    (L1, 2026-10-07: ``Path.resolve()`` raised out of ``build_policy`` and failed every session)."""
+    (L1, 2026-10-07: ``Path.resolve()`` raised out of ``build_policy`` and failed every session). The same when its
+    stat fails for another reason, such as a parent this user cannot search (codex + glm L3 r3)."""
     for root in _browser_roots(Path.home()):
         if root.loop:
             raise ConfinementError(
                 f"The browser profile path {root.path} is a symlink loop, so the floor cannot resolve it to deny it. "
                 "Refusing to grant bash hands (fail-closed); remove the link.")
+        if root.stat_errno:
+            raise ConfinementError(
+                f"could not check the browser profile path {root.path} ({os.strerror(root.stat_errno)}), so the "
+                "floor cannot deny it or walk its page storage. Refusing to grant bash hands (fail-closed). Make its "
+                "folders searchable to this user.")
+
+
+def _storage_matches(root: Path, pattern: str) -> list[Path]:
+    """What ``root.glob(pattern)`` names, but a folder that cannot be listed or a name that cannot be checked RAISES
+    (OSError): ``Path.glob()`` returns nothing for those, so ``chmod 000`` on a profile switched the page-storage walk
+    off (codex L3 r3). Absent names are skipped. Wildcards match as ``Path.glob()`` matches them (case-sensitive,
+    leading dots included)."""
+    level = [root]
+    parts = pattern.split("/")
+    for i, part in enumerate(parts):
+        last, nxt = i == len(parts) - 1, []
+        for d in level:
+            if not any(ch in part for ch in "*?["):
+                try:
+                    os.stat(d / part)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                nxt.append(d / part)
+                continue
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            nxt += [d / e.name for e in entries
+                    if fnmatch.fnmatchcase(e.name, part) and (last or e.is_dir())]
+        level = nxt
+    return level
 
 
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
@@ -3151,8 +3192,8 @@ def _browser_storage(policy: CrownJewelsPolicy, *, fresh: bool) -> tuple[list[_B
     if not fresh and hit is not None and time.monotonic() - hit[0] < _STORAGE_ROOTS_TTL:
         return hit[1], hit[2]
     browsers = _browser_roots(home)
-    found = sorted({g for r in browsers if not r.loop and os.path.isdir(r.path)
-                    for pattern in r.globs for g in r.path.glob(pattern)}, key=str)
+    found = sorted({g for r in browsers if not (r.loop or r.stat_errno) and os.path.isdir(r.path)
+                    for pattern in r.globs for g in _storage_matches(r.path, pattern)}, key=str)
     with _STORAGE_ROOTS_LOCK:
         _STORAGE_ROOTS_CACHE[key] = (time.monotonic(), browsers, found)
     return browsers, found
@@ -3223,7 +3264,13 @@ def _jewel_inodes(policy: CrownJewelsPolicy, *, fresh: bool = True) -> dict[tupl
     # hold gigabytes. Their page storage (each entry's globs in BROWSER_PROFILE_DIRS), where the cockpit's token is
     # kept, IS walked.
     home = Path.home()
-    browsers, storage_roots = _browser_storage(policy, fresh=fresh)
+    try:
+        browsers, storage_roots = _browser_storage(policy, fresh=fresh)
+    except OSError as exc:   # a page-storage folder that cannot be listed (codex L3 r3)
+        unverifiable(str(exc.filename or "a browser profile"), exc)
+    for r in browsers:
+        if r.stat_errno:     # a root whose page storage cannot be reached (codex + glm L3 r3)
+            unverifiable(str(r.path), OSError(r.stat_errno, os.strerror(r.stat_errno), str(r.path)))
     # Only this platform's entries (codex L3: on macOS an operator-declared jewel at ~/.mozilla was left unwalked
     # because .mozilla is a Linux browser entry).
     mine = "darwin" if platform.system() == "Darwin" else "linux"

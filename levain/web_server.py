@@ -97,6 +97,7 @@ from levain.http_guards import (
     LINK_PATH,
     UNLOCK_PATH,
     GuardedHandler,
+    _link_state,
     arm_launch_token,
     check_launch_token,
     new_launch_token,
@@ -607,12 +608,21 @@ class _LevainHTTPServer(ThreadingHTTPServer):
 
     @chat_token.setter
     def chat_token(self, value: str) -> None:
-        # Setting it can change the token, never remove it: None here would turn the gate off on a running server
-        # (complement + codex L3 r2). An ungated server is a make_server decision, not an attribute write.
+        # Setting it arms an ungated server, never removes the token: None here would turn the gate off on a running
+        # server (complement + codex L3 r2). An ungated server is a make_server decision, not an attribute write. Nor
+        # does it change an armed token (codex L3 r3): an unspent link code would unlock the new token, and the
+        # published record would still name the old one. Arming spends every code minted before it.
         if value is None:
             raise ValueError("the launch token cannot be removed from a running server.")
         check_launch_token(value)
-        self.launch_token = value
+        if value == self.launch_token:
+            return
+        if self.launch_token is not None:
+            raise ValueError("the launch token cannot be changed on a running server; start a new one.")
+        codes, lock = _link_state(self)
+        with lock:
+            codes.clear()
+            self.launch_token = value
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.

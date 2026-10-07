@@ -902,4 +902,12 @@ def stop_on_sigterm() -> SigtermStop:
         signal.signal(signal.SIGTERM, lambda *_a: None)
         raise KeyboardInterrupt
 
-    return SigtermStop(signal.signal(signal.SIGTERM, _stop), armed=True)
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+        return SigtermStop(previous, armed=True)
+    except KeyboardInterrupt:
+        # A SIGTERM (or Ctrl+C) landed before the caller held the SigtermStop, so the caller cannot restore it: put
+        # the previous handler back here (complement L3 r3).
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+        raise
