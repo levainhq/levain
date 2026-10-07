@@ -170,37 +170,52 @@ _PRETOOLUSE_BUDGET = PRETOOLUSE_TIMEOUT - 10.0
 _ALARM_AFTER = PRETOOLUSE_TIMEOUT - 5.0
 
 
-class _OutOfTime(Exception):
-    pass
+class _OutOfTime(BaseException):
+    """The alarm: a BaseException, so no ``except Exception`` on the way can swallow it; only the boundary and main()
+    catch it, and both answer with a deny."""
 
 
 def _alarm(_signum, _frame):
     raise _OutOfTime("the ledger judgement ran out of time")
 
 
+# Whether this edit is in levain's scope (a repository above the target or the session's cwd holds team state), decided
+# ONCE, first, before anything can fail: True, False, or None while it is not known yet. Unknown is a deny.
+_SCOPE: list[bool | None] = [None]
+_ANSWERED: list[bool] = [False]
+
+
 def pretooluse(payload: dict) -> None:
-    """THE fail-closed boundary, and the only one: ANY exception while an edit is judged, or a judgement that ran past
-    its one deadline, is a DENY when a repository above the real path of the target (or of the session's cwd) holds
-    levain team state, and silence otherwise. No path inside handles its own failures."""
+    """THE fail-closed boundary, and the only one. The scope is decided first (under the alarm, with bounded reads); then
+    ANY exception while the edit is judged, or a judgement that ran past its one deadline, is a DENY unless the edit is
+    known to be out of scope, where it is silence. No path inside handles its own failures, and the handler decides
+    from the stored scope, never by looking again."""
+    _SCOPE[0], _ANSWERED[0] = None, False
     answer: list[dict] = []
     started = time.monotonic()
     try:
+        _SCOPE[0] = any(_ledger_roots(Path(p)) for p in _places(payload))
         with T.deadline(_PRETOOLUSE_BUDGET):
             _pretooluse(payload, answer)
             late = T.expired()
         if late:
             raise T.DeadlineExceeded("the ledger judgement ran out of time")
-    except Exception as exc:  # noqa: BLE001 - the boundary
+    except (Exception, _OutOfTime) as exc:  # noqa: BLE001 - the boundary
+        if _SCOPE[0] is not False:
+            late = isinstance(exc, _OutOfTime) or time.monotonic() - started >= _PRETOOLUSE_BUDGET
+            _deny_out(late, exc)
         _disarm()
-        if any(_ledger_roots(Path(p)) for p in _places(payload)):
-            late = time.monotonic() - started >= _PRETOOLUSE_BUDGET or isinstance(exc, _OutOfTime)
-            why = "took too long" if late else \
-                f"could not be read ({type(exc).__name__}: {exc})"
-            _out(_deny(f"the team ledger judgement {why}; the edit is denied, never allowed late"))
         return
-    _disarm()
     for a in answer:
         _out(a)
+    _ANSWERED[0] = True
+    _disarm()
+
+
+def _deny_out(late: bool, exc: BaseException | None = None) -> None:
+    why = "took too long" if late else f"could not be read ({type(exc).__name__}: {exc})"
+    _out(_deny(f"the team ledger judgement {why}; the edit is denied, never allowed late"))
+    _ANSWERED[0] = True
 
 
 def _disarm() -> None:
@@ -278,6 +293,12 @@ def _deny(why: str) -> dict:
                                        f"{TAG} {why}; every edit is denied until `levain team doctor` is clean.")}}
 
 
+def _small_text(path: Path) -> str:
+    """The head of a git pointer file (``.git``, ``commondir``): a path, never more than a few KiB."""
+    with open(path, "rb") as fh:
+        return fh.read(4096).decode("utf-8", "replace")
+
+
 def _ledger_roots(target: Path) -> list[Path]:
     """Every directory above ``target`` whose repository holds levain team state, nearest first, read from the
     filesystem alone (so it answers when git cannot): a ``.git`` directory, or a linked worktree's ``.git`` file and
@@ -293,11 +314,11 @@ def _ledger_roots(target: Path) -> list[Path]:
             if g.is_dir():
                 common = g
             elif g.is_file():
-                gitdir = Path(g.read_text(encoding="utf-8", errors="replace").partition("gitdir:")[2].strip())
+                gitdir = Path(_small_text(g).partition("gitdir:")[2].strip())
                 gitdir = gitdir if gitdir.is_absolute() else p / gitdir
                 common = gitdir
                 if (gitdir / "commondir").is_file():
-                    common = gitdir / (gitdir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+                    common = gitdir / _small_text(gitdir / "commondir").strip()
             else:
                 continue
             if (common / DIRNAME).is_dir():
@@ -529,11 +550,19 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(payload, dict):
             payload = {}
         if event == "pretooluse" and hasattr(signal, "setitimer"):
-            signal.signal(signal.SIGALRM, _alarm)
-            signal.setitimer(signal.ITIMER_REAL, _ALARM_AFTER)
+            try:
+                signal.signal(signal.SIGALRM, _alarm)
+                signal.setitimer(signal.ITIMER_REAL, _ALARM_AFTER)
+            except (ValueError, OSError):
+                pass                       # not the main thread: the monotonic deadline still bounds git and locks
         (pretooluse if event == "pretooluse" else sessionstart)(payload)
+    except _OutOfTime:                     # the alarm landed in the boundary's own handler: the same deny
+        if event == "pretooluse" and not _ANSWERED[0] and _SCOPE[0] is not False:
+            _deny_out(True)
     except Exception as exc:  # noqa: BLE001 - fail open, visibly
         _fail_open(name, f"{type(exc).__name__}: {exc}")
+    finally:
+        _disarm()
     return 0
 
 

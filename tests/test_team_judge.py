@@ -1550,3 +1550,78 @@ def test_a_stale_seed_on_a_joined_clone_merges_and_never_drops_a_stronger_pin(tw
     strong = _pinned(ben)
     assert team("join", "--pins-from", str(stale), "--no-install", repo=ben) == 0
     assert all(_pinned(ben)[r]["length"] >= p["length"] for r, p in strong.items())
+
+
+def _main_pretooluse(payload, monkeypatch, capsys):
+    from levain.team import hook as H
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
+    t0 = time.monotonic()
+    assert H.main(["pretooluse"]) == 0
+    took = time.monotonic() - t0
+    raw = capsys.readouterr().out
+    return json.loads(raw) if raw.strip() else {}, took, raw
+
+
+def test_a_scope_read_that_hangs_is_a_deny_inside_the_alarm(two, monkeypatch, capsys):
+    # Head ruling (A) on L3 r3 (gemini HIGH + codex HIGH): the handler re-scanned .git/commondir after disarming the
+    # alarm, so a read that hangs there let the hook be killed and the edit through. The scope is decided once, first,
+    # under the alarm; a scope that cannot be decided is a deny.
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    git("worktree", "add", "-q", str(tmp / "benwt"), cwd=ben)
+    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+    real = H._small_text
+
+    def hang(path):
+        if path.name == "commondir":
+            time.sleep(30)
+        return real(path)
+    monkeypatch.setattr(H, "_small_text", hang)
+    out, took, _raw = _main_pretooluse({"session_id": "h", "transcript_path": "/x", "cwd": str(tmp / "benwt"),
+                                        "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                                        "tool_input": {"file_path": str(tmp / "benwt" / "src" / "settlement.py")},
+                                        "tool_use_id": "t"}, monkeypatch, capsys)
+    assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
+
+
+def test_an_alarm_inside_the_boundarys_handler_is_still_one_deny(two, monkeypatch, capsys):
+    # complement LOW on L3 r3: an alarm landing in the handler escaped to main()'s fail-open path.
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("judgement failed")
+    monkeypatch.setattr(H, "_pretooluse", boom)
+    real, calls = H._deny, []
+
+    def slow_deny(why):
+        calls.append(why)
+        if len(calls) == 1:
+            time.sleep(3)                                    # the alarm fires here, inside the handler
+        return real(why)
+    monkeypatch.setattr(H, "_deny", slow_deny)
+    out, took, raw = _main_pretooluse({"session_id": "h", "transcript_path": "/x", "cwd": str(ben),
+                                       "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                                       "tool_input": {"file_path": str(ben / "src" / "settlement.py")},
+                                       "tool_use_id": "t"}, monkeypatch, capsys)
+    assert raw.count("hookSpecificOutput") == 1 and out["hookSpecificOutput"]["permissionDecision"] == "deny", raw
+
+
+def test_no_broad_handler_on_the_way_can_swallow_the_alarm(two, monkeypatch, capsys):
+    # complement MED on L3 r3: _OutOfTime was an Exception, so fetch_if_due's `except Exception` turned the one-shot
+    # alarm into a note and the judgement ran on unbounded.
+    from levain.team import hook as H
+    from levain.team.transport import GitLedger as G
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+    _gl(ben).save_state(last_fetch_attempt=0)
+
+    def slow_sync(self, **k):
+        time.sleep(30)
+    monkeypatch.setattr(G, "_sync", slow_sync)
+    out, took, _raw = _main_pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben),
+                                        "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                                        "tool_input": {"file_path": str(ben / "src" / "billing.py")},
+                                        "tool_use_id": "t"}, monkeypatch, capsys)
+    assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
