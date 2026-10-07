@@ -1428,8 +1428,9 @@ class GitLedger:
         git(["reset", "-q", "--hard", orig], self.wt, timeout=60)
 
     def _sync(self, *, push: bool, timeout: float = 120, net_timeout: float = 150,
-              lock_timeout: float = 30.0, retries: int = _PUSH_RETRIES) -> str:
-        """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
+              lock_timeout: float = 30.0, retries: int = _PUSH_RETRIES, deadline: float | None = None) -> str:
+        """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held. ``deadline`` (a
+        time.monotonic() value) bounds the whole call: every step gets only what is left of it, and none starts after.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
         slow remote: the worktree lock is held only for the local rebase and commits. Everything after the fetch uses
@@ -1438,14 +1439,22 @@ class GitLedger:
         remote = self.remote
         if not remote:
             return "local only (no remote)"
-        with self.lock(name="net", timeout=net_timeout):
+
+        def left(cap: float) -> float:
+            if deadline is None:
+                return cap
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TeamError("out of time before the sync finished; `levain team sync` completes it")
+            return min(cap, remaining)
+        with self.lock(name="net", timeout=left(net_timeout)):
             for attempt in range(retries):
-                accepted = self._fetch_quarantined(remote, timeout)
+                accepted = self._fetch_quarantined(remote, left(timeout))
                 if accepted is None:
                     if not push:
                         return f"{remote} has no {BRANCH} branch yet"
                 else:
-                    self._rebase(accepted, timeout, lock_timeout)
+                    self._rebase(accepted, left(timeout), left(lock_timeout))
                     if not push:
                         return "fetched"
                     ahead = git(["rev-list", "--count", f"{accepted}..{REF}"], self.wt).stdout.strip()
@@ -1457,12 +1466,12 @@ class GitLedger:
                 if bad:
                     raise TeamError("this clone's own ledger is refused, so nothing was pushed: " + "; ".join(bad[:3]))
                 cp = git(["push", "-q", "--no-verify", remote, f"{head}:{REF}"], self.repo.toplevel,
-                         check=False, timeout=timeout)
+                         check=False, timeout=left(timeout))
                 if cp.returncode == 0:
                     with contextlib.suppress(TeamError, OSError):
                         self._record_pushed(head)     # the push was a fast-forward: the remote now holds exactly this
                     with contextlib.suppress(TeamError):
-                        self._fetch_quarantined(remote, timeout)
+                        self._fetch_quarantined(remote, left(timeout))
                     return "pushed"
                 err = (cp.stderr or "").lower()
                 race = any(s in err for s in ("non-fast-forward", "fetch first", "failed to update ref",
@@ -1518,12 +1527,13 @@ class GitLedger:
 
     def flush_unpushed(self, *, timeout: float = 10.0) -> str | None:
         """Push local ledger commits the remote does not have (acknowledgements are committed without a push), in ONE
-        fetch+push round bounded by ``timeout`` per git call: None when there was nothing to push, another process
+        fetch+push round that ends within ``timeout`` seconds (each step gets what is left): None when there was nothing to push, another process
         holds the network lock, or it was pushed; else a one-line reason. Never raises."""
         try:
             if not self.unpushed():
                 return None
-            self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1)
+            self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1,
+                       deadline=time.monotonic() + timeout)
             return None
         except TeamBusy:
             return "busy: another sync is running"

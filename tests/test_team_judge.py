@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -928,3 +929,25 @@ def test_the_repositorys_own_attributes_never_reach_a_ledger_write(two):
     gb = _gl(ben)
     blob = git("cat-file", "blob", f"HEAD:ledger/ben/{gb.device}.jsonl", cwd=gb.wt)
     assert "attributes do not reach me" in blob                               # UTF-8, exactly as written
+
+
+def test_flush_unpushed_ends_within_its_bound_against_a_slow_remote(two, monkeypatch):
+    # Head addendum (L2 r1 #8 / complement r2 LOW 3): the flush bounded each git call, not the whole round.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    edit(ben, "src/a.py", session="k1")
+    edit(ben, "src/a.py", session="k1")                                    # an ack, committed without a push
+    gb = _gl(ben)
+    assert gb.unpushed()
+    real = T.git
+
+    def slow(args, cwd, **kw):
+        if args and args[0] in ("fetch", "push") or args[:3] == ["-c", "fetch.fsckObjects=true", "fetch"]:
+            time.sleep(min(kw.get("timeout", 60), 0.8))
+        return real(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", slow)
+    t0 = time.monotonic()
+    gb.flush_unpushed(timeout=1.0)
+    assert time.monotonic() - t0 < 2.0

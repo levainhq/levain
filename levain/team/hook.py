@@ -401,7 +401,7 @@ def sessionstart(payload: dict) -> None:
     if fetch_note:
         push_note = fetch_note
     elif left > 6:
-        push_note = gl.flush_unpushed(timeout=left / 6)   # ~5 git calls in a sync round, each bounded by this
+        push_note = gl.flush_unpushed(timeout=left)       # one deadline for the whole flush
     else:
         push_note = "no time left in the session start to push"
     try:
