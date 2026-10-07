@@ -1,7 +1,7 @@
 """levain.chat — the CHAT HOST: entity conversations held in server memory (K1 part 2).
 
-``levain serve --chat <entity>`` is the third driver over :class:`levain.session.EntitySession`
-(after the REPL and ``levain run --task``). This module is the server-side half that has no HTTP in
+``levain serve --chat <entity>`` is the third surface over :class:`levain.session.EntitySession`
+(after the REPL and ``levain run --task``), reached through the OpenHands driver. This module is the server-side half that has no HTTP in
 it: a registry of live sessions, the propose→job→poll runtime that drives their turns off the
 request thread, and the state machine that says which operations a session accepts right now.
 
@@ -58,7 +58,8 @@ A job that failed without a result keeps what was streamed, and carries an ``err
 
 **A turn's wall-clock bound is a STOP REQUEST, honoured at the next step boundary.** Each turn,
 approval or refusal job has a watcher; at ``turn_seconds`` it marks the job ``deadline_hit`` and
-calls :meth:`EntitySession.request_stop` until the job ends. ``deadline_hit`` is never cleared: it
+asks the driver to stop (:meth:`~levain.chat_driver.HarnessDriver.interrupt`; for OpenHands,
+:meth:`EntitySession.request_stop`) until the job ends. ``deadline_hit`` is never cleared: it
 says the deadline passed while the job ran, and the result's ``timed_out`` says whether the stop
 ended the turn. A stopped turn comes back ``timed_out``, uncaptured, and the host breaks the session
 and releases its shell. The SDK's synchronous run cannot be cancelled inside a step, so a step
@@ -329,6 +330,9 @@ class ChatHost:
     ``entities`` maps a NAME to an entity directory; it is fixed at construction and is the whole
     of what a client can address. ``session_factory`` is a test seam; production passes ``None`` and
     gets :meth:`EntitySession.open` with the operator's model settings and :data:`CHAT_DRIVE_MODE`.
+    ``driver_factory(name, entity_dir)`` makes the :class:`~levain.chat_driver.HarnessDriver` for one
+    session of that entity; the two seams are exclusive, and a ``session_factory`` is wrapped in an
+    :class:`~levain.chat_driver.OpenHandsDriver`.
     """
 
     def __init__(
@@ -492,14 +496,14 @@ class ChatHost:
             if rec.state in ("opening", "busy", "closing"):
                 raise ChatError(
                     "busy", f"the session is {rec.state}; close it when that finishes", 409)
-            session, rec.driver = rec.driver, None
-            if session is None:
+            driver, rec.driver = rec.driver, None
+            if driver is None:
                 if rec.state != "failed":
                     rec.state = "closed"
                 return self._session_view(rec)
             rec.state = "closing"
         try:
-            session.close()
+            driver.close()
         finally:
             with self._lock:
                 rec.state = "closed"
@@ -713,14 +717,18 @@ class ChatHost:
             driver = self._driver_factory(rec.entity, self._entities[rec.entity])
             if driver.caps.approval_timing != "after_turn":
                 # Reserved in the contract, not driven here: an in-turn consent request needs the approval
-                # state machine (chat_driver module docstring, slice S10). A driver that is never opened
-                # holds nothing to release.
+                # state machine (chat_driver module docstring, slice S10). It is closed below, unopened.
                 raise DriverContractError(
                     f"{driver.harness}: this host drives only after-turn consent; "
                     f"{driver.caps.approval_timing!r} needs the approval state machine, which is not built")
             driver.open(self._route_events(rec))
         except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
             error = str(exc) or type(exc).__name__
+            if driver is not None:
+                try:
+                    driver.close()   # a failed open releases what it built (idempotent)
+                except Exception as close_exc:  # noqa: BLE001
+                    _log.error("chat open of %s: close after a failed open: %s", rec.entity, close_exc)
         # `exc` is unbound here (Python deletes it at the end of the except clause), so nothing in
         # this frame still references the traceback of the failed start. The SDK keeps that failure
         # in a reference cycle (module docstring), so collect it now, BEFORE the failure is published:

@@ -365,3 +365,36 @@ def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
         HarnessDriver.approve(d)      # the base default, not the fake's override
     with pytest.raises(DriverUnsupported):
         HarnessDriver.reject(d, "no")
+
+
+def test_a_failed_open_closes_the_driver_it_built(tmp_path):
+    """L1: a driver's open() may allocate before it raises; the host closes it and keeps only the text."""
+    class Leaky(_Fake):
+        def open(self, on_event, *, resume=None):
+            self.opened = True
+            raise RuntimeError("half built")
+
+    d = Leaky([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, st = _open(host, "alpha")
+    assert st["status"] == "failed" and st["error"] == "half built" and d.closed
+
+
+def test_the_openhands_driver_is_not_driveable_when_closed_and_keeps_an_errored_halt_held(tmp_path):
+    class Sess:
+        def run_turn(self, m):
+            return _Out(reply=None, gated=True, error="refusal did not take")
+
+        def close(self):
+            pass
+
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess())
+    with pytest.raises(RuntimeError):
+        d.send_turn("x")                     # never opened
+    d.open(lambda e: None)
+    assert d.send_turn("x").error and d.state == "awaiting_approval"   # the harness still holds actions
+    d.close()
+    with pytest.raises(RuntimeError):
+        d.send_turn("x")
+    assert d.state == "closed"
+    d.interrupt()                            # tolerated after close

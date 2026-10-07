@@ -132,7 +132,8 @@ class TurnOptions:
 class TurnOutcome(Protocol):
     """What a driver returns from a turn, an approval or a refusal. :class:`levain.session.TurnResult`
     satisfies it as it stands, and so does a plain dataclass, so :func:`levain.chat._turn_payload`
-    reads every harness's outcome the same way. Only the attributes the host reads are listed."""
+    reads every harness's outcome the same way. The host also reads ``unreadable_call`` where present
+    (:func:`levain.chat._turn_payload`); the attributes listed are the ones it requires."""
 
     reply: str | None
     tool_activity: Sequence[Any]
@@ -184,7 +185,7 @@ class HarnessDriver(abc.ABC):
     one worker thread at a time (a session runs at most one job), and :meth:`interrupt` and
     :meth:`close` from other threads while a job runs, which every implementation must tolerate."""
 
-    harness: str
+    harness: str = "unnamed"
     """The harness's name, for display and logs (``openhands``, later ``claude-code`` and ``codex``)."""
 
     caps: DriverCaps = DriverCaps()
@@ -194,7 +195,8 @@ class HarnessDriver(abc.ABC):
     @abc.abstractmethod
     def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
         """Open the conversation, or resume ``resume`` where :attr:`caps` says that is possible. A
-        refusal or a failure raises; the host keeps the message text and drops the exception."""
+        refusal or a failure raises; the host keeps the message text and drops the exception, and then
+        calls :meth:`close` (idempotent) so a failed open releases whatever it had built."""
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -251,8 +253,8 @@ class HarnessDriver(abc.ABC):
 
     @property
     def native(self) -> Any:
-        """The harness's own session object where one exists, for tests and the host's checks that
-        are about that harness (OpenHands' floor). ``None`` otherwise."""
+        """The harness's own session object where one exists (tests read it through
+        :attr:`levain.chat._Session.session`). ``None`` otherwise."""
         return None
 
 
@@ -300,14 +302,16 @@ class OpenHandsDriver(HarnessDriver):
 
     def _run(self, call: Callable[[Any], Any]) -> Any:
         with self._lock:
-            self._state = "active"
             session = self._session
+            if session is None:
+                raise RuntimeError("the driver is not open")
+            self._state = "active"
         result: Any = None
         try:
             result = call(session)
             return result
         finally:
-            gated = bool(getattr(result, "gated", False)) and getattr(result, "error", None) is None
+            gated = bool(getattr(result, "gated", False))   # an errored halt still holds its actions
             with self._lock:
                 if self._state == "active":
                     self._state = "awaiting_approval" if gated else "idle"
