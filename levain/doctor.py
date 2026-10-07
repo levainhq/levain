@@ -180,7 +180,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
         print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
         warned = [r for r in all_results if r.ok and r.warn]
-        print("All checks passed." if not warned else f"All checks passed, with {len(warned)} warning(s) above.")
+        print("All checks passed." + (f" ({len(warned)} warning(s) above.)" if warned else ""))
     if pending and not broken and verify_rc == 0:
         print(
             f"  Every failure above is a post-upgrade step not yet applied "

@@ -34,7 +34,10 @@ refused "non-root setup" "$LEVAIN" setup-isolation --path "$E"
 check "doctor warns before setup" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'NOT SET UP'"
 
 echo "== setup"
+OP_SAFE_BEFORE="$(git config --global --get-all safe.directory 2>/dev/null | sort)"
+info "safe.directory entries the operator already has: $(git config --show-origin --get-all safe.directory 2>/dev/null | tr '\n' ' ')"
 setup || { echo "setup failed"; exit 1; }
+if [ "$(git config --global --get-all safe.directory 2>/dev/null | sort)" = "$OP_SAFE_BEFORE" ]; then pass "setup added no safe.directory entry for the operator"; else fail "setup changed the operator's safe.directory"; fi
 H="$(cfgval hands_user)"; HID="$(cfgval hands_uid)"; WS="$(cfgval hands_workspace)"; HHOME="$(eval echo ~"$H")"
 echo "hands user: $H (id $HID), workspace: $WS"
 case "$WS" in "$HOME"/*) fail "workspace is under the operator's home";; *) pass "workspace is outside the operator's home";; esac
@@ -90,7 +93,10 @@ check "hands git status in the operator's repo" as_hands bash -c "cd '$WS/repo' 
 check "hands git commit in it, with the operator's git identity" as_hands bash -c "cd '$WS/repo' && echo x > f && git add f && git commit -q -m h && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
 check "operator git log sees it" bash -c "cd '$WS/repo' && test \"\$(git log --oneline | wc -l)\" -eq 2"
 as_hands bash -c "cd '$WS' && git init -q repo-h && cd repo-h && git commit -q --allow-empty -m h" >/dev/null 2>&1
-refused "operator git trusts a repository the hands user created" bash -c "cd '$WS/repo-h' && git status --short"
+# Without the runner image's own system/global entries, so this measures git's ownership check and
+# Levain's part in it (no operator entry), not the image's defaults.
+printf '[user]\n\tname = CI Operator\n\temail = ci-operator@invalid\n' > /tmp/levain-iso-clean-gitconfig
+refused "operator git trusts a repository the hands user created" env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/levain-iso-clean-gitconfig bash -c "cd '$WS/repo-h' && git status --short"
 
 echo "== undo, with a hands process still running"
 sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &

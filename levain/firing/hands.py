@@ -700,8 +700,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
         rc = run_plan(plan, dry_run=dry_run)
         if dry_run or rc != 0:
             return rc
+        # Asked of the directory service in a fresh process: this process's getpwnam can keep
+        # returning a just-deleted macOS account (measured on a CI runner).
+        gone = subprocess.run(_absent("user", host, hands), capture_output=True, cwd="/").returncode == 0
         leftovers = [what for what, there in (
-            (f"the user {hands}", _user_exists(hands)),
+            (f"the user {hands}", not gone),
             (f"the sudoers rule {sudoers_path(hands)}", sudoers_path(hands).exists()),
         ) if there]
         if leftovers:
