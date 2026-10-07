@@ -227,7 +227,6 @@ import os
 import platform
 import queue
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
@@ -2099,7 +2098,6 @@ class SandboxedShell:
         # precisely what a TOCTOU fix may not assume.
         self.effective_policy: CrownJewelsPolicy | None = None
         self._cmd_w: IO[str] | None = None   # the FIFO command channel write end (see start())
-        self._fifo_dir: str | None = None    # the tempdir holding the command FIFO (cleaned on close)
         self._stdout_q: "queue.Queue[str | None]" = queue.Queue(maxsize=_MAX_QUEUE_LINES)
         self._reader: threading.Thread | None = None
         self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
@@ -2125,20 +2123,24 @@ class SandboxedShell:
         """Spawn the sandboxed bash and its stdout reader thread. Returns self (chainable)."""
         if self._proc is not None:
             return self
-        # The command channel is a FIFO that BASH OPENS ITSELF as its script. Why a FIFO and not an
-        # inherited pipe fd (``pass_fds`` + ``/dev/fd/N``): an inherited fd is visible to bash's
-        # CHILDREN at a known number, so a command can ``os.read(3, …)`` and steal the command stream /
-        # learn the sentinel (apparatus L3 codex HIGH, verified live). A fd bash OPENS is CLOSE-ON-EXEC,
-        # so children never inherit it — the command channel is private from the commands. Children's
-        # stdin is ``/dev/null`` (no stdin hijack — apparatus L1). The fifo lives in an unguessable
-        # mkdtemp dir (a child would have to guess the path to interfere).
-        fifo_dir = tempfile.mkdtemp(prefix="levain-cmd-")
-        fifo = os.path.join(fifo_dir, "cmd")
-        rendezvous = -1
+        # The command channel is a PIPE. bash is given its read end as the script, by fd number
+        # (``bash /dev/fd/N``), and the FIRST line levain writes is ``exec N<&-``, before anything the
+        # entity sends. bash reads its script through a descriptor of its OWN, which it marks
+        # close-on-exec, so once that line has run no child holds the channel at any number. (A bare
+        # inherited fd was rejected once because children saw it at a known number and could read
+        # the command stream and the sentinel: apparatus L3 codex HIGH, verified live. Closing it
+        # before the first command is what answers that.)
+        # ⛔ WHY NOT A NAMED FIFO ANY MORE (lane M's M2 design, 8c, 2026-10-07): the FIFO was
+        # unlinked after the startup handshake, which kept it from the shell's own children
+        # (codex R2 #1: bash discloses its script path as ``$0``), but during the handshake its path
+        # existed and was on bash's argv, readable by every process of this user
+        # (``KERN_PROCARGS2``, ``/proc/<pid>/cmdline``). Another session's process could open it and
+        # write commands into this shell, or read them. A pipe has no name.
+        # Children's stdin is ``/dev/null`` (no stdin hijack — apparatus L1).
+        rd, wr = os.pipe()
         try:
-            os.mkfifo(fifo)
             self._proc = subprocess.Popen(
-                [*self._argv, fifo],
+                [*self._argv, f"/dev/fd/{rd}"],
                 stdin=subprocess.DEVNULL,   # children get /dev/null, NOT the command channel
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,   # merge stderr into stdout (terminal-like)
@@ -2159,46 +2161,40 @@ class SandboxedShell:
                 start_new_session=True,
                 # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
                 # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
-                # open in this process at spawn time. With the FIFO channel there is NO passed fd.
+                # open in this process at spawn time. The one passed fd is the command pipe's read
+                # end, which bash closes before it runs anything else.
                 close_fds=True,
+                pass_fds=(rd,),
             )
+            os.close(rd)
+            rd_in_bash, rd = rd, -1
+            # The write end is levain's alone: a dead bash gives EPIPE on write, not a block.
+            self._cmd_w = os.fdopen(wr, "w")
+            wr = -1
+            self._cmd_w.write(f"exec {rd_in_bash}<&-\n")
             # Drain bash's stdout from the start so the handshake below can observe its output (incl. a
             # `sandbox-exec` startup error).
             self._reader = threading.Thread(target=self._drain_stdout, daemon=True)
             self._reader.start()
-            # FIFO open dance (apparatus L3 codex round-2). O_RDWR RENDEZVOUS opens without blocking and
-            # provides a reader so (a) bash's own blocking O_RDONLY script-open unblocks and (b) the real
-            # O_WRONLY command channel opens without blocking. Then:
-            #   - HANDSHAKE proves bash actually opened + is reading — else sandbox-exec/bash died at
-            #     startup and spawn must FAIL, not hand back a dead shell (codex R2 #2);
-            #   - close the rendezvous so the parent is WRITER-ONLY → a dead bash gives EPIPE on write,
-            #     not an unbounded block (O_RDWR left the parent a reader → a big write could wedge; codex R2 #3);
-            #   - UNLINK the fifo so a child's ``open($0)`` (bash discloses the script PATH as ``$0``,
-            #     so "unguessable mkdtemp path" was NOT enough) hits ENOENT — the channel is truly
-            #     private from the commands (codex R2 #1). bash keeps reading via its open fd.
-            rendezvous = os.open(fifo, os.O_RDWR)
-            self._cmd_w = os.fdopen(os.open(fifo, os.O_WRONLY), "w")
+            # HANDSHAKE proves bash actually started and is reading — else the sandbox driver or bash
+            # died at startup and spawn must FAIL, not hand back a dead shell (codex R2 #2).
             self._handshake()
-            os.close(rendezvous)
-            rendezvous = -1
-            os.unlink(fifo)
         except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too, else
-            # a cancellation during _handshake() leaks the rendezvous fd + fifo dir (close() can't
-            # reach them: rendezvous is a local, _fifo_dir is unset until success — apparatus L3 codex R3).
-            if rendezvous >= 0:
-                try:
-                    os.close(rendezvous)
-                except OSError:
-                    pass
-                rendezvous = -1
-            self._teardown_failed_start(fifo_dir)
+            # a cancellation during _handshake() leaks the pipe ends and the process (apparatus L3
+            # codex R3).
+            for fd in (rd, wr):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._teardown_failed_start()
             if not isinstance(exc, Exception):
                 raise  # a cancellation (KeyboardInterrupt / SystemExit) propagates UNCHANGED
             reason = exc if isinstance(exc, ConfinementError) else (
                 f"could not spawn the sandboxed shell ({exc}); argv={self._argv[:2]}…"
             )
             raise ConfinementError(str(reason)) from exc
-        self._fifo_dir = fifo_dir
         return self
 
     def _handshake(self, timeout: float = 10.0) -> None:
@@ -2234,10 +2230,9 @@ class SandboxedShell:
             early = [*early[-19:], line]
         raise ConfinementError("timed out waiting for the shell startup handshake.")
 
-    def _teardown_failed_start(self, fifo_dir: str) -> None:
-        """Best-effort cleanup for a start() that raised: close the write end, kill the group, remove
-        the fifo dir. Leaves ``_proc``/``_cmd_w`` None + ``_fifo_dir`` unset so a later close() is a
-        no-op (this path already cleaned up)."""
+    def _teardown_failed_start(self) -> None:
+        """Best-effort cleanup for a start() that raised: close the write end, kill the group. Leaves
+        ``_proc``/``_cmd_w`` None so a later close() is a no-op (this path already cleaned up)."""
         if self._cmd_w is not None:
             try:
                 self._cmd_w.close()
@@ -2247,7 +2242,6 @@ class SandboxedShell:
         if self._proc is not None and self._proc.poll() is None:
             self._signal_group(signal.SIGKILL)
         self._proc = None
-        shutil.rmtree(fifo_dir, ignore_errors=True)
 
     def _drain_stdout(self) -> None:
         """Read stdout line by line into the queue; enqueue ``None`` at EOF (shell exited).
@@ -2435,9 +2429,6 @@ class SandboxedShell:
                         pass
         finally:
             self._proc = None
-            if self._fifo_dir is not None:
-                shutil.rmtree(self._fifo_dir, ignore_errors=True)  # always remove the command FIFO
-                self._fifo_dir = None
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()

@@ -22,6 +22,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Fixed
 
+- **The confined shell's command channel no longer has a name another process could open.** It was a named pipe in a temp directory whose path sat on the shell's command line until the shell had started, so a process of the same user (another session's entity, say) could read the path and write commands into this shell or read them in that window. It is now an anonymous pipe the shell reads by descriptor and closes before running anything else.
 - **The launch banner names every credential store the floor covers.** Its "READABLE" warning named three of the five stores (it left out both git credential files); it now reads the floor's own list.
 
 ## [0.6.9] — 2026-10-05

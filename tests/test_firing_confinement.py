@@ -430,10 +430,11 @@ def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
         )
         r = sh.run(fd_probe, timeout=15)
         assert "STOLE" not in r.output and "probe_done" in r.output
-        # (b) $0-path probe: bash discloses the script path as $0; opening it must fail (unlinked).
-        # If the attack SUCCEEDED, open() returns → exit 0; unlinked → FileNotFoundError → nonzero.
-        r0 = sh.run('python3 -c "import sys; open(sys.argv[1])" "$0" 2>&1', timeout=10)
-        assert r0.exit_code != 0 and "FileNotFoundError" in r0.output
+        # (b) $0-path probe: bash discloses its script as $0, now ``/dev/fd/N`` of a pipe it closed
+        # before running anything. A child opening it gets nothing (EBADF on macOS, ENOENT on Linux).
+        assert sh.run('echo "$0"', timeout=8).output.strip().startswith("/dev/fd/")
+        r0 = sh.run('python3 -c "import sys; open(sys.argv[1]).read()" "$0" 2>&1', timeout=10)
+        assert r0.exit_code != 0 and ("Bad file descriptor" in r0.output or "FileNotFoundError" in r0.output)
         # the shell itself is still perfectly usable afterward:
         assert sh.run("echo ok", timeout=8).output.strip() == "ok"
 
