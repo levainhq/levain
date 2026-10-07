@@ -1774,7 +1774,10 @@ def opened_file_path(fd: int) -> str:
     (a process may always read its own), ``F_GETPATH`` on macOS. Raises OSError when there is none
     (a pipe, a socket) or it cannot be read."""
     if platform.system() == "Linux":
-        return os.readlink(f"/proc/self/fd/{fd}")
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        if not path.startswith("/"):   # "pipe:[123]", "socket:[456]", "anon_inode:...": no file
+            raise OSError(f"fd {fd} is not a file ({path})")
+        return path
     import fcntl
 
     getpath = getattr(fcntl, "F_GETPATH", None)

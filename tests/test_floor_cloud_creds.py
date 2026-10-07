@@ -29,7 +29,8 @@ def home(tmp_path: Path, monkeypatch) -> Path:
     h = tmp_path / "home"
     h.mkdir()
     monkeypatch.setenv("HOME", str(h))
-    for var in ("AWS_LOGIN_CACHE_DIRECTORY", "CLOUDSDK_CONFIG", "AZURE_CONFIG_DIR", "XDG_RUNTIME_DIR"):
+    for var in ("XDG_RUNTIME_DIR", "GIT_CONFIG_GLOBAL",
+                *{v for v, _, _ in C._CRED_OVERRIDES}):   # a CI runner sets XDG_CONFIG_HOME
         monkeypatch.delenv(var, raising=False)
     return h
 

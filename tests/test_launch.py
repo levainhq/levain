@@ -50,6 +50,9 @@ def _run(code: str, *args: str, env: dict[str, str]) -> subprocess.CompletedProc
 _PROBE = (
     "import os, sys\n"
     "from levain import launch\n"
+    # On Linux the restored image marks itself not dumpable, after which not even it can read its
+    # own /proc/<pid>/environ; that has its own test. Here the re-exec alone is measured.
+    "launch.set_not_dumpable = lambda: False\n"
     "before = os.getpid()\n"
     "launch.reexec_if_needed()\n"
     + _kernel_view("os.getpid()") +
