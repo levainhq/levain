@@ -466,10 +466,11 @@ def main(argv: list[str] | None = None) -> int:
             "With --task: declare that NO HUMAN is in the loop at all — a scheduler invoked "
             "this and nobody will necessarily read the output (what `levain daemon install-seat` "
             "emits). With --consolidate, the consolidate may metabolize but is refused from "
-            "crystallizing. The "
-            "gate and the standard-credential denial (gh, AWS and the netrc / git credential "
-            "files; on macOS also the Keychain) already apply to any --task run; an entity "
-            "that needs them sets deny_standard_creds to false in .levain/confinement.json."
+            "crystallizing. By "
+            "default the gate and the standard-credential denial (gh, AWS and the netrc / git "
+            "credential files; on macOS also the Keychain) already apply to any --task run; "
+            "efferent_gate: \"ungated\" turns the gate off and deny_standard_creds: false lets the "
+            "entity read those stores (both in .levain/confinement.json)."
         ),
     )
     run_p.set_defaults(func=_cmd_run)
@@ -1071,7 +1072,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # without it, the interactive REPL. `--quiet`/`--max-iterations` only shape a task run.
     task = getattr(args, "task", None)
     # `--unattended` without `--task` is REFUSED rather than ignored. It is a security-relevant
-    # DECLARATION (no human in the loop → the standard cred stores join the crown-jewels floor),
+    # DECLARATION (no human in the loop → the consolidate may metabolize, never crystallize),
     # and a REPL is definitionally attended, so honouring it there is impossible while dropping it
     # silently would leave the operator believing a posture they did not get. A governance claim
     # the run does not enforce is the exact failure class this keystone exists to make impossible.
@@ -1579,9 +1580,9 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         # The FLOOR posture, resolved the same way and for the same reason. Until K4a the banner
         # carried one RESOLVED line (the gate) directly above one STATIC line (the floor),
         # answering the same operator question — and THAT ASYMMETRY WAS THE BUG.
-        # DERIVED from the spec, never hardcoded: build_seat_spec emits --unattended today, but a
-        # hardcoded "unattended" would keep claiming the strict floor for any future seat shape
-        # that does not (glm L3 LOW) — a claim outliving its enforcement.
+        # DERIVED from the spec, never hardcoded: build_seat_spec emits --unattended today. Since
+        # 2026-10-07 headless and unattended resolve the same cred floor, so the derivation matters
+        # only if a later policy splits them again (glm L3 LOW: a claim outliving its enforcement).
         # ⚠ NOT COVERED BY A TEST, deliberately: `build_seat_spec` always emits `--unattended`, so
         # hardcoding it here is presently INDISTINGUISHABLE from deriving it, and a mutation of
         # this line survives the suite. Recorded rather than papered over with a test that fakes a

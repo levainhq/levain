@@ -3399,6 +3399,17 @@ def test_cred_floor_label_names_every_store_the_floor_denies() -> None:
         assert path in label, path
 
 
+@pytest.mark.parametrize("path", [
+    "~/.pypirc", "~/.npmrc", "~/.docker/config.json", "~/.kube/config",
+])
+def test_token_files_found_readable_by_a_headless_entity_are_standard_cred_stores(path) -> None:
+    # Each held a live token readable by a headless entity's shell under the real profile
+    # (2026-10-07). Pinned by name, so dropping one from the tuple fails here.
+    from levain.firing.confinement import _STANDARD_CRED_FILES
+
+    assert path in _STANDARD_CRED_FILES
+
+
 def test_readme_names_every_store_the_cred_floor_denies() -> None:
     # The README lists the stores by hand for a reader deciding whether to set
     # deny_standard_creds; a store the floor gains must reach that list.

@@ -2,8 +2,11 @@
 
 **Why this exists as its own concept (K4a, 2026-07-29).** Levain used to answer one question about
 a session — ``human_present: bool`` — and derive everything from it. That bool turned out to be an
-UNDER-MODELED AXIS: it has three states, not two, and collapsing two of them was correct for the
-efferent gate and wrong for the crown-jewels floor.
+UNDER-MODELED AXIS: it has three states, not two. Until 2026-10-07 the efferent gate collapsed
+``headless`` with ``unattended`` and the crown-jewels cred floor did not; since then both draw the
+same line (see below). The third state stays as the record that a scheduler, not a person, invoked
+the run; no policy in this module splits on it today, and the autonomy policies still to come will.
+(The ``--unattended`` flag's metabolize-never-crystallize rule keys on the flag itself, not on this mode.)
 
 ===============  ==================  ==========================  ========  ===================
 mode             who invoked it      who reads the activity      gate      standard creds
@@ -20,11 +23,10 @@ existing ``human_present: bool`` signature untouched. **K3's security boundary d
 
 **Why the floor follows the same line.** Until 2026-10-07 the floor kept ``headless`` open and denied
 only ``unattended``; Phill ruled the default flipped (cockpit chat is ``headless``, and its every turn
-is captured). Note
-first that the crown-jewels floor is otherwise presence-INDEPENDENT: ``~/.anneal-memory`` is denied
+is captured). The crown-jewels floor is otherwise presence-INDEPENDENT: ``~/.anneal-memory`` is denied
 at the REPL too, with a human sitting right there, because the floor is *irreversibility
-containment* and not fan-in. So credentials need an actual argument to be drive-dependent, and it is
-this:
+containment* and not fan-in. The credential stores are the one drive-dependent part, for these
+reasons:
 
 1. **The gate does not cover the READ.** ``view`` is afferent (``AFFERENT_FILE_EDITOR_COMMANDS``),
    so a fully GATED seat can read ``~/.config/gh/hosts.yml`` with nothing stopping it. Bash being
@@ -36,13 +38,15 @@ this:
    asked to debug authentication.
 3. **That is where it turns bad.** A captured secret is exactly what a self-consolidate metabolizes
    into the NEOCORTEX, which is always-loaded and re-injected into every future turn — *including
-   interactive turns, where the gate is UNGATED and bash is available.* A silent unattended read can
-   surface a live credential into a session that CAN exfiltrate it.
+   interactive turns, where the gate is UNGATED and bash is available.* A credential read in any
+   session nobody reviews before a wrap can surface into a session that CAN exfiltrate it.
 
-So the discriminator is **whether a human sees the read as it happens**: only at the REPL does the
-operator see the ``view`` and the echo before the turn is captured and can wipe the store before a wrap
-runs. A ``headless`` turn (a ``--task`` run, a cockpit chat turn) is read afterwards, after its text
-was already captured, so it gets the same default as a scheduled seat. That is :func:`human_present`,
+So the default is: **closed everywhere except the interactive REPL.** The REPL is not live
+supervision: it runs a turn to completion (capture included) and only then shows its activity.
+It stays open by default as an operational-fit choice, because it is where an operator works with
+gh/aws-dependent tasks directly, reading every turn at the terminal before typing the next and before
+any wrap. A ``headless`` turn (a ``--task`` run, a cockpit chat turn) and a scheduled seat get the
+closed default. That line is :func:`human_present`,
 the gate's own derivation, so the floor and the gate answer from one place. An entity that needs
 ``gh`` or ``aws`` headless opts in with ``"deny_standard_creds": false``.
 

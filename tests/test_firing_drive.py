@@ -1,10 +1,10 @@
 """Tests for levain.firing.drive — the single drive-mode authority (K4a).
 
-The three-rung mode replaced a ``human_present`` bool that had been an UNDER-MODELED AXIS: the
-gate is right to collapse ``headless`` and ``unattended`` (neither has anyone to fan an action in
-to), and the crown-jewels cred floor is wrong to (only the unattended one compounds unsupervised).
-These pin BOTH halves of that asymmetry — the collapse and the distinction — because a change that
-loses either one is a security regression that no other test would catch.
+The three-rung mode replaced a ``human_present`` bool. The gate collapses ``headless`` and
+``unattended`` (neither has anyone to fan an action in to), and since 2026-10-07 the cred floor's
+default draws the same line (closed everywhere but the interactive REPL). These pin that line, and
+that an explicit setting still overrides it, because a change to either is a security regression
+no other test would catch.
 """
 
 from __future__ import annotations

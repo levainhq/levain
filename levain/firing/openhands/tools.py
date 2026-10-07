@@ -28,8 +28,8 @@ on every path — the same denylist, so there is no ``claim > enforcement`` gap 
 moat in file terms), sibling entities' ``.levain/`` stores, ``~/.ssh`` key material (``ssh_mode=
 "agent"`` — the entity authenticates via the agent socket but can't read/exfil raw keys),
 ``~/.ssh/authorized_keys`` WRITE (both ssh_modes — no key can be planted as a persistence backdoor),
-plus the operator-declared credential files/subtrees from ``confinement.json`` and — when the operator
-opts in (``deny_standard_creds``) — the standard cred stores (``confinement._STANDARD_CRED_SUBTREES`` /
+plus the operator-declared credential files/subtrees from ``confinement.json`` and — whenever the
+resolved ``deny_standard_creds`` is on (every drive but the interactive REPL, unless the entity opts out) — the standard cred stores (``confinement._STANDARD_CRED_SUBTREES`` /
 ``_STANDARD_CRED_FILES``). The entity's OWN ``<entity>/.levain/`` is its working space, NOT a jewel — readable,
 and its non-store files are writable — EXCEPT its own memory STORE files (``memory.{continuity.md,
 crystal.json,db}`` + the SQLite sidecars), which are WRITE-denied to the hands (``own_memory_files``,

@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Changed
 
 - **Chat and `levain run --task` no longer read your standard credential stores by default.** `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials` and, on macOS, the Keychain are now denied in every drive except the interactive `levain run` REPL, as they already were for a scheduled seat. Before, a `headless` session (a cockpit chat turn, or `--task` without `--unattended`) could read them, and reading a file is not an action the gate holds. An entity that needs `gh` or `aws` there sets `"deny_standard_creds": false` in `.levain/confinement.json`; an explicit `true` or `false` is unchanged. Measured 2026-10-07 on macOS under the real sandbox profile: a headless session's shell got `~/.config/gh/hosts.yml` before this change and is denied after it.
+- **Four more token files are standard credential stores:** `~/.pypirc` and `~/.npmrc` (registry publish tokens), `~/.docker/config.json` (registry auths) and `~/.kube/config` (cluster credentials). Each held a live token, or can, and was readable by a confined entity in every drive; measured 2026-10-07 under the real profile for the first three. They follow the same default and the same `deny_standard_creds` switch as the stores above.
 
 ### Fixed
 
