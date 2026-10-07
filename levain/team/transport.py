@@ -201,26 +201,27 @@ class Repo:
     def discover(cls, start: Path) -> "Repo | None":
         """The repository containing ``start`` (a file or a directory, existing or not), or None."""
         d = _existing_dir(start)
-
-        def one(flag: str) -> bytes | None:
-            # One path per call, as bytes, exactly one trailing LF removed: a path may hold any character but NUL,
-            # so a two-path answer split into lines cannot be trusted. Only "not a work tree" means None; any other
-            # failure (git missing, a timeout, safe.directory, a broken config) raises, so a hook in a joined clone
-            # reports it instead of reading "no repository" and going quiet.
-            cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
-            if cp.returncode != 0:
-                err = cp.stderr.lower()
-                if "not a git repository" in err or "must be run in a work tree" in err:
-                    return None
-                raise TeamError(f"git rev-parse {flag} failed: {_tail(cp)}")
-            if not cp.stdout_bytes.endswith(b"\n") or len(cp.stdout_bytes) < 2:
-                raise TeamError(f"git rev-parse {flag} gave an answer levain cannot read")
-            return cp.stdout_bytes[:-1]
-
-        top = one("--show-toplevel")
-        common = one("--git-common-dir") if top is not None else None
-        if top is None or common is None:
-            return None
+        # ONE git process answers both questions, so they come from one repository discovery: two calls let a
+        # directory swapped between them (a retargeted symlink) mix two repositories. rev-parse prints each path on its
+        # own line and a path may hold a line break, so the top level is asked twice, as A LF B LF A LF, and the split
+        # is accepted only when exactly one reading fits. Only "not a work tree" means None; any other failure (git
+        # missing, a timeout, safe.directory, a broken config) raises, so a hook in a joined clone reports it instead
+        # of reading "no repository" and going quiet.
+        cp = git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--show-toplevel"], d,
+                 timeout=10, check=False)
+        if cp.returncode != 0:
+            err = cp.stderr.lower()
+            if "not a git repository" in err or "must be run in a work tree" in err:
+                return None
+            raise TeamError(f"git rev-parse failed: {_tail(cp)}")
+        out = cp.stdout_bytes
+        fits = [(out[:k], out[k + 1:len(out) - k - 1]) for k in range(1, len(out)) if out[k:k + 1] == b"\n"
+                and len(out) >= 2 * k + 3 and out.endswith(b"\n" + out[:k] + b"\n")]
+        fits = [(top, common[:-1]) for top, common in fits if common.endswith(b"\n") and len(common) > 1
+                and top.startswith(b"/") and common.startswith(b"/")]
+        if len(fits) != 1:
+            raise TeamError("git rev-parse gave an answer levain cannot read (this repository's path is ambiguous)")
+        top, common = fits[0]
         try:
             return cls(Path(top.decode("utf-8")), Path(common.decode("utf-8")))
         except UnicodeDecodeError:

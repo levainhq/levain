@@ -371,3 +371,24 @@ def test_a_top_level_attributes_file_on_the_ledger_branch_is_tamper(two):
     assert any(".gitattributes" in t for t in ledger(ben).tamper)
     out = edit(ben, "src/unrelated.py", session="ga")["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny"
+
+
+def test_discovery_reads_the_top_level_and_the_git_dir_from_one_git_process(tmp_path, monkeypatch):
+    # The would-be known limit "the top level and the git directory come from two git calls, so a directory swapped
+    # between them (a retargeted symlink) can mix two repositories": one process, one discovery, no window.
+    from levain.team import transport as T
+    for name in ("proj", "proj\nx", "a\n/b"):
+        d = tmp_path / name
+        d.mkdir(parents=True)
+        git("init", "-q", cwd=d)
+        calls = []
+        real = T.git
+
+        def counting(args, cwd, **kw):
+            calls.append(args)
+            return real(args, cwd, **kw)
+        monkeypatch.setattr(T, "git", counting)
+        repo = Repo.discover(d / "sub" / "f.py")
+        monkeypatch.setattr(T, "git", real)
+        assert len(calls) == 1, calls
+        assert os.path.realpath(repo.toplevel) == os.path.realpath(d), name
