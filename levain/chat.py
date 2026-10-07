@@ -77,7 +77,16 @@ conversation, and its shell, at interpreter exit.
 **A session is counted toward the cap until its shell is released.** ``close`` marks it ``closing``
 (still counted, refusing every operation), tears it down outside the lock, and only then publishes
 ``closed``; an open that lands after shutdown is torn down while it still reads ``opening``. So a
-slow teardown can never let an ``open`` exceed ``max_sessions`` (codex L3 r2).
+slow teardown can never let an ``open`` exceed ``max_sessions`` (codex L3 r2). "Released" is what the
+driver CONFIRMS (:meth:`~levain.chat_driver.HarnessDriver.wait_closed`): a release still in flight past
+the driver's close bound is waited for by the host's reaper, and the record stays counted meanwhile.
+
+**A release that failed is not a release** (ruled 2026-10-07). When a driver's graceful close fails and it
+offers no force release (or that fails too), the session ends ``release_failed``: still counted, refusing
+every operation, and listed in ``/chat.json`` with its error and ``release_failed_since``. Its shell may
+still be live, so its slot is not handed to a new session. Restarting ``levain serve`` ends it (the
+process that held the shell exits); nothing else does. An OpenHands session cannot reach this state:
+:meth:`EntitySession.close` never raises.
 
 **Why the job registry is in memory, unlike** :mod:`levain.jobs` **(which is on disk).** A turn job is
 meaningful only while its conversation exists, and the conversation lives in this process (nothing
@@ -103,7 +112,9 @@ import logging
 import math
 import secrets
 import threading
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
@@ -133,7 +144,8 @@ __all__ = [
 
 _log = logging.getLogger("levain.chat")
 
-SessionState = Literal["opening", "idle", "busy", "gated", "closing", "broken", "failed", "closed"]
+SessionState = Literal["opening", "idle", "busy", "gated", "closing", "release_failed", "broken", "failed",
+                       "closed"]
 JobKind = Literal["open", "turn", "approve", "reject"]
 JobStatus = Literal["running", "done", "failed"]
 
@@ -154,7 +166,7 @@ MAX_LINE_CHARS = 2_000
 _ENDED_SESSIONS_KEPT = 100
 """How many ended sessions (closed, failed, broken) stay readable. Older ones are forgotten."""
 
-_LIVE_STATES = ("opening", "idle", "busy", "gated", "closing")
+_LIVE_STATES = ("opening", "idle", "busy", "gated", "closing", "release_failed")
 """The states that hold, or are about to hold, a conversation. Only these count toward the cap. A
 broken session's shell is released by the worker BEFORE it is marked broken."""
 
@@ -177,8 +189,14 @@ _WATCHER_JOIN_SECONDS = 10.0
 stop request blocks only while a step runs, and none is running by then, so this is a backstop."""
 
 _REAP_POLL_SECONDS = 60.0
-"""How long a reaper waits on a handed-off release between log lines, and between asks of a driver
-that could not say whether it is released."""
+"""How often the reaper logs a release that is still in flight."""
+
+_REAP_SWEEP_SECONDS = 0.25
+"""How often the reaper asks each pending driver whether it has released (a non-blocking ask)."""
+
+_SHUTDOWN_JOIN_SECONDS = 60.0
+"""How long :meth:`ChatHost.shutdown` waits for its side-by-side closes. Each is bounded by its driver;
+this bounds a driver that does not keep that promise (its record stays ``closing``, counted)."""
 
 
 class ChatError(Exception):
@@ -244,6 +262,7 @@ class _Session:
     session_id: str
     entity: str
     state: SessionState = "opening"
+    release_failed_since: str | None = None   # when its release failed (UTC, ISO 8601), for release_failed
     decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
     pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
     held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
@@ -341,6 +360,21 @@ def _default_factory(
     return _open
 
 
+_HOST_VIEW_KEYS = frozenset({"session_id", "entity", "state", "job_id", "error", "release_failed_since",
+                             "last_job"})
+"""The keys a session view takes from the host only, never from a driver's :meth:`describe`."""
+
+
+@dataclass(eq=False)
+class _Reaping:
+    """A closed driver whose release is still in flight, and what to run once it is confirmed."""
+
+    rec: _Session
+    driver: HarnessDriver
+    settle: Callable[[], None]
+    logged: float
+
+
 class ChatHost:
     """Live entity sessions for one server process, driven by jobs.
 
@@ -381,13 +415,15 @@ class ChatHost:
                 "turn_seconds must be a finite number of seconds above 0 and at most "
                 f"{threading.TIMEOUT_MAX:.0f}, or None")
         self._entities = {name: Path(p) for name, p in entities.items()}
-        opener = session_factory or _default_factory(
-            model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations
-        )
         # One driver per (entity, conversation), made by entity name. The default is OpenHands for every
-        # entity; a constellation of mixed harnesses supplies its own mapping here.
-        self._driver_factory: Callable[[str, Path], HarnessDriver] = driver_factory or (
-            lambda name, entity_dir: OpenHandsDriver(entity_dir, opener))
+        # entity; a constellation of mixed harnesses supplies its own mapping here (and then no OpenHands
+        # opener is built).
+        if driver_factory is None:
+            opener = session_factory or _default_factory(
+                model=model, base_url=base_url, api_key=api_key, max_iterations=max_iterations
+            )
+            driver_factory = lambda name, entity_dir: OpenHandsDriver(entity_dir, opener)  # noqa: E731
+        self._driver_factory: Callable[[str, Path], HarnessDriver] = driver_factory
         self._model = model
         self._max_sessions = max_sessions
         self._turn_seconds = turn_seconds
@@ -395,6 +431,11 @@ class ChatHost:
         self._sessions: dict[str, _Session] = {}
         self._jobs: dict[str, _Job] = {}
         self._shut = False
+        # The reaper is acquired HERE, before any session exists for it to wait on: no teardown path has
+        # to create a thread, so none can fail to (a host that cannot start it is not built).
+        self._reap_cond = threading.Condition()
+        self._reaping: list[_Reaping] = []
+        threading.Thread(target=self._reaper, daemon=True, name="levain-chat-reaper").start()
 
     # -- reads ---------------------------------------------------------------
 
@@ -515,8 +556,8 @@ class ChatHost:
                     "busy", f"the session is {rec.state}; close it when that finishes", 409)
             driver, rec.driver = rec.driver, None
             if driver is None:
-                if rec.state != "failed":
-                    rec.state = "closed"
+                if rec.state not in ("failed", "release_failed"):
+                    rec.state = "closed"      # a release that failed stays counted: only a restart ends it
                 return self._session_view(rec)
             rec.state = "closing"
         self._close_then(rec, driver, lambda: self._settle(rec, "closed"), quiet=False)
@@ -548,8 +589,10 @@ class ChatHost:
                 self._close_then(rec, s, functools.partial(self._settle, rec, "closed"))
             else:
                 closers.append(closer)
+        give_up = time.monotonic() + _SHUTDOWN_JOIN_SECONDS
         for closer in closers:
-            closer.join()      # each close is bounded by its driver, and they run together
+            # Each close is bounded by its driver and they run together; this bounds one that is not.
+            closer.join(max(0.0, give_up - time.monotonic()))
 
     # -- internals -----------------------------------------------------------
 
@@ -559,56 +602,76 @@ class ChatHost:
 
     def _close_then(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None], *,
                     quiet: bool = True) -> None:
-        """Close ``driver``, then run ``settle`` (it takes the lock itself) once the driver reports
-        everything released (:meth:`~levain.chat_driver.HarnessDriver.wait_closed`). The caller leaves the
-        record in a counted state until then, so a release still in flight (a turn that ignored the stop, a
-        native close that has not returned) keeps its slot. ``close()`` is bounded by the driver; what it
-        hands off is waited for on a reaper thread, never on the caller's. A close that raises never skips
-        ``settle`` once the driver reads released; the error is then logged (``quiet``, a worker or
-        shutdown, where nobody is waiting for it) or raised to the caller."""
+        """Close ``driver``, then run ``settle`` (it takes the lock itself) once the driver CONFIRMS the
+        release (:meth:`~levain.chat_driver.HarnessDriver.wait_closed`). The caller leaves the record in a
+        counted state until then. ``close()`` is bounded by the driver; a release still in flight is
+        handed to the reaper, never waited for on the caller's thread. A release that FAILED is not a
+        release (ruled 2026-10-07): the driver's force release runs once where it offers one, and
+        otherwise the record ends ``release_failed``, still counted (module docstring). A close that
+        raises never skips this; its error is then logged (``quiet``, a worker or shutdown, where nobody
+        is waiting) or raised to the caller."""
         try:
             driver.close()
-        except Exception as exc:  # noqa: BLE001 — a teardown failure never skips the settle below
+        except Exception as exc:  # noqa: BLE001 — a teardown failure never skips the release check below
             _log.error("chat session %s: close failed: %s", rec.session_id, exc)
             if not quiet:
                 raise
         finally:
-            if self._released(driver, 0):
-                settle()
-            else:
-                reaper = threading.Thread(target=self._reap, args=(rec, driver, settle), daemon=True,
-                                          name="levain-chat-reaper")
-                try:
-                    reaper.start()
-                except RuntimeError:
-                    # still counted: an unreleased session keeps its slot rather than freeing it early
-                    _log.error("chat session %s: no reaper thread; it stays counted", rec.session_id)
+            if not self._after_close(rec, driver, settle):
+                with self._reap_cond:
+                    self._reaping.append(_Reaping(rec, driver, settle, time.monotonic()))
+                    self._reap_cond.notify_all()
 
-    def _released(self, driver: HarnessDriver, timeout: float | None) -> bool | None:
-        """Whether ``driver`` has released everything, waiting at most ``timeout``; ``None`` when it could
-        not say (it raised), which every caller reads as not released: the slot stays counted."""
+    def _after_close(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None]) -> bool:
+        """One look at a closed driver. Released: settle. Failed: one force release where the driver
+        offers it, else ``release_failed``. ``False`` while the release is still in flight."""
+        if self._released(driver):
+            self._run_settle(rec, settle)
+            return True
         try:
-            return bool(driver.wait_closed(timeout))
-        except Exception as exc:  # noqa: BLE001
-            _log.error("chat: a driver could not say whether it is released: %s", exc)
-            return None
+            failure = driver.release_error()
+        except Exception as exc:  # noqa: BLE001 — cannot say: still in flight, still counted
+            _log.error("chat session %s: the driver could not report its release: %s", rec.session_id, exc)
+            return False
+        if failure is None:
+            return False
+        if driver.caps.can_force_release:
+            try:
+                driver.force_release()
+            except Exception as exc:  # noqa: BLE001
+                failure = f"{failure}; force release: {type(exc).__name__}: {exc}"
+            else:
+                if self._released(driver):
+                    self._run_settle(rec, settle)
+                    return True
+                failure = f"{failure}; force release returned without a confirmed release"
+        self._mark_release_failed(rec, failure)
+        return True
 
-    def _reap(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None]) -> None:
-        """Wait for a handed-off release, then settle the record. Never gives up: a session whose shell
-        is never released stays counted, which is the true state of the machine. A driver that cannot
-        say is asked again after the same interval, never in a tight loop (L1: it spun ~3M times a second)."""
-        while True:
-            released = self._released(driver, _REAP_POLL_SECONDS)
-            if released:
-                break
-            if released is None:
-                threading.Event().wait(_REAP_POLL_SECONDS)
-            _log.warning("chat session %s: still releasing its shell", rec.session_id)
+    def _released(self, driver: HarnessDriver) -> bool:
+        try:
+            return bool(driver.wait_closed(0))
+        except Exception:  # noqa: BLE001 — cannot say reads as not released: the slot stays counted
+            return False
+
+    def _mark_release_failed(self, rec: _Session, failure: str) -> None:
+        _log.error("chat session %s: its release failed, so it stays counted until the server restarts: %s",
+                   rec.session_id, failure)
+        with self._lock:
+            job = self._jobs.get(rec.job_id) if rec.job_id else None
+            if job is not None and job.status == "running":
+                job.status, job.error = "failed", f"the session's release failed: {failure}"
+            rec.job_id = None
+            rec.state, rec.error = "release_failed", failure
+            rec.release_failed_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _run_settle(self, rec: _Session, settle: Callable[[], None]) -> None:
+        """Run ``settle``; one that raises still ends the record, so nothing is left running or busy."""
         try:
             settle()
-        except BaseException as exc:  # noqa: BLE001 — no worker is left to settle this record
+        except BaseException as exc:  # noqa: BLE001 — no worker may be left to settle this record
             text = f"{type(exc).__name__}: {exc}"
-            _log.error("chat session %s: settling after a late release failed: %s", rec.session_id, text)
+            _log.error("chat session %s: settling after its release failed: %s", rec.session_id, text)
             with self._lock:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
                 if job is not None and job.status == "running":
@@ -617,6 +680,30 @@ class ChatHost:
                 if rec.state in ("opening", "busy", "closing"):
                     ended: SessionState = "failed" if job is not None and job.kind == "open" else "broken"
                     rec.state, rec.error = ended, text
+
+    def _reaper(self) -> None:
+        """The host's one reaper: asks every driver whose release is in flight, every
+        ``_REAP_SWEEP_SECONDS``, without blocking on any of them, and settles each as it ends. Never gives
+        up on one: a release that never ends stays counted, which is the true state of the machine."""
+        while True:
+            with self._reap_cond:
+                self._reap_cond.wait_for(lambda: bool(self._reaping))
+                pending = list(self._reaping)
+            done = []
+            for item in pending:
+                try:
+                    finished = self._after_close(item.rec, item.driver, item.settle)
+                except Exception as exc:  # noqa: BLE001 — one bad driver must not stop the reaper
+                    _log.error("chat session %s: reaping failed: %s", item.rec.session_id, exc)
+                    finished = False
+                if finished:
+                    done.append(item)
+                elif time.monotonic() - item.logged >= _REAP_POLL_SECONDS:
+                    _log.warning("chat session %s: still releasing its shell", item.rec.session_id)
+                    item.logged = time.monotonic()
+            with self._reap_cond:
+                self._reaping = [i for i in self._reaping if i not in done]
+                self._reap_cond.wait(_REAP_SWEEP_SECONDS)
 
     def _refuse_if_shut(self) -> None:
         if self._shut:
@@ -807,9 +894,20 @@ class ChatHost:
         except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
             error = str(exc) or type(exc).__name__
         if error is not None and driver is not None:
-            # A failed open releases what it built; the record reads opening (counted) until it has.
+            # A failed open releases what it built. The job's outcome is published now (a client polling
+            # it does not wait on a teardown); the record reads opening, counted, until the release is
+            # confirmed (concurrent.futures' shutdown(wait=False): return now, free on completion).
             failed = error
-            self._close_then(rec, driver, lambda: self._settle_open(rec, job, failed, None))
+            gc.collect()      # see _settle_open
+            with self._lock:
+                job.status, job.error = "failed", failed
+                rec.job_id = None
+
+            def _failed() -> None:
+                with self._lock:
+                    rec.state, rec.error = "failed", failed
+
+            self._close_then(rec, driver, _failed)
             return
         self._settle_open(rec, job, error, driver)
 
@@ -836,18 +934,15 @@ class ChatHost:
                 rec.info = driver.describe()
                 rec.job_id = None
                 job.status, job.result = "done", {"session": self._session_view(rec)}
-            # else: shut while opening. shutdown() skipped this record (it was opening), so the
-            # worker closes it, and the record keeps reading "opening" (counted, job running)
-            # until the shell is released below.
+            else:
+                # Shut while opening. shutdown() skipped this record (it was opening), so the worker
+                # closes it: the job's outcome is published now, and the record keeps reading
+                # "opening" (counted) until the release below is confirmed.
+                job.status, job.error = "failed", "the server shut down while the session opened"
+                rec.job_id = None
         if error is None and not accepted:
             assert driver is not None
-
-            def _shut_out() -> None:
-                with self._lock:
-                    rec.state, rec.job_id = "closed", None
-                    job.status, job.error = "failed", "the server shut down while the session opened"
-
-            self._close_then(rec, driver, _shut_out)
+            self._close_then(rec, driver, lambda: self._settle(rec, "closed"))
 
     def _route_events(self, rec: _Session) -> Callable[[DriverEvent], None]:
         """The driver's event sink. Bound once at open, it forwards each tool-activity line
@@ -907,7 +1002,7 @@ class ChatHost:
         if broken and rec.driver is not None:
             # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
             # so the cap can never be exceeded by a teardown still in progress (codex L3 r1): the
-            # record reads busy, its job running, until the driver reports released.
+            # record reads busy until the driver confirms the release.
             dead, rec.driver = rec.driver, None
 
         def _publish() -> None:
@@ -948,10 +1043,26 @@ class ChatHost:
             if to_close is not None:
                 self._close_then(rec, to_close, lambda: self._settle(rec, final))
 
-        if dead is not None:
-            self._close_then(rec, dead, _publish)
-        else:
+        if dead is None:
             _publish()
+            return
+        # The job's outcome is published now (a client polling it does not wait on a teardown); the record
+        # reads busy, counted, until the release is confirmed, then broken (closed if the server shut).
+        text = error if payload is None else payload["error"]
+        with self._lock:
+            if payload is None:
+                job.status, job.error = "failed", error
+            else:
+                job.status, job.result = "done", payload
+                job.activity, job.dropped = list(payload["tool_activity"]), cut
+            rec.decision_id, rec.pending, rec.held_digest = None, [], None
+            rec.job_id = None
+
+        def _broken() -> None:
+            with self._lock:
+                rec.state, rec.error = ("closed" if self._shut else "broken"), text
+
+        self._close_then(rec, dead, _broken)
 
     @staticmethod
     def _session_view(rec: _Session) -> dict[str, Any]:
@@ -960,8 +1071,12 @@ class ChatHost:
             "entity": rec.entity,
             "state": rec.state,
             "job_id": rec.job_id,
-            **rec.info,
         }
+        # The driver's banner fields never overwrite the host's own (a driver's `state` or `session_id`
+        # key would otherwise make a client read, or address, the wrong thing).
+        out.update((k, v) for k, v in rec.info.items() if k not in _HOST_VIEW_KEYS)
         if rec.error is not None:
             out["error"] = rec.error
+        if rec.release_failed_since is not None:
+            out["release_failed_since"] = rec.release_failed_since
         return out
