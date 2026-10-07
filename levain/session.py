@@ -42,6 +42,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +62,8 @@ from levain.firing.agent_reply import (
     unreadable_tool_call,
 )
 from levain.firing.confinement import (
+    _STANDARD_CRED_FILES,
+    _STANDARD_CRED_SUBTREES,
     ConfinementError,
     confinement_supported,
     load_confinement_config,
@@ -74,6 +77,7 @@ from levain.firing.drive import (
     resolve_cred_floor,
 )
 from levain.firing.gate import (
+    BASH_TOOL_NAMES,
     GateMode,
     PendingEfferent,
     resolve_gate_mode,
@@ -222,7 +226,8 @@ class TurnResult:
     """The agent's text for this turn, or ``None`` if it produced none."""
 
     tool_activity: list[str] = field(default_factory=list)
-    """Compact display lines for the tool actions run this turn (workspace-relative)."""
+    """Compact display lines for the tool actions run this turn (workspace-relative), and last, when the
+    turn's shell output read like a credential the floor denied, :data:`CRED_FLOOR_NOTE`."""
 
     error: str | None = None
     """The exception text if the turn raised, else ``None``."""
@@ -395,13 +400,21 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
             "native_tool_calling": True}
 
 
-# What a shell prints when a credential it needs is unreadable: git over HTTPS with no credential to
-# offer, the macOS Keychain refusing git's credential helper, and gh with no readable token.
-_CRED_FAILURE_SIGNATURES = ("could not read Username for 'https://", "failed to get: -50", "gh auth login")
+# What a shell prints when a credential it needs is unreadable: git over HTTPS reaching its prompt with no
+# credential to offer and no terminal to ask on (the confined shell has none), and git's Keychain helper
+# failing (it is silent when the item is merely absent).
+_CRED_FAILURE_LINES = re.compile(r"could not read (?:Username|Password) for 'https://|failed to get: -?\d+")
 CRED_FLOOR_NOTE = (
-    'the standard credential floor denied this; set "deny_standard_creds": false in '
-    ".levain/confinement.json, or use an ssh remote"
+    "this may be the standard credential floor, which denies the standard credential stores in this "
+    'drive; to allow them set "deny_standard_creds": false in .levain/confinement.json, or for git use '
+    "an ssh remote"
 )
+
+
+def _floor_path_forms() -> tuple[str, ...]:
+    """Each standard credential store as a shell output can name it: as written (``~/...``) and expanded."""
+    paths = (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES)
+    return tuple({form for p in paths for form in (p, os.path.expanduser(p))})
 
 
 def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> list[str]:
@@ -411,8 +424,9 @@ def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> 
     :func:`latest_agent_text` does, so activity keys on the real turn.
 
     ``cred_floor`` is whether this session's floor denies the standard credential stores. When it
-    does and a shell output this turn reads like a missing credential, one :data:`CRED_FLOOR_NOTE`
-    ends the list, so the denial is not mistaken for a broken remote or a logged-out tool."""
+    does and a shell output this turn reads like a denied or missing credential, one
+    :data:`CRED_FLOOR_NOTE` ends the list (a line that is not an action), so the denial is not
+    mistaken for a broken remote or a logged-out tool."""
     evs = list(events)
     start = turn_start(evs)
     prefix = str(workspace).rstrip(os.sep) + os.sep
@@ -434,14 +448,21 @@ def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> 
 
 
 def _reads_as_cred_failure(event) -> bool:
-    """Whether ``event`` is a shell observation whose output reads like a missing credential."""
-    if getattr(event, "tool_name", None) != "terminal":
+    """Whether ``event`` is a shell observation whose output reads like a denied or missing credential:
+    a line naming one of the floor's own stores with "operation not permitted" (what Go, Python and
+    Node print for the sandbox's EPERM: gh, docker, kubectl, aws, twine, npm), or git's credential
+    failures. An event with no shell output (a scaffold error, a rejection) does not."""
+    if getattr(event, "tool_name", None) not in BASH_TOOL_NAMES:
         return False
     try:
         text = str(event.observation.text)
     except Exception:  # noqa: BLE001 — a display note must never break a turn
         return False
-    return any(sig in text for sig in _CRED_FAILURE_SIGNATURES)
+    if _CRED_FAILURE_LINES.search(text):
+        return True
+    forms = _floor_path_forms()
+    return any("operation not permitted" in line.lower() and any(f in line for f in forms)
+               for line in text.splitlines())
 
 
 def _refused_action_ids(events) -> set[str]:
@@ -663,9 +684,9 @@ class EntitySession:
         not. The gate therefore treats ``headless`` and ``unattended`` identically, which is
         correct: neither has anyone to fan an action in to at the moment it would fire.
 
-        The **crown-jewels cred floor** draws the same line: unless the entity's ``confinement.json``
-        sets ``deny_standard_creds``, the standard credential stores are denied in every mode but
-        ``interactive``. A ``headless`` turn is read after its text was captured, the same as a
+        The **crown-jewels cred floor** draws the same line: the standard credential stores are denied
+        in every mode but ``interactive``, unless the entity's ``confinement.json`` sets
+        ``deny_standard_creds`` (``false`` allows them in every mode, ``true`` denies them in every mode). A ``headless`` turn is read after its text was captured, the same as a
         scheduled seat's, so a credential it reads can compound into always-loaded memory before
         anyone sees it. An entity whose task needs ``gh`` or an HTTPS git remote sets
         ``"deny_standard_creds": false`` (or uses an ssh remote). Why this is the floor's one

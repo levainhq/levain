@@ -626,7 +626,7 @@ def _drive_task(
             # No human is driving. With `efferent_gate: "auto"` BOTH modes below resolve GATED —
             # the fan-in a watching operator supplies at the REPL has to come from the gate here —
             # and both deny the standard credential stores unless confinement.json sets
-            # `deny_standard_creds`: the output is read after the turn was captured. `unattended`
+            # `deny_standard_creds` to false: the output is read after the turn was captured. `unattended`
             # still records that a scheduler, not a person, invoked the run. See
             # `levain.firing.drive`.
             mode="unattended" if unattended else "headless",
