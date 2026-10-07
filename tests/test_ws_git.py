@@ -104,7 +104,9 @@ def test_borrowed_objects_are_refused(tmp_path: Path) -> None:
 
 def test_ws_git_runs_as_the_hands_user_with_no_global_config_and_hooks_off(tmp_path: Path) -> None:
     h = ws_git.Hands("_levain_x_abcdef", 499, "/Users/_levain_x_abcdef", tmp_path)
-    argv = ws_git.ws_git_argv(h, tmp_path / "r", ["log", "-1"])
+    argv = ws_git.ws_git_argv(h, tmp_path / "r" / ".git", ["log", "-1"])
+    assert f"--git-dir={tmp_path / 'r' / '.git'}" in argv and f"--work-tree={tmp_path / 'r'}" in argv
+    assert "safe.bareRepository=explicit" in argv and "gpg.program=false" in argv
     assert argv[:5] == ["/usr/bin/sudo", "-n", "-u", "_levain_x_abcdef", "/usr/bin/env"] and argv[5] == "-i"
     assert "GIT_CONFIG_NOSYSTEM=1" in argv and "GIT_CONFIG_GLOBAL=/dev/null" in argv
     for setting in ("core.hooksPath=/dev/null", "core.fsmonitor=", "core.pager=cat", "credential.helper="):
@@ -129,22 +131,34 @@ def test_the_neutralised_settings_really_switch_hooks_off(tmp_path: Path) -> Non
     assert canary.exists()  # control: without the settings the hook fires
 
 
-def test_the_scan_finds_repositories_the_hands_user_does_not_own(tmp_path: Path) -> None:
+def test_the_scan_finds_repositories_of_any_shape_the_hands_user_does_not_own(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
-    g1, g2 = _repo(ws / "a"), _repo(ws / "deep" / "b")
-    assert sorted(operator_owned_gitdirs(ws, ME + 1)) == sorted([g1, g2])
+    g1, g2 = _repo(ws / "a"), _repo(ws / "d1" / "d2" / "d3" / "d4" / "d5" / "deep")  # no depth limit
+    bare = ws / "notes"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)         # bare, any name
+    (ws / "f").mkdir()
+    (ws / "f" / ".git").write_text("gitdir: /elsewhere\n")                        # a gitfile
+    found = operator_owned_gitdirs(ws, ME + 1)
+    assert {g1, g2, bare, ws / "f" / ".git"} <= set(found)
     assert operator_owned_gitdirs(ws, ME) == []
 
 
-def test_a_wildcard_safe_directory_is_found_with_its_origin(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("entry,hit", [
+    ("*", True), ("/Users/Shared/*", True), ("/Users/Shared/levain/*", True),
+    ("/Users/Shared/levain/_levain_x_abcdef/workspace/r", True), ("/some/path", False), ("/Users/Sh/*", False),
+])
+def test_a_safe_directory_entry_covering_the_workspace_is_found(tmp_path: Path, monkeypatch, entry, hit) -> None:
     cfg = tmp_path / "gitconfig"
-    cfg.write_text("[safe]\n\tdirectory = /some/path\n\tdirectory = *\n")
+    cfg.write_text(f"[safe]\n\tdirectory = /some/other\n\tdirectory = {entry}\n")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
-    found = ws_git.wildcard_safe_directory()
-    assert found == [f"file:{cfg}"]
-    cfg.write_text("[safe]\n\tdirectory = /some/path\n")
-    assert ws_git.wildcard_safe_directory() == []
+    found = ws_git.wildcard_safe_directory((Path("/Users/Shared/levain"),))
+    assert (found == [f"file:{cfg}"]) is hit
+
+
+def test_ws_git_output_is_stripped_of_terminal_control_bytes() -> None:
+    out = ws_git._sanitise(b"ok\tline\n\x1b]0;title\x07\x1b[2Jcaf\xc3\xa9\r\x00")
+    assert out == b"ok\tline\n]0;title[2Jcaf\xc3\xa9"
 
 
 def test_the_mask_repair_runs_as_the_owner_on_its_own_files_only(tmp_path: Path) -> None:
@@ -168,7 +182,7 @@ def test_doctor_fails_on_an_operator_owned_repo_in_the_workspace(tmp_path: Path,
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
     monkeypatch.setattr(ws_git, "operator_owned_gitdirs", lambda w, uid: [w / "repo" / ".git"])
-    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda: ["file:/etc/gitconfig"])
+    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): ["file:/etc/gitconfig"])
     results = doctor._check_hands_isolation(ed)
-    assert not results[0].ok and "belong to you" in results[0].detail and "ws-adopt" in results[0].hint
+    assert not results[0].ok and "do not belong to the entity" in results[0].detail and "ws-adopt" in results[0].hint
     assert results[1].ok and results[1].warn and "EVERY repository" in results[1].detail

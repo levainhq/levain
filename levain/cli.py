@@ -986,7 +986,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Remove the user, its group, its ssh key, its sudoers rule and the workspace "
-            "permissions. Files it created are handed to you; the workspace is removed only if empty."
+            "permissions. Files it created become root's, readable by you (never yours: your git "
+            "would trust a repository it filled); the workspace is removed only if empty."
         ),
     )
     iso_p.add_argument(

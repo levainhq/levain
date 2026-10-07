@@ -934,23 +934,25 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     from levain.firing.ws_git import operator_owned_gitdirs, wildcard_safe_directory
 
     extra: list[CheckResult] = []
-    wildcard = wildcard_safe_directory()
+    from levain.firing.hands import WORKSPACE_ROOT
+
+    wildcard = wildcard_safe_directory(tuple(WORKSPACE_ROOT.values()))
     if wildcard:
         extra.append(CheckResult(
             "git trust", True,
-            "your git trusts EVERY repository (safe.directory = * in " + ", ".join(wildcard) + "). That "
-            "switches off the check that keeps your git from running code the entity writes into a "
-            "repository in its workspace.",
-            hint="remove the `safe.directory = *` line, or replace it with the specific paths you need",
+            "your git trusts EVERY repository, or every one in the entity's workspace (safe.directory in "
+            + ", ".join(wildcard) + "). That switches off the check that keeps your git from running code "
+            "the entity writes into a repository in its workspace.",
+            hint="remove that safe.directory line, or narrow it to paths outside the entity's workspace",
             warn=True,
         ))
     owned = operator_owned_gitdirs(cfg.hands_workspace, cfg.hands_uid)
     if owned:
         return [CheckResult(
             name, False,
-            f"{len(owned)} repository(ies) in the workspace belong to you, not the entity's user: "
-            + ", ".join(str(g.parent) for g in owned[:3]) + ". Your git trusts them and the entity "
-            "can write their config and hooks, which your git would then run as you.",
+            f"{len(owned)} repository(ies) in the workspace do not belong to the entity's user (or could "
+            "not be read): " + ", ".join(str(g) for g in owned[:3]) + ". Your git trusts one you own, and "
+            "the entity can write its config and hooks, which your git would then run as you.",
             hint="levain ws-adopt <repository>, or move it out of the workspace",
         ), *extra]
     return [CheckResult(

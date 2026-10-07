@@ -40,8 +40,30 @@ _URL_OK = re.compile(r"^(https://|ssh://|git@[A-Za-z0-9.-]+:)")
 _NEUTRALISE = (
     "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "core.pager=cat",
     "-c", "core.editor=false", "-c", "core.sshCommand=false", "-c", "credential.helper=",
+    "-c", "core.askPass=", "-c", "core.gitProxy=", "-c", "gpg.program=false",
+    "-c", "gpg.ssh.program=false", "-c", "gpg.x509.program=false", "-c", "safe.bareRepository=explicit",
     "-c", "protocol.ext.allow=never",
 )
+
+
+def _real_git() -> str:
+    """The git binary itself. On macOS ``/usr/bin/git`` is an xcrun shim whose lookup could be
+    steered by the user running it (the hands user); resolve the real binary once, here, and
+    accept it only if root owns it and nobody else can write it."""
+    import platform
+    import stat
+
+    if platform.system() == "Darwin":
+        r = subprocess.run(["/usr/bin/xcrun", "--find", "git"], capture_output=True, text=True, cwd="/")
+        cand = r.stdout.strip()
+        if r.returncode == 0 and cand:
+            try:
+                st = os.stat(cand)
+                if st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return cand
+            except OSError:
+                pass
+    return _abs("git")
 
 
 class WsGitError(RuntimeError):
@@ -119,15 +141,41 @@ def _config_lines(config: Path, *args: str) -> list[str]:
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def ws_git_argv(hands: Hands, repo_dir: Path, args: list[str]) -> list[str]:
-    """``git`` as the hands user, with no system or global config (the hands user writes its own
-    ~/.gitconfig), the program-naming keys switched off, and a clean environment."""
+def ws_git_argv(hands: Hands, gitdir: Path, args: list[str]) -> list[str]:
+    """``git`` as the hands user, on exactly the git directory that was checked (``--git-dir`` and
+    ``--work-tree``: no discovery, so git cannot fall through to another one), with no system or
+    global config (the hands user writes its own ~/.gitconfig), the program-naming keys switched
+    off, and a clean environment."""
     return [
         "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i",
         f"HOME={hands.home}", f"PATH={SECURE_PATH}", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
         "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "LANG=" + os.environ.get("LANG", "en_US.UTF-8"),
-        _abs("git"), *_NEUTRALISE, "-C", str(repo_dir), *args,
+        _real_git(), *_NEUTRALISE, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
+        "-C", str(gitdir.parent), *args,
     ]
+
+
+_KEEP = {9, 10}
+
+
+def _sanitise(chunk: bytes) -> bytes:
+    """Drop terminal control bytes (escape sequences included) from text the entity wrote; keep
+    tab, newline and everything printable, UTF-8 included."""
+    return bytes(b for b in chunk if b >= 0x20 and b != 0x7F or b in _KEEP)
+
+
+def _run_relayed(argv: list[str]) -> int:
+    """Run with no terminal at all (stdin /dev/null, a new session: nothing it runs can reach the
+    operator's terminal) and relay its output with control characters removed."""
+    import sys
+
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True, cwd="/")
+    assert proc.stdout is not None
+    for chunk in iter(lambda: proc.stdout.read(65536), b""):
+        sys.stdout.buffer.write(_sanitise(chunk))
+    sys.stdout.flush()
+    return proc.wait()
 
 
 def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int:
@@ -138,7 +186,7 @@ def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int
     except (WsGitError, OSError) as exc:
         print(f"ws-git: {exc}")
         return 1
-    return subprocess.run(ws_git_argv(hands, Path(repo).resolve(), args), cwd="/").returncode
+    return _run_relayed(ws_git_argv(hands, gitdir, args))
 
 
 def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str) -> int:
@@ -180,40 +228,58 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str) -> int:
         print(f"ws-adopt: the clone failed, nothing changed: {r.stderr.strip()}")
         return 1
     # The clone's own remote points at the moved-aside path, a URL ws-git itself refuses: drop it.
-    subprocess.run(ws_git_argv(hands, src, ["remote", "remove", "operator-copy"]), capture_output=True, cwd="/")
+    subprocess.run(ws_git_argv(hands, src / ".git", ["remote", "remove", "operator-copy"]), capture_output=True, cwd="/")
     for name, url in remotes.items():
-        subprocess.run(ws_git_argv(hands, src, ["remote", "add", name, url]), capture_output=True, cwd="/")
+        subprocess.run(ws_git_argv(hands, src / ".git", ["remote", "add", "--", name, url]), capture_output=True, cwd="/")
     print(f"Adopted {src}: it now belongs to the hands user. Your original is at {aside}. Check the "
           "clone, then delete the original yourself; uncommitted changes and stashes exist only there.")
     return 0
 
 
-def operator_owned_gitdirs(workspace: Path, hands_uid: int, *, max_depth: int = 4) -> list[Path]:
-    """Every ``.git`` under the workspace (to ``max_depth``) that the hands user does not own. The
-    operator's git trusts such a repository while the hands user can write into it."""
+def operator_owned_gitdirs(workspace: Path, hands_uid: int) -> list[Path]:
+    """Every git directory under the workspace (``.git`` directories and files, and directories
+    shaped like one under any name, bare repositories included) that the hands user does not own.
+    The operator's git trusts such a repository while the hands user can write into it. No depth
+    limit; a directory that cannot be read is reported too, never assumed clean."""
     found: list[Path] = []
-    ws = workspace
-    for root, dirs, _files in os.walk(ws):
-        depth = Path(root).relative_to(ws).parts
-        if len(depth) >= max_depth:
-            dirs[:] = []
-        if ".git" in dirs or os.path.lexists(os.path.join(root, ".git")):
-            g = Path(root) / ".git"
+
+    def unreadable(err: OSError) -> None:
+        found.append(Path(err.filename or workspace))
+
+    for root, dirs, files in os.walk(workspace, onerror=unreadable):
+        here = Path(root)
+        candidates = [here / ".git"] if (".git" in dirs or ".git" in files) else []
+        if (here / "HEAD").is_file() and (here / "objects").is_dir() and (here / "refs").is_dir():
+            candidates.append(here)
+        for g in candidates:
             try:
                 if g.lstat().st_uid != hands_uid:
                     found.append(g)
             except OSError:
-                pass
-            dirs[:] = [d for d in dirs if d != ".git"]
-    return found
+                found.append(g)
+    return sorted(set(found))
 
 
-def wildcard_safe_directory() -> list[str]:
-    """Where the operator's git config trusts every repository (``safe.directory = *``), which turns
-    git's ownership check off. Read only; nothing is executed."""
+def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
+    """Where the operator's git config trusts every repository (``safe.directory = *``) or every one
+    under a workspace root (a ``<dir>/*`` entry covering it, or an entry inside it). Either switches
+    off git's ownership check for the entity's repositories. Read only; nothing is executed."""
     r = subprocess.run([_abs("git"), "config", "--show-origin", "--get-all", "safe.directory"],
                        capture_output=True, text=True, cwd="/")
-    return [ln.split("\t")[0] for ln in r.stdout.splitlines() if ln.split("\t")[-1].strip() == "*"]
+    hits = []
+    for ln in r.stdout.splitlines():
+        origin, _, value = ln.partition("\t")
+        value = value.strip()
+        if value == "*":
+            hits.append(origin)
+            continue
+        base = value[:-2] if value.endswith("/*") else value
+        for root in roots:
+            rs = str(root)
+            if (value.endswith("/*") and (rs + "/").startswith(base.rstrip("/") + "/")) or base.startswith(rs + "/") or base == rs:
+                hits.append(origin)
+                break
+    return hits
 
 
 def mask_repair_argv(hands: Hands) -> list[str]:

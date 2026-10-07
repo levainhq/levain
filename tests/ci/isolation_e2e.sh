@@ -120,13 +120,13 @@ check "doctor warns that the runner's git trusts every repository" bash -c "\"$L
 echo "== an operator-created repository: doctor fails, ws-adopt hands it over"
 check "operator creates a repository in the workspace" bash -c "cd '$WS' && opgit init -q repo-op && cd repo-op && echo o > o && opgit add o && opgit commit -q -m op"
 refused "doctor passes with it there" "$LEVAIN" doctor --path "$E"
-check "doctor names it" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'belong to you'"
+check "doctor names it" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'do not belong to the entity'"
 check "ws-adopt hands it over" "$LEVAIN" ws-adopt --path "$E" "$WS/repo-op"
 check "it now belongs to the hands user" test "$(stat -c %u "$WS/repo-op/.git" 2>/dev/null || stat -f %u "$WS/repo-op/.git")" = "$HID"
 refused "operator git reads it after adoption" opgit -C "$WS/repo-op" status --short
 check "the entity commits in it" as_hands bash -c "cd '$WS/repo-op' && echo e > e && git add e && git commit -q -m entity"
 check "its history came across" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-op" log --oneline -2
-if "$LEVAIN" doctor --path "$E" | grep -q 'belong to you'; then fail "doctor still reports an operator repository"; else pass "doctor no longer reports one"; fi
+if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports an operator repository"; else pass "doctor no longer reports one"; fi
 rm -rf "$WS"/repo-op.operator-*
 
 echo "== undo, with a hands process still running"
@@ -141,7 +141,8 @@ refused "sshd drop-in still exists" sudo test -e "/etc/ssh/sshd_config.d/levain-
 if [ -e "$CRON_DENY" ]; then refused "hands user still in $CRON_DENY" grep -qx "$H" "$CRON_DENY"; fi
 if [ -n "$(cfgval hands_user)$(cfgval hands_uid)$(cfgval hands_workspace)" ]; then fail "hands keys still recorded"; else pass "hands keys removed from confinement.json"; fi
 check "the non-empty workspace is kept" test -d "$WS"
-check "operator owns the files the hands created" test -O "$WS/from-hands"
+check "the files the hands created are now root's, not the operator's" test "$(stat -c %u "$WS/from-hands" 2>/dev/null || stat -f %u "$WS/from-hands")" = 0
+check "and the operator can read them" /bin/cat "$WS/from-hands"
 if [ -n "$(sudo find "$(dirname "$WS")" -uid "$HID" -print -quit 2>/dev/null)" ]; then fail "files still owned by the dead uid"; else pass "no file left owned by the dead uid"; fi
 check "operator creates a file in the workspace after undo" bash -c "echo z > '$WS/after-undo'"
 check "the entity's repository went to root, not to the operator" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = 0

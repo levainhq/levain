@@ -88,6 +88,7 @@ _LINUX_HANDS_HOME_ROOT = Path("/var/lib/levain-hands")
 WORKSPACE_ROOT = {"darwin": Path("/Users/Shared/levain"), "linux": Path("/var/lib/levain")}
 _RETIRED_IDS = {"darwin": Path("/var/db/levain/retired-hands-ids"),
                 "linux": Path("/var/lib/levain/retired-hands-ids")}
+_AT_SPOOL = {"darwin": Path("/usr/lib/cron/jobs"), "linux": Path("/var/spool/cron/atjobs")}
 _CRON_DENY = {"darwin": (Path("/usr/lib/cron/cron.deny"), Path("/usr/lib/cron/at.deny")),
               "linux": (Path("/etc/cron.deny"), Path("/etc/at.deny"))}
 
@@ -314,31 +315,42 @@ def plan_undo(
     hands_user: str,
     hands_id: int | None,
     operator_gid: int,
-    workspace: Path | None,
 ) -> Plan:
     """The reverse of :func:`plan_setup`, ordered so nothing acts on the tree while the hands user
-    can still change it: the sudoers rule goes first (no new processes), then every process of the
-    hands user is killed and the kill is verified, and only then are files handed back and the
-    account deleted. A deletion that fails stops the undo."""
+    can still change it: the sudoers rule goes first (no new processes), the id is retired, cron and
+    at jobs are removed, and every process of the hands user is killed and the kill verified. Only
+    then are files re-owned and the account deleted. A step that fails stops the undo.
+
+    ``hands_id`` is the id the DIRECTORY SERVICE gives the user (never the config's, which the
+    operator account can write); ``None`` when the user is already gone, and then nothing is killed
+    and only files with no owner left are re-owned. The workspace is always the derived one."""
     if not HANDS_USER_RE.match(hands_user):
         raise HandsSetupError(f"refusing to remove {hands_user!r}: not a Levain hands user name")
     ed = Path(entity_dir).expanduser().resolve()
-    ws = workspace or hands_workspace(host, hands_user)
+    ws = hands_workspace(host, hands_user)
+    tree = ws.parent
     steps: list[Step] = [
         Step("remove the sudoers drop-in (no new hands processes)", ("/bin/rm", "-f", str(sudoers_path(hands_user)))),
     ]
     if hands_id is not None:
         steps += [
-            Step("stop every process of the hands user, and check they are gone", call=lambda: _kill_all(hands_id)),
+            Step("retire the user id so no later hands user reuses it",
+                 call=lambda: _ensure_line(_RETIRED_IDS[host], str(hands_id), present=True, create=True)),
             Step("remove the hands user's cron jobs", (_abs("crontab"), "-r", "-u", hands_user), allow_fail=True),
-            Step(f"give the files the hands user created back to {operator}",
-                 call=lambda: _chown_back(ws.parent, hands_id, f"{operator}:{operator_gid}")),
+            Step("remove the hands user's at jobs", call=lambda: _remove_owned(_AT_SPOOL[host], hands_id)),
+            Step("stop every process of the hands user, and check they are gone", call=lambda: _kill_all(hands_id)),
         ]
+    steps += [
+        Step(f"hand what the hands user owned to root, readable by your group (never to you)",
+             call=lambda: _to_root(tree, hands_id, operator_gid)),
+        Step("remove the workspace ACLs",
+             call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(tree)) if host == "darwin"
+                                  else (_abs("setfacl"), "-R", "-P", "-b", str(tree)), missing_ok=True)),
+        Step("let your group read it, and empty the hooks and settings of the entity's repositories",
+             call=lambda: _readable_and_sanitised(tree, operator_gid)),
+    ]
     if host == "darwin":
         steps += [
-            Step("remove the workspace ACLs",
-                 call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(ws.parent)), missing_ok=True)),
-            Step("let your group read the entity's repositories (now root's)", call=lambda: _repos_readable(ws.parent)),
             Step("delete the hands user", ("/usr/bin/dscl", ".", "-delete", f"/Users/{hands_user}"),
                  skip_if=_absent("user", host, hands_user)),
             Step("delete the hands group", ("/usr/bin/dscl", ".", "-delete", f"/Groups/{hands_user}"),
@@ -347,9 +359,6 @@ def plan_undo(
         ]
     else:
         steps += [
-            Step("remove the workspace ACLs",
-                 call=lambda: _run_ok((_abs("setfacl"), "-R", "-b", str(ws.parent)), missing_ok=True)),
-            Step("let your group read the entity's repositories (now root's)", call=lambda: _repos_readable(ws.parent)),
             Step("delete the hands user and its home", (_abs("userdel"), "--remove", hands_user),
                  skip_if=_absent("user", host, hands_user)),
             Step("delete the hands group", (_abs("groupdel"), hands_user), skip_if=_absent("group", host, hands_user)),
@@ -362,9 +371,6 @@ def plan_undo(
           for deny in _CRON_DENY[host]],
         Step("remove the workspace if it is empty", call=lambda: _remove_if_empty(ws)),
     ]
-    if hands_id is not None:
-        steps.append(Step("retire the user id so no later hands user reuses it",
-                          call=lambda: _ensure_line(_RETIRED_IDS[host], str(hands_id), present=True, create=True)))
     return Plan(host, operator, hands_user, hands_id if hands_id is not None else -1, ed, ws, tuple(steps))
 
 
@@ -387,47 +393,79 @@ def _kill_all(uid: int, *, attempts: int = 20) -> tuple[bool, str]:
     return False, f"processes of uid {uid} are still running"
 
 
-def _chown_back(tree: Path, uid: int, owner: str) -> tuple[bool, str]:
-    """Hand every file ``uid`` owns under ``tree`` to ``owner`` (user:group), EXCEPT the entity's
-    repositories: each ``.git`` it owns goes to root. A ``.git`` given to the operator would carry
-    whatever config and hooks the entity wrote into it, and the operator's git would then run them;
-    a root-owned one the operator's git refuses, and root's id, unlike a retired one, is never
-    reused. Runs only after :func:`_kill_all` succeeded, so nothing can swap a directory for a
-    symlink under it."""
-    if not tree.exists():
-        return True, "no workspace"
-    find, chown = _abs("find"), _abs("chown")
-    op_gid = owner.split(":", 1)[1]
-    # root owns them; the operator's group may READ them (not write), so the work can be cloned:
-    # under the workspace's default ACL new files have no "other" bits (measured in CI on Linux).
-    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-uid", str(uid), "-prune",
-                       "-exec", chown, "-R", "-h", f"0:{op_gid}", "{}", "+"))
-    if not ok:
-        return ok, why
-    ok, why = _run_ok((find, str(tree), "-name", ".git", "-prune", "-o", "-uid", str(uid),
-                       "-exec", chown, "-h", owner, "{}", "+"))
-    if not ok:
-        return ok, why
-    return True, ""
+def _remove_owned(spool: Path, uid: int) -> tuple[bool, str]:
+    if not spool.is_dir():
+        return True, f"no {spool}"
+    return _run_ok((_abs("find"), str(spool), "-maxdepth", "1", "-type", "f", "-uid", str(uid), "-delete"))
 
 
-def _repos_readable(tree: Path) -> tuple[bool, str]:
-    """After the ACLs are cleared: let the operator's group READ the root-owned repositories, so the
-    work can be cloned. It runs after, not before: on Linux a chmod of the group bits on a file with
-    an ACL changes the ACL's mask, which clearing the ACL then throws away (measured in CI)."""
+def _owned_selector(uid: int | None) -> tuple[str, ...]:
+    """``find`` predicates for "what the hands user owned": by numeric uid, or (user already gone)
+    by having no owner at all. Directories, and files with a single link only: a hard link the
+    entity made to someone else's file is never re-owned or re-moded (it is not the entity's)."""
+    who = ("-nouser",) if uid is None else ("-uid", str(uid))
+    return ("(", "-type", "d", "-o", "-links", "1", ")", *who)
+
+
+def _to_root(tree: Path, uid: int | None, operator_gid: int) -> tuple[bool, str]:
+    """Re-own everything the hands user owned under ``tree`` to root, group = the operator's group.
+    Nothing goes to the operator: a directory the entity filled (a repository under any name, a
+    bare one included) would be trusted by the operator's git if the operator owned it. Runs only
+    after :func:`_kill_all`, so nothing can swap a directory for a symlink under it."""
     if not tree.exists():
         return True, "no workspace"
-    find = _abs("find")
-    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune",
-                       "-exec", _abs("chmod"), "-R", "g+rX,g-w", "{}", "+"))
+    return _run_ok((_abs("find"), str(tree), *_owned_selector(uid),
+                    "-exec", _abs("chown"), "-h", f"0:{operator_gid}", "{}", "+"))
+
+
+def _git_dir_shaped(path: Path) -> bool:
+    return (path / "HEAD").is_file() and (path / "objects").is_dir() and (path / "refs").is_dir()
+
+
+def _readable_and_sanitised(tree: Path, operator_gid: int, *, root_uid: int = 0) -> tuple[bool, str]:
+    """After the ACLs are cleared (a group chmod on a file with a Linux ACL edits the mask, which
+    clearing discards, measured in CI): let the operator's group read what root now owns, and, in
+    every directory shaped like a git directory, empty ``hooks/`` and cut ``config`` to the keys
+    ``ws-git`` accepts, because root's own git trusts a root-owned repository."""
+    if not tree.exists():
+        return True, "no workspace"
+    ok, why = _run_ok((_abs("find"), str(tree), "(", "-type", "d", "-o", "-links", "1", ")", "-uid", "0",
+                       "-gid", str(operator_gid), "-exec", _abs("chmod"), "g+rX,g-w", "{}", "+"))
     if not ok:
         return ok, why
-    repos = sorted(str(Path(p).parent) for p in subprocess.run(
-        [find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune"],
-        capture_output=True, text=True, cwd="/").stdout.split())
+    from levain.firing.ws_git import CONFIG_ALLOWLIST
+
+    repos: list[str] = []
+    for root, dirs, _files in os.walk(tree):
+        here = Path(root)
+        if not _git_dir_shaped(here) or here.lstat().st_uid != root_uid:
+            continue
+        hooks = here / "hooks"
+        if hooks.is_dir() and not hooks.is_symlink():
+            for h in hooks.iterdir():
+                if h.is_file() or h.is_symlink():
+                    h.unlink()
+        cfg = here / "config"
+        if cfg.is_file() and not cfg.is_symlink():
+            r = subprocess.run([_abs("git"), "config", "--file", str(cfg), "--list"], capture_output=True, text=True,
+                               cwd="/", env={"PATH": SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1",
+                                             "GIT_CONFIG_GLOBAL": "/dev/null"})
+            kept = [ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln]
+            kept = [(k, v) for k, v in kept if CONFIG_ALLOWLIST.match(k)]
+            cfg.unlink()
+            for k, v in kept:
+                subprocess.run([_abs("git"), "config", "--file", str(cfg), "--add", k, v], capture_output=True, cwd="/")
+            if cfg.exists():
+                os.chown(cfg, root_uid, operator_gid)
+                os.chmod(cfg, 0o640)
+        repos.append(str(here.parent if here.name == ".git" else here))
+        dirs[:] = []
     if repos:
-        return True, ("the entity's repositories are now root's, so your git will not run anything "
-                      "it wrote into them; clone what you want to keep: " + ", ".join(repos))
+        first = repos[0]
+        return True, ("the entity's repositories are now root's, with no hooks and only basic settings; "
+                      "your git will not use them directly. To keep the work: git -c safe.directory="
+                      f"{first} -c core.hooksPath=/dev/null clone --no-local {first} <destination>   "
+                      f"(repositories: {', '.join(repos)})")
     return True, ""
 
 
@@ -439,7 +477,8 @@ def _remove_if_empty(ws: Path) -> tuple[bool, str]:
         ws.parent.rmdir()
     except OSError as exc:
         if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-            return True, f"kept: {ws} has files in it; it is yours, delete it when you no longer need them"
+            return True, (f"kept: {ws} has files in it, now root's and readable by you; remove it with "
+                          f"`sudo rm -rf {ws.parent}` when you no longer need them")
         raise
     return True, ""
 
@@ -540,6 +579,76 @@ def existing_deny_lists(host: HostOS) -> tuple[Path, ...]:
     return tuple(p for p in _CRON_DENY[host] if p.exists())
 
 
+#: The first release of each git line that also checks who owns the git DIRECTORY, not just the
+#: worktree (CVE-2022-29187; RelNotes 2.30.5: "The safety check that verifies a safe ownership of
+#: the Git worktree is now extended to also cover the ownership of the Git directory"). Option H
+#: depends on it.
+_GITDIR_OWNERSHIP_FIX = {30: 5, 31: 4, 32: 3, 33: 4, 34: 4, 35: 4, 36: 2, 37: 1}
+
+
+def git_checks_gitdir_ownership(version_text: str) -> bool:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", version_text)
+    if not m:
+        return False
+    major, minor, patch = (int(x) for x in m.groups())
+    if major != 2:
+        return major > 2
+    if minor >= 38:
+        return True
+    return minor in _GITDIR_OWNERSHIP_FIX and patch >= _GITDIR_OWNERSHIP_FIX[minor]
+
+
+def git_version() -> str:
+    return subprocess.run([_abs("git"), "--version"], capture_output=True, text=True, cwd="/").stdout.strip()
+
+
+def git_refuses_foreign_gitdir(operator: str) -> bool:
+    """MEASURED, as root at setup: in a scratch repository whose worktree is the operator's and
+    whose git directory belongs to ``nobody``, the operator's git must refuse to work. A version
+    number cannot say this (distributions backport the fix without changing it)."""
+    nobody = pwd.getpwnam("nobody")
+    op = pwd.getpwnam(operator)
+    scratch = Path(tempfile.mkdtemp(prefix="levain-gitcheck-"))
+    try:
+        repo = scratch / "r"
+        env = {"PATH": SECURE_PATH, "HOME": "/nonexistent", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+        if subprocess.run([_abs("git"), "init", "-q", str(repo)], env=env, cwd="/", capture_output=True).returncode:
+            return False
+        os.chmod(scratch, 0o755)
+        for root, dirs, files in os.walk(repo / ".git"):
+            for name in [*dirs, *files]:
+                os.lchown(os.path.join(root, name), nobody.pw_uid, nobody.pw_gid)
+                os.chmod(os.path.join(root, name), 0o755 if name in dirs else 0o644)
+        os.chown(repo / ".git", nobody.pw_uid, nobody.pw_gid)
+        os.chown(repo, op.pw_uid, op.pw_gid)
+        r = subprocess.run(["/usr/bin/sudo", "-u", operator, "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
+                            _abs("git"), "-C", str(repo), "status"], capture_output=True, text=True, cwd="/")
+        return r.returncode != 0 and "dubious ownership" in (r.stderr + r.stdout)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def shared_root_problem(host: HostOS) -> str | None:
+    """The shared workspace root (``/Users/Shared`` is world-writable on macOS, so another local
+    account could create ``/Users/Shared/levain`` first) must be absent, or a real directory owned by
+    root and not writable by group or others."""
+    root = WORKSPACE_ROOT[host]
+    if not os.path.lexists(root):
+        return None
+    st = root.lstat()
+    if not stat_is_dir(st.st_mode) or root.is_symlink():
+        return f"{root} is not a plain directory"
+    if st.st_uid != 0 or st.st_mode & 0o022:
+        return f"{root} must be owned by root and not writable by group or others"
+    return None
+
+
+def stat_is_dir(mode: int) -> bool:
+    import stat as _stat
+
+    return _stat.S_ISDIR(mode)
+
+
 def invoking_operator() -> str:
     """The operator who ran ``sudo levain setup-isolation``. Refuses unless running as root through
     sudo from a non-root account: the sudoers rule names that account."""
@@ -614,7 +723,10 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
         if step.write is not None:
             ok, why = _install_file(*step.write, validate=step.validate, check=step.call)
         elif step.call is not None:
-            ok, why = step.call()
+            try:
+                ok, why = step.call()
+            except Exception as exc:  # noqa: BLE001 — a step that raises is a failed step, not a crash mid-undo
+                ok, why = False, f"{type(exc).__name__}: {exc}"
         else:
             r = subprocess.run(step.argv, capture_output=True, text=True, cwd="/")
             ok, why = r.returncode == 0, (r.stderr or r.stdout).strip()
@@ -667,24 +779,46 @@ RECORD_KEYS = ("hands_user", "hands_uid", "hands_workspace")
 
 def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner_gid: int) -> Path:
     """Set (or, with ``None``, remove) the hands keys in ``<entity>/.levain/confinement.json``,
-    keeping every other key, owned by the operator. Refuses to write through a symlink."""
+    keeping every other key, owned by the operator. Root does this inside a tree the operator
+    controls, so everything goes through a directory fd opened without following a symlink, and the
+    file is replaced atomically (a crash leaves the old file, never a half-written one)."""
     levain_dir = Path(entity_dir) / ".levain"
-    cfg = levain_dir / "confinement.json"
-    if levain_dir.is_symlink() or cfg.is_symlink():
-        raise HandsSetupError(f"refusing to write {cfg}: it is reached through a symlink")
-    data: dict = {}
-    if cfg.exists():
-        data = json.loads(cfg.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise HandsSetupError(f"{cfg} is not a JSON object; fix it before running setup-isolation")
-    for k in RECORD_KEYS:
-        data.pop(k, None)
-    data.update(values or {})
-    fd = os.open(cfg, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(data, indent=2) + "\n")
-    os.chown(cfg, owner_uid, owner_gid)
-    return cfg
+    try:
+        dfd = os.open(levain_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise HandsSetupError(f"refusing to write in {levain_dir}: {exc.strerror} (a symlink?)") from None
+    try:
+        data: dict = {}
+        try:
+            fd = os.open("confinement.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        except FileNotFoundError:
+            fd = None
+        except OSError as exc:
+            raise HandsSetupError(f"refusing to write {levain_dir}/confinement.json: {exc.strerror} (a symlink?)") from None
+        if fd is not None:
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                data = json.loads(fh.read() or "{}")
+            if not isinstance(data, dict):
+                raise HandsSetupError(f"{levain_dir}/confinement.json is not a JSON object; fix it first")
+        for k in RECORD_KEYS:
+            data.pop(k, None)
+        data.update(values or {})
+        tmp = f".confinement.json.levain-{os.getpid()}"
+        wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        try:
+            with os.fdopen(wfd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2) + "\n")
+                os.fchown(fh.fileno(), owner_uid, owner_gid)
+            os.replace(tmp, "confinement.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+    return levain_dir / "confinement.json"
 
 
 def _operator_path_under_home(operator: str) -> list[str]:
@@ -720,15 +854,28 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
     derived = hands_user_name(entity_dir)
     if undo:
         hands = cfg.hands_user or derived
-        hands_id = cfg.hands_uid
-        if hands_id is None and _user_exists(hands):
-            hands_id = pwd.getpwnam(hands).pw_uid
-        if not dry_run and _user_exists(hands) and not user_record_is_ours(hands, host):
-            print(f"setup-isolation: refusing to remove {hands}: it exists but was not created by Levain.")
+        if not HANDS_USER_RE.match(hands):
+            print(f"setup-isolation: refusing to remove {hands!r}: not a Levain hands user name")
             return 1
+        if cfg.hands_workspace is not None and cfg.hands_workspace != hands_workspace(host, hands):
+            print(f"setup-isolation: the recorded workspace {cfg.hands_workspace} is not the one setup "
+                  f"creates for {hands}; refusing (fix or remove the hands keys in confinement.json).")
+            return 1
+        hands_id: int | None = None
+        if _user_exists(hands):
+            if not dry_run and not user_record_is_ours(hands, host):
+                print(f"setup-isolation: refusing to remove {hands}: it exists but was not created by Levain.")
+                return 1
+            # From the directory service, after the marker check: the config is writable by the
+            # operator account, and root must not kill or re-own another account's processes and files.
+            hands_id = pwd.getpwnam(hands).pw_uid
+            if cfg.hands_uid is not None and cfg.hands_uid != hands_id:
+                print(f"setup-isolation: {hands} has id {hands_id}, but confinement.json records "
+                      f"{cfg.hands_uid}; refusing.")
+                return 1
         try:
             plan = plan_undo(entity_dir, operator=operator, host=host, hands_user=hands, hands_id=hands_id,
-                             operator_gid=op.pw_gid, workspace=cfg.hands_workspace)
+                             operator_gid=op.pw_gid)
         except HandsSetupError as exc:
             print(f"setup-isolation: {exc}")
             return 1
@@ -759,6 +906,15 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
         print(f"setup-isolation: the user {derived} already exists "
               + ("(a previous setup that did not finish). Run with --undo, then again." if ours
                  else "(an account Levain did not create). Remove or rename it first."))
+        return 1
+    problem = shared_root_problem(host)
+    if problem:
+        print(f"setup-isolation: refusing: {problem}.")
+        return 1
+    if not dry_run and not git_refuses_foreign_gitdir(operator):
+        print(f"setup-isolation: refusing: your git ({git_version() or 'git'}) works in a repository whose "
+              "git directory belongs to another user, so it would run code the entity writes into one. "
+              "Upgrade git (2.37.1 or later, or a release with the CVE-2022-29187 fix).")
         return 1
     ws_parent = hands_workspace(host, derived).parent
     if os.path.lexists(ws_parent):

@@ -45,7 +45,7 @@ def _undo(tmp_path: Path, host: str = "darwin", **kw):
     ed = _entity(tmp_path)
     kw.setdefault("hands_user", hands_user_name(ed))
     kw.setdefault("hands_id", 499)
-    return plan_undo(ed, operator="alice", host=host, operator_gid=20, workspace=None, **kw)
+    return plan_undo(ed, operator="alice", host=host, operator_gid=20, **kw)
 
 
 def _argvs(plan) -> list[tuple[str, ...]]:
@@ -239,14 +239,14 @@ def test_undo_refuses_a_name_setup_could_not_have_written(tmp_path: Path, bad) -
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_undo_order_rule_then_kill_then_files_then_account(tmp_path: Path, host) -> None:
+def test_undo_order_rule_retire_jobs_kill_then_files_then_account(tmp_path: Path, host) -> None:
     plan = _undo(tmp_path, host=host)
     why = [s.why for s in plan.steps]
     first = lambda text: next(i for i, w in enumerate(why) if text in w)  # noqa: E731
     assert first("sudoers") == 0
-    assert first("sudoers") < first("stop every process") < first("give the files") < first("delete the hands user")
-    assert first("give the files") < first("remove the workspace ACLs") < first("delete the hands user")
-    assert why[-1].startswith("retire the user id")
+    order = ["sudoers", "retire the user id", "cron jobs", "at jobs", "stop every process", "to root",
+             "remove the workspace ACLs", "let your group read", "delete the hands user"]
+    assert [first(t) for t in order] == sorted(first(t) for t in order)
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
@@ -257,10 +257,11 @@ def test_undo_account_deletion_fails_loudly_and_skips_only_when_already_gone(tmp
             assert not s.allow_fail and s.skip_if and s.skip_if[:2] == ("/bin/sh", "-c") and "!" in s.skip_if[2]
 
 
-def test_undo_without_a_known_id_does_not_kill_or_chown_by_name(tmp_path: Path) -> None:
+def test_undo_without_a_verified_id_kills_nothing_and_reowns_only_ownerless_files(tmp_path: Path) -> None:
     plan = _undo(tmp_path, hands_id=None)
     why = " ".join(s.why for s in plan.steps)
-    assert "stop every process" not in why and "give the files" not in why and "retire" not in why
+    assert "stop every process" not in why and "retire" not in why
+    assert hands._owned_selector(None)[-1] == "-nouser"
 
 
 # --- step bodies -----------------------------------------------------------------------------------
@@ -358,6 +359,7 @@ def test_record_hands_refuses_a_symlinked_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("mutate", [
+    {"hands_workspace": "/Users/Shared/levain/x"}, {"hands_workspace": "/Users/Shared/levain"},
     {"hands_user": "root"}, {"hands_user": 5}, {"hands_user": "_levain_coyote_ABCDEF"},
     {"hands_uid": 0}, {"hands_uid": True}, {"hands_uid": "499"},
     {"hands_workspace": "relative/ws"}, {"hands_workspace": "/Users/Shared/levain/x/../../etc"},
@@ -481,7 +483,7 @@ def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path:
     from levain.firing import ws_git
 
     # pinned: a runner image's own safe.directory=* would add a second (correct) warning
-    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda: [])
+    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): [])
     monkeypatch.setattr(ws_git, "operator_owned_gitdirs", lambda w, uid: [])
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
@@ -498,20 +500,78 @@ def test_the_warn_badge_prints_its_hint(capsys) -> None:
     assert "do this" in out and "[OK]" not in out
 
 
-def test_undo_gives_files_back_to_the_operator_but_the_entitys_repositories_to_root(tmp_path: Path, monkeypatch) -> None:
+def test_undo_gives_nothing_to_the_operator_and_never_follows_a_hard_link(tmp_path: Path, monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: calls.append(argv) or (True, ""))
-    monkeypatch.setattr(hands.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
-    assert hands._chown_back(tmp_path, 499, "alice:20") == (True, "")
-    to_root, to_op = calls
-    assert to_root[to_root.index("-name") + 1] == ".git" and "0:20" in to_root and "-R" in to_root
-    assert to_root.index("-uid") < to_root.index("-exec")
-    assert to_op[to_op.index("-name") + 1] == ".git" and "-prune" in to_op and "-o" in to_op
-    assert "alice:20" in to_op and "0:20" not in to_op
+    assert hands._to_root(tmp_path, 499, 20) == (True, "")
+    (argv,) = calls
+    assert "0:20" in argv and "alice" not in " ".join(argv)
+    assert ("-links", "1") == argv[argv.index("-links"):argv.index("-links") + 2]
+    assert argv[argv.index("-uid") + 1] == "499"
+
+
+def test_a_failing_step_body_is_a_failed_step_not_a_crash(tmp_path: Path) -> None:
+    def boom():
+        raise PermissionError("nope")
+    assert run_plan(_plan(Step("boom", call=boom)), dry_run=False, emit=lambda _: None) == 1
+
+
+def test_undo_empties_the_hooks_and_cuts_the_config_of_the_entitys_repositories(tmp_path: Path, monkeypatch) -> None:
+    import subprocess as sp
+
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: (True, ""))
+    tree = tmp_path / "h"
+    for repo in (tree / "workspace" / "r", tree / "workspace" / "bare.d"):
+        repo.mkdir(parents=True)
+    sp.run(["git", "init", "-q", str(tree / "workspace" / "r")], check=True)
+    sp.run(["git", "init", "-q", "--bare", str(tree / "workspace" / "bare.d")], check=True)
+    for g in (tree / "workspace" / "r" / ".git", tree / "workspace" / "bare.d"):
+        (g / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n")
+        sp.run(["git", "config", "--file", str(g / "config"), "core.fsmonitor", "evil"], check=True)
+        sp.run(["git", "config", "--file", str(g / "config"), "remote.origin.url", "git@h:o/r.git"], check=True)
+    ok, why = hands._readable_and_sanitised(tree, os.getgid(), root_uid=os.getuid())
+    assert ok and "repositories are now root's" in why
+    for g in (tree / "workspace" / "r" / ".git", tree / "workspace" / "bare.d"):
+        assert list((g / "hooks").iterdir()) == []
+        text = (g / "config").read_text()
+        assert "fsmonitor" not in text and "git@h:o/r.git" in text
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
 def test_undo_makes_the_repositories_readable_only_after_clearing_the_acls(tmp_path: Path, host) -> None:
     # On Linux a group chmod on a file with an ACL edits the mask, which clearing the ACL discards.
     why = [s.why for s in _undo(tmp_path, host=host).steps]
-    assert why.index("remove the workspace ACLs") < why.index("let your group read the entity's repositories (now root's)")
+    assert why.index("remove the workspace ACLs") < next(i for i, w in enumerate(why) if w.startswith("let your group read"))
+
+
+@pytest.mark.parametrize("version,ok", [
+    ("git version 2.50.1 (Apple Git-155)", True), ("git version 2.37.1", True), ("git version 2.37.0", False),
+    ("git version 2.34.4", True), ("git version 2.34.1", False), ("git version 2.29.9", False), ("garbage", False),
+])
+def test_the_git_version_floor_for_gitdir_ownership(version, ok) -> None:
+    assert hands.git_checks_gitdir_ownership(version) is ok
+
+
+def test_the_shared_root_must_be_roots_and_not_writable_by_others(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "levain"
+    monkeypatch.setitem(hands.WORKSPACE_ROOT, "darwin", root)
+    assert hands.shared_root_problem("darwin") is None            # absent: setup creates it as root
+    root.mkdir()
+    problem = hands.shared_root_problem("darwin")                 # owned by the test user, not root
+    assert problem and "owned by root" in problem
+    root.rmdir()
+    root.symlink_to(tmp_path)
+    assert "not a plain directory" in hands.shared_root_problem("darwin")
+
+
+def test_record_hands_refuses_a_symlinked_store_directory(tmp_path: Path) -> None:
+    ed = tmp_path / "e"
+    ed.mkdir()
+    real = tmp_path / "elsewhere"
+    real.mkdir()
+    (ed / ".levain").symlink_to(real)
+    with pytest.raises(HandsSetupError, match="refusing"):
+        hands.record_hands(ed, _record(ed), owner_uid=os.getuid(), owner_gid=os.getgid())
+    assert list(real.iterdir()) == []

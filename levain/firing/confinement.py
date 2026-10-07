@@ -1903,18 +1903,18 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             )
         if isinstance(hands_uid, bool) or not isinstance(hands_uid, int) or hands_uid <= 0:
             raise ConfinementError(f"{base}: hands_uid must be a positive integer, got {hands_uid!r}.{redo}")
-        roots = tuple(str(r) + os.sep for r in WORKSPACE_ROOT.values())
+        # Exactly the path setup creates for THIS user: undo (as root) re-owns and re-modes that
+        # tree, so a looser check would let a hand-edited path aim it at another directory.
+        expected = {str(r / hands_user / "workspace") for r in WORKSPACE_ROOT.values()}
         home = str(Path.home()) + os.sep
         if (
             not isinstance(hands_workspace_raw, str)
-            or not os.path.isabs(hands_workspace_raw)
-            or os.path.normpath(hands_workspace_raw) != hands_workspace_raw
-            or not hands_workspace_raw.startswith(roots)
+            or hands_workspace_raw not in expected
             or (hands_workspace_raw + os.sep).startswith(home)
         ):
             raise ConfinementError(
-                f"{base}: hands_workspace must be the absolute path setup-isolation created under "
-                f"{' or '.join(str(r) for r in WORKSPACE_ROOT.values())}, got {hands_workspace_raw!r}.{redo}"
+                f"{base}: hands_workspace must be the path setup-isolation created for {hands_user} "
+                f"({' or '.join(sorted(expected))}), got {hands_workspace_raw!r}.{redo}"
             )
         hands_workspace = Path(hands_workspace_raw)
 
