@@ -28,6 +28,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -176,6 +177,11 @@ def _parse_pins(raw: bytes) -> tuple[Trust, bool, bool]:
         return (Trust(data["files"], acc or None, seen, data.get("remote", {})), True, False) if ok \
             else (Trust(), False, False)
     return (Trust(data), True, False) if _valid_pins(data) else (Trust(), False, False)
+
+
+def _fold(path: bytes) -> str:
+    """A path as a case-insensitive, normalising filesystem sees it: NFC, case-folded."""
+    return unicodedata.normalize("NFC", path.decode("utf-8", "surrogateescape")).casefold()
 
 
 def _blob_lines(data: bytes) -> list[bytes]:
@@ -566,7 +572,7 @@ class GitLedger:
 
     def _judge(self, rev, team, pins, pin_problem, lagging):
         owner = team.owner if team else None
-        bad_paths, leaves = self._structure(rev)
+        bad_paths, leaves, aliased = self._structure(rev)
         tamper: list[str] = []
         for n, path in enumerate(bad_paths):
             if path is _MISSING_TEAM:
@@ -581,8 +587,9 @@ class GitLedger:
                     pass
             who = E._printable(" ⏎ ".join((who or "an author git does not attribute").splitlines()))
             shown = E._printable(" ⏎ ".join(path.decode("utf-8", "backslashreplace").splitlines()))
-            tamper.append(f"{shown!r} (written by {who}) is not a file levain writes; the team owner removes it from "
-                          f"the {BRANCH} branch")
+            what = ("differs from another path only in case or Unicode normalisation (a case-insensitive filesystem "
+                    "writes the two as one file)") if path in aliased else "is not a file levain writes"
+            tamper.append(f"{shown!r} (written by {who}) {what}; the team owner removes it from the {BRANCH} branch")
         if tamper:                                      # no blob of a structurally refused ledger is read
             return Judgement(I.build([], owner, [], tamper=tamper))
         if pin_problem:
@@ -594,6 +601,7 @@ class GitLedger:
         files: list[tuple[str, list[str]]] = []
         problems: list[str] = []
         by_safe = {E.safe_handle(h) for h in (team.members if team else {})}
+        folded_members = {_fold(h.encode()) for h in by_safe}
         seen_ids: dict[str, str] = {}
         for rel, data in sorted(whole.items()):
             cut = data.rfind(b"\n") + 1
@@ -608,6 +616,10 @@ class GitLedger:
                     tamper.append(f"ledger/{rel} and ledger/{other} both hold entry id {e.get('id')}; levain never "
                                   "writes an id twice (the owner removes the copy)")
             folder = rel.split("/", 1)[0]
+            if folder not in by_safe and _fold(folder.encode()) in folded_members:
+                tamper.append(f"ledger/{rel} is filed under {folder}/, a case variant of a member's folder (a "
+                              "case-insensitive filesystem would write it over that member's file); the owner removes it")
+                continue
             if team is not None and folder not in by_safe and not folder.startswith("pack-"):
                 problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
                 continue
@@ -628,11 +640,13 @@ class GitLedger:
             led = I.build(files, owner, problems)
         return Judgement(led, datas, files, problems)
 
-    def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]]]:
-        """(bad_paths, leaves) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree, judged as
+    def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]], set[bytes]]:
+        """(bad_paths, leaves, aliased) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree, judged as
         bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md`` (regular
         files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or filter
-        what levain writes, a ``.gitmodules``, any other file) is tamper too. No blob is read."""
+        what levain writes, a ``.gitmodules``, any other file) is tamper too, and so is a path that differs from another
+        only in case or Unicode normalisation (``aliased``): a case-insensitive filesystem checks the two out as one
+        file. No blob is read."""
         cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30,
                  binary=True)
         if cp.returncode != 0:
@@ -640,6 +654,8 @@ class GitLedger:
         bad_paths: list[bytes] = []
         leaves: list[tuple[bytes, str]] = []
         seen_paths: set[bytes] = set()
+        folded: dict[str, bytes] = {}
+        aliased: set[bytes] = set()       # a case-insensitive filesystem (macOS, Windows) checks two such paths out as one
         for rec in cp.stdout_bytes.split(b"\0"):
             if not rec:
                 continue
@@ -652,6 +668,10 @@ class GitLedger:
                 bad_paths.append(path)
                 continue
             seen_paths.add(path)
+            if folded.setdefault(_fold(path), path) != path:
+                bad_paths.append(path)
+                aliased.add(path)
+                continue
             is_tree = mode == b"040000" and kind == b"tree"
             if path in _TOP_FILES:
                 ok = mode in _REGULAR_MODES and kind == b"blob"
@@ -666,7 +686,7 @@ class GitLedger:
                 bad_paths.append(path)
         if b"team.toml" not in seen_paths:            # the team is part of the ledger: a tip without it is refused
             bad_paths.append(_MISSING_TEAM)
-        return bad_paths, leaves
+        return bad_paths, leaves, aliased
 
     # ---- rewrite protection: this clone's pins (trust on first use) ---------------------------------------------
     # A pin is the sha256 and length of the exact bytes of a ledger file this clone accepted (through its last LF).
@@ -753,10 +773,14 @@ class GitLedger:
             raise TeamError(f"--pins-from {path}: not a levain pins file (a clone's .git/{DIRNAME}/pins.json)")
         return rec.files
 
-    @staticmethod
-    def _pin_violations(pins: dict[str, dict], datas: dict[str, bytes], *, lag: bool = False) -> list[str]:
+    def _pin_violations(self, pins: dict[str, dict], datas: dict[str, bytes], *, lag: bool = False) -> list[str]:
         """The files of ``datas`` that do not hold the bytes ``pins`` pin. ``lag``: a missing or shorter file is the
-        local branch not having replayed them yet, and only a file that reaches a pin's length is checked."""
+        local branch not having replayed them yet, and only a file that reaches a pin's length is checked. A file of
+        THIS clone's device is never offered a repin (which would trust whatever replaced its own lines)."""
+        try:
+            mine = f"{self.device}.jsonl" if self.device else None
+        except TeamError:
+            mine = None
         out = []
         for rel, pin in sorted(pins.items()):
             data = datas.get(rel)
@@ -764,6 +788,11 @@ class GitLedger:
                 continue
             if data is None or len(data) < pin["length"] or \
                     hashlib.sha256(data[:pin["length"]]).hexdigest() != pin["sha256"]:
+                if mine is not None and rel.rpartition("/")[2] == mine:
+                    out.append(f"this clone's own ledger/{rel} no longer holds lines this clone wrote. To recover: "
+                               f"restore it from this clone's own copy (`git log {BRANCH} -- ledger/{rel}` shows its "
+                               f"history; an interrupted write is kept in .git/{DIRNAME}/set-aside/); do not repin it")
+                    continue
                 out.append(f"ledger/{rel} was rewritten or removed on the team ledger after this clone accepted it. "
                            f"To recover: the team owner restores the file on the {BRANCH} branch, or, once someone "
                            "has checked that the rewrite is intended, run `levain team repin` in this clone and then "
@@ -1109,7 +1138,12 @@ class GitLedger:
         dirty = self._dirty()
         if not dirty:
             return
-        own = re.compile(r"^ledger/[^/]+/" + re.escape(self.device) + r"\.jsonl$")
+        try:
+            handle = self.handle(self.team(self.head()))
+        except (TeamError, R.RolesError):
+            handle = None
+        folders = r"pack-[^/]+" + (f"|{re.escape(E.safe_handle(handle))}" if handle else "")
+        own = re.compile(rf"^ledger/(?:{folders})/" + re.escape(self.device) + r"\.jsonl$")
         regenerable = [p for p in dirty if p in ("team.toml", CANON_FILE)]
         if regenerable:
             git(["checkout", "-q", "HEAD", "--", *regenerable], self.wt, check=False)
@@ -1129,9 +1163,24 @@ class GitLedger:
                 self.warnings.append("an interrupted write of this clone's entry was NOT committed, because the team "
                                      f"ledger is refused; its file is kept at {kept}")
                 return
+            # Only an APPEND to what the branch holds is an interrupted write of this clone's; any other content (a
+            # checkout of a foreign path onto this one, an attribute filter's output) is set aside, never committed.
+            appends = {}
             for rel in mine:
-                self._stage(rel, (self.wt / rel).read_bytes())
-            self._commit("levain team: recover an interrupted write")
+                cp = git(["cat-file", "blob", f"HEAD:{rel}"], self.wt, check=False, timeout=60, binary=True)
+                committed = cp.stdout_bytes if cp.returncode == 0 else b""
+                data = (self.wt / rel).read_bytes()
+                if data.startswith(committed) and data != committed:
+                    appends[rel] = data
+            odd = [rel for rel in mine if rel not in appends]
+            if odd:
+                kept = self._set_aside(odd)
+                self.warnings.append("this clone's entry file held something other than an append to what the ledger "
+                                     f"branch holds, so it was NOT committed; it is kept at {kept}")
+            for rel, data in appends.items():
+                self._stage(rel, data)
+            if appends:
+                self._commit("levain team: recover an interrupted write")
 
     def _set_aside(self, rels: list[str]) -> Path:
         """Copy each worktree file to <levain-team>/set-aside/ and put the worktree back to HEAD for it."""
@@ -1301,7 +1350,7 @@ class GitLedger:
         """The whole bytes at ``rev`` of the canonical ledger files ``keep(rel)`` selects ({} for no rev)."""
         if not rev:
             return {}
-        _bad, leaves = self._structure(rev)
+        _bad, leaves, _aliased = self._structure(rev)
         leaves = [(p[len(b"ledger/"):].decode("ascii"), sha) for p, sha in leaves]
         leaves = [(rel, sha) for rel, sha in leaves if keep(rel)]
         blobs = self._blobs([sha for _r, sha in leaves])

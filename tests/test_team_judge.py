@@ -1112,3 +1112,75 @@ def test_the_trust_record_is_read_once_and_an_unreadable_one_raises(two):
     _pins_file(ben).write_text("{not json")
     with pytest.raises(LedgerReadError):
         gb.trust_record()
+
+
+def test_a_case_variant_of_a_members_folder_is_tamper_before_anything_is_written(tmp_path):
+    # L2 r3 MED 2, RAN (p5b.py): on a case-insensitive filesystem a member pushed ledger/ben/<Ben's device>.jsonl beside
+    # ledger/Ben/; the checkout collided the two, and Ben's next record committed the forged bytes over his own file.
+    # The namespace is judged case-folded, so the variant is refused at the read, before recovery can write anything.
+    git("init", "-q", "--bare", "--initial-branch=main", "origin.git", cwd=tmp_path)
+    ana = clone(tmp_path, "ana", "ana@ex.com")
+    (ana / "src").mkdir()
+    (ana / "src" / "b.py").write_text("x\n")
+    git("add", ".", cwd=ana)
+    git("commit", "-qm", "i", cwd=ana)
+    git("push", "-q", "origin", "HEAD:main", cwd=ana)
+    assert team("init", "--project", "p", "--owner", "ana", "--member", "ana=ana@ex.com", "--member",
+                "Ben=ben@ex.com", repo=ana) == 0
+    ben = clone(tmp_path, "ben", "ben@ex.com")
+    assert team("join", "--no-install", repo=ben) == 0
+    assert record_ruling(ben, "src/b.py", "ben real ruling") == 0
+    assert team("sync", repo=ana) == 0
+    ga, gb = _gl(ana), _gl(ben)
+    rel = f"ledger/ben/{gb.device}.jsonl"
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=b'{"forged": 1}\n', capture_output=True,
+                         cwd=ga.wt, check=True).stdout.decode().strip()
+    git("update-index", "--add", "--cacheinfo", f"100644,{sha},{rel}", cwd=ga.wt)
+    git("commit", "-qm", "case variant", cwd=ga.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    assert team("sync", repo=ben) != 0
+    assert record_ruling(ben, "src/c.py", "ben second") != 0
+    own = git("cat-file", "blob", f"levain-ledger:ledger/Ben/{gb.device}.jsonl", cwd=ben)
+    assert "forged" not in own and "ben real ruling" in own
+    # the owner's own clone refuses the variant too: it is in the same tree as Ben's folder
+    led = ledger(ana)
+    assert any("ledger/ben" in t and "case" in t for t in led.tamper), led.tamper
+
+
+def test_a_case_variant_of_a_member_with_no_folder_yet_is_tamper(two):
+    tmp, ana, ben = two
+    gl = _gl(ana)
+    (gl.wt / "ledger" / "BEN").mkdir()
+    (gl.wt / "ledger" / "BEN" / "ffffffffffffffff.jsonl").write_text("")
+    _push_wt(gl, "a folder ben's clone would write into")
+    assert team("sync", repo=ben) != 0
+    assert any("case variant" in t for t in ledger(ana).tamper)
+
+
+def test_a_refusal_of_this_clones_own_file_never_offers_a_repin(two):
+    # Head ruling on L2 r3 MED 2: repin would pin whatever replaced this clone's own lines.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "mine") == 0
+    ledger(ben)
+    gb = _gl(ben)
+    rel = next((gb.wt / "ledger" / "ben").glob("*.jsonl")).relative_to(gb.wt).as_posix()
+    sha = subprocess.run(["git", "hash-object", "-w", "--stdin"], input=b"", capture_output=True, cwd=gb.wt,
+                         check=True).stdout.decode().strip()
+    git("update-index", "--cacheinfo", f"100644,{sha},{rel}", cwd=gb.wt)
+    git("commit", "-qm", "own file emptied", cwd=gb.wt)
+    bad = ledger(ben).tamper
+    assert bad and all("repin" not in t.replace("do not repin", "") for t in bad), bad
+    assert any("this clone's own" in t for t in bad)
+
+
+def test_recovery_commits_only_an_append_to_this_clones_own_file(two):
+    # L2 r3 MED 2 (the second half), RAN: recovery staged whatever the worktree held at any folder's <device>.jsonl.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "mine") == 0
+    gb = _gl(ben)
+    f = next((gb.wt / "ledger" / "ben").glob("*.jsonl"))
+    f.write_text('{"not": "an append"}\n')
+    assert record_ruling(ben, "src/b.py", "second") == 0
+    own = git("cat-file", "blob", f"levain-ledger:{f.relative_to(gb.wt).as_posix()}", cwd=ben)
+    assert "an append" not in own and "mine" in own and "second" in own
+    assert any((gb.base / "set-aside").iterdir())
