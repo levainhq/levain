@@ -1410,3 +1410,18 @@ def test_a_leftover_quarantine_of_the_accepted_tip_is_swept(two):
     assert any(rel.startswith("ana/") for rel in _pinned(ben))           # the read pinned what it accepted
     assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
                           capture_output=True).returncode != 0
+
+
+def test_levains_fetch_brings_no_tags_into_the_code_repository(two):
+    # L2 r3 LOW 4, RAN (p2.py): levain's fetch auto-followed tags pushed onto ledger commits into the user's refs/tags.
+    tmp, ana, ben = two
+    gl = _gl(ana)
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    git("tag", "-a", "v9.9-evil", "-m", "x", gl.head(), cwd=ana)
+    git("push", "-q", "origin", "v9.9-evil", cwd=ana)
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    dan = clone(tmp, "dan", "ben@ex.com")
+    git("tag", "-d", "v9.9-evil", cwd=dan)
+    assert team("join", "--no-install", repo=dan) == 0
+    assert git("tag", "-l", cwd=ben).split() == [] and git("tag", "-l", cwd=dan).split() == []

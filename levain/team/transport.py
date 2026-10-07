@@ -118,6 +118,10 @@ _MISSING_TEAM = b"\0team.toml is missing"     # a marker no tree path can equal 
 # accepted tip (written from pins.json, never read to decide). The remote-tracking ref refs/remotes/<remote>/levain-ledger
 # is a mirror for people only: the user's own `git fetch` moves it unjudged, so nothing levain decides reads it.
 _INCOMING = f"refs/levain/incoming/{BRANCH}"
+# levain's fetches write ONE ref of their own and nothing else in the user's repository: no tags followed or pruned (the
+# user's remote.*.tagOpt and fetch.pruneTags are overridden), no submodules fetched, no FETCH_HEAD, and (--refmap=) no
+# "opportunistic" update of the configured remote-tracking ref, which would put an unjudged tip there.
+_FETCH_FLAGS = ["-q", "--no-write-fetch-head", "--refmap=", "--no-tags", "--no-recurse-submodules", "--no-prune"]
 _ACCEPTED = f"refs/levain/accepted/{BRANCH}"
 _MAX_LEDGER_FILE = 64 << 20        # one ledger file; an entry is ~1 KB, so this is tens of thousands of entries
 _MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement, counted once per path
@@ -1121,7 +1125,7 @@ class GitLedger:
         # judgement clears), with every object verified.
         join_ref, remote_tip = "refs/levain/join", None
         if remote:
-            cp = git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-write-fetch-head", "--refmap=", remote,
+            cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
                       f"+refs/heads/{BRANCH}:{join_ref}"], self.repo.toplevel, timeout=120, check=False)
             if cp.returncode != 0 and "couldn't find remote ref" not in (cp.stderr or ""):
                 raise TeamError(f"git fetch failed: {_tail(cp)}")
@@ -1521,9 +1525,7 @@ class GitLedger:
     def _fetch_and_accept(self, remote: str, timeout: float) -> str | None:
         top = self.repo.toplevel
         self.save_state(last_fetch_attempt=time.time())
-        # --refmap= : a command-line fetch otherwise ALSO updates the configured remote-tracking ref ("opportunistic"
-        # update), which would put an unjudged tip there.
-        cp = git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-write-fetch-head", "--refmap=", remote,
+        cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
                   f"+refs/heads/{BRANCH}:{_INCOMING}"], top, timeout=timeout, check=False)
         if cp.returncode != 0:
             if "couldn't find remote ref" in (cp.stderr or ""):
