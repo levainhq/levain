@@ -143,3 +143,13 @@ def test_a_store_named_by_a_command_that_succeeded_is_not_a_denial(tmp_path):
 def test_the_note_names_the_cost_of_turning_the_floor_off():
     assert "ssh agent" in CRED_FLOOR_NOTE and "to false" in CRED_FLOOR_NOTE and "every drive" in CRED_FLOOR_NOTE
     assert CRED_FLOOR_NOTE.index("ssh remote") < CRED_FLOOR_NOTE.index("deny_standard_creds")
+
+
+def test_one_long_line_of_denials_is_read_once(tmp_path):
+    # L3 r2 (codex, complement): every EPERM rescanned its whole line; 10,000 on one 240 kB line took 13.6 s
+    import time
+
+    line = "x: operation not permitted; " * 10_000
+    started = time.monotonic()
+    assert turn_tool_activity(_turn(_output(line)), tmp_path, cred_floor=True) == []
+    assert time.monotonic() - started < 2

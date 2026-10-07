@@ -473,11 +473,14 @@ def _reads_as_cred_failure(event) -> bool:
         return True
     if getattr(event.observation, "exit_code", None) == 0:
         return False
-    # only the lines holding an EPERM are read, so a large output is not split or copied
-    for m in _EPERM.finditer(text):
+    # only the lines holding an EPERM are read, each once, so a large output is neither copied nor rescanned
+    pos = 0
+    while (m := _EPERM.search(text, pos)) is not None:
         end = text.find("\n", m.end())
-        if _floor_path().search(text, text.rfind("\n", 0, m.start()) + 1, len(text) if end == -1 else end):
+        end = len(text) if end == -1 else end
+        if _floor_path().search(text, text.rfind("\n", 0, m.start()) + 1, end):
             return True
+        pos = end + 1
     return False
 
 
@@ -1238,11 +1241,12 @@ class EntitySession:
         miss it. The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
         when the finish carried no message: otherwise it is never shown. Thoughts beside other actions are not: such
         an action ran, and its thought often restates that very call. A classifier failure fails CLOSED: the reply
-        and every thought beside a finish count as flagged (a headless run exits 7); the turn itself never fails."""
+        and every thought beside a finish count as flagged (the reply alone when those thoughts cannot be read; a
+        headless run exits 7); the turn itself never fails."""
         try:
             thoughts = _finish_thoughts(events)
-        except Exception:  # noqa: BLE001 — the reply's own check below still fails closed
-            thoughts = []
+        except Exception:  # noqa: BLE001 — undeterminable is not "readable"
+            return bool(reply), [], bool(reply)
         try:
             names = self._tool_names()
             beside = [t for t in thoughts if unreadable_tool_call(t, names)]
@@ -1558,8 +1562,8 @@ def _activity_callback(on_event: Callable[[str], None], workspace: Path, *, cred
                     and not is_corrective_nudge(event)):
                 noted = False
             if cred_floor and not noted and _reads_as_cred_failure(event):
-                noted = True
                 on_event(CRED_FLOOR_NOTE)
+                noted = True
             if getattr(event, "source", None) != "agent":
                 return
             summary = tool_action_summary(event)

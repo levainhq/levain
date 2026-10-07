@@ -782,3 +782,15 @@ def test_an_unchecked_reply_gets_its_own_notice_on_every_surface(capsys):
     assert UNREADABLE_CHECK_FAILED_NOTICE in out and UNREADABLE_CALL_NOTICE not in out
     assert _turn_payload(result)["unreadable_unchecked"] is True
     assert _turn_payload(TurnResult(reply="hi"))["unreadable_unchecked"] is False
+
+
+def test_unreadable_finish_thoughts_fail_closed(tmp_path, monkeypatch):
+    # L3 r2 (complement): a failure reading the thoughts was swallowed, so the reply was judged with none, exit 0
+    import levain.session as session_mod
+
+    def boom(events):
+        raise RuntimeError("malformed thought")
+
+    monkeypatch.setattr(session_mod, "_finish_thoughts", boom)
+    result = _leaking_session(tmp_path, "All done.").run_turn("x")
+    assert result.unreadable_call is True and result.unreadable_unchecked is True and result.exit_code == 7
