@@ -1101,7 +1101,7 @@ def _resolve_api_key(args: argparse.Namespace) -> bool:
     lifts it out of the command line, see :mod:`levain.launch`), the value so lifted,
     ``--api-key-file``, then ``LEVAIN_API_KEY`` (removed from the environment once read, so no child
     inherits it). False, with the reason printed, when the key cannot be used."""
-    from levain.launch import API_KEY_ENV, take_lifted_api_key
+    from levain.launch import API_KEY_ENV, add_secret_file, take_lifted_api_key
 
     given = getattr(args, "api_key", None) or take_lifted_api_key()
     path = getattr(args, "api_key_file", None)
@@ -1133,6 +1133,7 @@ def _resolve_api_key(args: argparse.Namespace) -> bool:
         if not given:
             print(f"levain: the API key file {path} is empty.", file=sys.stderr)
             return False
+        add_secret_file(path)   # the floor denies it to the entity, both ways
     args.api_key = given if given is not None else env_key
     return True
 

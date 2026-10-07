@@ -78,6 +78,19 @@ NETWORK = tuple(n for base in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PRO
 )
 
 _lifted_api_key: str | None = None
+_secret_files: list[Path] = []   # files holding a secret levain was handed (the API key file)
+
+
+def add_secret_file(path: str | os.PathLike) -> None:
+    """Record a file that holds a secret levain was given, so the confinement floor denies it to the
+    entity both ways (``levain.firing.confinement.build_policy`` reads :func:`secret_files`)."""
+    p = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    if p not in _secret_files:
+        _secret_files.append(p)
+
+
+def secret_files() -> list[Path]:
+    return list(_secret_files)
 reexecuted = False   # True in an image this module re-executed (it restored a carry)
 
 

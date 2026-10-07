@@ -7,6 +7,7 @@ behaviour is selected by patching ``platform.system``, which is what the policy 
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -94,48 +95,108 @@ def test_a_relative_override_is_ignored_not_resolved_against_the_cwd(home: Path,
     assert C._cred_dir_sources() == [home / ".config" / "gcloud", home / ".azure"]
 
 
-def test_linux_denies_gcloud_and_azure_only_while_present(home: Path, linux) -> None:
-    (home / ".azure").mkdir()
+def test_linux_creates_and_masks_an_absent_gcloud_and_azure(home: Path, linux) -> None:
     policy = build_policy(_entity(home), deny_standard_creds=True)
-    assert home / ".azure" in policy.deny_read_write
-    assert home / ".config" / "gcloud" not in policy.deny_read_write
-    argv, create_first = C._bwrap_plan(policy)
-    assert [str(home / ".azure")] in _ops(argv, "--tmpfs")
-    assert all(".config/gcloud" not in d for d in create_first)
-    assert not any(".config/gcloud" in a for a in argv), "no mount, so no host dir is created"
+    assert home / ".config" / "gcloud" in policy.deny_read_write and home / ".azure" in policy.deny_read_write
+    argv, _ = C._bwrap_plan(policy)
+    for d in (home / ".config" / "gcloud", home / ".azure"):
+        assert [str(d)] in _ops(argv, "--tmpfs") and [str(d)] in _ops(argv, "--remount-ro"), d
+    mounted, _ = C._mount_plan_paths(argv, policy)
+    assert mounted[str(home / ".azure")] == "dir", "the provider creates it first, and the ledger owns it"
 
 
-def test_linux_denies_a_gcloud_dir_that_appears_after_the_policy_was_built(home: Path, linux) -> None:
-    policy = build_policy(_entity(home), deny_standard_creds=True)
-    assert home / ".config" / "gcloud" not in policy.deny_read_write
-    (home / ".config" / "gcloud").mkdir(parents=True)      # a first `gcloud auth login`, mid-session
-    fresh = refresh_socket_denies(policy)
-    assert home / ".config" / "gcloud" in fresh.deny_read_write
-    assert home / ".config" in fresh.deny_write_dirs       # pinned against rename as well
-    assert crown_jewel_reason(fresh, home / ".config" / "gcloud" / "credentials.db") is not None
+def test_linux_skips_a_cred_dir_override_this_user_cannot_create(home: Path, tmp_path: Path,
+                                                                 linux, monkeypatch) -> None:
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        monkeypatch.setenv("AZURE_CONFIG_DIR", str(locked / "az"))
+        argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+        assert not any(str(locked / "az") in a for a in argv), "the shell cannot create it either"
+    finally:
+        locked.chmod(0o755)
 
 
-def test_linux_refuses_a_symlinked_azure_dir(home: Path, linux) -> None:
-    (home / "dotfiles" / "azure").mkdir(parents=True)
-    (home / ".azure").symlink_to(home / "dotfiles" / "azure")
-    with pytest.raises(C.ConfinementError, match="symlink"):
-        C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
-
-
-def test_linux_masks_an_aws_cache_whose_parent_exists_after_the_read_only_aws_bind(home: Path,
-                                                                                    linux) -> None:
+def test_linux_masks_every_aws_cache_after_the_read_only_aws_bind(home: Path, linux) -> None:
     (home / ".aws" / "sso").mkdir(parents=True)
     argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
-    aws, cache = str(home / ".aws"), str(home / ".aws" / "sso" / "cache")
-    assert [cache] in _ops(argv, "--tmpfs") and [cache] in _ops(argv, "--remount-ro")
+    aws = str(home / ".aws")
     i_ro = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--ro-bind", aws, aws])
-    assert i_ro < argv.index(cache), "the read-only bind of ~/.aws must not land on top of the cache tmpfs"
-    # an absent ~/.aws/cli cannot be created from inside the read-only ~/.aws, so nothing is mounted
-    assert not any(a.startswith(str(home / ".aws" / "cli")) for a in argv)
+    for rel in _AWS_CACHES:
+        cache = str(home / rel)
+        assert [cache] in _ops(argv, "--tmpfs") and [cache] in _ops(argv, "--remount-ro"), rel
+        assert i_ro < argv.index(cache), "the read-only bind of ~/.aws must not land on top of a cache"
 
 
-def test_linux_creates_no_aws_cache_dirs_when_aws_is_absent(home: Path, linux) -> None:
+def test_linux_masks_the_aws_caches_when_aws_is_absent_too(home: Path, linux) -> None:
     argv, create_first = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
     assert create_first.count(str(home / ".aws")) == 1
-    assert not any("/cache" in d for d in create_first)
-    assert not any(a.endswith("/cache") for a in argv)
+    for rel in _AWS_CACHES:
+        assert [str(home / rel)] in _ops(argv, "--tmpfs"), rel
+
+
+def test_the_credential_overrides_are_followed(home: Path, tmp_path: Path, monkeypatch) -> None:
+    o = tmp_path / "o"
+    gitcfg = o / "gitconfig"
+    gitcfg.parent.mkdir()
+    gitcfg.write_text("[credential]\n\thelper = store --file=%s\n" % (o / "git-store"))
+    env = {
+        "AWS_SHARED_CREDENTIALS_FILE": str(o / "aws-creds"),
+        "KUBECONFIG": f"{o / 'k1'}{os.pathsep}{o / 'k2'}{os.pathsep}relative/k3",
+        "DOCKER_CONFIG": str(o / "docker"),
+        "GH_CONFIG_DIR": str(o / "gh"),
+        "NETRC": str(o / "netrc"),
+        "NPM_CONFIG_USERCONFIG": str(o / "npmrc"),
+        "XDG_CONFIG_HOME": str(o / "xdg"),
+        "GIT_CONFIG_GLOBAL": str(gitcfg),
+    }
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    for f in ("aws-creds", "k1", "k2", "docker/config.json", "netrc", "npmrc", "xdg/git/credentials",
+              "git-store"):
+        assert o / f in policy.deny_files, f
+    for d in ("gh", "xdg/gh"):
+        assert o / d in policy.deny_read_write, d
+    assert home / ".kube" / "config" in policy.deny_files, "the default stays denied as well"
+    assert not any("relative" in str(p) for p in policy.deny_files)
+
+
+def test_the_api_key_file_is_denied_to_the_entity(home: Path, monkeypatch) -> None:
+    from levain import launch
+
+    key = home / "keys" / "model.key"
+    key.parent.mkdir()
+    key.write_text("sk-x")
+    monkeypatch.setattr(launch, "_secret_files", [])
+    launch.add_secret_file(key)
+    policy = build_policy(_entity(home))
+    assert key in policy.deny_files
+    assert crown_jewel_reason(policy, key) is not None
+
+
+def test_a_symlink_loop_in_a_cred_path_does_not_crash_the_build(home: Path, linux) -> None:
+    (home / ".netrc").symlink_to(home / ".netrc")
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    assert home / ".netrc" in policy.deny_files
+    with pytest.raises(C.ConfinementError):
+        C._bwrap_plan(policy)
+
+
+def test_a_link_root_whose_target_the_floor_does_not_name_refuses(home: Path, tmp_path: Path) -> None:
+    import dataclasses
+
+    target = tmp_path / "t"
+    target.mkdir()
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    (ro / "link").symlink_to(target)
+    ro.chmod(0o555)
+    try:
+        base = build_policy(_entity(home))
+        policy = dataclasses.replace(base, deny_read_write=(*base.deny_read_write, ro / "link"))
+        with pytest.raises(C.ConfinementError, match="does not name"):
+            C._bwrap_plan(policy)
+    finally:
+        ro.chmod(0o755)

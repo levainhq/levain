@@ -232,6 +232,7 @@ def test_api_key_file_is_read_and_a_loose_one_refused(tmp_path: Path, capsys) ->
     f.chmod(0o600)
     a = _args(api_key_file=str(f))
     assert _resolve_api_key(a) is True and a.api_key == SECRET
+    assert f in launch.secret_files(), "the floor denies the key file to the entity"
 
 
 def test_api_key_from_the_environment_is_used_once(monkeypatch) -> None:

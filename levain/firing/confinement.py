@@ -226,6 +226,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shlex
 import signal
 import stat
@@ -368,35 +369,73 @@ _STANDARD_CRED_SUBTREES = (
     "~/.config/gcloud",             # gcloud's credential databases and ADC (or $CLOUDSDK_CONFIG)
     "~/.azure",                     # az's MSAL token cache and service principals (or $AZURE_CONFIG_DIR)
 )
-# Credential directories that are a tool's WHOLE home, and the environment overrides that move one.
-# On Linux they are denied only while they exist, the browser-profile rule: bwrap must create an
-# absent path to mount over it, and creating ~/.azure would plant a config dir for a tool the
-# operator never used. They are re-checked at every shell spawn (`refresh_socket_denies`), so a
-# first `gcloud auth login` during a session is denied from the next spawn on. macOS denies them
-# whether or not they exist. The ~/.aws caches need neither: ~/.aws is a read-only tool directory
-# on Linux (:data:`_CRED_TOOL_DIRS`), so an absent cache under it cannot be created from inside.
+# Credential directories that are a tool's WHOLE home. On Linux an absent one is created (0700,
+# recorded in the placeholder ledger and removed at close if still empty) and masked like every
+# other absent jewel directory, so the shell can neither plant a config there nor read what an
+# operator's `gcloud auth login` writes there mid-session (L2 r1). One whose parent this user cannot
+# write is skipped: the shell cannot create it either. macOS denies them whether or not they exist.
 _PRESENT_ONLY_CRED_DIRS = ("~/.config/gcloud", "~/.azure")
-_CRED_DIR_ENV = ("AWS_LOGIN_CACHE_DIRECTORY", "CLOUDSDK_CONFIG", "AZURE_CONFIG_DIR")
+# The tools' own credential-location overrides (L1 r1), read from the environment when the policy
+# is built: (variable, "dir" | "file", the path(s) its value names). Each is denied IN ADDITION to
+# the default location, which can still hold what was written before the override was set.
+_CRED_OVERRIDES: tuple[tuple[str, str, str], ...] = (
+    ("AWS_LOGIN_CACHE_DIRECTORY", "dir", "{}"),
+    ("CLOUDSDK_CONFIG", "dir", "{}"),
+    ("AZURE_CONFIG_DIR", "dir", "{}"),
+    ("GH_CONFIG_DIR", "dir", "{}"),
+    ("XDG_CONFIG_HOME", "dir", "{}/gh"),
+    ("XDG_CONFIG_HOME", "file", "{}/git/credentials"),
+    ("AWS_SHARED_CREDENTIALS_FILE", "file", "{}"),
+    ("NETRC", "file", "{}"),
+    ("NPM_CONFIG_USERCONFIG", "file", "{}"),
+    ("DOCKER_CONFIG", "file", "{}/config.json"),
+    ("KUBECONFIG", "file", "{list}"),       # a colon-separated list: every entry
+)
+_CRED_DIR_ENV = tuple(v for v, kind, _ in _CRED_OVERRIDES if kind == "dir")
+
+
+def _git_store_files(config: Path) -> list[Path]:
+    """The files a ``credential.helper = store --file <path>`` in git config ``config`` names."""
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for m in re.finditer(r"^\s*helper\s*=\s*\"?store\b[^\n]*?--file(?:=|\s+)(\S+?)\"?\s*$", text,
+                         re.MULTILINE):
+        out.append(Path(os.path.expanduser(m.group(1).strip("'\""))))
+    return out
+
+
+def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
+    """``(dirs, files)`` the credential-location overrides in ``environ`` name: absolute paths only (a
+    relative value would be resolved against whatever directory levain was started in). Includes the
+    store files a ``GIT_CONFIG_GLOBAL`` config names."""
+    env = os.environ if environ is None else environ
+    dirs: list[Path] = []
+    files: list[Path] = []
+    for var, kind, form in _CRED_OVERRIDES:
+        value = env.get(var, "")
+        values = value.split(os.pathsep) if form == "{list}" else [value]
+        for v in values:
+            v = os.path.expanduser(v)
+            if not v or not os.path.isabs(v):
+                continue
+            path = Path(v if form == "{list}" else form.format(v))
+            (dirs if kind == "dir" else files).append(path)
+    git_global = os.path.expanduser(env.get("GIT_CONFIG_GLOBAL", ""))
+    if git_global and os.path.isabs(git_global):
+        files += [f for f in _git_store_files(Path(git_global)) if f.is_absolute()]
+    return list(_dedup_paths(dirs)), list(_dedup_paths(files))
 
 
 def _cred_dir_sources() -> list[Path]:
-    """The present-only credential directories, lexical: the defaults, plus each override in
-    :data:`_CRED_DIR_ENV` that is set to an absolute path (the default stays denied too: it can still
-    hold the tokens written before the override)."""
+    """The credential directories that are a tool's whole home, lexical: the defaults and every
+    override (:data:`_CRED_DIR_ENV`)."""
     home = Path.home()
-    out = [home / d[2:] for d in _PRESENT_ONLY_CRED_DIRS]
-    for var in _CRED_DIR_ENV:
-        value = os.path.expanduser(os.environ.get(var, ""))
-        if value and os.path.isabs(value):
-            out.append(Path(value))
-    return list(_dedup_paths(out))
+    return list(_dedup_paths([home / d[2:] for d in _PRESENT_ONLY_CRED_DIRS] + _cred_overrides()[0]))
 
 
-def _present_cred_dirs(sources: tuple[Path, ...] | list[Path]) -> list[Path]:
-    """Every spelling of each source this platform denies now: all of them off Linux, and on Linux
-    those that exist (a dangling link counts, so the plan refuses it rather than skipping it)."""
-    linux = platform.system() == "Linux"
-    return [p for src in sources if not linux or os.path.lexists(src) for p in _spellings(src)]
 _STANDARD_CRED_FILES = (
     "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
                                     # profile / SSO the entity legitimately needs; an operator whose
@@ -423,6 +462,24 @@ _STANDARD_CRED_FILES = (
 _CRED_TOOL_DIRS = ("~/.kube", "~/.docker", "~/.aws", "~/.config/git")
 
 
+def floor_roots(specs) -> list[Path]:
+    """THE way a list of jewel roots enters the floor, as data: each ``~/rel`` or absolute path at
+    its three spellings (:func:`_spellings`). The standard cred stores, the cloud directories, the
+    credential overrides and the ledger go through it; a new list (browser profiles) is one more
+    tuple passed here, and the plan's absent-path handling (a tool directory read-only, an absent
+    directory created and ledgered, a $HOME-level file a session placeholder, a link refused where
+    it could be swapped) applies to it unchanged."""
+    return [p for spec in specs for p in _spellings(spec)]
+
+
+def _secret_files() -> list[Path]:
+    try:
+        from levain.launch import secret_files
+    except ImportError:   # pragma: no cover — levain.launch is part of this package
+        return []
+    return secret_files()
+
+
 def _spellings(spec: str | Path) -> list[Path]:
     """A jewel path at the three spellings the ssh vectors have used since 2026-08-21: the raw
     ``Path.home()`` form (the true lexical path), resolved HOME plus the unresolved rest, and the
@@ -438,12 +495,21 @@ def _spellings(spec: str | Path) -> list[Path]:
     so the next list cannot repeat the resolved-only miss."""
     s = str(spec)
     if s == "~" or s.startswith("~/"):
-        home = Path.home()
-        rel = s[2:]
-        raw = home / rel
-        return list(_dedup_paths([raw, home.resolve() / rel, raw.resolve()]))
-    p = Path(s)
-    return list(_dedup_paths([p, p.parent.resolve() / p.name, p.resolve()]))
+        raw = Path.home() / s[2:]
+        candidates = [lambda: Path.home().resolve() / s[2:], raw.resolve]
+    else:
+        raw = Path(s)
+        candidates = [lambda: raw.parent.resolve() / raw.name, raw.resolve]
+    out = [raw]
+    for spell in candidates:
+        # A symlink loop must not crash the policy build (L1 r1). The raw spelling stays denied (on
+        # macOS a literal deny of a path no lookup can finish), and the Linux plan, which resolves
+        # every root again, refuses bash with the reason.
+        try:
+            out.append(spell())
+        except (OSError, RuntimeError):
+            pass
+    return list(_dedup_paths(out))
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
@@ -751,9 +817,10 @@ class CrownJewelsPolicy:
     # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
     # only: the bwrap plan mounts each read-only and binds its existing subdirectories back read-write,
     # creating an absent one at 0700 first. Seatbelt needs no counterpart (it denies absent paths).
-    cred_dir_sources: tuple[Path, ...] = ()  # the present-only credential directories, lexical
-    # (:func:`_cred_dir_sources`), kept so the spawn-time refresh can deny one that appears after the
-    # policy was built, as ``socket_sources`` is for the sockets. Empty unless ``deny_standard_creds``.
+    cred_dir_sources: tuple[Path, ...] = ()  # the credential directories that are a tool's whole home
+    # (:func:`_cred_dir_sources`: ~/.config/gcloud, ~/.azure, and every directory override), lexical.
+    # Their spellings are in ``deny_read_write``; this tells the Linux plan which absent roots may be
+    # skipped when this user cannot create them. Empty unless ``deny_standard_creds``.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -1158,12 +1225,13 @@ def build_policy(
     tool_dirs: list[Path] = []
     cred_dir_sources: list[Path] = []
     if deny_standard_creds:
-        subtrees.extend(p for s in _STANDARD_CRED_SUBTREES if s not in _PRESENT_ONLY_CRED_DIRS
-                        for p in _spellings(s))
         cred_dir_sources = _cred_dir_sources()
-        subtrees.extend(_present_cred_dirs(cred_dir_sources))
-        files.extend(p for f in _STANDARD_CRED_FILES for p in _spellings(f))
+        subtrees.extend(floor_roots([*_STANDARD_CRED_SUBTREES, *cred_dir_sources]))
+        files.extend(floor_roots([*_STANDARD_CRED_FILES, *_cred_overrides()[1]]))
         tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
+    # The model API key file levain was given (`--api-key-file`): denied both ways, so the key the
+    # flag keeps off the command line is not left readable to the entity instead (L2 r1).
+    files.extend(floor_roots(_secret_files()))
     # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
     # deletes from the operator's home, so the entity may neither read nor write it.
     # At all three spellings, like every other jewel (L1 r1): a link at ~/.levain-runtime must not
@@ -1575,9 +1643,6 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
-    # Credential directories that exist now and did not at build (on Linux they are denied only
-    # while present: `_PRESENT_ONLY_CRED_DIRS`), the same union.
-    listed += _present_cred_dirs(policy.cred_dir_sources)
     new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
         policy = replace(
@@ -3472,6 +3537,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
             argv += ["--bind-try", str(child), str(child)]
+    entity_store_dirs = list(ro_store_dirs)
     # The standard cred files' TOOL directories get the same construct (lane P2, items 5 and 6): an
     # absent cred file in one then needs no mountpoint, so no 0444 stub lands on the host, and a
     # link in one is masked at its target because it cannot be replaced from inside. An absent tool
@@ -3495,7 +3561,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 continue
             argv += ["--bind-try", str(child), str(child)]
 
-    def _absent_in_ro_store(f: Path) -> bool:
+    def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
         # the NEAREST EXISTING ancestor, not the parent: an absent `.levain/vault` (or a path
         # deeper under an absent dir) cannot be created from inside a read-only store dir, and
@@ -3506,12 +3572,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # A read-only tool directory may not exist yet (the provider creates it just before
         # bwrap), so the walk stops at one whether or not it exists. Compared at the real parent,
         # because the read-only mounts are spelled that way.
+        dirs = ro_store_dirs if dirs is None else dirs
         if f.exists():
             return False
         anc = f.parent.resolve()
-        while anc not in ro_store_dirs and not anc.exists() and anc != anc.parent:
+        while anc not in dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
-        return anc in ro_store_dirs
+        return anc in dirs
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -3528,6 +3595,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
+    cred_dir_spellings = set(floor_roots(policy.cred_dir_sources))
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
         # A subtree root spelled lexically (:func:`_spellings`) may be a link, and bwrap refuses to
         # mount on one ("Can't mount on symlink destination", bubblewrap.c). Its resolved spelling is
@@ -3538,6 +3606,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if real.is_symlink():
             if real.parent not in ro_store_dirs:
                 _refuse_replaceable_link(real)
+            # Skipped only because its target is mounted under its own spelling, which is checked
+            # here rather than assumed (L2 r1): a list that added a link root alone is refused.
+            if real.resolve() not in policy.deny_read_write:
+                raise ConfinementError(
+                    f"{real} is a symlink to {real.resolve()}, which the floor does not name, so the "
+                    "Linux plan cannot cover it. Refusing to grant bash hands (fail-closed)."
+                )
             continue
         sub = real
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
@@ -3550,14 +3625,21 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
-        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+        # An absent root under a read-only TOOL directory is mounted all the same (created first by
+        # the provider, 0700, ledgered): the shell could not create it, but the operator's tool can,
+        # mid-session, and what it writes there must not be readable through the read-only bind (the
+        # aws caches, research §4; L2 r1). Only the entity's own store dirs skip absent roots.
+        absent_in_store = _absent_in_ro_store(sub, entity_store_dirs)
+        if not sub.exists() and not absent_in_store and not _mountpoint_creatable(sub):
+            if sub in cred_dir_spellings:
+                continue   # a tool's home this user cannot create: the shell cannot create it either
             raise ConfinementError(
                 f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
                 "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
                 "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
                 "(fail-closed)."
             )
-        if _absent_in_ro_store(sub):
+        if absent_in_store:
             continue
         if sub.exists() and not sub.is_dir():
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
