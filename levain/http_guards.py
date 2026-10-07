@@ -451,7 +451,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
         stamp = (self.headers.get(LINK_TIME_HEADER) or "").strip()
         token = self.server.launch_token
         # The proof binds a time, so a request seen once cannot be replayed after its nonce is forgotten (gemini L3).
-        fresh = stamp.isascii() and stamp.isdigit() and abs(time.time() - int(stamp)) <= LINK_SKEW_SECONDS
+        fresh = (stamp.isascii() and stamp.isdigit() and len(stamp) <= 12   # a bounded int() (codex + glm L3)
+                 and abs(time.time() - int(stamp)) <= LINK_SKEW_SECONDS)
         if (len(nonce) < 16 or not _token_shaped(nonce) or not proof or not fresh
                 or not hmac.compare_digest(proof.encode("utf-8"),
                                            _link_proof(token, "levain-link-request", nonce, stamp).encode("utf-8"))):
@@ -594,7 +595,12 @@ class _PortLock:
             import fcntl
 
             self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            except OSError:
+                os.close(self.fd)   # __exit__ does not run when __enter__ raises
+                self.fd = None
+                raise
         except ImportError:
             self.fd = None
         return self
@@ -611,6 +617,7 @@ class PublishedToken:
     unlocked: str
     path: "Path | None"
     token: str = ""
+    pub_id: str = ""
 
     def close(self) -> None:
         """Remove this server's runtime file, if it is still this server's: a later server on the port (even one in
@@ -620,9 +627,11 @@ class PublishedToken:
         try:
             with _PortLock(self.path.parent, int(self.path.stem)):
                 rec = json.loads(self.path.read_text(encoding="utf-8"))
-                if rec.get("pid") == os.getpid() and rec.get("token") == self.token:
+                # The publication's own id (codex L3: a same-process successor reusing an explicit token on the
+                # same port would match on pid and token alone).
+                if isinstance(rec, dict) and rec.get("pub_id") == self.pub_id:
                     self.path.unlink()
-        except (OSError, ValueError):
+        except Exception:  # noqa: BLE001 — shutdown must go on: a bad record is not a reason to skip server_close
             pass
 
 
@@ -641,6 +650,7 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
         return PublishedToken(url, None)
     out = stream if stream is not None else sys.stdout
     unlocked = f"{url}#code={mint_link_code(server)}"
+    pub_id = secrets.token_hex(8)
     path: "Path | None" = None
     err: "OSError | None" = None
     try:
@@ -650,6 +660,8 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
         with _PortLock(d, port):
             # A tmp file a crashed writer left (head ruling: unlink it if stale): its name carries the writer's pid.
             for old in d.glob(f".{int(port)}.*.tmp"):
+                if sys.platform == "win32":
+                    break   # os.kill(pid, 0) is CTRL_C there (gemini L3); a stale tmp only takes a little space
                 try:
                     old_pid = int(old.name.split(".")[2])
                     os.kill(old_pid, 0)
@@ -660,7 +672,7 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid()}, fh)
+                    json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid(), "pub_id": pub_id}, fh)
                 os.replace(tmp, path)
             except OSError:
                 tmp.unlink(missing_ok=True)
@@ -679,7 +691,7 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
     else:
         print(f"  token: not printed here (this output is not a terminal); it is in {path} (0600). "
               f"Open the page with: levain serve --open-running --port {int(port)}", file=out, flush=True)
-    return PublishedToken(unlocked, path, token)
+    return PublishedToken(unlocked, path, token, pub_id)
 
 
 def read_running(port: int) -> dict[str, Any]:
@@ -687,6 +699,8 @@ def read_running(port: int) -> dict[str, Any]:
     (no file, unreadable, or the process that wrote it is gone)."""
     path = runtime_dir() / f"{int(port)}.json"
     rec = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(rec, dict):
+        raise ValueError(f"{path} is not a Levain runtime record")
     pid = rec.get("pid")
     if not isinstance(pid, int) or not isinstance(rec.get("token"), str) or not isinstance(rec.get("url"), str):
         raise ValueError(f"{path} is not a Levain runtime record")
@@ -700,6 +714,9 @@ def read_running(port: int) -> dict[str, Any]:
         # This user wrote the record, so its pid now belonging to someone else means the writer is gone.
         raise ValueError(f"the server that wrote {path} (pid {pid}) is no longer running") from None
     return rec
+
+
+_LINK_REPLY_MAX = 4096
 
 
 def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
@@ -727,7 +744,10 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
                  LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce, stamp)})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
-        reply = json.loads(r.read())
+        raw = r.read(_LINK_REPLY_MAX + 1)   # whoever holds the port cannot make this read without end (codex L3)
+    if len(raw) > _LINK_REPLY_MAX:
+        raise ValueError("the answer on that port was too long to be a link; not opening it")
+    reply = json.loads(raw)
     if not isinstance(reply, dict):
         raise ValueError("the answer on that port was not a link; not opening it")
     code, proof = reply.get("code"), reply.get("proof")
@@ -771,7 +791,9 @@ def stop_on_sigterm() -> "Callable[[], None]":
         return lambda: None
 
     def _stop(signum: int, frame: Any) -> None:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a second SIGTERM must not cut the cleanup short
+        # One stop: a second SIGTERM must not cut the cleanup short. A Python no-op, not SIG_IGN, which a child
+        # started during shutdown would inherit across exec (complement L3).
+        signal.signal(signal.SIGTERM, lambda *_a: None)
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, _stop)

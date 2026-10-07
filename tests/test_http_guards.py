@@ -738,3 +738,68 @@ def test_a_stale_tmp_file_from_a_crashed_writer_is_removed(tmp_path, monkeypatch
                                kind="serve", stream=io.StringIO())
     assert not stale.exists() and (rt / "7487.json").exists()
     pub.close()
+
+
+def test_full_branch_round_review_fixes(tmp_path, monkeypatch):
+    """L3 17da00ebad17a811: a timestamp header too long for int() is a 403, not a traceback; a non-object runtime
+    record is refused by read_running and does not stop close(); a successor that reuses the token is not removed by
+    its predecessor's close(); a squatter cannot make --open-running read without end."""
+    import io
+    import json
+    from types import SimpleNamespace
+
+    import levain.http_guards as hg
+    import levain.web_server as ws
+    from levain.dashboard import AnnealPaths, SubstrateSource
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    httpd = ws.make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
+                           read_token=_TOKEN)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = httpd.server_address[1]
+        got = _raw_post(port, "/link", {"X-Levain-Token": "", "X-Levain-Link-Nonce": "n" * 24,
+                                        "X-Levain-Link-Time": "9" * 5000, "X-Levain-Link-Proof": "x"})
+        assert got[0] == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+    srv = SimpleNamespace(launch_token=_TOKEN)
+    old = hg.publish_launch_token(srv, "http://127.0.0.1:7486/", port=7486, kind="serve", stream=io.StringIO())
+    new = hg.publish_launch_token(srv, "http://127.0.0.1:7486/", port=7486, kind="serve", stream=io.StringIO())
+    old.close()
+    assert (tmp_path / ".levain-runtime" / "7486.json").exists()
+    (tmp_path / ".levain-runtime" / "7486.json").write_text("[]")
+    with pytest.raises(ValueError, match="not a Levain runtime record"):
+        hg.read_running(7486)
+    new.close()   # does not raise
+
+
+def test_request_link_code_bounds_what_it_reads(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from levain.http_guards import request_link_code
+
+    class _Flood(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            body = b"{" + b" " * 100_000 + b"}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Flood)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(ValueError, match="too long"):
+            request_link_code(f"http://127.0.0.1:{httpd.server_address[1]}/", _TOKEN)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)

@@ -94,9 +94,7 @@
   }
   // The launch-token refusal (token.js): a 403 whose JSON says error "launch_token". Checked BEFORE the off-box
   // matcher below, whose /token/i would also match its message. `sent` is the launch token the request carried.
-  let lastLaunchRefusal = false;   // the last parsed 403 was the launch token's (not Host / cross-site)
   function launchRefused(status, data, sent) {
-    lastLaunchRefusal = !!(data && data.error === "launch_token");
     if (!(window.LevainToken && window.LevainToken.isRefusal(status, data))) return false;
     window.LevainToken.lock(sent ? "That token was not accepted." : null, sent);
     return true;
@@ -107,10 +105,12 @@
   // NB (complement L3 FIND-4): this ``/token/i`` matcher is coupled to the kernel's literal token-403
   // message ("missing or invalid write token") and is DUPLICATED in flow's fleetview_web.py — tighten
   // the regex in one place and you must mirror it in the other repo, or the prompt/drop silently drifts.
-  async function isTokenReject(res, sent) {
-    lastLaunchRefusal = false;
+  // `seen` (optional) learns whether the 403 was the launch token's own: per call, never shared state, so a job poll
+  // landing between a read and its check cannot change the answer (complement L3).
+  async function isTokenReject(res, sent, seen) {
     try {
       const d = await res.json();
+      if (seen) seen.launch = !!(d && d.error === "launch_token");
       if (launchRefused(res.status, d, sent)) return false;
       if (d && d.error === "launch_token") return false;   // even with token.js missing: never the off-box prompt
       return /token/i.test((d && d.message) || "");
@@ -291,7 +291,8 @@
       // prompt once, store, retry. A read-only mesh surface never asks for the off-box token (it gates
       // only a writable off-box bind), so it never prompts here. (A launch-token 403 is not this one:
       // isTokenReject hands it to token.js's unlock form and returns false.) The token, once entered, also unlocks writes.
-      if (res.status === 403 && await isTokenReject(res, sent)) {
+      const seen = {};
+      if (res.status === 403 && await isTokenReject(res, sent, seen)) {
         // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
         // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
@@ -310,7 +311,7 @@
         }
       }
       // "locked" only for the launch token's own refusal: a Host or cross-site 403 shows no form (complement L3).
-      if (res.status === 403 && !sentLaunchToken() && lastLaunchRefusal) {
+      if (res.status === 403 && !sentLaunchToken() && seen.launch) {
         status("locked — see the form at the top of the page"); return;
       }
       // Refused for a launch token the page has since replaced: the unlock's own load() was latched behind this

@@ -13,6 +13,7 @@ import pytest
 
 from levain.firing.confinement import (
     BROWSER_PROFILE_DIRS,
+    browser_profile_roots,
     build_policy,
     bwrap_available,
     crown_jewel_reason,
@@ -57,16 +58,46 @@ def _profile(home: Path, rel: str) -> Path:
     return p
 
 
+def test_a_hardlink_to_a_profiles_page_storage_refuses_bash(home: Path) -> None:
+    """codex L3: profiles are not walked whole, but their Session/Local Storage is, so another name for the file the
+    cockpit's token lives in (say, in the entity's workspace) is caught at shell start."""
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    rel = "Library/Application Support/Google/Chrome" if platform.system() == "Darwin" else ".config/google-chrome"
+    prof = _profile(home, rel)
+    entity = _entity(home)
+    (entity / "workspace" / "alias.log").hardlink_to(prof / "Session Storage" / "000003.log")
+    try:
+        with pytest.raises(ConfinementError, match="names on disk"):
+            _refuse_multiply_linked_jewels(build_policy(entity))
+    finally:
+        (prof / "Private").chmod(0o700)
+
+
 def test_every_browser_profile_root_is_denied_to_the_file_editor(home: Path) -> None:
+    mine = "darwin" if platform.system() == "Darwin" else "linux"
+    for os_name, rel in BROWSER_PROFILE_DIRS:   # present, so Linux denies them too
+        if os_name == mine:
+            (home / rel).mkdir(parents=True, exist_ok=True)
     policy = build_policy(_entity(home))
-    for rel in BROWSER_PROFILE_DIRS:
+    for os_name, rel in BROWSER_PROFILE_DIRS:
+        if os_name != mine:
+            continue
         root = (home / rel).resolve()
         assert root in policy.deny_read_write, rel
         assert crown_jewel_reason(policy, home / rel / "Default" / "Cookies") is not None, rel
 
 
+@pytest.mark.skipif(platform.system() == "Darwin", reason="Linux-only rule")
+def test_on_linux_an_absent_browser_is_not_denied_so_bwrap_does_not_create_it(home: Path) -> None:
+    """codex L3: bwrap creates an absent denied path on the host to mount over it."""
+    assert browser_profile_roots(home) == []
+    (home / ".mozilla").mkdir()
+    assert browser_profile_roots(home) == [(home / ".mozilla").resolve()]
+
+
 def test_the_list_covers_the_ruled_browsers_on_both_platforms() -> None:
-    joined = "\n".join(BROWSER_PROFILE_DIRS)
+    joined = "\n".join(rel for _os, rel in BROWSER_PROFILE_DIRS)
     for name in ("Google/Chrome", "Chromium", "BraveSoftware", "Microsoft Edge", "Arc", "Vivaldi", "Firefox",
                  "Library/Safari", "Library/Containers/com.apple.Safari", "Library/Cookies",
                  ".config/google-chrome", ".config/chromium", ".config/microsoft-edge", ".config/vivaldi",

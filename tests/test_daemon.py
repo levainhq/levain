@@ -1256,3 +1256,17 @@ def test_a_symlinked_log_path_is_never_followed(tmp_path, monkeypatch):
     with pytest.raises(d.DaemonError, match="symlink"):   # codex L3: the service would follow it later
         d._prepare_private_logs(spec)
     assert not target.exists()
+
+
+def test_a_log_path_that_is_not_this_users_regular_file_is_refused(tmp_path, monkeypatch):
+    """codex L3: in a shared --log-dir another user could pre-create the log world-readable, or put a FIFO there."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    os.mkfifo(spec.stdout_log)
+    with pytest.raises(d.DaemonError, match="not a regular file"):
+        d._prepare_private_logs(spec)

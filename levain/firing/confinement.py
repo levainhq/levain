@@ -690,31 +690,44 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
 
-# BROWSER PROFILES, home-relative, read AND write denied on every OS (head ruling 2026-10-07, after L2 measured the
-# cockpit's launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies, saved
-# logins and local storage unencrypted, so it is a crown jewel whatever Levain keeps in it. Both platforms' paths are
-# listed on both: a path that does not exist on this machine denies nothing and costs one rule.
-BROWSER_PROFILE_DIRS: tuple[str, ...] = (
-    # macOS
-    "Library/Application Support/Google/Chrome",                  # Chrome (all channels' profiles)
-    "Library/Application Support/Chromium",                       # Chromium
-    "Library/Application Support/BraveSoftware",                  # Brave
-    "Library/Application Support/Microsoft Edge",                 # Edge
-    "Library/Application Support/Arc",                            # Arc
-    "Library/Application Support/Vivaldi",                        # Vivaldi
-    "Library/Application Support/Firefox",                        # Firefox
-    "Library/Safari",                                             # Safari history, local storage
-    "Library/Containers/com.apple.Safari",                        # Safari's sandbox container
-    "Library/Cookies",                                            # the system cookie store Safari uses
-    # Linux
-    ".config/google-chrome",                                      # Chrome
-    ".config/chromium",                                           # Chromium
-    ".config/BraveSoftware",                                      # Brave
-    ".config/microsoft-edge",                                     # Edge
-    ".config/vivaldi",                                            # Vivaldi
-    ".mozilla",                                                   # Firefox
-    ".var/app",                                                   # every flatpak app's data, flatpak browsers among them
+# BROWSER PROFILES, home-relative, read AND write denied (head ruling 2026-10-07, after L2 measured the cockpit's
+# launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies, saved logins and
+# local storage unencrypted, so it is a crown jewel whatever Levain keeps in it. Each entry is (platform, path): on
+# macOS every entry is denied whether or not it exists (a Seatbelt rule for an absent path costs nothing); on Linux
+# only an entry that exists is, because bwrap CREATES an absent denied path on the host to mount over it (codex L3),
+# which would litter every home with every browser's directories.
+BROWSER_PROFILE_DIRS: tuple[tuple[str, str], ...] = (
+    ("darwin", "Library/Application Support/Google/Chrome"),      # Chrome (all channels' profiles)
+    ("darwin", "Library/Application Support/Chromium"),           # Chromium
+    ("darwin", "Library/Application Support/BraveSoftware"),      # Brave
+    ("darwin", "Library/Application Support/Microsoft Edge"),     # Edge
+    ("darwin", "Library/Application Support/Arc"),                # Arc
+    ("darwin", "Library/Application Support/Vivaldi"),            # Vivaldi
+    ("darwin", "Library/Application Support/Firefox"),            # Firefox
+    ("darwin", "Library/Safari"),                                 # Safari history, local storage
+    ("darwin", "Library/Containers/com.apple.Safari"),            # Safari's sandbox container
+    ("darwin", "Library/Cookies"),                                # the system cookie store Safari uses
+    ("linux", ".config/google-chrome"),                           # Chrome
+    ("linux", ".config/chromium"),                                # Chromium
+    ("linux", ".config/BraveSoftware"),                           # Brave
+    ("linux", ".config/microsoft-edge"),                          # Edge
+    ("linux", ".config/vivaldi"),                                 # Vivaldi
+    ("linux", ".mozilla"),                                        # Firefox
+    ("linux", ".var/app"),                                        # every flatpak app's data, flatpak browsers among them
 )
+
+# Inside a Chromium-family profile, the storage a page's sessionStorage/localStorage lands in. These ARE walked for
+# other names at shell start (a hardlink to them elsewhere would carry the cockpit's token past the path deny; codex
+# L3); the rest of a profile is not (see _jewel_inodes).
+_BROWSER_STORAGE_GLOBS = ("*/Session Storage", "*/Local Storage")
+
+
+def browser_profile_roots(home: Path) -> list[Path]:
+    """The browser profile roots denied on this platform (see ``BROWSER_PROFILE_DIRS``), resolved."""
+    if platform.system() == "Darwin":
+        return [(home / rel).resolve() for os_name, rel in BROWSER_PROFILE_DIRS if os_name == "darwin"]
+    return [(home / rel).resolve() for os_name, rel in BROWSER_PROFILE_DIRS
+            if os_name == "linux" and (home / rel).exists()]
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -1081,7 +1094,7 @@ def build_policy(
     # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
     runtime = (home / RUNTIME_DIR_NAME).resolve()
     subtrees.append(runtime)
-    browsers = [(home / rel).resolve() for rel in BROWSER_PROFILE_DIRS]
+    browsers = browser_profile_roots(home)
     subtrees.extend(browsers)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
@@ -3049,15 +3062,17 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
             return
         unverifiable(str(exc.filename or "a crown-jewel directory"), exc)
 
-    # Browser profiles are denied by path but not walked here: Safari's WebKit cache hardlinks its own files, its
+    # Browser profiles are denied by path but not walked whole: Safari's WebKit cache hardlinks its own files, its
     # container is privacy-protected (os.walk is refused, which would refuse bash outright), and a Chrome profile can
-    # hold gigabytes; walking them at every shell start would refuse or stall every entity on a machine with a browser.
+    # hold gigabytes. Their page storage (_BROWSER_STORAGE_GLOBS), where the cockpit's token is kept, IS walked.
     home = Path.home()
-    unwalked = {(home / rel).resolve() for rel in BROWSER_PROFILE_DIRS}
+    unwalked = {(home / rel).resolve() for _os_name, rel in BROWSER_PROFILE_DIRS}
+    storage_roots = sorted({hit for root in unwalked if os.path.isdir(root)
+                            for pattern in _BROWSER_STORAGE_GLOBS for hit in root.glob(pattern)}, key=str)
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,
                    key=lambda p: str(p))
     walked: list[Path] = []
-    for root in roots:
+    for root in [*roots, *storage_roots]:
         if any(root == w or root.is_relative_to(w) for w in walked):
             continue
         walked.append(root)
