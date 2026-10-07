@@ -78,7 +78,8 @@ _MISSING_TEAM = b"\0team.toml is missing"     # a marker no tree path can equal 
 _INCOMING = f"refs/levain/incoming/{BRANCH}"
 _ACCEPTED = f"refs/levain/accepted/{BRANCH}"
 _MAX_LEDGER_FILE = 64 << 20        # one ledger file; an entry is ~1 KB, so this is tens of thousands of entries
-_MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement
+_MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement, counted once per path
+_MAX_LEDGER_LEAVES = 20000         # ledger files in one tree (pins.json holds ~120 bytes each, under its own cap)
 _PINS_MAX_BYTES = 8 << 20          # a pins file holds ~120 bytes per ledger file
 _READ_ATTEMPTS = 3
 _PIN_RACE_TEXT = ("the ledger kept moving while this clone recorded what it accepted (a concurrent read pinned a newer "
@@ -141,7 +142,7 @@ _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false",
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
-        input_text: str | None = None) -> subprocess.CompletedProcess:
+        input_text: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
                GIT_NO_REPLACE_OBJECTS="1",   # a replace ref must not change what levain reads
@@ -149,7 +150,8 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     # Bytes in, bytes out: text=True would decode with the parent's locale and turn a CR into a line break. The
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
-    # that is a path or ledger content is read from stdout_bytes.
+    # that is a path or ledger content is read from stdout_bytes. ``binary``: plumbing whose output is ledger content
+    # or a tree; stdout is left empty (never a second, decoded copy of up to the size limits in memory).
     try:
         raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True,
                              timeout=timeout, input=None if input_text is None else input_text.encode("utf-8"),
@@ -158,7 +160,7 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
         raise TeamError("git is not on PATH") from None
-    cp = subprocess.CompletedProcess(raw.args, raw.returncode, raw.stdout.decode("utf-8", "replace"),
+    cp = subprocess.CompletedProcess(raw.args, raw.returncode, "" if binary else raw.stdout.decode("utf-8", "replace"),
                                      raw.stderr.decode("utf-8", "replace"))
     cp.stdout_bytes = raw.stdout
     if check and cp.returncode != 0:
@@ -518,7 +520,7 @@ class GitLedger:
             return Judgement(I.build([], owner, [], tamper=tamper))
         if pin_problem:
             return Judgement(I.build([], owner, [], tamper=[pin_problem]))
-        blobs = self._blobs({sha for _p, sha in leaves})
+        blobs = self._blobs([sha for _p, sha in leaves])
         whole = {path[len(b"ledger/"):].decode("ascii"): blobs[sha] for path, sha in leaves}
         tamper += self._pin_violations(pins, whole)
         datas: dict[str, bytes] = {}
@@ -564,7 +566,8 @@ class GitLedger:
         bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md`` (regular
         files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or filter
         what levain writes, a ``.gitmodules``, any other file) is tamper too. No blob is read."""
-        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30,
+                 binary=True)
         if cp.returncode != 0:
             raise LedgerReadError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
@@ -713,31 +716,39 @@ class GitLedger:
                 raise TeamError(f"could not save the pins: {exc.strerror}") from None
             return [rel]
 
-    def _blobs(self, shas: set[str]) -> dict[str, bytes]:
+    def _blobs(self, refs) -> dict[str, bytes]:
         """Blob contents by sha through ``cat-file --batch``: length-framed, so content is never read as framing.
         Every frame is bounds-checked: its size must fit the output, a LF must close it, and nothing may remain."""
+        refs = list(refs)                               # one sha per tree reference: a blob at two paths counts twice
+        if len(refs) > _MAX_LEDGER_LEAVES:
+            raise LedgerReadError(f"the ledger has {len(refs)} files, past levain's limit of {_MAX_LEDGER_LEAVES}; the "
+                                  "team owner removes the extra files")
+        shas = set(refs)
         if not shas:
             return {}
         order = sorted(shas)
         # Sizes first, so no ledger file is ever read whole into memory past the limits (a hook killed for memory
         # would answer nothing at all).
         cp = git(["cat-file", "--batch-check"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
-                 check=False, timeout=60)
+                 check=False, timeout=60, binary=True)
         rows = cp.stdout_bytes.split(b"\n")
         if cp.returncode != 0 or len(rows) != len(order) + 1 or rows[-1]:
             raise LedgerReadError(f"could not read ledger sizes: {_tail(cp)}")
-        total = 0
+        sizes: dict[str, int] = {}
         for want, row in zip(order, rows):
             head = row.split(b" ")
             if len(head) != 3 or head[0] != want.encode("ascii") or head[1] != b"blob" or not head[2].isdigit():
                 raise LedgerReadError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
-            total += int(head[2])
-            if int(head[2]) > _MAX_LEDGER_FILE or total > _MAX_LEDGER_TOTAL:
-                raise LedgerReadError(f"a ledger file ({want[:10]}, {int(head[2])} bytes) is past levain's limits "
+            sizes[want] = int(head[2])
+        total = 0
+        for want in refs:                               # summed per reference: each is decoded and held per path
+            total += sizes[want]
+            if sizes[want] > _MAX_LEDGER_FILE or total > _MAX_LEDGER_TOTAL:
+                raise LedgerReadError(f"a ledger file ({want[:10]}, {sizes[want]} bytes) is past levain's limits "
                                       f"({_MAX_LEDGER_FILE >> 20} MiB a file, {_MAX_LEDGER_TOTAL >> 20} MiB in all); the "
                                       "team owner removes it from the ledger branch")
         cp = git(["cat-file", "--batch"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
-                 check=False, timeout=60)
+                 check=False, timeout=60, binary=True)
         if cp.returncode != 0:
             raise LedgerReadError(f"could not read ledger contents: {_tail(cp)}")
         out: dict[str, bytes] = {}
@@ -1133,7 +1144,7 @@ class GitLedger:
         _bad, leaves = self._structure(rev)
         leaves = [(p[len(b"ledger/"):].decode("ascii"), sha) for p, sha in leaves]
         leaves = [(rel, sha) for rel, sha in leaves if keep(rel)]
-        blobs = self._blobs({sha for _r, sha in leaves})
+        blobs = self._blobs([sha for _r, sha in leaves])
         return {rel: blobs[sha] for rel, sha in leaves}
 
     def judge_remote(self, rev: str) -> Judgement:

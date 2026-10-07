@@ -745,3 +745,23 @@ def test_repin_outside_a_joined_clone_says_so(tmp_path, capsys):
     git("init", "-q", cwd=tmp_path)
     assert team("repin", repo=tmp_path) == 2
     assert "has not joined" in capsys.readouterr().err
+
+
+def test_the_size_limit_counts_a_blob_once_per_path_that_holds_it(two, monkeypatch):
+    # L3 r2 codex HIGH 2: the total counted unique blobs, so one blob at many paths passed the limit while every path
+    # was decoded and held separately.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    ga = _gl(ana)
+    f = _own_file(ga)
+    (f.parent / "0123456789abcdef.jsonl").write_bytes(f.read_bytes())          # the same blob at a second path
+    _push_wt(ga, "one blob, two paths")
+    size = len(f.read_bytes())
+    monkeypatch.setattr(T, "_MAX_LEDGER_TOTAL", int(size * 1.5))
+    with pytest.raises(T.LedgerReadError, match="past levain's limits"):
+        ga.judge(ga.head(), ga.team(), {})
+    monkeypatch.setattr(T, "_MAX_LEDGER_TOTAL", 512 << 20)
+    monkeypatch.setattr(T, "_MAX_LEDGER_LEAVES", 1)
+    with pytest.raises(T.LedgerReadError, match="files, past levain's limit"):
+        ga.judge(ga.head(), ga.team(), {})
