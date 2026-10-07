@@ -3881,6 +3881,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     return out, create_first
 
 
+def _probe_env() -> dict[str, str]:
+    from levain.launch import child_env   # stdlib-only, so this module stays a dependency leaf
+
+    return child_env()
+
+
 def bwrap_available() -> bool:
     """True iff ``bwrap`` is present AND CAN ACTUALLY ESTABLISH A NAMESPACE ON THIS HOST RIGHT NOW.
 
@@ -3903,6 +3909,7 @@ def bwrap_available() -> bool:
              "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         # Cannot even attempt it -> not available. FAIL CLOSED; never let an exception here read as
@@ -3927,6 +3934,7 @@ def bwrap_netns_available() -> bool:
              "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False

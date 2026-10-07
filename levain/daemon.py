@@ -421,7 +421,9 @@ class DaemonProvider(ABC):
 
 
 def _run(cmd: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    from levain.launch import child_env
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=child_env())
     if check and proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise DaemonError(f"`{' '.join(cmd)}` failed (rc={proc.returncode}): {msg}")

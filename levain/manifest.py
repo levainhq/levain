@@ -371,9 +371,11 @@ def _run_anneal_json(
     ]
     for cmd in candidates:
         try:
+            from levain.launch import child_env
+
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                errors="replace", timeout=timeout,
+                errors="replace", timeout=timeout, env=child_env(),
             )
         except subprocess.TimeoutExpired:
             return None

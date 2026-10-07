@@ -25,6 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..launch import child_env
 from . import canon as C
 from . import entry as E
 from . import index as I
@@ -260,7 +261,7 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
         # --link-authority: only the owner's supersedes cross authors, the same rule levain's in-force view applies
         cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import",
                              "--link-authority", owner, "-"],
-                            input=body, capture_output=True, text=True, timeout=20)
+                            input=body, capture_output=True, text=True, timeout=20, env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"[team] anneal import did not run: {exc}"
     tail = ((cp.stderr or cp.stdout).strip().splitlines() or ["exit " + str(cp.returncode)])[-1]

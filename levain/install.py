@@ -3923,7 +3923,10 @@ def _run_anneal_cmd(
     errors: list[str] = []
     for cmd in candidates:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            from levain.launch import child_env
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                                    env=child_env())
         except OSError as e:
             errors.append(f"{cmd[0]}: {e}")
             continue

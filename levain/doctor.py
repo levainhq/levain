@@ -795,7 +795,10 @@ def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     happens to invoke a Levain-aware tool isn't silenced by a parent shell
     that set the var for an unrelated reason.
     """
-    env = {k: v for k, v in os.environ.items() if k != "LEVAIN_HOOK_SUPPRESS"}
+    from levain.launch import child_env
+
+    env = child_env()
+    env.pop("LEVAIN_HOOK_SUPPRESS", None)
     try:
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, env=env

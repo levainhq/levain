@@ -593,7 +593,9 @@ def _edit_via_editor(stdscr: "curses.window", initial_text: str) -> str | None:
         curses.endwin()  # hand the terminal to the editor
         rc = 1
         try:
-            rc = subprocess.call(shlex.split(editor) + [tmp])
+            from levain.launch import child_env
+
+            rc = subprocess.call(shlex.split(editor) + [tmp], env=child_env(prefixes=("VIM", "NVIM")))
         except (OSError, ValueError):  # missing editor / unbalanced quotes in $EDITOR
             return None
         finally:
