@@ -265,6 +265,14 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
             kind = "a symlink" if stat.S_ISLNK(dst.st_mode) else f"mode {stat.S_IMODE(dst.st_mode):04o}"
             raise DaemonError(f"{d} must be a directory this user owns that no other user can write (it is {kind}, "
                               f"owner uid {dst.st_uid}); pass another --log-dir.")
+        # Every directory above it too (codex L3 + L1): one another user can write, without the sticky bit, lets them
+        # rename the log directory away and put their own in its place.
+        for anc in d.parents:
+            ast_ = os.lstat(anc)
+            if stat.S_ISLNK(ast_.st_mode) or ast_.st_uid not in (0, os.getuid()) or (
+                    ast_.st_mode & 0o022 and not ast_.st_mode & stat.S_ISVTX):
+                raise DaemonError(f"{d} sits under {anc} (mode {stat.S_IMODE(ast_.st_mode):04o}, owner uid "
+                                  f"{ast_.st_uid}), which another user could replace it in; pass another --log-dir.")
         # The service will append to whatever is at this path: it must be a regular file this user owns with one
         # name, never a link (it would be followed), a hardlink to another file, a FIFO or device (it would block), or
         # another user's file (codex L3: in a shared --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed

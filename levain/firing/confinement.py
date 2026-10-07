@@ -221,6 +221,7 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -665,9 +666,6 @@ class CrownJewelsPolicy:
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
     # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
-    browser_mountpoints: tuple[Path, ...] = ()  # Linux: the absent browser profile roots in
-    # `deny_read_write` that levain creates (empty, 0700) for the session so an entity cannot plant
-    # a link there mid-session (head ruling 2026-10-07): the directories that are levain's to remove.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -698,19 +696,16 @@ PROJECT_MEMORY_HOME = ".anneal-projects"
 # (Chromium browsers encrypt those with a Keychain or keyring key; their page storage is plain), so it is a crown
 # jewel whatever Levain keeps in it. A maintained list, like the credential stores: a browser not on it is not denied.
 #
-# Each entry is (platform, path, page-storage globs). On macOS every entry is denied whether or not it exists: a
-# Seatbelt rule for an absent path costs nothing, and an absent denied path cannot be created by the entity. On Linux
-# a mount needs a mountpoint: an entry is denied when it exists, or when its parent exists, in which case levain
-# creates it empty (0700) for the session (``browser_mountpoints``; head ruling 2026-10-07), so an entity cannot
-# plant it as a link while its shell is live.
-# An entry whose parent is absent too (no ~/snap) is not denied; the roots are re-derived at every shell spawn
-# (:func:`refresh_socket_denies`), so it is covered from the spawn after its parent appears.
-# A path whose components include a symlink is denied at both spellings, the link's and its target's; a link that
-# reaches the entity's own workspace or directory refuses bash (:func:`_refuse_planted_browser_links`). On Linux,
-# entries under ``.config`` are denied under the default ``~/.config`` AND under ``$XDG_CONFIG_HOME`` and
-# ``$CHROME_CONFIG_HOME`` when those are set (both, not either: levain reads the variables from its own environment,
-# which may not be the browser's). Paths from the Chromium user-data-dir doc
-# (https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md), Kagi's Orion notes
+# Each entry is (platform, path, page-storage globs): data, read by the floor. On macOS every entry is denied, at its
+# literal and resolved spellings, whether or not it exists: a Seatbelt rule for an absent path costs nothing, and an
+# absent denied path cannot be created by the entity. On Linux an entry that exists is denied at its resolved
+# spelling; a mount needs a mountpoint, so an absent entry is left to the floor's handling of absent protected paths.
+# The roots are re-derived at every shell spawn (:func:`refresh_socket_denies`), so a profile created mid-session is
+# denied from the next spawn. An entry whose path is a symlink loop is not denied and refuses bash
+# (:func:`_refuse_unresolvable_browser_roots`). On Linux, entries under ``.config`` are denied under the default
+# ``~/.config`` AND under ``$XDG_CONFIG_HOME`` and ``$CHROME_CONFIG_HOME`` when those are set (both, not either: levain
+# reads the variables from its own environment, which may not be the browser's). Paths from the Chromium
+# user-data-dir doc (https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md), Kagi's Orion notes
 # (https://help.kagi.com/orion/misc/technical.html) and the vendors' layouts (L1 + L2, 2026-10-07).
 #
 # The globs are the ONLY parts of a profile walked for other names (hardlinks) at shell start, ruled by Phill
@@ -804,64 +799,15 @@ def _linux_config_homes(home: Path) -> list[Path]:
     return homes
 
 
-def _first_symlink(path: Path, home: Path) -> Path | None:
-    """The first component of ``path`` that is a symlink, checked from below ``home`` (or from ``/`` for a path
-    outside it), or None. Every component, not only the last: an entity could plant ``~/snap`` or ``~/.var``."""
-    start = home if path == home or path.is_relative_to(home) else Path(path.anchor)
-    cur = start
-    for part in path.relative_to(start).parts:
-        cur = cur / part
-        try:
-            if stat.S_ISLNK(os.lstat(cur).st_mode):
-                return cur
-        except OSError:
-            return None   # absent from here down: nothing below can be a link
-    return None
-
-
 @dataclass(frozen=True)
 class _BrowserRoot:
-    path: Path                 # a profile path, resolved (on macOS a linked root is also listed at its link's spelling)
+    path: Path                 # a profile root as denied: resolved, or on macOS also its literal spelling
     globs: tuple[str, ...]     # its page storage, walked for other names
-    link: Path | None = None   # the symlink on the way, when there is one
-    present: bool = True       # denied: False when only checked for where its link leads
-    created: bool = False      # Linux: absent under a writable parent: levain creates it empty for the session
-    broken: bool = False       # its link does not resolve (a loop): checked, never denied
-
-
-def _resolved(p: Path) -> Path | None:
-    """``p.resolve()``, or None for a link that cannot be resolved (a loop raises RuntimeError on Python 3.12)."""
-    try:
-        return p.resolve()
-    except (OSError, RuntimeError):
-        return None
-
-
-def _creatable(p: Path) -> bool:
-    return p.parent.is_dir() and os.access(p.parent, os.W_OK)
-
-
-def _links_below(root: Path, globs: tuple[str, ...]) -> list[Path]:
-    """Symlinks inside a profile root on the way to its page storage (codex L3: ``Default`` linked elsewhere puts the
-    profile, token included, outside the denied root). Every prefix of every glob is looked at; what is inside the
-    page storage itself is :func:`_refuse_planted_browser_links`' to check."""
-    prefixes = {"/".join(g.split("/")[:i]) for g in globs for i in range(1, len(g.split("/")) + 1)}
-    found: set[Path] = set()
-    for prefix in sorted(prefixes):
-        for hit in root.glob(prefix):
-            try:
-                if stat.S_ISLNK(os.lstat(hit).st_mode):
-                    found.add(hit)
-            except OSError:
-                continue
-    return sorted(found, key=str)
+    loop: bool = False         # its path does not resolve (a symlink loop): not denied, refuses bash
 
 
 def _browser_roots(home: Path) -> list[_BrowserRoot]:
-    """Every browser profile path denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``),
-    plus where any symlink on the way leads. A link is found at any component, from below ``home`` down to the root,
-    and inside the root on the way to its page storage; its target is denied too, and checked against the entity's
-    own tree (:func:`_refuse_planted_browser_links`), whether or not it exists yet."""
+    """Every browser profile root denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
     darwin = platform.system() == "Darwin"
     out: list[_BrowserRoot] = []
     for os_name, rel, globs in BROWSER_PROFILE_DIRS:
@@ -870,88 +816,40 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
         cands = ([base / rel[len(".config/"):] for base in _linux_config_homes(home)]
                  if not darwin and rel.startswith(".config/") else [home / rel])
         for c in cands:
-            link = _first_symlink(c, home)
-            target = _resolved(c)
-            if target is None:
-                out.append(_BrowserRoot(c, globs, link or c, present=False, broken=True))
+            try:
+                os.stat(c)
+                looped = False
+            except OSError as exc:
+                looped = exc.errno == errno.ELOOP
+            try:
+                target = c.resolve()   # a loop raises RuntimeError on Python 3.12 and resolves quietly on 3.13 (L1)
+            except (OSError, RuntimeError):
+                looped = True
+            if looped:
+                out.append(_BrowserRoot(c, globs, loop=True))
                 continue
-            exists = target.exists()
-            if darwin or exists:
-                out.append(_BrowserRoot(target, globs, link))
-                if darwin and link is not None:
-                    out.append(_BrowserRoot(c, globs, link))   # the link's own spelling, for Seatbelt
-            elif _creatable(target):
-                # Absent, under a writable parent (head ruling 2026-10-07, gemini L3): denied too, so bwrap mounts
-                # over it and an entity cannot plant it as a link while its shell runs. The mountpoint is the empty
-                # 0700 directory levain makes (:func:`_prepare_mountpoints`), named in ``browser_mountpoints``.
-                # Through a link, the target is what is created (L1). A root whose
-                # parent is absent too (no ~/snap) is covered from the spawn after the parent appears.
-                out.append(_BrowserRoot(target, globs, link, created=True))
-            else:
-                out.append(_BrowserRoot(target, globs, link, present=False))
-            if not exists or not target.is_dir():
-                continue
-            for inner in _links_below(target, globs):
-                inner_target = _resolved(inner)
-                if inner_target is None:
-                    out.append(_BrowserRoot(inner, (), inner, present=False, broken=True))
-                    continue
-                # A link within the profile is denied with it; a link to a socket (Chromium's SingletonSocket points
-                # into the temp dir) is not profile data.
-                if inner_target.is_relative_to(target) or (
-                        inner_target.exists() and not (inner_target.is_dir() or inner_target.is_file())):
-                    continue
-                out.append(_BrowserRoot(inner_target, (), inner, darwin or inner_target.exists()))
+            if darwin:
+                out.append(_BrowserRoot(target, globs))
+                if target != c:
+                    out.append(_BrowserRoot(c, globs))
+            elif target.exists():
+                out.append(_BrowserRoot(target, globs))
     return out
 
 
 def browser_profile_roots(home: Path) -> list[Path]:
     """The browser profile paths denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
-    return list(_dedup_paths([r.path for r in _browser_roots(home) if r.present]))
+    return list(_dedup_paths([r.path for r in _browser_roots(home) if not r.loop]))
 
 
-def _refuse_planted_browser_links(policy: CrownJewelsPolicy) -> None:
-    """Refuse bash when a browser profile path reaches the entity's own workspace or directory through a symlink, or
-    through a link that does not resolve (L1 + L2 + L3, 2026-10-07). With the Linux base bound read-write, an entity
-    can create an absent ``~/.mozilla`` or ``~/snap`` as a link into its workspace, or a link inside a profile's page
-    storage, and a browser would then write its profile (cookies, logins, the cockpit's token) where the entity
-    reads it, which the floor cannot deny without denying the workspace. Inside page storage any link that leaves
-    the profile refuses: browsers keep none there. Any other symlinked root is denied at its target and the session
-    carries on."""
-    home = Path.home()
-    mine = [Path(policy.entity_dir).resolve(), Path(policy.workspace).resolve()]
-
-    def refuse(what: str, link: Path, why: str) -> None:
-        raise ConfinementError(
-            f"The browser profile path {what} goes through the symlink {link}, {why}, so a browser could keep its "
-            "profile (cookies, logins, the cockpit's launch token) where the entity reads it. Refusing to grant bash "
-            "hands (fail-closed); remove or repoint the link.")
-
-    browsers = _browser_roots(home)
-    for root in browsers:
-        if root.broken:
-            refuse(str(root.path), root.link or root.path, "which does not resolve (a loop)")
-        if root.link is None:
-            continue
-        hit = next((m for m in mine if root.path == m or root.path.is_relative_to(m) or m.is_relative_to(root.path)),
-                   None)
-        if hit is not None:
-            refuse(str(root.path), root.link, f"into {hit}, which this entity can write")
-    for root in browsers:
-        if not root.present or not root.globs or not root.path.is_dir():
-            continue
-        for store in (g for pattern in root.globs for g in root.path.glob(pattern)):
-            for dirpath, dirs, files in os.walk(store) if store.is_dir() else [(str(store.parent), [], [store.name])]:
-                for name in [*dirs, *files]:
-                    p = Path(dirpath) / name
-                    try:
-                        if not stat.S_ISLNK(os.lstat(p).st_mode):
-                            continue
-                    except OSError:
-                        continue
-                    t = _resolved(p)
-                    if t is None or not t.is_relative_to(root.path):
-                        refuse(str(store), p, f"out of the profile to {t or 'a loop'}")
+def _refuse_unresolvable_browser_roots(policy: CrownJewelsPolicy) -> None:
+    """Refuse bash when a browser profile root's path is a symlink loop: it cannot be resolved, so it cannot be denied
+    (L1, 2026-10-07: ``Path.resolve()`` raised out of ``build_policy`` and failed every session)."""
+    for root in _browser_roots(Path.home()):
+        if root.loop:
+            raise ConfinementError(
+                f"The browser profile path {root.path} is a symlink loop, so the floor cannot resolve it to deny it. "
+                "Refusing to grant bash hands (fail-closed); remove the link.")
 
 
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
@@ -1320,9 +1218,7 @@ def build_policy(
     # entity could unlock the cockpit, read the operator's memory over loopback and drive the chat routes.
     runtime = (home / RUNTIME_DIR_NAME).resolve()
     subtrees.append(runtime)
-    browser_roots = _browser_roots(home)
-    browsers = list(_dedup_paths([r.path for r in browser_roots if r.present]))
-    browser_mountpoints = _dedup_paths([r.path for r in browser_roots if r.created])
+    browsers = browser_profile_roots(home)
     subtrees.extend(browsers)
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
@@ -1637,7 +1533,6 @@ def build_policy(
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
-        browser_mountpoints=browser_mountpoints,
     )
 
 
@@ -1749,12 +1644,8 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
     # Browser profile roots likewise (L1, 2026-10-07): a browser first run, or a root reached through a link that
     # appeared, after the session was built is denied from the next spawn on.
-    browser_roots = _browser_roots(Path.home())
-    listed = [*listed, *_dedup_paths([r.path for r in browser_roots if r.present])]
+    listed = [*listed, *browser_profile_roots(Path.home())]
     new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
-    new_mountpoints = [r.path for r in browser_roots if r.created and r.path not in policy.browser_mountpoints]
-    if new_mountpoints:
-        policy = replace(policy, browser_mountpoints=_dedup_paths([*policy.browser_mountpoints, *new_mountpoints]))
     if new_dirs:
         policy = replace(
             policy,
@@ -2715,7 +2606,7 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
-        _refuse_planted_browser_links(refreshed)
+        _refuse_unresolvable_browser_roots(refreshed)
         _refuse_multiply_linked_jewels(refreshed)
         shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
@@ -3256,7 +3147,7 @@ def _browser_storage(policy: CrownJewelsPolicy, *, fresh: bool) -> tuple[list[_B
     if not fresh and hit is not None and hit[0] is policy:
         return hit[1], hit[2]
     browsers = _browser_roots(Path.home())
-    found = sorted({g for r in browsers if r.present and os.path.isdir(r.path)
+    found = sorted({g for r in browsers if not r.loop and os.path.isdir(r.path)
                     for pattern in r.globs for g in r.path.glob(pattern)}, key=str)
     with _STORAGE_ROOTS_LOCK:
         _STORAGE_ROOTS_CACHE[id(policy)] = (policy, browsers, found)
@@ -3331,8 +3222,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy, *, fresh: bool = True) -> dict[tupl
     # kept, IS walked.
     home = Path.home()
     browsers, storage_roots = _browser_storage(policy, fresh=fresh)
-    unwalked = ({(home / rel).resolve() for _os_name, rel, _globs in BROWSER_PROFILE_DIRS}
-                | {home / rel for _os_name, rel, _globs in BROWSER_PROFILE_DIRS} | {r.path for r in browsers})
+    unwalked = {home / rel for _os_name, rel, _globs in BROWSER_PROFILE_DIRS} | {r.path for r in browsers}
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,
                    key=lambda p: str(p))
     walked: list[Path] = []

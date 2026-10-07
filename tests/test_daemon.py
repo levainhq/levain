@@ -1340,3 +1340,21 @@ def test_a_log_dir_others_can_write_is_refused(tmp_path, monkeypatch):
     with pytest.raises(d.DaemonError, match="no other user can write .it is mode 1777"):
         d._prepare_private_logs(spec)
 
+
+
+def test_a_log_dir_under_a_directory_others_can_rename_in_is_refused(tmp_path, monkeypatch):
+    """codex L3 + L1: a private log dir in a non-sticky shared parent can be renamed away and replaced."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o777)
+    (shared / "logs").mkdir(mode=0o700)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=shared / "logs")
+    with pytest.raises(d.DaemonError, match="another user could replace it in"):
+        d._prepare_private_logs(spec)
+    os.chmod(shared, 0o1777)   # sticky: others cannot rename what is not theirs
+    d._prepare_private_logs(spec)

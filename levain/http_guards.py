@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -455,14 +456,32 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self._allow = "GET, HEAD, POST"
         self._reject(405, "method_not_allowed", "this server answers GET, HEAD and POST")
 
-    def __getattr__(self, name: str) -> Any:
-        # BaseHTTPRequestHandler dispatches to ``do_<METHOD>`` when the attribute exists and answers 501 otherwise:
-        # every method it would not find here (PROPFIND, a lowercase "get", any token) goes to _other_method, so
-        # none reaches a response before the guards (L1).
-        # The one exempt handler (_DO_METHOD_EXEMPT) still routes its own methods until its gate lands.
-        if name.startswith("do_") and (type(self).__module__, type(self).__qualname__) not in _DO_METHOD_EXEMPT:
-            return self._other_method
-        raise AttributeError(name)
+    def handle_one_request(self) -> None:
+        """The stdlib's request loop with ONE change, the dispatch: GET, HEAD and POST go to this class's guarded
+        ``do_*``, and every other method, whatever its name (PROPFIND, a lowercase "get", any token), goes through
+        the same guards to a 405 (:meth:`_other_method`). The stdlib looked up ``do_<METHOD>`` and answered 501
+        before any guard ran (codex L3 + L1). The one exempt handler (``_DO_METHOD_EXEMPT``) keeps the stdlib loop
+        until its gate lands."""
+        if (type(self).__module__, type(self).__qualname__) in _DO_METHOD_EXEMPT:
+            return super().handle_one_request()
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ""
+                self.request_version = ""
+                self.command = ""
+                self.send_error(HTTPStatus.REQUEST_URI_TOO_LONG)
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            if not self.parse_request():
+                return   # an error was sent
+            {"GET": self.do_GET, "HEAD": self.do_HEAD, "POST": self.do_POST}.get(self.command, self._other_method)()
+            self.wfile.flush()
+        except TimeoutError as e:
+            self.log_error("Request timed out: %r", e)
+            self.close_connection = True
 
     def _link(self) -> None:
         """``POST /link``: mint a link code for a caller that proves it holds the token without sending it (see
