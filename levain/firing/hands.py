@@ -338,6 +338,7 @@ def plan_undo(
         steps += [
             Step("remove the workspace ACLs",
                  call=lambda: _run_ok(("/bin/chmod", "-R", "-N", str(ws.parent)), missing_ok=True)),
+            Step("let your group read the entity's repositories (now root's)", call=lambda: _repos_readable(ws.parent)),
             Step("delete the hands user", ("/usr/bin/dscl", ".", "-delete", f"/Users/{hands_user}"),
                  skip_if=_absent("user", host, hands_user)),
             Step("delete the hands group", ("/usr/bin/dscl", ".", "-delete", f"/Groups/{hands_user}"),
@@ -348,6 +349,7 @@ def plan_undo(
         steps += [
             Step("remove the workspace ACLs",
                  call=lambda: _run_ok((_abs("setfacl"), "-R", "-b", str(ws.parent)), missing_ok=True)),
+            Step("let your group read the entity's repositories (now root's)", call=lambda: _repos_readable(ws.parent)),
             Step("delete the hands user and its home", (_abs("userdel"), "--remove", hands_user),
                  skip_if=_absent("user", host, hands_user)),
             Step("delete the hands group", (_abs("groupdel"), hands_user), skip_if=_absent("group", host, hands_user)),
@@ -402,12 +404,22 @@ def _chown_back(tree: Path, uid: int, owner: str) -> tuple[bool, str]:
                        "-exec", chown, "-R", "-h", f"0:{op_gid}", "{}", "+"))
     if not ok:
         return ok, why
-    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune",
-                       "-exec", _abs("chmod"), "-R", "g+rX,g-w", "{}", "+"))
-    if not ok:
-        return ok, why
     ok, why = _run_ok((find, str(tree), "-name", ".git", "-prune", "-o", "-uid", str(uid),
                        "-exec", chown, "-h", owner, "{}", "+"))
+    if not ok:
+        return ok, why
+    return True, ""
+
+
+def _repos_readable(tree: Path) -> tuple[bool, str]:
+    """After the ACLs are cleared: let the operator's group READ the root-owned repositories, so the
+    work can be cloned. It runs after, not before: on Linux a chmod of the group bits on a file with
+    an ACL changes the ACL's mask, which clearing the ACL then throws away (measured in CI)."""
+    if not tree.exists():
+        return True, "no workspace"
+    find = _abs("find")
+    ok, why = _run_ok((find, str(tree), "-name", ".git", "-type", "d", "-user", "root", "-prune",
+                       "-exec", _abs("chmod"), "-R", "g+rX,g-w", "{}", "+"))
     if not ok:
         return ok, why
     repos = sorted(str(Path(p).parent) for p in subprocess.run(
