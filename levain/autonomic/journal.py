@@ -157,14 +157,17 @@ class _State:
     receipts: dict[tuple[str, str], str]
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def durable_fsync(fd: int) -> None:
+    """Flush ``fd`` to stable storage. On macOS ``os.fsync`` only reaches the drive's cache, so a power
+    loss can drop a write the caller already acted on; ``F_FULLFSYNC`` flushes the cache too."""
+    full = getattr(fcntl, "F_FULLFSYNC", None)
+    if full is not None:
+        try:
+            fcntl.fcntl(fd, full)
+            return
+        except OSError:
+            pass   # a filesystem without it (some network mounts): fall back to fsync
+    os.fsync(fd)
 
 
 class RunJournal:
@@ -173,6 +176,48 @@ class RunJournal:
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
         self._lock_path = self._path.with_name(self._path.name + ".lock")
+        self._lease_dir = self._path.with_name(self._path.name + ".leases")
+
+    # --- leases: who is inside an effect right now -------------------------------------------
+    # An effect's owner holds an exclusive flock on its lease file from just BEFORE its intent is
+    # appended until just AFTER its result (or unknown) is appended. The OS drops the lock when the
+    # owner dies, so "intent, no result, lease not held" means the owner is gone: POISONED. A process
+    # id would be wrong twice: a recycled pid reads a dead owner as alive, and a second thread of the
+    # same process reads a live owner as dead.
+    def _lease_path(self, run_id: str, effect_id: str) -> Path:
+        name = hashlib.sha256(f"{run_id}\0{effect_id}".encode("utf-8")).hexdigest()[:32]
+        return self._lease_dir / name
+
+    def _take_lease(self, run_id: str, effect_id: str) -> int:
+        self._lease_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._lease_path(run_id, effect_id), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _drop_lease(self, run_id: str, effect_id: str, fd: int) -> None:
+        try:
+            self._lease_path(run_id, effect_id).unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(fd)   # releases the flock
+
+    def _lease_held(self, run_id: str, effect_id: str) -> bool:
+        try:
+            fd = os.open(self._lease_path(run_id, effect_id), os.O_RDWR)
+        except FileNotFoundError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
 
     @property
     def path(self) -> Path:
@@ -197,11 +242,11 @@ class RunJournal:
         with open(self._path, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
-            os.fsync(f.fileno())
+            durable_fsync(f.fileno())
         if not existed:
             dfd = os.open(self._path.parent, os.O_RDONLY)
             try:
-                os.fsync(dfd)
+                durable_fsync(dfd)
             finally:
                 os.close(dfd)
 
@@ -213,7 +258,7 @@ class RunJournal:
             if data and not data.endswith(b"\n"):
                 f.truncate(data.rfind(b"\n") + 1)
                 f.flush()
-                os.fsync(f.fileno())
+                durable_fsync(f.fileno())
 
     def _state(self) -> _State:
         st = _State({}, {}, {}, set(), {}, {}, set(), {})
@@ -255,6 +300,10 @@ class RunJournal:
             if r["hold_id"] in st.holds and st.holds[r["hold_id"]]["decided"] is None:
                 st.holds[r["hold_id"]]["decided"] = r["approve"]
                 st.holds[r["hold_id"]]["by"] = r.get("by")
+        elif t == "withdraw":
+            h = st.holds.get(r["hold_id"])
+            if h is not None and h["decided"] is None:
+                del st.holds[r["hold_id"]]   # closed undecided; a later hold() opens it afresh
         elif t == "fence":
             st.fences[r["binding_id"]] = max(st.fences.get(r["binding_id"], 0), int(r["generation"]))
         elif t == "cancel":
@@ -270,17 +319,16 @@ class RunJournal:
         with self._locked():
             return self._state().fences.get(binding_id, 0)
 
-    def start(self, run_id: str, *, binding_id: str, generation: int | None = None) -> None:
-        """Admit a run under the binding's governance generation: ``generation`` if given, else the
-        CURRENT one, read under the same lock as the admission (so a fence cannot land between the
-        read and the write). Starting an existing run id again is a no-op (a resumed run keeps its
-        original admission, so a run fenced once stays fenced)."""
+    def start(self, run_id: str, *, binding_id: str, generation: int) -> None:
+        """Admit a run under the binding's governance ``generation``, which the caller reads from the
+        authority that fences the binding (:meth:`BindingStore.admit` reads it under the store lock).
+        Starting an existing run id again is a no-op (a resumed run keeps its original admission, so a
+        run fenced once stays fenced)."""
         with self._locked():
-            st = self._state()
-            if run_id in st.runs:
+            if run_id in self._state().runs:
                 return
-            gen = st.fences.get(binding_id, 0) if generation is None else int(generation)
-            self._append({"t": "run", "run_id": run_id, "binding_id": binding_id, "generation": gen})
+            self._append({"t": "run", "run_id": run_id, "binding_id": binding_id,
+                          "generation": int(generation)})
 
     def fence(self, binding_id: str, *, generation: int | None = None) -> int:
         """Every run of ``binding_id`` admitted under a generation BELOW the fence stops at its next
@@ -302,48 +350,54 @@ class RunJournal:
                 self._append({"t": "cancel", "run_id": run_id, "reason": reason})
 
     # --- effects ---------------------------------------------------------------------------
-    def _barrier(self, st: _State, run_id: str, effect_id: str) -> EffectOutcome | None:
-        """The outcome that stops ``effect_id`` before any decision logic, or ``None``."""
+    def _barrier(self, st: _State, run_id: str, effect_id: str,
+                 current_generation: int | None) -> EffectOutcome | None:
+        """The outcome that stops ``effect_id`` before any decision logic, or ``None``.
+        ``current_generation`` is the binding's generation from the authority that fences it (the
+        registry); the run is fenced if it or any fence in this journal is past the run's admission."""
         key = (run_id, effect_id)
         run = st.runs.get(run_id)
         if run is None:
             raise KeyError(f"run {run_id!r} was never started")
-        if run_id in st.cancelled:
-            return EffectOutcome(EffectStatus.CANCELLED)
-        if st.fences.get(run["binding_id"], 0) > run["generation"]:
-            return EffectOutcome(EffectStatus.FENCED)
+        # a recorded result first: a replay runs nothing, so a cancel or fence after the effect does not
+        # hide what already happened (and a receipt that never landed can still be written)
         if key in st.results:
             return EffectOutcome(EffectStatus.REPLAYED, st.results[key]["result"],
                                  receipt_id=st.receipts.get(key))
+        if run_id in st.cancelled:
+            return EffectOutcome(EffectStatus.CANCELLED)
+        if max(st.fences.get(run["binding_id"], 0), current_generation or 0) > run["generation"]:
+            return EffectOutcome(EffectStatus.FENCED)
         if key in st.unknown:
             return EffectOutcome(EffectStatus.POISONED)
         if key in st.intents:
-            pid = st.intents[key].get("pid")
-            if isinstance(pid, int) and pid != os.getpid() and _pid_alive(pid):
+            if self._lease_held(run_id, effect_id):
                 return EffectOutcome(EffectStatus.IN_FLIGHT)
             return EffectOutcome(EffectStatus.POISONED)
         return None
 
-    def peek(self, run_id: str, effect_id: str) -> EffectOutcome | None:
+    def peek(self, run_id: str, effect_id: str, *, current_generation: int | None = None) -> EffectOutcome | None:
         """The barrier that would stop ``effect_id`` right now (cancelled, fenced, already done,
         poisoned, in flight), or ``None`` if nothing but a decision could. Runs nothing. A caller
         uses it to short-circuit a replay before deciding anything; :meth:`effect` re-checks under
         its own lock."""
         with self._locked():
-            return self._barrier(self._state(), run_id, effect_id)
+            return self._barrier(self._state(), run_id, effect_id, current_generation)
 
-    def hold(self, run_id: str, effect_id: str, *, digest: str) -> EffectOutcome:
+    def hold(self, run_id: str, effect_id: str, *, digest: str, at: str | None = None,
+             current_generation: int | None = None) -> EffectOutcome:
         """Open (or find) the decision that guards ``effect_id``: the run suspends BEFORE the effect.
 
         Returns HELD with the hold id (new, or the existing open one: proposing the same effect again
         never opens a second decision), APPROVED if that hold was already approved (the decision was
         made and the effect has not run: run it with :meth:`effect`), or the barrier that stops the
         effect. A different ``digest`` from the one the open or approved hold carries means the
-        bytes changed under the decision: the run is cancelled."""
+        bytes changed under the decision: the run is cancelled. ``at`` (an ISO time) is recorded with a
+        new hold, so a hold whose pending never landed can be found and rejected later."""
         hold_id = hold_id_for(run_id, effect_id)
         with self._locked():
             st = self._state()
-            barrier = self._barrier(st, run_id, effect_id)
+            barrier = self._barrier(st, run_id, effect_id, current_generation)
             if barrier is not None:
                 return barrier
             h = st.holds.get(hold_id)
@@ -357,23 +411,24 @@ class RunJournal:
                     return EffectOutcome(EffectStatus.APPROVED, hold_id=hold_id, decided_by=h["by"])
                 return EffectOutcome(EffectStatus.CANCELLED)   # rejected (the run is cancelled too)
             self._append({"t": "hold", "hold_id": hold_id, "binding_id": st.runs[run_id]["binding_id"],
-                          "run_id": run_id, "effect_id": effect_id, "digest": digest})
+                          "run_id": run_id, "effect_id": effect_id, "digest": digest, "at": at})
             return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, new_hold=True)
 
     def effect(self, run_id: str, effect_id: str, *, digest: str,
-               fn: Callable[[], Any], needs_decision: bool = False) -> EffectOutcome:
+               fn: Callable[[], Any], needs_decision: bool = False,
+               current_generation: int | None = None) -> EffectOutcome:
         """Run one effect at most once.
 
         ``digest`` identifies exactly what the effect will do (the bytes a person approves). It is
         recorded with the intent and with any hold, and a decision must echo it.
         ``needs_decision`` is the gate's verdict for this effect: True means the effect runs only
         under an APPROVED hold of its own (one is opened if there is none). An effect with no
-        approved hold of its own is HELD while any hold on its binding is open."""
-        key = (run_id, effect_id)
+        approved hold of its own is HELD while any hold on its binding is open.
+        ``current_generation``: the binding's generation from its fencing authority (see ``_barrier``)."""
         hold_id = hold_id_for(run_id, effect_id)
         with self._locked():
             st = self._state()
-            barrier = self._barrier(st, run_id, effect_id)
+            barrier = self._barrier(st, run_id, effect_id, current_generation)
             if barrier is not None:
                 return barrier
             binding_id = st.runs[run_id]["binding_id"]
@@ -397,17 +452,25 @@ class RunJournal:
                 # Approved bytes and the bytes about to run differ: what was approved is not this.
                 self._append({"t": "cancel", "run_id": run_id, "reason": "digest_changed"})
                 return EffectOutcome(EffectStatus.CANCELLED)
-            self._append({"t": "intent", "run_id": run_id, "effect_id": effect_id,
-                          "digest": digest, "pid": os.getpid()})
+            lease = self._take_lease(run_id, effect_id)   # before the intent: see "leases" above
+            try:
+                self._append({"t": "intent", "run_id": run_id, "effect_id": effect_id,
+                              "digest": digest, "pid": os.getpid()})
+            except BaseException:
+                self._drop_lease(run_id, effect_id, lease)
+                raise
         try:
-            result = fn()
-            json.dumps(result)
-        except BaseException:
+            try:
+                result = fn()
+                json.dumps(result)
+            except BaseException:
+                with self._locked():
+                    self._append({"t": "unknown", "run_id": run_id, "effect_id": effect_id})
+                raise
             with self._locked():
-                self._append({"t": "unknown", "run_id": run_id, "effect_id": effect_id})
-            raise
-        with self._locked():
-            self._append({"t": "result", "run_id": run_id, "effect_id": effect_id, "result": result})
+                self._append({"t": "result", "run_id": run_id, "effect_id": effect_id, "result": result})
+        finally:
+            self._drop_lease(run_id, effect_id, lease)
         return EffectOutcome(EffectStatus.DONE, result)
 
     def note_receipt(self, run_id: str, effect_id: str, receipt_id: str) -> None:
@@ -435,24 +498,39 @@ class RunJournal:
                 self._append({"t": "cancel", "run_id": h["run_id"], "reason": "rejected"})
             return HoldResult(True, "approved" if approve else "rejected")
 
+    def withdraw(self, hold_id: str) -> bool:
+        """Close an UNDECIDED hold without deciding it: the infrastructure failed (its pending could not
+        be persisted, a chain's state could not be written), which is not a "no" from anyone, so the run
+        is NOT cancelled and re-delivering the event proposes the effect again. Returns True iff an
+        open hold was closed."""
+        with self._locked():
+            h = self._state().holds.get(hold_id)
+            if h is None or h["decided"] is not None:
+                return False
+            self._append({"t": "withdraw", "hold_id": hold_id})
+            return True
+
+    def admitted(self, run_id: str) -> bool:
+        """True iff ``run_id`` was admitted (a re-delivery of a run that already started)."""
+        with self._locked():
+            return run_id in self._state().runs
+
     def open_holds(self) -> list[dict[str, Any]]:
-        """Every undecided hold (``hold_id``, ``binding_id``, ``run_id``, ``effect_id``, ``digest``):
+        """Every undecided hold (``hold_id``, ``binding_id``, ``run_id``, ``effect_id``, ``digest``,
+        ``at``):
         each one is stopping its binding's undecided effects until someone decides it."""
         with self._locked():
             st = self._state()
-        return [{k: h[k] for k in ("hold_id", "binding_id", "run_id", "effect_id", "digest")}
+        return [{k: h.get(k) for k in ("hold_id", "binding_id", "run_id", "effect_id", "digest", "at")}
                 for h in st.holds.values() if h["decided"] is None]
 
     def poisoned(self) -> list[tuple[str, str]]:
-        """Every effect whose outcome is unknown and whose recording process is gone: the list a
-        human must look at. (An intent whose process is still alive is in flight, not poisoned.)"""
+        """Every effect whose outcome is unknown and whose owner is gone: the list a human must look
+        at. (An intent whose owner still holds its lease is in flight, not poisoned.)"""
         with self._locked():
             st = self._state()
-        out = sorted(st.unknown - set(st.results))
-        for key, intent in st.intents.items():
-            if key in st.results or key in st.unknown:
-                continue
-            pid = intent.get("pid")
-            if not (isinstance(pid, int) and _pid_alive(pid)):
-                out.append(key)
-        return sorted(set(out))
+            out = set(st.unknown - set(st.results))
+            for key in st.intents:
+                if key not in st.results and key not in st.unknown and not self._lease_held(*key):
+                    out.add(key)
+        return sorted(out)

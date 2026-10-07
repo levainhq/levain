@@ -73,7 +73,7 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
-from levain.autonomic.journal import RunJournal
+from levain.autonomic.journal import RunJournal, durable_fsync
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -782,6 +782,15 @@ class ReplaceResult:
         return self.ok
 
 
+def _record_generation(rec: dict[str, Any]) -> int:
+    """A stored record's governance generation (0 when absent: a record written before generations).
+    Raises ``ValueError`` on anything but a non-negative int."""
+    g = rec.get("generation", 0)
+    if isinstance(g, bool) or not isinstance(g, int) or g < 0:
+        raise ValueError(f"binding {rec.get('binding_id')!r} has a malformed generation {g!r}")
+    return g
+
+
 def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """``json.loads`` ``object_pairs_hook``: build the object, refusing a key that appears twice."""
     out: dict[str, Any] = {}
@@ -833,17 +842,99 @@ class BindingStore:
             finally:
                 os.close(fd)
 
-    def _fence(self, binding_id: str) -> None:
-        """Fence ``binding_id`` in the run journal, BEFORE the store write that changes it: if the
-        write then fails, runs were stopped for a grant that stayed live, which is the safe direction.
-        A fence that cannot be written is logged, not raised: stopping a grant must never be blocked by
-        the journal, and a journal that cannot be read or appended to runs no effect at all."""
+    @property
+    def journal(self) -> RunJournal | None:
+        """The run journal this store fences and admits runs into, or ``None``."""
+        return self._journal
+
+    def _initial_generation(self, binding_id: str) -> int:
+        """The governance generation a NEW record starts at: the highest fence the journal ever wrote
+        for this id (a removed and re-added grant must not reopen runs fenced under its old record),
+        0 without a journal. A journal that cannot be read runs no effect, so 0 is safe there."""
+        if self._journal is None:
+            return 0
+        try:
+            return self._journal.generation(binding_id)
+        except Exception as e:  # noqa: BLE001
+            _log.error("binding store: journal generation for %r unreadable (%s): %s", binding_id,
+                       type(e).__name__, e)
+            return 0
+
+    def _fence(self, rec: dict[str, Any]) -> None:
+        """Bump the record's governance ``generation`` IN the record, so the bump commits in the same
+        atomic write as the change that caused it (a pause, revoke, expire, tighten, supersede), and
+        mirror it to the run journal. The registry's generation is the authority: the gate compares a
+        run's admission generation with it before every effect, so a journal fence that fails to
+        write cannot leave a stopped grant's admitted run able to fire. Call under ``_locked``, then
+        write the records."""
+        bid = rec["binding_id"]
+        try:
+            old = _record_generation(rec)
+        except ValueError:
+            old = 0
+        new = max(old, self._initial_generation(bid)) + 1
+        rec["generation"] = new
         if self._journal is None:
             return
         try:
-            self._journal.fence(binding_id)
-        except Exception as e:  # noqa: BLE001 — see the docstring: never block a stop on the journal
-            _log.error("binding store: journal fence for %r FAILED (%s): %s", binding_id, type(e).__name__, e)
+            self._journal.fence(bid, generation=new)
+        except Exception as e:  # noqa: BLE001 — the registry generation is the authority
+            _log.error("binding store: journal fence for %r FAILED (%s): %s — the registry generation "
+                       "still fences its runs", bid, type(e).__name__, e)
+
+    def generation(self, binding_id: str) -> int | None:
+        """The binding's current governance generation from the registry, or ``None`` when it is
+        absent, its generation is malformed, or the registry is corrupt (no authority: fail closed).
+        The gate reads this before every journaled effect."""
+        for r in self._read_raw():
+            if r["binding_id"] == binding_id:
+                try:
+                    return _record_generation(r)
+                except ValueError as e:
+                    _log.warning("binding store: %s", e)
+                    return None
+        return None
+
+    def admit(self, binding_id: str, run_id: str) -> Binding | None:
+        """Admit a journaled run of ``binding_id`` — the fire path's ONE step between "may this grant
+        fire" and "this run is in": under the store lock, the binding must be fireable (:meth:`is_fireable`),
+        the run is started in the journal at the binding's CURRENT generation, and a ONE-SHOT is
+        claimed (set ``REVOKED``) in the same locked step. Every verb that fences takes the same lock, so
+        a pause or tighten either lands first (the binding is not fireable, or the run is admitted
+        under the new generation and sees its kills) or lands after (the run is admitted under the old
+        generation and is fenced at its first effect): never between the check and the admission.
+        Returns the fireable snapshot (a one-shot's pre-claim ACTIVE form), or ``None``. Re-admitting a
+        known run is a no-op in the journal (a re-delivery keeps its first admission), and a claimed
+        one-shot's own run is let back in on re-delivery (its claim is that run's admission)."""
+        if self._journal is None:
+            raise ValueError("admit needs a run journal: construct the store with journal=")
+        with self._locked():
+            records = self._read_raw(for_mutation=True)
+            rec = next((r for r in records if r["binding_id"] == binding_id), None)
+            if rec is None:
+                return None
+            b = self._load(rec)
+            if b is None:
+                return None
+            if (not self.is_fireable(b) and b.one_shot and b.status is BindingStatus.REVOKED
+                    and self._journal.admitted(run_id)):
+                # A re-delivery of the run this one-shot was claimed for: let it back in to finish
+                # (done effects replay, an approved effect runs once). A person's revoke after the
+                # claim bumped the generation, so such a run is fenced at its next effect.
+                again = replace(b, status=BindingStatus.ACTIVE)
+                return again if self.is_fireable(again) else None
+            if not self.is_fireable(b):
+                return None
+            try:
+                gen = _record_generation(rec)
+            except ValueError as e:
+                _log.warning("binding store: refusing to admit a run of %r: %s", binding_id, e)
+                return None
+            self._journal.start(run_id, binding_id=binding_id, generation=gen)
+            if b.one_shot:
+                rec["status"] = BindingStatus.REVOKED.value
+                self._write_raw(records)
+            return b
 
     # --- raw IO (call under the lock for mutations) ------------------------------------
     def _scan(self) -> tuple[list[dict[str, Any]], str | None]:
@@ -949,8 +1040,18 @@ class BindingStore:
             out[bid] = r
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(out, ensure_ascii=False, indent=2))
+            f.flush()
+            durable_fsync(f.fileno())
         os.replace(tmp, self.path)
+        # the rename itself must reach the disk before the caller acts on it (a one-shot's claim, a
+        # pause): fsync the directory too
+        dfd = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            durable_fsync(dfd)
+        finally:
+            os.close(dfd)
 
     @staticmethod
     def _load(rec: dict[str, Any]) -> Binding | None:
@@ -1036,6 +1137,7 @@ class BindingStore:
                         f"add: binding {binding.binding_id!r} already exists; add does not merge "
                         "tightenings into it (use tighten_guard)")
                 return False
+            record["generation"] = self._initial_generation(binding.binding_id)
             records.append(record)
             self._write_raw(records)
             return True
@@ -1097,8 +1199,9 @@ class BindingStore:
                 return self._replace_refused(old_binding_id, "old_changed")
             if precondition is not None and not precondition(current):
                 return self._replace_refused(old_binding_id, "precondition_failed")
-            self._fence(old_binding_id)
+            self._fence(old_rec)
             old_rec["status"] = BindingStatus.REVOKED.value   # supersede the old grant
+            record["generation"] = self._initial_generation(new_binding.binding_id)
             records.append(record)
             self._write_raw(records)
             return ReplaceResult(True, "replaced")
@@ -1232,7 +1335,7 @@ class BindingStore:
                             "new binding)"
                         )
                     if not status.is_active:
-                        self._fence(binding_id)   # a pause/revoke/expire stops admitted runs
+                        self._fence(rec)   # a pause/revoke/expire stops admitted runs
                     rec["status"] = status.value
                     self._write_raw(records)
                     return True
@@ -1422,7 +1525,7 @@ class BindingStore:
                 updated = replace(b, guard_additions=b.guard_additions + tuple(new_guards))
                 # a run admitted before the tightening carries the old kill set: fence it, so it stops
                 # at its next effect and a new delivery runs under the new kills.
-                self._fence(binding_id)
+                self._fence(rec)
                 raw_adds = rec.get("guard_additions")
                 # append to the raw list: existing entries keep any field this version does not know
                 rec["guard_additions"] = ((list(raw_adds) if isinstance(raw_adds, list) else [])
@@ -1440,6 +1543,8 @@ class BindingStore:
             kept = [r for r in records if r.get("binding_id") != binding_id]
             if len(kept) == len(records):
                 return False
-            self._fence(binding_id)
+            for r in records:
+                if r["binding_id"] == binding_id:
+                    self._fence(r)   # mirrored to the journal; the record itself is gone
             self._write_raw(kept)
             return True
