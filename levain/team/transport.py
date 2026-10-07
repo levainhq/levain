@@ -926,13 +926,23 @@ class GitLedger:
                 if rel is not None:
                     raise TeamError("pins.json is unreadable, so one file cannot be picked out of it; "
                                     "run `levain team repin` to drop them all")
+                # The accepted remote tip is kept when it can still be read out of the record: it is the floor for
+                # this clone's own pushed lines, which no repin trusts away.
+                accepted = None
+                with contextlib.suppress(OSError, ValueError, RecursionError, AttributeError):
+                    acc = json.loads(self._pins_bytes() or b"{}").get("accepted")
+                    accepted = acc if isinstance(acc, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", acc) else None
                 try:
-                    (self.base / "pins.json").unlink()
+                    if accepted:
+                        self._write_trust(Trust(accepted=accepted))
+                    else:
+                        (self.base / "pins.json").unlink()
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
                     raise TeamError(f"could not drop the pins: {exc.strerror}") from None
-                return ["pins.json (it was unreadable)"]
+                return ["pins.json (it was unreadable" + ("" if accepted else "; the remote tip this clone last "
+                        "accepted was lost with it, so run `levain team join` to record it again") + ")"]
             if rel is None:
                 dropped, files, remote = sorted(set(rec.files) | set(rec.remote)), {}, {}
             else:
@@ -1443,10 +1453,13 @@ class GitLedger:
         return [f"the REMOTE team ledger ({self.remote}) is refused: {t}" for t in bad]
 
     def _own_rel(self, rel: str, handle: str | None) -> bool:
-        """A file only THIS clone writes: its device id, under its member's folder or a pack folder it seeded."""
+        """A file only THIS clone writes: its device id, under its member's folder or a pack folder it seeded. With the
+        handle unknown (the git email maps to no member), the device id alone decides: a case-variant folder is
+        already refused by the namespace judgement."""
         folder, _, name = rel.partition("/")
-        return name == f"{self.device}.jsonl" and (folder.startswith("pack-") or
-                                                   (handle is not None and folder == E.safe_handle(handle)))
+        if handle is None:
+            return name == f"{self.device}.jsonl"
+        return name == f"{self.device}.jsonl" and (folder.startswith("pack-") or folder == E.safe_handle(handle))
 
     def _whole(self, rev: str | None, keep) -> dict[str, bytes]:
         """The whole bytes at ``rev`` of the canonical ledger files ``keep(rel)`` selects ({} for no rev)."""
@@ -1474,7 +1487,7 @@ class GitLedger:
             try:
                 handle = self.handle(self.team(local))
             except R.RolesError:
-                handle = None                         # own files then judged by pins like every other file
+                handle = None                         # own files then decided by the device id alone
             own = lambda rel: self._own_rel(rel, handle)  # noqa: E731
             if rec is None:
                 rec, problem = self._trust()
@@ -1521,6 +1534,11 @@ class GitLedger:
             with contextlib.suppress(Exception):
                 self.save_state(last_fetch_error=str(exc))
             raise
+        except OSError as exc:                       # the record could not be written: the fetch was not accepted
+            why = f"the fetched remote tip could not be recorded ({exc.strerror or exc})"
+            with contextlib.suppress(Exception):
+                self.save_state(last_fetch_error=why)
+            raise TeamError(why) from None
 
     def _fetch_and_accept(self, remote: str, timeout: float) -> str | None:
         top = self.repo.toplevel

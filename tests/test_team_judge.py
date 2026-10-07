@@ -1425,3 +1425,49 @@ def test_levains_fetch_brings_no_tags_into_the_code_repository(two):
     git("tag", "-d", "v9.9-evil", cwd=dan)
     assert team("join", "--no-install", repo=dan) == 0
     assert git("tag", "-l", cwd=ben).split() == [] and git("tag", "-l", cwd=dan).split() == []
+
+
+def test_with_no_handle_this_clones_own_file_is_still_judged_as_its_own(two):
+    # L1 r3 LOW-MED 5: with the handle unknown (the git email no longer maps to a member), this clone's own file was
+    # judged by pins like a teammate's, so its own unpushed lines made the remote look rewritten.
+    tmp, ana, ben = two
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/x.py", "--words",
+                "unpushed", "--no-push", repo=ben) == 0
+    ledger(ben)                                              # pins ben's own file with the unpushed line
+    git("config", "user.email", "someone-else@ex.com", cwd=ben)
+    assert _gl(ben).incoming_refusal() == []
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None, gb.state().get("last_fetch_error")
+
+
+def test_a_repin_of_an_unreadable_record_keeps_the_accepted_tip_it_can_still_read(two, capsys):
+    # L1 r3 LOW 8: a repin of an unreadable pins.json deleted the accepted tip with it, and the message then said sync.
+    tmp, ana, ben = two
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    acc = gb.accepted_tip()
+    _pins_file(ben).write_text(json.dumps({"v": 3, "accepted": acc, "files": "not a map"}))
+    assert team("repin", repo=ben) == 0
+    assert gb.accepted_tip() == acc and team("sync", repo=ben) == 0
+    _pins_file(ben).write_text("{not json")
+    capsys.readouterr()
+    assert team("repin", repo=ben) == 0
+    assert "levain team join" in capsys.readouterr().out
+
+
+def test_a_record_that_cannot_be_written_during_a_fetch_is_saved_as_the_fetch_error(two, monkeypatch):
+    # L1 r3 LOW 13: an OSError from writing the trusted record escaped the fetch's error record.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    real = T._atomic_write
+
+    def full(path, *a, **k):
+        if path.name == "pins.json":
+            raise OSError(28, "No space left on device")
+        return real(path, *a, **k)
+    monkeypatch.setattr(T, "_atomic_write", full)
+    note = gb.fetch_only(interval=0, timeout=30)
+    assert note and "could not be recorded" in note
+    assert "could not be recorded" in gb.state().get("last_fetch_error", "")
