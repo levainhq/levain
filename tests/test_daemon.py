@@ -1286,3 +1286,20 @@ def test_a_log_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(d.os, "getuid", lambda: me + 1)   # the file now belongs to "someone else"
     with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
         d._prepare_private_logs(spec)
+
+
+def test_a_log_this_user_cannot_open_gets_the_ownership_message(tmp_path, monkeypatch):
+    """L1: a root-owned 0644 leftover log fails the open itself (EACCES), and says what to do about it."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    spec.stdout_log.write_text("")
+    spec.stdout_log.chmod(0o444)
+    if os.access(spec.stdout_log, os.W_OK):
+        pytest.skip("running as a user who can write a 0444 file")
+    with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
+        d._prepare_private_logs(spec)

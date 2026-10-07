@@ -743,18 +743,26 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
         headers={LINK_NONCE_HEADER: nonce, LINK_TIME_HEADER: stamp,
                  LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce, stamp)})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    deadline = time.monotonic() + 2 * timeout
-    raw = b""
-    with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
-        # Bounded in size AND time: whoever holds the port cannot make this read without end, by volume or by
-        # dripping a byte at a time (codex + L1 L3).
-        while len(raw) <= _LINK_REPLY_MAX:
-            if time.monotonic() > deadline:
-                raise ValueError("the answer on that port took too long to be a link; not opening it")
-            chunk = r.read1(1024)
-            if not chunk:
-                break
-            raw += chunk
+    got: list[bytes | BaseException] = []
+
+    def exchange() -> None:
+        try:
+            with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
+                got.append(r.read(_LINK_REPLY_MAX + 1))
+        except BaseException as exc:  # noqa: BLE001 — handed to the caller's thread below
+            got.append(exc)
+
+    # Bounded in size AND time: whoever holds the port cannot hold this call without end, by volume or by dripping
+    # the status line, headers or body a byte at a time (codex + L1). A socket timeout is per receive, so the whole
+    # exchange runs on a daemon thread with one deadline; a thread still waiting at it is abandoned.
+    worker = threading.Thread(target=exchange, name="levain-link-request", daemon=True)
+    worker.start()
+    worker.join(2 * timeout)
+    if worker.is_alive() or not got:
+        raise ValueError("the answer on that port took too long to be a link; not opening it")
+    if isinstance(got[0], BaseException):
+        raise got[0]
+    raw = got[0]
     if len(raw) > _LINK_REPLY_MAX:
         raise ValueError("the answer on that port was too long to be a link; not opening it")
     reply = json.loads(raw)

@@ -830,9 +830,46 @@ def test_request_link_code_gives_up_on_a_dripping_listener(tmp_path):
     t.start()
     try:
         started = _time.monotonic()
-        with pytest.raises(ValueError, match="too long"):
+        with pytest.raises(ValueError, match="took too long"):
             request_link_code(f"http://127.0.0.1:{httpd.server_address[1]}/", _TOKEN, timeout=1.0)
         assert _time.monotonic() - started < 10
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_request_link_code_gives_up_on_a_listener_dripping_its_headers(tmp_path):
+    """L1: a socket timeout is per receive, so a deadline only on the body let a listener drip the status line and
+    headers for as long as it liked."""
+    import socket
+    import time as _time
+
+    from levain.http_guards import request_link_code
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def drip():
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\n")
+        while not stop.is_set():
+            try:
+                conn.sendall(b"X-Drip: a\r\n")
+            except OSError:
+                break
+            _time.sleep(0.2)
+        conn.close()
+
+    t = threading.Thread(target=drip, daemon=True)
+    t.start()
+    try:
+        started = _time.monotonic()
+        with pytest.raises(ValueError, match="took too long"):
+            request_link_code(f"http://127.0.0.1:{srv.getsockname()[1]}/", _TOKEN, timeout=0.5)
+        assert _time.monotonic() - started < 3
+    finally:
+        stop.set()
+        srv.close()

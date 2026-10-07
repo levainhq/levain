@@ -262,13 +262,17 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
         # (it would be followed), a FIFO or device (it would block), or another user's file (codex L3: in a shared
         # --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed
         # through that descriptor, so nothing can be swapped in between the check and the chmod (L1 L3).
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_NOCTTY", 0))
         try:
             fd = os.open(log, flags, 0o600)
         except OSError as exc:
             if os.path.islink(log):
                 raise DaemonError(
                     f"{log} is a symlink; a unit's log must be a regular file. Remove it and install again.") from exc
+            if isinstance(exc, PermissionError):   # another user's file (say, root's from an earlier sudo install)
+                raise DaemonError(
+                    f"{log} is not a regular file this user owns; remove it or pass another --log-dir.") from exc
             raise DaemonError(f"could not open {log}: {exc}") from exc
         try:
             st = os.fstat(fd)

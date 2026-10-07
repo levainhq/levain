@@ -748,7 +748,8 @@ BROWSER_PROFILE_DIRS: tuple[tuple[str, str], ...] = (
 # only, and Safari's container cannot be walked at all (it refuses a listing). Each name is looked for at every
 # profile depth below, relative to a denied root.
 _BROWSER_PROFILE_DEPTHS = (
-    "*",                        # Chrome, Chromium, Edge, Vivaldi, Opera: <root>/<profile>/
+    "",                         # Opera, Opera GX: the root is the default profile (no Default/ folder)
+    "*",                        # Chrome, Chromium, Edge, Vivaldi: <root>/<profile>/; Opera's _side_profiles/<id>/ too
     "*/*",                      # Brave, Arc (<root>/<browser>/<profile>/), Firefox (<root>/Profiles/<profile>/)
     "*/config/*/*",             # flatpak Chromium-family: .var/app/<id>/config/<browser>/<profile>/
     "*/config/*/*/*",           # flatpak Brave: .var/app/<id>/config/BraveSoftware/Brave-Browser/<profile>/
@@ -760,14 +761,16 @@ _BROWSER_STORAGE_NAMES = (
     "storage/default",                                            # Firefox per-origin storage (localStorage)
     "sessionstore.jsonlz4", "sessionstore-backups",               # Firefox's session store (sessionStorage)
 )
-_BROWSER_STORAGE_GLOBS = tuple(f"{depth}/{name}" for depth in _BROWSER_PROFILE_DEPTHS for name in _BROWSER_STORAGE_NAMES)
+_BROWSER_STORAGE_GLOBS = tuple(f"{depth}/{name}" if depth else name
+                                for depth in _BROWSER_PROFILE_DEPTHS for name in _BROWSER_STORAGE_NAMES)
 
 
 def _linux_config_homes(home: Path) -> list[Path]:
     homes = [home / ".config"]
     for var in ("XDG_CONFIG_HOME", "CHROME_CONFIG_HOME"):
         v = os.environ.get(var)
-        if v and Path(v).expanduser() not in homes:
+        # a relative value is ignored, as the XDG Base Directory spec says to
+        if v and Path(v).expanduser().is_absolute() and Path(v).expanduser() not in homes:
             homes.append(Path(v).expanduser())
     return homes
 
@@ -3072,10 +3075,10 @@ def _foreign_runtime_dirs() -> list[str]:
 def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int, str]]:
     """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, one path to it)``.
 
-    The jewels are the named ones (followed through symlinks) plus every entry under the hidden
-    subtrees and the ssh dir (walked without following symlinks), except browser profiles, of which only the page
-    storage named in ``_BROWSER_STORAGE_GLOBS`` is walked (Phill, 2026-10-07), and on Linux the session bus and
-    the systemd manager socket bwrap step (7) masks. An absent jewel is skipped: there is no file to
+    The jewels are the named ones (followed through symlinks), on Linux the session bus and the systemd manager
+    socket bwrap step (7) masks, and every entry under the hidden subtrees and the ssh dir (walked without following
+    symlinks). Browser profiles are the exception among the subtrees: only the page storage named in
+    ``_BROWSER_STORAGE_GLOBS`` is walked (Phill, 2026-10-07). An absent jewel is skipped: there is no file to
     have other names.
 
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("could not check"),

@@ -77,6 +77,27 @@ def test_a_hardlink_to_a_profiles_page_storage_refuses_bash_at_both_depths(home:
         (prof / "Private").chmod(0o700)
 
 
+@pytest.mark.parametrize("osname,rel", [("Darwin", "Library/Application Support/com.operasoftware.Opera"),
+                                        ("Darwin", "Library/Application Support/com.operasoftware.OperaGX"),
+                                        ("Linux", ".config/opera")])
+def test_a_hardlink_to_operas_page_storage_at_the_profile_root_refuses_bash(home: Path, monkeypatch, osname,
+                                                                            rel) -> None:
+    """L1: Opera keeps its default profile at the root itself, with no Default/ folder."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: osname)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    store = home / rel / "Session Storage"
+    store.mkdir(parents=True)
+    (store / "000003.log").write_text("levain.token")
+    entity = _entity(home)
+    (entity / "workspace" / "alias.log").hardlink_to(store / "000003.log")
+    with pytest.raises(ConfinementError, match="names on disk"):
+        _refuse_multiply_linked_jewels(build_policy(entity))
+
+
 def test_a_hardlink_to_firefox_page_storage_refuses_bash(home: Path, monkeypatch) -> None:
     import levain.firing.confinement as cf
     from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
@@ -224,3 +245,15 @@ def test_on_linux_a_hardlink_to_a_containerised_browsers_page_storage_refuses_ba
     (entity / "workspace" / "alias.log").hardlink_to(d / "000003.log")
     with pytest.raises(ConfinementError, match="names on disk"):
         _refuse_multiply_linked_jewels(build_policy(entity))
+
+
+def test_on_linux_a_relative_xdg_config_home_is_ignored(home: Path, monkeypatch) -> None:
+    """L1: the XDG Base Directory spec says a relative $XDG_CONFIG_HOME is invalid and is ignored."""
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    monkeypatch.chdir(home)
+    (home / "relxdg" / "chromium").mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relxdg")
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    assert (home / "relxdg" / "chromium").resolve() not in cf.browser_profile_roots(home)

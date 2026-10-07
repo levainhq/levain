@@ -122,7 +122,7 @@ function fetch(path, init) {
   if (hdr["X-Levain-Token"] !== TOKEN) return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat.json" && process.argv[3] === "releasefailed") return reply(200, { entities: ["ent"], model: "m", sessions: [
     { entity: "ent", state: "release_failed", error: "<b>close raised</b>", release_failed_since: "2026-10-07T17:00:00+00:00" },
-    { entity: "ent", state: "idle" }] });
+    { entity: "ent", state: "release_failed" }, { entity: "ent", state: "idle" }] });
   if (path === "/chat.json" && process.argv[3] === "nosessions") return reply(200, { entities: ["ent"], model: "m" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
@@ -279,7 +279,8 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
     const walk = (n) => { if (n.tagName === "p" && n.className === "chat-err") lines.push(n.textContent); n.children.forEach(walk); };
     walk(panel);
     const want = MODE === "releasefailed"
-      ? ["release failed: <b>close raised</b> since 2026-10-07T17:00:00+00:00; restart levain serve to free this slot"] : [];
+      ? ["release failed: <b>close raised</b> since 2026-10-07T17:00:00+00:00; restart levain serve to free this slot",
+         "release failed: no detail since an unknown time; restart levain serve to free this slot"] : [];
     ok(JSON.stringify(lines) === JSON.stringify(want), "release_failed lines: " + JSON.stringify(lines));
     ok(!find(panel, (n) => n.tagName === "b"), "the error is text, never markup");
     ok(byText(panel, "Start session"), "the picker still shows");
