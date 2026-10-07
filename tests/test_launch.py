@@ -284,6 +284,7 @@ def test_the_browser_opens_from_a_child_with_the_allowlist_and_the_url_on_stdin(
     assert argv[-2:] == ["-m", "levain._browser"] and not any("chat_token" in a for a in argv)
     assert "chat_token=t" in kw["input"]
     assert "GH_TOKEN" not in kw["env"] and kw["env"]["BROWSER"] == "firefox"
+    assert kw["stdout"] is launch.subprocess.DEVNULL, "a browser inheriting a pipe would hold the call"
 
 
 def test_token_shaped_names_in_an_allowed_namespace_are_carried() -> None:

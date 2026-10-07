@@ -431,3 +431,42 @@ def test_linux_live_home_entries_cannot_be_created_removed_or_swapped(home: Path
     assert os.readlink(home / "lnk") == str(home / "target")
     assert not (home / "top").exists() and not (home / "newdir").exists()
     assert (home / "sub" / "ok").exists() and (ent / "workspace" / "w").exists()
+
+
+def test_a_dir_levain_made_that_is_not_empty_yet_is_kept_not_forgotten(home: Path) -> None:
+    parent, child = home / ".config", home / ".config" / "gh"
+    made = C._prepare_mountpoints({str(child): "dir"})
+    C._ledger_enter(made, {str(child)}, "1:a")                 # only the mountpoint is claimed
+    C._ledger_release("1:b")                                     # an unrelated release runs the exit
+    assert str(parent) in [e["path"] for e in __import__("json").loads(
+        (C._ledger_dir() / "placeholders.json").read_text())["entries"]]
+    C._ledger_release("1:a")
+    assert not child.exists() and not parent.exists()
+
+
+def test_a_dead_levain_whose_sandbox_group_lives_keeps_its_claim(monkeypatch) -> None:
+    import subprocess as sp
+
+    p = sp.Popen(["sleep", "5"], start_new_session=True, env={"PATH": "/bin:/usr/bin"})
+    try:
+        monkeypatch.setattr(C, "_pidns", lambda: "ns")
+        assert C._claim_alive(f"{2 ** 22 + 3}:-:ns:x:g{p.pid}")
+    finally:
+        p.kill()
+        p.wait()
+    assert not C._claim_alive(f"{2 ** 22 + 3}:-:ns:x:g{p.pid}")
+
+
+def test_a_git_store_path_with_spaces_is_read_whole(tmp_path: Path) -> None:
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text('[credential]\n\thelper = store --file "/home/u/my creds"\n'
+                   "\thelper = \"store --file='/opt/x y'\"\n\thelper = osxkeychain\n")
+    assert C._git_store_files(cfg) == [Path("/home/u/my creds"), Path("/opt/x y")]
+
+
+def test_a_secret_file_registry_that_cannot_be_read_refuses_the_floor(home: Path, monkeypatch) -> None:
+    import sys as _sys
+
+    monkeypatch.setitem(_sys.modules, "levain.launch", None)
+    with pytest.raises(ConfinementError):
+        build_policy(_entity(home))

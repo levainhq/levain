@@ -401,9 +401,24 @@ def _git_store_files(config: Path) -> list[Path]:
     except OSError:
         return []
     out = []
-    for m in re.finditer(r"^\s*helper\s*=\s*\"?store\b[^\n]*?--file(?:=|\s+)(\S+?)\"?\s*$", text,
-                         re.MULTILINE):
-        out.append(Path(os.path.expanduser(m.group(1).strip("'\""))))
+    for line in text.splitlines():
+        m = re.match(r"\s*helper\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if not words or words[0] != "store":
+            continue
+        for k, w in enumerate(words):
+            if w.startswith("--file="):
+                out.append(Path(os.path.expanduser(w[len("--file="):])))
+            elif w == "--file" and k + 1 < len(words):
+                out.append(Path(os.path.expanduser(words[k + 1])))
     return out
 
 
@@ -475,8 +490,8 @@ def floor_roots(specs) -> list[Path]:
 def _secret_files() -> list[Path]:
     try:
         from levain.launch import secret_files
-    except ImportError:   # pragma: no cover — levain.launch is part of this package
-        return []
+    except ImportError as exc:   # fail closed: a key file the floor cannot learn of is not left open
+        raise ConfinementError(f"could not learn which secret files to deny ({exc})") from exc
     return secret_files()
 
 
@@ -4421,6 +4436,17 @@ def _claim_alive(claim: str) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
+        # levain is gone, but its sandbox may still be dying (bwrap's pid 1 goes down after a
+        # SIGKILLed levain only when PDEATHSIG reaches it): the shell's process group, recorded in
+        # the claim once the shell started, keeps the claim until it is empty (L3 r1).
+        if len(parts) >= 5 and parts[4].startswith("g"):
+            try:
+                os.killpg(int(parts[4][1:]), 0)
+                return True
+            except (ValueError, ProcessLookupError):
+                return False
+            except PermissionError:
+                return True
         return False
     except PermissionError:
         return True   # someone else's process with that pid: alive, so the claim is kept
@@ -4522,6 +4548,10 @@ class _LedgerTxn:
             if e["path"] in paths and _identity_matches(e):
                 e["claims"].append(claim)
 
+    def retag(self, old: str, new: str) -> None:
+        for e in self.entries:
+            e["claims"] = [new if c == old else c for c in e["claims"]]
+
     def drop(self, claim: str) -> None:
         for e in self.entries:
             e["claims"] = [c for c in e["claims"] if c != claim]
@@ -4545,6 +4575,10 @@ class _LedgerTxn:
                         self.removed.append(e["path"])
                     except OSError:
                         kept.append(e)   # still there: try again next time
+                elif e.get("kind") == "dir" and _identity_matches(e):
+                    # Still levain's directory, only not empty yet (another session's object inside
+                    # it, say): kept, so it goes once that is gone (L3 r1).
+                    kept.append(e)
                 # else: it is no longer the object levain made (the operator's now); forget it
             path = _ledger_dir() / _LEDGER_NAME
             tmp = path.with_name(path.name + ".tmp")
@@ -4877,7 +4911,9 @@ class BwrapProvider(ConfinementProvider):
                     # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                     txn.record(made)
             if txn.ok:
-                txn.claim({*mounted, *create_first}, claim)
+                # Everything this spawn made is claimed too, parents included (an absent ~/.config
+                # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
+                txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).
@@ -4897,6 +4933,13 @@ class BwrapProvider(ConfinementProvider):
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
             shell.start()
+            if shell._proc is not None:
+                # The claim now names the shell's process group as well (see `_claim_alive`).
+                tagged = f"{claim}:g{shell._proc.pid}"
+                with _LedgerTxn() as txn:
+                    if txn.ok:
+                        txn.retag(claim, tagged)
+                shell._ledger_claim = tagged
             shell._recheck()   # whatever changed during the start closes it before any command
         except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
             shell.close()

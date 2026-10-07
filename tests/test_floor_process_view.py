@@ -287,3 +287,68 @@ def test_a_file_shaped_procfs_mount_is_masked_not_tmpfsd(policy, tmp_path: Path,
     argv = C._bwrap_argv(policy)
     assert ["--ro-bind", "/dev/null", str(f)] == argv[argv.index(str(f)) - 2: argv.index(str(f)) + 1]
     assert "--tmpfs" != argv[argv.index(str(f)) - 1]
+
+
+# --- L3 r1 -------------------------------------------------------------------------------------------
+
+
+def _under_floor(tmp_path: Path, monkeypatch):
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True, exist_ok=True)
+    return T, T._EDITOR_FLOOR.set(build_policy(ent))
+
+
+def test_x_mode_still_refuses_an_existing_file(tmp_path: Path, monkeypatch) -> None:
+    T, token = _under_floor(tmp_path, monkeypatch)
+    f = tmp_path / "ws.txt"
+    f.write_text("KEEP")
+    try:
+        with pytest.raises(FileExistsError):
+            T._floored_open(f, "x")
+        with T._floored_open(tmp_path / "new.txt", "x") as fh:
+            fh.write("ok")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert f.read_text() == "KEEP" and (tmp_path / "new.txt").read_text() == "ok"
+
+
+def test_a_planted_fifo_is_refused_without_blocking(tmp_path: Path, monkeypatch) -> None:
+    T, token = _under_floor(tmp_path, monkeypatch)
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    try:
+        with pytest.raises(T._FloorRefusedOpen, match="not a regular file"):
+            T._floored_open(fifo)
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+
+
+def test_a_dangling_link_is_refused_not_followed_into_a_create(tmp_path: Path, monkeypatch) -> None:
+    T, token = _under_floor(tmp_path, monkeypatch)
+    link = tmp_path / "dangling"
+    link.symlink_to(tmp_path / "elsewhere" / "target")
+    (tmp_path / "elsewhere").mkdir()
+    try:
+        with pytest.raises(T._FloorRefusedOpen, match="dangling"):
+            T._floored_open(link, "w")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert not (tmp_path / "elsewhere" / "target").exists()
+
+
+def test_the_patched_opens_are_the_editors_only_way_to_read_a_file() -> None:
+    """The open-then-check rides the module-global `open` of two editor modules. A later SDK that
+    reads or writes another way would bypass it silently, so this fails if one appears."""
+    import inspect
+
+    from openhands.tools.file_editor import editor
+    from openhands.tools.file_editor.utils import encoding
+
+    for mod in (editor, encoding):
+        src = inspect.getsource(mod)
+        for primitive in ("read_text(", "read_bytes(", "write_text(", "write_bytes(", "io.open(",
+                          "os.open(", "codecs.open(", "mmap"):
+            assert primitive not in src, f"{mod.__name__} uses {primitive}"

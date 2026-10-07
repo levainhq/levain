@@ -57,12 +57,14 @@ _ALLOW = frozenset({
     # The dynamic loader's search paths. Not secrets, and an interpreter or extension found only
     # through one (an HPC module, a conda or nix build of libpython) would not start without it.
     "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
+    # A display's auth file PATH (the file is the secret, and stays where it is), for the browser.
+    "XAUTHORITY",
 })
 # Config namespaces: the locale, XDG dirs, the interpreter's own switches, and this stack's settings.
 # A name in one of them that is SHAPED like a credential is carried all the same (:data:`_TOKEN_SHAPED`):
 # a namespace is a pattern, and a future ``LEVAIN_TEAM_TOKEN`` must not ride the exec-time block
 # because its prefix was allowed. Such a name is allowed only by being listed in :data:`_ALLOW`.
-_ALLOW_PREFIXES = ("LC_", "XDG_", "PYTHON", "LEVAIN_", "VAGUS_", "ANNEAL_")
+_ALLOW_PREFIXES = ("LC_", "XDG_", "PYTHON", "LEVAIN_", "VAGUS_", "ANNEAL_", "CONDA_", "PIPX_")
 _TOKEN_SHAPED = re.compile(r"(^|_)(KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASS|PWD|"
                            r"CREDENTIAL|CREDENTIALS|AUTH|COOKIE|SESSION)(_|$)")
 # Names in an allowed namespace that are secrets or plumbing, never allowed.
@@ -133,8 +135,11 @@ def open_browser(url: str, unlocked: str | None = None) -> None:
     process's whole environment. Best effort: no browser is fine."""
     payload = json.dumps({"url": url, "unlocked": unlocked})
     try:
+        # Output to /dev/null, not a pipe: a browser the helper starts inherits it and lives on, and
+        # a captured pipe would hold this call until the timeout (L3 r1).
         subprocess.run([sys.executable, "-P", "-m", "levain._browser"], input=payload, text=True,
-                       capture_output=True, timeout=60, env=child_env("BROWSER"))
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+                       env=child_env("BROWSER"))
     except (OSError, subprocess.SubprocessError):
         pass
 

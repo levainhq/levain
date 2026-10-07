@@ -68,6 +68,7 @@ import dataclasses
 import logging
 import os
 import shutil
+import stat
 import threading
 import weakref
 from pathlib import Path
@@ -130,22 +131,38 @@ def _floored_open(file, *args, **kwargs):
     def opener(path, flags):
         # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
         # jewel), and a file this call creates is created O_EXCL, so a refusal knows it may remove it.
+        # O_NONBLOCK on the way in: a FIFO the shell planted must be refused, not block the editor.
         created = False
+        probe = (flags & ~(os.O_TRUNC | os.O_CREAT | os.O_EXCL)) | os.O_NONBLOCK
         try:
-            fd = os.open(path, flags & ~(os.O_TRUNC | os.O_CREAT), 0o666)
-        except FileNotFoundError:
-            if not flags & os.O_CREAT:
-                raise
-            fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_EXCL, 0o666)
-            created = True
+            if flags & os.O_CREAT and flags & os.O_EXCL:
+                # `open(path, "x")`: the caller asked to fail on an existing file, so no first open.
+                fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_NONBLOCK, 0o666)
+                created = True
+            else:
+                try:
+                    fd = os.open(path, probe, 0o666)
+                except FileNotFoundError:
+                    if not flags & os.O_CREAT:
+                        raise
+                    fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_EXCL | os.O_NONBLOCK, 0o666)
+                    created = True
+        except FileExistsError:
+            if flags & os.O_EXCL:
+                raise   # the caller's own "x" semantics
+            # A dangling link: creating would make a file wherever it points.
+            raise _FloorRefusedOpen(f"{path} is a dangling symlink; the floor does not create its target")
         try:
-            reason = opened_file_reason(policy, fd)
+            st = os.fstat(fd)
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                reason = "the opened path is not a regular file (a FIFO, device or socket)"
+            else:
+                reason = opened_file_reason(policy, fd)
         except Exception as exc:  # noqa: BLE001 — a check that cannot run refuses
             reason = f"the opened file could not be checked ({exc})"
         if reason is not None:
             if created:
                 try:
-                    st = os.fstat(fd)
                     real = opened_file_path(fd)
                     lst = os.lstat(real)
                     if (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
@@ -154,6 +171,7 @@ def _floored_open(file, *args, **kwargs):
                     pass
             os.close(fd)
             raise _FloorRefusedOpen(reason)
+        os.set_blocking(fd, not flags & os.O_NONBLOCK)
         if flags & os.O_TRUNC:
             os.ftruncate(fd, 0)
         return fd
