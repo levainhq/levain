@@ -35,6 +35,7 @@ import datetime as _dt
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
@@ -92,6 +93,16 @@ def _execution_from_record(rec: object) -> ExecutionResult:
     return ExecutionResult(ok=rec["ok"], detail=detail if isinstance(detail, str) else "",
                            error=error if isinstance(error, str) else None,
                            downstream_id=downstream if isinstance(downstream, str) else None)
+
+
+class _Settle(Enum):
+    """What the run journal holds for a hold after a resolver tried to decide it (``EfferentGate._settle``)."""
+
+    COMMITTED = "committed"
+    APPROVED_BEFORE = "approved_before"
+    REJECTED_BEFORE = "rejected_before"
+    STALE = "stale"
+    FAULT = "fault"
 
 
 @dataclass(frozen=True)
@@ -571,10 +582,9 @@ class EfferentGate:
         if posture is None:
             # a corrupt posture name on a record whose seal otherwise verified (a re-sealed corruption,
             # or an enum that was retired) — DROP into a refuse, never an executable rung (codex MED).
-            settled = self._reject_hold(pending, by=decision.by)
-            self._release(pending, decide_first)
-            if not settled:
-                return self._already_decided(pending)
+            stop = self._settle_deny(pending, decide_first, by=decision.by)
+            if stop is not None:
+                return stop
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -596,10 +606,9 @@ class EfferentGate:
             )
 
         if not decision.approved:
-            settled = self._reject_hold(pending, by=decision.by, withdraw=decision.withdraw)
-            self._release(pending, decide_first)
-            if not settled:
-                return self._already_decided(pending)
+            stop = self._settle_deny(pending, decide_first, by=decision.by, withdraw=decision.withdraw)
+            if stop is not None:
+                return stop
             # a silence-window DROP (the sweep, by=on-loop) is a ``timed_out`` MODE; an explicit human
             # deny is ``refused`` — orthogonal to the ``denied`` verdict either way (Slice 3a.5 §2.1).
             deny_terminal = "timed_out" if decision.by == "on-loop" else "refused"
@@ -623,10 +632,9 @@ class EfferentGate:
             # a missing typed proof, or an approval nobody may give unattended, is not a person's "no"
             # to the action: withdraw (the run stays open); a re-validation failure IS a decision
             withdraw = guard in ("elevated_requires_typed_proof", "unattended_approval_not_allowed")
-            settled = self._reject_hold(pending, by=decision.by, withdraw=withdraw)
-            self._release(pending, decide_first)
-            if not settled:
-                return self._already_decided(pending)
+            stop = self._settle_deny(pending, decide_first, by=decision.by, withdraw=withdraw)
+            if stop is not None:
+                return stop
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -657,19 +665,24 @@ class EfferentGate:
             actor_first_estimate=decision.first_estimate, run=run,
         )
         if run is not None:
-            # Approve the run's hold with the digest of exactly what fires. ``already_decided`` (a second
-            # pending for the same effect) falls through: the journal then answers with what the first
-            # decision did (replayed, or cancelled). Any other refusal fires nothing.
-            assert self._journal is not None   # _journal_bar refused a run without a journal
-            d = self._journal.decide(hold_id_for(run.run_id, run.effect_id), approve=True,
-                                     digest=self._digest_of(request), by=decision.by)
-            if not d.ok and d.reason != "already_decided":
+            # Approve the run's hold with the digest of exactly what fires, and act on what the journal
+            # actually holds afterwards: this approval, or an earlier approval, fires (the journal runs
+            # the effect at most once); an earlier REJECTION fires nothing and writes no second receipt;
+            # a hold that is gone or holds other bytes denies; a journal fault leaves the pending for a
+            # retry and writes nothing.
+            settle, detail = self._settle(pending, approve=True, by=decision.by)
+            if settle is _Settle.FAULT:
+                return self._journal_fault(pending, detail)
+            if settle is _Settle.REJECTED_BEFORE:
+                self._release(pending, decide_first)
+                return self._already_decided(pending)
+            if settle is _Settle.STALE:
                 self._release(pending, decide_first)
                 return self._deny_fields(
                     created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                     context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
                     producers=pending.producers, authority=authority, posture=posture,
-                    verdict="denied", by=decision.by, reason=f"journal:{d.reason}",
+                    verdict="denied", by=decision.by, reason=f"journal:{detail}",
                     actor_first_estimate=decision.first_estimate,
                 )
         self._release(pending, decide_first)   # the decision is committed: the pending can go
@@ -821,14 +834,16 @@ class EfferentGate:
             return None
         posture = self._posture_of(pending)
         if posture is None:   # corrupt posture (codex MED) → DROP, no execution path
-            self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
+            if self._settle(pending, approve=False, by="on-loop")[0] is _Settle.FAULT:
+                return None   # the decision did not land: leave the pending for the next sweep
             if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                 _log.error("efferent gate sweep: corrupt posture on %s — DROPPED", pending.pending_id)
             return None
         # HIGH-3 (defence-in-depth behind the seal): the silence default is the VALIDATED posture's,
         # never the raw stored fail_open. A disagreement → DROP, never auto-fire.
         if pending.fail_open != posture.fail_open:
-            self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
+            if self._settle(pending, approve=False, by="on-loop")[0] is _Settle.FAULT:
+                return None   # the decision did not land: leave the pending for the next sweep
             if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                 _log.error("efferent gate sweep: fail_open/posture mismatch on %s (stored=%s, %s.fail_open=%s)"
                            " — DROPPED, NOT auto-fired", pending.pending_id, pending.fail_open,
@@ -839,7 +854,8 @@ class EfferentGate:
             # action DELIBERATELY opted into auto_fire_actions (in code) may autonomously fire — a
             # forged/recomputed cooling-off record over a non-allowlisted action is DROPPED.
             if pending.action_name not in self._auto_fire_actions:
-                self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
+                if self._settle(pending, approve=False, by="on-loop")[0] is _Settle.FAULT:
+                    return None   # the decision did not land: leave the pending for the next sweep
                 if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                     _log.error("efferent gate sweep: %r not in the auto-fire allowlist — cooling-off %s "
                                "DROPPED, not auto-fired", pending.action_name, pending.pending_id)
@@ -848,8 +864,8 @@ class EfferentGate:
         else:
             decision = ConfirmDecision(approved=False, by="on-loop", reason="confirm_window_elapsed")
         outcome = self.resolve(pending.pending_id, decision)  # resolve CLAIMS + re-verifies the seal
-        if outcome.refused and outcome.reason == "unknown_pending":
-            return None   # snapshot-vs-claim race (another resolver won) — a non-decision
+        if outcome.refused and outcome.reason in ("unknown_pending", "journal:already_decided"):
+            return None   # another resolver won the claim or the decision — a non-decision here
         return outcome
 
     # =================================================================================================
@@ -1310,27 +1326,70 @@ class EfferentGate:
             _log.error("efferent gate: could not cancel run %s (%s): %s", request.run.run_id,
                        type(e).__name__, e)
 
-    def _reject_hold(self, pending: PendingAction, *, by: str, withdraw: bool = False) -> bool:
-        """Close the run hold a pending carries, so no undecided effect of the binding waits on it.
-        A DECISION (a deny, a dropped tampered or expired pending) rejects it, which cancels the run.
-        An infrastructure fault (``withdraw``: the pending or the chain state could not be written)
-        withdraws it, leaving the run open for a re-delivery. Fail-soft. Returns False only when the
-        journal answered that ANOTHER decision was committed first (this one changes nothing)."""
+    def _settle(self, pending: PendingAction, *, approve: bool, by: str,
+                withdraw: bool = False) -> tuple["_Settle", str]:
+        """Record this resolver's decision on the run hold a pending carries, and report what the journal
+        ACTUALLY holds afterwards (the one construct every resolve and sweep branch acts on):
+
+          - COMMITTED: this decision was recorded (or a withdraw closed the open hold; or the pending
+            has no run, so there is nothing to record);
+          - APPROVED_BEFORE / REJECTED_BEFORE: another decision was recorded first; this one changes
+            nothing;
+          - STALE: the hold is gone (withdrawn) or holds other bytes; ``detail`` names which;
+          - FAULT: the journal could not be read or written; ``detail`` is the exception type. Nothing
+            is known to have been recorded, so the caller releases nothing and writes no receipt.
+
+        A DECISION (a deny, a dropped tampered or expired pending) rejects, which cancels the run. An
+        infrastructure fault (``withdraw``) withdraws, leaving the run open for a re-delivery."""
         if self._journal is None or not pending.run_id or not pending.effect_id:
-            return True
+            return _Settle.COMMITTED, ""
         hold_id = hold_id_for(pending.run_id, pending.effect_id)
         digest = effect_digest(action_name=pending.action_name, payload=pending.payload,
                                context_id=pending.context_id)
         try:
             if withdraw:
-                self._journal.withdraw(hold_id)
-                return True
-            d = self._journal.decide(hold_id, approve=False, digest=digest, by=by)
-            return d.ok or d.reason != "already_decided"
+                if self._journal.withdraw(hold_id):
+                    return _Settle.COMMITTED, ""
+            else:
+                d = self._journal.decide(hold_id, approve=approve, digest=digest, by=by)
+                if d.ok:
+                    return _Settle.COMMITTED, ""
+                if d.reason != "already_decided":
+                    return _Settle.STALE, d.reason
+            state = self._journal.hold_state(hold_id)
         except Exception as e:  # noqa: BLE001
-            _log.error("efferent gate: could not reject the hold of %s (%s): %s", pending.pending_id,
-                       type(e).__name__, e)
-            return True
+            _log.error("efferent gate: could not record a decision on the hold of %s (%s): %s",
+                       pending.pending_id, type(e).__name__, e)
+            return _Settle.FAULT, type(e).__name__
+        if state == "approved":
+            return _Settle.APPROVED_BEFORE, ""
+        if state == "rejected":
+            return _Settle.REJECTED_BEFORE, ""
+        if state is None:
+            return (_Settle.COMMITTED, "") if withdraw else (_Settle.STALE, "unknown_hold")
+        return _Settle.FAULT, "hold_still_open"   # a withdraw that did not close an open hold
+
+    def _settle_deny(self, pending: PendingAction, decide_first: bool, *, by: str,
+                     withdraw: bool = False) -> GateOutcome | None:
+        """Settle a deny (or withdraw), then release the pending ONLY if the journal now holds a decision
+        for it. Returns the outcome that ends the resolve (a fault, or someone else's decision), or
+        ``None`` when this deny was recorded and the caller writes its deny receipt."""
+        settle, detail = self._settle(pending, approve=False, by=by, withdraw=withdraw)
+        if settle is _Settle.FAULT:
+            return self._journal_fault(pending, detail)
+        self._release(pending, decide_first)
+        if settle in (_Settle.APPROVED_BEFORE, _Settle.REJECTED_BEFORE):
+            return self._already_decided(pending)
+        return None
+
+    @staticmethod
+    def _journal_fault(pending: PendingAction, detail: str) -> GateOutcome:
+        """The decision could not be recorded: nothing changed, the pending stays for a retry."""
+        return GateOutcome(
+            posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+            reason=f"journal_error:{detail}", receipt_id=None, execution=None,
+            binding_id=pending.authority.get("binding_id") if isinstance(pending.authority, dict) else None,
+        )
 
     def _persist(self, *, created_at, action_name, proposal_id, posture, fired, face) -> str | None:
         """Append the gate-receipt FAIL-SOFT (L1-HIGH-1). A receipt-persist failure (a disk error, or

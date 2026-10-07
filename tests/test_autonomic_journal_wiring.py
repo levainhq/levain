@@ -1009,3 +1009,93 @@ def test_the_orphan_sweep_accepts_a_naive_clock(tmp_path):
     w = World(tmp_path)
     w.gate.sweep_timeouts(_dt.datetime(2026, 10, 7, 15, 0, 0))      # naive, 3 hours later
     assert w.journal.open_holds() == []
+
+
+# --- L1+L2 on ade957f: one settle construct (head's ruling) ------------------------------------
+
+def test_a_deny_the_journal_could_not_record_leaves_the_pending_and_writes_nothing(tmp_path):
+    # probe1: the journal fault was swallowed, the pending released, a deny receipt written, the hold
+    # left open; the orphan sweep then withdrew it and a re-delivery re-proposed the denied action
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    receipts_before = len(list(w.receipts.read()))
+    real = w.journal.decide
+    w.journal.decide = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    out = w.resolve_open(approve=False)
+    assert out.links[-1].outcome.reason == "journal_error:OSError"
+    assert len(w.pending.list_open()) == 1 and len(list(w.receipts.read())) == receipts_before
+    w.journal.decide = real
+    w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=3))           # the hold has a pending: not withdrawn
+    assert len(w.journal.open_holds()) == 1
+    retry = w.resolve_open(approve=False)                           # the chain state was put back
+    assert retry.aborted and retry.reason == "denied:human"         # the retry records the deny
+    assert w.dispatch("c1").outcome.reason == "journal:cancelled" and w.outbox() == [("link0", "c1-0")]
+
+
+def test_a_sweep_drop_the_journal_could_not_record_leaves_the_pending(tmp_path):
+    # probe5: the sweep's drop paths ignored a journal fault and removed the pending anyway
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00k",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="s", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=Posture.COOLING_OFF,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    w.dispatch("s1")
+    assert len(w.pending.list_open()) == 1                         # cooling-off, not on the allowlist
+    real = w.journal.decide
+    w.journal.decide = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=3))
+    assert len(w.pending.list_open()) == 1 and len(w.journal.open_holds()) == 1
+    w.journal.decide = real
+    w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=3))           # the drop lands once the journal does
+    assert w.pending.list_open() == [] and w.journal.open_holds() == [] and w.outbox() == []
+
+
+def test_a_withdraw_that_lost_to_an_approval_writes_no_deny_receipt(tmp_path):
+    # probe2: withdraw found the hold already approved, returned "settled", and a deny receipt was
+    # written for an effect that then fired
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.pending.list_open()
+    from levain.autonomic import effect_digest
+    w.journal.decide(hold_id_for(p.run_id, p.effect_id), approve=True, by="human",
+                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    before = len(list(w.receipts.read()))
+    out = w.resolve_open_as(ConfirmDecision(approved=False, by="on-loop", withdraw=True))
+    assert out.links[-1].outcome.reason == "journal:already_decided"
+    assert len(list(w.receipts.read())) == before and w.pending.list_open() == []
+    assert w.dispatch("c1").chain.completed                         # the approval still runs, once
+
+
+def test_an_approval_after_a_rejection_fires_nothing_and_writes_no_receipt(tmp_path):
+    # probe3: already_decided fell through to _fire after an earlier REJECT and wrote a second receipt
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.pending.list_open()
+    from levain.autonomic import effect_digest
+    w.journal.decide(hold_id_for(p.run_id, p.effect_id), approve=False, by="human",
+                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    before = len(list(w.receipts.read()))
+    out = w.resolve_open(approve=True)
+    assert out.links[-1].outcome.reason == "journal:already_decided"
+    assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
+
+
+def test_refence_of_a_removed_binding_already_fenced_is_a_no_op(tmp_path):
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("r1")
+    w.store.remove(b.binding_id)
+    fences = lambda: sum(1 for l in w.journal.path.read_text().splitlines() if '"t":"fence"' in l)  # noqa: E731
+    before = fences()
+    w.store.refence(b.binding_id)
+    w.store.refence(b.binding_id)
+    assert fences() == before

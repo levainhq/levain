@@ -516,18 +516,20 @@ class ChainStateStore:
         durable_replace(self.path, json.dumps(records, ensure_ascii=False, indent=2))
 
     # --- public API --------------------------------------------------------------------
-    def add(self, state: ChainState) -> None:
+    def add(self, state: ChainState) -> str:
         """Persist a chain state. A duplicate ``chain_id`` is REPLACED (idempotent re-pause). Locked. A
         store that cannot be read RAISES (:class:`ChainStoreUnavailableError`) instead of being
-        rewritten as if it held only this state."""
+        rewritten as if it held only this state. Returns the ``chain_id`` that OWNS the paused link: this
+        state's, or the one an earlier delivery already wrote for the same pending."""
         with self._locked():
             records = self._read_raw(for_advance=True)
-            if any(r.get("pending_id") == state.pending_id and r.get("chain_id") != state.chain_id
-                   for r in records):
-                return   # another delivery already wrote the state for this paused link: one owner
+            for r in records:
+                if r.get("pending_id") == state.pending_id and r.get("chain_id") != state.chain_id:
+                    return str(r.get("chain_id"))   # another delivery already owns this paused link
             records = [r for r in records if r.get("chain_id") != state.chain_id]
             records.append(state.to_dict())
             self._write_raw(records)
+            return state.chain_id
 
     def get(self, chain_id: str) -> ChainState | None:
         """Return the chain state by id, or ``None`` (absent or malformed). The inspection path."""
@@ -754,20 +756,13 @@ class ChainExecutor:
                 # chain that can't persist its resume state leaves NO orphaned fireable pending (the
                 # two-resource invariant — codex/L1 HIGH).
                 pending_id = outcome.pending_id or ""
-                owner = self._chain_store.find_by_pending(pending_id) if pending_id else None
-                if owner is not None:
-                    # a re-delivery reached the same paused link: its pending and its chain state are
-                    # already open, so report that pause instead of writing a second state for it
-                    return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
-                                        paused_at=i, pending_id=pending_id, chain_id=owner.chain_id,
-                                        reason=outcome.reason)
                 try:
                     state = ChainState.create(
                         created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
                         completed=ctx.completed, paused_at_link=i, paused_payload=request.payload,
                         pending_id=pending_id,
                     )
-                    self._chain_store.add(state)
+                    chain_id = self._chain_store.add(state)
                 except Exception as e:  # noqa: BLE001 — can't persist the chain → consume its pending + abort
                     _log.error("chainpath: chain-state persist FAILED for %s (%s): %s — consuming the "
                                "just-proposed pending %s + aborting (no orphaned fireable pending)",
@@ -777,9 +772,9 @@ class ChainExecutor:
                     return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
                                         paused_at=i, reason=f"chain_state_persist_failed:{type(e).__name__}")
                 _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
-                          binding.binding_id, i, outcome.posture.name, outcome.pending_id, state.chain_id)
+                          binding.binding_id, i, outcome.posture.name, outcome.pending_id, chain_id)
                 return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
-                                    paused_at=i, pending_id=outcome.pending_id, chain_id=state.chain_id,
+                                    paused_at=i, pending_id=outcome.pending_id, chain_id=chain_id,
                                     reason=outcome.reason)
 
             # killed / refused / deferred / fired-but-effect-failed → ABORT (no further links).
@@ -955,6 +950,16 @@ class ChainExecutor:
         # re-screens §1.5, claims the pending). The gate writes the link's receipt.
         link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
+        if link_outcome.refused and link_outcome.reason.startswith("journal_error:"):
+            # the decision did not land, so the pending is still open: put the chain state back so a
+            # retry of this resolve finds its chain (best effort; a re-delivery rebuilds it otherwise)
+            try:
+                self._chain_store.add(state)
+            except Exception as e:  # noqa: BLE001
+                _log.error("chainpath resume: could not restore chain %s after a journal fault (%s): %s",
+                           state.chain_id, type(e).__name__, e)
+            return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
+                                paused_at=state.paused_at_link, reason=link_outcome.reason)
 
         if not link_outcome.fired:
             # denied / dropped / effect-failed → the chain ENDS here (no continuation). The chain state
