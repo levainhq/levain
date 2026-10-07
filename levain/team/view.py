@@ -699,10 +699,10 @@ class _ViewHandler(GuardedHandler):
 
     @staticmethod
     def _refusal(gl: GitLedger) -> tuple[list[str], bool]:
-        """(why the quarantined remote tip is refused, whether it could not be judged at all), judged fresh on every
-        page: the answer depends on the quarantine, pins.json and this clone's own lines, and a repin changes it
-        without a fetch. Only while a refused tip sits in quarantine is this a ledger read; otherwise it is one ref
-        lookup."""
+        """(why the refused remote tip is refused, whether it could not be judged at all), judged fresh on every page:
+        the refused tip is the one the trusted record (pins.json) names, whichever command's fetch refused it, and the
+        answer depends on that record and this clone's own lines, so a repin changes it without a fetch. Only while
+        the record names a refused tip is this a ledger read; otherwise it is one read of the record."""
         try:
             return gl.incoming_refusal(), False
         except LedgerReadError as exc:
@@ -735,8 +735,8 @@ class _ViewHandler(GuardedHandler):
             ok_at = _epoch(st.get("last_fetch_ok"))
             if note and ok_at is not None and ok_at >= began:
                 note = None         # another process fetched successfully while this fetch was failing
-            # The refusal is read from the quarantine itself, so it shows whichever command fetched the refused tip
-            # (this view, a sync, the hook), for as long as that tip is what the remote holds.
+            # The refusal is read from the trusted record, so it shows whichever command fetched the refused tip
+            # (this view, a sync, the hook), until a fetch or a repin accepts a tip.
             refusal, unjudged = self._refusal(gl)
             detail = note or st.get("last_fetch_error") or ""
             if refusal:

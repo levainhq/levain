@@ -1111,7 +1111,7 @@ def test_a_quarantine_that_cannot_be_judged_is_shown_as_a_refusal_not_a_503(capf
 
 def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_view):
     # codex, L3 10-07: a refusal recorded by another command's fetch (a CLI sync) never reached the page, which
-    # inferred refusal from the last error string. The page now reads the quarantine itself.
+    # inferred refusal from the last error string. The page now reads the refusal from the clone's trusted record.
     from levain.cli import main as levain_main
     from levain.team.transport import GitLedger, Repo
     ana, ben, port = two_clone_view
@@ -1125,10 +1125,20 @@ def test_a_tampered_remote_is_refused_on_the_page_whoever_fetched_it(two_clone_v
     _git("commit", "-qm", "tamper", cwd=wt)
     _git("push", "-q", "origin", "levain-ledger", cwd=wt)
     levain_main(["team", "sync", "--repo", str(ana)])                   # another command fetches the tampered tip
+    # lane C2 (e7b4ac2): each fetch now owns its ref and deletes it when it returns, and the refusal lives in the
+    # trusted record (pins.json "refused"); the page must still say so with no fetch ref left anywhere.
+    assert _git("for-each-ref", "refs/levain/", cwd=ana).count("incoming") == 0
     m, words = _words(port, "/view.json")                              # no fetch from the view in this interval
     assert m["fetch"]["refused"] is True and words == ["VAT rounds half-even."]   # the last accepted copy
     page = _page(port, "/")
     assert "refused as tampered" in page and "remote, as last accepted" in page and "notes.txt" not in page
+    # The view's own fetch of the refused tip: once that request has returned (its ref deleted), later pages still
+    # say refused.
+    _words(port, "/view.json?fetch=1")
+    assert _git("for-each-ref", "refs/levain/", cwd=ana).count("incoming") == 0
+    m, words = _words(port, "/view.json")
+    assert m["fetch"]["refused"] is True and words == ["VAT rounds half-even."]
+    assert "refused as tampered" in _page(port, "/")
 
 
 
